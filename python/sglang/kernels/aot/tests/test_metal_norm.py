@@ -46,9 +46,7 @@ _TOL = {
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize(
-    "hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-)
+@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
 def test_rms_norm(batch_size, hidden_size, dtype):
     eps = 1e-6

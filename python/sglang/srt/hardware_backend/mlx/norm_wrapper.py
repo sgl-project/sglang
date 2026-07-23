@@ -70,7 +70,7 @@ class MLXRMSNormWrapper(nn.Module):
         object.__setattr__(self, "_kernel", kernel)
         object.__setattr__(self, "_eps", float(inner.eps))
         self._refresh_weight_cache(inner.weight)
-    
+
     def _refresh_weight_cache(self, w):
         object.__setattr__(self, "_w_is_1D", w.ndim == 1)
         object.__setattr__(self, "_w_dtype", w.dtype)

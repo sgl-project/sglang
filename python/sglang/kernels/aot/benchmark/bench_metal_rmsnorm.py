@@ -16,7 +16,6 @@ import itertools
 import time
 
 import mlx.core as mx
-
 from sgl_kernel import metal
 
 if metal._metal is None:  # pragma: no cover - guards a missing/failed build
@@ -51,6 +50,7 @@ def bench(fn, warmup=10, iters=100):
         mx.eval(fn())
     end = time.perf_counter()
     return (end - start) / iters
+
 
 def bench_chain(step, x0, chain=200, warmup=3):
     for _ in range(warmup):
