@@ -11,8 +11,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _tree_cache(page_size=8):
-    allocator = MagicMock(page_size=page_size)
+def _tree_cache():
+    allocator = MagicMock(page_size=8)
     allocator.alloc_extend.return_value = torch.tensor([1])
     allocator.alloc_decode.return_value = torch.tensor([1])
     return MagicMock(token_to_kv_pool_allocator=allocator)

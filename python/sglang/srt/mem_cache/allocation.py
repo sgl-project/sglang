@@ -502,24 +502,14 @@ def alloc_paged_token_slots_decode(
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
-    if token_per_req == 1:
-        num_tokens = (
-            get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=allocator.page_size,
-                decode=True,
-            )
-            * allocator.page_size
+    num_tokens = (
+        get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=allocator.page_size,
+            prefix_lens=seq_lens_cpu - token_per_req,
         )
-    else:
-        num_tokens = (
-            get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=allocator.page_size,
-                prefix_lens=seq_lens_cpu - token_per_req,
-            )
-            * allocator.page_size
-        )
+        * allocator.page_size
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     # DSV4-NPU allocator also needs req_pool_indices + per-req state lens and
