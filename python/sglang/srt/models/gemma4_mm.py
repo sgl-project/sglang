@@ -421,6 +421,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 ):
                     all_embeds.append(pv.to(self.language_model.device))
                     continue
+                if isinstance(vt, PPMissingLayer):
+                    raise ValueError(
+                        "Gemma 4 language-only mode requires precomputed image "
+                        "embeddings; local multimodal fallback is unavailable."
+                    )
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
                     raise ValueError(
@@ -484,6 +489,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 ):
                     all_embeds.append(pv.to(self.language_model.device))
                     continue
+                if isinstance(vt, PPMissingLayer):
+                    raise ValueError(
+                        "Gemma 4 language-only mode requires precomputed video "
+                        "embeddings; local multimodal fallback is unavailable."
+                    )
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
                     raise ValueError(
