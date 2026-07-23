@@ -13,6 +13,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_cuda
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
@@ -127,9 +128,11 @@ class TestLMHeadFP32(unittest.TestCase):
         self.assertEqual(state["a"], expected_a_dtype)
         self.assertEqual(state["b"], expected_b_dtype)
         self.assertEqual(logits.dtype, torch.float32)
-        if hidden_state.is_cuda and not enable_fp32:
+        if is_cuda() and hidden_state.is_cuda and not enable_fp32:
             self.assertEqual(state["operation"], "mm")
             self.assertEqual(state["out_dtype"], torch.float32)
+        elif not enable_fp32:
+            self.assertEqual(state["operation"], "matmul")
 
     def test_flag_true_fp16_activations(self):
         self._run_case(torch.float16, True, torch.float16, torch.float32, torch.float32)

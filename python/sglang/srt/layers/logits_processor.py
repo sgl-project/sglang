@@ -50,6 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils.common import (
     is_cpu,
+    is_cuda,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -59,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_nvidia_cuda = is_cuda()
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -752,8 +754,10 @@ class LogitsProcessor(nn.Module):
                     None,  # bias
                     True,  # is_vnni
                 )
-            elif hidden_states.is_cuda:
-                # RL may use tied FP32 weights, so normalize both operands to BF16.
+            elif _is_nvidia_cuda and hidden_states.is_cuda:
+                # torch.mm(out_dtype=...) is NVIDIA CUDA-only; ROCm tensors also
+                # report is_cuda. RL may use tied FP32 weights, so normalize both
+                # operands to BF16.
                 input_dtype = (
                     torch.bfloat16
                     if self.rl_on_policy_target is not None
