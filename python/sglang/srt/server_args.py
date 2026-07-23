@@ -6103,7 +6103,7 @@ class ServerArgs:
             raise ValueError(
                 "--enable-cp-cache-layer-split requires the Compressor V2 path"
             )
-        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 

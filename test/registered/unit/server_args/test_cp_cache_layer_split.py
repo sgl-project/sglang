@@ -132,7 +132,7 @@ class TestCpCacheLayerSplitServerArgs(CustomTestCase):
             _make_layer_split_args()._handle_cp_cache_layer_split()
 
         with patch("sglang.srt.server_args.is_hip", return_value=False), patch(
-            "sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate.is_unified_kv_triton",
             return_value=True,
         ), self.assertRaisesRegex(ValueError, "unified_kv_triton"):
             _make_layer_split_args()._handle_cp_cache_layer_split()
