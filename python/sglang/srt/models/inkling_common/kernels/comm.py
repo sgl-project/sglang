@@ -7,7 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -94,7 +94,7 @@ def _ar_jit():
     lazy so importing comm.py doesn't pull in the JIT machinery)."""
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_all_reduce
+    from sglang.kernels.ops.communication import inkling_all_reduce
 
     return inkling_all_reduce
 
@@ -103,7 +103,7 @@ def _ar_jit():
 def _ar_fused_jit():
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_ar_fused
+    from sglang.kernels.ops.communication import inkling_ar_fused
 
     return inkling_ar_fused
 
@@ -241,7 +241,7 @@ def ar_sconv_norm_fusable(
     (attn-side: wo_ud AR -> attn_sconv -> mlp_norm; MoE-side: MoE AR ->
     mlp_sconv -> next attn_norm)
     can run as the single fused kernel
-    (kernels/ops/model/inkling/inkling_ar_fused.py). Must be
+    (kernels/ops/communication/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
     if not is_cuda():
@@ -251,7 +251,7 @@ def ar_sconv_norm_fusable(
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV_NORM.get()
     ):
         return False
-    if get_exec().comm.enable_scattered_sconv:
+    if get_server_args().enable_scattered_sconv:
         # The decode {AR -> sconv -> norm} fusion is full-width; under scattered
         # sconv the output sconvs are hidden-sharded, so it does not apply.
         return False
@@ -396,7 +396,7 @@ def get_ar_buffer(
         envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         # Scattered sconv replaces the AR with reduce_scatter_hidden, which
         # stages from comm.buffer[:n] -- never hand out the v4 region there.
-        and not get_exec().comm.enable_scattered_sconv
+        and not get_server_args().enable_scattered_sconv
     ):
         res = _get_inkling_ar_resources(comm)
         if (
@@ -675,7 +675,7 @@ def all_gather_hidden(input: torch.Tensor, group: GroupCoordinator) -> torch.Ten
 def _ar_ssconv_jit():
     if not is_cuda():
         return None
-    from sglang.kernels.ops.model.inkling import inkling_ar_scattered_sconv
+    from sglang.kernels.ops.communication import inkling_ar_scattered_sconv
 
     return inkling_ar_scattered_sconv
 
@@ -689,14 +689,14 @@ def scattered_ar_sconv_fusable(
 ) -> bool:
     """True when an extend {reduce_scatter_hidden -> sconv(shard) ->
     all_gather_hidden} chain can run as the single fused v3/v3b-style kernel
-    (kernels/ops/model/inkling/inkling_ar_scattered_sconv.py). Pure function of
+    (kernels/ops/communication/inkling_ar_scattered_sconv.py). Pure function of
     per-forward
     state -- the producing layer (reduce=False) and the consuming site must
     evaluate it identically."""
     if not is_cuda():
         return False
     if not (
-        get_exec().comm.enable_scattered_sconv
+        get_server_args().enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
@@ -1033,7 +1033,7 @@ def fullwidth_ar_sconv_fusable(
     if not is_cuda():
         return False
     if not (
-        not get_exec().comm.enable_scattered_sconv
+        not get_server_args().enable_scattered_sconv
         and envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get()
         and envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SCONV.get()
     ):
