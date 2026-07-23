@@ -31,13 +31,13 @@ pub enum TmEvent {
     /// the scheduler wire needs it and it can't be recovered from the hashed
     /// `RidHash` (which `on_abort` re-derives via `RidHash::from_rid`).
     Abort(String),
-    /// The Python MM bridge finished a request parked in `Encoding`: `input_ids`
-    /// are the final (placeholder-expanded) prompt ids from the model's
+    /// An MM worker finished a request parked in `Encoding`: `input_ids` are
+    /// the final (placeholder-expanded) prompt ids from the model's
     /// `mm_processor`. The processed `mm_inputs` object stays Python-side (rid-
     /// keyed table, attached by `RustServer.drain`), so no `PyObject` rides here.
     MmEncoded { rid: String, input_ids: Vec<i32> },
-    /// The Python MM bridge failed a request parked in `Encoding` (bad media
-    /// URL, processor error, …) — reject it back to the client as a 400.
+    /// An MM worker failed a request parked in `Encoding` (bad media URL,
+    /// processor error, …) — reject it back to the client as a 400.
     MmFailed { rid: String, message: String },
 }
 

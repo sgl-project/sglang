@@ -8,8 +8,9 @@ by sweeping client concurrency and plotting TTFT and ITL:
 - **rust arm** (`SGLANG_RUST_SERVER=1`): the embedded Rust server
   (`rust/sglang-server`) running api-server / tokenizer manager / detokenizer
   as Rust threads inside the scheduler process. Multimodal preprocessing still
-  runs in Python via `MmBridge` using the same `mm_processor` stack, so the
-  A/B isolates the frontend / tokenize / IPC / detokenize differences.
+  runs in Python (Rust mm workers calling `MmProcessorHost`, same
+  `mm_processor` stack), so the A/B isolates the frontend / tokenize / IPC /
+  detokenize differences.
 
 Each arm is launched once with identical server args. Because every level
 replays the same seeded images, both caches that could short-circuit repeats

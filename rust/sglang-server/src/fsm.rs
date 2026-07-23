@@ -37,7 +37,7 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding (the Python MM bridge runs the model's
+    /// Has multimodal inputs → Encoding (an MM worker runs the model's Python
     /// `mm_processor` and returns the final expanded `input_ids`).
     HasMultimodal,
     /// Plain text → Tokenizing.
@@ -116,7 +116,7 @@ impl RequestState {
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
             (Normalizing, Validated(AlreadyTokenized)) => Queued,
-            // The MM bridge returns the *final* (placeholder-expanded) input_ids,
+            // The MM worker returns the *final* (placeholder-expanded) input_ids,
             // so an encoded request skips the tokenizer pool entirely.
             (Encoding, EncodeDone) => Queued,
             (Tokenizing, TokenizeDone) => Queued,

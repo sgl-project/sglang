@@ -867,7 +867,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         # Multimodal processing lives in a shared helper so the embedded Rust
-        # server's MM bridge (rust_server.MmBridge) runs the exact same code.
+        # server's MM path (rust_server.MmProcessorHost) runs the exact same code.
         input_ids, mm_inputs, token_type_ids = await run_mm_processor_for_request(
             obj=obj,
             input_text=input_text,

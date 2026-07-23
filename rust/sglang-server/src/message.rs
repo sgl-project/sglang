@@ -99,7 +99,7 @@ pub struct GenerateRequest {
     pub return_text_in_logprobs: Option<bool>,
     /// Multimodal inputs, carried opaquely (URL / base64 / path / nested lists —
     /// any JSON shape the Python `GenerateReqInput` accepts). Consumed by the
-    /// Encoding stage, which ships them to the Python MM bridge; never read by
+    /// Encoding stage, which ships them to the MM worker pool; never read by
     /// the tokenizer or serialized onto the scheduler header. Boxed: absent on
     /// the common text-only request, so it shouldn't grow every `Request` moved
     /// between stages.
@@ -131,11 +131,12 @@ impl GenerateRequest {
         })
     }
 
-    /// Serialize the fields the Python MM bridge needs to run the model's
-    /// `mm_processor` for this request: a msgpack array
-    /// `[text, input_ids, image_data, video_data, audio_data]`. The bridge
+    /// Serialize the fields the Python `mm_processor` handler needs for this
+    /// request: a msgpack array
+    /// `[text, input_ids, image_data, video_data, audio_data]`. The handler
+    /// (`MmProcessorHost.handle_sync`, called by the MM worker pool)
     /// reconstructs a `GenerateReqInput` from it and returns the final
-    /// (placeholder-expanded) `input_ids` via `push_mm_result`.
+    /// (placeholder-expanded) `input_ids`.
     pub fn to_mm_payload_msgpack(&self) -> Result<Bytes, Error> {
         use rmpv::Value;
         let text_val = match &self.text {
@@ -530,9 +531,8 @@ fn split_mm_column(
     }
 }
 
-/// One request handed to the Python MM bridge (via `Server.recv_mm_requests`):
-/// the rid to correlate the result plus the msgpack payload from
-/// [`GenerateRequest::to_mm_payload_msgpack`].
+/// One request handed to the MM worker pool: the rid to correlate the result
+/// plus the msgpack payload from [`GenerateRequest::to_mm_payload_msgpack`].
 #[derive(Debug)]
 pub struct MmRequest {
     pub rid: String,

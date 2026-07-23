@@ -42,14 +42,14 @@ pub struct Ingress {
     /// `model_config.vocab_size`; bounds client-supplied token ids in
     /// `validate` (`None` → unknown, checks skipped).
     vocab_size: Option<u64>,
-    /// Whether the model is multimodal (a Python MM bridge is polling `mm_tx`).
+    /// Whether the model is multimodal (an MM worker pool consumes `mm_tx`).
     /// When false, mm fields on a request are silently ignored — the exact
     /// Python `TokenizerManager` behavior (`mm_processor is None` skips the MM
     /// block without error).
     mm_enabled: bool,
-    /// → Python MM bridge (drained via `Server.recv_mm_requests`).
+    /// → MM worker pool (spawned via `Server.start_mm_workers`).
     mm_tx: flume::Sender<MmRequest>,
-    /// Requests parked in `Encoding` while the Python MM bridge processes their
+    /// Requests parked in `Encoding` while an MM worker processes their
     /// media; resumed by `MmEncoded` / `MmFailed`. Only this (single) thread
     /// touches it, so no lock.
     pending_mm: HashMap<RidHash, Request>,
@@ -186,7 +186,7 @@ impl Ingress {
                         }
                     }
                 }
-                // Hand off to the Python MM bridge and park the request; it
+                // Hand off to the MM worker pool and park the request; it
                 // re-enters via `MmEncoded` (→ Queued) or `MmFailed` (→ reject).
                 // Doesn't loop.
                 RequestState::Encoding => {
@@ -216,7 +216,7 @@ impl Ingress {
                         let err = match e {
                             flume::TrySendError::Full(_) => Error::QueueFull,
                             flume::TrySendError::Disconnected(_) => {
-                                Error::Internal("mm bridge gone".into())
+                                Error::Internal("mm worker pool gone".into())
                             }
                         };
                         self.fail(&mut req, err);
@@ -309,7 +309,7 @@ impl Ingress {
         }
     }
 
-    /// The Python MM bridge finished a parked request: fill the final expanded
+    /// An MM worker finished a parked request: fill the final expanded
     /// `input_ids`, advance `Encoding → Queued`, and resume driving (→ ring).
     /// No pending entry means the request was already rejected/aborted — the
     /// result is dropped (its Python-side `mm_inputs` table entry is popped by
@@ -327,7 +327,7 @@ impl Ingress {
         self.drive(req);
     }
 
-    /// The Python MM bridge failed a parked request (bad URL, processor error):
+    /// An MM worker failed a parked request (bad URL, processor error):
     /// reject it back to the client, mirroring the Python TokenizerManager's
     /// per-request exception → 400 behavior.
     fn on_mm_failed(&mut self, rid: String, message: String) {
@@ -714,17 +714,16 @@ mod tests {
         }
     }
 
-    /// A multimodal request parks in `Encoding` (submitted to the mm bridge, not
-    /// the tokenizer pool, not the ring) until `MmEncoded` resumes it → ring.
+    /// A multimodal request parks in `Encoding` (submitted to the mm worker
+    /// pool, not the tokenizer pool, not the ring) until `MmEncoded` resumes
+    /// it → ring.
     #[test]
     fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
         let (mut ingress, _detok_rx, consumer, _tm_tx, mm_rx) = make_ingress();
         ingress.drive(mm_generate_req("mm-1"));
 
-        // Submitted to the bridge with the mm payload; nothing on the ring yet.
-        let sub = mm_rx
-            .try_recv()
-            .expect("mm bridge must receive the request");
+        // Submitted to the mm pool with the mm payload; nothing on the ring yet.
+        let sub = mm_rx.try_recv().expect("mm pool must receive the request");
         assert_eq!(sub.rid, "mm-1");
         let val = rmpv::decode::read_value(&mut &sub.payload[..]).unwrap();
         let arr = val

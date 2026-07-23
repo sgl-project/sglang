@@ -2,8 +2,8 @@
 
 `run_mm_processor_for_request` is the multimodal block of
 `TokenizerManager._tokenize_one_request`, extracted verbatim so the Python
-TokenizerManager and the embedded Rust server's MM bridge
-(`sglang.srt.managers.rust_server.MmBridge`) stay behavior-identical by
+TokenizerManager and the embedded Rust server's MM path
+(`sglang.srt.managers.rust_server.MmProcessorHost`) stay behavior-identical by
 construction: both run the same model-specific `mm_processor`, the same
 input_ids/token_type_ids overrides, and the same mm_hashes / precompute-hash
 handling.

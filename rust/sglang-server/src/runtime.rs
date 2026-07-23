@@ -212,12 +212,12 @@ impl ServerArgs {
 pub struct Runtime {
     pub ingress: IngressConsumer,
     pub egress: EgressProducer,
-    /// Requests parked in `Encoding`, drained by the Python MM bridge
-    /// (`Server.recv_mm_requests`). Empty channel when the model is not
+    /// Requests parked in `Encoding`, drained by the Rust MM worker pool
+    /// (`Server.start_mm_workers`). Empty channel when the model is not
     /// multimodal (the ingress never routes to it).
     pub mm: flume::Receiver<crate::message::MmRequest>,
-    /// Back-channel for the MM bridge's results (`Server.push_mm_result` /
-    /// `push_mm_error`) into the tm-ingress loop.
+    /// Back-channel for the MM workers' results (`MmEncoded` / `MmFailed`)
+    /// into the tm-ingress loop.
     pub tm: flume::Sender<TmEvent>,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -230,6 +230,12 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    /// Adopt late-spawned worker threads (the MM pool, spawned once the Python
+    /// side has built its processor stack) into the shutdown join set.
+    pub fn adopt_threads(&self, handles: Vec<JoinHandle<()>>) {
+        self.threads.lock().unwrap().extend(handles);
+    }
+
     /// Stop the runtime and join every worker thread (with a bounded wait).
     ///
     /// Dropping `shutdown_tx` wakes the tm-ingress/tm-egress selectors (which
@@ -294,8 +300,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.channel_cap);
     let (tok_tx, tok_rx) = flume::bounded::<crate::message::Request>(cfg.channel_cap);
-    // Encoding → Python MM bridge. Bounded like the other stage edges so a slow
-    // bridge back-pressures new MM requests instead of buffering unboundedly.
+    // Encoding → MM worker pool. Bounded like the other stage edges so a slow
+    // pool back-pressures new MM requests instead of buffering unboundedly.
     let (mm_tx, mm_rx) = flume::bounded::<crate::message::MmRequest>(cfg.channel_cap);
     let mut detok_tx = Vec::with_capacity(cfg.detokenizer_worker_num);
     let mut detok_rx = Vec::with_capacity(cfg.detokenizer_worker_num);

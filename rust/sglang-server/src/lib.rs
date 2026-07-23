@@ -8,7 +8,10 @@
 //!   * `push_batch`    — Python scheduler thread pushes one output batch.
 //!   * `push_result`   — Python scheduler thread pushes one control result.
 //!
-//! All are non-blocking, so the GIL is never held across a wait.
+//! All are non-blocking, so the GIL is never held across a wait. The one
+//! deliberate exception to "stages never touch a `PyObject`" is the MM worker
+//! pool ([`mm`]): its Rust threads call the registered Python `mm_processor`
+//! handler until that pipeline is ported to native Rust.
 
 mod api_server;
 mod detokenizer;
@@ -17,6 +20,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod mm;
 mod runtime;
 mod tokenizer;
 mod tokenizer_manager;
@@ -207,81 +211,18 @@ impl Server {
         })
     }
 
-    /// Drain multimodal requests parked in the Rust `Encoding` stage for the
-    /// Python MM bridge. Blocks (GIL released) up to `timeout_ms` for the first
-    /// request, then drains up to `max` without waiting. Returns
-    /// `list[(rid, payload)]` where `payload` is the msgpack
-    /// `[text, input_ids, image_data, video_data, audio_data]` array built by
-    /// `GenerateRequest::to_mm_payload_msgpack`. Empty list on timeout/shutdown.
-    #[pyo3(signature = (max = 16, timeout_ms = 1000))]
-    fn recv_mm_requests<'py>(
-        &self,
-        py: Python<'py>,
-        max: usize,
-        timeout_ms: u64,
-    ) -> Vec<(String, Bound<'py, PyBytes>)> {
-        let batch = py.detach(|| {
-            let mut out = Vec::new();
-            match self
-                .rt
-                .mm
-                .recv_timeout(std::time::Duration::from_millis(timeout_ms))
-            {
-                Ok(first) => out.push(first),
-                Err(_) => return out, // timeout or shutdown
-            }
-            while out.len() < max.max(1) {
-                match self.rt.mm.try_recv() {
-                    Ok(m) => out.push(m),
-                    Err(_) => break,
-                }
-            }
-            out
-        });
-        batch
-            .into_iter()
-            .map(|m| (m.rid, PyBytes::new(py, &m.payload)))
-            .collect()
-    }
-
-    /// MM bridge success: resume the parked request with the final
-    /// (placeholder-expanded) prompt ids, passed as raw little-endian int64
-    /// bytes (`array("q").tobytes()`). The bridge MUST have stored the processed
-    /// `mm_inputs` object in its rid-keyed table *before* calling this — the
-    /// scheduler drains the request (and attaches that entry) strictly after.
-    /// `False` only on shutdown.
-    fn push_mm_result(&self, py: Python<'_>, rid: &str, input_ids: &[u8]) -> PyResult<bool> {
-        if !input_ids.len().is_multiple_of(8) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "input_ids must be raw little-endian int64 bytes",
-            ));
-        }
-        let ids: Vec<i32> = input_ids
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as i32)
-            .collect();
-        let rid = rid.to_string();
-        Ok(py.detach(|| {
-            self.rt
-                .tm
-                .send(crate::runtime::channels::TmEvent::MmEncoded {
-                    rid,
-                    input_ids: ids,
-                })
-                .is_ok()
-        }))
-    }
-
-    /// MM bridge failure: reject the parked request back to the client (400).
-    /// `False` only on shutdown.
-    fn push_mm_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        let (rid, message) = (rid.to_string(), message.to_string());
-        py.detach(|| {
-            self.rt
-                .tm
-                .send(crate::runtime::channels::TmEvent::MmFailed { rid, message })
-                .is_ok()
-        })
+    /// Register the Python MM handler and spawn the Rust MM worker pool. Each
+    /// worker drains one `Encoding`-parked request at a time and calls
+    /// `handler(rid, payload) -> bytes` — the msgpack
+    /// `[text, input_ids, image_data, video_data, audio_data]` payload in, the
+    /// final placeholder-expanded prompt ids (raw little-endian int64 bytes)
+    /// out; a Python exception rejects the request as a 400. `workers` bounds
+    /// MM concurrency. Call once, before serving multimodal traffic.
+    #[pyo3(signature = (handler, workers = 8))]
+    fn start_mm_workers(&self, py: Python<'_>, handler: Py<PyAny>, workers: usize) {
+        let handles =
+            mm::spawn_workers(py, self.rt.mm.clone(), self.rt.tm.clone(), handler, workers);
+        self.rt.adopt_threads(handles);
     }
 
     /// Signal all threads to stop (best effort).
