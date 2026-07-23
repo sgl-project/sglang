@@ -95,13 +95,13 @@ jobs:
               - "python/sglang/srt/observability/**"
               - "python/sglang/kernels/ops/diffusion/**"
               - "test/registered/kernels/ops/diffusion/**"
-              - "test/registered/kernels/ops/diffusion/benchmark/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
-              - "test/registered/kernels/ops/**"
+              - "test/registered/kernels/**"
               # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
               # base-b-kernel suites import it directly, so kernel edits must run them.
               - "python/sglang/kernels/**"
