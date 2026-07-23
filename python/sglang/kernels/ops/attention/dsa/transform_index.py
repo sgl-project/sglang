@@ -14,6 +14,58 @@ def transform_index_page_table_decode(**kwargs):
     return transform_index_page_table_decode_fast(**kwargs)
 
 
+@triton.jit
+def prepare_trtllm_nope_sparse_metadata_kernel(
+    page_table_ptr: torch.Tensor,
+    topk_lens_ptr: torch.Tensor,
+    row_stride: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    valid = offsets < TOPK
+    indices = tl.load(
+        page_table_ptr + row * row_stride + offsets,
+        mask=valid,
+        other=-1,
+    )
+    topk_len = tl.sum((valid & (indices >= 0)).to(tl.int32), axis=0)
+
+    # TRTLLM-GEN's native H512 dynamic sparse kernel produces NaNs for an
+    # empty row. CUDA-graph padding rows are never consumed, so point them at
+    # a valid dummy token and run a one-element attention instead.
+    is_empty = topk_len == 0
+    tl.store(page_table_ptr + row * row_stride, 0, mask=is_empty)
+    tl.store(topk_lens_ptr + row, tl.maximum(topk_len, 1))
+
+
+def prepare_trtllm_nope_sparse_metadata(
+    page_table: torch.Tensor,
+) -> torch.Tensor:
+    """Build per-query active top-k lengths for native H512 TRTLLM-GEN MLA.
+
+    ``page_table`` must contain packed valid token locations followed by ``-1``
+    padding. The tensor is only modified for fully empty CUDA-graph padding
+    rows, whose first entry is replaced with the valid dummy token location 0.
+    """
+    assert page_table.ndim == 2
+    assert page_table.dtype == torch.int32
+    assert page_table.is_contiguous()
+    num_rows, topk = page_table.shape
+    topk_lens = torch.empty(num_rows, dtype=torch.int32, device=page_table.device)
+    block_topk = triton.next_power_of_2(topk)
+    prepare_trtllm_nope_sparse_metadata_kernel[(num_rows,)](
+        page_table,
+        topk_lens,
+        page_table.stride(0),
+        TOPK=topk,
+        BLOCK_TOPK=block_topk,
+        num_warps=8,
+    )
+    return topk_lens
+
+
 def _allocate_prefill_result(
     topk_indices: torch.Tensor,
     real_num_tokens: int,

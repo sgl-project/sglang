@@ -94,6 +94,7 @@ for _mod, _fn in [
     ("dsa.triton_sparse_mla", "triton_sparse_mla_fwd"),
     ("dsa.transform_index", "transform_index_page_table_prefill"),
     ("dsa.transform_index", "transform_index_page_table_decode"),
+    ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.cp_split", "dsa_cp_round_robin_split_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
