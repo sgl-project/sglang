@@ -2081,22 +2081,31 @@ async def _send_disaggregation_warmup_requests(
     ssl_verify: Union[bool, str],
     timeout: int,
 ) -> List[int]:
+    # Fan out dp_size POSTs; each POST is a dp_size-item batch routed to
+    # one rank so every scheduler sees the pre-#30748 batch shape (fix
+    # for the DP-attention crash). ``routed_dp_rank`` must stay scalar.
     ssl_context = (
         ssl_verify
         if isinstance(ssl_verify, bool)
         else ssl.create_default_context(cafile=ssl_verify)
     )
 
+    dp_size = server_args.dp_size
+    tp_size = server_args.tp_size
+    bootstrap_rooms = [
+        (i + 1) * (2**63 // (max(dp_size, 1) + 1)) + (i % max(tp_size, 1))
+        for i in range(dp_size)
+    ]
+
     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
         json_data = {
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 8,
-                "ignore_eos": True,
-            },
-            "bootstrap_host": FAKE_BOOTSTRAP_HOST,
-            "bootstrap_room": dp_rank,
-            "input_ids": [10, 11, 12, 13],
+            "sampling_params": [
+                {"temperature": 0.0, "max_new_tokens": 8, "ignore_eos": True}
+            ]
+            * dp_size,
+            "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * dp_size,
+            "bootstrap_room": bootstrap_rooms,
+            "input_ids": [[10, 11, 12, 13]] * dp_size,
             "routed_dp_rank": dp_rank,
         }
         async with session.post(
@@ -2110,7 +2119,7 @@ async def _send_disaggregation_warmup_requests(
         headers=headers,
     ) as session:
         return await asyncio.gather(
-            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
+            *(send_request(session, dp_rank) for dp_rank in range(dp_size))
         )
 
 
