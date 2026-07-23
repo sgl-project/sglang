@@ -325,6 +325,8 @@ class MMEncoder:
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
+        self.scheduler_send_sockets = {}
+        self.scheduler_send_locks = {}
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
         # Dedicated executor for image preprocessing (resize/normalize).
         # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
@@ -1904,20 +1906,67 @@ class MMEncoder:
                 serialized_data = pickle.dumps(new_mm_data)
                 buffer = embedding_tensor.__buffer__()
 
-        # Use thread pool executor for parallel ZMQ send operations
+        _zmq_xfer_start = time.perf_counter()
+        if (
+            self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and url is not None
+        ):
+            lock = self.scheduler_send_locks.get(endpoint)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.scheduler_send_locks[endpoint] = lock
+
+            async with lock:
+                sock = self.scheduler_send_sockets.get(endpoint)
+                if sock is None:
+                    sock = self.context.socket(zmq.PUSH)
+                    config_socket(sock, zmq.PUSH)
+                    sock.setsockopt(zmq.IMMEDIATE, 1)
+                    sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
+                    sock.connect(endpoint)
+                    self.scheduler_send_sockets[endpoint] = sock
+                try:
+                    frames = (
+                        [serialized_data, buffer]
+                        if buffer is not None
+                        else [serialized_data]
+                    )
+                    tracker = await sock.send_multipart(frames, copy=False, track=True)
+                    await asyncio.to_thread(tracker.wait, self.send_timeout)
+                except Exception:
+                    if self.scheduler_send_sockets.get(endpoint) is sock:
+                        self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                    raise
+
+            if encoder_metrics_collector is not None:
+                encoder_metrics_collector.observe_transfer(
+                    time.perf_counter() - _zmq_xfer_start,
+                    backend=self.server_args.encoder_transfer_backend,
+                )
+            return
+
+        # Per-request sockets remain for zmq_to_tokenizer and legacy direct
+        # scheduler sends. Scheduler URL sends use persistent sockets above.
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
+            sock.setsockopt(zmq.IMMEDIATE, 1)
+            sock.setsockopt(zmq.SNDTIMEO, int(self.send_timeout * 1000))
             try:
                 sock.connect(endpoint)
                 if buffer is not None:
-                    sock.send_multipart([serialized_data, buffer], copy=False)
+                    tracker = sock.send_multipart(
+                        [serialized_data, buffer], copy=False, track=True
+                    )
                 else:
-                    sock.send_multipart([serialized_data], copy=False)
+                    tracker = sock.send_multipart(
+                        [serialized_data], copy=False, track=True
+                    )
+                tracker.wait(timeout=self.send_timeout)
             finally:
                 sock.close(linger=5000)
 
-        _zmq_xfer_start = time.perf_counter()
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
         if (
             encoder_metrics_collector is not None

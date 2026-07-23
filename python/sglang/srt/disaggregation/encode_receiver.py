@@ -676,6 +676,13 @@ class WaitingImageRequestStatus(IntEnum):
     TIMEOUT = -2
 
 
+def _select_mm_processor_prompt(recv_req, mm_processor):
+    """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
+    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
+        return list(recv_req.input_ids)
+    return recv_req.input_text or recv_req.input_ids
+
+
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
     """Create a unique part request ID by appending part index suffix."""
     return f"{original_req_id}_local_part_{part_idx}"
@@ -722,6 +729,8 @@ class WaitingImageRequest:
         model_type,
         host_name,
         receive_count,
+        zmq_context=None,
+        embedding_port=None,
     ):
         self.rid = rid
         self.recv_req = recv_req
@@ -734,9 +743,16 @@ class WaitingImageRequest:
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
-        self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL, host=host_name
-        )
+        self.zmq_context = zmq_context
+        if embedding_port is None:
+            if self.zmq_context is None:
+                raise ValueError("zmq_context is required for a per-request socket")
+            self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
+                self.zmq_context, zmq.PULL, host=host_name
+            )
+        else:
+            self.embedding_port = embedding_port
+            self.recv_socket = None
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
@@ -833,58 +849,71 @@ class WaitingImageRequest:
     def _try_recv_mm_data(self):
         if self.status != WaitingImageRequestStatus.PENDING:
             return
-        while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
+        if self.recv_socket is None:
+            return
+        while self.status == WaitingImageRequestStatus.PENDING:
             try:
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
-                # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
-                logger.warning(
-                    f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
-                )
-                self.error_msg = recv_obj.error_msg
-                self.error_code = recv_obj.error_code
-                self.status = WaitingImageRequestStatus.FAIL
-                self.recv_socket.close()
-                return
+            self.consume_parts(parts)
 
-            # Extract original req_id from part_req_id and drop stale payloads
-            # that may arrive on a reused ZMQ port after a prior request aborted.
-            original_req_id = extract_original_req_id(recv_obj.req_id)
-            if original_req_id != self.recv_req.rid:
-                logger.warning(
-                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-                )
-                continue
-            recv_obj.req_id = original_req_id
+    def consume_parts(self, parts):
+        if self.status != WaitingImageRequestStatus.PENDING:
+            return
 
-            buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            recv_obj.embedding = (
-                torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                .reshape(recv_obj.shape)
-                .clone()
+        recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+        if getattr(recv_obj, "error_msg", None) is not None:
+            logger.warning(
+                f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
             )
+            self.error_msg = recv_obj.error_msg
+            self.error_code = recv_obj.error_code
+            self.status = WaitingImageRequestStatus.FAIL
+            self.close_recv_socket()
+            return
 
-            if self.recv_embedding_data is None:
-                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj, model_type=self.model_type
-                )
-            else:
-                self.recv_embedding_data.add(recv_obj)
+        original_req_id = extract_original_req_id(recv_obj.req_id)
+        if original_req_id != self.recv_req.rid:
+            logger.warning(
+                f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                f"got rid={recv_obj.req_id}"
+            )
+            return
+        recv_obj.req_id = original_req_id
+
+        buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+        recv_obj.embedding = (
+            torch.frombuffer(buffer, dtype=recv_obj.dtype)
+            .reshape(recv_obj.shape)
+            .clone()
+        )
+
+        if self.recv_embedding_data is None:
+            self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
+                recv_obj, model_type=self.model_type
+            )
+        else:
+            self.recv_embedding_data.add(recv_obj)
+
+        if not self.recv_embedding_data.ready:
+            return
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
+            _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
-        self.recv_socket.close()
+        self.close_recv_socket()
+
+    def close_recv_socket(self):
+        if self.recv_socket is not None:
+            self.recv_socket.close()
+            self.recv_socket = None
 
     def _cleanup_gpu_buffer(self):
         pass
@@ -946,11 +975,13 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         encoder_urls,
         host_name,
         receive_count,
+        zmq_context,
         embeddings_engine,
         dtype,
         gpu_id=0,
         model_type: Optional[str] = None,
         embedding_pool=None,
+        embedding_port=None,
     ):
         super().__init__(
             rid=rid,
@@ -960,6 +991,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             model_type=model_type,
             host_name=host_name,
             receive_count=receive_count,
+            zmq_context=zmq_context,
+            embedding_port=embedding_port,
         )
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
@@ -1221,7 +1254,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         else:
             recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
+            _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
@@ -1476,6 +1509,10 @@ class MMReceiverBase(ABC):
         encode_urls: Optional[List[str]] = None,
     ):
         self.context = zmq.asyncio.Context(20)
+        # Scheduler-side receive is polled synchronously. Keep one regular ZMQ
+        # context alive for the process instead of creating a temporary context
+        # whose destruction also closes its per-request socket.
+        self.scheduler_context = zmq.Context()
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
         # (tokenizer manager process), it grows / shrinks in place as encoders
@@ -1494,6 +1531,24 @@ class MMReceiverBase(ABC):
         self.nnodes = server_args.nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingImageRequest] = []
+        self.waiting_by_rid: Dict[str, WaitingImageRequest] = {}
+        self.scheduler_embedding_port = None
+        self.scheduler_recv_socket = None
+        if (
+            self.encoder_transfer_backend == "zmq_to_scheduler"
+            and scheduler is not None
+        ):
+            (
+                self.scheduler_embedding_port,
+                self.scheduler_recv_socket,
+            ) = get_zmq_socket_on_host(
+                self.scheduler_context, zmq.PULL, host=self.hostname
+            )
+            logger.info(
+                "Scheduler TP rank %s reuses ZMQ embedding port %s",
+                self.tp_rank,
+                self.scheduler_embedding_port,
+            )
         self.scheduler = scheduler
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
 
@@ -1804,6 +1859,28 @@ class MMReceiverBase(ABC):
             obj.need_wait_for_mm_inputs = False
 
     # For zmq_to_scheduler
+    def _drain_scheduler_embeddings(self):
+        if self.scheduler_recv_socket is None:
+            return
+
+        while True:
+            try:
+                parts = self.scheduler_recv_socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+            except zmq.Again:
+                return
+
+            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            rid = extract_original_req_id(recv_obj.req_id)
+            waiting_req = self.waiting_by_rid.get(rid)
+            if waiting_req is None:
+                logger.warning(
+                    "Dropping embedding data for inactive request %s", recv_obj.req_id
+                )
+                continue
+            waiting_req.consume_parts(parts)
+
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
         for recv_req in recv_reqs:
@@ -1826,8 +1903,16 @@ class MMReceiverBase(ABC):
                     model_type=self.model_type,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    zmq_context=(
+                        None
+                        if self.scheduler_recv_socket is not None
+                        else self.scheduler_context
+                    ),
+                    embedding_port=self.scheduler_embedding_port,
                     **extra_kwargs,
                 )
+                if self.scheduler_recv_socket is not None:
+                    self.waiting_by_rid[waiting_req.rid] = waiting_req
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:
@@ -1836,14 +1921,16 @@ class MMReceiverBase(ABC):
         if len(self.waiting_list) == 0:
             return new_recv_reqs, []
 
+        self._drain_scheduler_embeddings()
         current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
-            waiting_req._try_recv_mm_data()
+            if self.scheduler_recv_socket is None:
+                waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
                 waiting_req.status = WaitingImageRequestStatus.TIMEOUT
                 waiting_req._cleanup_gpu_buffer()
-                waiting_req.recv_socket.close()
+                waiting_req.close_recv_socket()
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
@@ -1884,6 +1971,8 @@ class MMReceiverBase(ABC):
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING
                 new_waiting.append(waiting_req)
+                continue
+            self.waiting_by_rid.pop(waiting_req.rid, None)
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs

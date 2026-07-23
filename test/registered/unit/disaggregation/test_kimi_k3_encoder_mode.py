@@ -1,13 +1,24 @@
 import asyncio
+import pickle
 import sys
+import time
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 import torch
+import zmq
+import zmq.asyncio
 from PIL import Image
 
+from sglang.srt.disaggregation.encode_receiver import (
+    EmbeddingData,
+    MMReceiverHTTP,
+    WaitingImageRequest,
+    _select_mm_processor_prompt,
+)
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
@@ -128,6 +139,128 @@ def test_kimi_k3_declares_encoder_only_weight_prefixes():
         "vision_tower.",
         "mm_projector.",
     )
+
+
+def test_epd_scheduler_uses_token_ids_for_tokenized_mm_processors():
+    recv_req = SimpleNamespace(
+        input_text="unexpanded prompt", input_ids=array("q", [11, 22, 33])
+    )
+
+    prompt = _select_mm_processor_prompt(
+        recv_req, SimpleNamespace(prefer_tokenized_input=True)
+    )
+
+    assert prompt == [11, 22, 33]
+    assert isinstance(prompt, list)
+    assert (
+        _select_mm_processor_prompt(
+            recv_req, SimpleNamespace(prefer_tokenized_input=False)
+        )
+        == "unexpanded prompt"
+    )
+
+
+def test_epd_scheduler_keeps_receive_context_alive():
+    context = zmq.Context()
+    waiting_req = WaitingImageRequest(
+        rid="test-rid",
+        recv_req=SimpleNamespace(num_items_assigned={}),
+        mm_processor=None,
+        encoder_urls=[],
+        model_type="kimi_k3",
+        host_name="127.0.0.1",
+        receive_count=1,
+        zmq_context=context,
+    )
+    sender = context.socket(zmq.PUSH)
+    try:
+        assert waiting_req.zmq_context is context
+        sender.connect(f"tcp://127.0.0.1:{waiting_req.embedding_port}")
+        sender.send_multipart([b"metadata", b"embedding"])
+        assert waiting_req.recv_socket.poll(timeout=1000) & zmq.POLLIN
+        assert waiting_req.recv_socket.recv_multipart() == [
+            b"metadata",
+            b"embedding",
+        ]
+    finally:
+        sender.close(linger=0)
+        waiting_req.recv_socket.close(linger=0)
+        context.term()
+
+
+def test_epd_scheduler_routes_many_requests_over_one_receive_socket():
+    context = zmq.Context()
+    receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+    receiver.scheduler_recv_socket = context.socket(zmq.PULL)
+    port = receiver.scheduler_recv_socket.bind_to_random_port("tcp://127.0.0.1")
+    received = []
+
+    class Sink:
+        def consume_parts(self, parts):
+            received.append(pickle.loads(parts[0]).req_id)
+
+    receiver.waiting_by_rid = {f"rid-{i}": Sink() for i in range(32)}
+    sender = context.socket(zmq.PUSH)
+    try:
+        sender.connect(f"tcp://127.0.0.1:{port}")
+        for i in range(32):
+            mm_data = EmbeddingData(
+                req_id=f"rid-{i}_local_part_0",
+                num_parts=1,
+                part_idx=0,
+                grid_dim=None,
+                modality=Modality.IMAGE,
+                error_msg="probe",
+                error_code=599,
+            )
+            sender.send_multipart([pickle.dumps(mm_data)])
+
+        deadline = time.monotonic() + 2
+        while len(received) < 32 and time.monotonic() < deadline:
+            receiver._drain_scheduler_embeddings()
+            time.sleep(0.01)
+        assert received == [f"rid-{i}_local_part_0" for i in range(32)]
+    finally:
+        sender.close(linger=0)
+        receiver.scheduler_recv_socket.close(linger=0)
+        context.term()
+
+
+def test_epd_encoder_reuses_scheduler_zmq_peer():
+    async def send_twice():
+        context = zmq.asyncio.Context()
+        receiver = context.socket(zmq.PULL)
+        port = receiver.bind_to_random_port("tcp://127.0.0.1")
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.server_args = SimpleNamespace(
+            encoder_transfer_backend="zmq_to_scheduler"
+        )
+        encoder.send_timeout = 3
+        encoder.context = context
+        encoder.scheduler_send_sockets = {}
+        encoder.scheduler_send_locks = {}
+        mm_data = EmbeddingData(
+            req_id="test-rid_local_part_0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            error_msg="probe",
+            error_code=599,
+        )
+        try:
+            for _ in range(2):
+                await encoder._send(None, mm_data, url=f"127.0.0.1:{port}")
+                parts = await asyncio.wait_for(receiver.recv_multipart(), timeout=1)
+                assert pickle.loads(parts[0]).req_id == mm_data.req_id
+            assert len(encoder.scheduler_send_sockets) == 1
+        finally:
+            for socket in encoder.scheduler_send_sockets.values():
+                socket.close(linger=0)
+            receiver.close(linger=0)
+            context.term()
+
+    asyncio.run(send_twice())
 
 
 if __name__ == "__main__":
