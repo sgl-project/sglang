@@ -57,6 +57,8 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   const auto gate = load_as<vec_t>(params.input, input_offset);
   const auto up = load_as<vec_t>(params.input, input_offset + num_vecs);
 
+  PDLTriggerSecondary<kUsePDL>();
+
   const float beta = params.beta;
   const float inv_beta = params.inv_beta;
   const float linear_beta = params.linear_beta;
@@ -83,7 +85,6 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
   }
 
   store_as<vec_t>(params.out, out, output_offset);
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 // ----------------------------------------------------------------

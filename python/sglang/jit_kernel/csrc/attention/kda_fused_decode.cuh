@@ -20,8 +20,12 @@
 //     pool updates, mirroring kda_packed_decode;
 //   * tvm-ffi host wrapper (KdaFusedDecodeKernel) with TensorMatcher shape /
 //     stride / dtype validation replaces the pybind binding;
-//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD)
-
+//   * optional 1D-TMA bulk state load (SGLANG_KDA_FUSED_DECODE_TMA_LOAD),
+//     ported from the standalone KDA_decode/kda_decode_fusion_kernel.cu
+//     experiment on chunan/kda (same mbarrier staging, same 3/4-stage
+//     dispatch by grid size);
+//   * PDL (kUsePDL, plumbed like kda_packed_decode): griddepcontrol wait at
+//     kernel entry, launch_dependents at every exit.
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -398,7 +402,8 @@ template <
     bool kUseLowerBound = false,
     bool kApplyBetaSigmoid = true,
     bool kUseTmaLoad = false,
-    int kTmaStages = kNumChunks>
+    int kTmaStages = kNumChunks,
+    bool kUsePDL = false>
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
     const __nv_bfloat16* __restrict__ x_q,
     const __nv_bfloat16* __restrict__ x_k,
@@ -434,6 +439,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     int64_t onormg_row_stride,
     int64_t cs_slot_stride,
     int64_t cs_w_stride) {
+  device::PDLWaitPrimary<kUsePDL>();
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -464,6 +470,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     bos = cu_seqlens == nullptr ? i_n : cu_seqlens[i_n];
     const int eos = cu_seqlens == nullptr ? i_n + 1 : cu_seqlens[i_n + 1];
     if (eos <= bos) {
+      device::PDLTriggerSecondary<kUsePDL>();
       return;
     }
     slot = ssm_state_indices == nullptr ? i_n : ssm_state_indices[i_n];
@@ -475,6 +482,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     if (tid < kDimV) {
       out[(i_n * hv_count_pad + i_hv) * kDimV + tid] = __float2bfloat16(0.0f);
     }
+    device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -807,6 +815,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   }
   __syncthreads();
 
+  device::PDLTriggerSecondary<kUsePDL>();
+
   if constexpr (kApplyOnorm) {
     if constexpr (kAccumulateOnormSumsq) {
       if (lane == 0) {
@@ -881,7 +891,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the optional 1D-TMA state-staging path
 // (SGLANG_KDA_FUSED_DECODE_TMA_LOAD) in place of the default cp.async path.
-template <bool kUseLowerBound, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
+template <bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
     /*kUseStaticDecodeLayout=*/true,
@@ -900,8 +910,10 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     kUseLowerBound,
     /*kApplyBetaSigmoid=*/true,
     kUseTmaLoad,
-    kTmaStages>;
+    kTmaStages,
+    kUsePDL>;
 
+template <bool kUsePDL>
 struct KdaFusedDecodeKernel {
   static void
   run(const tvm::ffi::TensorView mixed_qkv,     // [B, 3*H*128] bf16, row-strided
@@ -963,7 +975,8 @@ struct KdaFusedDecodeKernel {
     const auto* mixed_ptr = static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr());
     auto* cs_ptr = static_cast<__nv_bfloat16*>(conv_states.data_ptr());
     const auto* bias_ptr = static_cast<const float*>(conv_bias.data_ptr());
-    auto kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true> : kda_fused_decode_k3_kernel<false>;
+    auto kernel =
+        use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL> : kda_fused_decode_k3_kernel<false, kUsePDL>;
     int tma_stages = 0;
     if (kda_fused_decode_use_tma_load()) {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
@@ -974,15 +987,15 @@ struct KdaFusedDecodeKernel {
       const int override_stages = kda_fused_decode_tma_stages_override();
       tma_stages = override_stages != 0 ? override_stages : (B * static_cast<int>(kH) >= 1024 ? 3 : 4);
       if (tma_stages == 2) {
-        kernel =
-            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 2> : kda_fused_decode_k3_kernel<false, true, 2>;
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 2>
+                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 2>;
       } else if (tma_stages == 3) {
-        kernel =
-            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 3> : kda_fused_decode_k3_kernel<false, true, 3>;
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 3>
+                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 3>;
       } else {
         tma_stages = 4;
-        kernel =
-            use_lower_bound ? kda_fused_decode_k3_kernel<true, true, 4> : kda_fused_decode_k3_kernel<false, true, 4>;
+        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 4>
+                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 4>;
       }
     }
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
@@ -990,7 +1003,7 @@ struct KdaFusedDecodeKernel {
     host::RuntimeDeviceCheck(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
 
-    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)(
+    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes).enable_pdl(kUsePDL)(
         kernel,
         /*x_q=*/mixed_ptr,
         /*x_k=*/mixed_ptr + kSeg,
