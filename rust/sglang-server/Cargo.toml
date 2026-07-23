@@ -48,3 +48,8 @@ tracing-appender = "0.2"
 
 # tokenizer
 dynamo-tokenizers = "1.5.1"
+
+# --- native multimodal preprocessing (pure-Rust core; no pyo3 in this graph —
+# the `python` feature would drag in a second, incompatible pyo3) ---
+sglang-mm = { path = "../sglang-mm", default-features = false }
+rayon = "1.10"

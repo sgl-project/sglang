@@ -219,6 +219,13 @@ pub struct Runtime {
     /// Back-channel for the MM workers' results (`MmEncoded` / `MmFailed`)
     /// into the tm-ingress loop.
     pub tm: flume::Sender<TmEvent>,
+    /// The loaded tokenizer, shared with the native MM path (`None` under
+    /// `skip_tokenizer_init`).
+    pub tokenizer: Option<Arc<dyn crate::tokenizer::TextTokenizer>>,
+    /// Native MM results parked between a worker's `MmEncoded` and the
+    /// scheduler drain (`Server.take_native_mm`); empty unless a native MM
+    /// pipeline is registered.
+    pub mm_native: crate::mm::NativeSidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -321,10 +328,18 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
-    // The same instance is shared by the tokenizer pool (encode) and the detok
-    // shards (decode); `None` only under `skip_tokenizer_init`.
+    // The same instance is shared by the tokenizer pool (encode), the detok
+    // shards (decode), and the native MM path; `None` only under
+    // `skip_tokenizer_init`.
     let dyn_tokenizer =
         tokenizer::load_tokenizer(cfg.tokenizer_path.as_deref(), skip_tokenizer_init)?;
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
+        .as_ref()
+        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+
+    // Sidecar for native MM results (shared: MM workers insert, the Python
+    // drain pops, tm-ingress purges late entries).
+    let mm_native: crate::mm::NativeSidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -353,10 +368,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Tokenizer pool (pinned, CPU bound) ---
     // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
     // there is none and ingress never routes to the pool, so we skip it.
-    if let Some(t) = &dyn_tokenizer {
+    if let Some(tokenizer) = &text_tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
-        let tokenizer: Arc<dyn tokenizer::TextTokenizer> =
-            Arc::new(tokenizer::DynamoTokenizer::new(t.clone()));
+        let tokenizer = tokenizer.clone();
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
@@ -406,6 +420,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let mm_enabled = cfg.server_args.model_is_multimodal();
         let mut parts = Some((tm_rx, ingress_tx, mm_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
+        let mm_native = mm_native.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx, mm_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
@@ -416,6 +431,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 cfg.server_args.model_config.vocab_size,
                 mm_enabled,
                 mm_tx,
+                mm_native.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -462,6 +478,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         egress: egress_tx,
         mm: mm_rx,
         tm: tm_tx,
+        tokenizer: text_tokenizer,
+        mm_native,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

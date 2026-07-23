@@ -53,6 +53,10 @@ pub struct Ingress {
     /// media; resumed by `MmEncoded` / `MmFailed`. Only this (single) thread
     /// touches it, so no lock.
     pending_mm: HashMap<RidHash, Request>,
+    /// Native MM results sidecar — purged here when a late result arrives for
+    /// a request that is no longer parked (it would otherwise leak: only the
+    /// scheduler drain pops entries).
+    mm_native: crate::mm::NativeSidecar,
     shutdown: flume::Receiver<()>,
 }
 
@@ -65,6 +69,7 @@ impl Ingress {
         vocab_size: Option<u64>,
         mm_enabled: bool,
         mm_tx: flume::Sender<MmRequest>,
+        mm_native: crate::mm::NativeSidecar,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -76,6 +81,7 @@ impl Ingress {
             mm_enabled,
             mm_tx,
             pending_mm: HashMap::new(),
+            mm_native,
             shutdown,
         }
     }
@@ -104,6 +110,9 @@ impl Ingress {
         if err.http_status() == 500 {
             tracing::error!(rid = id.0, error = %err, "ingress rejected request");
         }
+        // A rejected request never reaches the scheduler drain: purge any
+        // parked native MM result (no-op for the common non-mm request).
+        self.mm_native.lock().unwrap().remove(&req.rid);
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         let _ = self
@@ -318,6 +327,9 @@ impl Ingress {
         let id = RidHash::from_rid(&rid);
         let Some(mut req) = self.pending_mm.remove(&id) else {
             tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
+            // The request will never reach the scheduler drain, so its native
+            // sidecar entry (if any) must be purged here or it leaks.
+            self.mm_native.lock().unwrap().remove(&rid);
             return;
         };
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -502,6 +514,7 @@ mod tests {
             Some(1000),
             true,
             mm_tx,
+            Default::default(),
             sd_rx,
         );
         (ingress, detok_rx, consumer, tm_tx, mm_rx)
@@ -789,6 +802,7 @@ mod tests {
             None,
             false,
             mm_tx,
+            Default::default(),
             sd_rx,
         );
 

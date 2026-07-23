@@ -6,17 +6,31 @@ description = "Rust-accelerated multimodal preprocessing for SGLang"
 license = "Apache-2.0"
 
 [lib]
-name = "_core"
-crate-type = ["cdylib"]
+name = "sglang_mm"
+# cdylib: the PyO3 module (`sglang.srt.multimodal._core`).
+# rlib:   pure-Rust core linked by sglang-server's native MM path.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `python` gates every PyO3 binding. sglang-server links the pure-Rust core
+# with `default-features = false` — it pins its own (newer) pyo3, and two
+# pyo3 versions cannot share one extension module.
+default = ["python"]
+python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
-numpy = "0.23"
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+numpy = { version = "0.23", optional = true }
 rayon = "1.10"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 blake3 = "1"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Native media fetch (stage 1 of the server MM pipeline); rustls so the
+# extension never links the system OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 
 [profile.release]
 lto = true

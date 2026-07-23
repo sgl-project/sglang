@@ -1,23 +1,50 @@
 # sglang-mm
 
 Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
-resize, patchify, normalize, and content hash — all parallel and GIL-released.
+fetch, resize, patchify, normalize, and content hash — all parallel and
+GIL-released.
 
-Compiled as `sglang.srt.multimodal._core` via setuptools-rust when installing sglang.
+Built two ways:
+
+- **PyO3 extension** `sglang.srt.multimodal._core` (feature `python`, default)
+  via setuptools-rust when installing sglang — used by Python processors and
+  parity tests.
+- **Pure-Rust `rlib`** (`default-features = false`) linked by `sglang-server`'s
+  native MM worker path — no pyo3 in that dependency graph (the server pins
+  its own, newer pyo3).
 
 ## Architecture
 
 ```
 src/
-├── lib.rs                    # PyO3 module root (_core)
-├── registry.rs               # ImageProcessorSpec trait + ProcessorRegistry
+├── lib.rs                    # module root; PyO3 module (_core) feature-gated
+├── registry.rs               # ImageProcessorSpec registry (Python-facing)
+│                             # + VisionProcessor trait / native_pipeline_from_spec
+│                             #   (pure-Rust pipeline driven by sglang-server)
 ├── common/
 │   ├── mod.rs                # thread pool, image decode, SHA256 hash, base64
-│   ├── resize.rs             # PIL-exact Lanczos resize
+│   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
+│   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
+│   ├── tokens.rs             # placeholder-id expansion + per-item offsets
 │   └── transforms.rs         # reusable primitives: normalize, pad, extract_patches
 └── <model>/
-    └── mod.rs                # model-specific processor
+    └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
+
+## Native server pipeline (`VisionProcessor`)
+
+`sglang-server`'s MM workers process image-only requests for supported model
+families entirely in Rust: `common::fetch` → decode → the family's
+`VisionProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
+placeholder expansion. The Python side selects the family by passing a spec
+JSON (`{"family": "qwen_vl", ...resolved processor params}`) to
+`registry::native_pipeline_from_spec`. Anything outside a family's scope
+(video/audio, precomputed features, unknown source shapes, placeholder
+mismatches) falls back per-request to the Python `mm_processor` path.
+
+Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
+Adding one = a `VisionProcessor` impl in `src/<model>/mod.rs` plus a `family`
+arm in `native_pipeline_from_spec`.
 
 ## Python API
 

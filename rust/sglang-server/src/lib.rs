@@ -218,17 +218,75 @@ impl Server {
     /// final placeholder-expanded prompt ids (raw little-endian int64 bytes)
     /// out; a Python exception rejects the request as a 400. `workers` bounds
     /// MM concurrency. Call once, before serving multimodal traffic.
-    #[pyo3(signature = (handler, workers = 8))]
-    fn start_mm_workers(&self, py: Python<'_>, handler: Py<PyAny>, workers: usize) {
-        let handles =
-            mm::spawn_workers(py, self.rt.mm.clone(), self.rt.tm.clone(), handler, workers);
+    ///
+    /// `native_spec_json` (when the model family has a pure-Rust pipeline)
+    /// enables the native path: image-only requests are processed entirely in
+    /// Rust and their results parked for [`Server::take_native_mm`]; anything
+    /// unsupported still drives `handler`.
+    #[pyo3(signature = (handler, workers = 8, native_spec_json = None))]
+    fn start_mm_workers(
+        &self,
+        py: Python<'_>,
+        handler: Py<PyAny>,
+        workers: usize,
+        native_spec_json: Option<&str>,
+    ) -> PyResult<()> {
+        let native = native_spec_json
+            .map(|spec| {
+                mm::NativeContext::new(spec, self.rt.tokenizer.clone(), self.rt.mm_native.clone())
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        let handles = mm::spawn_workers(
+            py,
+            self.rt.mm.clone(),
+            self.rt.tm.clone(),
+            handler,
+            workers,
+            native,
+        );
         self.rt.adopt_threads(handles);
+        Ok(())
+    }
+
+    /// Pop the native MM result for `rid` (stored strictly before the request
+    /// was pushed to the ingress ring). Returns
+    /// `(features_f32_bytes, grids, offsets, mrope_i64_bytes, mrope_delta)`
+    /// or `None` when the request took the Python path. Called by
+    /// `RustServer.drain` under the GIL — the buffers are wrapped zero-copy
+    /// into tensors there; no processing happens Python-side.
+    fn take_native_mm<'py>(
+        &self,
+        py: Python<'py>,
+        rid: &str,
+    ) -> Option<(
+        Bound<'py, PyBytes>,
+        Vec<(u32, u32, u32)>,
+        Vec<(u32, u32)>,
+        Bound<'py, PyBytes>,
+        i64,
+    )> {
+        let res = self.rt.mm_native.lock().unwrap().remove(rid)?;
+        // f32/i64 → native-endian byte views (numpy `frombuffer` reads the
+        // same layout on the Python side).
+        let features = PyBytes::new(py, cast_bytes(&res.features));
+        let mrope = PyBytes::new(py, cast_bytes(&res.mrope));
+        let grids = res.grids.iter().map(|g| (g[0], g[1], g[2])).collect();
+        Some((features, grids, res.offsets, mrope, res.mrope_delta))
     }
 
     /// Signal all threads to stop (best effort).
     fn shutdown(&self) {
         self.rt.request_shutdown();
     }
+}
+
+/// Reinterpret a plain-old-data slice as its raw bytes (native endianness).
+fn cast_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // Safety: `T` is a primitive numeric here (f32/i64) — no padding, any
+    // byte pattern valid, alignment only decreases.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// Keeps the non-blocking log writer's background thread alive for the process
