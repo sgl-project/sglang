@@ -78,7 +78,50 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # Cache the constant per-(row-map, batch, T) verify scatter indices
         # (ssm_state_indices), which never change across verify calls.
         self._verify_idx_cache: dict = {}
+        # State pools whose stride layout has been validated against the
+        # recurrent_kda contract (per-layer views are pool-stable, so id() is
+        # a stable key — same lifetime argument as _gate_cache).
+        self._state_contract_ok: set = set()
         logger.info("Using FlashInfer KDA kernel")
+
+    def _check_state_stride_contract(self, ssm_states: torch.Tensor) -> None:
+        """One-time (per pool view) check that ``ssm_states`` matches the
+        layout ``recurrent_kda`` was compiled for.
+
+        The kernel's state argument is a CuTe fake tensor of shape
+        ``[N, HV, V, K]`` with stride ``(sym_int64(divisibility=16), V*K, K, 1)``
+        and ``assumed_align=32`` (flashinfer ``kda_kernels/recurrent_kda.py``):
+        the slot stride is free — which is what lets the envelope-strided pools
+        (unified memory / page-major layout, slot stride = per-slot envelope
+        pitch) be passed in and updated IN PLACE on the cu_seqlens path — but
+        the inner strides are compiled-in constants and the divisibility /
+        alignment are hard assumptions. A pool violating them would mis-address
+        state in-kernel without any error; fail loudly here instead.
+        """
+        key = id(ssm_states)
+        if key in self._state_contract_ok:
+            return
+        if ssm_states.dim() != 4:
+            raise ValueError(
+                f"recurrent_kda needs a [N, HV, V, K] state pool; got "
+                f"shape {tuple(ssm_states.shape)}"
+            )
+        _, hv, v, k = ssm_states.shape
+        if ssm_states.stride()[1:] != (v * k, k, 1):
+            raise ValueError(
+                "recurrent_kda state inner strides must be compact "
+                f"(V*K, K, 1)=({v * k}, {k}, 1); got {ssm_states.stride()[1:]} "
+                "(only the slot stride may be non-compact)"
+            )
+        base_bytes = ssm_states.storage_offset() * ssm_states.element_size()
+        if ssm_states.stride(0) % 16 != 0 or base_bytes % 32 != 0:
+            raise ValueError(
+                "recurrent_kda state pool breaks the compiled stride contract: "
+                f"slot stride {ssm_states.stride(0)} elements must be a multiple "
+                f"of 16 and the base byte offset {base_bytes} a multiple of 32 "
+                "(sym_int64(divisibility=16) / assumed_align=32)"
+            )
+        self._state_contract_ok.add(key)
 
     # ---- gate / beta normalization (shared by decode + verify) ----
 
@@ -126,6 +169,11 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         head_k_dim = q.shape[3]
         num_v_heads = v.shape[2]
         head_v_dim = v.shape[3]
+
+        # The committed pool goes into the kernel as-is (in-place update); under
+        # unified memory / page-major it is an envelope-strided view, which the
+        # cu_seqlens path supports — verify the compiled contract once per pool.
+        self._check_state_stride_contract(ssm_states)
 
         # Pack each request as a length-1 sequence ([1, B, ...] + cu_seqlens) so
         # recurrent_kda indexes the committed pool IN-KERNEL via ssm_state_indices.

@@ -64,8 +64,9 @@ def covered(
     onorm_g: torch.Tensor,
 ) -> bool:
     """The kernel is compiled for the K3 KDA decode regime: 12 heads of 128,
-    packed [T, 4608] qkv rows, transposed [slots, 3, 4608] conv pool, dense
-    fp32 [slots, 12, 128, 128] ssm pool, one token per request."""
+    packed [T, 4608] qkv rows, transposed [slots, 3, 4608] conv pool, fp32
+    [slots, 12, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
+    kernel reads the real slot stride), one token per request."""
     if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != _CONV_DIM:
         return False
     HV, V, K = ssm_states.shape[-3:]
@@ -93,7 +94,15 @@ def covered(
         and b.stride(-1) == 1
         and onorm_g.stride(-1) == 1
         and conv_states.stride(-1) == 1
-        and ssm_states.view(-1, HV, V, K).is_contiguous()
+        # Inner [HV, V, K] must be contiguous (the kernel float4-loads V*K
+        # chunks); the slot pitch (stride(-4)) is arbitrary — a locally
+        # allocated pool packs it at HV*V*K, the unified / page-major pools at
+        # the multi-layer envelope. The kernel reads ssm_states.stride(0), so
+        # any slot pitch is fine. (Do NOT use .view(-1, HV, V, K): that fails /
+        # copies on an envelope-strided view.)
+        and ssm_states.stride(-1) == 1
+        and ssm_states.stride(-2) == K
+        and ssm_states.stride(-3) == V * K
         and cache_indices.is_contiguous()
     )
 
@@ -137,7 +146,12 @@ def kda_fused_decode(
         dt_bias,
         onorm_g,
         onorm_weight,
-        ssm_states.view(-1, _H, 128, 128),
+        # Pass the pool view as-is (already [slots, HV, V, K]); the kernel
+        # binding reads its real slot stride via state.stride(0). A
+        # .view(-1, _H, 128, 128) here would break on envelope-strided pools
+        # (unified / page-major) — the reshape can't fold a non-dense slot
+        # pitch and would raise / silently copy.
+        ssm_states,
         cache_indices,
         out,
         float(scale),

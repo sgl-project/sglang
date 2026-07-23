@@ -14,6 +14,11 @@
 //   * conv state addressed through cs_slot_stride/cs_w_stride so the kernel
 //     updates the packed [slots, width, conv_dim] mamba pool in place
 //     (the pool is natively transposed on this branch);
+//   * ssm/temporal state addressed through state_slot_stride (state.stride(0))
+//     so the kernel reads/writes envelope-strided [slots, HV, V, K] pools in
+//     place: the unified / page-major layouts pitch one slot across ALL layers
+//     (56,171,520 B on K3), NOT the dense HV*V*K pitch. int64 slot*stride math
+//     avoids the envelope-pitch overflow (the exact chunk_delta_h bug pattern);
 //   * the static-decode-layout path honors ssm_state_indices (the shipped
 //     config hardwired slot = blockIdx.x, valid only for dense benches);
 //   * padded cuda-graph slots (index < 0) zero the output row and skip all
@@ -125,43 +130,48 @@ __device__ __forceinline__ void cp_async_wait_oldest(int outstanding_groups) {
 }
 
 template <int kStageChunkV>
-__device__ __forceinline__ void
-cp_async_state_chunk_stage(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk, int stage) {
+__device__ __forceinline__ void cp_async_state_chunk_stage(
+    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage) {
   constexpr int kFloat4PerChunk = kStageChunkV * kDimK / 4;
   const int tid = threadIdx.x;
   const int v_base = chunk * kStageChunkV;
+  // Slot stride is the (possibly envelope) pitch supplied by the host, not
+  // HV*V*K; the intra-slot offset i_hv*V*K + ... stays contiguous. int64
+  // because slot*state_slot_stride overflows int32 on strided pools.
+  const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
   for (int linear4 = tid; linear4 < kFloat4PerChunk; linear4 += kThreads) {
     const int elem = linear4 * 4;
     const int row = elem / kDimK;
     const int k = elem - row * kDimK;
     float* dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
-    const float* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+    const float* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
     cp_async_cg_16b(dst, src);
   }
   cp_async_commit();
 }
 
 template <int kCopyThreads>
-__device__ __forceinline__ void
-cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk) {
+__device__ __forceinline__ void cp_async_state_chunk_for(
+    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
   const int tid = threadIdx.x;
   const int stage = chunk & 1;
   const int v_base = chunk * kChunkV;
+  const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
   for (int linear4 = tid; linear4 < kFloat4PerChunk; linear4 += kCopyThreads) {
     const int elem = linear4 * 4;
     const int row = elem / kDimK;
     const int k = elem - row * kDimK;
     float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
-    const float* src = state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
+    const float* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
     cp_async_cg_16b(dst, src);
   }
   cp_async_commit();
 }
 
-__device__ __forceinline__ void
-cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int HV, int chunk) {
-  cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, HV, chunk);
+__device__ __forceinline__ void cp_async_state_chunk(
+    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+  cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -216,10 +226,15 @@ __device__ __forceinline__ void tma_load_1d(float* smem_dst, const float* gmem_s
 
 template <int kStageChunkV>
 __device__ __forceinline__ void tma_state_chunk_stage(
-    float* s_state, const float* state, int slot, int i_hv, int HV, int chunk, int stage, uint64_t* bar) {
+    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage,
+    uint64_t* bar) {
   constexpr uint32_t kBytes = kStageChunkV * kDimK * sizeof(float);
   float* dst = s_state + stage * kStageChunkV * kDimK;
-  const float* src = state + ((slot * HV + i_hv) * kDimV + chunk * kStageChunkV) * kDimK;
+  // 16B-aligned for any slot iff state_slot_stride*sizeof(float) % 16 == 0
+  // (host gates TMA off otherwise); the intra-slot chunk offset is a multiple
+  // of kStageChunkV*kDimK*4, always 16B-aligned.
+  const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
+  const float* src = state + slot_base + ((i_hv * kDimV + chunk * kStageChunkV) * kDimK);
   tma_load_1d(dst, src, bar, kBytes);
 }
 
@@ -438,7 +453,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     int64_t beta_row_stride,
     int64_t onormg_row_stride,
     int64_t cs_slot_stride,
-    int64_t cs_w_stride) {
+    int64_t cs_w_stride,
+    int64_t state_slot_stride) {
   device::PDLWaitPrimary<kUsePDL>();
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -519,13 +535,13 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       for (int c = 0; c < kTmaStages; ++c) {
         mbarrier_init_one(&s_tma_bar[c]);
       }
-      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 0, 0, &s_tma_bar[0]);
+      tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, state_slot_stride, 0, 0, &s_tma_bar[0]);
       if (kTmaStages > 1 && kNumChunks > 1) {
-        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, hv_count, 1, 1, &s_tma_bar[1]);
+        tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, state_slot_stride, 1, 1, &s_tma_bar[1]);
       }
     }
   } else {
-    cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, 0);
+    cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 0);
   }
 
   if constexpr (kUpdateConvState) {
@@ -673,7 +689,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   __syncthreads();
 
   if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk && kNumChunks > 1) {
-    cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, 1);
+    cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, 1);
   }
 
   const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
@@ -704,7 +720,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     if constexpr (kUseTmaLoad) {
       if (tid == 0 && chunk + 2 < kNumChunks && chunk + 2 < kTmaStages) {
         tma_state_chunk_stage<kChunkV>(
-            s_state, state, slot, i_hv, hv_count, chunk + 2, chunk + 2, &s_tma_bar[chunk + 2]);
+            s_state, state, slot, i_hv, state_slot_stride, chunk + 2, chunk + 2, &s_tma_bar[chunk + 2]);
       }
       mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages], (chunk / kTmaStages) & 1);
     } else if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
@@ -722,7 +738,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
     if constexpr (!kUseTmaLoad && !kPrefetchNextStateChunk) {
       if (chunk + 1 < kNumChunks) {
-        cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, chunk + 1);
+        cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 1);
       }
     }
 
@@ -758,8 +774,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       float dot_hq_a = 0.0f;
       float dot_hq_b = 0.0f;
-      const int state_idx_a = ((slot * hv_count + i_hv) * kDimV + v0) * kDimK + k_base;
-      const int state_idx_b = ((slot * hv_count + i_hv) * kDimV + v1) * kDimK + k_base;
+      // Writeback mirrors the load addressing: slot pitch from the host stride
+      // (int64, envelope-safe), intra-slot offset i_hv*V*K + v*K + k contiguous.
+      const int64_t slot_base_wb = static_cast<int64_t>(slot) * state_slot_stride;
+      const int64_t state_idx_a = slot_base_wb + ((i_hv * kDimV + v0) * kDimK + k_base);
+      const int64_t state_idx_b = slot_base_wb + ((i_hv * kDimV + v1) * kDimK + k_base);
       const float h_a_0 = h_a_vals[0] + r_k[0] * v_new0;
       const float h_a_1 = h_a_vals[1] + r_k[1] * v_new0;
       const float h_a_2 = h_a_vals[2] + r_k[2] * v_new0;
@@ -801,7 +820,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
               state,
               slot,
               i_hv,
-              hv_count,
+              state_slot_stride,
               chunk + kTmaStages,
               chunk % kTmaStages,
               &s_tma_bar[chunk % kTmaStages]);
@@ -809,7 +828,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       }
     } else if constexpr (!kUseTmaLoad && kPrefetchNextStateChunk) {
       if (chunk + 2 < kNumChunks) {
-        cp_async_state_chunk(s_state, state, slot, i_hv, hv_count, chunk + 2);
+        cp_async_state_chunk(s_state, state, slot, i_hv, state_slot_stride, chunk + 2);
       }
     }
   }
@@ -928,7 +947,7 @@ struct KdaFusedDecodeKernel {
       const tvm::ffi::TensorView dt_bias,       // [H*128] fp32
       const tvm::ffi::TensorView onorm_g,       // [B, H*128] bf16, row-strided
       const tvm::ffi::TensorView onorm_weight,  // [128] fp32
-      const tvm::ffi::TensorView state,         // [slots, H, 128, 128] fp32 dense
+      const tvm::ffi::TensorView state,         // [slots, H, 128, 128] fp32; inner-contiguous, any slot pitch
       const tvm::ffi::TensorView indices,       // [B] int32 (< 0 = padded slot)
       const tvm::ffi::TensorView out,           // [B, H*128] bf16 dense
       double scale,
@@ -961,10 +980,15 @@ struct KdaFusedDecodeKernel {
     TensorMatcher({kSeg}).with_dtype<fp32_t>().with_device(device).with_strides({1}).verify(dt_bias);
     TensorMatcher({B_, kSeg}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(onorm_g);
     TensorMatcher({128}).with_dtype<fp32_t>().with_device(device).with_strides({1}).verify(onorm_weight);
+    // Slot stride (dim 0) is a wildcard: a locally-allocated pool pitches a
+    // slot at the dense kH*128*128, but the unified / page-major pools pitch it
+    // at the multi-layer envelope (56M elems on K3). The kernel reads the real
+    // slot pitch from state.stride(0); only the inner [HV, V, K] contiguity
+    // (strides {V*K, K, 1}) is load-bearing here.
     TensorMatcher({Slots_, kH, 128, 128})
         .with_dtype<fp32_t>()
         .with_device(device)
-        .with_strides({kH * 128 * 128, 128 * 128, 128, 1})
+        .with_strides({-1, 128 * 128, 128, 1})
         .verify(state);
     TensorMatcher({B_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(indices);
     TensorMatcher({B_, kSeg}).with_dtype<bf16_t>().with_device(device).with_strides({kSeg, 1}).verify(out);
@@ -975,10 +999,23 @@ struct KdaFusedDecodeKernel {
     const auto* mixed_ptr = static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr());
     auto* cs_ptr = static_cast<__nv_bfloat16*>(conv_states.data_ptr());
     const auto* bias_ptr = static_cast<const float*>(conv_bias.data_ptr());
+    // Real per-slot pitch of the ssm/temporal pool (elements): dense kH*128*128
+    // for a local pool, the multi-layer envelope for the unified / page-major
+    // pools. Threaded into every ssm-state read/write; int64 avoids the
+    // envelope-pitch overflow.
+    const int64_t state_slot_stride = state.stride(0);
     auto kernel =
         use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL> : kda_fused_decode_k3_kernel<false, kUsePDL>;
     int tma_stages = 0;
-    if (kda_fused_decode_use_tma_load()) {
+    // TMA 1D-bulk needs the per-slot source address (state + slot*stride) 16B
+    // aligned for every slot. state.data_ptr() is torch-aligned and each chunk
+    // offset is a multiple of kChunkV*kDimK*4 B, so alignment holds iff the slot
+    // pitch itself is 16B-aligned, i.e. state_slot_stride % 4 == 0 (fp32). The
+    // K3 envelope pitch (14,042,880 elems, %4==0) and the dense pitch both
+    // satisfy this; a pathological stride falls back to cp.async (still fully
+    // fused, just no TMA) rather than silently mis-addressing the descriptor.
+    const bool tma_slot_stride_aligned = (state_slot_stride % 4) == 0;
+    if (kda_fused_decode_use_tma_load() && tma_slot_stride_aligned) {
       // Full-state staging (4 stages, 64KB, sync-free) wins while the grid
       // is small enough that occupancy isn't the limiter; past that the
       // 48KB 3-stage variant (one sync for the single stage reuse) benches
@@ -1038,7 +1075,8 @@ struct KdaFusedDecodeKernel {
         b.stride(0),
         onorm_g.stride(0),
         conv_states.stride(0),
-        conv_states.stride(1));
+        conv_states.stride(1),
+        state_slot_stride);
   }
 };
 

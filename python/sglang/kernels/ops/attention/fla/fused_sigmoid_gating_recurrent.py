@@ -20,6 +20,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    stride_h0_source,
     cu_seqlens,
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
@@ -108,11 +109,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        # Slot stride comes from the caller (h0_source.stride(0)): the state pool
+        # may be an envelope-strided view (page-major / unified memory), where the
+        # per-slot pitch spans ALL layers' state, not HV*K*V. int64: envelope
+        # pitches overflow an int32 index product.
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_source
                 + i_hv * K * V
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -132,10 +137,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             retrieve_parent_token_base, mask=mask_retrieve, other=0
         )
 
-    # Prepare intermediate state cache index if enabled
+    # Prepare intermediate state cache index if enabled. int64: the buffer is
+    # contiguous but `cache_idx * cache_steps * HV * K * V` can exceed int32 for
+    # large slot counts.
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
@@ -290,11 +297,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_indices + i_n).to(tl.int64)
             if idx >= 0:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + idx * stride_h0_source
                     + i_hv * K * V
                     + o_v[None, :] * K
                     + o_k[:, None]
@@ -418,6 +425,11 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        # Envelope-strided state pools (page-major / unified memory) have a
+        # per-slot pitch != HV*K*V; contiguous pools pass exactly HV*K*V.
+        stride_h0_source=(
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
