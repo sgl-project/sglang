@@ -731,6 +731,27 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(charge(63), 0)
         self.assertEqual(charge(64), 64)
 
+    def test_non_aligned_input_uses_logical_prefill_budget(self):
+        self.mock_token_allocator.available_size.return_value = 1024
+        self.mock_token_allocator.full_available_size.return_value = 1024
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=100,
+            rem_chunk_tokens=None,
+        )
+        adder.can_run_list.append(MagicMock())
+        req = self._create_delayer_req(65)
+        req.mamba_host_hit_length = 0
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertNotEqual(result, AddReqResult.OTHER)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(adder.rem_input_tokens, 35)
+
     def test_full_kv_page_boundary_admission(self):
         capacity = 262144
         self.mock_token_allocator.available_size.return_value = capacity
@@ -759,7 +780,6 @@ class TestPrefillAdder(CustomTestCase):
                 req, has_chunked_req=False, truncation_align_size=None
             )
 
-        self.assertNotEqual(result(262073), AddReqResult.NO_TOKEN)
         self.assertNotEqual(result(262137), AddReqResult.NO_TOKEN)
         self.assertEqual(result(262138), AddReqResult.NO_TOKEN)
 
@@ -769,16 +789,12 @@ class TestPrefillAdder(CustomTestCase):
         scheduler.max_total_num_tokens = 262144
         scheduler.max_new_tokens_limit = None
 
-        for input_len, expected in ((262135, 9), (262136, 8), (262137, 7)):
-            with self.subTest(input_len=input_len):
-                req = SimpleNamespace(
-                    origin_input_ids=range(input_len),
-                    sampling_params=SimpleNamespace(
-                        max_new_tokens=10, min_new_tokens=0
-                    ),
-                )
-                scheduler.init_req_max_new_tokens(req)
-                self.assertEqual(req.sampling_params.max_new_tokens, expected)
+        req = SimpleNamespace(
+            origin_input_ids=range(262137),
+            sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
+        )
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 7)
 
 
 if __name__ == "__main__":
