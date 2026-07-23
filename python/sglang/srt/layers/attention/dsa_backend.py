@@ -126,11 +126,11 @@ except Exception:
 _DSA_TRITON_FP8_DECODE = os.environ.get("SGLANG_DSA_TRITON_FP8_DECODE", "0") == "1"
 
 if _is_hip:
-    from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
+    from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.srt.layers.attention.dsa.triton_sparse_mla_decode import (
         triton_sparse_mla_decode_fp8,
     )
-    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     try:
         from aiter import (  # noqa: F401
