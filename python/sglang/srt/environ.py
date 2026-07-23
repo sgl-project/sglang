@@ -943,7 +943,6 @@ class Envs:
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
-    SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
     # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA
     # serving enables this layout independently of the flag.
     SGLANG_OPT_LINEARIZED_SHARED_SINK = EnvBool(True)

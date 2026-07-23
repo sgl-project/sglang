@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -8,19 +7,65 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
-        # A/B debug escape hatch: route through the pip flash-attn-4 package
-        # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
-        from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-    else:
-        from sglang.kernels.ops.attention.flash_attn.cute import (
-            flash_attn_varlen_func as _flash_attn_varlen_func,
-        )
+    from flash_attn.cute import flash_attn_varlen_func as _pip_flash_attn_varlen_func
 except Exception as _e:  # pragma: no cover
-    _flash_attn_varlen_func = None
-    _flash_attn_import_error = _e
+    _pip_flash_attn_varlen_func = None
+    _pip_flash_attn_import_error = _e
 else:
-    _flash_attn_import_error = None
+    _pip_flash_attn_import_error = None
+
+try:
+    from sglang.kernels.ops.attention.flash_attn.cute import (
+        flash_attn_varlen_func as _inkling_flash_attn_varlen_func,
+    )
+except Exception as _e:  # pragma: no cover
+    _inkling_flash_attn_varlen_func = None
+    _inkling_flash_attn_import_error = _e
+else:
+    _inkling_flash_attn_import_error = None
+
+
+def _select_flash_attn_varlen_func(
+    *,
+    has_zero_length: bool,
+    rel_bias: Optional[torch.Tensor],
+    rel_bias_prep_cache: Optional[dict],
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
+    sfq: Optional[torch.Tensor],
+    sfk: Optional[torch.Tensor],
+    sfv: Optional[torch.Tensor],
+):
+    """Select pip FA4 unless the call needs the in-tree implementation."""
+    needs_vendored_impl = has_zero_length or any(
+        value is not None
+        for value in (
+            rel_bias,
+            rel_bias_prep_cache,
+            q_descale,
+            k_descale,
+            v_descale,
+            sfq,
+            sfk,
+            sfv,
+        )
+    )
+
+    if needs_vendored_impl:
+        if _inkling_flash_attn_varlen_func is None:  # pragma: no cover
+            raise ImportError(
+                "The vendored FA4 implementation is not available, but this call "
+                "has a zero-length input or uses rel_bias, FP8 descales, or MXFP8 "
+                "block scales."
+            ) from _inkling_flash_attn_import_error
+        return _inkling_flash_attn_varlen_func
+
+    if _pip_flash_attn_varlen_func is None:  # pragma: no cover
+        raise ImportError(
+            "The pip flash-attn-4 package is required for standard FA4 calls."
+        ) from _pip_flash_attn_import_error
+    return _pip_flash_attn_varlen_func
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -68,13 +113,6 @@ def flash_attn_varlen_func(
     return_softmax_lse: bool = False,
     **_: object,
 ):
-    if _flash_attn_varlen_func is None:  # pragma: no cover
-        raise ImportError(
-            "FlashAttention-4 CUTE is not available. Install flash-attn-4 with "
-            "its CUDA/CUTE dependencies, or run from a source tree where the "
-            "vendored FA4 package is importable."
-        ) from _flash_attn_import_error
-
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
     cu_seqlens_q, cu_seqlens_k = [
         _maybe_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k)
@@ -114,7 +152,26 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
-    result = _flash_attn_varlen_func(
+    flash_attn_impl = _select_flash_attn_varlen_func(
+        # TODO(mmangkad): Remove this fallback once SGLang picks up
+        # flash-attn-4 4.0.0b20 or newer. Version 4.0.0b19 returns the wrong
+        # arity from its zero-work fast path; the vendored version preserves
+        # the established empty output/LSE behavior.
+        has_zero_length=q.numel() == 0 or v.numel() == 0,
+        rel_bias=rel_bias,
+        rel_bias_prep_cache=rel_bias_prep_cache,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sfq=sfq,
+        sfk=sfk,
+        sfv=sfv,
+    )
+    if flash_attn_impl is _pip_flash_attn_varlen_func and num_splits == 0:
+        # Preserve the previous pip FA4 behavior. Its automatic SplitKV path
+        # can select a configuration that is unsupported on SM90.
+        num_splits = 1
+    result = flash_attn_impl(
         q=q,
         k=k,
         v=v,
