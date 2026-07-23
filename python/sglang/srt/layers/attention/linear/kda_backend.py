@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBack
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
+    build_verify_intermediate_state_indices,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
     get_linear_attn_verify_backend,
@@ -359,9 +360,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             decode_backend, prefill_backend, verify_backend
         )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
-        # used by the MTP / target_verify path (mirrors GDNAttnBackend).
-        self.verify_intermediate_state_indices = torch.arange(
-            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
+        # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+        self.verify_intermediate_state_indices = (
+            build_verify_intermediate_state_indices(
+                self.req_to_token_pool.size,
+                model_runner.server_args,
+                model_runner.device,
+            )
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
