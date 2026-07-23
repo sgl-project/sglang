@@ -9,6 +9,54 @@ reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
 ---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: minwm-spmatrix-atl2-spot
+spec:
+  disruption:
+    budgets:
+      - nodes: 100%
+    consolidateAfter: 10m
+    consolidationPolicy: WhenEmpty
+  limits:
+    cpu: "384"
+  template:
+    metadata:
+      labels:
+        seedleap.ai/capacity-pool: minwm-spmatrix-atl2-karpenter
+    spec:
+      expireAfter: 8h
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: minwm-test-atl2
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - p5.48xlarge
+            - p5en.48xlarge
+            - p6-b200.48xlarge
+            - p6-b300.48xlarge
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - us-east-1-atl-2a
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+      taints:
+        - effect: NoSchedule
+          key: seedleap.ai/capacity-pool
+          value: minwm-spmatrix-atl2-karpenter
+      terminationGracePeriod: 10m
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -69,12 +117,12 @@ spec:
       tolerations:
         - key: seedleap.ai/capacity-pool
           operator: Equal
-          value: minwm-test-atl2-karpenter
+          value: minwm-spmatrix-atl2-karpenter
           effect: NoSchedule
       nodeSelector:
         karpenter.sh/capacity-type: spot
-        karpenter.sh/nodepool: minwm-test-atl2-p6-spot
-        seedleap.ai/capacity-pool: minwm-test-atl2-karpenter
+        karpenter.sh/nodepool: minwm-spmatrix-atl2-spot
+        seedleap.ai/capacity-pool: minwm-spmatrix-atl2-karpenter
         topology.kubernetes.io/zone: us-east-1-atl-2a
       containers:
         - name: benchmark
