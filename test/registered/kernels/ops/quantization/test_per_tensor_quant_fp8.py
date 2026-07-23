@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
     per_tensor_quant_fp8,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

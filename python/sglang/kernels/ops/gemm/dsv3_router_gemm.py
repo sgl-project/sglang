@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dsv3_router_gemm_module(
+def dsv3_router_gemm_module(
     num_experts: int,
     hidden_dim: int,
     use_pdl: bool,
@@ -54,7 +54,7 @@ def _dsv3_router_gemm_custom_op(
     num_experts = router_weights.shape[0]
     hidden_dim = hidden_states.shape[1]
     out_float = output.dtype == torch.float32
-    module = _jit_dsv3_router_gemm_module(
+    module = dsv3_router_gemm_module(
         num_experts, hidden_dim, is_arch_support_pdl(), out_float
     )
     module.dsv3_router_gemm(hidden_states, router_weights, output)

@@ -213,8 +213,8 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm._jit_dsv3_router_gemm import (
-        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
+        dsv3_router_gemm as dsv3_router_gemm,
     )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
@@ -512,7 +512,7 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                logits = _jit_dsv3_router_gemm(
+                logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 

@@ -56,7 +56,7 @@ _is_musa = is_musa()
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sglang.kernels.ops.activation._jit_activation import (
+    from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _legacy_silu_and_mul,
     )
 elif _is_musa:

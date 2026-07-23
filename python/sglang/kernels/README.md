@@ -25,9 +25,9 @@ sglang/kernels/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
-`diffusion`, `embeddings`, `gemm`, `grammar`, `kv_canary`, `kvcache`,
-`layernorm`, `lplb`, `mamba`, `memory`, `model`, `moe`, `quantization`,
-`sampling`, `spatial`, `speculative`.
+`diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
+`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
+`sampling`, `speculative`.
 
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`

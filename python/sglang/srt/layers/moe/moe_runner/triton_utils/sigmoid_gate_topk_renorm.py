@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.model.inkling.inkling_gate_topk_renorm import (
+from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_topk_renorm_v2,
 )
 from sglang.srt.environ import envs

@@ -7,7 +7,7 @@ must be untouched by tau.
 import pytest
 import torch
 
-from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+from sglang.kernels.ops.attention.inkling_attn_prologue import (
     inkling_attn_prologue_decode,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

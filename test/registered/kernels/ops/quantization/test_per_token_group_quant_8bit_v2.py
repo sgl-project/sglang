@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
+from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

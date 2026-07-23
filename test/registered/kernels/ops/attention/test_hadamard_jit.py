@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from scipy.linalg import hadamard
 
-from sglang.kernels.ops.attention.hadamard import (
+from sglang.kernels.ops.quantization.hadamard import (
     hadamard_transform,
     hadamard_transform_12n,
     hadamard_transform_20n,

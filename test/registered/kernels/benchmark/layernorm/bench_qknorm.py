@@ -2,7 +2,7 @@ import torch
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.ops.layernorm._jit_norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
 from sglang.test.ci.ci_register import register_cuda_ci
 

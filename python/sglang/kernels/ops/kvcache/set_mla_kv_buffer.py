@@ -27,9 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 @cache_once
-def _jit_set_mla_kv_buffer_module(
-    nope_bytes: int, rope_bytes: int, use_pdl: bool
-) -> Module:
+def set_mla_kv_buffer_module(nope_bytes: int, rope_bytes: int, use_pdl: bool) -> Module:
     args = make_cpp_args(nope_bytes, rope_bytes, use_pdl)
     return load_jit(
         f"set_mla_kv_buffer_{nope_bytes}_{rope_bytes}",
@@ -66,7 +64,7 @@ def can_use_set_mla_kv_buffer(nope_bytes: int, rope_bytes: int) -> bool:
         )
         return False
     try:
-        _jit_set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
+        set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
         return True
     except Exception as e:  # pragma: no cover - compile-time only
         logger.warning(
@@ -115,7 +113,5 @@ def set_mla_kv_buffer(
     if num_warps <= 0:
         num_warps = _pick_num_warps(n_loc)
 
-    module = _jit_set_mla_kv_buffer_module(
-        nope_bytes, rope_bytes, is_arch_support_pdl()
-    )
+    module = set_mla_kv_buffer_module(nope_bytes, rope_bytes, is_arch_support_pdl())
     module.set_mla_kv_buffer(buf, loc, src_nope, src_rope, num_warps)
