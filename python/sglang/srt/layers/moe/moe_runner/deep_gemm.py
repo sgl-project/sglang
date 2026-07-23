@@ -1016,21 +1016,26 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Keep these allocations at the DeepGEMM call site. On Hopper, use a
-    # row-major FP32 scale so the existing layout transform creates a separate
-    # owning TMA buffer, matching the pre-#30924 lifetime boundary. Blackwell
-    # keeps the packed UE8M0 layout that DeepGEMM consumes directly.
+    # Keep these allocations at the DeepGEMM call site. On Hopper, match the
+    # pre-#30924 path: allocate a row-major FP32 scale, let the quant kernel
+    # write it, then let the existing DeepGEMM layout transform allocate the
+    # TMA buffer. Blackwell keeps the packed UE8M0 layout it consumes directly.
     down_input = torch.empty(
         (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
     )
-    down_input_scale = create_per_token_group_quant_fp8_output_scale(
-        x_shape=down_input.shape,
-        device=hidden_states_device,
-        group_size=group_size,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        down_input_scale = create_per_token_group_quant_fp8_output_scale(
+            x_shape=down_input.shape,
+            device=hidden_states_device,
+            group_size=group_size,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+    else:
+        down_input_scale = torch.empty(
+            (E, N, G), device=hidden_states_device, dtype=torch.float32
+        )
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
