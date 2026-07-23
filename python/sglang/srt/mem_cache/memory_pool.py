@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import logging
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
@@ -37,7 +38,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
 )
+from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -92,6 +93,12 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Debug-only invariant in the Mamba slot-donation path calls tensor.item(), which
+# forces a per-request cudaStreamSynchronize on the scheduler thread and can stall
+# the scheduler under load. Off by default; set SGLANG_MAMBA_DEBUG_ASSERTS=1 to
+# re-enable for debugging.
+_MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
@@ -1404,12 +1411,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_value_donated = (
             req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
-        assert mamba_value_donated.item() != -1, (
-            f"Donated mamba slot is -1: donate_idx={donate_idx}, "
-            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-            f"next_track_idx={req.mamba_next_track_idx}, "
-            f"rid={req.rid}"
-        )
+        if _MAMBA_DEBUG_ASSERTS:
+            # .item() forces a cudaStreamSynchronize; only pay it when debugging.
+            assert mamba_value_donated.item() != -1, (
+                f"Donated mamba slot is -1: donate_idx={donate_idx}, "
+                f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                f"next_track_idx={req.mamba_next_track_idx}, "
+                f"rid={req.rid}"
+            )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 
@@ -4893,7 +4902,7 @@ class MiniMaxSparseKVPool(KVCache):
         if index_pool is not None and self._can_fuse_kv_index_store(
             index_pool, cache_k, cache_idx_k
         ):
-            from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
+            from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 
             main = self.main_pool
             head_bytes = main.head_dim * main.dtype.itemsize
