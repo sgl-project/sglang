@@ -194,8 +194,20 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
     exit 2
   fi
   mkdir -p "${SP_RESULTS}"
+  SP_RESULTS_S3=""
+  if [[ -n "${MINWM_RESULTS_S3_URI:-}" ]]; then
+    SP_RESULTS_S3="${MINWM_RESULTS_S3_URI%/}/${MINWM_RUN_ID}"
+    aws s3 sync "${SP_RESULTS_S3}/" "${RESULTS}/" \
+      --no-progress --only-show-errors
+  fi
   nvidia-smi -L | tee "${RESULTS}/sp-gpus.txt"
   nvidia-smi topo -m | tee "${RESULTS}/sp-topology.txt"
+
+  sync_sp_results() {
+    [[ -n "${SP_RESULTS_S3}" ]] || return 0
+    aws s3 sync "${RESULTS}/" "${SP_RESULTS_S3}/" \
+      --no-progress --only-show-errors
+  }
 
   sp_lane_complete() {
     local prefix="$1"
@@ -290,6 +302,9 @@ PY
     wait "${server_pid}" 2>/dev/null || true
     kill "${monitor_pid}" 2>/dev/null || true
     wait "${monitor_pid}" 2>/dev/null || true
+    if (( lane_status == 0 )); then
+      sync_sp_results
+    fi
     return "${lane_status}"
   }
 
@@ -308,6 +323,7 @@ PY
   cp "${SP_RESULTS}/sp_matrix_report.json" "${RESULTS}/"
   cp "${SP_RESULTS}/sp_matrix_report.md" "${RESULTS}/"
   touch "${RESULTS}/sp-matrix-artifacts-ready"
+  sync_sp_results
   echo "MINWM_B200_SP_MATRIX_COMPLETE results=${RESULTS}"
   if (( ARTIFACT_HOLD_SECONDS > 0 )); then
     echo "MINWM_ARTIFACT_HOLD seconds=${ARTIFACT_HOLD_SECONDS}"
