@@ -4229,6 +4229,13 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # TBO capture is unsupported: the prefill capture dummy has no
+            # extend lens for compute_split_seq_index, and a frozen split
+            # index would be wrong at replay anyway.
+            (
+                "two-batch overlap",
+                lambda: self.enable_two_batch_overlap,
+            ),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
