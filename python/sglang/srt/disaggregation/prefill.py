@@ -560,7 +560,10 @@ class SchedulerDisaggregationPrefillMixin:
                 and len(req.output_ids) < req.token_handoff_max_tokens
             ]
             if bridge_indices:
-                bridge_batch = last_batch.copy()
+                # Match the normal scheduler's prefill-to-decode transition:
+                # the live ScheduleBatch owns allocator/cache state, while
+                # ScheduleBatch.copy() is only a result-processing snapshot.
+                bridge_batch = last_batch
                 bridge_batch.filter_batch(keep_indices=bridge_indices)
                 if running_batch.is_empty():
                     running_batch = bridge_batch
