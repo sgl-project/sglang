@@ -597,7 +597,10 @@ class TokenizerManagerScoreMixin:
                         f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
                     )
 
-        # Check if multi-item scoring is enabled
+        # Check if multi-item scoring is enabled. enable_mis is a static startup
+        # feature flag (never overridden post-publish), and score_request is also
+        # exercised on a bare mixin without a published context, so read it off
+        # server_args rather than the resolved-config bag.
         use_multi_item_scoring = self.server_args.enable_mis
 
         input_ids = None

@@ -26,9 +26,7 @@ import torch
 from torch import nn
 from transformers import ApertusConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import XIELU
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -52,7 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -442,7 +440,7 @@ class ApertusForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

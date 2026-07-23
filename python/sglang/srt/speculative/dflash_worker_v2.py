@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -329,7 +330,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = (
-            self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -391,7 +392,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -1256,7 +1257,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = self.server_args.mamba_track_interval
+            mamba_track_interval = get_exec().mamba.mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != batch.seq_lens // mamba_track_interval

@@ -29,7 +29,7 @@ from sglang.srt.layers.clippable_linear import (
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, get_device_capability, is_cuda, is_hip
 
 # ---------------------------------------------------------------------------
@@ -181,9 +181,8 @@ class Gemma4VisionAttention(nn.Module):
     @staticmethod
     def _select_backend() -> str:
         """Mirror VisionAttention._determine_attention_backend for consistency."""
-        from sglang.srt.runtime_context import get_server_args
 
-        override = get_server_args().mm_attention_backend
+        override = get_mm().mm_attention_backend
         if override is not None:
             return override
         if is_cuda():
