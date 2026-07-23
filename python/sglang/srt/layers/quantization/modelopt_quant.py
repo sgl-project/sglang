@@ -499,7 +499,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        self.enable_flashinfer_bmm = (
+            is_sm100_supported() or is_sm120_supported()
+        ) and is_flashinfer_available()
 
     def create_weights(
         self,
@@ -1176,6 +1178,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
+        is_awq: bool = False,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1184,6 +1187,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "Detected nvfp4 checkpoint. Please note that the "
                 "format is experimental and subject to change."
             )
+        self.is_awq = is_awq
         self.group_size = group_size
         self.use_per_token_activation = (
             envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
@@ -1288,6 +1292,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     first_group = next(iter(config_groups.values()), {})
                     weights_config = first_group.get("weights", {})
                     group_size = weights_config.get("group_size")
+            # NVFP4 (incl. NVFP4_AWQ) always uses group_size 16
+            if group_size is None and quant_method and "NVFP4" in quant_method:
+                group_size = 16
 
             exclude_modules = config.get("ignore", [])
         else:
@@ -1306,10 +1313,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if quant_method not in ["FP8", "NVFP4"]:
+        if quant_method not in ["FP8", "NVFP4", "NVFP4_AWQ"]:
             raise ValueError(
-                "ModelOpt currently only supports: FP8, NVFP4"
-                " quantizations in sglang. Please check the "
+                "ModelOpt currently only supports: FP8, NVFP4, NVFP4_AWQ "
+                "quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
@@ -1330,6 +1337,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             group_size,
             exclude_modules,
             config.get("packed_modules_mapping"),
+            is_awq="AWQ" in quant_method,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1454,6 +1462,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             needs_scalar_to_array=True,
         )
         layer.register_parameter("input_scale", input_scale)
+
+        # NVFP4_AWQ: per-input-channel activation pre-scale baked into the weights
+        # offline. Length == input_size_per_partition; shards along the input dim
+        # (input_dim=0) so it splits correctly on row-parallel linears.
+        if self.quant_config.is_awq:
+            pre_quant_scale = ModelWeightParameter(
+                data=torch.ones(input_size_per_partition, dtype=params_dtype),
+                input_dim=0,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("pre_quant_scale", pre_quant_scale)
 
         weight_scale_2 = _make_per_tensor_scale_parameter(
             (len(output_partition_sizes),),
@@ -1674,6 +1694,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             x_m = x_fp4.shape[0]
             output_dtype = layer.params_dtype
         else:
+            # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
+            if self.quant_config.is_awq:
+                x = x * layer.pre_quant_scale
             x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
             x_m, _ = x.shape
             output_dtype = x.dtype

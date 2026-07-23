@@ -6,14 +6,14 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.jit_kernel.inkling_rel_proj import rel_proj_small_t
-from sglang.jit_kernel.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
     apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
+from sglang.kernels.ops.model.inkling.inkling_rel_proj import rel_proj_small_t
+from sglang.kernels.ops.model.inkling.inkling_row_scale import row_compact_bf16
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -36,7 +36,7 @@ try:
     import cutlass.cute as cute
     from cutlass.cute import Float32
 
-    from sglang.jit_kernel.flash_attn.cute.seqlen_info import SeqlenInfoQK
+    from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
 except Exception as _import_error:
     cute = None
     Float32 = None
@@ -364,7 +364,8 @@ class InklingAttention(nn.Module):
 
     def _fused_attn_prologue_verify(self, q, k, v, forward_batch, log_scaling_tau=None):
         """Fused target-verify {k/v sconv + save_windows + qk-norm (+ KV store)}
-        (jit_kernel/inkling_attn_prologue.py); returns ``(q, k, v, did_store)``.
+        (kernels/ops/model/inkling/inkling_attn_prologue.py); returns
+        ``(q, k, v, did_store)``.
 
         The fused kernel writes raw bf16 KV, so it only does the store when the
         KV pool is bf16: full layers at ``out_cache_loc`` in the full pool,
@@ -376,7 +377,9 @@ class InklingAttention(nn.Module):
         qk-norm stay fused either way. For the FA4 MXFP8 pool, the prologue can
         quantize Q and directly fill the fp8 K/V cache plus interleaved scale
         buffers, returning Q's per-token scales as ``q_descale``/``sfq``."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_verify
+        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+            inkling_attn_prologue_verify,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -478,7 +481,9 @@ class InklingAttention(nn.Module):
         the backend store. Store gating (bf16 NHD / FA4 MXFP8 pools, SWA loc
         translation) is identical to the verify prologue. Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_extend
+        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+            inkling_attn_prologue_extend,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
@@ -610,7 +615,9 @@ class InklingAttention(nn.Module):
         kernel. Decode is one token/seq so the conv taps come from the working
         cache (no cross-token reads, no barrier). Returns
         (q, k, v, did_store, q_descale)."""
-        from sglang.jit_kernel.inkling_attn_prologue import inkling_attn_prologue_decode
+        from sglang.kernels.ops.model.inkling.inkling_attn_prologue import (
+            inkling_attn_prologue_decode,
+        )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
             get_token_to_kv_pool,
