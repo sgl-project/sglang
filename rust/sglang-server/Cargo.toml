@@ -1,9 +1,14 @@
 [package]
 name = "sglang-server"
-version = "0.1.0"
-edition = "2024"
+description = "Sglang server in rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module.
+[package.metadata.sglang]
+python-module = "sglang.srt.server._core"
+
 [lib]
 name = "sglang_server"
 # cdylib: the pyo3 module imported by the (embedded) Python scheduler process.
@@ -11,44 +16,25 @@ name = "sglang_server"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# --- Python boundary (only crossed by recv_requests / push_chunk) ---
-pyo3 = { version = "0.29.0", features = ["extension-module"] }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+pyo3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+uuid = { workspace = true }
 
-# --- async API server (I/O bound) ---
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "signal"] }
 axum = { version = "0.8.9", features = ["json", "tokio"] }
-futures = "0.3"
-async-stream = "0.3"
-
-# --- inter-stage transport: MPMC, move-only (zero copy), lock-free fast path ---
+core_affinity = "0.8"
+# the dynamo-tokenizers is deps on hf-hub, should bump version together
+dynamo-tokenizers = "1.5.3"
 flume = "0.12.0"
-
-# --- zero-copy payloads: refcounted byte buffers for fan-out to detok shards ---
-bytes = "1"
-
-# --- msgpack wire format, aligned with the Python dev/msgpack-migration schema ---
+hf-hub = { version = "0.4", default-features = false }
+regex-syntax = "0.8"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# --- regex AST parsing: finite max-length bound for `stop_regex` (mirrors the
-# Python `sampling_params.get_max_seq_length`) ---
-regex-syntax = "0.8"
-
-# --- CPU core binding for the runtime pools ---
-core_affinity = "0.8"
-
-# --- ids / misc ---
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-
-# tokenizer
-dynamo-tokenizers = "1.5.1"
-
-# Offline HF Hub cache lookup only (no `tokio`/`ureq`/TLS features) — resolves a
-# repo id to its already-downloaded local tokenizer.json without network/openssl.
-hf-hub = { version = "0.5.0", default-features = false }
