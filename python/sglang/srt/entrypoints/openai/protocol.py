@@ -410,6 +410,7 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    routed_experts_dtype: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @model_serializer(mode="wrap")
