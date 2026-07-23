@@ -953,6 +953,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             and base_layer.quant_method.runner is not None
         ):
             runner_backend = base_layer.quant_method.runner.runner_backend
+        elif (
+            hasattr(base_layer, "scheme")
+            and getattr(base_layer.scheme, "runner", None) is not None
+        ):
+            # compressed-tensors attaches the MoeRunner to the layer's scheme,
+            # not to quant_method; without this WNA16 models silently fall
+            # back to the Triton runner in auto mode.
+            runner_backend = base_layer.scheme.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
@@ -1112,6 +1120,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
         quant_info = self._quant_info
+
+        # EP: the dispatcher builds its global->local expert mapping lazily on
+        # the first dispatch, so construction-time quant info can miss it.
+        # Refresh here; global_num_experts is the mapping's domain size.
+        if hasattr(quant_info, "expert_map"):
+            expert_map = getattr(base_layer.dispatcher, "local_expert_mapping", None)
+            if expert_map is not None:
+                quant_info.expert_map = expert_map
+                quant_info.global_num_experts = expert_map.numel()
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():
