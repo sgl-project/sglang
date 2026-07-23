@@ -24,8 +24,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
-from sglang.jit_kernel.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
+from sglang.kernels.ops.layernorm._jit_norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled

@@ -10,10 +10,10 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
-from sglang.jit_kernel.mp import register_comm_cleanup
-from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
+from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
