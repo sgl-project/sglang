@@ -1156,7 +1156,9 @@ class ModelRunner:
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(
-                    spec_algorithm.is_dflash() if spec_algorithm is not None else False
+                    spec_algorithm.is_dflash_family()
+                    if spec_algorithm is not None
+                    else False
                 ),
                 speculative_draft_attention_backend=getattr(
                     self.server_args, "speculative_draft_attention_backend", None
