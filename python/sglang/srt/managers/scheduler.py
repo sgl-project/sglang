@@ -291,6 +291,13 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _prewarm_hccl_group(device, group, device_module):
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=group)
+    device_module.synchronize()
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -464,6 +471,23 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        if (
+            _is_npu
+            and self.tp_worker.model_runner.model_config.is_deepseek_v4_arch
+        ):
+            rank = (
+                self.ps.dp_rank
+                if self.ps.dp_rank is not None
+                else self.tp_group.rank_in_group
+            )
+            logger.info("HCCL DP prewarm start: rank=%s", rank)
+            _prewarm_hccl_group(
+                device=self.tp_group.device,
+                group=self.tp_group.device_group,
+                device_module=self.tp_group.device_module,
+            )
+            logger.info("HCCL DP prewarm done: rank=%s", rank)
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
