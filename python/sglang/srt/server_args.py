@@ -5539,23 +5539,24 @@ class ServerArgs:
             # Closed-loop exact fold: the flush replays raw ring inputs through
             # the recurrent update into the checkpoint, bit-identical to the
             # recurrent baseline -- which keeps its state in fp32. A 16-bit
-            # checkpoint would re-quantize the exactly-folded state every flush
-            # and become the dominant residual error source, so require fp32.
+            # checkpoint re-quantizes the folded state every flush, so it drifts
+            # from the fp32 baseline in principle. fp32 stays the default; a
+            # 16-bit checkpoint is allowed (it ~halves the state pool -> ~2x
+            # concurrency) but warned -- validate accuracy per model/workload.
             if self.mamba_ssm_dtype is None:
                 logger.info(
                     "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
-                    "float32 (the closed-loop exact fold requires the fp32 SSM "
-                    "checkpoint for recurrent-parity)."
+                    "float32 (the closed-loop exact fold keeps the SSM checkpoint "
+                    "bit-identical to the recurrent baseline)."
                 )
                 self.mamba_ssm_dtype = "float32"
             elif self.mamba_ssm_dtype != "float32":
-                raise ValueError(
-                    "--enable-linear-replayssm-spec requires --mamba-ssm-dtype "
-                    f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
-                    "exact fold keeps the committed state bit-identical to the "
-                    "recurrent baseline, which is only meaningful against the "
-                    "fp32 checkpoint; a 16-bit checkpoint would re-quantize it "
-                    "every flush."
+                logger.warning(
+                    "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
+                    "closed-loop fold re-quantizes the committed state each flush "
+                    "(fp32 keeps it bit-exact to the recurrent baseline), so it may "
+                    "drift over long sequences. Validate accuracy for your model.",
+                    self.mamba_ssm_dtype,
                 )
 
     def _validate_linear_replayssm_spec_ring(self):
