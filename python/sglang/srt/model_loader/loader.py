@@ -837,7 +837,15 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
         for _, module in model.named_modules():
+            # LoRA wrappers forward `quant_method` for forward-path dispatch but
+            # don't own the packed params; skip them so the inner base layer
+            # (yielded separately by `named_modules`) handles it. Wrappers only
+            # exist when weights are reloaded on a live model with LoRA enabled.
+            if isinstance(module, BaseLayerWithLoRA):
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -1052,8 +1060,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                         recorded_loader[key][name] = attr
         model.recorded_loader = recorded_loader
 
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
         # Apply FP8 quantization (creates new Parameters, loses attributes)
         for _, module in model.named_modules():
+            # Skip LoRA wrappers; the inner base layer owns the packed params.
+            if isinstance(module, BaseLayerWithLoRA):
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 with device_loading_context(module, target_device):
