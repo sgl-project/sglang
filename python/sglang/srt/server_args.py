@@ -3017,6 +3017,16 @@ class ServerArgs:
         "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
         NS("model"),
     ] = False
+    fastsafetensors_nogds: A[
+        Optional[bool],
+        "Force GPU Direct Storage on/off for --load-format fastsafetensors. Default "
+        "(unset) auto-detects: disabled on integrated/unified-memory GPUs (e.g. DGX "
+        "Spark/GB10), where GDS has no discrete-VRAM DMA target to accelerate and "
+        "otherwise falls back through a non-reclaimable pinned-host-memory staging "
+        "path that can inflate real memory usage several-fold over the checkpoint "
+        "size; left enabled (library default) on discrete GPUs.",
+        NS("model"),
+    ] = None
     remote_instance_weight_loader_seed_instance_ip: A[
         Optional[str],
         "The ip of the seed instance for loading weights from remote instance.",
