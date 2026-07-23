@@ -1955,9 +1955,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(operation.hash_value) == 0:
             completed = False
         else:
+            # kv pool
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
+            # sidecar pool
+            if completed and operation.pool_transfers:
+                completed = operation.pool_transfers_done
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed

@@ -1491,9 +1491,13 @@ class HiRadixCache(RadixCache):
         if len(operation.hash_value) == 0:
             completed = False
         else:
+            # kv pool
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
+            # sidecar pool (only present when using HybridCacheController)
+            if completed and getattr(operation, "pool_transfers", None):
+                completed = getattr(operation, "pool_transfers_done", False)
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
