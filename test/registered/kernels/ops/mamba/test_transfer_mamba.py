@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -193,7 +192,9 @@ def assert_device_matches_host(host, device_pool, host_indices, device_indices):
 
         # Conv
         for conv_idx in range(len(host.conv_buffer)):
-            host_conv = host.conv_buffer[conv_idx][host_indices.cpu(), layer_id, 0].to(DEVICE)
+            host_conv = host.conv_buffer[conv_idx][host_indices.cpu(), layer_id, 0].to(
+                DEVICE
+            )
             dev_conv = device_pool.mamba_cache.conv[conv_idx][layer_id][device_indices]
             torch.testing.assert_close(dev_conv, host_conv)
 

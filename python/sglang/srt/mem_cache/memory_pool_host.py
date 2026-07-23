@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 import numpy as np
 import psutil
 import torch
-
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_write_back_jit_kernel,
 )
