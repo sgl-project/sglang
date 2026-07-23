@@ -28,11 +28,15 @@ from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
 )
+from sglang.srt.utils import is_npu
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h,
     )
+
+if is_npu():
+    from sgl_kernel_npu.fla.kda import chunk_kda_fwd_intra_npu as chunk_kda_fwd_intra
 
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
