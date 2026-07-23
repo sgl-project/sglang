@@ -320,6 +320,134 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
+class TestAvailableGpuMemory(CustomTestCase):
+    """Tests for common available-memory helper dispatch through platforms."""
+
+    def test_oot_get_available_gpu_memory_uses_available_memory_override(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def __init__(self):
+                self.calls = []
+
+            def get_available_memory(self, device_id=0):
+                self.calls.append(device_id)
+                return (3 * (1 << 30), 10 * (1 << 30))
+
+            def get_device_total_memory(self, device_id=0):
+                raise AssertionError("legacy fallback should not run")
+
+            def get_current_memory_usage(self, device=None):
+                raise AssertionError("legacy fallback should not run")
+
+        platform = P()
+        with patch.object(common, "current_platform", platform):
+            self.assertEqual(common.get_available_gpu_memory("custom", 2), 3.0)
+
+        self.assertEqual(platform.calls, [2])
+
+    def test_oot_get_available_gpu_memory_uses_device_mixin_override(self):
+        from sglang.srt.utils import common
+
+        class M(DeviceMixin):
+            def get_available_memory(self, device_id=0):
+                self.calls.append(device_id)
+                return (4 * (1 << 30), 12 * (1 << 30))
+
+        class P(SRTPlatform, M):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def __init__(self):
+                self.calls = []
+
+            def get_device_total_memory(self, device_id=0):
+                raise AssertionError("legacy fallback should not run")
+
+            def get_current_memory_usage(self, device=None):
+                raise AssertionError("legacy fallback should not run")
+
+        platform = P()
+        with patch.object(common, "current_platform", platform):
+            self.assertEqual(common.get_available_gpu_memory("custom", 3), 4.0)
+
+        self.assertEqual(platform.calls, [3])
+
+    def test_oot_get_available_gpu_memory_without_override_uses_legacy_fallback(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def __init__(self):
+                self.total_calls = []
+                self.usage_calls = []
+
+            def get_device_total_memory(self, device_id=0):
+                self.total_calls.append(device_id)
+                return 10 * (1 << 30)
+
+            def get_current_memory_usage(self, device=None):
+                self.usage_calls.append(device)
+                return 2 * (1 << 30)
+
+        platform = P()
+        with patch.object(common, "current_platform", platform):
+            self.assertEqual(common.get_available_gpu_memory("custom", 4), 8.0)
+
+        self.assertEqual(platform.total_calls, [4])
+        self.assertEqual(platform.usage_calls, [None])
+
+    def test_oot_get_available_gpu_memory_override_error_propagates(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def get_available_memory(self, device_id=0):
+                raise RuntimeError("available memory query failed")
+
+            def get_device_total_memory(self, device_id=0):
+                raise AssertionError("legacy fallback should not run")
+
+            def get_current_memory_usage(self, device=None):
+                raise AssertionError("legacy fallback should not run")
+
+        with patch.object(common, "current_platform", P()):
+            with self.assertRaisesRegex(RuntimeError, "available memory query failed"):
+                common.get_available_gpu_memory("custom", 0)
+
+    def test_oot_get_available_gpu_memory_override_not_implemented_propagates(self):
+        from sglang.srt.utils import common
+
+        class P(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "custom"
+            device_type = "custom"
+
+            def get_available_memory(self, device_id=0):
+                raise NotImplementedError("available memory hook is not implemented")
+
+            def get_device_total_memory(self, device_id=0):
+                raise AssertionError("legacy fallback should not run")
+
+            def get_current_memory_usage(self, device=None):
+                raise AssertionError("legacy fallback should not run")
+
+        with patch.object(common, "current_platform", P()):
+            with self.assertRaisesRegex(NotImplementedError, "not implemented"):
+                common.get_available_gpu_memory("custom", 0)
+
+
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""
 
