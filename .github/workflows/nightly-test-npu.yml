@@ -232,9 +232,9 @@ jobs:
             test_case: test/registered/ascend/performance/minimax_m2_5/test_npu_minimax_m2_5_w8a8_4p_in64k_out1k_prefix90_50ms_gpqa.py
             test_type: 'perf'
           # deepseek_v3_2 accuracy tests
-          - name: deepseek_v3_2_8p_aime25
+          - name: deepseek_v3_2_8p_gsm8k
             runner: linux-aarch64-a3-16
-            test_case: test/registered/ascend/accuracy/deepseek_v3_2/test_npu_deepseek_v3_2_8p_aime25.py
+            test_case: test/registered/ascend/accuracy/deepseek_v3_2/test_npu_deepseek_v3_2_8p_gsm8k.py
           # glm4_7_flash accuracy tests
           - name: glm4_7_flash_1p_aime25
             runner: linux-aarch64-a3-2
