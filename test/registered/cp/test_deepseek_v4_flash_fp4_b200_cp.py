@@ -31,8 +31,17 @@ _DEEPEP_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
 
+_MEGAMOE_ENV = {
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "0",
+    "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
+    "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
+    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
+}
 
-class TestDSV4FlashFP4B200Balanced_CP(
+
+class TestDSV4FlashFP4B200Balanced_CP_DeepEP(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -73,6 +82,55 @@ class TestDSV4FlashFP4B200Balanced_CP(
                 DEEPEP_CONFIG,
             ],
             env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "megamoe",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_MEGAMOE_ENV,
         )
 
     @classmethod
