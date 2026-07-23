@@ -13,7 +13,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -22,7 +25,9 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -56,7 +61,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
     DeepseekMHAForwardMixin,
 )
 from sglang.srt.runtime_context import (
-    get_exec,
     get_forward,
     get_model,
     get_parallel,
@@ -80,7 +84,7 @@ if _is_cuda:
     try:
         from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
         from sglang.kernels.ops.gemm import bmm_fp8
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
@@ -270,7 +274,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         )
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -1226,7 +1230,7 @@ class SarvamMLAForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

@@ -51,8 +51,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_npu,
+    support_triton,
+)
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -936,7 +941,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # --enable-mis: every request must carry delimiter indices (the score
             # endpoint always produces MIS-structured requests; consumers index
             # without None-checking).
-            if get_exec().features.enable_mis and any(
+            if get_server_args().enable_mis and any(
                 r.multi_item_delimiter_indices is not None for r in batch.reqs
             ):
                 assert all(
@@ -1105,7 +1110,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
-        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        rl_on_policy_target = get_server_args().rl_on_policy_target
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
@@ -1659,7 +1664,7 @@ def _clamp_position_native(seq_lens):
 
 
 if is_cuda() or is_hip():
-    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+    from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:

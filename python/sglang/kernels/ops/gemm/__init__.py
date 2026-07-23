@@ -65,7 +65,7 @@ register_kernel(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 fused QKV-A GEMM (drop-in with AOT signature)",
         ),
-        description="DeepSeek-V3 fused-A GEMM (sglang.jit_kernel).",
+        description="DeepSeek-V3 fused-A GEMM (sglang.kernels.jit).",
     )
 )
 register_kernel(
@@ -78,7 +78,7 @@ register_kernel(
             supported_dtypes=("bfloat16",),
             description="DeepSeek-V3 router GEMM; num_tokens in [1, 16]",
         ),
-        description="DeepSeek-V3 router GEMM (sglang.jit_kernel, JIT-only).",
+        description="DeepSeek-V3 router GEMM (sglang.kernels.jit, JIT-only).",
     )
 )
 

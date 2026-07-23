@@ -3,7 +3,7 @@ per-buffer index_put_ stores (main K, main V, index K, optional index V)."""
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.kvcache.minimax_store_kv_index import store_kv_index
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

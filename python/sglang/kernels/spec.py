@@ -2,7 +2,7 @@
 
 This module defines small, dependency-free descriptors used to *inventory*
 kernel implementations and drive a simple, heuristic dispatch. It intentionally
-does not import ``torch``, ``sgl_kernel`` or ``sglang.jit_kernel`` at module
+does not import ``torch``, ``sgl_kernel`` or ``sglang.kernels.jit`` at module
 import time so that ``import sglang.kernels`` stays cheap and works on a CPU-only
 box (see RFC #29630, Phase 2).
 
@@ -29,7 +29,7 @@ import msgspec
 class KernelBackend(str, Enum):
     """Provenance of a kernel implementation (how it is built), not its device.
 
-    ``JIT`` (``sglang.jit_kernel``, compiles under nvcc *and* hipcc) and ``AOT``
+    ``JIT`` (``sglang.kernels.jit``, compiles under nvcc *and* hipcc) and ``AOT``
     (the ``sgl_kernel`` wheel, built for CUDA *and* ROCm) are both cross-device;
     which devices a given op supports is expressed by its
     :class:`CapabilityRequirement` list. Platform-specific libraries (e.g.
@@ -40,7 +40,7 @@ class KernelBackend(str, Enum):
     TORCH = "torch"  # pure-torch reference (forward_native)
     TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
     TRITON = "triton"
-    JIT = "jit"  # sglang.jit_kernel (nvcc / hipcc)
+    JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc)
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
     FLASHINFER = "flashinfer"

@@ -25,7 +25,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -37,7 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -757,7 +759,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
         if _is_cpu:
-            from sglang.srt.model_loader.weight_utils import pad_loaded_weight
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
 
             loaded_weight = pad_loaded_weight(
                 loaded_weight, param.output_dim, output_sizes
@@ -801,7 +805,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             current_block_offset += shard_block_size
 
         if _is_cpu:
-            from sglang.srt.model_loader.weight_utils import pad_loaded_weight
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
 
             loaded_weight = pad_loaded_weight(
                 loaded_weight, param.output_dim, shard_block_sizes
@@ -1590,7 +1596,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_exec().comm.enable_quant_communications
+                        and get_server_args().enable_quant_communications
                     )
                     if forward_batch is not None
                     else False

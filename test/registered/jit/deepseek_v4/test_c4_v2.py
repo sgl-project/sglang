@@ -7,8 +7,7 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.dsv4 import compress_forward
-from sglang.jit_kernel.tests.deepseek_v4.common import (
+from sglang.kernels.jit.tests.deepseek_v4.common import (
     LegacyContext,
     PagedContext,
     make_legacy_context,
@@ -16,6 +15,7 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
     make_state_pool,
     to_seq_extend,
 )
+from sglang.kernels.ops.attention.dsv4 import compress_forward
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

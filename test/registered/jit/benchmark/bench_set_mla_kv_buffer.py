@@ -14,14 +14,16 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_QUANTILES,
     get_benchmark_range,
 )
-from sglang.jit_kernel.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.kvcache._jit_set_mla_kv_buffer import (
+    set_mla_kv_buffer as jit_set,
+)
 from sglang.srt.mem_cache.utils import set_mla_kv_buffer_kernel as sglang_triton_kernel
 from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton as sglang_wrapper
 from sglang.test.ci.ci_register import register_cuda_ci

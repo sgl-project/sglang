@@ -2,13 +2,15 @@ import math
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_empty, create_random
+from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.utils import create_empty, create_random
 
 # per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
 # kernel is kept only as the perf baseline for this benchmark.
-from sglang.jit_kernel.per_token_group_quant import per_token_group_quant
-from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
+from sglang.kernels.ops.quantization._jit_per_token_group_quant import (
+    per_token_group_quant,
+)
+from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
     per_token_group_quant_8bit_v2,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (

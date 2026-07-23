@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
