@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_per_tensor_quant_fp8_module(is_static: bool, dtype: torch.dtype) -> Module:
+def per_tensor_quant_fp8_module(is_static: bool, dtype: torch.dtype) -> Module:
     args = make_cpp_args(is_static, dtype)
     return load_jit(
         "per_tensor_quant_fp8",
@@ -41,7 +41,7 @@ def per_tensor_quant_fp8(
         output_s: Output scale tensor (float scalar or 1D tensor with 1 element)
         is_static: If True, assumes scale is pre-computed and skips absmax computation
     """
-    module = _jit_per_tensor_quant_fp8_module(is_static, input.dtype)
+    module = per_tensor_quant_fp8_module(is_static, input.dtype)
     module.per_tensor_quant_fp8(input.view(-1), output_q.view(-1), output_s.view(-1))
 
 

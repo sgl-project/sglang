@@ -29,7 +29,7 @@ framework-specific optimization workflow.
 - `test/registered/jit/benchmark/diffusion/bench_qwen_image_modulation.py`
 - `test/registered/jit/benchmark/diffusion/bench_group_norm_silu.py`
 - `test/registered/jit/benchmark/diffusion/bench_residual_gate_add.py`
-- `python/sglang/kernels/ops/layernorm/_jit_norm.py`
+- `python/sglang/kernels/ops/layernorm/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
 - `docs_new/docs/sglang-diffusion/attention_backends.mdx` (repo root)
@@ -137,7 +137,7 @@ framework-specific optimization workflow.
 **QK Norm Optimization**
 
 - Entry point: `apply_qk_norm` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm from `python/sglang/kernels/ops/layernorm/_jit_norm.py` via `fused_inplace_qknorm`.
+- Fast path: JIT fused inplace QK norm from `python/sglang/kernels/ops/layernorm/norm.py` via `fused_inplace_qknorm`.
 - Preconditions for fused path:
   - CUDA only.
   - `allow_inplace=True` and `q_eps == k_eps`.
