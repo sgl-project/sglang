@@ -239,7 +239,7 @@ jobs:
             runner: 8-gpu-b200
             wheel_arch: x86_64
           - arch_label: sm120
-            runner: 1-gpu-small
+            runner: 1-gpu-5090
             wheel_arch: x86_64
           # temporarily disabled due to runner availability
 #           - arch_label: sm100-aarch64
