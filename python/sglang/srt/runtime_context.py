@@ -574,17 +574,9 @@ class _ConfigBag:
     writers are ``get_context().override(source, ...)`` (permanent) and
     the scoped ``.override(**kw)`` context manager (tests). Sub-namespaces
     (e.g. ``exec.moe``) are nested ``_ConfigBag`` instances reached by attribute.
-
-    Leaves and sub-bags are stored as **real instance attributes** (in
-    ``__dict__``), so ``bag.leaf`` / ``bag.sub`` is a plain attribute load that
-    ``torch.compile`` / dynamo can trace — config reads inside a compiled model
-    forward (e.g. ``get_exec().comm.enable_symm_mem`` in the embedding layer)
-    must not graph-break. ``_fields`` / ``_subs`` keep the authoritative
-    name→value maps used for override routing, membership, and scoped restore;
-    ``__getattr__`` is only a fallback for genuinely absent names. (Deliberately
-    no ``__slots__``: leaves are dynamic, and the ``__dict__`` is what makes the
-    reads traceable.)
     """
+
+    __slots__ = ("_path", "_fields", "_subs")
 
     def __init__(self, path: str):
         object.__setattr__(self, "_path", path)
@@ -592,9 +584,7 @@ class _ConfigBag:
         object.__setattr__(self, "_subs", {})  # {subname: _ConfigBag}
 
     def __getattr__(self, name: str) -> Any:
-        # Fallback only: real leaves/sub-bags resolve via __dict__ before this
-        # runs. Uses object.__getattribute__ (not self._fields) to stay safe if
-        # invoked before __init__ populates the bookkeeping dicts.
+        # Reached only when ``name`` is not a real attribute (slot).
         fields = object.__getattribute__(self, "_fields")
         if name in fields:
             return fields[name]
@@ -611,16 +601,8 @@ class _ConfigBag:
         )
 
     def _set(self, name: str, value: Any) -> None:
-        """Internal write (publish + override) that bypasses the read-only guard.
-        Updates both the bookkeeping map and the real attribute (traceable read)."""
+        """Internal write (publish + override) that bypasses the read-only guard."""
         object.__getattribute__(self, "_fields")[name] = value
-        object.__setattr__(self, name, value)
-
-    def _set_sub(self, name: str, sub: _ConfigBag) -> None:
-        """Register a nested bag as both a bookkeeping entry and a real
-        attribute (so ``bag.sub`` is a plain, traceable attribute load)."""
-        object.__getattribute__(self, "_subs")[name] = sub
-        object.__setattr__(self, name, sub)
 
     def __contains__(self, name: str) -> bool:
         return name in object.__getattribute__(self, "_fields")
@@ -635,13 +617,11 @@ class _ConfigBag:
             path = object.__getattribute__(self, "_path")
             raise ValueError(f"unknown config leaf for {path!r}: {sorted(unknown)}")
         saved = {name: fields[name] for name in kwargs}
-        for name, value in kwargs.items():
-            self._set(name, value)
+        fields.update(kwargs)
         try:
             yield self
         finally:
-            for name, value in saved.items():
-                self._set(name, value)
+            fields.update(saved)
 
 
 def _build_config_bags(server_args: Any) -> dict:
@@ -680,8 +660,7 @@ def _build_config_bags(server_args: Any) -> dict:
             subs = object.__getattribute__(bag, "_subs")
             child = subs.get(name)
             if child is None:
-                child = _ConfigBag(".".join(parts[: depth + 1]))
-                bag._set_sub(name, child)
+                child = subs[name] = _ConfigBag(".".join(parts[: depth + 1]))
             bag = child
         if field in object.__getattribute__(bag, "_subs"):
             raise ValueError(
@@ -702,7 +681,6 @@ class RuntimeContext:
         "_server_args",
         "_config_bags",
         "_overrides_log",
-        "_publish_role",
         "flags",
         "resources",
         "forward",
@@ -713,7 +691,6 @@ class RuntimeContext:
         self._server_args: ServerArgs | None = None
         self._config_bags: dict | None = None
         self._overrides_log: list = []
-        self._publish_role: str | None = None
         self.flags = Flags()
         self.resources = Resources()
         self.forward = ForwardFlags()
@@ -838,11 +815,8 @@ class RuntimeContext:
         self._overrides_log.append((source, dict(fields)))
 
     def overrides_log(self) -> list:
-        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
-
-        Returns deep-ish copies (source, dict(fields)) so callers inspecting the
-        log cannot mutate the recorded provenance in place."""
-        return [(source, dict(fields)) for source, fields in self._overrides_log]
+        """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``."""
+        return list(self._overrides_log)
 
     def resolved_server_args_dict(self, base: dict | None = None) -> dict:
         """Serialize the *resolved* config: the pristine ``server_args`` fields
@@ -884,35 +858,6 @@ class RuntimeContext:
         """
         return _ServerArgsOverride(self, fields)
 
-    @contextmanager
-    def preserve_config(self):
-        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
-
-        Used when a nested construction step must leave the process-wide config
-        exactly as it found it — notably ``build_draft_tp_worker``, which builds
-        a draft worker off a private ``ServerArgs`` copy and must not disturb the
-        target's published config. Unlike ``set_server_args`` (which re-projects
-        the bags from a pristine record and so *discards* every post-publish
-        override made during target loading, e.g. ``kv_cache_dtype`` or
-        ``disable_shared_experts_fusion``), this restores the resolved bags
-        as-is, so namespace readers keep the target's resolved values afterward.
-        """
-        prev_server_args = self._server_args
-        prev_bags = self._config_bags
-        prev_overrides_log = self._overrides_log
-        prev_publish_role = self._publish_role
-        prev_parallel_config = self.parallel._config
-        prev_capture = self.flags.capture.enable_torch_compile
-        try:
-            yield
-        finally:
-            self._server_args = prev_server_args
-            self._config_bags = prev_bags
-            self._overrides_log = prev_overrides_log
-            self._publish_role = prev_publish_role
-            self.parallel._config = prev_parallel_config
-            self.flags.capture.enable_torch_compile = prev_capture
-
 
 class _ServerArgsOverride:
     """Scoped config override (see ``RuntimeContext.override_server_args``).
@@ -924,21 +869,13 @@ class _ServerArgsOverride:
     nondeterministic point.
     """
 
-    __slots__ = (
-        "_context",
-        "_fields",
-        "_prev_server_args",
-        "_prev_bags",
-        "_prev_overrides_log",
-        "_prev_publish_role",
-        "_prev_parallel_config",
-        "_prev_capture",
-        "_installed",
-    )
+    __slots__ = ("_context", "_fields", "_previous", "_previous_capture", "_installed")
 
     def __init__(self, context: RuntimeContext, fields: dict):
         self._context = context
         self._fields = fields
+        self._previous: ServerArgs | None = None
+        self._previous_capture = False
         self._installed = False
 
     def install(self) -> ServerArgs:
@@ -948,18 +885,8 @@ class _ServerArgsOverride:
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
-        # Snapshot the ENTIRE pre-install lifecycle state so restore() reinstates
-        # it verbatim: reseeding only ``_server_args`` would leave the projected
-        # bags / parallel leaves / provenance from this override live after the
-        # scope (violating fail-closed and leaking config into later tests), and
-        # would also drop any outer override that was active before this one.
-        ctx = self._context
-        self._prev_server_args = ctx._server_args
-        self._prev_bags = ctx._config_bags
-        self._prev_overrides_log = ctx._overrides_log
-        self._prev_publish_role = ctx._publish_role
-        self._prev_parallel_config = ctx.parallel._config
-        self._prev_capture = ctx.flags.capture.enable_torch_compile
+        self._previous = self._context._server_args
+        self._previous_capture = self._context.flags.capture.enable_torch_compile
         server_args = ServerArgs(model_path="dummy")
         if self._fields:
             server_args.override(source="test-override", **self._fields)
@@ -968,26 +895,24 @@ class _ServerArgsOverride:
         # materialized so bare post-publish writes raise like they do on a
         # fully resolved config.
         object.__setattr__(server_args, "_declarations_materialized", True)
-        ctx.set_server_args(server_args)
+        self._context.set_server_args(server_args)
         self._installed = True
         return server_args
 
     def restore(self) -> None:
-        """Reinstate the exact pre-install lifecycle state (or the empty slot)."""
+        """Reinstate the previously published config (or the empty slot)."""
         if not self._installed:
             return
         self._installed = False
-        ctx = self._context
-        ctx._server_args = self._prev_server_args
-        ctx._config_bags = self._prev_bags
-        ctx._overrides_log = self._prev_overrides_log
-        ctx._publish_role = self._prev_publish_role
-        ctx.parallel._config = self._prev_parallel_config
-        ctx.flags.capture.enable_torch_compile = self._prev_capture
-        self._prev_server_args = None
-        self._prev_bags = None
-        self._prev_overrides_log = None
-        self._prev_parallel_config = None
+        previous, self._previous = self._previous, None
+        if previous is None:
+            self._context._server_args = None
+        else:
+            self._context.set_server_args(previous)
+        # set_server_args reseeds the capture tier from the published object
+        # (and the empty-slot path does not touch it at all); the snapshot
+        # puts back the exact pre-install runtime state either way.
+        self._context.flags.capture.enable_torch_compile = self._previous_capture
 
     def __enter__(self) -> ServerArgs:
         return self.install()
@@ -1073,26 +998,6 @@ def get_observability() -> _ConfigBag:
     return _CONTEXT.config_bag("observability")
 
 
-def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
-    """Install process-wide config for this OS process.
-
-    Records the process ``role`` (``tokenizer`` / ``scheduler`` / ``encoder`` /
-    ``expert_backup`` / ``launcher`` / ``test``) and projects the config bags.
-    One call per process; draft workers skip publish (they must not clobber the
-    target). ``role`` is provenance today — per-role namespace projection and
-    fail-closed enforcement is a later unit. ``hf_config`` is accepted for
-    forward-compat and currently unused.
-    """
-    _CONTEXT._publish_role = role
-    _CONTEXT.set_server_args(server_args)
-    return _CONTEXT
-
-
-def publish_role() -> str | None:
-    """The role recorded by the last ``publish`` (None for a legacy set)."""
-    return _CONTEXT._publish_role
-
-
 def get_stream(name: str) -> Any:
     return _CONTEXT.get_stream(name)
 
@@ -1126,7 +1031,6 @@ def reset_context() -> None:
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
     _CONTEXT._overrides_log = []
-    _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()

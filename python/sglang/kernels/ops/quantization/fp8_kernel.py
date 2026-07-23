@@ -59,7 +59,7 @@ if _is_cuda or _is_musa:
         per_token_group_quant,
         sgl_per_token_quant_fp8,
     )
-    from sglang.kernels.ops.quantization._jit_per_tensor_quant_fp8 import (
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
@@ -543,7 +543,7 @@ def _run_per_token_group_quant_8bit_kernel(
     ``sglang_per_token_quant_fp8``.
     """
     if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
-        from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
+        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )
 

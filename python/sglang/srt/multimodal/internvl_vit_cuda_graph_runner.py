@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.runtime_context import get_mm
+from sglang.srt.runtime_context import get_server_args
 
 
 class InternViTCudaGraphRunner:
@@ -95,7 +95,7 @@ class InternViTCudaGraphRunner:
 
     def _warmup_once(self, key: Hashable) -> None:
         """Run a tiny eager warmup on the preallocated buffers to trigger lazy init."""
-        override_backend = get_mm().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
         cu = self.cu[key]
         cu_kk = self.cu_kk[key]
         max_len = int(cu_kk.max().item()) if cu_kk.numel() else 0
@@ -115,7 +115,7 @@ class InternViTCudaGraphRunner:
 
     def _capture_graph(self, key: Hashable) -> None:
         g = torch.cuda.CUDAGraph()
-        override_backend = get_mm().mm_attention_backend
+        override_backend = get_server_args().mm_attention_backend
 
         cu = self.cu[key]
         cu_kk = self.cu_kk[key]
