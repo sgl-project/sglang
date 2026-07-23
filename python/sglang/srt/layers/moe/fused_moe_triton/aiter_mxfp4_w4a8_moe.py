@@ -34,10 +34,7 @@ def _import_aiter_w4a8():
             import aiter.ops.triton.moe_routing.routing as _routing_mod
 
         from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
-        from aiter.ops.triton.moe.quant_moe import (
-            downcast_to_static_fp8,
-            downcast_to_static_fp8_gather,
-        )
+        from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
     except ImportError:
         return None
 
@@ -53,7 +50,6 @@ def _import_aiter_w4a8():
         _routing_mod.routing,
         moe_gemm_a8w4,
         downcast_to_static_fp8,
-        downcast_to_static_fp8_gather,
     )
 
 
@@ -150,9 +146,7 @@ def aiter_w4a8_gfx1250_forward(
             "aiter triton W4A8 MoE (moe_gemm_a8w4) is required for the gfx1250 "
             "GPT-OSS MXFP4 path but was not found in the installed aiter build."
         )
-    routing, moe_gemm_a8w4, downcast_to_static_fp8, downcast_to_static_fp8_gather = (
-        imported
-    )
+    routing, moe_gemm_a8w4, downcast_to_static_fp8 = imported
 
     assert hidden_states.dtype == torch.bfloat16
 
@@ -166,18 +160,12 @@ def aiter_w4a8_gfx1250_forward(
 
     # gfx1250: the in-kernel gather is broken, so we pass gather_indx=None to
     # moe_gemm_a8w4 and perform the gather ourselves.
+    gather_src = gather_idx.to(torch.long) // topk
+    x = hidden_states[gather_src]
     if apply_router_weight_on_input:
         # Router weights must be applied in bf16 before quantization.
-        gather_src = gather_idx.to(torch.long) // topk
-        x = hidden_states[gather_src]
         x = x * gammas[:, None].to(x.dtype)
-        x_fp8 = downcast_to_static_fp8(x, a13_scale)
-    else:
-        # Fully fused: divide routing indices, gather hidden_states rows, and
-        # quantize to fp8 in a single Triton kernel — no intermediate bf16 buffer.
-        x_fp8 = downcast_to_static_fp8_gather(
-            hidden_states, a13_scale, gather_src_idx=gather_idx, topk=topk
-        )
+    x_fp8 = downcast_to_static_fp8(x, a13_scale)
 
     # GEMM1: FP8 activations x MXFP4 weights, fused SwiGLU, requantize the
     # intermediate to FP8 using the down_proj activation scale (a2_scale) so
