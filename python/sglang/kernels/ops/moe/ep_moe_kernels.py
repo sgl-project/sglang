@@ -898,6 +898,7 @@ def post_reorder_for_cutlass_moe(
 @triton.jit
 def post_reorder_deepgemm_triton_kernel(
     down_output_ptr,
+    pair_delta_ptr,
     output_ptr,
     src2dst_ptr,
     topk_ids_ptr,
@@ -906,11 +907,16 @@ def post_reorder_deepgemm_triton_kernel(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    HAS_PAIR_DELTA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    """`expert_id >= 0` includes the shared expert at num_experts (padding=-1); don't
-    switch to the cutlass `!= num_local_experts` gate. routed_scaling_factor is folded into the store.
+    """Fixed-order DeepGEMM pair combine.
+
+    ``pair_delta`` is an unweighted canonical token/top-k contribution.  It is
+    added to the provider pair before this kernel applies the route weight and
+    the final routed scaling.  ``expert_id >= 0`` includes a shared expert at
+    ``num_experts``; padding/nonlocal pairs use ``-1``.
     """
     OutDtype = output_ptr.dtype.element_ty
 
@@ -939,6 +945,12 @@ def post_reorder_deepgemm_triton_kernel(
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
+                if HAS_PAIR_DELTA:
+                    pair_idx = src_idx * topk + idx
+                    delta_ptr_offs = (
+                        pair_delta_ptr + pair_idx * hidden_size + offset
+                    )
+                    in_data += tl.load(delta_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
         sum_vec *= routed_scaling_factor
         store_ptr_offs = output_ptr_offs + src_idx * hidden_size
@@ -955,10 +967,22 @@ def post_reorder_deepgemm(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    pair_delta=None,
 ):
+    if pair_delta is not None:
+        expected_shape = (num_tokens, topk, hidden_size)
+        if tuple(pair_delta.shape) != expected_shape:
+            raise ValueError(
+                f"pair_delta must have shape {expected_shape}, "
+                f"got {tuple(pair_delta.shape)}"
+            )
+        if pair_delta.device != down_output.device or not pair_delta.is_contiguous():
+            raise ValueError("pair_delta must be contiguous on the provider device")
+    pair_delta_ptr = down_output if pair_delta is None else pair_delta
     grid, block_dim = _get_launch_config_2d(down_output.device, num_tokens, hidden_size)
     post_reorder_deepgemm_triton_kernel[grid](
         down_output,
+        pair_delta_ptr,
         output,
         src2dst,
         topk_ids,
@@ -967,6 +991,7 @@ def post_reorder_deepgemm(
         num_tokens,
         hidden_size,
         float(routed_scaling_factor),
+        HAS_PAIR_DELTA=pair_delta is not None,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
     )

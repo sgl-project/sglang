@@ -1364,6 +1364,17 @@ class FusedMoE(torch.nn.Module):
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
 
+        return self.combine_and_finalize(
+            combine_input=combine_input,
+            origin_hidden_states_dim=origin_hidden_states_dim,
+        )
+
+    def combine_and_finalize(
+        self,
+        combine_input: CombineInput,
+        origin_hidden_states_dim: int,
+    ) -> torch.Tensor:
+        """Apply the common post-MoE combine, trim, and reduction contract."""
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):

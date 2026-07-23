@@ -158,7 +158,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
+        from sglang.srt.lora.sgl_lora.hooks import (
+            OUTPUT_DTYPE_STATE_KEY,
+            SglMoeLoRAHooks,
+        )
+
+        typed_hooks = hooks if isinstance(hooks, SglMoeLoRAHooks) else None
         weight_dtype = quant_info.w13_weight.dtype
+        if typed_hooks is not None:
+            if (
+                not runner_input.use_masked_gemm
+                or weight_dtype != torch.bfloat16
+                or "src2dst" not in running_state
+            ):
+                raise NotImplementedError(
+                    "Typed SGL LoRA hooks require Standard dispatch and the "
+                    "masked BF16 DeepGEMM path"
+                )
+            if self.config.apply_router_weight_on_input or self.config.no_combine:
+                raise NotImplementedError(
+                    "Typed SGL LoRA hooks require provider-owned route weighting "
+                    "and combine"
+                )
+            if running_state[OUTPUT_DTYPE_STATE_KEY] not in (
+                torch.bfloat16,
+                torch.float32,
+            ):
+                raise NotImplementedError(
+                    "Typed SGL LoRA DeepGEMM output must be BF16 or FP32"
+                )
+
         if not runner_input.use_masked_gemm:
             if weight_dtype == torch.bfloat16:
                 hidden_states = self._run_bf16_contiguous_gemm(
@@ -171,7 +200,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         else:
             if weight_dtype == torch.bfloat16:
                 hidden_states = self._run_masked_bf16_gemm(
-                    runner_input, quant_info, running_state
+                    runner_input, quant_info, running_state, hooks=typed_hooks
                 )
             else:
                 hidden_states = self._run_masked_gemm(
@@ -580,9 +609,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         runner_input: DeepGemmRunnerInput,
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
         from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.lora.sgl_lora.hooks import (
+            PAIR_CONTRIBUTION_STATE_KEY,
+            DownHookContext,
+            GateUpHookContext,
+        )
 
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
@@ -608,6 +643,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         dispose_tensor(hidden_states)
 
+        if hooks is not None and hooks.inject_gate_up is not None:
+            hooks.inject_gate_up(
+                GateUpHookContext(
+                    provider_gate_up=gateup_output,
+                    pair_to_provider_row=running_state["src2dst"],
+                    provider_layout="gate_then_up",
+                )
+            )
+
         down_input = torch.empty(
             (
                 gateup_output.shape[0],
@@ -621,6 +665,29 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # Act
         silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
         del gateup_output
+
+        if hooks is not None:
+            if hooks.build_down_pair_contribution is not None:
+                # The callback returns an unweighted canonical pair delta.
+                # Provider post-permute owns route weighting, routed scaling,
+                # FP32 accumulation, and the output allocation/cast.
+                contribution = hooks.build_down_pair_contribution(
+                    DownHookContext(
+                        provider_activation=down_input,
+                        pair_to_provider_row=running_state["src2dst"],
+                    )
+                )
+                if contribution is not None:
+                    topk_ids = running_state["topk_ids"]
+                    contribution.validate_for(
+                        expected_shape=(
+                            topk_ids.shape[0],
+                            topk_ids.shape[1],
+                            w2_weight.shape[1],
+                        ),
+                        expected_device=down_input.device,
+                    )
+                    running_state[PAIR_CONTRIBUTION_STATE_KEY] = contribution
 
         # GroupGemm-1
         n = w2_weight.shape[1]
@@ -717,6 +784,10 @@ def post_permute_deep_gemm_to_standard(
 ) -> StandardCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.lora.sgl_lora.hooks import (
+        OUTPUT_DTYPE_STATE_KEY,
+        PAIR_CONTRIBUTION_STATE_KEY,
+    )
 
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
@@ -724,10 +795,13 @@ def post_permute_deep_gemm_to_standard(
     src2dst = running_state["src2dst"]
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
+    output_dtype = running_state.get(OUTPUT_DTYPE_STATE_KEY, hidden_states_dtype)
+    pair_contribution = running_state.get(PAIR_CONTRIBUTION_STATE_KEY)
+    pair_delta = None if pair_contribution is None else pair_contribution.values
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         output = torch.empty(
-            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+            hidden_states_shape, dtype=output_dtype, device=hidden_states_device
         )
     post_reorder_deepgemm(
         runner_output.hidden_states,
@@ -743,6 +817,7 @@ def post_permute_deep_gemm_to_standard(
             if runner_config.routed_scaling_factor is not None
             else 1.0
         ),
+        pair_delta=pair_delta,
     )
     dispose_tensor(runner_output.hidden_states)
 

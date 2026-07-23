@@ -15,11 +15,17 @@ from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerC
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
+    from sglang.srt.lora.sgl_lora.hooks import (
+        MoeLoRAHookBuilder,
+        SglMoeLoRAHooks,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +36,12 @@ class MoeRunner:
         runner_backend: MoeRunnerBackend,
         config: MoeRunnerConfig,
         lora_enabled: bool = False,
+        lora_hook_builder: Optional[MoeLoRAHookBuilder] = None,
     ):
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
+        self.lora_hook_builder = lora_hook_builder
 
         self.fused_func = None
 
@@ -83,8 +91,8 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
-        if not lora_enabled:
+        # An injected hook builder also requires the decomposed runner path.
+        if not lora_enabled and lora_hook_builder is None:
             a2a_backend_name = get_moe_a2a_backend().value
             runner_backend_name = runner_backend.value
 
@@ -112,14 +120,23 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
+        self,
+        dispatch_output: DispatchOutput,
+        quant_info: MoeQuantInfo,
+        lora_info=None,
+        *,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> CombineInput:
-        if self.fused_func is not None and not self.lora_enabled:
+        if (
+            self.fused_func is not None
+            and not self.lora_enabled
+            and self.lora_hook_builder is None
+        ):
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
 
-        def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+        def _maybe_build_legacy_lora_hooks(_runner_input: Any) -> Optional[LoRAHooks]:
             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
@@ -139,10 +156,45 @@ class MoeRunner:
                 )
             return None
 
+        def _build_typed_lora_hooks(
+            running_state: dict,
+        ) -> Optional[SglMoeLoRAHooks]:
+            if self.lora_hook_builder is None:
+                return None
+
+            from sglang.srt.lora.sgl_lora.hooks import (
+                OUTPUT_DTYPE_STATE_KEY,
+                MoeLoRAHookBuildContext,
+                SglMoeLoRAHooks,
+            )
+
+            resolved_output_dtype = (
+                dispatch_output.hidden_states.dtype
+                if output_dtype is None
+                else output_dtype
+            )
+            context = MoeLoRAHookBuildContext(
+                dispatch_output=dispatch_output,
+                lora_info=lora_info,
+                runner_backend=self.runner_backend,
+            )
+            hooks = self.lora_hook_builder(context)
+            if hooks is not None and not isinstance(hooks, SglMoeLoRAHooks):
+                raise TypeError(
+                    "An SGL LoRA hook builder must return SglMoeLoRAHooks or None"
+                )
+            if hooks is not None:
+                running_state[OUTPUT_DTYPE_STATE_KEY] = resolved_output_dtype
+            return hooks
+
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
         if hasattr(self.runner_core, "run_from_dispatch"):
-            hooks = _maybe_build_lora_hooks(dispatch_output)
+            if self.lora_hook_builder is not None:
+                raise NotImplementedError(
+                    "Typed SGL LoRA hooks require a decomposed MoeRunner core"
+                )
+            hooks = _maybe_build_legacy_lora_hooks(dispatch_output)
             return self.runner_core.run_from_dispatch(
                 dispatch_output, quant_info, self.config, hooks=hooks
             )
@@ -159,11 +211,23 @@ class MoeRunner:
         if self.meta_overlap_args is not None:
             running_state["meta_overlap_args"] = self.meta_overlap_args
 
+        # The typed builder must see canonical dispatch tensors before a provider
+        # pre-permute can dispose or replace their storage.
+        typed_hooks = _build_typed_lora_hooks(running_state)
+        if typed_hooks is not None and not self.runner_backend.is_deep_gemm():
+            raise NotImplementedError(
+                "Typed SGL LoRA hooks currently support the DeepGEMM runner core"
+            )
+
         runner_input = self.pre_permute_func(
             dispatch_output, quant_info, self.config, running_state
         )
 
-        hooks = _maybe_build_lora_hooks(runner_input)
+        hooks = (
+            typed_hooks
+            if self.lora_hook_builder is not None
+            else _maybe_build_legacy_lora_hooks(runner_input)
+        )
 
         runner_output = self.runner_core.run(
             runner_input, quant_info, running_state, hooks=hooks
