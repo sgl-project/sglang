@@ -625,7 +625,7 @@ class CommonKVManager(BaseKVManager):
             # The strict topology validated above has one decode TP/DCP rank
             # for each prefill CP rank, so each sender waits for one receiver.
             required_dst_info_num = 1
-            logger.info(
+            logger.debug(
                 "Using PCP-DCP rank affinity: prefill_cp_rank=%d -> "
                 "decode_dcp_rank=%d",
                 self.dcp_rank,
