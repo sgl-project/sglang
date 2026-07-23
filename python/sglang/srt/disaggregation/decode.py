@@ -2050,6 +2050,8 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                if getattr(batch, "token_handoff_replay_batch", False):
+                    self.complete_token_handoff_replay_batch(batch)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -2065,6 +2067,11 @@ class SchedulerDisaggregationDecodeMixin:
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            if (
+                self.last_batch
+                and getattr(self.last_batch, "token_handoff_replay_batch", False)
+            ):
+                self.complete_token_handoff_replay_batch(self.last_batch)
 
         while True:
             # Receive requests
@@ -2132,39 +2139,16 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch
             and getattr(self.last_batch, "token_handoff_replay_batch", False)
         ):
-            replay_batch = self.last_batch
-            for req in replay_batch.reqs:
-                expected = req.token_handoff_replay_expected_id
-                actual = int(req.output_ids[-1])
-                if actual != expected:
-                    prepare_abort(
-                        req,
-                        f"Token handoff replay mismatch: expected {expected}, "
-                        f"got {actual}",
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
-                    self.output_streamer.stream_output([req], req.return_logprob)
-                    continue
-                req.stream = req.token_handoff_original_stream
-                decode_ids, _ = req.init_incremental_detokenize()
-                req.send_decode_id_offset = len(decode_ids)
-                req.send_token_offset = len(req.output_ids)
-                logger.info(
-                    "Token handoff replay verified rid=%s bridge_tokens=%d",
-                    req.rid,
-                    len(req.output_ids),
-                )
-                del req.token_handoff_replay_expected_id
-                del req.token_handoff_original_stream
+            # The overlap event loop has not processed this batch's result yet.
+            # Yield one scheduling turn; pop_and_process() validates it below.
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
-            replay_batch.filter_batch()
-            if not replay_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = replay_batch
-                else:
-                    running_batch.merge_batch(replay_batch)
-            self.last_batch = None
+        while self.disagg_token_handoff_replay_completed_batches:
+            replay_batch = self.disagg_token_handoff_replay_completed_batches.pop(0)
+            if running_batch.is_empty():
+                running_batch = replay_batch
+            else:
+                running_batch.merge_batch(replay_batch)
 
         if self.disagg_token_handoff_replay_queue:
             replay_reqs = self.disagg_token_handoff_replay_queue
@@ -2180,6 +2164,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             replay_batch.prepare_for_extend()
             replay_batch.token_handoff_replay_batch = True
+            self.disagg_token_handoff_replay_inflight = replay_batch
             set_schedule_time_batch(replay_batch)
             return NextBatchPlan(
                 batch_to_run=replay_batch,
@@ -2213,6 +2198,42 @@ class SchedulerDisaggregationDecodeMixin:
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def complete_token_handoff_replay_batch(
+        self: Scheduler, replay_batch: ScheduleBatch
+    ) -> None:
+        """Validate replay after its result is committed to each request."""
+
+        for req in replay_batch.reqs:
+            expected = req.token_handoff_replay_expected_id
+            actual = int(req.output_ids[-1])
+            if actual != expected:
+                prepare_abort(
+                    req,
+                    f"Token handoff replay mismatch: expected {expected}, got {actual}",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self.output_streamer.stream_output([req], req.return_logprob)
+                continue
+
+            req.stream = req.token_handoff_original_stream
+            decode_ids, _ = req.init_incremental_detokenize()
+            req.send_decode_id_offset = len(decode_ids)
+            req.send_token_offset = len(req.output_ids)
+            logger.info(
+                "Token handoff replay verified rid=%s bridge_tokens=%d",
+                req.rid,
+                len(req.output_ids),
+            )
+            del req.token_handoff_replay_expected_id
+            del req.token_handoff_original_stream
+
+        replay_batch.filter_batch()
+        replay_batch.token_handoff_replay_batch = False
+        self.disagg_token_handoff_replay_inflight = None
+        if not replay_batch.is_empty():
+            self.disagg_token_handoff_replay_completed_batches.append(replay_batch)
 
     def get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
