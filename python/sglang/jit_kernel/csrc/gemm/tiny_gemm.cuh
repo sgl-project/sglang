@@ -75,7 +75,7 @@ __global__ __launch_bounds__(K / kTinyNGemmVecSize, 1)  // 1 block per SM
         acc = fma_f32_bf16(xv[m][i], wv[n][i], acc);
       }
 #else
-      for (uint32_t i = 0; i < kTinyGemmVecSize / 2; ++i) {
+      for (uint32_t i = 0; i < kTinyNGemmVecSize / 2; ++i) {
         const auto [x0, x1] = cast<fp32x2_t>(bf16x2_t{xv[m][2 * i], xv[m][2 * i + 1]});
         const auto [w0, w1] = cast<fp32x2_t>(bf16x2_t{wv[n][2 * i], wv[n][2 * i + 1]});
         acc = fmaf(x0, w0, acc);
