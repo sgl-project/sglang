@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
@@ -174,6 +175,10 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
+                # Verify the remapped prefix exists in quant_description.
+                # If not (e.g. json uses fused name as-is), fall back to original.
+                if prefix_in_quant_config + ".weight" not in self.quant_description:
+                    prefix_in_quant_config = prefix
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -208,6 +213,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
             ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
             ("W4A8_MXFP", ModelSlimMXFP4W4A8Scheme),
+            ("W4A4_MXFP4", ModelSlimMXFP4Scheme),
         ]
 
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
@@ -233,38 +239,61 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
         ]
-        w13_keys = [
-            prefix + ".0.gate_proj.weight",
-            prefix + ".0.up_proj.weight",
+
+        # Try multiple naming conventions:
+        #   (gate_proj, up_proj, down_proj) – standard compressed-tensors format
+        #   (w1, w3, w2)                      – MiniMax-M2.5 / some other models
+        naming_conventions = [
+            ("gate_proj", "up_proj", "down_proj"),
+            ("w1", "w3", "w2"),
         ]
-        w2_key = prefix + ".0.down_proj.weight"
-        w13_entries = {
-            key: self.quant_description[key]
-            for key in w13_keys
-            if key in self.quant_description
-        }
-        if not w13_entries or w2_key not in self.quant_description:
-            missing_groups = []
-            if not w13_entries:
-                missing_groups.append(f"W13 ({', '.join(w13_keys)})")
-            if w2_key not in self.quant_description:
-                missing_groups.append(f"W2 ({w2_key})")
+
+        w13_scheme_name = None
+        w2_scheme_name = None
+        for gate_name, up_name, down_name in naming_conventions:
+            w13_keys = [
+                f"{prefix}.0.{gate_name}.weight",
+                f"{prefix}.0.{up_name}.weight",
+            ]
+            w2_key = f"{prefix}.0.{down_name}.weight"
+            w13_entries = {
+                key: self.quant_description[key]
+                for key in w13_keys
+                if key in self.quant_description
+            }
+            if w13_entries and w2_key in self.quant_description:
+                w13_names = list(w13_entries.values())
+                # For w13, both projections must agree on the scheme
+                unique_w13 = set(w13_names)
+                if len(unique_w13) > 1:
+                    raise ValueError(
+                        f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
+                        f"{w13_entries}"
+                    )
+                w13_scheme_name = w13_names[0]
+                w2_scheme_name = self.quant_description[w2_key]
+                break
+
+        if w13_scheme_name is None:
+            # Build a helpful error message listing all attempted key patterns
+            all_attempted = []
+            for gate_name, up_name, down_name in naming_conventions:
+                w13_keys = [
+                    f"{prefix}.0.{gate_name}.weight",
+                    f"{prefix}.0.{up_name}.weight",
+                ]
+                w2_key = f"{prefix}.0.{down_name}.weight"
+                w13_found = any(k in self.quant_description for k in w13_keys)
+                w2_found = w2_key in self.quant_description
+                status = (
+                    f"({gate_name}/{up_name}={'found' if w13_found else 'missing'}, "
+                    f"{down_name}={'found' if w2_found else 'missing'})"
+                )
+                all_attempted.append(status)
             raise ValueError(
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
-                + ", ".join(missing_groups)
+                + "; ".join(all_attempted)
             )
-
-        w13_names = list(w13_entries.values())
-        w2_name = self.quant_description[w2_key]
-
-        # For w13, gate_proj and up_proj must agree on the scheme
-        unique_w13 = set(w13_names)
-        if len(unique_w13) > 1:
-            raise ValueError(
-                f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
-                f"{w13_entries}"
-            )
-        w13_scheme_name = w13_names[0]
 
         # Map scheme names to classes
         scheme_map = dict(
@@ -280,14 +309,14 @@ class ModelSlimConfig(QuantizationConfig):
             return cls(self, weight_group)
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
-        w2_scheme = instantiate(w2_name, weight_group="w2")
+        w2_scheme = instantiate(w2_scheme_name, weight_group="w2")
         if w13_scheme is None or w2_scheme is None:
             raise ValueError(
                 f"Unsupported ModelSlim MoE schemes for layer {prefix}: "
-                f"gate/up={w13_names}, down_proj='{w2_name}'"
+                f"W13='{w13_scheme_name}', W2='{w2_scheme_name}'"
             )
-        logger.info_once(f"Using {type(w13_scheme).__name__} for gate_up_proj")
-        logger.info_once(f"Using {type(w2_scheme).__name__} for down_proj")
+        logger.info_once(f"Using {type(w13_scheme).__name__} for W13")
+        logger.info_once(f"Using {type(w2_scheme).__name__} for W2")
 
         return w13_scheme, w2_scheme
 

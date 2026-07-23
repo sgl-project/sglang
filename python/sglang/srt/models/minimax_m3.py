@@ -107,7 +107,7 @@ _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
-        from sglang.jit_kernel.minimax_m3.qk_norm_rope import (
+        from sglang.kernels.ops.attention.minimax_m3_qk_norm_rope import (
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope_cache,
@@ -1003,7 +1003,7 @@ class MiniMaxM3Attention(nn.Module):
             qkv = fused_out[:, : self._fused_main_size]
 
             if self._combined_qknorm_ok:
-                from sglang.jit_kernel.minimax_qknorm_rope import (
+                from sglang.kernels.ops.attention.minimax_qknorm_rope import (
                     minimax_qknorm_rope_grouped,
                 )
 
@@ -1023,7 +1023,9 @@ class MiniMaxM3Attention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
 
         if self._use_fused_qknorm_rope:
-            from sglang.jit_kernel.minimax_qknorm_rope import minimax_qknorm_rope
+            from sglang.kernels.ops.attention.minimax_qknorm_rope import (
+                minimax_qknorm_rope,
+            )
 
             minimax_qknorm_rope(
                 qkv,
@@ -1055,7 +1057,7 @@ class MiniMaxM3Attention(nn.Module):
                     and self.index_rotary_emb.cos_sin_cache.dtype == torch.float32
                 )
                 if use_fused_index_norm_rope:
-                    from sglang.jit_kernel.minimax_qknorm_rope import (
+                    from sglang.kernels.ops.attention.minimax_qknorm_rope import (
                         minimax_qknorm_rope,
                     )
 

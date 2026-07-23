@@ -23,14 +23,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    v4_rope_inplace_npu,
+)
+from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
-)
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    v4_rope_inplace_npu,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -125,7 +125,10 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
-from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
+from sglang.srt.models.deepseek_common.utils import (
+    _use_aiter_bpreshuffle_gfx95,
+    is_wint4afp8_or_wint4a16_config,
+)
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
     _is_cuda,
@@ -2743,7 +2746,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -2879,16 +2882,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                         loaded_params.add(name)
                         break
                     else:
+                        skip_unmaterialized_expert_param = False
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
                             if _is_npu:
                                 name = name.replace("weight_packed", "weight")
-                            name = name.replace(weight_name, param_name)
-                            if name not in params_dict:
+                            resolved_name = name.replace(weight_name, param_name)
+                            if resolved_name not in params_dict:
+                                skip_unmaterialized_expert_param = True
                                 continue
-                            param = params_dict[name]
+                            param = params_dict[resolved_name]
                             weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,
@@ -2898,16 +2903,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 func_args=(
                                     param,
                                     loaded_weight,
-                                    name,
+                                    resolved_name,
                                 ),
                                 func_kwargs={
                                     "shard_id": shard_id,
                                     "expert_id": expert_id,
                                 },
                             )
-                            loaded_params.add(name)
+                            loaded_params.add(resolved_name)
                             break
                         else:
+                            if skip_unmaterialized_expert_param:
+                                continue
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
                             if (
