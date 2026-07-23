@@ -274,18 +274,86 @@ def test_multi_head_different_pages():
     print("  ✅ Multi-head dispatch test passed!")
 
 
-# --- micro-benchmark ---------------------------------------------------------
+# --- CUDA graph replay test --------------------------------------------------
+
+
+def test_cuda_graph_replay():
+    """Verify kernel correctness under CUDA graph capture + replay."""
+    dev = torch.device("cuda")
+    torch.manual_seed(555)
+
+    page_size = 128
+    num_heads = 16
+    num_pages = 4
+    sm_scale = HEAD_DIM**-0.5
+
+    k_all = torch.randn(
+        num_pages, page_size, HEAD_DIM, dtype=torch.bfloat16, device=dev
+    )
+    k_mxfp4 = quantize_mxfp4(k_all.view(-1, HEAD_DIM)).reshape(
+        num_pages, page_size, BYTES_PER_TOKEN
+    )
+    k_bf16 = dequant_mxfp4(k_mxfp4.view(-1, BYTES_PER_TOKEN)).view(
+        num_pages, page_size, HEAD_DIM
+    )
+    k_cache = k_mxfp4.view(-1, BYTES_PER_TOKEN).contiguous()
+
+    from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
+
+    # Warmup
+    q_warm = torch.randn(num_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    page_ids_warm = (torch.arange(num_heads, device=dev) % num_pages).to(torch.int32)
+    mxfp4_decode_attention(q_warm, k_cache, page_ids_warm, sm_scale, page_size)
+    torch.cuda.synchronize()
+
+    # Capture static tensors
+    q_static = torch.zeros(num_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    page_ids_static = torch.zeros(num_heads, dtype=torch.int32, device=dev)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = mxfp4_decode_attention(
+            q_static, k_cache, page_ids_static, sm_scale, page_size
+        )
+    captured = graph_out.clone()
+
+    # Replay with real data
+    q_replay = torch.randn_like(q_static)
+    page_ids_replay = (torch.arange(num_heads, device=dev) % num_pages).to(torch.int32)
+    q_static.copy_(q_replay)
+    page_ids_static.copy_(page_ids_replay)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Verify against reference
+    ref = reference_decode_attention(
+        q_replay, k_bf16, page_ids_replay, sm_scale, page_size
+    )
+    assert not torch.equal(graph_out, captured)
+    cos = torch.nn.functional.cosine_similarity(
+        graph_out.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
+    print(f"  CUDA graph replay cos={cos:.6f}")
+    assert cos > 0.99
+    print("  ✅ CUDA graph replay test passed!")
+
+
+# --- micro-benchmark (cold L2, multiple rounds) ------------------------------
+
+
+def _flush_l2(dev: torch.device, size_mb: int = 64) -> None:
+    """Evict cached data from L2 by streaming a large buffer."""
+    buf = torch.empty(size_mb * 1024 * 1024 // 4, dtype=torch.float32, device=dev)
+    buf.zero_()
 
 
 def bench_decode():
-    """Measure decode latency for realistic DSV4 Flash shapes."""
+    """Measure decode latency with cold L2, multiple rounds."""
     dev = torch.device("cuda")
     torch.manual_seed(777)
 
     page_size = 128
     num_heads = 64  # DSV4 Flash
-    batch_size = 1
-    total = batch_size * num_heads
     num_pages = 4
     sm_scale = HEAD_DIM**-0.5
 
@@ -296,34 +364,41 @@ def bench_decode():
         num_pages, page_size, BYTES_PER_TOKEN
     )
     k_cache = k_mxfp4.view(-1, BYTES_PER_TOKEN).contiguous()
-
-    q = torch.randn(total, HEAD_DIM, dtype=torch.bfloat16, device=dev)
-    page_indices = (torch.arange(total, device=dev) % num_pages).to(torch.int32)
+    q = torch.randn(num_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    page_indices = (torch.arange(num_heads, device=dev) % num_pages).to(torch.int32)
 
     from sglang.jit_kernel.dsv4.mxfp4_decode import mxfp4_decode_attention
 
-    # warmup (also triggers JIT compilation)
-    for _ in range(3):
-        mxfp4_decode_attention(q, k_cache, page_indices, sm_scale, page_size)
+    # JIT warmup
+    mxfp4_decode_attention(q, k_cache, page_indices, sm_scale, page_size)
     torch.cuda.synchronize()
 
-    # timed runs
-    N_ITER = 100
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    ROUNDS = 3
+    ITERS = 100
+    round_medians = []
 
-    start.record()
-    for _ in range(N_ITER):
-        mxfp4_decode_attention(q, k_cache, page_indices, sm_scale, page_size)
-    end.record()
-    torch.cuda.synchronize()
+    for r in range(ROUNDS):
+        _flush_l2(dev)
 
-    elapsed_us = start.elapsed_time(end) * 1000 / N_ITER
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        for _ in range(ITERS):
+            mxfp4_decode_attention(q, k_cache, page_indices, sm_scale, page_size)
+        end.record()
+        torch.cuda.synchronize()
+
+        elapsed_us = start.elapsed_time(end) * 1000 / ITERS
+        round_medians.append(elapsed_us)
+
+    median_us = sorted(round_medians)[len(round_medians) // 2]
+    toks = page_size * num_heads
     print(
-        f"\n  MXFP4 decode benchmark: {elapsed_us:.1f} us/iter "
-        f"({page_size} tokens × {num_heads} heads)"
+        f"\n  MXFP4 decode benchmark: {median_us:.1f} us/iter "
+        f"({toks} QK ops, {toks / median_us * 1e6 / 1e3:.1f} kTok/s)"
     )
-    print(f"  → {page_size * num_heads / elapsed_us * 1e6 / 1e3:.1f} kTok/s")
+    print(f"  rounds (cold L2): {[f'{v:.1f}' for v in round_medians]} us")
 
 
 # --- main --------------------------------------------------------------------
@@ -333,6 +408,7 @@ if __name__ == "__main__":
 
     test_correctness_single_page()
     test_multi_head_different_pages()
+    test_cuda_graph_replay()
     bench_decode()
 
     print("\n✅ All tests passed!")
