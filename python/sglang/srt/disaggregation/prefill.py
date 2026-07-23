@@ -89,7 +89,9 @@ def token_handoff_eligible(req: Req, scheduler: Scheduler) -> bool:
         and scheduler.ps.tp_size == 1
         and scheduler.ps.pp_size == 1
         and scheduler.spec_algorithm.is_none()
-        and (req.sampling_params.temperature or 0.0) == 0.0
+        # SamplingParams.normalize rewrites temperature=0 to
+        # temperature=1/top_k=1, so top_k is the stable greedy marker here.
+        and req.sampling_params.top_k == 1
         and req.sampling_params.max_new_tokens > 1
     )
 
