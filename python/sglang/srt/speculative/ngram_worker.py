@@ -202,6 +202,12 @@ class NGRAMWorker(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    @staticmethod
+    def _grammar_forces_sync(batch: ScheduleBatch) -> bool:
+        """Whether the scheduler ran this grammar batch synchronously, i.e. resolved
+        the previous result before this forward (Scheduler.need_grammar_sync)."""
+        return batch.has_grammar and not batch.spec_algorithm.supports_grammar_overlap()
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -231,11 +237,11 @@ class NGRAMWorker(BaseSpecWorker):
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
         #
-        # Grammar batches are synchronous by design, not by omission: this draft
-        # runs on the host, so the scheduler keeps NGRAM on need_grammar_sync
-        # (supports_grammar_overlap is False) and the corpus lookup below already
-        # sees the previous batch's committed tokens.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        # The grammar half mirrors the scheduler's need_grammar_sync gate, so read
+        # the same capability instead of assuming grammar always means sync: this
+        # draft runs on the host, which is what keeps NGRAM off grammar overlap
+        # (by design, not pending migration -- see supports_grammar_overlap).
+        use_prev_tokens = self.enable_overlap and not self._grammar_forces_sync(batch)
         i = 0
         for req in batch.reqs:
             prev_tokens = (
@@ -347,10 +353,9 @@ class NGRAMWorker(BaseSpecWorker):
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Same splice condition as _prepare_draft_tokens (see there for why
-        # grammar batches are synchronous by design): only overlap mode has
-        # accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        # Same splice condition as _prepare_draft_tokens (see there): only overlap
+        # mode has accepted tokens missing from req.output_ids.
+        use_prev_tokens = self.enable_overlap and not self._grammar_forces_sync(batch)
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
