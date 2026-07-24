@@ -85,12 +85,14 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_non_idle_and_non_empty,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 class Glm4MoeLiteMLP(nn.Module):
@@ -242,6 +244,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            **({"scoring_func": "sigmoid"} if _is_npu else {}),
         )
 
         self.shared_experts_is_int8 = False
