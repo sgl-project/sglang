@@ -659,6 +659,12 @@ def can_handle(
         return False
     if v_extend.shape[2] != v_buffer.shape[2]:
         return False
+    # MLA (head_dim != v_head_dim, e.g. DeepSeek 576 vs 512) uses a shared
+    # latent KV cache and an absorbed-attention layout the split-KV verify
+    # kernel is not built for; it GPU-faults on that shape. Fall back to
+    # extend_attention_fwd, which handles MLA correctly.
+    if q_extend.shape[2] != v_extend.shape[2]:
+        return False
     # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
     # target-verify step runs inside a captured CUDA/HIP graph, where a
     # device->host sync raises hipErrorStreamCaptureUnsupported. We therefore
