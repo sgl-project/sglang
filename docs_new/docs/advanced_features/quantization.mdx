@@ -61,7 +61,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>No</td>
       <td>No</td>
       <td>Yes (A5)</td>
-      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> checkpoints are auto-detected via <code>modelslim</code></td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> dense and MoE checkpoints are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -801,6 +801,7 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W4A4_DYNAMIC``` MOE with online quantization of activations
     - [x]  ```W4A8_DYNAMIC``` MOE with online quantization of activations
+    - [x]  ```W4A8_MXFP``` MOE with dynamic MXFP8 activation quantization
     - [x]  ```W8A8_DYNAMIC``` MOE with online quantization of activations
     - [ ]  ```W4A8``` linear TBD
     - [ ]  ```W4A16``` linear TBD

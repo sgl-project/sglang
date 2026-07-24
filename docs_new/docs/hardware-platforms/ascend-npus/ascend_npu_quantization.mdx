@@ -69,6 +69,14 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
       <td><strong style={{color: 'red'}}>x</strong></td>
     </tr>
     <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/30318">MXFP4 W4A8 (ModelSlim)</a></td>
+      <td>MoE</td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+    </tr>
+    <tr>
       <td><a href="https://github.com/sgl-project/sglang/pull/23795">MXFP4 W4A4</a></td>
       <td>Linear</td>
       <td><strong style={{color: 'red'}}>x</strong></td>
@@ -384,6 +392,23 @@ python3 -m sglang.launch_server \
 > - Weights are packed FP4 (`float4_e2m1fn_x2`, two nibbles per byte) with a UE8M0 per-block shared exponent (block_size = 32); activations are per-token MXFP8. Matmul runs via `npu_quant_matmul(..., x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[0, 0, 32])`.
 > - The packed-FP4 dtype passed to the NPU ops (`dst_type` / `x2_dtype` / `input_dtype`) must be resolved from `torch_npu.float4_e2m1fn_x2` (an int enum), not the `torch.float4_e2m1fn_x2` dtype object, which recent op-plugin builds reject.
 > - Online and offline share the same kernel path and layout; they differ only in the weight source (RTN at load vs msmodelslim calibration).
+
+**ModelSlim W4A8 MXFP4 for LLM MoE models:**
+
+SGLang auto-detects offline ModelSlim `W4A8_MXFP` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend A5 or newer.
+
+```bash Command
+MODEL_PATH=/path/to/w4a8-mxfp4-moe-model
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --tp-size 1
+```
+
+> **Implementation Notes:**
+> - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
+> - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP8 dispatch. SGLang dynamically quantizes each expert input to MXFP8 immediately before grouped matmul.
 
 **MXFP4 W4A4 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
