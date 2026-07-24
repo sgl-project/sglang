@@ -608,8 +608,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.token_to_kv_pool = self.draft_runner_list[
                 step
             ].token_to_kv_pool
+            # DP/MLP-sync padding mutates ForwardBatch fields in place. Keep
+            # those per-runner mutations from leaking into the next MTP step.
+            step_forward_batch = replace(forward_batch)
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
-                forward_batch
+                step_forward_batch
             )
             maybe_detect_nan(
                 output.logits_output.next_token_logits,
@@ -673,8 +676,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            # Actual width: the multi-layer chain fills num_steps + 1 rows/req.
-            num_tokens_per_req=self.speculative_num_steps + 1,
+            # Actual width: the multi-layer chain fills num_steps + 1 rows/req,
+            # plus the boundary-KV front rows when the widened window is active
+            # (must match the capture width in the draft-extend graph runner).
+            num_tokens_per_req=self.speculative_num_steps
+            + 1
+            + self.draft_extend_num_front_tokens,
             num_tokens_for_logprob_per_req=1,
             num_front_tokens=self.draft_extend_num_front_tokens,
         )
