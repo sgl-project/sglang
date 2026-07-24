@@ -123,9 +123,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
-        # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
+        available_size = allocator.available_size()
+        if available_size < num_tokens:
+            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
