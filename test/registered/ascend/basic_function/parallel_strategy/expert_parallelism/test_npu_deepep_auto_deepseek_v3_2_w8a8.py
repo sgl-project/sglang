@@ -56,6 +56,7 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         "SGLANG_NPU_USE_MULTI_STREAM": "1",
         "TASK_QUEUE_ENABLE": "0",
         "TRANSFORMERS_VERBOSITY": "error",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     }
 
     accuracy = 0.95  # Test GSM8K accuracy ≥0.95
