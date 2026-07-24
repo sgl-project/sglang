@@ -459,7 +459,7 @@ def update_expert_weights_single_layer(
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
             # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
-            is_active = elastic_ep_state.active_ranks_cpu
+            is_active = elastic_ep_state.committed_active_ranks_cpu
             for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
                 has_isend = any(op.op == torch.distributed.isend for op in ops)
                 has_irecv = any(op.op == torch.distributed.irecv for op in ops)

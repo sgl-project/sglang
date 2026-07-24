@@ -19,6 +19,7 @@ class SchedulerIpcChannels:
     recv_from_rpc: Optional[zmq.Socket]
     send_to_tokenizer: SenderWrapper
     send_to_detokenizer: SenderWrapper
+    send_to_controller: SenderWrapper
     send_metrics_from_scheduler: Optional[zmq.Socket]
 
     @classmethod
@@ -52,6 +53,9 @@ class SchedulerIpcChannels:
             send_to_tokenizer_raw = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
+            send_to_controller_raw = get_zmq_socket(
+                context, zmq.PUSH, port_args.controller_input_ipc_name, False
+            )
             if skip_tokenizer_init:
                 # No decode work: send outputs straight to the tokenizer side
                 # (MultiTokenizerRouter fans out when tokenizer_worker_num > 1).
@@ -66,11 +70,13 @@ class SchedulerIpcChannels:
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
             send_to_detokenizer = SenderWrapper(send_to_detokenizer_raw)
+            send_to_controller = SenderWrapper(send_to_controller_raw)
         else:
             recv_from_tokenizer = None
             recv_from_rpc = None
             send_to_tokenizer = SenderWrapper(None)
             send_to_detokenizer = SenderWrapper(None)
+            send_to_controller = SenderWrapper(None)
 
         if metrics_enabled:
             send_metrics_from_scheduler = get_zmq_socket(
@@ -84,5 +90,6 @@ class SchedulerIpcChannels:
             recv_from_rpc=recv_from_rpc,
             send_to_tokenizer=send_to_tokenizer,
             send_to_detokenizer=send_to_detokenizer,
+            send_to_controller=send_to_controller,
             send_metrics_from_scheduler=send_metrics_from_scheduler,
         )

@@ -150,6 +150,9 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.recv_from_scheduler = get_zmq_socket(
+                self.context, zmq.PULL, port_args.controller_input_ipc_name, True
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -177,6 +180,7 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.elastic_ep_send_timeout_ms = envs.SGLANG_ELASTIC_EP_SEND_TIMEOUT_MS.get()
         self.load_snapshot_reader = create_load_snapshot_reader(
             server_args,
             port_args,
@@ -575,6 +579,13 @@ class DataParallelController:
                 )
                 worker_ports.append(worker_port)
                 self.workers[slot] = worker_socket
+                if (
+                    server_args.elastic_ep_backend is not None
+                    and self.elastic_ep_send_timeout_ms >= 0
+                ):
+                    worker_socket.setsockopt(
+                        zmq.SNDTIMEO, self.elastic_ep_send_timeout_ms
+                    )
                 logger.debug(
                     "Assigned port %s to worker slot %s on host %s",
                     worker_port,
@@ -642,7 +653,9 @@ class DataParallelController:
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
-                        server_args, dp_rank, worker_ports
+                        server_args,
+                        dp_rank,
+                        worker_ports,
                     )
                     if server_args.is_ep_scale_joiner:
                         # Scale-joiner outputs return through the primary tokenizer.
@@ -657,6 +670,9 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.controller_input_ipc_name = (
+                        port_args.controller_input_ipc_name
+                    )
                     rank_port_args.instance_id = port_args.instance_id
 
                 reader, writer = mp.Pipe(duplex=False)
@@ -759,8 +775,22 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
+                try:
+                    sock_send(self.workers[slot], req)
+                except zmq.Again:
+                    if (
+                        self.server_args.elastic_ep_backend is None
+                        or self.elastic_ep_send_timeout_ms < 0
+                    ):
+                        raise
+                    logger.warning(
+                        "send to DP worker %s timed out after %s ms; "
+                        "skipping for this request",
+                        slot,
+                        self.elastic_ep_send_timeout_ms,
+                    )
+                else:
+                    return
             attempts += 1
         raise RuntimeError(
             f"Cannot route request: all {len(active)} active DP workers "
@@ -793,15 +823,24 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    _EVENT_LOOP_DRAIN_BATCH = 64
+
     def event_loop(self):
+        poller = zmq.Poller()
+        poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+        poller.register(self.recv_from_scheduler, zmq.POLLIN)
         while True:
-            while True:
-                self.soft_watchdog.feed()
-                try:
-                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                self._request_dispatcher(recv_req)
+            self.soft_watchdog.feed()
+            ready = dict(poller.poll(timeout=1000))
+            for socket in (self.recv_from_tokenizer, self.recv_from_scheduler):
+                if socket not in ready:
+                    continue
+                for _ in range(self._EVENT_LOOP_DRAIN_BATCH):
+                    try:
+                        recv_req = sock_recv(socket, flags=zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    self._request_dispatcher(recv_req)
 
 
 def run_data_parallel_controller_process(

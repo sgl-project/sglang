@@ -2,19 +2,15 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Iterator, List, Optional
 
 import torch
 
 from sglang.srt.distributed import get_world_group, parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
-from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
-
-if TYPE_CHECKING:
-    from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.utils import is_cpu, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +36,23 @@ def get_scale_cohort_target(rank_offset: int) -> Optional[int]:
 
 @dataclass
 class ElasticEPState:
-    active_ranks: Optional[torch.Tensor]
-    last_active_ranks: Optional[torch.Tensor]
-    active_ranks_cpu: Optional[torch.Tensor]
+    """Elastic EP active-rank state.
+
+    Naming convention in this class:
+    - global: tensor indices are world ranks.
+    - pg: the mask originated from a process group, already mapped to global.
+      PG masks may cover only a prefix of capacity because launch-time groups
+      exclude later-admitted ranks.
+    - _cpu: tensor storage is on CPU; it does not mean CPU process-group source.
+    """
+
+    active_ranks: torch.Tensor
+    committed_active_ranks_cpu: torch.Tensor
+    last_handled_committed_active_ranks_cpu: torch.Tensor
+    staging_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    staging_global_pg_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    next_staging_slot: int = 0
+    pending_staging_slots: list[int] = field(default_factory=list)
     effective_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
@@ -52,24 +62,137 @@ class ElasticEPState:
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
 
-    def is_active_equal_last(self) -> bool:
-        return torch.equal(self.active_ranks, self.last_active_ranks)
+    def submit_active_snapshot(
+        self,
+        global_pg_active_ranks: torch.Tensor,
+        non_blocking: bool = True,
+    ) -> None:
+        """Enqueue copies of world-size active-rank snapshots.
+
+        With non_blocking=True (overlap path) the scheduler relies on
+        copy_done.synchronize() (same forward_stream, recorded strictly later)
+        to act as the barrier before reading the staging buffers. Non-overlap
+        callers pass non_blocking=False so the staging buffers are valid as
+        soon as this call returns.
+        """
+        slot = self.next_staging_slot
+        self.next_staging_slot ^= 1
+        staging_active_ranks_cpu = self.staging_active_ranks_cpu_slots[slot]
+        staging_global_pg_active_ranks_cpu = (
+            self.staging_global_pg_active_ranks_cpu_slots[slot]
+        )
+        self.pending_staging_slots.append(slot)
+        assert len(self.pending_staging_slots) <= 2
+
+        if self.active_ranks.device.type == "cuda":
+            staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=non_blocking)
+        else:
+            # CPU backend: fully synchronous, no stream involved.
+            staging_active_ranks_cpu.copy_(self.active_ranks)
+
+        num_pg_ranks = global_pg_active_ranks.numel()
+        assert num_pg_ranks <= self.committed_active_ranks_cpu.numel()
+        if global_pg_active_ranks.device.type == "cuda":
+            staging_global_pg_active_ranks_cpu[:num_pg_ranks].copy_(
+                global_pg_active_ranks, non_blocking=non_blocking
+            )
+        else:
+            staging_global_pg_active_ranks_cpu[:num_pg_ranks].copy_(
+                global_pg_active_ranks
+            )
+
+    def commit_active_snapshot(
+        self, global_pg_active_ranks_cpu: torch.Tensor, consensus_cpu_group
+    ) -> bool:
+        """Commit the oldest unconsumed world-size snapshot.
+
+        The committed mirror is a sticky fault latch: ranks return to active
+        only through explicit recover/reset. Caller must ensure the staging
+        buffers are ready, either by passing non_blocking=False to
+        submit_active_snapshot (non-overlap path) or by synchronizing the
+        stream after submit (e.g. via copy_done.synchronize, overlap path).
+        global_pg_active_ranks_cpu is a read-only process-group observation.
+        Returns True if a snapshot was committed.
+        """
+        if not self.pending_staging_slots:
+            return False
+        slot = self.pending_staging_slots.pop(0)
+        snapshot = self.staging_active_ranks_cpu_slots[slot]
+        global_pg_snapshot = self.staging_global_pg_active_ranks_cpu_slots[slot]
+
+        num_pg_ranks = global_pg_active_ranks_cpu.numel()
+        assert num_pg_ranks <= self.committed_active_ranks_cpu.numel()
+        self.committed_active_ranks_cpu.bitwise_and_(snapshot)
+        self.committed_active_ranks_cpu.bitwise_and_(global_pg_snapshot)
+        self.committed_active_ranks_cpu[:num_pg_ranks].bitwise_and_(
+            global_pg_active_ranks_cpu
+        )
+        torch.distributed.all_reduce(
+            self.committed_active_ranks_cpu,
+            op=torch.distributed.ReduceOp.MIN,
+            group=consensus_cpu_group,
+        )
+        return True
+
+    def is_stale_snapshot(self) -> bool:
+        """Return True iff a new fault has appeared since the last handled
+        snapshot. Call commit_active_snapshot() before this check."""
+        return not torch.equal(
+            self.committed_active_ranks_cpu,
+            self.last_handled_committed_active_ranks_cpu,
+        )
+
+    def mark_snapshot_handled(self) -> None:
+        """Snap last_handled to the current staging value so subsequent
+        is_stale_snapshot() calls only flag *new* faults."""
+        self.last_handled_committed_active_ranks_cpu.copy_(
+            self.committed_active_ranks_cpu
+        )
+
+    def clear_pending_snapshots(self) -> None:
+        self.pending_staging_slots.clear()
 
     def sync_active_to_cpu(self):
-        if self.active_ranks is not None:
-            self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
+        self.committed_active_ranks_cpu.copy_(self.active_ranks.detach().cpu())
 
     def snapshot_active_to_last(self):
-        if self.active_ranks is not None:
-            self.last_active_ranks = self.active_ranks.clone()
+        self.last_handled_committed_active_ranks_cpu.copy_(
+            self.active_ranks.detach().cpu()
+        )
 
     def reset(self):
-        if self.active_ranks is not None:
-            # Reserved slots stay inactive until their ranks join.
-            self.active_ranks.zero_()
-            self.active_ranks[: self.effective_ep_size] = 1
-            self.snapshot_active_to_last()
-            self.sync_active_to_cpu()
+        # Reserved slots stay inactive until their ranks join.
+        self.active_ranks.zero_()
+        self.active_ranks[: self.effective_ep_size] = 1
+        self.realign_snapshots_to_active()
+
+    def realign_snapshots_to_active(self):
+        """Re-baseline all snapshot state to the current active_ranks pattern.
+
+        Must run after any legitimate rewrite of active_ranks (fault recovery
+        reset, scale-up admission): the committed mirror is AND-sticky, so stale
+        staging slots holding the old pattern would otherwise re-kill ranks that
+        just became active, and a committed/last-handled mismatch would trigger a
+        spurious fault retract at the next result boundary. Pending staging slots
+        are overwritten, not dropped, so each submitted forward still has one
+        commit; those commits become idempotent ANDs against the new baseline.
+        Realign drains the device before overwriting the staging buffers so an
+        in-flight D2H copy cannot race the overwrite.
+        """
+        if self.active_ranks.device.type == "cuda":
+            # Drain any in-flight async staging copies before overwriting the
+            # pinned buffers; realign only runs on rare scale/recovery events.
+            torch.cuda.synchronize()
+
+        self.snapshot_active_to_last()
+        self.sync_active_to_cpu()
+        pattern = self.committed_active_ranks_cpu
+        for staging_active_ranks_cpu in self.staging_active_ranks_cpu_slots:
+            staging_active_ranks_cpu.copy_(pattern)
+        for (
+            staging_global_pg_active_ranks_cpu
+        ) in self.staging_global_pg_active_ranks_cpu_slots:
+            staging_global_pg_active_ranks_cpu.copy_(pattern)
 
 
 class ElasticEPStateManager:
@@ -93,13 +216,13 @@ class ElasticEPStateManager:
                 f"world_size ({world_size})."
             )
 
-            inst = cls._build_state(ep_size=active_rank_capacity, device=None)
+            inst = cls._build_state(
+                ep_size=active_rank_capacity,
+                effective_ep_size=world_size,
+                device=None,
+            )
             inst.effective_ep_size = world_size
             inst.original_ep_size = world_size
-            if active_rank_capacity > world_size:
-                inst.active_ranks[world_size:].zero_()
-                inst.snapshot_active_to_last()
-                inst.sync_active_to_cpu()
 
             if server_args.moe_a2a_backend == "nixl":
                 cls._on_scale = cls._on_scale_nixl
@@ -117,8 +240,7 @@ class ElasticEPStateManager:
         global_rank = torch.distributed.get_rank()
         inst.active_ranks.zero_()
         inst.active_ranks[global_rank] = 1
-        inst.snapshot_active_to_last()
-        inst.sync_active_to_cpu()
+        inst.realign_snapshots_to_active()
 
         if server_args.ep_join_mode == "scale":
             inst.effective_ep_size = (
@@ -144,13 +266,46 @@ class ElasticEPStateManager:
 
     @classmethod
     def _build_state(
-        cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
+        cls,
+        *,
+        ep_size: Optional[int] = None,
+        effective_ep_size: Optional[int] = None,
+        device: Optional[torch.device] = None,
     ) -> ElasticEPState:
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
+        if effective_ep_size is not None:
+            active[effective_ep_size:].zero_()
+        active_cpu = active.detach().cpu().clone()
+        # Initialize staging to the healthy initial state so is_stale_snapshot()
+        # before the first submit returns False (no false positive on startup).
+        if active.device.type == "cuda":
+            staging_active_ranks_cpu_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+        else:
+            staging_active_ranks_cpu_slots = (active_cpu.clone(), active_cpu.clone())
+
+        if active.device.type == "cuda":
+            staging_global_pg_active_ranks_cpu_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+        else:
+            staging_global_pg_active_ranks_cpu_slots = (
+                active_cpu.clone(),
+                active_cpu.clone(),
+            )
+
         return ElasticEPState(
             active_ranks=active,
-            last_active_ranks=active.clone(),
-            active_ranks_cpu=active.detach().cpu().clone(),
+            committed_active_ranks_cpu=active_cpu.clone(),
+            last_handled_committed_active_ranks_cpu=active_cpu,
+            staging_active_ranks_cpu_slots=staging_active_ranks_cpu_slots,
+            staging_global_pg_active_ranks_cpu_slots=(
+                staging_global_pg_active_ranks_cpu_slots
+            ),
+            pending_staging_slots=[],
         )
 
     @classmethod
@@ -292,13 +447,15 @@ class ElasticEPStateManager:
         The CPU snapshot is authoritative because rank polling uses it too.
         """
         inst = cls._instance
-        if inst is None or inst.active_ranks_cpu is None:
+        if inst is None:
             return False
         if inst.scale_phase == "recovery_unsupported":
             return False
         if inst.pending_ep_size is not None:
             return True
-        active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
+        active_count = int(
+            inst.committed_active_ranks_cpu[: inst.effective_ep_size].sum().item()
+        )
         return active_count < inst.effective_ep_size
 
 
@@ -352,8 +509,10 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
-    while not all(mooncake_ep.get_peer_state(backend, ranks)):
+def _wait_for_peer_state(mooncake_ep, process_group, ranks: List[int]) -> None:
+    # Relaunched ranks become recoverable asynchronously, so we poll until the
+    # target process group reports all requested peers as ready.
+    while not all(mooncake_ep.get_peer_state(process_group, ranks)):
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
 
@@ -389,12 +548,20 @@ def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
     return True
 
 
-def try_recover_ranks(global_ranks: List[int]) -> bool:
-    """Recover ranks in WORLD and every launch-time parallel group."""
-    if not _try_recover_world(global_ranks):
-        return False
-
+def can_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
+
+    world_group = torch.distributed.group.WORLD
+    return all(mooncake_ep.get_peer_state(world_group, global_ranks))
+
+
+def recover_ranks(global_ranks: List[int]) -> None:
+    from mooncake import ep as mooncake_ep
+
+    # Recover the world process group first, then recover each derived process group
+    # using ranks mapped into that group's local rank space.
+    world_group = torch.distributed.group.WORLD
+    mooncake_ep.recover_ranks(world_group, global_ranks)
 
     for group in _iter_live_parallel_groups():
         local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
@@ -408,13 +575,20 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
-    return True
+
+
+def join_process_group(label: str, process_group) -> None:
+    from mooncake import ep as mooncake_ep
+
+    logger.info("Recovered rank joining Mooncake process group %s", label)
+    mooncake_ep.join_group(process_group)
 
 
 def _join_world_group() -> None:
-    from mooncake import ep as mooncake_ep
-
-    mooncake_ep.join_group(torch.distributed.group.WORLD)
+    join_process_group(
+        "default_world",
+        torch.distributed.group.WORLD,
+    )
 
 
 def join_scale_process_group() -> None:
@@ -425,14 +599,18 @@ def join_scale_process_group() -> None:
 
 def join_process_groups() -> None:
     """Rejoin WORLD and every launch-time parallel group after recovery."""
-    from mooncake import ep as mooncake_ep
-
     _join_world_group()
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
-        mooncake_ep.join_group(group.device_group)
-        mooncake_ep.join_group(group.cpu_group)
+        join_process_group(
+            f"{group.unique_name}:device",
+            group.device_group,
+        )
+        join_process_group(
+            f"{group.unique_name}:cpu",
+            group.cpu_group,
+        )
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
@@ -456,67 +634,3 @@ def get_healthy_expert_location_src_rank(
         "No healthy rank found for broadcasting expert location metadata. "
         "All ranks are marked as elastic_ep_rejoin."
     )
-
-
-def maybe_recover_ep_ranks(
-    *,
-    tp_group: parallel_state.GroupCoordinator,
-    eplb_manager: EPLBManager,
-    random_seed: int,
-) -> bool:
-    # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-    # synchronization, and this function is on the forward-path.
-    # This check only runs when `--elastic-ep-backend` is enabled, so the
-    # synchronization overhead does not propagate to other configs.
-    # Leave for future optimization of the elastic EP path.
-    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
-        return False
-
-    tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
-    tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
-    tp_active_ranks &= tp_active_ranks_cpu
-    # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-    # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-    # tp-group index is the same as the global rank index.
-    ranks_to_recover = [
-        i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
-    ]
-
-    # try_recover_ranks polls peer state via Mooncake EP backend.
-    # Mooncake's internal semantics guarantee that all ranks observe
-    # consistent peer readiness state, so collective operations below
-    # are safe even though polling appears local.
-    if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-        eplb_manager.reset_generator()
-        broadcast_global_expert_location_metadata(
-            src_rank=get_healthy_expert_location_src_rank(
-                invoked_in_elastic_ep_rejoin_path=False
-            )
-        )
-        ElasticEPStateManager.instance().reset()
-        broadcast_pyobj(
-            [random_seed],
-            parallel_state.get_world_group().rank,
-            parallel_state.get_world_group().cpu_group,
-            src=parallel_state.get_world_group().ranks[0],
-        )
-        logger.info(f"recover ranks {ranks_to_recover} done")
-        return True
-
-    return False
-
-
-def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
-    elastic_ep_state = ElasticEPStateManager.instance()
-    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
-        return False
-    elastic_ep_state.snapshot_active_to_last()
-    elastic_ep_state.sync_active_to_cpu()
-    logger.info("EPLB due to rank faults")
-    gen = eplb_manager.rebalance()
-    while True:
-        try:
-            next(gen)
-        except StopIteration:
-            break
-    return True

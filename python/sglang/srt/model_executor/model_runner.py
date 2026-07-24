@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -33,7 +33,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
-from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed import bootstrap, get_world_group
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
@@ -45,8 +45,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     get_scale_cohort_target,
     join_process_groups,
     join_scale_process_group,
-    maybe_rebalance_after_rank_fault,
-    maybe_recover_ep_ranks,
+    recover_ranks,
     register_scale_cohort,
     try_admit_scale_ranks,
 )
@@ -189,6 +188,7 @@ from sglang.srt.state_capturer.routed_experts import (
     set_global_experts_capturer,
 )
 from sglang.srt.utils import (
+    broadcast_pyobj,
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
@@ -466,8 +466,7 @@ class ModelRunner:
         if state is not None:
             state.active_ranks.zero_()
             state.active_ranks[:join_effective_ep_size] = 1
-            state.snapshot_active_to_last()
-            state.sync_active_to_cpu()
+            state.realign_snapshots_to_active()
             state.scale_phase = "syncing_new_world"
         self._elastic_scale_ready_barrier(
             target_size=join_effective_ep_size,
@@ -1326,6 +1325,7 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        elastic_ep_state = ElasticEPStateManager.instance()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1365,14 +1365,6 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
@@ -1407,6 +1399,18 @@ class ModelRunner:
 
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
+
+        # Disagg-prefill loops have no elastic result boundary, so submits there
+        # would never commit and would overflow the staging ring.
+        if (
+            self.enable_elastic_ep
+            and not self.is_draft_worker
+            and self.server_args.disaggregation_mode != "prefill"
+        ):
+            elastic_ep_state.submit_active_snapshot(
+                global_pg_active_ranks=self.tp_group.active_ranks,
+                non_blocking=not self.server_args.disable_overlap_schedule,
+            )
 
         return output
 
@@ -1725,8 +1729,7 @@ class ModelRunner:
         state = ElasticEPStateManager.instance()
         for rank in ranks_to_join:
             state.active_ranks[rank] = 1
-        state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
+        state.realign_snapshots_to_active()
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
@@ -1806,13 +1809,6 @@ class ModelRunner:
                     logger.error("[Elastic EP] %s", error)
                 return
 
-            recovered = maybe_recover_ep_ranks(
-                tp_group=self.tp_group,
-                eplb_manager=self.eplb_manager,
-                random_seed=self.server_args.random_seed,
-            )
-            if recovered:
-                self.forward_pass_id = 0
             return
 
         local_timeout = (
@@ -1860,22 +1856,28 @@ class ModelRunner:
                 effective_size=effective_size,
             )
 
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
-        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        return output
+    def recover_ep_ranks_after_retract(self, ranks_to_recover: List[int]) -> None:
+        # `ranks_to_recover` uses global rank indices.
+        assert ranks_to_recover
+        recover_ranks(ranks_to_recover)
+        self.forward_pass_id = 0
+        if self.eplb_manager is not None:
+            self.eplb_manager.reset_generator()
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            ),
+        )
+        ElasticEPStateManager.instance().reset()
+
+        broadcast_pyobj(
+            [self.server_args.random_seed],
+            get_world_group().rank,
+            get_world_group().cpu_group,
+            src=get_world_group().ranks[0],
+        )
 
     def update_model_fields(
         self,
