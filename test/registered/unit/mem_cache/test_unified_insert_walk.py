@@ -13,7 +13,11 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
@@ -161,6 +165,114 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         cache.tree_core.end_insert()
         cache.sanity_check()
 
+    def test_backup_executor_skips_already_backed_nodes(self):
+        """Overlapping BackupKV chains must not back a node twice: a second
+        backup would allocate a second host copy and leak the first."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        node = next(iter(cache.root_node.children.values()))
+
+        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertTrue(node.backuped)
+        host_avail = cache.cache_controller.mem_pool_host.available_size()
+
+        # Re-applying an overlapping chain is a no-op skip, not a re-backup.
+        self.assertEqual(_write_backup(cache, node, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.available_size(), host_avail
+        )
+
+    def test_shallower_crossing_backs_up_above_backuped_middle(self):
+        """A shallower crossing node above a backuped middle must back up in
+        the same insert as the deeper crossing (its own walk barrier)."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        top = next(iter(cache.root_node.children.values()))
+
+        # A storage-prefetch completion host-inserts a backuped node below the
+        # still-unbacked top, legitimately breaking backup continuity.
+        host_indices = cache.cache_controller.mem_pool_host.alloc(8)
+        host_result = cache.tree_core.insert_host(
+            cache.root_node.id,
+            RadixKey(array("q", list(range(1, 9)))),
+            host_indices,
+            [f"h{i}" for i in range(8)],
+        )
+        cache.cache_controller.mem_pool_host.free(
+            host_indices[: host_result.prefix_len]
+        )
+        middle = next(iter(top.children.values()))
+        self.assertTrue(middle.backuped)
+        self.assertFalse(top.backuped)
+
+        # The device insert unevicts the middle and adds the deep leaf.
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 13)))
+        deep = next(iter(middle.children.values()))
+
+        cache.write_through_threshold = min(top.hit_count, deep.hit_count) + 1
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 17)))
+        cache.writing_check(write_back=True)
+        self.assertTrue(top.backuped)
+        self.assertTrue(deep.backuped)
+
+    def test_evict_drains_collected_frees_when_walk_raises(self):
+        """A device-eviction walk that raises mid-way must still free the
+        already-collected slots via the finally drain."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        self._insert(cache, allocator, req_to_token_pool, [10, 11, 12, 13])
+        available = allocator.available_size()
+
+        real_next = cache.tree_core.evict_device_next_node
+        calls = []
+
+        def raise_on_second(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real_next(*args, **kwargs)
+
+        with mock.patch.object(
+            cache.tree_core, "evict_device_next_node", side_effect=raise_on_second
+        ):
+            with self.assertRaises(RuntimeError):
+                cache.evict(EvictParams(num_tokens=8))
+        self.assertEqual(allocator.available_size(), available + 4)
+
+    def test_evict_host_drains_collected_frees_when_walk_raises(self):
+        """A host-eviction walk that raises mid-way must still free the
+        already-evicted host slots via the finally drain."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        for start in (1, 100):
+            self._insert(
+                cache, allocator, req_to_token_pool, list(range(start, start + 4))
+            )
+        for child in list(cache.root_node.children.values()):
+            self.assertGreater(_write_backup(cache, child, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        cache.evict(EvictParams(num_tokens=8))
+
+        host_avail = cache.cache_controller.mem_pool_host.available_size()
+        real_evict = cache.tree_core._evict_host_leaf
+        calls = []
+
+        def raise_on_second(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                raise RuntimeError("boom")
+            return real_evict(*args, **kwargs)
+
+        with mock.patch.object(
+            cache.tree_core, "_evict_host_leaf", side_effect=raise_on_second
+        ):
+            with self.assertRaises(RuntimeError):
+                cache.evict_host(8)
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.available_size(), host_avail + 4
+        )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestResumableInsertWalkSWA(_InsertWalkSuite):
@@ -199,6 +311,35 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertIsNotNone(window_node.component_data[ComponentType.SWA].value)
         self.assertIsNotNone(window_node.component_data[ComponentType.FULL].value)
         cache.sanity_check()
+
+    def test_dec_swa_lock_only_drains_frees_when_walk_raises(self):
+        """A SWA early-release that raises mid-walk must still free the
+        already-evicted SWA slots via the finally drain."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = list(range(1, 2 * sw + 1))
+        key = RadixKey(array("q", seq))
+        cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
+        m = cache.match_prefix(MatchPrefixParams(key=key))
+        lock = cache.inc_lock_ref(m.last_device_node)
+        # Release FULL first so the SWA early-release is the last lock standing.
+        cache.dec_lock_ref(m.last_device_node, lock.to_dec_params(), skip_swa=True)
+
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        real_evict = cache.tree_core._evict_component_and_detach_lru
+
+        def evict_then_raise(*args, **kwargs):
+            real_evict(*args, **kwargs)
+            raise RuntimeError("boom")
+
+        with mock.patch.object(
+            cache.tree_core,
+            "_evict_component_and_detach_lru",
+            side_effect=evict_then_raise,
+        ):
+            with self.assertRaises(RuntimeError):
+                cache.dec_swa_lock_only(m.last_device_node, lock.swa_uuid_for_lock)
+        self.assertEqual(allocator.swa_attn_allocator.available_size(), swa_avail + sw)
 
 
 if __name__ == "__main__":
