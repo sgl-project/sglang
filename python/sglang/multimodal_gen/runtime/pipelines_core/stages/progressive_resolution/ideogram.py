@@ -153,9 +153,10 @@ class Ideogram4ProgressiveDenoisingStage(
     """Progressive-resolution denoising stage for Ideogram 4.
 
     Inherits the progressive loop from ProgressiveDenoisingStage and the
-    Ideogram-specific dual-transformer forward pass from Ideogram4DenoisingStage
-    via MRO.  __init__ calls DenoisingStage directly to avoid cooperative-init
-    incompatibility between the two parent signatures.
+    Ideogram-specific forward pass from Ideogram4DenoisingStage via MRO. The
+    base checkpoint uses two transformers, while distilled checkpoints pass no
+    unconditional transformer. __init__ calls DenoisingStage directly to avoid
+    cooperative-init incompatibility between the two parent signatures.
 
     MRO for method resolution:
       Ideogram4ProgressiveDenoisingStage

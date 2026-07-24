@@ -296,6 +296,7 @@ class _TransferChunk:
     is_last_chunk: bool
     aux_index: Optional[int]
     normalized_state: Optional[List[Optional[npt.NDArray[np.int32]]]]
+    wait_event: Optional[object] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -506,6 +507,7 @@ class MoriKVManager(CommonKVManager):
                 infos[transfer_info.engine_key] = transfer_info
 
                 if len(infos) >= transfer_info.required_dst_info_num:
+                    self.resolve_kv_replica_factor(infos)
                     # All decode peers reported their dst metadata; pick a
                     # non-None decode_prefix_len if any peer set it (they
                     # should all agree, but be defensive). 0 means "no
@@ -1392,8 +1394,16 @@ class MoriKVSender(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank,
+        )
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None
@@ -1420,6 +1430,8 @@ class MoriKVSender(CommonKVSender):
             else None
         )
         self._record_transfer_indices(kv_indices, state_indices)
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
         self.kv_mgr.enqueue_transfer(
             _TransferChunk(
                 sender=self,
@@ -1428,6 +1440,7 @@ class MoriKVSender(CommonKVSender):
                 is_last_chunk=is_last_chunk,
                 aux_index=self.aux_index if is_last_chunk else None,
                 normalized_state=normalized_state,
+                wait_event=wait_event,
             )
         )
         self._maybe_finalize_if_room_failed()
@@ -1444,6 +1457,11 @@ class MoriKVSender(CommonKVSender):
         if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
             self._finalize_failure()
             return
+
+        # Wait for the prefill forward that produced these KV pages before
+        # issuing the RDMA read (early-send overlaps that forward).
+        if task.wait_event is not None:
+            task.wait_event.synchronize()
 
         statuses, infos = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,

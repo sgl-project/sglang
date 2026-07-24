@@ -376,6 +376,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
 
+    def resize(self, config) -> None:
+        size_full = int(config.full_max_total_num_tokens)
+        size_swa = int(config.swa_max_total_num_tokens)
+        self._size_full = size_full
+        self._size_swa = size_swa
+        for alloc, sz in (
+            (self.full_attn_allocator, size_full),
+            (self.swa_attn_allocator, size_swa),
+        ):
+            alloc.size = int(sz)
+            if self.page_size > 1:
+                alloc.num_pages = int(sz) // self.page_size
+        self.clear()
+
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()

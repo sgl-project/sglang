@@ -32,6 +32,7 @@ import torch
 import triton
 from torch.profiler import record_function
 
+from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -45,7 +46,6 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,7 @@ class MambaSubPoolSpec(SubPoolSpec):
     conv_dtype: torch.dtype
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
+    conv_slice_axis: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -538,6 +539,12 @@ class UnifiedMambaPool(MambaPool):
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
         self.replayssm_is_kda = False
+        self.enable_gdn_replayssm_spec = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
+        self.debug_memory_pool = False
+        self.conv_shard_groups = None
+        self.conv_slice_axis = spec.conv_slice_axis
 
         assert (
             conv_views[0].shape[0] == self.num_mamba_layers
@@ -874,6 +881,7 @@ def init_unified_mamba_pools(
         conv_dtype=cp.dtype.conv,
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
+        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
     total_bytes = (

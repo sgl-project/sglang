@@ -31,7 +31,9 @@ from sglang.multimodal_gen.test.server.realtime_consistency import (
 from sglang.multimodal_gen.test.server.test_server_utils import get_generate_fn
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
-    LINGBOT_WORLD_REALTIME_sampling_params,
+    LONGLIVE2_I2V_CI_sampling_params,
+    LONGLIVE2_T2V_CI_sampling_params,
+    REALTIME_MODEL_sampling_params,
 )
 
 # Request construction
@@ -493,8 +495,8 @@ def test_realtime_sampling_params_route_to_realtime_video_generator():
     assert generate_fn.__name__ == "generate_realtime_video"
 
 
-def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
-    params = LINGBOT_WORLD_REALTIME_sampling_params
+def test_realtime_model_params_are_lossless_gt_ready():
+    params = REALTIME_MODEL_sampling_params
 
     assert "floating island hotel" in params.prompt
     assert "825646291038" in str(params.image_path)
@@ -519,6 +521,33 @@ def test_lingbot_realtime_plastic_beach_params_are_lossless_gt_ready():
         [],
         [],
     ]
+
+
+def test_longlive2_cases_share_realtime_model_sampling_profile():
+    for params in (
+        LONGLIVE2_T2V_CI_sampling_params,
+        LONGLIVE2_I2V_CI_sampling_params,
+    ):
+        assert params.prompt == REALTIME_MODEL_sampling_params.prompt
+        assert params.fps == REALTIME_MODEL_sampling_params.fps
+        assert params.extras == {
+            "seed": 42,
+            "num_inference_steps": 4,
+            "guidance_scale": 1.0,
+        }
+        assert params.realtime_num_chunks is None
+        assert params.realtime_perf_thresholds == {}
+
+    assert LONGLIVE2_T2V_CI_sampling_params.image_path is None
+    assert (
+        LONGLIVE2_T2V_CI_sampling_params.output_size
+        == REALTIME_MODEL_sampling_params.output_size
+    )
+    assert (
+        LONGLIVE2_I2V_CI_sampling_params.image_path
+        == REALTIME_MODEL_sampling_params.image_path
+    )
+    assert LONGLIVE2_I2V_CI_sampling_params.output_size == "960x928"
 
 
 def test_lingbot_realtime_case_is_registered_by_default():

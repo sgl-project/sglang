@@ -2,29 +2,23 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import defaultdict
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
-    alloc_paged_token_slots_extend_npu,
+from sglang.kernels.ops.speculative.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+    verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_alloc_reserve_per_decode,
-    get_last_loc,
-)
-from sglang.srt.speculative.triton_ops.spec_tree import (
-    sgl_build_tree_kernel_efficient_triton,
-    verify_tree_greedy_kernel_triton,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -39,6 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -46,6 +41,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +49,11 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
-
-
-ALLOC_EXTEND_FUNCS = defaultdict(
-    lambda: alloc_paged_token_slots_extend,
-    {
-        "npu": alloc_paged_token_slots_extend_npu,
-    },
-)
+elif _is_cpu:
+    from sgl_kernel import (
+        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
+    )
+    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
 def per_step_draft_out_cache_loc(
@@ -137,6 +130,12 @@ class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1
     QLEN_ONLY_BITPACKING = 2
+
+
+def default_tree_mask_mode() -> TreeMaskMode:
+    # The CPU verify attention kernel (intel_amx) consumes the qlen x qlen
+    # QLEN_ONLY tree mask directly; FULL_MASK is for the GPU kernels.
+    return TreeMaskMode.QLEN_ONLY if _is_cpu else TreeMaskMode.FULL_MASK
 
 
 def build_tree_kernel_efficient(
@@ -230,6 +229,21 @@ def build_tree_kernel_efficient(
         )
     elif _is_xpu:
         sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    elif _is_cpu:
+        sgl_build_tree_kernel_efficient_cpu(
             parent_list,
             top_scores_index,
             seq_lens,
@@ -376,6 +390,20 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
 
+    elif _is_cpu:
+        sgl_verify_tree_greedy_cpu(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
+            # the CPU/CUDA call sites stay grep-symmetric.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
     elif _is_npu:
         from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 
@@ -461,15 +489,15 @@ def eagle_prepare_for_verify(
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_extend_cache_locs_func,
+    )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
     )
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -513,8 +541,12 @@ def eagle_prepare_for_verify(
         if target_worker.model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.FULL
     )
-    batch.capture_hidden_mode = capture_mode
-    verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+    verify_forward_batch = ForwardBatch.init_new(
+        batch,
+        target_worker.model_runner,
+        capture_hidden_mode=capture_mode,
+        return_hidden_states_before_norm=False,
+    )
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
@@ -535,6 +567,76 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def _seeded_verify_coins(
+    *,
+    sampling_seed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive deterministic verify-side coins from per-request sampling seeds.
+
+    Mirrors the main seeded-sampling path: murmur_hash32(seed, seq_lens,
+    column) mapped to [0, 1). Columns [0, draft_token_num) drive the
+    per-draft rejection coins; column draft_token_num drives the final
+    fallback-sampling coin.
+
+    Scope: this seeds only the verify-side RNG. With rejection sampling the
+    draft workers still pick candidates via unseeded multinomial
+    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
+    until the draft RNG is seeded in a follow-up; top-k/greedy draft
+    selection is already deterministic.
+    """
+    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+
+    cols = torch.arange(draft_token_num + 1, device=device, dtype=torch.int64)
+    hashed = murmur_hash32(
+        sampling_seed.to(torch.uint64), seq_lens.to(torch.uint64), cols
+    )
+    uniforms = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    # The float32 cast rounds the top 129 uint32 hashes to exactly 1.0, but
+    # the sampling kernels expect half-open [0, 1) coins: a 1.0 coin walks
+    # past the last CDF bucket and can return a zero-probability token.
+    # Clamp to the largest float32 below one; every other coin value is
+    # untouched, so previously verified bitwise baselines stay intact.
+    max_coin = 1.0 - 2**-24
+    coins = (
+        uniforms[:, :draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    coins_for_final_sampling = (
+        uniforms[:, draft_token_num].to(torch.float32).clamp_(max=max_coin)
+    ).contiguous()
+    return coins, coins_for_final_sampling
+
+
+def _verify_coins(
+    *,
+    sampling_info: SamplingBatchInfo,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    candidates: torch.Tensor,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rejection and final-sampling coins for verify: deterministic seeded
+    coins when sampling_seed is set (see _seeded_verify_coins), torch.rand
+    otherwise.
+    """
+    if sampling_info.sampling_seed is not None:
+        return _seeded_verify_coins(
+            sampling_seed=sampling_info.sampling_seed,
+            seq_lens=seq_lens,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+    # coins for rejection sampling
+    coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+    # coins for final sampling
+    coins_for_final_sampling = torch.rand(
+        (candidates.shape[0],), dtype=torch.float32, device=device
+    )
+    return coins, coins_for_final_sampling
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -549,13 +651,12 @@ def eagle_sample(
 
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import (
-        get_attention_tp_group,
         is_dp_attention_enabled,
     )
+    from sglang.srt.runtime_context import get_server_args
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
-    from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -617,7 +718,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -638,13 +739,11 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
-        from sglang.srt.speculative.reject_sampling import (
+        from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = (
-            get_global_server_args().speculative_use_rejection_sampling
-        )
+        use_rejection_sampling = get_server_args().speculative_use_rejection_sampling
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -655,20 +754,22 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        target_probs = top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
-        )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
@@ -687,10 +788,13 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        # coins for rejection sampling
-        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
-        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
 
         sampling_fn = (
             chain_speculative_sampling_triton
@@ -710,8 +814,8 @@ def eagle_sample(
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=get_global_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
 
@@ -720,7 +824,9 @@ def eagle_sample(
         # non-determinism in softmax/top_k/top_p, causing different
         # sampled tokens. Broadcast from rank 0 to ensure consistency.
         tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
         )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
@@ -771,8 +877,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -787,15 +891,22 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
     for i, r in enumerate(batch.reqs):
-        cur = r.kv_allocated_len
+        cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # Whole-page accounting: the paged allocator hands out full pages, so
+        # round nxt up to the page boundary or the unaligned tail is allocated
+        # but never recorded — a stranded-tail leak at page_size > 1.
+        nxt = max(
+            cur,
+            (r.kv_committed_len + double_alloc + page_size - 1)
+            // page_size
+            * page_size,
+        )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.kv_allocated_len = nxt
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -805,9 +916,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
-    from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_server_args
 
-    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
+    if page_size > 1 and (get_server_args().speculative_eagle_topk or 1) > 1:
         max_alloc_len = int(nxt_kv_lens_cpu.max())
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
@@ -820,31 +931,21 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # barrier has chained to the prev forward -> host stalls a full forward.
     cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    else:
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            cur_kv_lens_device,
-        )
-        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
-        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
-            req_pool_indices=batch.req_pool_indices,
-            batch=batch,
-        )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        cur_kv_lens_device,
-        nxt_kv_lens_device,
-        out_cache_loc,
-        bs,
+    tree_cache = batch.tree_cache
+    req_to_token_pool = batch.req_to_token_pool
+    req_pool_indices = batch.req_pool_indices
+    reqs = batch.reqs
+    cur_kv_lens = cur_kv_lens_device
+    nxt_kv_lens = nxt_kv_lens_device
+    alloc_for_spec_decode(
+        tree_cache,
+        req_to_token_pool,
+        reqs=reqs,
+        req_pool_indices=req_pool_indices,
+        cur_kv_lens=cur_kv_lens,
+        cur_kv_lens_cpu=cur_kv_lens_cpu,
+        nxt_kv_lens=nxt_kv_lens,
+        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+        num_needed_tokens=num_needed_tokens,
+        batch=batch,
     )
