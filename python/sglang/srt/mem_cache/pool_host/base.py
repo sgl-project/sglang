@@ -9,7 +9,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.mmap_allocator import memory_available_bytes
+from sglang.srt.mem_cache.mmap_allocator import (
+    HICACHE_HOST_MEMORY_RESERVE_BYTES as HICACHE_HOST_MEMORY_RESERVE_BYTES,
+)
+from sglang.srt.mem_cache.mmap_allocator import (
+    memory_available_bytes,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -20,9 +25,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-# Host RAM to leave free when sizing HiCache pools (OS, other processes).
-HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -124,7 +126,7 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
-        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

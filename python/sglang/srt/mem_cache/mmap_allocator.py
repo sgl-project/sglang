@@ -48,6 +48,11 @@ MEM_BACKEND_HUGEPAGE = 2
 HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
 HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
 
+# Host RAM to leave free when sizing HiCache pools (OS, other processes).
+# This reserve applies only to normal RAM. Pre-reserved hugetlb pages are
+# dedicated to hugepage allocations and must not be reduced by it.
+HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 * (1024**3)
+
 _HUGEPAGE_SYSFS_PATH = (
     "/sys/kernel/mm/hugepages/hugepages-2048kB",
     "/sys/kernel/mm/hugepages/hugepages-1048576kB",
@@ -84,16 +89,23 @@ def hugepage_available_bytes(hugepage_size: int) -> int:
 def memory_available_bytes() -> int:
     """Bytes available for HiCache host pool preflight.
 
-    Without ``SGLANG_HUGEPAGE_SIZE``, uses free host RAM. With hugepages requested,
-    uses ``max(RAM, free hugetlb)`` so preflight can succeed when normal RAM is
-    low but the reserved hugetlb pool is large (``alloc_mmap`` still may fall
-    back to normal pages if the pool is exhausted at allocation time).
+    The normal-RAM path keeps ``HICACHE_HOST_MEMORY_RESERVE_BYTES`` free for the
+    OS and other processes. With hugepages requested, free hugetlb bytes are
+    considered without that reserve because they have already been removed from
+    normal RAM and dedicated to hugepage allocations. ``alloc_mmap`` may still
+    fall back to normal pages if the hugetlb allocation fails.
     """
-    available_bytes = psutil.virtual_memory().available
+    normal_available_bytes = max(
+        psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES,
+        0,
+    )
     hugepage_size = hugepage_size_requested()
     if hugepage_size > 0:
-        available_bytes = max(available_bytes, hugepage_available_bytes(hugepage_size))
-    return available_bytes
+        return max(
+            normal_available_bytes,
+            hugepage_available_bytes(hugepage_size),
+        )
+    return normal_available_bytes
 
 
 def _tensor_storage_key(tensor: torch.Tensor) -> int:
