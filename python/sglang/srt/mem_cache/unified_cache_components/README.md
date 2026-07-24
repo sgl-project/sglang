@@ -17,6 +17,15 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 │              UnifiedRadixCache                │
 │            (unified_radix_cache.py)           │
 │                                               │
+│  controller: executes all pool/host I/O and   │
+│  drains the tree's deferred Cache/Component   │
+│  Actions ("tree decides, cache executes")     │
+└──────────────────────┬────────────────────────┘
+                       ▼
+┌───────────────────────────────────────────────┐
+│               UnifiedTreeCore                 │
+│      (unified_cache/unified_tree_core.py)     │
+│                                               │
 │  root_node ──► UnifiedTreeNode (radix tree)   │
 │  components ► {ComponentType → TreeComponent} │
 │  lru_lists ─► {ComponentType → UnifiedLRUList}│
@@ -61,7 +70,10 @@ node.component_data[ComponentType.MAMBA]  # MambaComponent data
 
 | File | Contents |
 |------|----------|
-| `../unified_radix_cache.py` | `UnifiedRadixCache`, `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_radix_cache.py` | `UnifiedRadixCache` — the controller: pool/host I/O, deferred-action draining |
+| `../unified_cache/unified_tree_core.py` | `UnifiedTreeCore` — the tree, LRUs, and size counters; `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_cache/unified_tree_core_interface.py` | `UnifiedTreeCoreInterface`, `NodeId` — the tree/cache boundary contract |
+| `../unified_cache/cache_action.py` | Deferred `CacheAction`/`ComponentAction` types emitted by the tree |
 | `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
 | `full_component.py` | `FullComponent` — standard full-attention KV cache component |
 | `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |

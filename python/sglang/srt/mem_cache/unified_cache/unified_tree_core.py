@@ -11,6 +11,9 @@ The cache builds the component drivers and passes them in; the tree holds them
 cache for cache-level logic, but the TreeCore itself never touches it.
 """
 
+# TODO(Jialin): Split this file into smaller cohesive modules (e.g. tree
+# building blocks, insert/match walks, eviction drivers).
+
 from __future__ import annotations
 
 import logging
