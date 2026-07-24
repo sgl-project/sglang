@@ -8837,6 +8837,8 @@ class PortArgs:
     tokenizer_ipc_name: str
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
+    # The ipc filename for DataParallelController to receive control-plane updates (zmq)
+    controller_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
@@ -8906,6 +8908,7 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                controller_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -8927,13 +8930,14 @@ class PortArgs:
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
+            # We need 7 consecutive ports from port_base for:
+            # port_base, detokenizer, rpc, metrics, scheduler, load collector,
+            # controller input.
             # In multi-node, all nodes derive ports independently from
             # dist_init_port, so the derivation must be deterministic
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
-            NUM_DERIVED_PORTS = 5
+            NUM_DERIVED_PORTS = 6
             if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -8947,6 +8951,9 @@ class PortArgs:
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
+            default_controller_input_ipc_name = NetworkAddress(
+                dist_init_host, port_base + 6
+            ).to_tcp()
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -8974,6 +8981,7 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
+                    wait_port_available(port_base + 6, "controller_input_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -8989,6 +8997,7 @@ class PortArgs:
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
+                controller_input_ipc_name=default_controller_input_ipc_name,
                 detokenizer_ipc_name=NetworkAddress(
                     dist_init_host, detokenizer_port
                 ).to_tcp(),

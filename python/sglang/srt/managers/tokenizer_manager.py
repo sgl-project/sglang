@@ -55,7 +55,6 @@ from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    ActiveRanksOutput,
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
@@ -618,7 +617,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (HealthCheckOutput, lambda x: None),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
-                (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
@@ -2834,9 +2832,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         state.out_list.append(out)
         state.event.set()
-
-    def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
         if not msg.success:

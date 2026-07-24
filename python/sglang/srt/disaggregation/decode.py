@@ -2004,6 +2004,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._handle_elastic_ep_result_boundary(result, batch)
+                ):
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -2017,9 +2022,15 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
-        def pop_and_process():
+        def pop_and_process() -> bool:
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if (
+                self.server_args.elastic_ep_backend is not None
+                and not self._handle_elastic_ep_result_boundary(tmp_result, batch)
+            ):
+                return False
             self.process_batch_result(tmp_batch, tmp_result)
+            return True
 
         while True:
             # Receive requests
@@ -2045,7 +2056,8 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                if not pop_and_process():
+                    continue
 
             # Launch the current batch
             if batch:
@@ -2058,7 +2070,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    if not pop_and_process():
+                        continue
             elif batch is None:
                 self.on_idle()
 

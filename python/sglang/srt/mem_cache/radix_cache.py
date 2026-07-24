@@ -451,8 +451,15 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        # NOTE: Use [req.req_pool_idx, :kv_len_to_handle] instead of
+        # [req.req_pool_idx, :len(token_ids)]. During elastic EP retraction
+        # (or any path where prepare_for_decode runs but process_batch_result
+        # is skipped), kv_len_to_handle may be larger than len(token_ids) because
+        # prepare_for_decode increments committed length and allocates a new KV
+        # slot but output_ids is NOT updated. Using len(token_ids) would leak that
+        # newly allocated slot.
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_len_to_handle
         ]
 
         radix_key = RadixKey(

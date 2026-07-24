@@ -511,6 +511,15 @@ def broadcast_global_expert_location_metadata(
     src_rank: int = 0,
     group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ExpertLocationMetadata:
+    """Broadcast the global ExpertLocationMetadata from src_rank to all ranks.
+
+    This is used in Elastic EP rank recovery to ensure that all ranks (including
+    newly recovered ones) share exactly the same expert location metadata.
+
+    Note: The caller must ensure src_rank is a healthy rank. In recovery scenarios,
+    this function is called after recover_ranks succeeds, at which point all
+    ranks (including src_rank=0) have recovered and are ready.
+    """
     from sglang.srt.runtime_context import get_server_args
 
     server_args = get_server_args()

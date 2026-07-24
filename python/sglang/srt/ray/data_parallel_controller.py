@@ -164,6 +164,9 @@ class RayDataParallelController(DataParallelController):
                             # All DP ranks share the same NCCL port (reuse TP group)
                             rank_port_args.nccl_port = port_args.nccl_port
                             rank_port_args.instance_id = port_args.instance_id
+                            rank_port_args.controller_input_ipc_name = (
+                                port_args.controller_input_ipc_name
+                            )
                             # The detokenizer and tokenizer bind using the
                             # original port_args addresses (127.0.0.1 when
                             # dist_init_addr is unset).  Scheduler actors must
@@ -178,7 +181,6 @@ class RayDataParallelController(DataParallelController):
                         dist_init_addr = (
                             f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
                         )
-
                         actor = _create_scheduler_actor(
                             pg=self.pg,
                             bundle_idx=bundle_idx,
