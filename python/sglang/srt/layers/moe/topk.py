@@ -1875,6 +1875,24 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
+        # LP path: solve the per-layer LP outside torch.compile (the solver
+        # contains an EP all-reduce that can't run inside compiled regions), then
+        # remap logical->physical using the resulting probabilities. Mirrors the
+        # _is_cuda branch above. topk_ids still holds valid router ids here (the
+        # padded region is masked below), so the count/all-reduce inside solve()
+        # matches the CUDA path. The torch LP fallback backs this on ROCm.
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+            == "lp"
+        ):
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
+            if lplb_solver is not None:
+                log2phy_prob = lplb_solver.solve(topk_ids)
+
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded
         # region with 0 so every kernel sees a valid in-range expert id.
@@ -1886,7 +1904,12 @@ def _post_process_topk_ids(
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
+        if log2phy_prob is not None:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info, log2phy_prob
+            )
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        elif _eplb_remap_enabled():
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )

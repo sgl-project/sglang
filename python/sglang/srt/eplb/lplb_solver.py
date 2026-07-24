@@ -125,9 +125,9 @@ class LPLBSolver:
         # Count copies per logical expert
         logcnt = torch.bincount(phy2log, minlength=self.num_logical)
 
-        # Separate single-copy vs replicated experts.
-        # Stored as int64 so they can be used directly as index tensors in
-        # _solve without per-call .long() casts (Tier 1 optimization).
+        # Separate single-copy vs replicated experts. Stored as int64 so they
+        # can be used directly as index tensors in _solve without per-call
+        # .long() casts.
         self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int64)
         self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
         self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int64)
@@ -177,33 +177,91 @@ class LPLBSolver:
         self.c_vec[-1] = 1000.0
 
         # Store log2phy as int64 so it can be used directly as index tensor
-        # without per-call .long() casts (Tier 1 optimization).
+        # without per-call .long() casts.
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
-        # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
-        # 20-40s compile cost happens once at startup rather than on the first
-        # real request. No-op when the fused backend is unavailable.
+        # Pick the LP solve backend once, at init:
+        #   _use_fused -> NVIDIA cuBLASDx fused kernel (prep/IPM/post in CUDA
+        #                 C++). Per-step, CUDA-graph-capturable. Needs a Hopper+
+        #                 GPU with Math-DX headers.
+        #   _hip_fused -> ROCm HIP block-Cholesky IPM kernel (torch prep/post +
+        #                 the hand-written HIP kernel for the solve). Per-step,
+        #                 CUDA-graph-capturable (no rocSOLVER workspace allocs).
+        #   neither    -> pure-torch per-step solver (_solve_torch). Correct on
+        #                 any backend but not graph-capturable on ROCm, so it
+        #                 requires --disable-cuda-graph there.
+        from sglang.kernels.ops.lplb.torch_solver import fused_backend_available
+
+        self._use_fused = fused_backend_available()
+        self._hip_fused = False
+
+        # Pre-JIT-compile the IPM kernel for this (NC, NV) shape so the 20-40s
+        # compile cost happens once at startup rather than on the first request.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
+        _is_hip = getattr(torch.version, "hip", None) is not None
+        if self._use_fused:
+            from sglang.kernels.ops.lplb.torch_solver import warmup as _ipm_warmup
 
-        _ipm_warmup(nc, nv, num_iters=5, device=device)
+            _ipm_warmup(nc, nv, num_iters=5, device=device)
+        elif _is_hip:
+            # ROCm has no cuBLASDx, so use the hand-written HIP block-Cholesky
+            # IPM kernel: it is CUDA-graph-capturable (allocates no workspace
+            # mid-launch, unlike rocSOLVER) and fast (~80us/solve vs ~28ms for
+            # torch.linalg.cholesky_ex on these tiny matrices). If it can't build
+            # (e.g. no hipcc toolchain) fall back to the pure-torch per-step
+            # solver, which is correct but requires --disable-cuda-graph.
+            try:
+                from sglang.kernels.ops.lplb import cuda_solver
+
+                cuda_solver.warmup(nc, nv, num_iters=5, device=str(device))
+                self._hip_fused = True
+                logger.info(
+                    "LPLBSolver: HIP block-Cholesky IPM kernel enabled "
+                    "(per-step, CUDA-graph-capturable)."
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "LPLBSolver: HIP IPM kernel unavailable (%s); using the "
+                    "pure-torch per-step LP solver (requires --disable-cuda-graph).",
+                    e,
+                )
+        else:
+            logger.info(
+                "LPLBSolver: fused IPM backend unavailable (non-Hopper GPU); "
+                "using the pure-torch per-step LP solver."
+            )
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
 
-        # Pre-allocate the buffers the JIT CUDA prep / IPM / post kernels write
-        # into. All writes are contiguous full-tensor stores (no strided
-        # ``out=`` semantics), so the reuse is safe under high concurrency.
-        # Constructed lazily on the first solve() call (we don't know the
-        # device-side log2phy_prob shape until then) — see _solve.
+        # Pre-allocate the buffers the fused / HIP prep / IPM / post steps write
+        # into. All writes are contiguous full-tensor stores (no strided ``out=``
+        # semantics), so reusing them across forwards is safe under concurrency
+        # and avoids per-forward allocations that would otherwise be retained in
+        # each captured decode graph's memory pool and OOM the GPU. The pure-torch
+        # fallback (_solve_torch) allocates its own scratch instead.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
         self._t1 = torch.empty(self.num_single, dtype=torch.float32, device=device)
         self._x = torch.empty(nv, dtype=torch.float32, device=device)
-        self._log2phy_prob = torch.empty(
+        # Persistent log2phy_prob buffer, overwritten in place by each per-step
+        # fused / HIP solve.
+        self._log2phy_prob = torch.zeros(
             log2phy.shape, dtype=torch.float32, device=device
+        )
+        # Scratch for the in-place HIP per-step post step. HIP path only; the
+        # NV fused and pure-torch paths never read it, so it is not allocated
+        # there (keeps the CUDA path's footprint identical to upstream).
+        self._phy_prob = (
+            torch.zeros(
+                self.num_single + self.num_red_phy + 1,
+                dtype=torch.float32,
+                device=device,
+            )
+            if self._hip_fused
+            else None
         )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -227,10 +285,9 @@ class LPLBSolver:
         # Step 1: Count local tokens per logical expert.
         # topk_ids comes from the router and is by construction in
         # [0, num_logical), so we can scatter_add directly without filtering.
-        # Boolean masking + numel() (the previous defensive form) forced a
-        # GPU->host sync on every forward pass via aten::nonzero and a
-        # tensor-shape read; scatter_add on the flattened tensor is async
-        # and a no-op when topk_ids is empty (DP-attention idle rank case).
+        # scatter_add on the flattened tensor is async and a no-op when topk_ids
+        # is empty (DP-attention idle rank case); a boolean-mask + numel() form
+        # would instead force a GPU->host sync on every forward pass.
         local_counts = torch.zeros(self.num_logical, dtype=torch.int32, device=device)
         flat_ids = topk_ids.flatten()
         local_counts.scatter_add_(
@@ -254,13 +311,56 @@ class LPLBSolver:
         # Step 3: Run LP solver
         return self._solve(global_counts)
 
+    def _solve_hip(self, global_counts: torch.Tensor) -> torch.Tensor:
+        """ROCm per-step solve: torch prep/post around the HIP IPM kernel.
+
+        prep and post are cheap capturable torch ops (lp_prep.cuh uses warp
+        shuffles that assume a 32-wide warp, so it is not reused on HIP); only
+        the IPM solve — the part that would otherwise need rocSOLVER — runs in
+        the hand-written HIP block-Cholesky kernel. All three are
+        CUDA-graph-capturable, so this runs inside the decode graph every step.
+
+        Writes into pre-allocated static buffers (``_A_full``/``_b``/``_x``/
+        ``_phy_prob``/``_log2phy_prob``) instead of allocating per forward: with
+        the decode graph captured across ~50 batch sizes, per-step allocations
+        would be retained in each graph's private memory pool and OOM the GPU.
+        """
+        from sglang.kernels.ops.lplb import cuda_solver
+
+        # prep in place: only the Big-M last column of A and the RHS b depend on
+        # the counts; A's first NV-1 columns hold the constant A_base from init.
+        total = global_counts.sum().clamp(min=1.0)
+        counts_norm = global_counts / total
+        t1 = counts_norm[self.log_single]  # (num_single,)
+        b1 = counts_norm[self.log_replicated]  # (num_red_log,)
+        b2 = -(self.B1 @ t1).flatten()  # (num_gpus,)
+        torch.cat([b1, b2], out=self._b)  # (nc,) -> static buffer
+        self._A_full[:, -1] = self._b - self._A_base_row_sum  # Big-M column
+
+        x = cuda_solver.solve_ipm(
+            self._A_full, self._b, self.c_vec, num_iters=5, result=self._x
+        )
+
+        # post in place -> static _log2phy_prob.
+        self._phy_prob.zero_()
+        self._phy_prob[self.phy_replicated] = x[: self.num_red_phy].clamp(min=0)
+        self._phy_prob[self.phy_single] = t1
+        self._log2phy_prob.copy_(torch.take(self._phy_prob, self.log2phy))
+        return self._log2phy_prob
+
     def _solve(self, global_counts: torch.Tensor) -> torch.Tensor:
         """Three CUDA kernel launches replace ~14 torch ops.
 
         Pipeline (all writes go into pre-allocated buffers from __init__):
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
-        Raises if the JIT CUDA backend is unavailable.
+        Falls back to the HIP per-step path or the pure-torch pipeline when the
+        fused cuBLASDx backend is unavailable (ROCm/HIP or non-Hopper GPU).
         """
+        if self._hip_fused:
+            return self._solve_hip(global_counts)
+        if not self._use_fused:
+            return self._solve_torch(global_counts)
+
         from sglang.kernels.ops.lplb import cuda_solver
 
         cuda_solver.prep_lp_inputs(
@@ -283,3 +383,92 @@ class LPLBSolver:
             self.log2phy,
         )
         return self._log2phy_prob
+
+    def _prep_torch(self, global_counts: torch.Tensor):
+        """Build the IPM inputs (A, b) and the single-copy ratios t1 from the
+        global token counts (mirrors lp_prep.cuh, ~8 torch ops). Cheap
+        elementwise work with no host sync."""
+        total = global_counts.sum().clamp(min=1.0)
+        counts_norm = global_counts / total
+        t1 = counts_norm[self.log_single]  # (num_single,)
+        b1 = counts_norm[self.log_replicated]  # (num_red_log,)
+        b2 = -(self.B1 @ t1).flatten()  # (num_gpus,)
+        b = torch.cat([b1, b2])  # (nc,)
+        # A = [A_base | Big-M column], where the Big-M column = b - A_base_row_sum.
+        A = torch.cat(
+            [self.A_base, (b - self._A_base_row_sum).unsqueeze(1)], dim=1
+        )  # (nc, nv)
+        return A, b, t1
+
+    def _post_torch(self, x: torch.Tensor, t1: torch.Tensor) -> torch.Tensor:
+        """Turn the IPM solution x into log2phy_prob (mirrors lp_post.cuh)."""
+        device = x.device
+        x_ratios = x[: self.num_red_phy].clamp(min=0)
+        # phy_prob has a trailing always-zero "sink" slot; log2phy's -1 padding
+        # is routed there via torch.take's negative-index wrap-around.
+        phy_prob = torch.zeros(
+            self.num_single + self.num_red_phy + 1, dtype=torch.float32, device=device
+        )
+        phy_prob[self.phy_replicated] = x_ratios
+        phy_prob[self.phy_single] = t1
+        return torch.take(phy_prob, self.log2phy)  # (num_logical, max_copies)
+
+    def _solve_torch(self, global_counts: torch.Tensor) -> torch.Tensor:
+        """Pure-torch per-step equivalent of the fused prep → IPM → post
+        pipeline. Used when neither the fused cuBLASDx kernel nor the HIP kernel
+        is available; correct on any backend but not CUDA-graph-capturable on
+        ROCm (see _ipm_solve_robust), so it requires --disable-cuda-graph there.
+        """
+        A, b, t1 = self._prep_torch(global_counts)
+        x = self._ipm_solve_robust(A, b, self.c_vec)  # (nv,)
+        return self._post_torch(x, t1)
+
+    def _ipm_solve_robust(
+        self, A: torch.Tensor, b: torch.Tensor, c: torch.Tensor, num_iters: int = 5
+    ) -> torch.Tensor:
+        """Barrier-method IPM for ``min c^T x s.t. Ax=b, x>=0``.
+
+        Solves the KKT system with a dense Cholesky factorization
+        (``torch.linalg.cholesky_ex`` + ``torch.cholesky_solve``) of the
+        1e-6-regularized SPD normal equations, mirroring the fused cuBLASDx
+        kernel's block-Cholesky POSV. ``cholesky_ex`` (``check_errors=False``)
+        returns the error ``info`` as a device tensor and never raises, so —
+        unlike ``torch.linalg.solve``'s LU pivoting — it neither host-syncs nor
+        aborts on a rank-deficient system (common with sparse per-batch expert
+        counts); the 1e-6 diagonal keeps the normal equations SPD. The step size
+        and the non-convergence fallback use ``torch.where`` (not a Python
+        ``if``, which would force a ``.item()`` host sync).
+
+        Matches the fused kernel's behavior: returns 0.5 everywhere on
+        non-convergence, so the downstream dispatch spreads tokens uniformly
+        over valid replicas.
+        """
+        nc, nv = A.shape
+        device = A.device
+        x = torch.ones(nv, device=device, dtype=torch.float32)
+        eye = torch.eye(nc, device=device, dtype=torch.float32)
+        one = torch.ones((), device=device, dtype=torch.float32)
+        d_max = torch.zeros((), device=device, dtype=torch.float32)
+        for _ in range(num_iters):
+            ax2 = A * (x * x).unsqueeze(0)  # (nc, nv)
+            ax2a = ax2 @ A.t() + 1e-6 * eye  # (nc, nc) SPD regularized KKT
+            ax2c = ax2 @ c  # (nc,)
+            L, _info = torch.linalg.cholesky_ex(ax2a)  # (nc, nc) lower factor
+            delta = torch.cholesky_solve(ax2c.unsqueeze(1), L).squeeze(1)  # (nc,)
+            r = A.t() @ delta  # (nv,)
+            d = x * (c - r)  # (nv,)
+            d_max = d.max()
+            # alpha = 0.999 / d_max when d_max > 1e-9 else 1.0 — branch-free so
+            # no host sync. The barrier step keeps 0.999 * d / d_max < 1, so x
+            # stays strictly positive and diag(x^2) keeps the KKT SPD.
+            alpha = torch.where(d_max > 1e-9, 0.999 / d_max.clamp(min=1e-9), one)
+            x = x * (1.0 - alpha * d)
+
+        # Device-side convergence test; pick x or the all-0.5 fallback via where
+        # (no Python branch -> capturable).
+        max_residual = (A @ x - b).abs().max()
+        converged = (
+            (d_max < 0.1) & (x[-1] >= 0) & (x[-1] < 1e-4) & (max_residual < 0.05)
+        )
+        half = torch.full((nv,), 0.5, device=device, dtype=torch.float32)
+        return torch.where(converged, x, half)

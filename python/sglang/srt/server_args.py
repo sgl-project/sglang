@@ -6482,6 +6482,28 @@ class ServerArgs:
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+            if self.ep_dispatch_algorithm == "lp":
+                logger.info(
+                    "LPLB (ep_dispatch_algorithm='lp') is enabled on the MoRI "
+                    "backend. Per-layer LP balances the routed experts' redundant "
+                    "replicas; routed tokens are dispatched to the least-loaded "
+                    "physical replica through MoRI."
+                )
+                if self.enable_waterfill:
+                    # LPLB and Waterfill are complementary, not mutually
+                    # exclusive: Waterfill balances the shared-expert slot
+                    # (topk 8->9), LPLB balances the routed redundant replicas.
+                    # They apply in sequence in the TopK forward (select_experts
+                    # runs the LPLB logical->physical remap on the routed top-k,
+                    # then _apply_deepep_waterfill appends the shared expert), so
+                    # both can be enabled together.
+                    logger.info(
+                        "DeepEP Waterfill is also enabled alongside LPLB: "
+                        "Waterfill balances the shared-expert slot while LPLB "
+                        "balances the routed redundant replicas (applied in "
+                        "sequence, complementary)."
+                    )
+
             # Check chunked prefill for mori
             # Skip validation if chunked prefill is disabled (i.e., size <= 0).
             # Skip validation if disaggregation mode is decode.
