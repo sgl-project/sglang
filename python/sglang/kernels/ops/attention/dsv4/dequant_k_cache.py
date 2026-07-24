@@ -85,6 +85,86 @@ def dequantize_k_cache_paged(
     return out
 
 
+def gather_dequant_requant_fp8_paged(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+    extra_rows: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gather DeepSeek-V4 paged KV cache into a flat FP8 workspace.
+
+    This is the Q8KV8 sparse-prefill adapter for the DeepSeek-V4 packed layout.
+    It gathers token IDs from the existing paged cache, dequantizes the 448-dim
+    nope region with its UE8M0 per-64 scales, casts the 64-dim BF16 rope tail to
+    FP8, and writes the result as ``(num_tokens + extra_rows, 1, 512)`` FP8.
+
+    ``extra_rows`` appends zero rows for kernels that map masked sparse indices
+    to a valid zero landing pad.
+    """
+    assert quant_k_cache.is_contiguous()
+    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    assert extra_rows >= 0
+
+    quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
+    num_tokens = page_table_1_flattened.shape[0]
+    total_rows = num_tokens + extra_rows
+    bytes_per_page = quant_k_cache_u8.shape[-1]
+    s_offset_bytes = page_size * NOPE_ROPE_BYTES
+
+    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
+    buf_uint8 = quant_k_cache_u8.reshape(-1)
+
+    if out is None:
+        out = torch.zeros(
+            (total_rows, 1, DIM_NOPE + DIM_ROPE),
+            dtype=fp8_dtype,
+            device=quant_k_cache.device,
+        )
+    else:
+        assert out.shape == (total_rows, 1, DIM_NOPE + DIM_ROPE)
+        assert out.dtype == fp8_dtype
+        if extra_rows:
+            out[num_tokens:].zero_()
+
+    if num_tokens == 0:
+        return out
+
+    _gather_dequant_requant_fp8_paged_kernel[(num_tokens,)](
+        out,
+        buf_fp8,
+        buf_bf16,
+        buf_uint8,
+        page_table_1_flattened,
+        out.stride(0),
+        BYTES_PER_PAGE=bytes_per_page,
+        PAGE_SIZE=page_size,
+        DIM_NOPE=DIM_NOPE,
+        DIM_ROPE=DIM_ROPE,
+        TILE_SIZE=TILE_SIZE,
+        NUM_SCALE_TILES=NUM_SCALE_TILES,
+        NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+        PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+        S_OFFSET_BYTES=s_offset_bytes,
+    )
+    return out
+
+def cast_q_fp8_for_q8kv8_prefill(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cast DeepSeek-V4 sparse-prefill Q to the Q8KV8 kernel format.
+
+    The incoming Q is the model-produced BF16/FP16 tensor already shaped as
+    ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
+    Q8KV8 sparse prefill consumes FP8 Q plus a scalar dequant scale. Keep the
+    scale at one to match the current V4 packed-KV adapter, which requants the
+    dequantized KV workspace directly into FP8 with no additional global scale.
+    """
+    assert q.ndim == 3
+    assert q.shape[-1] == DIM_NOPE + DIM_ROPE
+    q_fp8 = q.to(fp8_dtype).contiguous()
+    q_scale = torch.ones((), dtype=torch.float32, device=q.device)
+    return q_fp8, q_scale
+
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
@@ -134,6 +214,58 @@ def _dequantize_k_cache_paged_kernel(
     bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
     rope_data = tl.load(buf_bf16_ptr + bf16_off)
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+@triton.jit
+def _gather_dequant_requant_fp8_paged_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+    )
+    out_row_base = token_id * output_stride_0
+
+    nope_offs = tl.arange(0, TILE_SIZE)
+    for tile_id in tl.static_range(NUM_SCALE_TILES):
+        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
+        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+
+        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+
+        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
+        tl.store(
+            output_ptr + out_off,
+            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+        )
+
+    rope_offs = tl.arange(0, DIM_ROPE)
+    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+    rope_data = tl.load(buf_bf16_ptr + bf16_off)
+    tl.store(
+        output_ptr + out_row_base + DIM_NOPE + rope_offs,
+        rope_data.to(output_ptr.dtype.element_ty),
+    )
 
 
 def dequantize_k_cache_paged_ref(
@@ -193,6 +325,29 @@ def dequantize_k_cache_paged_ref(
     )
     out[:, 0, :DIM_NOPE] = nope.to(torch.bfloat16)
     out[:, 0, DIM_NOPE:] = rope
+    return out
+
+
+def gather_dequant_requant_fp8_paged_ref(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+    extra_rows: int = 0,
+) -> torch.Tensor:
+    """Torch reference for :func:`gather_dequant_requant_fp8_paged`."""
+    active = dequantize_k_cache_paged_ref(
+        quant_k_cache,
+        page_table_1_flattened,
+        page_size,
+    ).to(fp8_dtype)
+    if extra_rows == 0:
+        return active
+    out = torch.zeros(
+        (active.shape[0] + extra_rows, 1, DIM_NOPE + DIM_ROPE),
+        dtype=fp8_dtype,
+        device=active.device,
+    )
+    out[: active.shape[0]] = active
     return out
 
 

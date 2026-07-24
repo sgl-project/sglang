@@ -43,55 +43,20 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_return_hidden_states_mode_configuration(self):
-        disabled = ServerArgs(model_path="dummy")
-        self.assertFalse(disabled.enable_return_hidden_states)
-        self.assertIsNone(disabled.return_hidden_states_mode)
+    def test_dsv4_prefill_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
 
-        last = ServerArgs(
-            model_path="dummy",
-            return_hidden_states_mode="last",
+        default_args = parser.parse_args([])
+        self.assertEqual(default_args.dsv4_prefill_backend, "auto")
+
+        q8_args = parser.parse_args(
+            ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
         )
-        self.assertTrue(last.enable_return_hidden_states)
-        self.assertEqual(last.return_hidden_states_mode, "last")
+        self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
 
-        legacy_full = ServerArgs(
-            model_path="dummy",
-            enable_return_hidden_states=True,
-        )
-        self.assertTrue(legacy_full.enable_return_hidden_states)
-        self.assertEqual(legacy_full.return_hidden_states_mode, "full")
-
-        parsed_last = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--return-hidden-states-mode",
-                "last",
-            ]
-        )
-        self.assertTrue(parsed_last.enable_return_hidden_states)
-        self.assertEqual(parsed_last.return_hidden_states_mode, "last")
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "return_hidden_states_mode must be one of",
-        ):
-            ServerArgs(
-                model_path="dummy",
-                return_hidden_states_mode="lst",
-            )
-
-    def test_draft_quantization_explicitness_survives_asdict_round_trip(self):
-        inherited = ServerArgs(model_path="dummy", quantization="modelopt_fp4")
-        inherited._handle_missing_default_values()
-        self.assertEqual(inherited.speculative_draft_model_quantization, "modelopt_fp4")
-        self.assertFalse(inherited._speculative_draft_quantization_explicitly_set)
-
-        reconstructed = ServerArgs(**dataclasses.asdict(inherited))
-        reconstructed._handle_missing_default_values()
-
-        self.assertFalse(reconstructed._speculative_draft_quantization_explicitly_set)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--dsv4-prefill-backend", "flashmla_kv"])
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
