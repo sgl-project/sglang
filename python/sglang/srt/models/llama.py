@@ -118,6 +118,22 @@ class LlamaMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_GATE_UP_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_GATE_UP_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
+
 
 class LlamaAttention(nn.Module):
     def __init__(
@@ -246,6 +262,22 @@ class LlamaAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_QKV_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -623,6 +655,13 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -694,6 +733,44 @@ class LlamaForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """AutoWeightsLoader path with RemapRegistry for FP8 suffix normalization."""
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+            get_weight_remap,
+        )
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        mapper = get_weight_remap(self)
+        loaded = loader.load_weights(weights, mapper=mapper)
+
+        if self.config.tie_word_embeddings:
+            params_dict = dict(self.named_parameters())
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
