@@ -9,6 +9,7 @@ __all__ = [
     "CIRegistry",
     "CIBundle",
     "collect_tests",
+    "bundle_in_process_groups",
     "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
@@ -54,12 +55,14 @@ class CIRegistry:
     nightly: bool = False
     disabled: Optional[str] = None
     # Files sharing the same `in_process_group` value run in a single
-    # `python3 -m unittest <mod1> <mod2> ...` invocation per partition,
-    # amortizing the ~10s `import sglang` startup cost. Members must be
-    # safe to share a Python interpreter (no global monkey-patching,
-    # no env-var mutation that other members depend on, etc.). Files
-    # without this set keep the existing per-file `python3 file.py -f`
-    # behavior. Group identity is per-suite — `auto_partition` validates
+    # `python3 -m unittest <mod1> <mod2> ...` invocation (per partition
+    # when partitioned; still one process on full-suite runs), amortizing
+    # the ~10s `import sglang` startup cost. Members must be safe to share
+    # a Python interpreter (no global monkey-patching, no env-var mutation
+    # that other members depend on, etc.) and must live on importable
+    # module paths (every path segment a Python identifier). Files without
+    # this set keep the existing per-file `python3 file.py -f` behavior.
+    # Group identity is per-suite — `bundle_in_process_groups` validates
     # uniformity across members before bundling.
     in_process_group: Optional[str] = None
 
@@ -74,12 +77,19 @@ class CIRegistry:
 class CIBundle:
     """A bundle of `CIRegistry` entries that share the same
     `in_process_group` and run together in one `python3 -m unittest`
-    invocation. Produced by `auto_partition` as an atomic bin-pack unit
-    so the whole group lands in a single partition.
+    invocation. Produced by `bundle_in_process_groups` as an atomic
+    bin-pack unit so the whole group lands in a single partition (and
+    still runs as one process when the suite is not partitioned).
 
     `est_time` is the bundle's wall-clock budget: either from a
     grouped `live_est` entry keyed `"group:<group_key>"`, or, on first
-    rollout, `sum(member.est_time) - (N-1) * _BUNDLE_IMPORT_COST_SEC`.
+    rollout, `sum(member_est) - (N-1) * _BUNDLE_IMPORT_COST_SEC` where
+    each member_est prefers per-file `live_est` over in-source
+    `est_time`.
+
+    Kept as a dataclass (not msgspec.Struct) so this module stays
+    stdlib-only: `scripts/ci/utils/compute_partitions.py` loads it via
+    importlib on bare ubuntu-latest check-changes runners.
     """
 
     group_key: str
@@ -365,16 +375,28 @@ def ut_parse_one_file(filename: str) -> Tuple[List[CIRegistry], bool]:
     return visitor.registries, visitor.has_main_entry
 
 
-def _bundle_in_process_groups(
-    files: List[CIRegistry], live_est: Optional[dict]
+def _member_est_time(member: CIRegistry, live_est: Optional[dict]) -> float:
+    """Per-file estimate: prefer `live_est[filename]`, else in-source `est_time`."""
+    if live_est is not None and member.filename in live_est:
+        return float(live_est[member.filename])
+    return float(member.est_time)
+
+
+def bundle_in_process_groups(
+    files: List[CIRegistry], live_est: Optional[dict] = None
 ) -> List[Union[CIRegistry, CIBundle]]:
     """Roll up CIRegistry entries that share an `in_process_group` value
     into atomic `CIBundle` bin-pack units. Ungrouped files pass through.
 
+    Call this before `run_unittest_files` (and before LPT partitioning)
+    so `in_process_group` is honored on both partitioned and full-suite
+    runs.
+
     Per-bundle est_time prefers a grouped `live_est[f"group:{key}"]`
     entry recorded by a prior partition run; absent that, falls back
-    to `sum(member.est_time) - (N-1) * _BUNDLE_IMPORT_COST_SEC` (each
-    additional member avoids one cold `import sglang`).
+    to `sum(member_est) - (N-1) * _BUNDLE_IMPORT_COST_SEC` where each
+    member_est prefers per-file `live_est` over in-source `est_time`
+    (each additional member avoids one cold `import sglang`).
     """
     grouped: dict[str, List[CIRegistry]] = {}
     singletons: List[CIRegistry] = []
@@ -400,7 +422,7 @@ def _bundle_in_process_groups(
             est = float(live_est[live_key])
         else:
             est = (
-                sum(m.est_time for m in members)
+                sum(_member_est_time(m, live_est) for m in members)
                 - max(0, len(members) - 1) * _BUNDLE_IMPORT_COST_SEC
             )
             est = max(est, 1.0)  # never zero or negative
@@ -432,7 +454,7 @@ def auto_partition(
     if not files or size <= 0:
         return []
 
-    units = _bundle_in_process_groups(files, live_est)
+    units = bundle_in_process_groups(files, live_est=live_est)
 
     def est_of(u: Union[CIRegistry, CIBundle]) -> float:
         if isinstance(u, CIBundle):

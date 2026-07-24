@@ -124,6 +124,12 @@ def _filename_to_module(filename: str) -> str:
     repo). We normalize against cwd before stripping ``.py`` and
     converting separators, so ``/.../test/registered/foo/test_x.py``
     → ``registered.foo.test_x``.
+
+    Raises ``ValueError`` if any path segment is not a valid Python
+    identifier (e.g. a directory named ``4-gpu-models``), so a mistaken
+    ``in_process_group`` opt-in fails with a clear pre-flight error
+    rather than an opaque unittest import failure that blames the whole
+    bundle.
     """
     if os.path.isabs(filename):
         try:
@@ -134,7 +140,16 @@ def _filename_to_module(filename: str) -> str:
             pass
     if filename.endswith(".py"):
         filename = filename[:-3]
-    return filename.replace(os.sep, ".").replace("/", ".")
+    module = filename.replace(os.sep, ".").replace("/", ".")
+    bad = [part for part in module.split(".") if part and not part.isidentifier()]
+    if bad:
+        raise ValueError(
+            f"cannot map {filename!r} to a unittest module path: "
+            f"non-identifier segment(s) {bad!r}. Files under such paths "
+            f"cannot use in_process_group; run them as per-file "
+            f"`python3 file.py -f` instead."
+        )
+    return module
 
 
 def _run_one_bundle(
@@ -301,7 +316,7 @@ def _repo_relative_path(p: str) -> str:
 
 
 def run_unittest_files(
-    files: Union[List[TestFile], List[CIRegistry]],
+    files: Union[List[TestFile], List[Union[CIRegistry, CIBundle]]],
     timeout_per_file: float,
     continue_on_error: bool = False,
     enable_retry: bool = False,
@@ -309,11 +324,12 @@ def run_unittest_files(
     retry_wait_seconds: int = 60,
 ):
     """
-    Run a list of test files.
+    Run a list of test units (per-file CIRegistry/TestFile or CIBundle).
 
     Args:
-        files: List of TestFile objects to run
-        timeout_per_file: Timeout in seconds for each test file
+        files: List of TestFile, CIRegistry, or CIBundle units to run
+        timeout_per_file: Timeout in seconds for each test file (bundle timeout
+            is max(this, bundle.est_time * 2 + 60))
         continue_on_error: If True, continue running remaining tests even if one fails.
                           If False, stop at first failure (default behavior for PR tests).
         enable_retry: If True, retry failed tests that appear to be accuracy/performance
@@ -342,8 +358,10 @@ def run_unittest_files(
             # In-process bundle: one `python3 -m unittest <mod1> <mod2> ...`
             # invocation that shares `import sglang` across all members.
             # Per-member retry/timing is intentionally simplified to per-bundle
-            # for v1; on failure we fall back to running each member as its
-            # own `python3 file.py -f` so blame attribution is preserved.
+            # for v1. On failure every member is marked failed with the shared
+            # bundle reason (no per-member re-run yet); with unittest -f,
+            # modules after the first failure may not have run but are still
+            # listed as failed.
             bundle_passed = _run_one_bundle(
                 bundle=file,
                 idx=i,
