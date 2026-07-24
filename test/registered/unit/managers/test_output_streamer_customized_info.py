@@ -6,6 +6,7 @@ from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -36,7 +37,7 @@ class _FakeReq:
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
-        self.time_stats = None
+        self.time_stats = SchedulerReqTimeStats()
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0

@@ -1,6 +1,7 @@
 """Unit tests for trace.py — no server, no model loading."""
 
 import os
+import pickle
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -515,6 +516,48 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertIsNotNone(ctx2.last_span_context)
+
+    def test_state_round_trip_with_128_bit_ids(self):
+        trace_id = (1 << 127) + 1
+        span_id = (1 << 63) + 1
+        ctx = mod.TraceReqContext(rid="req-1")
+        ctx.trace_req_start(ts=1000)
+        ctx.last_span_context = otel_trace.SpanContext(
+            trace_id=trace_id,
+            span_id=span_id,
+            is_remote=True,
+        )
+
+        state = ctx.__getstate__()
+        self.assertEqual(state["last_span_context"]["trace_id"], f"{trace_id:032x}")
+        self.assertEqual(state["last_span_context"]["span_id"], f"{span_id:016x}")
+
+        restored = object.__new__(mod.TraceReqContext)
+        restored.__setstate__(state)
+        self.assertEqual(restored.last_span_context.trace_id, trace_id)
+        self.assertEqual(restored.last_span_context.span_id, span_id)
+
+        pickle_restored = pickle.loads(pickle.dumps(ctx))
+        self.assertEqual(pickle_restored.last_span_context.trace_id, trace_id)
+        self.assertEqual(pickle_restored.last_span_context.span_id, span_id)
+        ctx.trace_req_finish(ts=2000)
+
+    def test_setstate_accepts_legacy_integer_ids(self):
+        trace_id = (1 << 127) + 1
+        span_id = (1 << 63) + 1
+        ctx = TraceReqContext(rid="req-1")
+        ctx.trace_req_start(ts=1000)
+        state = ctx.__getstate__()
+        state["last_span_context"] = {
+            "trace_id": trace_id,
+            "span_id": span_id,
+        }
+
+        restored = object.__new__(TraceReqContext)
+        restored.__setstate__(state)
+        self.assertEqual(restored.last_span_context.trace_id, trace_id)
+        self.assertEqual(restored.last_span_context.span_id, span_id)
+        ctx.trace_req_finish(ts=2000)
 
     def test_events_cache_partial_match(self):
         """Events outside the slice time range stay in cache."""

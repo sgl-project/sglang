@@ -54,6 +54,11 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    DPControllerReqTimeStats,
+    SchedulerReqTimeStats,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
@@ -69,6 +74,8 @@ else:
     Image = Any
 
 logger = logging.getLogger(__name__)
+
+RequestTimeStats = Union[APIServerReqTimeStats, DPControllerReqTimeStats]
 
 
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
@@ -100,7 +107,7 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     """Wraps an arbitrary Python object as pickle-serialized bytes for msgpack IPC.
 
     In msgpack mode, fields that carry opaque or non-msgspec-typed payloads
-    (e.g. multimodal inputs, time stats, customized info) are stored as
+    (e.g. multimodal inputs or customized info) are stored as
     PickleWrapper so the outer struct can still be msgpack-encoded.  In pickle
     mode (_USE_PICKLE_IPC=True), wrap_as_pickle / unwrap_from_pickle are no-ops
     and this class is not used on the wire.
@@ -878,18 +885,15 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     multi_item_delimiter_indices: Optional[List[int]] = None
 
     # For observability
-    # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    time_stats: Optional[RequestTimeStats] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
         self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
-        self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
-        self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
@@ -1166,16 +1170,13 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     multi_item_delimiter_indices: Optional[List[int]] = None
 
     # For observability
-    # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    time_stats: Optional[RequestTimeStats] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
-        self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
-        self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
 class BatchTokenizedEmbeddingReqInput(BaseBatchReq, kw_only=True):
@@ -1278,8 +1279,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1360,8 +1360,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1397,8 +1396,7 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
 
     # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):

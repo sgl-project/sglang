@@ -1371,6 +1371,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
+        tokenized_obj.time_stats = time_stats.to_ipc() if time_stats else None
         tokenized_obj.wrap_pickle_fields()
         self._dispatch_to_scheduler(tokenized_obj)
         tokenized_obj.time_stats = time_stats
@@ -1386,6 +1387,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
         for tokenized_obj in tokenized_objs:
+            tokenized_obj.time_stats = (
+                tokenized_obj.time_stats.to_ipc() if tokenized_obj.time_stats else None
+            )
             tokenized_obj.wrap_pickle_fields()
 
         if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -1904,7 +1908,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
-        recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:

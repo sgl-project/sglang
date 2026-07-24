@@ -199,7 +199,7 @@ class SchedulerOutputStreamer:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self.get_cached_tokens_details(req))
-                time_stats.append(req.time_stats)
+                time_stats.append(req.time_stats.to_ipc())
                 retraction_counts.append(req.retraction_count)
 
                 phs = req.pooled_hidden_state
@@ -234,7 +234,7 @@ class SchedulerOutputStreamer:
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
+                time_stats=time_stats,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -414,7 +414,7 @@ class _GenerationStreamAccumulator:
 
         self.retraction_counts.append(req.retraction_count)
 
-        self.time_stats.append(req.time_stats)
+        self.time_stats.append(req.time_stats.to_ipc())
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -567,7 +567,7 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
+            time_stats=self.time_stats,
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
