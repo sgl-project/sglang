@@ -61,9 +61,11 @@ impl NativeContext {
     }
 }
 
-/// Spawn `workers` `mm-worker-{i}` threads (unpinned — the heavy work happens
-/// off the pinned pools either way) and return their join handles for the
-/// runtime's shutdown join.
+/// Spawn `workers` `mm-worker-{i}` threads and return their join handles for
+/// the runtime's shutdown join. Not pinned here: they inherit the launch
+/// thread's affinity, which `RustServer.launch` narrows to the server cores
+/// before calling `start_mm_workers` so MM work never preempts the scheduler
+/// thread on its reserved cores.
 pub fn spawn_workers(
     py: Python<'_>,
     rx: flume::Receiver<MmRequest>,

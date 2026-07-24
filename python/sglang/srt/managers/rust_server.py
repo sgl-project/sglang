@@ -390,6 +390,20 @@ class RustServer:
         # would, through handle_sync.
         mm_host = None
         if scheduler.model_config.is_multimodal:
+            # New threads inherit the spawning thread's CPU affinity, and this
+            # launch thread still has the full mask here. Narrow it to the
+            # server cores first so every MM thread created below — the host
+            # loop, the processor/io executors it spawns, and the Rust MM
+            # workers — stays off the scheduler's reserved launch cores:
+            # MM preprocessing scheduled onto those cores preempts the
+            # scheduler loop and inflates inter-token latency.
+            if server_cores is not None:
+                try:
+                    os.sched_setaffinity(0, set(server_cores))
+                except OSError as e:
+                    logger.warning(
+                        "rust server: cannot confine mm threads to server cores: %s", e
+                    )
             mm_host = MmProcessorHost(scheduler)
             server.start_mm_workers(
                 mm_host.handle_sync, MmProcessorHost.MM_WORKERS, mm_host.native_spec()
