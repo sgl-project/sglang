@@ -26,7 +26,7 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
-class TestEagleLlama2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
+class TestEagleLlama3Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     """Testcase: EAGLE3 retract under tight KV cache budget.
     Validates memory safety when requests are retracted due to limited KV space.
     Ensures no memory leaks or corruption under high memory pressure.
@@ -50,7 +50,7 @@ class TestEagleLlama2Retract(Eagle3Base, SpecAccuracyKit, SpecFeatureKit):
     )
 
 
-class TestEagleLlama2AbortAll(Eagle3Base, AbortAllMixin):
+class TestEagleLlama3AbortAll(Eagle3Base, AbortAllMixin):
     """Testcase: EAGLE3 abort-all storm under heavy speculation load.
     Stresses request cancellation paths while speculative decoding is active.
     Verifies clean shutdown and resource cleanup during abort storms.
@@ -70,7 +70,7 @@ class TestEagleLlama2AbortAll(Eagle3Base, AbortAllMixin):
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
-class TestEagleLlama2WaitingTimeout(Eagle3Base, WaitingTimeoutMixin):
+class TestEagleLlama3WaitingTimeout(Eagle3Base, WaitingTimeoutMixin):
     """Testcase: EAGLE3 waiting queue timeout with minimal concurrency.
     Validates request timeout behavior while waiting in the scheduling queue.
     Ensures timed-out requests are safely discarded without affecting others.
@@ -93,7 +93,7 @@ class TestEagleLlama2WaitingTimeout(Eagle3Base, WaitingTimeoutMixin):
     )
 
 
-class TestEagleLlama2RunningTimeout(Eagle3Base, RunningTimeoutTwoWaveMixin):
+class TestEagleLlama3RunningTimeout(Eagle3Base, RunningTimeoutTwoWaveMixin):
     """Testcase: EAGLE3 running-timeout regression (two-wave pattern).
     Regression test for https://github.com/sgl-project/sglang/pull/18760.
     Validates correct timeout handling for long-running speculative requests

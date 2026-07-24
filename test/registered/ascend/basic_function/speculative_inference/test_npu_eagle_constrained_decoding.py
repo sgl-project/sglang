@@ -42,8 +42,6 @@ class TestEagleConstrainedDecoding(
     grammar_backend = "xgrammar"
     # Run the synchronous (non-overlap) scheduling path.
     disable_overlap = True
-    os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
-    env = os.environ.copy()
 
     @classmethod
     def setUpClass(cls):
@@ -78,12 +76,16 @@ class TestEagleConstrainedDecoding(
         if cls.disable_overlap:
             launch_args.append("--disable-overlap-schedule")
         launch_args.extend(cls.other_launch_args)
+        env = {
+            **os.environ,
+            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+        }
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=launch_args,
-            env=cls.env,
+            env=env,
         )
 
     @classmethod
