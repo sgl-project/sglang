@@ -27,6 +27,19 @@ from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.plamo3_detector import (
+    Plamo3ToolDetector,
+    BEGIN_TOOL_REQUESTS,
+    END_TOOL_REQUESTS,
+    BEGIN_TOOL_REQUEST,
+    END_TOOL_REQUEST,
+    BEGIN_TOOL_NAME,
+    END_TOOL_NAME,
+    BEGIN_TOOL_ARGUMENTS,
+    END_TOOL_ARGUMENTS,
+    CONSTRAIN_JSON,
+    MSG,
+)
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -4481,6 +4494,212 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+class TestPlamo3ToolDetector(unittest.TestCase):
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Plamo3ToolDetector()
+
+    def _make_tool_request(self, name, args_json):
+        return (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + name
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + args_json
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+
+    def test_detect_and_parse_single_call(self):
+        text = self._make_tool_request("get_weather", '{"city": "Tokyo"}')
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "Tokyo"}
+        )
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_with_prefix_text(self):
+        text = "Some intro text.\n" + self._make_tool_request(
+            "get_weather", '{"city": "Osaka"}'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertIn("Some intro text", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "Osaka"}
+        )
+
+    def test_detect_and_parse_multiple_calls(self):
+        text = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Tokyo"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Osaka"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "Tokyo"}
+        )
+        self.assertEqual(
+            json.loads(result.calls[1].parameters), {"city": "Osaka"}
+        )
+
+    def test_detect_and_parse_no_tool_call(self):
+        text = "Hello world, no tools here."
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertIn("Hello world", result.normal_text)
+
+    def test_detect_and_parse_invalid_json(self):
+        text = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + "not valid json"
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_single_call(self):
+        full_text = self._make_tool_request("get_weather", '{"city": "Nagoya"}')
+        chunk_size = 5
+        tool_calls = {}
+        for i in range(0, len(full_text), chunk_size):
+            chunk = full_text[i : i + chunk_size]
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                idx = call.tool_index
+                if idx not in tool_calls:
+                    tool_calls[idx] = {"name": "", "parameters": ""}
+                if call.name:
+                    tool_calls[idx]["name"] += call.name
+                if call.parameters:
+                    tool_calls[idx]["parameters"] += call.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]), {"city": "Nagoya"}
+        )
+
+    def test_streaming_multiple_calls(self):
+        full_text = (
+            BEGIN_TOOL_REQUESTS
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Tokyo"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + BEGIN_TOOL_REQUEST
+            + BEGIN_TOOL_NAME
+            + "get_weather"
+            + END_TOOL_NAME
+            + BEGIN_TOOL_ARGUMENTS
+            + CONSTRAIN_JSON
+            + MSG
+            + '{"city": "Yokohama"}'
+            + END_TOOL_ARGUMENTS
+            + END_TOOL_REQUEST
+            + END_TOOL_REQUESTS
+        )
+        chunk_size = 7
+        tool_calls = {}
+        for i in range(0, len(full_text), chunk_size):
+            chunk = full_text[i : i + chunk_size]
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                idx = call.tool_index
+                if idx not in tool_calls:
+                    tool_calls[idx] = {"name": "", "parameters": ""}
+                if call.name:
+                    tool_calls[idx]["name"] += call.name
+                if call.parameters:
+                    tool_calls[idx]["parameters"] += call.parameters
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"}
+        )
+        self.assertEqual(
+            json.loads(tool_calls[1]["parameters"]), {"city": "Yokohama"}
+        )
+
+    def test_structure_info(self):
+        get_info = self.detector.structure_info()
+        info = get_info("get_weather")
+        self.assertEqual(info.trigger, BEGIN_TOOL_REQUESTS)
+        self.assertIn(BEGIN_TOOL_REQUEST, info.begin)
+        self.assertIn("get_weather", info.begin)
+        self.assertIn(END_TOOL_ARGUMENTS, info.end)
+        self.assertIn(END_TOOL_REQUESTS, info.end)
+
+    def test_has_tool_call(self):
+        self.assertTrue(self.detector.has_tool_call(BEGIN_TOOL_REQUESTS))
+        self.assertTrue(self.detector.has_tool_call(BEGIN_TOOL_REQUEST))
+        self.assertFalse(self.detector.has_tool_call("plain text"))
+
 
 
 if __name__ == "__main__":
