@@ -50,8 +50,11 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 KV_MEM_KINDS = {"VRAM", "DRAM"}
-DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = 1 << 30
 HOST_REGISTRATION_ALIGNMENT = 4096
+# Ionic rejects a non-hugepage MR with exactly 2^18 4KiB mappings
+# (1GiB at a merely 4KiB-aligned address) as BAD_ATTR. Stay one page below
+# that firmware boundary; the value is aligned down further to each KV item.
+DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = (1 << 30) - HOST_REGISTRATION_ALIGNMENT
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
