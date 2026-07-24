@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutp
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 
 class Gemma4SGLangProcessor(SGLangBaseProcessor):
@@ -78,7 +78,9 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         first_stride = _SSCP_CONV_STRIDE_SIZES[0][0]
         return hop * first_stride
 
-    def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
+    def _video_decoder_to_tensor(
+        self, vdw: VideoDecoderWrapper
+    ) -> Tuple[torch.Tensor, List[int]]:
         """Convert a VideoDecoderWrapper to a (sampled_frames, C, H, W) uint8 tensor.
 
         SGLang's load_video returns VideoDecoderWrapper which the HF
@@ -98,7 +100,8 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         else:
             indices = torch.arange(0, total, total / num_frames).int().tolist()
         frames_np = vdw.get_frames_at(indices)  # (N, H, W, C)
-        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
+        video = torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
+        return video, indices
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -114,14 +117,31 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                 padded.append(a)
             audios = padded
         if videos:
-            videos = [
-                (
-                    self._video_decoder_to_tensor(v)
-                    if isinstance(v, VideoDecoderWrapper)
-                    else v
-                )
-                for v in videos
-            ]
+            video_metadata_list = []
+            converted_videos = []
+            for v in videos:
+                if isinstance(v, VideoDecoderWrapper):
+                    total_frames = len(v)
+                    fps = v.avg_fps
+                    video, frame_indices = self._video_decoder_to_tensor(v)
+                    metadata = {
+                        "total_num_frames": total_frames,
+                        "fps": fps,
+                        "duration": total_frames / fps if fps and fps > 0 else None,
+                        "frames_indices": frame_indices,
+                        "video_backend": _BACKEND,
+                    }
+                    video_metadata_list.append(metadata)
+                    converted_videos.append(video)
+                else:
+                    converted_videos.append(v)
+            videos = converted_videos
+            # Only pass metadata when every video came from a
+            # VideoDecoderWrapper (the typical case).  Mixed lists are
+            # unlikely and would need per-item None handling that the HF
+            # metadata batching does not support.
+            if len(video_metadata_list) == len(videos):
+                kwargs["video_metadata"] = video_metadata_list
             kwargs.setdefault("do_sample_frames", False)
         return super().process_mm_data(
             input_text, images=images, videos=videos, audios=audios, **kwargs
