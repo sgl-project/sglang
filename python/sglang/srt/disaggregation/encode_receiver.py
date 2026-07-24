@@ -1024,6 +1024,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                         "modality": modality.name,
                         "prefill_host": self.host_name,
                         "embedding_port": self.embedding_port,
+                        # Echoed via /send so encoder can release GPU embedding early.
+                        "receive_count": self.receive_count,
                     }
                 )
                 cum_idx += 1
@@ -1495,6 +1497,7 @@ class MMReceiverBase(ABC):
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingImageRequest] = []
         self.scheduler = scheduler
+        self.gpu_id = scheduler.ps.gpu_id if scheduler is not None else 0
         self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
 
         self.model_type = (
@@ -1521,10 +1524,9 @@ class MMReceiverBase(ABC):
             self.embedding_pool = None
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
             if pool_mb and pool_mb > 0 and scheduler is not None:
-                gpu_id = getattr(scheduler, "gpu_id", 0)
                 try:
                     self.embedding_pool = MooncakeEmbeddingPool(
-                        self.embeddings_engine, gpu_id, pool_mb * 1024 * 1024
+                        self.embeddings_engine, self.gpu_id, pool_mb * 1024 * 1024
                     )
                 except Exception:
                     logger.exception(
@@ -1956,8 +1958,7 @@ class MMReceiverBase(ABC):
             f"Pre-allocating GPU buffer for mooncake RDMA: "
             f"req_id={req_id}, size={total_bytes} bytes"
         )
-        gpu_id = getattr(self.scheduler, "gpu_id", 0)
-        embeddings = torch.empty(total_bytes, dtype=torch.uint8, device=gpu_id)
+        embeddings = torch.empty(total_bytes, dtype=torch.uint8, device=self.gpu_id)
         self.embeddings_engine.register(
             embeddings.data_ptr(),
             embeddings.nbytes,
@@ -2077,13 +2078,12 @@ class MMReceiverHTTP(MMReceiverBase):
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
-            gpu_id = getattr(self.scheduler, "gpu_id", 0)
             return self._process_waiting_requests(
                 recv_reqs,
                 WaitingImageRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
-                gpu_id=gpu_id,
+                gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)

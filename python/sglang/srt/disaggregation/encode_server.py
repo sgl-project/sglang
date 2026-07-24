@@ -107,6 +107,8 @@ rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
+# mooncake: /send completions per part; release GPU embedding once receive_count reached.
+mooncake_send_done_count: Dict[str, int] = dict()
 
 use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
 
@@ -2002,6 +2004,7 @@ class MMEncoder:
     async def _cleanup_inflight_encode_state(self, req_id: str):
         if not hasattr(self, "_inflight_encode_events"):
             return
+        mooncake_send_done_count.pop(req_id, None)
         async with self._inflight_encode_lock:
             self._inflight_encode_events.pop(req_id, None)
             self._inflight_encode_meta.pop(req_id, None)
@@ -4073,9 +4076,15 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     req_id = request["req_id"]
-    # Don't pop embedding_to_send here — other decoder TP ranks may still
-    # need it for their /send calls. Cleanup is handled by the scheduled
-    # timeout task or _cleanup_inflight_encode_state.
+    # Keep embedding until all ranks have /send'd; release early when receive_count is met.
+    expected_sends = request.get("receive_count")
+    if expected_sends:
+        done = mooncake_send_done_count.get(req_id, 0) + 1
+        if done >= expected_sends:
+            mooncake_send_done_count.pop(req_id, None)
+            await encoder._cleanup_inflight_encode_state(req_id)
+        else:
+            mooncake_send_done_count[req_id] = done
     return ORJSONResponse(content=None)
 
 
