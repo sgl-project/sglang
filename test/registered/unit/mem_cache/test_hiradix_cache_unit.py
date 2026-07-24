@@ -96,6 +96,25 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
             if isinstance(e, BlockStored) and e.medium == StorageMedium.CPU
         ]
 
+    def _stored_gpu_events(self, cache):
+        return [
+            e
+            for e in cache.take_events()
+            if isinstance(e, BlockStored) and e.medium == StorageMedium.GPU
+        ]
+
+    def _backup_and_evict(self, cache, tokens):
+        node = self._leaf_for(cache, tokens)
+        backed_up = cache.write_backup(node, write_back=True)
+        self.assertGreater(backed_up, 0)
+        cache.writing_check(write_back=True)
+        cache.take_events()
+        self.assertGreater(cache._evict_backuped(node), 0)
+        cache.take_events()
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        return node
+
     def test_split_pending_write_through_publishes_fragments(self):
         cache, allocator = self._build_cache()
         cache.take_events()
@@ -119,6 +138,49 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_exact_recomputation_publishes_gpu_store(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        self._backup_and_evict(cache, [1, 2, 3, 4])
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        stored_gpu = self._stored_gpu_events(cache)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_gpu],
+            [[1, 2], [3, 4]],
+        )
+        self.assertIsNone(stored_gpu[0].parent_block_hash)
+        self.assertEqual(stored_gpu[1].parent_block_hash, stored_gpu[0].block_hashes[0])
+
+    def test_partial_recomputation_publishes_only_materialized_gpu_blocks(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        self._backup_and_evict(cache, [1, 2, 3, 4])
+
+        self._insert(cache, allocator, [1, 2, 5, 6])
+        stored_gpu = self._stored_gpu_events(cache)
+        self.assertEqual(
+            [list(e.token_ids) for e in stored_gpu],
+            [[1, 2], [5, 6]],
+        )
+        self.assertNotIn([3, 4], [list(e.token_ids) for e in stored_gpu])
+        self.assertIsNone(stored_gpu[0].parent_block_hash)
+        self.assertEqual(stored_gpu[1].parent_block_hash, stored_gpu[0].block_hashes[0])
+
+    def test_existing_device_node_does_not_publish_duplicate_gpu_store(self):
+        cache, allocator = self._build_cache()
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        cache.take_events()
+        self._insert(cache, allocator, [1, 2, 3, 4])
+
+        self.assertEqual(self._stored_gpu_events(cache), [])
 
 
 if __name__ == "__main__":
