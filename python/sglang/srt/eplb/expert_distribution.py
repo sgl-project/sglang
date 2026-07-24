@@ -53,32 +53,38 @@ class ExpertDistributionMetrics:
 
 
 @dataclass
-class RecordMetadata:
+class _Record:
+    buffer: "RecordBuffer"
     offset: int
     length: int
     shape: tuple
     dtype: torch.dtype
 
+    def __reduce_ex__(self, protocol: int):
+        tensor = self.buffer.get(self).clone()
+        return tensor.__reduce_ex__(protocol)
+
 
 class RecordBuffer:
     def __init__(self, buffer_size_mb: int):
         self._buffer_stream = torch.cuda.Stream()
+        self._buffer_ready = torch.cuda.Event()
         self._buffer_size = buffer_size_mb * 1024 * 1024
         self._buffer = torch.as_tensor(
             torch.UntypedStorage(self._buffer_size, device=torch.device("cpu")),
             dtype=torch.uint8,
-            pin_memory=True,
-        )
+        ).pin_memory()
         self._head = 0
         self._is_full = False
 
-    def store(self, tensor: torch.Tensor) -> Optional[RecordMetadata]:
+    def store(self, tensor: torch.Tensor) -> Optional[_Record]:
         assert tensor.is_cuda, "Input tensor must be on CUDA device"
 
         if self._is_full:
             return None
         if tensor.numel() == 0:
-            return RecordMetadata(
+            return _Record(
+                self,
                 offset=self._head,
                 length=0,
                 shape=tuple(tensor.shape),
@@ -94,6 +100,9 @@ class RecordBuffer:
         # Keep tensor alive until buffer stream finishes
         t.record_stream(self._buffer_stream)
 
+        # Ensure the tensor is ready before copying to the pinned buffer
+        self._buffer_ready.record()
+
         nbytes = t.numel()
         start = self._head
         end = start + nbytes
@@ -106,19 +115,23 @@ class RecordBuffer:
 
         # Asynchronously copy tensor data to the pinned buffer
         with torch.cuda.stream(self._buffer_stream):
+            self._buffer_ready.wait(self._buffer_stream)
             self._buffer[start:end].copy_(t, non_blocking=True)
+
+        # Advance head pointer
         self._head = end
 
-        return RecordMetadata(
+        return _Record(
+            self,
             offset=start,
             length=nbytes,
             shape=tuple(tensor.shape),
             dtype=tensor.dtype,
         )
 
-    def get(self, address: RecordMetadata) -> torch.Tensor:
-        raw_bytes = self._buffer[address.offset : address.offset + address.length]
-        return raw_bytes.view(address.dtype).reshape(address.shape).clone()
+    def get(self, record: _Record) -> torch.Tensor:
+        raw = self._buffer[record.offset : record.offset + record.length]
+        return raw.view(record.dtype).reshape(record.shape)
 
     def synchronize(self):
         self._buffer_stream.synchronize()
@@ -130,20 +143,6 @@ class RecordBuffer:
     @property
     def is_full(self) -> bool:
         return self._is_full
-
-
-def init_recorder_buffer(
-    server_args: ServerArgs,
-) -> Optional[RecordBuffer]:
-    if server_args.expert_distribution_recorder_mode == "per_token_buffered":
-        # preallocate a large pinned CPU buffer
-        buffer_size_mb = server_args.expert_distribution_recorder_buffer_size
-        # adjust buffer size
-        if buffer_size_mb is None or buffer_size_mb <= 0:
-            buffer_size_mb = 1024  # default to 1GB
-        return RecordBuffer(buffer_size_mb)
-    else:
-        return None
 
 
 class ExpertDistributionRecorder(ABC):
@@ -238,14 +237,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._buffer = init_recorder_buffer(server_args)
         self._accumulator = _Accumulator.init_new(
-            server_args, expert_location_metadata, rank, self._buffer
+            server_args, expert_location_metadata, rank
         )
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(
-                server_args, expert_location_metadata, rank, self._buffer
-            )
+            k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -398,7 +394,6 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[RecordBuffer] = None,
     ) -> "_SinglePassGatherer":
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
@@ -406,11 +401,9 @@ class _SinglePassGatherer(ABC):
             )
 
         if server_args.expert_distribution_recorder_mode == "per_token_buffered":
-            gatherer = _BufferedDetailSinglePassGatherer(
+            return _BufferedDetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
-            gatherer.set_buffer(buffer)
-            return gatherer
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
@@ -476,7 +469,6 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._metadata: Optional[Dict[str, Any]] = None
-        self._num_tokens = 0
         self._topk_ids_of_layer = torch.zeros(
             (
                 expert_location_metadata.num_layers,
@@ -488,7 +480,6 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
             device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
-        self._data = None
         assert (
             not server_args.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
@@ -500,8 +491,8 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata = dict(
             # TODO pr-chain
             # rids=forward_batch.rids,
-            input_ids=self._data.store(forward_batch.input_ids),
-            positions=self._data.store(forward_batch.positions),
+            input_ids=forward_batch.input_ids,
+            positions=forward_batch.positions,
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
             forward_mode=forward_batch.forward_mode.value,
         )
@@ -522,14 +513,11 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
         self._misc_objects.append(
             dict(
                 layer_id=layer_idx,
-                num_tokens_per_rank=self._data.store(num_tokens_per_rank),
-                num_tokens_per_rdma_rank=self._data.store(num_tokens_per_rdma_rank),
-                num_tokens_per_expert=self._data.store(num_tokens_per_expert),
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
             )
         )
-
-    def set_buffer(self, buffer: RecordBuffer):
-        self._data = buffer
 
     def reset(self):
         self._topk_ids_of_layer[...] = -1
@@ -537,7 +525,7 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata = None
 
     def collect(self) -> Dict:
-        num_tokens = self._num_tokens
+        num_tokens = len(self._metadata["input_ids"])
 
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
@@ -548,11 +536,9 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
 
         return dict(
             **self._metadata,
-            topk_ids_of_layer=self._data.store(
-                self._topk_ids_of_layer[:, :num_tokens, :]
-            ),
+            topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :],
             misc_objects=self._misc_objects,
-            global_physical_count=self._data.store(global_physical_count),
+            global_physical_count=global_physical_count,
         )
 
 
@@ -813,10 +799,9 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[RecordBuffer] = None,
     ) -> "_Accumulator":
         return _Accumulator.get_class(server_args)(
-            server_args, expert_location_metadata, rank, buffer
+            server_args, expert_location_metadata, rank
         )
 
     @staticmethod
@@ -834,12 +819,10 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[RecordBuffer] = None,
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-        self._data = buffer
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -982,9 +965,10 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._records = []
-
-        # ensure buffer is set correctly
-        assert self._data is not None
+        buffer_size_mb = self._server_args.expert_distribution_recorder_buffer_size
+        if buffer_size_mb is None or buffer_size_mb <= 0:
+            buffer_size_mb = 1024  # default to 1GB
+        self._buffer = RecordBuffer(buffer_size_mb)
 
     def get_single_pass_gatherer_keys(self):
         if False:  # TODO `server_args.enable_two_batch_overlap`
@@ -1003,37 +987,40 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
-        if self._data.is_full:
-            return  # drop potential broken records
+        # Buffer is full, skip recording to avoid OOM.
+        if self._buffer.is_full:
+            return
 
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
+
+        def _process_object(obj):
+            if isinstance(obj, torch.Tensor):
+                return self._buffer.store(obj)
+            return obj
+
+        single_pass_data_processed = {
+            k: _process_object(v) for k, v in single_pass_data.items()
+        }
 
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
                 rank=self._rank,
                 gatherer_key=gatherer_key,
-                **single_pass_data,
+                **single_pass_data_processed,
             )
         )
 
     def reset(self):
         super().reset()
         self._records.clear()
-        self._data.reset()
+        self._buffer.reset()
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
 
-        # Ensure all data is written to the buffer
-        self._data.synchronize()
-
-        for record in self._records:
-            # De-reference RecordMetadata to actual tensor data
-            for k, v in record.items():
-                if isinstance(v, RecordMetadata):
-                    record[k] = self._data.get(v, sync=False)
-
+        # ensure D2H copies are completed
+        self._buffer.synchronize()
         output = dict(
             records=self._records,
             # NOTE: This may change during recording, so here we say it is the "last" one
