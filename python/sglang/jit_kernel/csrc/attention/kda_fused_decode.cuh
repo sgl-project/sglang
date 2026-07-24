@@ -35,8 +35,14 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/ptx/cp_async.cuh>
+#include <sgl_kernel/ptx/mbarrier.cuh>
+#include <sgl_kernel/ptx/sync.cuh>
+#include <sgl_kernel/ptx/tma.cuh>
 #include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -57,16 +63,16 @@ constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
 
-__device__ __forceinline__ float bf16_load(const __nv_bfloat16* ptr, int idx) {
+SGL_DEVICE float bf16_load(const __nv_bfloat16* ptr, int idx) {
   return __bfloat162float(ptr[idx]);
 }
 
-__device__ __forceinline__ __nv_bfloat16 bf16_store(float value) {
+SGL_DEVICE __nv_bfloat16 bf16_store(float value) {
   return __float2bfloat16(value);
 }
 
 template <bool kUseCacheGlobalStore>
-__device__ __forceinline__ void store_state_float4(float* ptr, float4 value) {
+SGL_DEVICE void store_state_float4(float* ptr, float4 value) {
   if constexpr (kUseCacheGlobalStore) {
     __stcg(reinterpret_cast<float4*>(ptr), value);
   } else {
@@ -74,63 +80,18 @@ __device__ __forceinline__ void store_state_float4(float* ptr, float4 value) {
   }
 }
 
-__device__ __forceinline__ float sigmoid_fast(float x) {
-  return 1.0f / (1.0f + __expf(-x));
-}
-
-__device__ __forceinline__ float silu_fast(float x) {
-  return x * sigmoid_fast(x);
-}
-
-__device__ __forceinline__ float softplus_fast(float x) {
-  return x > 20.0f ? x : log1pf(__expf(x));
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float value) {
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    value += __shfl_xor_sync(0xffffffffu, value, offset);
-  }
-  return value;
-}
-
-__device__ __forceinline__ void cp_async_cg_16b(float* smem_ptr, const float* gmem_ptr) {
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_ptr));
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-  asm volatile("cp.async.wait_all;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_group_0() {
-  asm volatile("cp.async.wait_group 0;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_group_1() {
-  asm volatile("cp.async.wait_group 1;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_group_2() {
-  asm volatile("cp.async.wait_group 2;\n" ::);
-}
-
-__device__ __forceinline__ void cp_async_wait_oldest(int outstanding_groups) {
+SGL_DEVICE void cp_async_wait_oldest(int outstanding_groups) {
   if (outstanding_groups >= 3) {
-    cp_async_wait_group_2();
+    ptx::cp_async_wait_group<2>();
   } else if (outstanding_groups == 2) {
-    cp_async_wait_group_1();
+    ptx::cp_async_wait_group<1>();
   } else {
-    cp_async_wait_group_0();
+    ptx::cp_async_wait_group<0>();
   }
 }
 
 template <int kStageChunkV>
-__device__ __forceinline__ void cp_async_state_chunk_stage(
+SGL_DEVICE void cp_async_state_chunk_stage(
     float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage) {
   constexpr int kFloat4PerChunk = kStageChunkV * kDimK / 4;
   const int tid = threadIdx.x;
@@ -145,13 +106,13 @@ __device__ __forceinline__ void cp_async_state_chunk_stage(
     const int k = elem - row * kDimK;
     float* dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
     const float* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
-    cp_async_cg_16b(dst, src);
+    ptx::cp_async_cg_16b(dst, src);
   }
-  cp_async_commit();
+  ptx::cp_async_commit_group();
 }
 
 template <int kCopyThreads>
-__device__ __forceinline__ void cp_async_state_chunk_for(
+SGL_DEVICE void cp_async_state_chunk_for(
     float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
   const int tid = threadIdx.x;
@@ -164,12 +125,12 @@ __device__ __forceinline__ void cp_async_state_chunk_for(
     const int k = elem - row * kDimK;
     float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
     const float* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
-    cp_async_cg_16b(dst, src);
+    ptx::cp_async_cg_16b(dst, src);
   }
-  cp_async_commit();
+  ptx::cp_async_commit_group();
 }
 
-__device__ __forceinline__ void cp_async_state_chunk(
+SGL_DEVICE void cp_async_state_chunk(
     float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
@@ -180,52 +141,10 @@ __device__ __forceinline__ void cp_async_state_chunk(
 #define KDA_FUSED_DECODE_HAS_TMA 0
 #endif
 
-__device__ __forceinline__ void mbarrier_init_one(uint64_t* bar) {
-#if KDA_FUSED_DECODE_HAS_TMA
-  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(addr));
-#endif
-}
-
-__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* bar, uint32_t parity) {
-#if KDA_FUSED_DECODE_HAS_TMA
-  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  uint32_t done = 0;
-  while (!done) {
-    asm volatile(
-        "{\n"
-        ".reg .pred P;\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n"
-        "selp.b32 %0, 1, 0, P;\n"
-        "}\n"
-        : "=r"(done)
-        : "r"(addr), "r"(parity));
-  }
-#endif
-}
-
 // 1D TMA bulk copy gmem -> smem; the issuing thread arrives with expect-tx on
-// the mbarrier, completion is observed via mbarrier_wait_parity.
-__device__ __forceinline__ void tma_load_1d(float* smem_dst, const float* gmem_src, uint64_t* bar, uint32_t bytes) {
-#if KDA_FUSED_DECODE_HAS_TMA
-  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
-  const uint32_t mbar = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("fence.proxy.async.shared::cta;" ::);
-  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar), "r"(bytes));
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::"
-      "bytes [%0], [%1], %2, [%3];" ::"r"(dst),
-      "l"(gmem_src),
-      "r"(bytes),
-      "r"(mbar)
-      : "memory");
-#else
-  __trap();
-#endif
-}
-
+// the mbarrier, completion is observed via ptx::mbar_wait_parity.
 template <int kStageChunkV>
-__device__ __forceinline__ void tma_state_chunk_stage(
+SGL_DEVICE void tma_state_chunk_stage(
     float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage,
     uint64_t* bar) {
   constexpr uint32_t kBytes = kStageChunkV * kDimK * sizeof(float);
@@ -235,15 +154,21 @@ __device__ __forceinline__ void tma_state_chunk_stage(
   // of kStageChunkV*kDimK*4, always 16B-aligned.
   const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
   const float* src = state + slot_base + ((i_hv * kDimV + chunk * kStageChunkV) * kDimK);
-  tma_load_1d(dst, src, bar, kBytes);
+#if KDA_FUSED_DECODE_HAS_TMA
+  ptx::fence_async_smem();
+  ptx::mbar_arrive_expect_tx(bar, kBytes);
+  ptx::cp_async_bulk_1d_load(dst, src, kBytes, bar);
+#else
+  __trap();
+#endif
 }
 
-__device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
+SGL_DEVICE float block_reduce_sum(float value, float* scratch) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
 
-  float warp_total = warp_reduce_sum(value);
+  float warp_total = device::warp::reduce_sum(value);
   if (lane == 0) {
     scratch[warp] = warp_total;
   }
@@ -252,7 +177,7 @@ __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
   float block_total = 0.0f;
   if (warp == 0) {
     block_total = lane < kWarps ? scratch[lane] : 0.0f;
-    block_total = warp_reduce_sum(block_total);
+    block_total = device::warp::reduce_sum(block_total);
     if (lane == 0) {
       scratch[0] = block_total;
     }
@@ -266,13 +191,8 @@ struct Sum2 {
   float y;
 };
 
-__device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    x += __shfl_xor_sync(0xffffffffu, x, offset);
-    y += __shfl_xor_sync(0xffffffffu, y, offset);
-  }
-  return {x, y};
+SGL_DEVICE Sum2 warp_reduce_sum_pair(float x, float y) {
+  return {device::warp::reduce_sum(x), device::warp::reduce_sum(y)};
 }
 
 struct Sum4 {
@@ -282,24 +202,21 @@ struct Sum4 {
   float d;
 };
 
-__device__ __forceinline__ Sum4 warp_reduce_sum4(float a, float b, float c, float d) {
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    a += __shfl_xor_sync(0xffffffffu, a, offset);
-    b += __shfl_xor_sync(0xffffffffu, b, offset);
-    c += __shfl_xor_sync(0xffffffffu, c, offset);
-    d += __shfl_xor_sync(0xffffffffu, d, offset);
-  }
-  return {a, b, c, d};
+SGL_DEVICE Sum4 warp_reduce_sum4(float a, float b, float c, float d) {
+  return {
+      device::warp::reduce_sum(a),
+      device::warp::reduce_sum(b),
+      device::warp::reduce_sum(c),
+      device::warp::reduce_sum(d)};
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y, float* scratch) {
+SGL_DEVICE Sum2 block_reduce_sum2_for(float x, float y, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
-  const float warp_x = warp_reduce_sum(x);
-  const float warp_y = warp_reduce_sum(y);
+  const float warp_x = device::warp::reduce_sum(x);
+  const float warp_y = device::warp::reduce_sum(y);
   if (lane == 0) {
     scratch[warp] = warp_x;
     scratch[kReduceWarps + warp] = warp_y;
@@ -311,8 +228,8 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y, float* s
   if (warp == 0) {
     block_x = lane < kReduceWarps ? scratch[lane] : 0.0f;
     block_y = lane < kReduceWarps ? scratch[kReduceWarps + lane] : 0.0f;
-    block_x = warp_reduce_sum(block_x);
-    block_y = warp_reduce_sum(block_y);
+    block_x = device::warp::reduce_sum(block_x);
+    block_y = device::warp::reduce_sum(block_y);
     if (lane == 0) {
       scratch[0] = block_x;
       scratch[1] = block_y;
@@ -322,18 +239,18 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y, float* s
   return {scratch[0], scratch[1]};
 }
 
-__device__ __forceinline__ Sum2 block_reduce_sum2(float x, float y, float* scratch) {
+SGL_DEVICE Sum2 block_reduce_sum2(float x, float y, float* scratch) {
   return block_reduce_sum2_for<kWarps>(x, y, scratch);
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ float block_reduce_sum_active_for(float value, float* scratch) {
+SGL_DEVICE float block_reduce_sum_active_for(float value, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
   float warp_total = 0.0f;
   if (warp < kReduceWarps) {
-    warp_total = warp_reduce_sum(value);
+    warp_total = device::warp::reduce_sum(value);
   }
   if (lane == 0 && warp < kReduceWarps) {
     scratch[warp] = warp_total;
@@ -343,7 +260,7 @@ __device__ __forceinline__ float block_reduce_sum_active_for(float value, float*
   float block_total = 0.0f;
   if (warp == 0) {
     block_total = lane < kReduceWarps ? scratch[lane] : 0.0f;
-    block_total = warp_reduce_sum(block_total);
+    block_total = device::warp::reduce_sum(block_total);
     if (lane == 0) {
       scratch[0] = block_total;
     }
@@ -353,15 +270,15 @@ __device__ __forceinline__ float block_reduce_sum_active_for(float value, float*
 }
 
 template <int kReduceWarps>
-__device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y, float* scratch) {
+SGL_DEVICE Sum2 block_reduce_sum2_active_for(float x, float y, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
   float warp_x = 0.0f;
   float warp_y = 0.0f;
   if (warp < kReduceWarps) {
-    warp_x = warp_reduce_sum(x);
-    warp_y = warp_reduce_sum(y);
+    warp_x = device::warp::reduce_sum(x);
+    warp_y = device::warp::reduce_sum(y);
   }
   if (lane == 0 && warp < kReduceWarps) {
     scratch[warp] = warp_x;
@@ -374,8 +291,8 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y, f
   if (warp == 0) {
     block_x = lane < kReduceWarps ? scratch[lane] : 0.0f;
     block_y = lane < kReduceWarps ? scratch[kReduceWarps + lane] : 0.0f;
-    block_x = warp_reduce_sum(block_x);
-    block_y = warp_reduce_sum(block_y);
+    block_x = device::warp::reduce_sum(block_x);
+    block_y = device::warp::reduce_sum(block_y);
     if (lane == 0) {
       scratch[0] = block_x;
       scratch[1] = block_y;
@@ -385,7 +302,7 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y, f
   return {scratch[0], scratch[1]};
 }
 
-__device__ __forceinline__ float fp32_at(const float* ptr, int64_t idx) {
+SGL_DEVICE float fp32_at(const float* ptr, int64_t idx) {
   return ptr[idx];
 }
 
@@ -547,7 +464,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     if (tid == 0) {
 #pragma unroll
       for (int c = 0; c < kTmaStages; ++c) {
-        mbarrier_init_one(&s_tma_bar[c]);
+        ptx::mbar_init(&s_tma_bar[c], 1);
       }
       tma_state_chunk_stage<kChunkV>(s_state, state, slot, i_hv, state_slot_stride, 0, 0, &s_tma_bar[0]);
       if (kTmaStages > 1 && kNumChunks > 1) {
@@ -598,14 +515,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_k[cs_base + cs_w_stride] = k_shift1;
       cs_k[cs_base + 2 * cs_w_stride] = k_new;
 
-      s_q[k] = silu_fast(q_acc);
-      s_k[k] = silu_fast(k_acc);
+      s_q[k] = device::math::silu_fast(q_acc);
+      s_k[k] = device::math::silu_fast(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
       }
     }
   } else {
@@ -625,14 +542,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       q_acc += bf16_load(x_q, bos * x_row_stride + hk) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
       k_acc += bf16_load(x_k, bos * x_row_stride + hk) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
-      s_q[k] = silu_fast(q_acc);
-      s_k[k] = silu_fast(k_acc);
+      s_q[k] = device::math::silu_fast(q_acc);
+      s_k[k] = device::math::silu_fast(k_acc);
 
       const float g_raw = bf16_load(g, bos * g_row_stride + i_hv * kDimK + k) + dt_bias[hk];
       if constexpr (kUseLowerBound) {
-        s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
+        s_decay[k] = __expf(lower_bound * device::math::sigmoid_fast(exp_a * g_raw));
       } else {
-        s_decay[k] = __expf(-exp_a * softplus_fast(g_raw));
+        s_decay[k] = __expf(-exp_a * device::math::softplus_fast(g_raw));
       }
     }
   }
@@ -662,11 +579,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
       cs_v[cs_base + 2 * cs_w_stride] = v_new;
-      s_v[v] = silu_fast(v_acc);
+      s_v[v] = device::math::silu_fast(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -682,11 +599,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         v_acc += bf16_load(cs_v, cs_idx) * fp32_at(w_v_t, w * hvv_dim + hvv);
       }
       v_acc += bf16_load(x_v, bos * x_row_stride + hvv) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
-      s_v[v] = silu_fast(v_acc);
+      s_v[v] = device::math::silu_fast(v_acc);
 
       if constexpr (kApplyOnorm && kPreloadOnormParams) {
         const int64_t onorm_idx = i_n * onormg_row_stride + i_hv * kDimV + v;
-        pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, onorm_idx));
+        pre_onorm_gate = device::math::sigmoid_fast(bf16_load(onorm_g, onorm_idx));
         pre_onorm_weight = onorm_weight[v];
       }
     }
@@ -695,7 +612,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
   if (tid == 0) {
     const float beta_raw = bf16_load(beta, bos * beta_row_stride + i_hv);
     if constexpr (kApplyBetaSigmoid) {
-      s_beta = sigmoid_fast(beta_raw);
+      s_beta = device::math::sigmoid_fast(beta_raw);
     } else {
       s_beta = beta_raw;
     }
@@ -736,15 +653,15 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         tma_state_chunk_stage<kChunkV>(
             s_state, state, slot, i_hv, state_slot_stride, chunk + 2, chunk + 2, &s_tma_bar[chunk + 2]);
       }
-      mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages], (chunk / kTmaStages) & 1);
+      ptx::mbar_wait_parity(&s_tma_bar[chunk % kTmaStages], (chunk / kTmaStages) & 1);
     } else if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
       if (chunk + 1 < kNumChunks) {
-        cp_async_wait_group_1();
+        ptx::cp_async_wait_group<1>();
       } else {
-        cp_async_wait_all();
+        ptx::cp_async_wait_all();
       }
     } else {
-      cp_async_wait_all();
+      ptx::cp_async_wait_all();
     }
     if constexpr (!kUseTmaLoad && !kSkipWarpSync) {
       __syncwarp();
@@ -860,7 +777,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       float total_sumsq = 0.0f;
       if (warp == 0) {
         total_sumsq = lane < kWarps ? s_reduce[lane] : 0.0f;
-        total_sumsq = warp_reduce_sum(total_sumsq);
+        total_sumsq = device::warp::reduce_sum(total_sumsq);
         if (lane == 0) {
           s_reduce[0] = total_sumsq;
         }
@@ -877,7 +794,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;
@@ -902,7 +819,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           gate = pre_onorm_gate;
           weight = pre_onorm_weight;
         } else {
-          gate = sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
+          gate = device::math::sigmoid_fast(bf16_load(onorm_g, i_n * onormg_row_stride + i_hv * kDimV + tid));
           weight = onorm_weight[tid];
         }
         const float y = raw_o * rstd * weight * gate;

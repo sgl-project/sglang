@@ -246,7 +246,7 @@ enum class ScaleFormat : uint8_t { E4M3 = 0, E8M0 = 1 };
 // micro-cycle bench reusing the kind::mxf4 wrapper at K=96 with only bit 31
 // flipped — `recipes/_other/cublas_nvfp4_ref/README.md` §21.2). The sparse
 // variant uses a DIFFERENT asm string (`tcgen05.mma.sp...`, 4 operands;
-// see `tcgen05_mma_mxf4nvf4_block16_sp[_2sm]` in common/ptx_tcgen05.cuh).
+// see `tcgen05_mma_mxf4nvf4_block16_sp[_2sm]` in common/ptx/tcgen05.cuh).
 // K-dim selection lives in idesc bit 31; sparse selection lives in BOTH
 // idesc bit 2 AND the sp variant of the asm string.
 //

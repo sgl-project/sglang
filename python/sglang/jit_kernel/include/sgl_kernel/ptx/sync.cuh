@@ -2,10 +2,12 @@
 
 #pragma once
 
+#include <sgl_kernel/utils.cuh>
+
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ================= common/ptx_sync.cuh =================
+// ================= common/ptx/sync.cuh =================
 // Lightweight sync wrappers: named barrier.cta, fence.proxy.async variants.
 // PTX ISA 9.2 §9.7.13.
 
@@ -16,8 +18,23 @@ namespace ptx {
 // fence.proxy.async.shared::cta — make generic-proxy smem writes visible to
 // the async proxy (TMA store engine). Required before any cp.async.bulk store
 // that reads smem written by regular ld/st.
-static __device__ __forceinline__ void fence_async_smem() {
+static SGL_DEVICE void fence_async_smem() {
     asm volatile("fence.proxy.async.shared::cta;");
+}
+
+// Publish mbarrier initialization from the generic proxy before an async
+// engine uses the barrier.
+static SGL_DEVICE void fence_mbarrier_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;");
+}
+
+// Partial-CTA rendezvous. `id` must be in [1, 15]; barrier 0 is reserved for
+// the full-CTA barrier used by __syncthreads().
+static SGL_DEVICE void named_barrier_sync(
+        uint32_t id, uint32_t num_threads) {
+    asm volatile("bar.sync %0, %1;"
+                 :: "r"(id), "r"(num_threads)
+                 : "memory");
 }
 
 
@@ -33,7 +50,7 @@ static __device__ __forceinline__ void fence_async_smem() {
 // the separate arrive/wait wrappers let you interleave other work between.
 
 
-static __device__ __forceinline__ void cluster_sync() {
+static SGL_DEVICE void cluster_sync() {
     asm volatile("barrier.cluster.arrive.aligned;");
     asm volatile("barrier.cluster.wait.aligned;");
 }
@@ -42,7 +59,7 @@ static __device__ __forceinline__ void cluster_sync() {
 // when the cluster_sync is also the publish/observe boundary for memory
 // writes done before/after — e.g., between `mbarrier.init` (release) and
 // any `.shared::cluster` use of those mbars (acquire). PTX ISA §9.7.13.
-static __device__ __forceinline__ void cluster_sync_rel_acq() {
+static SGL_DEVICE void cluster_sync_rel_acq() {
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
@@ -56,7 +73,7 @@ static __device__ __forceinline__ void cluster_sync_rel_acq() {
 // issue, alloc/dealloc) without having to gate on `lane_id == 0`.
 //
 // PTX ISA 9.2 §9.7.4. sm_90+.
-static __device__ __forceinline__ bool elect_one() {
+static SGL_DEVICE bool elect_one() {
     uint32_t pred;
     asm volatile(
         "{\n\t.reg .pred p;\n\t"
@@ -64,6 +81,13 @@ static __device__ __forceinline__ bool elect_one() {
         "selp.b32 %0, 1, 0, p;\n\t}\n"
         : "=r"(pred));
     return pred != 0;
+}
+
+// Rank of the executing CTA within its cluster.
+static SGL_DEVICE uint32_t cluster_cta_rank() {
+    uint32_t rank;
+    asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+    return rank;
 }
 
 
@@ -115,14 +139,14 @@ static __device__ __forceinline__ bool elect_one() {
 //   wins on memory-bound epilogues per the example above.
 
 template <int N>
-static __device__ __forceinline__ void setmaxnreg_dec() {
+static SGL_DEVICE void setmaxnreg_dec() {
     static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
     static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N));
 }
 
 template <int N>
-static __device__ __forceinline__ void setmaxnreg_inc() {
+static SGL_DEVICE void setmaxnreg_inc() {
     static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
     static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N));

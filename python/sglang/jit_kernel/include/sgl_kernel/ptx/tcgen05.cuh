@@ -2,12 +2,13 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx_addr.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/utils.cuh>
 
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ================= common/ptx_tcgen05.cuh =================
+// ================= common/ptx/tcgen05.cuh =================
 // tcgen05 (Blackwell 5th-gen TensorCore) wrappers. PTX ISA 9.2 §9.7.16.
 //
 // LIFECYCLE (mandatory order, PTX ISA §9.7.16.7.1):
@@ -59,17 +60,17 @@ namespace ptx {
 
 // ---- TMEM allocation lifecycle ----------------------------------------------
 
-static __device__ __forceinline__ void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
+static SGL_DEVICE void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
                  :: "r"(smem_addr_for_taddr), "r"(n_cols));
 }
 
-static __device__ __forceinline__ void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
+static SGL_DEVICE void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
                  :: "r"(taddr), "r"(n_cols));
 }
 
-static __device__ __forceinline__ void tcgen05_relinquish() {
+static SGL_DEVICE void tcgen05_relinquish() {
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
 }
 
@@ -80,7 +81,7 @@ static __device__ __forceinline__ void tcgen05_relinquish() {
 // these wrappers from a designated warp). The resulting TMEM addresses are
 // symmetric — each CTA's TMEM is allocated at the same column offset.
 
-static __device__ __forceinline__ void tcgen05_alloc_2sm(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
+static SGL_DEVICE void tcgen05_alloc_2sm(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
     asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;"
                  :: "r"(smem_addr_for_taddr), "r"(n_cols));
 }
@@ -122,7 +123,7 @@ static __device__ __forceinline__ void tcgen05_alloc_2sm(uint32_t smem_addr_for_
 // .32x32b.x8: 8 b32 registers per lane = 256 cells/warp = 8 TMEM columns.
 // Per-lane 8 FP32 → 4 bf16x2 packs = 16 BF16 bytes = one int4. Natural fit for
 // BF16 epilogues that drain a TMEM column band with 16-byte smem stores.
-static __device__ __forceinline__ void tcgen05_ld_32x32b_x8(
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(
         uint32_t taddr,
         uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
         uint32_t& r4, uint32_t& r5, uint32_t& r6, uint32_t& r7) {
@@ -131,6 +132,23 @@ static __device__ __forceinline__ void tcgen05_ld_32x32b_x8(
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3),
                    "=r"(r4), "=r"(r5), "=r"(r6), "=r"(r7)
                  : "r"(taddr));
+}
+
+static SGL_DEVICE void tcgen05_ld_32x32b_x8(
+        uint32_t taddr, uint32_t* dst) {
+    tcgen05_ld_32x32b_x8(
+        taddr, dst[0], dst[1], dst[2], dst[3],
+        dst[4], dst[5], dst[6], dst[7]);
+}
+
+static SGL_DEVICE void tcgen05_st_32x32b_x8(
+        uint32_t taddr, const uint32_t* src) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 "
+                 " [%8], {%0, %1, %2, %3, %4, %5, %6, %7};"
+                 :
+                 : "r"(src[0]), "r"(src[1]), "r"(src[2]), "r"(src[3]),
+                   "r"(src[4]), "r"(src[5]), "r"(src[6]), "r"(src[7]),
+                   "r"(taddr));
 }
 
 
@@ -148,15 +166,15 @@ static __device__ __forceinline__ void tcgen05_ld_32x32b_x8(
 // drain provably retires before "buffer free" is signaled. This is the ordering
 // CuteDSL gets from placing `tcgen05.wait::ld.sync.aligned` (cd:1835) right
 // before the @216 arrive (cd:1840).
-static __device__ __forceinline__ void tcgen05_wait_ld() {
+static SGL_DEVICE void tcgen05_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
-static __device__ __forceinline__ void tcgen05_wait_st() {
+static SGL_DEVICE void tcgen05_wait_st() {
     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
 // Commit prior tcgen05.mma operations to an mbarrier (arrive-on-one).
-static __device__ __forceinline__ void tcgen05_commit_arrive(uint64_t* bar) {
+static SGL_DEVICE void tcgen05_commit_arrive(uint64_t* bar) {
     // Note: spec accepts `.shared::cluster` or no state-space; NOT `.shared::cta`.
     asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
                  :: "r"(to_shared(bar)));
@@ -165,7 +183,7 @@ static __device__ __forceinline__ void tcgen05_commit_arrive(uint64_t* bar) {
 // cta_group::2 commit — pairs with cta_group::2 MMA. Signals the mbar in
 // generic-proxy. By itself it only signals the LOCAL CTA's mbar; use the
 // multicast variant below if you want both peer CTAs notified.
-static __device__ __forceinline__ void tcgen05_commit_arrive_2sm(uint64_t* bar) {
+static SGL_DEVICE void tcgen05_commit_arrive_2sm(uint64_t* bar) {
     asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.b64 [%0];"
                  :: "r"(to_shared(bar)));
 }
@@ -176,7 +194,7 @@ static __device__ __forceinline__ void tcgen05_commit_arrive_2sm(uint64_t* bar) 
 // multicast to the same offset as mbar in the shared memory of each
 // destination CTA." Mbar address: pass a CTA-local pointer; the generic
 // addressing mode resolves it to the per-CTA copy.
-static __device__ __forceinline__ void tcgen05_commit_arrive_2sm_multicast(
+static SGL_DEVICE void tcgen05_commit_arrive_2sm_multicast(
         uint64_t* bar, uint16_t cta_mask) {
     asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one"
                  ".shared::cluster.multicast::cluster.b64 [%0], %1;"
@@ -184,7 +202,7 @@ static __device__ __forceinline__ void tcgen05_commit_arrive_2sm_multicast(
 }
 
 
-static __device__ __forceinline__ void tcgen05_fence_after_thread_sync() {
+static SGL_DEVICE void tcgen05_fence_after_thread_sync() {
     asm volatile("tcgen05.fence::after_thread_sync;");
 }
 
@@ -202,7 +220,7 @@ static __device__ __forceinline__ void tcgen05_fence_after_thread_sync() {
 // full table and the per-M layout rules. Off-table shapes are NOT
 // rejected by ptxas — they hit cudaErrorIllegalInstruction at runtime,
 // so consult Table 41 before changing any of (M, N).
-static __device__ __forceinline__ void tcgen05_mma_f16(
+static SGL_DEVICE void tcgen05_mma_f16(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -226,7 +244,7 @@ static __device__ __forceinline__ void tcgen05_mma_f16(
 // and 2cta" picking-table) for the full table and details. Off-
 // table shapes hit cudaErrorIllegalInstruction at the *commit* (not the
 // MMA) — chase the descriptor, not the commit, when debugging.
-static __device__ __forceinline__ void tcgen05_mma_f16_2sm(
+static SGL_DEVICE void tcgen05_mma_f16_2sm(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -243,7 +261,7 @@ static __device__ __forceinline__ void tcgen05_mma_f16_2sm(
 // inst_desc_high : upper 32 bits of the 64-bit instruction descriptor (the
 //                  PTX op uses the upper 32 only).
 // scale_c  : 0 = D = A·B; non-zero = D = D + A·B (predicate).
-static __device__ __forceinline__ void tcgen05_mma_f8f6f4(
+static SGL_DEVICE void tcgen05_mma_f8f6f4(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -258,7 +276,7 @@ static __device__ __forceinline__ void tcgen05_mma_f8f6f4(
 // (Layout A for M=256, Layout B for M=128). Each peer must have called
 // `tcgen05_alloc_2sm`. Dense (no SF), so no sf_a/sf_b operands. Pair with
 // `tcgen05_commit_arrive_2sm` (or its multicast variant) for completion.
-static __device__ __forceinline__ void tcgen05_mma_f8f6f4_2sm(
+static SGL_DEVICE void tcgen05_mma_f8f6f4_2sm(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -275,7 +293,7 @@ static __device__ __forceinline__ void tcgen05_mma_f8f6f4_2sm(
 //
 // Valid shapes (cta_group::1, dense): M ∈ {64, 128}, N ∈ {8, 16, …, 256}
 // steps of 8, K = 8. Provenance: kernels/qr/studies/inhouse_gemm/tf32_mma.cuh.
-static __device__ __forceinline__ void tcgen05_mma_tf32(
+static SGL_DEVICE void tcgen05_mma_tf32(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -292,7 +310,7 @@ static __device__ __forceinline__ void tcgen05_mma_tf32(
 //
 // Valid shapes (cta_group::2, dense): M ∈ {128, 256}, N ∈ {16, 32, …, 256}
 // **steps of 16**, K = 8.
-static __device__ __forceinline__ void tcgen05_mma_tf32_2sm(
+static SGL_DEVICE void tcgen05_mma_tf32_2sm(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t inst_desc_high, uint32_t scale_c) {
     asm volatile(
@@ -336,7 +354,7 @@ static __device__ __forceinline__ void tcgen05_mma_tf32_2sm(
 
 // kind::mxf4nvf4.block_scale.block16 sparse, cta_group::1 (M=128, K=128 sparse).
 // `sp_meta` is a TMEM byte address holding the metadata cells.
-static __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_block16_sp(
+static SGL_DEVICE void tcgen05_mma_mxf4nvf4_block16_sp(
         uint32_t d, uint64_t desc_a, uint64_t desc_b,
         uint32_t sp_meta, uint32_t inst_desc_high, uint32_t scale_c,
         uint32_t sf_a, uint32_t sf_b) {

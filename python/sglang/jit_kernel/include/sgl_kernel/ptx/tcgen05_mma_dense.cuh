@@ -2,12 +2,12 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx_mma_desc.cuh>
-#include <sgl_kernel/ptx_tcgen05.cuh>
+#include <sgl_kernel/ptx/mma_desc.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
 
 #include <cstdint>
 
-// ================= common/ptx_tcgen05_mma_dense.cuh =================
+// ================= common/ptx/tcgen05_mma_dense.cuh =================
 // Parametric wrapper unifying `tcgen05.mma kind::f16` (BF16/F16 inputs) and
 // `tcgen05.mma kind::f8f6f4` (FP8/FP6/FP4 inputs, dense — no scale_block) under
 // one templated entry point. Both kinds share IDENTICAL operand shape and the
@@ -16,7 +16,7 @@
 //
 // Composition pieces used unchanged from existing common headers:
 //   * `mma_inst_desc_f16` / `mma_inst_desc_f8f6f4`   (mma_desc.cuh)
-//   * `tcgen05_mma_f16{,_2sm}` / `tcgen05_mma_f8f6f4{,_2sm}` (ptx_tcgen05.cuh)
+//   * `tcgen05_mma_f16{,_2sm}` / `tcgen05_mma_f8f6f4{,_2sm}` (ptx/tcgen05.cuh)
 //   * `tcgen05_alloc{,_2sm}`, `tcgen05_commit_arrive{,_2sm,...}`, etc.
 //
 // What this header adds:

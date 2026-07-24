@@ -20,19 +20,20 @@
 #include <sgl_kernel/cuda_check.h>
 #include <sgl_kernel/distributed/communicator.cuh>
 #include <sgl_kernel/tensor_map.h>
-#include <sgl_kernel/ptx_addr.cuh>
-#include <sgl_kernel/ptx_mbarrier.cuh>
-#include <sgl_kernel/ptx_mma.cuh>
-#include <sgl_kernel/ptx_smem.cuh>
-#include <sgl_kernel/ptx_sync.cuh>
-#include <sgl_kernel/ptx_cvt.cuh>
-#include <sgl_kernel/ptx_clc.cuh>
-#include <sgl_kernel/ptx_tma.cuh>
-#include <sgl_kernel/ptx_tcgen05.cuh>
-#include <sgl_kernel/ptx_mma_desc.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/ptx/mbarrier.cuh>
+#include <sgl_kernel/ptx/mma.cuh>
+#include <sgl_kernel/ptx/smem.cuh>
+#include <sgl_kernel/ptx/sync.cuh>
+#include <sgl_kernel/ptx/cvt.cuh>
+#include <sgl_kernel/ptx/clc.cuh>
+#include <sgl_kernel/ptx/tma.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
+#include <sgl_kernel/ptx/mma_desc.cuh>
 #include <sgl_kernel/dense_gemm_mainloop.cuh>
-#include <sgl_kernel/ptx_tcgen05_mma_dense.cuh>
+#include <sgl_kernel/ptx/tcgen05_mma_dense.cuh>
 #include <sgl_kernel/swizzle.h>
+#include <sgl_kernel/utils.cuh>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -160,25 +161,7 @@ constexpr __host__ __device__ size_t region_bytes(int R) {
 // slots/flags/out stay race-free. Serving overlaps the next layer's kernels
 // the same way; an unfused cublas composite cannot cooperate across the
 // vendor-kernel boundary.
-static __device__ __forceinline__ void pdl_launch_dependents() {
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-}
-static __device__ __forceinline__ void pdl_wait() {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-}
-// ldmatrix.x2 (non-trans) — one n8×k16 B fragment (b0,b1) from an [n][k]
-// row-major tile: lane L's r_m = (row n=L/4, k-pair 2(L%4)) of matrix m —
-// exactly the mma.m16n8k16 .col B fragment (k-pairs per lane, n = L/4).
-// Lanes 0-7 address matrix 0 rows (k-half 0), 8-15 matrix 1 (k-half 1).
-static __device__ __forceinline__ void ldmatrix_x2_b16(
-        uint32_t smem_addr, uint32_t& r0, uint32_t& r1) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared::cta.b16 {%0, %1}, [%2];"
-                 : "=r"(r0), "=r"(r1) : "r"(smem_addr));
-}
-static __device__ __forceinline__ uint32_t cluster_ctarank() {
-    uint32_t r; asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r;
-}
-static __device__ __forceinline__ uint32_t bf2_u32(float2 f) {
+SGL_DEVICE uint32_t bf2_u32(float2 f) {
     const __nv_bfloat162 p = __float22bfloat162_rn(f);
     return *reinterpret_cast<const uint32_t*>(&p);
 }
@@ -207,7 +190,7 @@ struct Params {
 // kN/8 = 896 n8-tiles over gridDim CTAs: first `rem` CTAs own base+1 tiles.
 struct Strip {
     int t0, nt;
-    static __device__ Strip make(int cta, int ncta) {
+    static SGL_DEVICE Strip make(int cta, int ncta) {
         const int kT = kN / 8;
         const int base = kT / ncta, rem = kT % ncta;
         Strip s;
@@ -275,7 +258,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
     uint64_t* fullb  = reinterpret_cast<uint64_t*>(a_st + size_t(S) * kStA);
     uint64_t* emptyb = fullb + S;
 
-    const uint32_t crank = C > 1 ? cluster_ctarank() : 0;
+    const uint32_t crank = C > 1 ? ptx::cluster_cta_rank() : 0;
     {
         if (tid == 0) {
             ptx::prefetch_tensormap(&w_map);
@@ -336,7 +319,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
 #pragma unroll
                 for (int k16 = 0; k16 < kBK / 16; ++k16) {
                     uint32_t b0, b1;
-                    ldmatrix_x2_b16(
+                    ptx::ldmatrix_x2_b16(
                         b_base + uint32_t(b_row) * (kBK * 2)
                                + swz::smem_col_128b_bf16(b_row, (k16 * 2 + b_ka) * 8) * 2,
                         b0, b1);
@@ -364,11 +347,11 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
 
     // ---- epilogue: push ----------------------------------------------------
     __syncthreads();               // whole CTA past its smem/feed reads
-    pdl_launch_dependents();       // next launch streams weights under our
+    device::PDLTriggerSecondary<true>();  // next launch streams weights under our
                                    // push+boundary+reduce (needs 2-CTA/SM
                                    // co-residency: 100% smem carveout + this
                                    // kernel's smem ≤ ~113 KB)
-    pdl_wait();   // prior grid reached ITS trigger (k-loop end) — NOT done
+    device::PDLWaitPrimary<true>();  // prior grid reached ITS trigger (k-loop end) — NOT done
     {
         // guard: epoch e-2 (same parity) fully reduced everywhere before we
         // overwrite its slots. Steady-state this is already set (~one hot
@@ -523,8 +506,7 @@ constexpr __host__ __device__ int d3_bn(int Mp) {
 
 // drain-order slot offset: unit = (tile t, n-block nb, epi-warp w, lane l),
 // 16 B each. Total = num_tiles * (BN/8) * 4 * 32 * 16 = Mpad*N*2 bytes.
-__device__ __forceinline__ size_t d3_slot_off(int t, int nb, int w, int l,
-                                              int nblk_per_tile) {
+SGL_DEVICE size_t d3_slot_off(int t, int nb, int w, int l, int nblk_per_tile) {
     return ((size_t(t) * nblk_per_tile + nb) * 4u + w) * 32u * 16u + size_t(l) * 16u;
 }
 
@@ -635,7 +617,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
     }
 
     // x and all slot traffic remain behind the dependency.
-    pdl_wait();
+    device::PDLWaitPrimary<true>();
 
     // done-guard before any slot write (W3; PDL wait pairs with the trigger)
     {
@@ -749,7 +731,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
         }
     }
     __syncthreads();
-    pdl_launch_dependents();
+    device::PDLTriggerSecondary<true>();
     if (warp_id == 1) {
         ptx::tcgen05_dealloc(taddr, kTmemCols);
         ptx::tcgen05_relinquish();

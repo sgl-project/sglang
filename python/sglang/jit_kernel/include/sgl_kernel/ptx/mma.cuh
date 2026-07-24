@@ -5,10 +5,10 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ================= common/ptx_mma.cuh =================
+// ================= common/ptx/mma.cuh =================
 // Warp-level mma.sync wrappers. PTX ISA 9.2 §9.7.14
 // (refs/sections/9_7_14_warp_level_matrix_multiply_accumulate.txt).
-// Distinct from tcgen05 MMA (`ptx_tcgen05_mma_dense.cuh`): mma.sync is the
+// Distinct from tcgen05 MMA (`ptx/tcgen05_mma_dense.cuh`): mma.sync is the
 // warp-register form — co-resides freely (no TMEM, no 1-CTA/SM cap), the
 // pick for small/latency-bound and co-resident GEMMs
 // (recipes/gemm_design_guide §2.2/§2.3).

@@ -2,12 +2,12 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx_addr.cuh>
-#include <sgl_kernel/ptx_mbarrier.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/ptx/mbarrier.cuh>
 
 #include <cstdint>
 
-// ================= common/ptx_clc.cuh =================
+// ================= common/ptx/clc.cuh =================
 // Cluster Launch Control (CLC) wrappers. PTX ISA 9.2 §9.7.13.17 / §9.7.13.18.
 // sm_100+ (verified on sm_103a / B300).
 //

@@ -1,13 +1,18 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/ptx/mbarrier.cuh>
+#include <sgl_kernel/ptx/sync.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
+#include <sgl_kernel/ptx/tma.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <cuda/ptx>
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
@@ -17,106 +22,6 @@
 #include <utility>
 
 namespace sglang {
-
-namespace ptx {
-
-SGL_DEVICE void mbarrier_init(uint64_t* mbar, uint32_t expected_arrivers) {
-  ::cuda::ptx::mbarrier_init(mbar, expected_arrivers);
-}
-
-// Required between mbarrier.init (generic proxy) and the first cp.async.bulk
-// complete_tx on the barrier (async proxy).
-SGL_DEVICE void fence_mbarrier_init() {
-  asm volatile("fence.mbarrier_init.release.cluster;");
-}
-
-SGL_DEVICE void mbarrier_wait_parity(uint64_t* mbar, uint32_t parity) {
-  while (!::cuda::ptx::mbarrier_try_wait_parity(mbar, parity))
-    ;
-}
-
-SGL_DEVICE void mbarrier_arrive(uint64_t* mbar) {
-  ::cuda::ptx::mbarrier_arrive(mbar);
-}
-
-SGL_DEVICE void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
-  namespace ns = ::cuda::ptx;
-  ns::mbarrier_arrive_expect_tx(ns::sem_release, ns::scope_cta, ns::space_shared, mbar, tx_bytes);
-}
-
-SGL_DEVICE void cp_async_bulk(void* smem_dst, const void* gmem_src, int bytes, uint64_t* mbar) {
-  namespace ns = ::cuda::ptx;
-  ns::cp_async_bulk(ns::space_shared, ns::space_global, smem_dst, gmem_src, bytes, mbar);
-}
-
-// Partial-CTA rendezvous. `id` must be in [1, 15]: barrier 0 is __syncthreads'.
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
-}
-
-SGL_DEVICE bool elect_one_sync(unsigned mask = 0xffffffffu) {
-  int pred;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred p;\n\t"
-      "elect.sync _|p, %1;\n\t"
-      "selp.b32 %0, 1, 0, p;\n\t"
-      "}\n"
-      : "=r"(pred)
-      : "r"(mask));
-  return pred;
-}
-
-// TMEM allocation — warp-collective, one warp per call.
-SGL_DEVICE void tmem_alloc(uint32_t* smem_dst, uint32_t num_cols) {
-  const auto dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
-  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(dst), "r"(num_cols));
-}
-
-SGL_DEVICE void tmem_dealloc(uint32_t tmem_addr, uint32_t num_cols) {
-  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(tmem_addr), "r"(num_cols));
-}
-
-SGL_DEVICE void tmem_relinquish_alloc_permit() {
-  asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
-}
-
-SGL_DEVICE void tmem_store_wait() {
-  asm volatile("tcgen05.wait::st.sync.aligned;");
-}
-
-// Warp-group register reallocation (sm_90a+). All 4 warps of an aligned
-// warp group must execute the same call; count in [24, 256], multiple of 8.
-template <uint32_t kRegCount>
-SGL_DEVICE void setmaxnreg_inc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(kRegCount));
-}
-
-template <uint32_t kRegCount>
-SGL_DEVICE void setmaxnreg_dec() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(kRegCount));
-}
-
-SGL_DEVICE void tmem_load_x8(uint32_t src_addr, float* dst) {
-  uint32_t* d = reinterpret_cast<uint32_t*>(dst);
-  asm volatile(
-      "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-      "{%0, %1, %2, %3, %4, %5, %6, %7},"
-      "[%8];\n"
-      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]), "=r"(d[4]), "=r"(d[5]), "=r"(d[6]), "=r"(d[7])
-      : "r"(src_addr));
-}
-
-SGL_DEVICE void tmem_store_x8(uint32_t dst_addr, const float* src) {
-  const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
-  asm volatile(
-      "tcgen05.st.sync.aligned.32x32b.x8.b32"
-      "[%8], {%0, %1, %2, %3, %4, %5, %6, %7};\n"
-      :
-      : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]), "r"(dst_addr));
-}
-
-}  // namespace ptx
 
 struct AttnResTMAParams {
   const bf16_t* __restrict__ prefix_sum;  // [T, H]
@@ -214,26 +119,25 @@ template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t 
 SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_>::forward(
     const AttnResTMAParams& params, Smem* smem) {
   using namespace device;
-  constexpr float kLog2 = 1.4426950408889634f;
   using row_vec_t = AlignedVector<bf16x2_t, kVecElems / 2>;  // 16 bytes
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
   const auto lane_id = tx % kWarpThreads;
 
   if (warp_id == 0 && lane_id < kNumStages) {
-    ptx::mbarrier_init(&smem->bar_full[lane_id], 1);
-    ptx::mbarrier_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
-    ptx::fence_mbarrier_init();
+    ::ptx::mbar_init(&smem->bar_full[lane_id], 1);
+    ::ptx::mbar_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
+    ::ptx::fence_mbarrier_init();
   } else if (warp_id == 1) {
-    ptx::tmem_alloc(&smem->tmem_base, kTmemCols);
-    ptx::tmem_relinquish_alloc_permit();
+    ::ptx::tcgen05_alloc(::ptx::to_shared(&smem->tmem_base), kTmemCols);
+    ::ptx::tcgen05_relinquish();
   }
 
   __syncthreads();
   if (warp_id >= kNumConsumerWarps) {  // producer warp (group); first warp works
-    if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_dec<kProducerRegs>();
+    if constexpr (kConsumerRegs > 0) ::ptx::setmaxnreg_dec<kProducerRegs>();
     // TODO: reduce the register usage
-    if (warp_id == kNumConsumerWarps && ptx::elect_one_sync()) {
+    if (warp_id == kNumConsumerWarps && ::ptx::elect_one()) {
       uint32_t global_chunks = 0;
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
       for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
@@ -244,10 +148,10 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           const auto slot = global_chunks % kNumStages;
           const auto phase = (global_chunks / kNumStages) & 1;
           if (global_chunks >= kNumStages) {
-            ptx::mbarrier_wait_parity(&smem->bar_free[slot], phase ^ 1);
+            ::ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
           }
           // One barrier per chunk; each row still gets its own bulk copy.
-          ptx::mbarrier_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
+          ::ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
             const auto row = base_row + r;
@@ -256,14 +160,14 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             // Only prefix_sum is written by the immediately-preceding kernel;
             // one wait before the first token's prefix load covers the rest.
             if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
-            ptx::cp_async_bulk(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
+            ::ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
       }
       PDLTriggerSecondary<true>();
     }
   } else {  // 2 consumer warp groups; one chunk per rendezvous
-    if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_inc<kConsumerRegs>();
+    if constexpr (kConsumerRegs > 0) ::ptx::setmaxnreg_inc<kConsumerRegs>();
     const auto group = warp_id / (kNumConsumerWarps / kNumGroups);
     const auto tid_in_group = tx % kGroupThreads;
     const auto tmem_cw = smem->tmem_base + group * kTmemColsPerGroup;
@@ -284,7 +188,8 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ptx::tmem_store_x8(tmem_cw + si * kVecElems, &staged[si * kVecElems]);
+        ::ptx::tcgen05_st_32x32b_x8(
+            tmem_cw + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
@@ -298,9 +203,10 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ptx::tmem_store_x8(tmem_ow + si * kVecElems, &staged[si * kVecElems]);
+        ::ptx::tcgen05_st_32x32b_x8(
+            tmem_ow + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
       }
-      ptx::tmem_store_wait();
+      ::ptx::tcgen05_wait_st();
     }
 
     uint32_t global_chunks = 0;  // mirrors the producer's chunk counter
@@ -316,7 +222,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         const uint32_t an = (kNumRows + 1 - base_row) < kChunkRows ? (kNumRows + 1 - base_row) : kChunkRows;
         const auto slot = global_chunks % kNumStages;
         const auto phase = (global_chunks / kNumStages) & 1;
-        ptx::mbarrier_wait_parity(&smem->bar_full[slot], phase);
+        ::ptx::mbar_wait_parity(&smem->bar_full[slot], phase);
 
         // Score pass: the cw slice is loaded once and reused across the
         // chunk's rows; each row's 16B slices land in registers. rms/dot
@@ -330,7 +236,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           const auto tile = si * kNumGroups + group;
           if (tile >= kNumTiles) continue;
           float q[kVecElems];
-          ptx::tmem_load_x8(tmem_cw + si * kVecElems, q);
+          ::ptx::tcgen05_ld_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<uint32_t*>(q));
           const auto* q2 = reinterpret_cast<const float2*>(q);
           const auto offset = tile * kTile + tid_in_group * kVecElems;
 #pragma unroll
@@ -347,7 +253,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             }
           }
         }
-        ptx::mbarrier_arrive(&smem->bar_free[slot]);
+        ::ptx::mbar_arrive(&smem->bar_free[slot]);
 
         // Fused bank write: the prefix row (last row of the last chunk) is
         // already in registers; snapshot it to bank row nvb with plain
@@ -373,12 +279,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
 
 #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-#pragma unroll
-          for (int n = 0; n < an; n++) {
-            acc_rms[n] += __shfl_xor_sync(0xffffffffu, acc_rms[n], offset);
-            acc_dot[n] += __shfl_xor_sync(0xffffffffu, acc_dot[n], offset);
-          }
+        for (int n = 0; n < an; n++) {
+          acc_rms[n] = warp::reduce_sum(acc_rms[n]);
+          acc_dot[n] = warp::reduce_sum(acc_dot[n]);
         }
         if (lane_id == 0) {
 #pragma unroll
@@ -387,7 +290,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             smem->warp_dot[warp_id][r] = acc_dot[r];
           }
         }
-        ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
+        ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
         // Lane r totals row r, then broadcasts: an*16 smem loads per warp
         // instead of per thread.
         float lane_logit = 0.f;
@@ -415,12 +318,12 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           chunk_max = fmaxf(chunk_max, logit[r]);
         }
         const float new_max = fmaxf(run_max, chunk_max);
-        const float correction = exp2f((run_max - new_max) * kLog2);
+        const float correction = exp2f((run_max - new_max) * math::log2e);
         float weight[kChunkRows];
         float weight_sum = 0.f;
 #pragma unroll
         for (uint32_t r = 0; r < an; ++r) {
-          weight[r] = exp2f((logit[r] - new_max) * kLog2);
+          weight[r] = exp2f((logit[r] - new_max) * math::log2e);
           weight_sum += weight[r];
         }
         run_sum = run_sum * correction + weight_sum;
@@ -466,7 +369,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
       float acc_sq = warp::reduce_sum(acc_sq2.x + acc_sq2.y);
       if (lane_id == 0) smem->warp_ssq[warp_id] = acc_sq;
-      ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
+      ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
       float total_sq = 0.f;
 #pragma unroll
       for (uint32_t w = 0; w < kNumConsumerWarps; ++w) {
@@ -481,7 +384,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         const auto tile = si * kNumGroups + group;
         if (tile >= kNumTiles) continue;
         float q[kVecElems];
-        ptx::tmem_load_x8(tmem_ow + si * kVecElems, q);
+        ::ptx::tcgen05_ld_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<uint32_t*>(q));
         const auto* q2 = reinterpret_cast<const float2*>(q);
         row_vec_t out_vec;
 #pragma unroll
@@ -492,9 +395,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         out_vec.store(out_ptr, tile * (kTile / kVecElems) + tid_in_group);
       }
     }
-    ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
+    ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
     if (warp_id == 1) {
-      ptx::tmem_dealloc(smem->tmem_base, kTmemCols);
+      ::ptx::tcgen05_dealloc(smem->tmem_base, kTmemCols);
     }
   }
 }

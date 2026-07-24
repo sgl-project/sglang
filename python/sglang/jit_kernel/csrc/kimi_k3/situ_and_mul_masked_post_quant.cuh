@@ -61,8 +61,8 @@ situ_and_mul(DType2 gate, DType2 up, float beta, float inv_beta, float linear_be
   using namespace device;
   const auto [g0, g1] = cast<fp32x2_t>(gate);
   const auto [u0, u1] = cast<fp32x2_t>(up);
-  const float gate_out0 = beta * tanhf(g0 * inv_beta) * (1.0f / (1.0f + __expf(-g0)));
-  const float gate_out1 = beta * tanhf(g1 * inv_beta) * (1.0f / (1.0f + __expf(-g1)));
+  const float gate_out0 = beta * tanhf(g0 * inv_beta) * math::sigmoid_fast(g0);
+  const float gate_out1 = beta * tanhf(g1 * inv_beta) * math::sigmoid_fast(g1);
   const float up_out0 = linear_beta * tanhf(u0 * inv_linear_beta);
   const float up_out1 = linear_beta * tanhf(u1 * inv_linear_beta);
   const float val0 = gate_out0 * up_out0;

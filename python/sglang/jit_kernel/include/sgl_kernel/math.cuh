@@ -58,6 +58,24 @@ SGL_DEVICE T exp(T a) {
   return DTypeTrait<T>::exp(a);
 }
 
+/// \brief Fast approximate sigmoid for FP32 device code.
+SGL_DEVICE float sigmoid_fast(float x) {
+  return 1.0f / (1.0f + __expf(-x));
+}
+
+/// \brief Fast approximate SiLU for FP32 device code.
+SGL_DEVICE float silu_fast(float x) {
+  return x * sigmoid_fast(x);
+}
+
+/// \brief Fast approximate softplus for FP32 device code.
+///
+/// Values above 20 use the asymptotic result directly, avoiding overflow and
+/// an unnecessary exponential while matching common softplus kernels.
+SGL_DEVICE float softplus_fast(float x) {
+  return x > 20.0f ? x : log1pf(__expf(x));
+}
+
 /// \brief Returns sin(a).
 template <typename T>
 SGL_DEVICE T sin(T a) {

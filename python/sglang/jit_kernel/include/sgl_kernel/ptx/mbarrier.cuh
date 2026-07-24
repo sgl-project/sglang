@@ -2,11 +2,12 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx_addr.cuh>
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
 
-// ================= common/ptx_mbarrier.cuh =================
+// ================= common/ptx/mbarrier.cuh =================
 // mbarrier wrappers. PTX ISA 9.2 §9.7.13.15.
 //
 // Wait variant: this file ONLY wraps `try_wait.parity`. The other two waiter
@@ -47,7 +48,7 @@
 //     is done internally. Pass `&array[i]` or `&single_bar`; for a known-
 //     shared array nvcc folds `__cvta_generic_to_shared` to a single PTX
 //     instruction (or nothing).
-//   - all wrappers are zero-cost (static __device__ __forceinline__).
+//   - all wrappers are zero-cost (static SGL_DEVICE).
 //   - the spin-wait wrapper uses `WAIT_%=` for inline-asm label uniqueness so
 //     it can be inlined multiple times in the same kernel without colliding.
 //   - default `.sem` for `try_wait` is `.acquire` per the spec — we don't
@@ -90,7 +91,7 @@
 namespace ptx {
 
 // mbarrier.init [bar], count;
-static __device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
+static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
     asm volatile("mbarrier.init.shared.b64 [%0], %1;"
                  :: "r"(to_shared(bar)), "r"(count));
 }
@@ -99,7 +100,7 @@ static __device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) 
 // mbarrier.arrive [bar]. Returns the 64-bit phase state token, but the only
 // remaining waiter wrapper is parity-based, so the return is typically
 // discarded.
-static __device__ __forceinline__ uint64_t mbar_arrive(uint64_t* bar) {
+static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
     uint64_t state;
     asm volatile("mbarrier.arrive.shared.b64 %0, [%1];"
                  : "=l"(state) : "r"(to_shared(bar)));
@@ -116,7 +117,7 @@ static __device__ __forceinline__ uint64_t mbar_arrive(uint64_t* bar) {
 // State-token return is sinked (`_`) since cross-CTA waits are parity-based.
 //
 // First-principles derivation: see `ptx/b_mbarrier/README.md` "Cluster scope".
-static __device__ __forceinline__ void mbar_arrive_cluster(uint64_t* bar, uint32_t cta_rank) {
+static SGL_DEVICE void mbar_arrive_cluster(uint64_t* bar, uint32_t cta_rank) {
     const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
     asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];" :: "r"(mapped));
 }
@@ -134,7 +135,7 @@ static __device__ __forceinline__ void mbar_arrive_cluster(uint64_t* bar, uint32
 // (`mbarrier.arrive.release.cta.shared::cluster.b64 _, [addr], 1`, PTX 1840),
 // paired with the MMA-warp's default-`.acquire` `try_wait`. Use this whenever
 // the arriving warp has done TMEM/smem work the waiting peer must observe.
-static __device__ __forceinline__ void mbar_arrive_cluster_release(uint64_t* bar, uint32_t cta_rank) {
+static SGL_DEVICE void mbar_arrive_cluster_release(uint64_t* bar, uint32_t cta_rank) {
     const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
     asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0], 1;" :: "r"(mapped));
 }
@@ -142,7 +143,7 @@ static __device__ __forceinline__ void mbar_arrive_cluster_release(uint64_t* bar
 
 // mbarrier.arrive.expect_tx [bar], bytes; (combined arrive + set tx-count).
 // State is sinked with `_` — caller must use parity-based wait.
-static __device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
                  :: "r"(to_shared(bar)), "r"(bytes));
 }
@@ -152,7 +153,7 @@ static __device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, uint
 // multiple peer CTAs into one CTA's mbar (typical: 2-CTA TMA where every
 // CTA's arrive_expect_tx targets CTA-0's mbar). Pair with the cluster TMA
 // load (`cp_async_bulk_tensor_2d_load_cluster`).
-static __device__ __forceinline__ void mbar_arrive_expect_tx_cluster(
+static SGL_DEVICE void mbar_arrive_expect_tx_cluster(
         uint64_t* bar, uint32_t cta_rank, uint32_t bytes) {
     const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
     asm volatile("mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;"
@@ -163,7 +164,7 @@ static __device__ __forceinline__ void mbar_arrive_expect_tx_cluster(
 // suspend the thread; we loop because the spec allows spurious early wakeups
 // (system timeout). The default and only wait wrapper here — see header
 // comment for why state-token / test_wait variants are intentionally absent.
-static __device__ __forceinline__ void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
     asm volatile(
         "{\n\t.reg .pred p;\n\t"
         "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"

@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ================= common/ptx_cvt.cuh =================
+// ================= common/ptx/cvt.cuh =================
 // Templated cvt wrappers — pack 2 FP32 inputs into the dst dtype's packed
 // representation in a single PTX `cvt` instruction.
 //
