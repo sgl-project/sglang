@@ -124,7 +124,7 @@ class EnvJSON(EnvField):
 
 class EnvBool(EnvField):
     def parse(self, value: str) -> bool:
-        value = value.lower()
+        value = value.strip().lower()
         if value in ["true", "1", "yes", "y"]:
             return True
         if value in ["false", "0", "no", "n"]:
@@ -135,7 +135,7 @@ class EnvBool(EnvField):
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
-            return int(value)
+            return int(value.strip())
         except ValueError:
             raise ValueError(f'"{value}" is not a valid integer value')
 

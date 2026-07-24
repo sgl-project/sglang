@@ -1222,8 +1222,7 @@ _warned_bool_env_var_keys = set()
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name, default)
-    value = value.lower()
+    value = os.getenv(name, default).strip().lower()
 
     truthy_values = ("true", "1")
     falsy_values = ("false", "0")
@@ -1246,7 +1245,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
     if value is None or not value.strip():
         return default
     try:
-        return int(value)
+        return int(value.strip())
     except ValueError:
         return default
 
