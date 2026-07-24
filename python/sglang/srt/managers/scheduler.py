@@ -1198,6 +1198,9 @@ class Scheduler(
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+            self.disagg_decode_transfer_queue.prealloc_queue = (
+                self.disagg_decode_prealloc_queue
+            )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.

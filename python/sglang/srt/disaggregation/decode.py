@@ -271,6 +271,7 @@ class DecodeRequest:
     hicache_restored_node: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    awaiting_hicache_finalize: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -1041,20 +1042,62 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
+            # Deferred HiCache path: when L2/L3 load_back is needed, defer
+            # _pre_alloc + send_metadata until load_back completes. This uses
+            # the ACTUAL restored token count as total_prefix_len, avoiding
+            # an unfillable gap if L3 prefetch returns fewer tokens than
+            # promised.
+            is_deferred_hicache = (
+                self.scheduler.enable_decode_hicache
+                and prefix_match is not None
+                and prefix_match.needs_local_restore
             )
-            decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
+            if is_deferred_hicache:
+                decode_req.prefix_match = prefix_match
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
+                reserved_restore_tokens += required_alloc_tokens
+                # Reserve FULL required_alloc_tokens since _pre_alloc is
+                # deferred and available_size hasn't decreased yet.
+                decode_req.awaiting_hicache_finalize = True     
+            else:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
+                decode_req.prefix_match = prefix_match
+                if self.scheduler.enable_decode_hicache:
+                    self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    reserved_restore_tokens += prefix_match.restore_token_count
+                decode_req.req.cache_protected_len = total_prefix_len
+
+                page_size = self.token_to_kv_pool_allocator.page_size
+                kv_transfer_page_size = page_size
+                if self.scheduler.enable_hisparse:
+                    # Direct-to-host sends host/C4 rows; keep allocator.page_size
+                    # logical and use the compressed page size only for these indices.
+                    kv_transfer_page_size = getattr(
+                        self.token_to_kv_pool_allocator,
+                        "hisparse_page_size",
+                        page_size,
+                    )
+                    kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                else:
+                    # Only send delta indices (beyond prefix) to prefill.
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx
+                    ][total_prefix_len:origin_input_len]
+
+            self._send_decode_kv_metadata(
+                decode_req, total_prefix_len, kv_indices, kv_transfer_page_size
+            )
+            
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
-            if prefix_match is not None:
-                reserved_restore_tokens += prefix_match.restore_token_count
+            
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
@@ -1065,132 +1108,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
-            decode_req.req.cache_protected_len = total_prefix_len
-
-            page_size = self.token_to_kv_pool_allocator.page_size
-            kv_transfer_page_size = page_size
-            if self.scheduler.enable_hisparse:
-                # Direct-to-host sends host/C4 rows; keep allocator.page_size
-                # logical and use the compressed page size only for these indices.
-                kv_transfer_page_size = getattr(
-                    self.token_to_kv_pool_allocator,
-                    "hisparse_page_size",
-                    page_size,
-                )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
-            else:
-                # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][total_prefix_len:origin_input_len]
-
-            seq_len = origin_input_len
-
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(kv_indices_full, device_page_size)
-
-            def _swa_ring_payload():
-                # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
-                # Same window positions and order -> positional match with prefill.
-                ring_stride = self.token_to_kv_pool.unified_swa_ring_size
-                window_size = self.token_to_kv_pool.unified_swa_window
-                window_start = max(0, seq_len - window_size)
-                positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(decode_req.req.req_pool_idx)
-                ring_rows = state_slot * ring_stride + (positions % ring_stride)
-                return ring_rows.astype(np.int32)
-
-            def _c128_state_payload():
-                online = is_dsv4_c128_online_enabled()
-                ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
-                return get_dsv4_c128_state_indices(
-                    int(decode_req.req.req_pool_idx),
-                    seq_len,
-                    online=online,
-                    ring_size=ring_size,
-                )
-
-            state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
-            if StateType.C128_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
-                )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                else:
-                    state_indices.append(None)
-
-            decode_req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert decode_req.metadata_buffer_index is not None
-            # int32 for ZMQ serialization -- from_zmq reads np.int32.
-            page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
-                np.int32
-            )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                decode_prefix_len=total_prefix_len,
-            )
-            if decode_req.is_rebootstrap:
-                self.kv_manager.submit_prefill_recompute(
-                    decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
-                )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
-                )
+            
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -1200,6 +1118,166 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ]
 
         return preallocated_reqs, failed_reqs
+    
+    def _send_decode_kv_metadata(
+            self,
+            decode_req: DecodeRequest,
+            decode_prefix_len: int,
+            kv_indices: np.ndarray,
+            kv_transfer_page_size: int,
+    ) -> None:
+        """Build state indices, allocate a metadata buffer slot, and send
+        send_metadata' to the prefill side
+        
+        Shared by both the synchronous admission path (pop-preallocated
+        and the deferred Hicache path (_finalize_hicache_admission').
+        kv_indices"/ ‘kv_transfer_page_size' are computed by the caller
+        because the HiSparse direct-to-host path differs from the device-pool
+        path.
+        """
+        req = decode_req.req
+        seq_len = len(req.origin_input_ids)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        def _mamba_payload():
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    decode_req.req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        def _swa_payload():
+            window_size = self.scheduler.sliding_window_size
+            window_start = max(0, seq_len - window_size)
+            window_start = page_align_floor(window_start, page_size)
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return kv_to_page_indices(window_kv_indices_swa, page_size)
+
+        def _dsa_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, :seq_len
+            ]
+            # Indexer lives on device pool; always use device page_size
+            device_page_size = self.token_to_kv_pool.page_size
+            return kv_to_page_indices(kv_indices_full, device_page_size)
+
+        def _swa_ring_payload():
+            # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
+            # Same window positions and order -> positional match with prefill.
+            ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+            window_size = self.token_to_kv_pool.unified_swa_window
+            window_start = max(0, seq_len - window_size)
+            positions = np.arange(window_start, seq_len, dtype=np.int64)
+            state_slot = int(decode_req.req.req_pool_idx)
+            ring_rows = state_slot * ring_stride + (positions % ring_stride)
+            return ring_rows.astype(np.int32)
+
+        def _c128_state_payload():
+            online = is_dsv4_c128_online_enabled()
+            ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
+            return get_dsv4_c128_state_indices(
+                int(decode_req.req.req_pool_idx),
+                seq_len,
+                online=online,
+                ring_size=ring_size,
+            )
+
+        state_types = self.kv_manager.kv_args.state_types
+        state_indices: Optional[List] = []
+        if StateType.C128_STATE in state_types:
+            clear_c128_state = getattr(
+                self.token_to_kv_pool, "clear_c128_req_state", None
+            )
+            if clear_c128_state is not None:
+                clear_c128_state(int(decode_req.req.req_pool_idx))
+        for st in state_types:
+            if st == StateType.MAMBA:
+                state_indices.append(_mamba_payload())
+            elif st == StateType.SWA:
+                state_indices.append(_swa_payload())
+            elif st == StateType.DSA:
+                state_indices.append(_dsa_payload())
+            elif st == StateType.MINIMAX_INDEX_K:
+                # Index rows live at the same loc as main KV on the same
+                # page_size, so reuse the full-seq page-ids.
+                state_indices.append(_dsa_payload())
+            elif st == StateType.SWA_RING:
+                state_indices.append(_swa_ring_payload())
+            elif st == StateType.C128_STATE:
+                state_indices.append(_c128_state_payload())
+            else:
+                state_indices.append(None)
+
+        decode_req.metadata_buffer_index = (
+            self.req_to_metadata_buffer_idx_allocator.alloc()
+        )
+        assert decode_req.metadata_buffer_index is not None
+        # int32 for ZMQ serialization -- from_zmq reads np.int32.
+        page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
+            np.int32
+        )
+        decode_req.kv_receiver.send_metadata(
+            page_indices,
+            decode_req.metadata_buffer_index,
+            state_indices,
+            decode_prefix_len=decode_prefix_len,
+        )
+        if decode_req.is_rebootstrap:
+            self.kv_manager.submit_prefill_recompute(
+                decode_req.kv_receiver,
+                decode_req.req.build_rebootstrap_payload(),
+            )
+        if (
+            self.transfer_queue.enable_staging
+            and hasattr(decode_req.kv_receiver, "require_staging")
+            and decode_req.kv_receiver.require_staging
+        ):
+            self.transfer_queue.staging_handler.register_decode_req(
+                decode_req.req.bootstrap_room, decode_req
+            )
+
+    def _finalize_hicache_admission(self, decode_req: DecodeRequest) -> None:
+        """Complete admission for a deferred Hicache req after load_back.
+        Called from the transfer queue when "awaiting_hicache_finalize`is
+        True andhicache_restore_status'reached READY.Runs the deferred
+        pre_alloc'.send_metadata' using the AcTUAL restored token
+        count (which may be less than the original L2+L3 promise when the L3
+        prefetch timed out or returned partial data).
+        """
+        pm = decode_req.prefix_match
+        req = decode_req.req
+        origin_input_len = len(req.origin_input_ids)
+
+        actual_l1 = pm.l1_prefix_len
+        actual_total = pm.decode_prefix_len
+
+        self._pre_alloc(req, pm.prefix_indices, actual_l1, actual_total)
+        req.cache_protected_len = actual_total
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kv_indices = (
+            self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                actual_total:origin_input_len
+            ]
+            .cpu()
+            .numpy()
+        )
+        self._send_decode_kv_metadata(
+            decode_req, actual_total, kv_indices, page_size
+        )
+
+        decode_req.awaiting_hicache_finalize = False
+        if not pm.needs_local_restore:
+            self.tree_cache.dec_lock_ref(pm.last_device_node)
+
 
     @property
     def num_tokens_pre_allocated(self):
@@ -1653,6 +1731,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.prealloc_queue: Optional[DecodePreallocQueue] = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1867,6 +1946,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     if rids_to_check is None or decode_req.req.rid in rids_to_check
                 ]
             )
+            self._finalize_awaiting_hicache_reqs()
 
         if self.enable_staging:
             polls = self._poll_with_staging()
@@ -1913,7 +1993,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if not decode_req.awaiting_hicache_finalize:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
@@ -1961,7 +2042,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.queue[i].req.bootstrap_room
                 )
             idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
+            if idx == -1:
+                continue
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
             self.metadata_buffers.bootstrap_room[idx] = 0
