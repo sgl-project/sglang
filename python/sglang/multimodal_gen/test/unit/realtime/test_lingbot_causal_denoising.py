@@ -72,6 +72,9 @@ def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    # Unit stub built via __new__ has no real transformer; None makes
+    # _reset_causal_cache_config_defaults() a no-op (getattr chain -> None).
+    stage.transformer = None
 
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
@@ -93,6 +96,9 @@ def test_lingbot_realtime_cache_config_uses_request_overrides():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    # Unit stub built via __new__ has no real transformer; None makes
+    # _reset_causal_cache_config_defaults() a no-op (getattr chain -> None).
+    stage.transformer = None
 
     batch = SimpleNamespace(
         realtime_causal_sink_size=4,
