@@ -36,6 +36,10 @@ class _InsertWalkSuite(CustomTestCase):
     _insert = UnifiedRadixCacheSuite._insert
     _init_hicache = UnifiedRadixCacheSuite._init_hicache
     _build_hicache_fixture = UnifiedRadixCacheSuite._build_hicache_fixture
+    _make_seq = UnifiedRadixCacheSuite._make_seq
+    _skip_unsupported_hicache_test = (
+        UnifiedRadixCacheSuite._skip_unsupported_hicache_test
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
@@ -273,6 +277,33 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             cache.cache_controller.mem_pool_host.available_size(), host_avail + 4
         )
 
+    def test_match_split_relocation_survives_finalizer_failure(self):
+        """A match-walk split's pending write-through relocation applies before
+        the finalizers, so a finalizer failure cannot strand the stale record."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.write_through_threshold = 1
+        # The leaf backs up on insert; its ack stays pending (no writing_check).
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        self.assertTrue(cache.ongoing_write_through)
+
+        full_comp = cache.components[ComponentType.FULL]
+        with mock.patch.object(
+            full_comp,
+            "finalize_match_result_in_cache",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaises(RuntimeError):
+                cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+
+        # The relocation reached the pending record: the ack clears the
+        # pending marker on both split halves, not just the stale node.
+        cache.writing_check(write_back=True)
+        parent = next(iter(cache.root_node.children.values()))
+        (child,) = parent.children.values()
+        self.assertIsNone(parent.write_through_pending_id)
+        self.assertIsNone(child.write_through_pending_id)
+        cache.sanity_check()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestResumableInsertWalkSWA(_InsertWalkSuite):
@@ -340,6 +371,149 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
             with self.assertRaises(RuntimeError):
                 cache.dec_swa_lock_only(m.last_device_node, lock.swa_uuid_for_lock)
         self.assertEqual(allocator.swa_attn_allocator.available_size(), swa_avail + sw)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestResumableInsertWalkWriteBack(_InsertWalkSuite):
+    cfg = CacheConfig()
+
+    def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
+        """Write-back eviction will keep freeing device KV when the host pool
+        is exhausted and host eviction cannot free space to prevent OOM."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        # Two-node chain: the drop must cascade parent-ward across eviction
+        # iterations, not just delete a single leaf.
+        seq_parent = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_parent)
+        seq = seq_parent + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+
+        # Exhaust the KV host pool. The tree has no host leaves, so
+        # evict_host cannot free anything and every D->H backup fails.
+        host_pool = cache.cache_controller.mem_pool_host
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+        self.assertEqual(host_pool.available_size(), 0)
+
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+
+        # The chain is gone entirely: no device hit, no host hit.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertEqual(m.host_hit_length, 0)
+        cache.sanity_check()
+
+    def test_hicache_write_back_drop_respects_pins_then_frees_subtree(self):
+        """The host-pressure drop fallback must decline while any node in the
+        unbacked subtree is host-pinned, then reclaim the whole subtree --
+        including a demoted child's host backup -- once unpinned."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        host_pool = cache.cache_controller.mem_pool_host
+        baseline_host = host_pool.available_size()
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        child_seq = parent_seq + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, child_seq)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        child = cache.resolve_node_handle(m.last_device_node)
+
+        # Evict only the child leaf -> real backup + demote, leaving it
+        # host-only under a still-unbacked device parent (write-back backs up
+        # single nodes leaf-first, so this is a normal intermediate state).
+        result = cache.evict(EvictParams(num_tokens=len(child.key)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(child.key))
+        self.assertTrue(child.evicted and child.backuped)
+        parent = child.parent
+        self.assertFalse(parent.backuped)
+        self.assertGreater(baseline_host - host_pool.available_size(), 0)
+
+        # From here every backup fails (controller.write returns None), so
+        # each evict() attempts the drop fallback on the parent.
+        with mock.patch.object(cache.cache_controller, "write", return_value=None):
+            # Pinned subtree root: drop declines, chain stays intact.
+            cache.inc_host_lock_ref(parent.id)
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+            self.assertEqual(result.num_tokens_evicted, 0)
+            cache.dec_host_lock_ref(parent.id)
+
+            # Pinned host-only descendant: drop declines as well.
+            cache.inc_host_lock_ref(child.id)
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+            self.assertEqual(result.num_tokens_evicted, 0)
+            m = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
+            )
+            self.assertEqual(len(m.device_indices), len(parent_seq))
+            cache.dec_host_lock_ref(child.id)
+
+            # Unpinned: the subtree drops and the child's host slots return.
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(parent_seq))
+        self.assertEqual(host_pool.available_size(), baseline_host)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertEqual(m.host_hit_length, 0)
+        cache.sanity_check()
+
+    def test_drop_fallback_frees_host_for_later_backups_same_round(self):
+        """Host slots reclaimed by the drop fallback itself (an interior
+        host-only descendant) must be reusable by later write-back backups in
+        the same eviction round (pre-split freed them inline)."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        host_pool = cache.cache_controller.mem_pool_host
+
+        # Chain 1: unbacked parent -> host-only child -> host-only grandchild.
+        p1 = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, p1)
+        c1 = p1 + self._make_seq(1000, 2)
+        self._insert(cache, allocator, req_to_token_pool, c1)
+        g1 = c1 + self._make_seq(2000, 2)
+        self._insert(cache, allocator, req_to_token_pool, g1)
+        cache.evict(EvictParams(num_tokens=4))
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", p1))))
+        parent = cache.resolve_node_handle(m.last_device_node)
+        (child,) = parent.children.values()
+        (grandchild,) = child.children.values()
+        self.assertTrue(child.evicted and child.backuped)
+        self.assertTrue(grandchild.evicted and grandchild.backuped)
+
+        # Chain 2: a younger unbacked leaf needing 4 host slots; only 2 can
+        # come from evict_host (the grandchild leaf) — the other 2 exist only
+        # if the drop fallback's child slots are drained within the round.
+        p2 = self._make_seq(5000, 4)
+        self._insert(cache, allocator, req_to_token_pool, p2)
+        leaf2 = None
+        for node in cache.root_node.children.values():
+            if list(node.key.token_ids[: len(p2)]) == list(p2):
+                leaf2 = node
+        self.assertIsNotNone(leaf2)
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+
+        real_write = cache.cache_controller.write
+        calls = []
+
+        def fail_first(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                return None
+            return real_write(*args, **kwargs)
+
+        with mock.patch.object(cache.cache_controller, "write", side_effect=fail_first):
+            result = cache.evict(EvictParams(num_tokens=len(p1) + len(p2)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(p1) + len(p2))
+        self.assertTrue(leaf2.evicted and leaf2.backuped)
+        cache.sanity_check()
 
 
 if __name__ == "__main__":

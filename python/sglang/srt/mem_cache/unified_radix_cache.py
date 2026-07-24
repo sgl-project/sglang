@@ -377,9 +377,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
+        # Apply the walk's actions (e.g. a pending write-through relocation on
+        # a split) before the finalizers, which can evict or raise.
+        self._apply_cache_actions(result.cache_actions)
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
-        self._apply_cache_actions(result.cache_actions)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -473,6 +475,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         elif self.tree_core.drop_subtree_no_host(
                             node_id, tracker, device_frees, host_frees
                         ):
+                            # Free the dropped slots now so later backups in
+                            # this round can reuse the reclaimed host space.
+                            self._drain_frees(device_frees, host_frees)
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
                                 "due to host memory pressure, root node %d",
@@ -724,8 +729,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
     ) -> None:
+        # Apply and consume: a spent list cannot be double-applied (double free).
         for action in actions:
             self._apply_cache_action(action)
+        if isinstance(actions, list):
+            actions.clear()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         # Component actions route to their component class; the rest are
@@ -749,18 +757,20 @@ class UnifiedRadixCache(BasePrefixCache):
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
-        # Free per component device slots.
+        # Free per component device slots, consuming the dict.
         for ct, indices in device_frees.items():
             self._apply_cache_action(
                 FreeComponentDeviceSlot(indices, component_type=ct)
             )
+        device_frees.clear()
 
     def _drain_host_frees(
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
-        # Free per component host-pool slots collected during eviction walks.
+        # Free per component host-pool slots, consuming the dict.
         for ct, host_values in host_frees.items():
             self.components[ct].free_host_values(host_values)
+        host_frees.clear()
 
     def _drain_frees(
         self,
@@ -1240,16 +1250,18 @@ class UnifiedRadixCache(BasePrefixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
+        # Apply the host-insert walk's actions before the transfer commit.
+        self._apply_cache_actions(insert_result.cache_actions)
+        commit_actions: list[CacheAction | ComponentAction] = []
         self.tree_core.commit_hicache_transfers(
             last_host_node_id,
             CacheTransferPhase.PREFETCH,
             comp_xfers,
-            cache_actions=insert_result.cache_actions,
+            cache_actions=commit_actions,
             insert_result=insert_result,
             pool_storage_result=operation.pool_storage_result,
         )
-
-        self._apply_cache_actions(insert_result.cache_actions)
+        self._apply_cache_actions(commit_actions)
 
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]
