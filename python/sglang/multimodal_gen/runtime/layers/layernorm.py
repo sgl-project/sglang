@@ -54,6 +54,9 @@ if USE_AITER:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
+if _is_xpu:
+    from sgl_kernel import fused_inplace_qknorm_rope
+
 if not _is_cpu:
     from sglang.kernels.ops.diffusion.triton.norm import norm_infer, rms_norm_fn
 
@@ -887,6 +890,7 @@ def apply_qk_norm(
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
+    # The in-place kernel needs a real view (no copy), so it also requires contiguity.
     if (
         _is_cuda
         and allow_inplace
@@ -894,6 +898,8 @@ def apply_qk_norm(
         and q.dtype in (torch.float16, torch.bfloat16)
         and q_norm.weight.dtype == q.dtype
         and k_norm.weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -908,8 +914,9 @@ def apply_qk_norm(
 
     q_shape = q.shape
     k_shape = k.shape
-    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
-    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    # reshape (not view) so a non-contiguous q/k (e.g. a chunked qkv view) is handled.
+    q_out = q_norm(q.reshape(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.reshape(-1, head_dim)).view(k_shape)
     return q_out, k_out
 
 
@@ -965,7 +972,7 @@ def apply_qk_norm_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA shapes."""
+    """Apply QK RMSNorm followed by RoPE, fusing both on supported CUDA/XPU shapes."""
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
         apply_flashinfer_rope_qk_inplace,
@@ -1041,6 +1048,30 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+        )
+        return q, k
+
+    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
+    # merge this path with the CUDA fused qknorm+rope branch.
+    if (
+        _is_xpu
+        and allow_inplace
+        and (q_eps == k_eps)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == k.dtype
+        and head_dim in (64, 128, 256)
+        and rope_dim in (32, 64, 128, 256)
+    ):
+        fused_inplace_qknorm_rope(
+            q=q,
+            k=k,
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=q_eps,
         )
         return q, k
 
