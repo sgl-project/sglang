@@ -95,6 +95,18 @@ class InRange(Property):
         return (value >= self.lo) & (value < self.hi)
 
 
+class InClosedRange(Property):
+    """Closed [lo, hi] -- for value sanity (e.g. a probability / confidence)."""
+
+    def __init__(self, lo, hi):
+        self.lo = lo
+        self.hi = hi
+        self.name = f"in_closed_range[{lo},{hi}]"
+
+    def ok(self, value: torch.Tensor) -> torch.Tensor:
+        return (value >= self.lo) & (value <= self.hi)
+
+
 class PageAligned(Property):
     def __init__(self, page_size: int):
         self.page_size = page_size
@@ -102,6 +114,15 @@ class PageAligned(Property):
 
     def ok(self, value: torch.Tensor) -> torch.Tensor:
         return value % self.page_size == 0
+
+
+class IsTrue(Property):
+    """The value is itself the boolean condition (for derived / scalar asserts)."""
+
+    name = "is_true"
+
+    def ok(self, value: torch.Tensor) -> torch.Tensor:
+        return value
 
 
 # name -> Invariant; enumerated by the CI meta-test to enforce injection coverage.
