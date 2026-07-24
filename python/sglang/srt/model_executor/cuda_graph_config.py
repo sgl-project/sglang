@@ -53,8 +53,9 @@ ALLOWED_BACKENDS_PER_PHASE = {
         Backend.DISABLED,
     ),
     # full for prefill captures one whole-forward graph per num_tokens
-    # bucket (bs=1 only); replay pads num_tokens up to the nearest
-    # captured bucket. Opt-in: the padding waste is the operator's call.
+    # bucket with a fixed request-slot count; replay pads num_tokens up to
+    # the nearest captured bucket. Opt-in: the padding waste is the
+    # operator's call.
     Phase.PREFILL: (
         Backend.FULL,
         Backend.BREAKABLE,
@@ -66,8 +67,8 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # Per-phase settings schema. Keys other than backend are runner-level
 # (read by any backend in that phase); tc_compiler is the lone
 # backend-specific knob (only meaningful when backend == tc_piecewise).
-# For prefill, bs carries the captured shape size (token count for
-# tc_piecewise, request count for breakable) — one shape knob per phase.
+# For prefill, bs carries aggregate-token capture buckets for every backend;
+# full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req is prefill-only and only meaningful when backend == full.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
@@ -87,8 +88,8 @@ class PhaseConfig:
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger
-    # batches fall back to eager. Ignored by BCG (bs=1 only) and TC_PIECEWISE
-    # (bs-invariant via torch.compile). None auto-derives chunked_prefill_size // 512.
+    # batches fall back to eager. Ignored by BCG and TC_PIECEWISE. None
+    # auto-derives chunked_prefill_size // 512.
     full_prefill_max_req: Optional[int] = None
 
 
