@@ -1,6 +1,8 @@
+from typing import Optional
 import unittest
 
 import torch
+torch.use_deterministic_algorithms(True)
 
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_gpu,
