@@ -96,9 +96,11 @@ metallib_name = "sgl_metal_kernels.metallib"
 # (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
     "csrc/metal/rope_pool_fused.metal",
+    "csrc/metal/rms_norm.metal",
 ]
 cxx_sources = [
     "csrc/metal/rope_pool_fused.cpp",
+    "csrc/metal/rms_norm.cpp",
 ]
 
 # Header search paths shared by both the Metal shader compiler and the C++

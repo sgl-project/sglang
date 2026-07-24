@@ -110,3 +110,38 @@ def rope_pool_fused(
         num_kv_heads,
         float(rope_base),
     )
+
+
+def rms_norm(
+    x: "mx.array",
+    w: "mx.array",
+    *,
+    eps: float,
+) -> "mx.array":
+    """Apply RMSNorm: ``y = x * rsqrt(mean(x**2, axis=-1) + eps) * w``.
+
+    Args:
+        x: Input tensor with shape ``[num_rows, hidden]``.
+        w: Weight tensor with shape ``[hidden]``, same dtype as ``x``.
+        eps: Epsilon added inside the reciprocal square root.
+
+    Returns:
+        The normalized tensor, same shape and dtype as ``x``.
+    """
+    if x.ndim != 2:
+        raise ValueError(
+            f"rms_norm expects x to be 2-D [num_rows, hidden], got {x.shape}"
+        )
+    if w.ndim != 1:
+        raise ValueError(f"rms_norm expects w to be 1-D [hidden], got {w.shape}")
+    if w.shape[0] != x.shape[1]:
+        raise ValueError(
+            f"rms_norm weight length {w.shape[0]} must match x hidden dim {x.shape[1]}"
+        )
+    if x.dtype != w.dtype:
+        raise ValueError(f"rms_norm x/w dtypes must match, got {x.dtype} vs {w.dtype}")
+    # Kernel reads x/w as flat row-major buffers; make them contiguous
+    # (no-op if already). Local import keeps mlx optional at module load.
+    import mlx.core as mx
+
+    return _metal.rms_norm(mx.contiguous(x), mx.contiguous(w), float(eps))
