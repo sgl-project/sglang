@@ -215,6 +215,12 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
+
+        # Gemma4 KV-shared layers pass k=v=None: they read KV from an earlier
+        # layer's cache and must not write new extend K/V. extend_attention_cpu
+        # only skips the k/v-extend requirement for is_cross_attn=True, so we
+        # reuse that path here - this is NOT encoder cross-attention.
+        is_extend_cache_read_only = layer.is_cross_attention or k is None or v is None
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -230,7 +236,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            layer.is_cross_attention or k is None or v is None,
+            is_extend_cache_read_only,
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
