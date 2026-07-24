@@ -489,7 +489,7 @@ def eagle_prepare_for_verify(
     target_worker: TpModelWorker,
 ):
     from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
+        assign_extend_cache_locs_uniform_func,
     )
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -509,11 +509,13 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        batch.out_cache_loc = assign_extend_cache_locs_func(
+        # Uniform variant: end offsets (= start + draft_token_num) are computed
+        # inside the kernel, keeping the eager `seq_lens + N` add off the host
+        # critical path (bs=1 MTP inter-phase seam).
+        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
-            end_offset=batch.seq_lens + verify_input.draft_token_num,
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
