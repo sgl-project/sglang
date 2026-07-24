@@ -59,6 +59,10 @@ uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-ind
 
 ## Method 2: From source
 
+<Note>
+Building from source requires the Protocol Buffers compiler (`protoc`) for Rust gRPC components. On macOS, install it with `brew install protobuf`. On Linux, install it with `apt install protobuf-compiler`.
+</Note>
+
 ```bash Command
 # Use the last release branch
 git clone -b v0.5.15 https://github.com/sgl-project/sglang.git
