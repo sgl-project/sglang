@@ -27,14 +27,9 @@ class HybridAttnBackend(AttentionBackend):
         server_args = model_runner.server_args
         self.spec_attn_is_decode = server_args.speculative_attention_mode == "decode"
         self.spec_attn_is_prefill = server_args.speculative_attention_mode == "prefill"
-        # Backend that serves target_verify. --verify-attention-backend names it
-        # directly (must match one of the two composed slots); when unset it
-        # follows the deprecated --speculative-attention-mode routing.
         self.verify_backend = self._resolve_verify_backend(server_args)
-        # decide_needs_cpu_seq_lens ORs this flag across the backends the spec
-        # decode loop actually touches: the decode backend (decode steps) and the
-        # verify backend (target_verify steps). A cpu-seq-lens prefill backend
-        # that never serves the loop must not force a per-step seq_lens D2H sync.
+        # Only the backends the spec decode loop runs: decode + verify, not a
+        # prefill backend that never serves it (would force a per-step D2H sync).
         self.needs_cpu_seq_lens = (
             decode_backend.needs_cpu_seq_lens or self.verify_backend.needs_cpu_seq_lens
         )

@@ -252,9 +252,7 @@ class KDAKernelDispatcher:
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
-    # GPU-only decode/verify metadata (graph replay passes seq_lens_cpu=None);
-    # extend reads extend_seq_lens_cpu and mamba indices rebuild from req objects.
-    # Matches the other MambaAttnBackendBase subclasses (Mamba2/GDN/ShortConv).
+    # Decode/verify metadata is GPU-only (graph replay passes seq_lens_cpu=None).
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):

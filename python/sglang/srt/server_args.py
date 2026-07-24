@@ -3796,12 +3796,8 @@ class ServerArgs:
             )
             self.smg_grpc_mode = True
 
-        # --speculative-attention-mode routes target-verify by naming a phase
-        # ('prefill'/'decode') rather than the backend, and its default
-        # 'prefill' combined with an explicit attention backend silently routes
-        # verify to the prefill backend, disabling the sync-free decode path (a
-        # cpu-seq-lens prefill backend forces a per-step host sync). Only warn
-        # when the user has not already moved to --verify-attention-backend.
+        # Default 'prefill' silently routes verify to the prefill backend under
+        # an explicit attention backend, disabling the sync-free decode path.
         if (
             self.speculative_algorithm is not None
             and self.verify_attention_backend is None
