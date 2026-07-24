@@ -7,6 +7,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import dataclasses
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
@@ -893,6 +894,38 @@ class TestForwardFlags(_IsolatedServerArgs):
         with fwd.scoped(flashinfer_trtllm_bypass=True):
             self.assertTrue(fwd.flashinfer_trtllm_bypass)
         self.assertFalse(fwd.flashinfer_trtllm_bypass)
+
+    def test_flashinfer_allreduce_fusion_rejects_hybrid_ep_tp(self):
+        import sglang.srt.layers.communicator as communicator
+
+        server_args = SimpleNamespace(flashinfer_allreduce_fusion_backend="auto")
+        with (
+            patch.object(communicator, "_is_sm90_supported", True),
+            patch.object(communicator, "_is_sm100_supported", False),
+            patch.object(communicator, "_is_flashinfer_available", True),
+            patch.object(communicator, "is_dp_attention_enabled", return_value=False),
+            patch.object(
+                communicator,
+                "is_flashinfer_allreduce_unavailable",
+                return_value=False,
+            ),
+            patch.object(communicator, "get_server_args", return_value=server_args),
+        ):
+            for moe_ep_size, moe_tp_size, expected in (
+                (1, 8, True),
+                (8, 1, True),
+                (2, 4, False),
+            ):
+                with (
+                    self.subTest(moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size),
+                    get_parallel().override(
+                        moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size
+                    ),
+                ):
+                    self.assertEqual(
+                        communicator.apply_flashinfer_allreduce_fusion(batch_size=1),
+                        expected,
+                    )
 
 
 class TestPublishLifecycle(_IsolatedServerArgs):
