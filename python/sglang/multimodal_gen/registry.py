@@ -69,6 +69,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
+    LingBotVideoMoEPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -131,6 +134,9 @@ from sglang.multimodal_gen.configs.sample.joy_image import (
 )
 from sglang.multimodal_gen.configs.sample.krea2 import (
     Krea2SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+    LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
@@ -1029,7 +1035,7 @@ def _register_configs():
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
         ],
     )
 
@@ -1111,8 +1117,10 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
-            and "image-edit" not in hf_id.lower(),
+            lambda hf_id: (
+                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+                and "image-edit" not in hf_id.lower()
+            ),
         ],
     )
 
@@ -1141,6 +1149,18 @@ def _register_configs():
             lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
             lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
             lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
+        ],
+    )
+
+    register_configs(
+        sampling_param_cls=LingBotVideoMoESamplingParams,
+        pipeline_config_cls=LingBotVideoMoEPipelineConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-video-moe-30b-a3b",
+            "/mnt/storage01/lipan02/lingbot-video-moe-30b-a3b",
+        ],
+        model_detectors=[
+            lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
         ],
     )
 
