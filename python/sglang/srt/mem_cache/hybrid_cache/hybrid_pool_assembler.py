@@ -638,7 +638,7 @@ def build_deepseek_v4_hicache_stack(
             # (rid, B) tiles not yet promoted to their window's durable row.
             # State capture stages a tile at EXACTLY the strided SWA window
             # boundaries (every `stride`-th page + the true tail; see
-            # capture_c4_state_windows_unified / _capture_compress_state_windows),
+            # capture_c4_state_windows_unified),
             # NOT at every page boundary, so per-request in-flight tiles track the
             # (already strided) durable SWA window budget. Size the slack at 1.5x
             # the durable capacity as concurrency headroom for boundaries captured

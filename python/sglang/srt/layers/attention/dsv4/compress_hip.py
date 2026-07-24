@@ -59,7 +59,7 @@ def capture_c4_state_windows_unified(
     Under unified-kv the model calls backend.forward_core_compressor, not the
     compressor's own forward, so the legacy per-request capture never runs and
     the state staging stayed empty (every (rid, B) bind missed and strict reuse
-    was rejected). This mirrors _capture_compress_state_windows exactly (same
+    was rejected). This mirrors _reference_capture_compress_state_windows exactly (same
     per-request buffer, page boundaries, slot and D2H copy) so a reusing request
     restores the boundary bit-exact. Must run before the in-place compress
     transform mutates kv_score_input; the caller invokes it at the top of
@@ -307,7 +307,7 @@ class CompressorHip(_CompressorBase):
             print(f"[sgl] {name}: shape={y.shape}, dtype={y.dtype}, device={y.device}")
             print(f"{y.flatten()[:10]}...{y.flatten()[-10:]}")
 
-    def _capture_compress_state_windows(
+    def _reference_capture_compress_state_windows(
         self,
         kv_and_score_buffer,
         valid_kv_len: int,
@@ -318,7 +318,11 @@ class CompressorHip(_CompressorBase):
         stride: int = 1,
         tail_B: int = -1,
     ) -> None:
-        """Capture the c4 / c4-indexer overlap state [B-ratio, B) at each page boundary
+        """Test-only reference oracle for capture_c4_state_windows_unified, kept
+        for the byte-parity cross-check in TestUnifiedCaptureEquivalence (no
+        runtime caller).
+
+        Capture the c4 / c4-indexer overlap state [B-ratio, B) at each page boundary
         B into the host state pool.
 
         The device state ring is a small rolling buffer, so interior boundary states
@@ -474,34 +478,8 @@ class CompressorHip(_CompressorBase):
         )
 
         bs = forward_batch.batch_size
-        # Strict-mode c4 overlap-state capture (Phase C): snapshot [B-ratio, B)
-        # at each page boundary so a reusing request can restore the state ring
-        # and avoid the boundary dirty read. Gate the (single) req_pool_indices
-        # sync on the host pool actually being wired -- a no-op otherwise, so the
-        # non-strict / best-effort path pays nothing.
-        _cap_hp = (
-            getattr(
-                token_to_kv_pool,
-                (
-                    "_c4_indexer_state_host_pool"
-                    if self.is_in_indexer
-                    else "_c4_state_host_pool"
-                ),
-                None,
-            )
-            if self.ratio == 4
-            else None
-        )
-        _cap_rids = req_pool_indices.tolist() if _cap_hp is not None else None
-        # Stride/tail gate parameters (mirror capture_swa_windows): only stage the
-        # SWA-carried boundaries so no orphan state tile is produced. Synced once,
-        # gated on the host pool being wired so the non-strict path pays nothing.
-        if _cap_rids is not None:
-            _cap_stride = max(
-                1, int(getattr(token_to_kv_pool, "_swa_offload_page_stride", 1))
-            )
-            _cap_orig = getattr(forward_batch, "orig_seq_lens", None)
-            _cap_orig_l = _cap_orig.tolist() if _cap_orig is not None else None
+        # Strict c4 overlap-state capture now lives in compressor_v2.forward_unified
+        # (capture_c4_state_windows_unified); the inline capture here was dead.
         pt = 0
         for i in range(bs):
             kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
@@ -548,27 +526,6 @@ class CompressorHip(_CompressorBase):
                 )
             post_state_to_set = kv_and_score_buffer[valid_kv_len - post_state_len :]
             state_pool.set_state_by_state_loc(post_state_loc, post_state_to_set)
-
-            # Capture the boundary overlap state from the pre-transform buffer
-            # (same bytes set_state_by_state_loc just persisted), BEFORE the
-            # in-place compress transform below mutates kv_and_score_buffer.
-            if _cap_rids is not None:
-                _page = backend.page_size
-                _tail_B = (
-                    (int(_cap_orig_l[i]) // _page) * _page
-                    if _cap_orig_l is not None
-                    else -1
-                )
-                self._capture_compress_state_windows(
-                    kv_and_score_buffer,
-                    valid_kv_len,
-                    int(prefix_lens[i]),
-                    int(extend_lens[i]),
-                    _cap_rids[i],
-                    backend,
-                    stride=_cap_stride,
-                    tail_B=_tail_B,
-                )
 
             compress_len = valid_kv_len // self.ratio * self.ratio
             if compress_len == 0:
@@ -643,19 +600,6 @@ class CompressorHip(_CompressorBase):
             compressed_kv_output[indices_in_seq - prefix_lens[i] + pt] = kv_compressed
 
             pt += extend_lens[i]
-
-        # H2 (overlap safety): the prefill c4 state capture above enqueued its
-        # D2H copies non_blocking on the current (forward) stream but -- unlike
-        # capture_compress_state_windows_decode -- never recorded the pool's
-        # capture-done event. A cross-stream reuse restore then wait_capture_done
-        # on a stale (or absent) event, leaving its H2D free to read a
-        # half-written host tile under overlap scheduling. Record here, symmetric
-        # to the decode-source path, so restore orders strictly after these
-        # copies. No-op unless the strict state pool is wired.
-        if _cap_hp is not None:
-            _rec = getattr(_cap_hp, "record_capture_done", None)
-            if _rec is not None:
-                _rec()
 
         return compressed_kv_output
 

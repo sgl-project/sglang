@@ -35,7 +35,62 @@ from sglang.srt.layers.attention.dsv4.compress_hip import (
 from sglang.srt.mem_cache import memory_pool_host as MPH
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 
-_CAPTURE = CompressorHip._capture_compress_state_windows
+# Test-only reference oracle, kept for the byte-parity cross-check below.
+_REFERENCE = CompressorHip._reference_capture_compress_state_windows
+
+
+def _capture_via_unified(
+    fake_self,
+    *,
+    kv_and_score_buffer,
+    valid_kv_len,
+    prefix_len,
+    extend_len,
+    rid,
+    backend,
+    stride=1,
+    tail_B=-1,
+):
+    """Drive the production capture (capture_c4_state_windows_unified) through
+    the legacy call shape so these tests exercise the real prefill path."""
+    kv = kv_and_score_buffer.kv_score
+    pre_len = valid_kv_len - extend_len
+    pre_state = kv[:pre_len]
+    new_tok = kv[pre_len:]
+    page = backend.page_size
+    tk = backend.token_to_kv_pool
+    tk.translate_loc_from_full_to_swa = lambda x: x
+    tk._swa_offload_page_stride = stride
+    backend.req_to_token_pool = types.SimpleNamespace(
+        req_to_token=torch.zeros(
+            (int(rid) + 8, int(prefix_len) + int(extend_len) + page + 8),
+            dtype=torch.int64,
+        )
+    )
+    state_pool = types.SimpleNamespace(
+        translate_from_swa_loc_to_state_loc=lambda x: x,
+        get_state_by_state_loc=lambda loc: types.SimpleNamespace(kv_score=pre_state),
+    )
+    fb = types.SimpleNamespace(
+        batch_size=1,
+        extend_prefix_lens_cpu=[int(prefix_len)],
+        extend_seq_lens_cpu=[int(extend_len)],
+        req_pool_indices=torch.tensor([int(rid)], dtype=torch.int64),
+    )
+    if tail_B is not None and tail_B >= 0:
+        fb.orig_seq_lens = torch.tensor([int(tail_B)], dtype=torch.int64)
+    capture_c4_state_windows_unified(
+        backend=backend,
+        state_pool=state_pool,
+        kv_score_input=new_tok,
+        forward_batch=fb,
+        is_indexer=fake_self.is_in_indexer,
+        layer_id=fake_self.layer_id,
+        ratio=fake_self.ratio,
+    )
+
+
+_CAPTURE = _capture_via_unified
 
 
 _CAPTURE_DECODE = DeepseekV4HipRadixBackend.capture_compress_state_windows_decode
@@ -187,8 +242,9 @@ class TestCompressStateCapture(unittest.TestCase):
 class TestUnifiedCaptureEquivalence(unittest.TestCase):
     """The UNIFIED-KV prefill capture helper (``capture_c4_state_windows_unified``,
     wired into ``compressor_v2.forward_unified``) must stage byte-identical tiles
-    to the legacy ``_capture_compress_state_windows`` for the same per-request
-    ``[pre_kv_state | new tokens]`` buffer. Legacy is fed the already-concatenated
+    to the test-only reference oracle ``_reference_capture_compress_state_windows``
+    for the same per-request
+    ``[pre_kv_state | new tokens]`` buffer. The oracle is fed the already-concatenated
     buffer; unified builds the cat internally from a faked state pool -- both must
     land the same ``(rid, B)`` staging with the same bytes/offsets."""
 
@@ -223,7 +279,7 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
             ring_size=ring_size, slot_bytes=slot_bytes, num_pages=16
         )
         be_leg = _fake_backend(hp_leg, page=page, swa_ring=swa_ring)
-        _CAPTURE(
+        _REFERENCE(
             _fake_self(ratio=ratio),
             kv_and_score_buffer=types.SimpleNamespace(kv_score=state_buf),
             valid_kv_len=state_buf.size(0),
@@ -292,7 +348,7 @@ class TestUnifiedCaptureEquivalence(unittest.TestCase):
             ring_size=ring_size, slot_bytes=slot_bytes, num_pages=16
         )
         be_leg = _fake_backend(hp_leg, page=page, swa_ring=swa_ring)
-        _CAPTURE(
+        _REFERENCE(
             _fake_self(ratio=ratio),
             kv_and_score_buffer=types.SimpleNamespace(kv_score=state_buf),
             valid_kv_len=state_buf.size(0),
