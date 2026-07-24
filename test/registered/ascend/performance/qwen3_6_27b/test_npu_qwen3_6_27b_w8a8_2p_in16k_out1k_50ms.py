@@ -21,9 +21,10 @@ QWEN3_6_27B_16K_1k_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
     "GDN_ATTN_BACKEND_TRITON": "1",
     "ASCEND_USE_FIA": "1",
 }
@@ -44,22 +45,37 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    29,
+    37,
     "--max-mamba-cache-size",
-    58,
+    74,
     "--mem-fraction-static",
-    0.68,
+    0.70,
     "--cuda-graph-bs",
     1,
     2,
+    3,
+    4,
+    6,
     8,
+    10,
     12,
+    14,
     16,
+    18,
     20,
+    21,
+    23,
     24,
+    25,
     26,
+    27,
     28,
     29,
+    30,
+    31,
+    33,
+    35,
+    37,
     "--quantization",
     "modelslim",
     "--dtype",
@@ -69,11 +85,11 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
-    3,
+    4,
     "--speculative-eagle-topk",
     1,
     "--speculative-num-draft-tokens",
-    4,
+    5,
     "--reasoning-parser",
     "qwen3",
     "--tool-call-parser",
@@ -90,8 +106,9 @@ class TestNPUQwen3_6_27B_2P_In16k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     other_args = QWEN3_6_27B_16K_1k_OTHER_ARGS
     envs = QWEN3_6_27B_16K_1k_ENVS
     dataset_name = "random"
-    max_concurrency = 29
-    num_prompts = 116
+    max_concurrency = 37
+    warmup_requests = 4
+    num_prompts = 37
     input_len = 16000
     output_len = 1000
     random_range_ratio = 1

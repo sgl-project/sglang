@@ -56,7 +56,7 @@ class TestAscendDeepEP(CustomTestCase):
         ]
 
         cls.extra_envs = {
-            "HCCL_BUFFSIZE": "1000",
+            "DEEPEP_HCCL_BUFFSIZE": "1000",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
             "SGLANG_NPU_USE_MLAPO": "1",
             "TRANSFORMERS_VERBOSITY": "error",
