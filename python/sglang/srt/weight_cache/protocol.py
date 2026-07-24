@@ -202,12 +202,6 @@ def check_ipc_quant_support(
 # ---------------------------------------------------------------------------
 
 
-# Sanity cap on a single socket message. IPC messages carry only metadata —
-# base64 CUDA IPC handles plus per-tensor shape/dtype — never the weight bytes
-# themselves (those stay in GPU memory and are shared zero-copy). Even a model
-# with hundreds of thousands of tensors serializes to a few MiB here, so a
-# generous 256 MiB cap still rejects a corrupt/hostile length prefix long before
-# it can drive a multi-GiB allocation in recv_msg.
 MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
 
 
