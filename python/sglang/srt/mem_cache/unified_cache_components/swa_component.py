@@ -1928,6 +1928,28 @@ class SWAComponent(TreeComponent):
             self._release_swa_host(host_indices)
             return
 
+        if self._strict_bit_exact:
+            # Ring-paged window model (symmetric with offload): BACKUP_HOST /
+            # BACKUP_STORAGE attach one whole ``ring`` page to the carrier node,
+            # and PREFETCH forces ``window_pages == 1``. So the prefetched buffer
+            # is exactly one SWA ring page (== one window == ``stride`` tokens)
+            # and attaches WHOLE to the window's carrier node (the inserted host
+            # node, keyed by its trailing Full page hash -- same node offload
+            # stored it under). Never carve token sub-ranges out of a page_size
+            # radix node via ``_split_node``: ``child_key(page_size)`` assumes
+            # >= page_size logical units, but a ring (e.g. 131) < page_size (256)
+            # window has none -> IndexError. ``restore_pending_swa_windows``
+            # copies this page positionally into the request ring block later.
+            cd_t = target.component_data[ct]
+            if window_require_pages == 1 and cd_t.host_value is None:
+                self._attach_swa_host_value(target, host_indices)
+                _attach_state_durable_row(self, target, host_indices)
+            else:
+                # Already present, or an unexpected multi-window buffer: fail-safe
+                # (recompute) -- never crash, never attach a desynced window.
+                self._release_swa_host(host_indices)
+            return
+
         # Buffer covers token range [loaded_start, total_len).
         loaded_start = insert_result.total_len - window_require_pages * stride
 
