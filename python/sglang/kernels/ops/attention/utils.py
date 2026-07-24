@@ -177,6 +177,18 @@ def mla_quantize_and_rope_for_fp8(
     return q_out, k_nope_out, k_rope_out
 
 
+def mla_quantize_without_rope_for_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize MLA components to FP8 without applying rotary embeddings."""
+    attn_dtype = torch.float8_e4m3fn
+    q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
+    return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
+
+
 def concat_mla_absorb_q_general(q_nope, q_rope):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
         return concat_mla_absorb_q(q_nope, q_rope)

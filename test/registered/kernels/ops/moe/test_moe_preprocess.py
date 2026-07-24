@@ -6,7 +6,7 @@ configs (the block schedule and kernel config are chosen together).
 import pytest
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton_utils.inkling_moe import (
+from sglang.kernels.ops.moe.inkling_moe import (
     SMALL_M_BLOCK_SIZE_M,
     compute_grouped_gemm_metadata,
     fused_moe_preprocess,

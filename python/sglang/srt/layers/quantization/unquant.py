@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
     use_intel_xpu_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -107,6 +108,25 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _BF16_GEMM_BACKEND = backend
+
+
+def _bf16_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+@register_custom_op(fake_impl=_bf16_gemm_dispatch_fake)
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
+        x.numel() // x.shape[-1], weight.shape[0], weight.shape[1]
+    ):
+        return _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
+            *x.shape[:-1], -1
+        )
+    return F.linear(x, weight, bias)
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -214,15 +234,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and (bias is None or bias.dtype == torch.bfloat16)
             and not layer.weight.requires_grad
             and (bias is None or not bias.requires_grad)
-            and _use_cutedsl_bf16_gemm(
+        ):
+            if torch.compiler.is_compiling():
+                # The m-dependent kernel heuristic would guard on the symbolic
+                # token dim under Dynamo and recompile per shape bucket; the
+                # opaque op resolves it at runtime with concrete shapes,
+                # keeping the per-shape kernel choice.
+                return bf16_gemm_dispatch(x, layer.weight, bias)
+            if _use_cutedsl_bf16_gemm(
                 x.numel() // x.shape[-1],
                 layer.weight.shape[0],
                 layer.weight.shape[1],
-            )
-        ):
-            x_shapes = x.shape
-            output = _cutedsl_bf16_gemm(x.view(-1, x_shapes[-1]), layer.weight, bias)
-            return output.view(*x_shapes[:-1], -1)
+            ):
+                x_shapes = x.shape
+                output = _cutedsl_bf16_gemm(
+                    x.view(-1, x_shapes[-1]), layer.weight, bias
+                )
+                return output.view(*x_shapes[:-1], -1)
+            return F.linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 

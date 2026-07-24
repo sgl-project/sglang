@@ -64,7 +64,7 @@ fn resolve_max_message_size() -> usize {
 /// Everything else (typically `PyRuntimeError`, but also Python tracebacks
 /// from inside the tokenizer manager) maps to `INTERNAL`.
 fn pyerr_to_status(err: PyErr, context: &str) -> Status {
-    let is_client_error = Python::with_gil(|py| {
+    let is_client_error = Python::attach(|py| {
         err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py)
     });
     let msg = format!("{}: {}", context, err);
@@ -125,9 +125,10 @@ impl Drop for RequestAbortGuard {
 fn spawn_abort(bridge: Arc<PyBridge>, rid: String) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            let _ = handle.spawn_blocking(move || {
+            // Fire-and-forget: dropping the JoinHandle detaches the task.
+            drop(handle.spawn_blocking(move || {
                 let _ = bridge.abort(&rid, false);
-            });
+            }));
         }
         Err(_) => {
             tracing::warn!(

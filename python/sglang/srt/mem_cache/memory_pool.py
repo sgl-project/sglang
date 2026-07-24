@@ -3361,7 +3361,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             # payload and the interleaved UE8M0 scales.
             if not self.mxfp8_sf_interleaved or cache_k.dtype == self.store_dtype:
                 raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
-            from sglang.srt.layers.quantization.mxfp8_quant import quant_store_kv_mxfp8
+            from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
 
             quant_store_kv_mxfp8(
                 cache_k,
@@ -3394,7 +3394,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
         BlockScaledBasicChunk layout for page_size==128, flat otherwise."""
         if self.mxfp8_sf_interleaved:
-            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 
@@ -3436,7 +3436,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         # scale rows must travel with their fp8 payload or dequant reads
         # mismatched exponents.
         if self.mxfp8_sf_interleaved:
-            from sglang.srt.layers.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 

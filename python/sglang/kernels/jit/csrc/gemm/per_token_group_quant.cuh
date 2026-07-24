@@ -47,9 +47,15 @@ template <>
 struct WeightTrait<fp8_e4m3_t> {
   using packed2_t = fp8x2_e4m3_t;
   static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
-  // SATFINITE conversion saturates to +-448, no need to clip
+  // SATFINITE saturates +-inf / out-of-range values, but converts NaN to an
+  // fp8 NaN code. IEEE fminf/fmaxf return the non-NaN operand, so clamping
+  // first quantizes non-finite inputs to +-448 -- matching the v1/v2/Triton
+  // kernels. CUDA-graph capture warmup runs the model on whatever the
+  // (reused, uninitialized) buffers contain, and relies on this: an fp8 NaN
+  // code would poison the downstream GEMM and trip the sampler NaN check.
+  // For finite inputs the clamp is bit-identical to bare SATFINITE.
   SGL_DEVICE static packed2_t quant(const float2 v) {
-    return packed2_t{v};
+    return packed2_t{float2{fminf(fmaxf(v.x, -kMaxValue), kMaxValue), fminf(fmaxf(v.y, -kMaxValue), kMaxValue)}};
   }
 };
 
@@ -284,9 +290,14 @@ struct QuantTrait {
       scale_inv = static_cast<uint8_t>(exp);
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
+      // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
+      // clamp only sanitizes non-finite inputs (see WeightTrait<fp8_e4m3_t>);
+      // __hmin2/__hmax2 return the non-NaN operand.
+      const auto lo2 = cast<T2>(float2{-kMaxValue, -kMaxValue});
+      const auto hi2 = cast<T2>(float2{kMaxValue, kMaxValue});
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmul2(in[i], scale2));
+        out[i] = static_cast<Q2>(__hmin2(__hmax2(__hmul2(in[i], scale2), lo2), hi2));
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)

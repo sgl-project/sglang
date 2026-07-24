@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dspark_components.kernels.dispatch import (
+from sglang.kernels.ops.speculative.dspark.dispatch import (
     inputs_on_cuda,
 )
 

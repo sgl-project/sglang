@@ -192,12 +192,14 @@ dev_mps = ["sglang[all_mps]", "sglang[test]"]
 [project.scripts]
 sglang = "sglang.cli.main:main"
 
-# Rust-accelerated multimodal preprocessing (sglang.srt.multimodal._core).
-# grpc is intentionally omitted here (it needs proto/tonic); ROCm only builds mm.
-[[tool.setuptools-rust.ext-modules]]
-target = "sglang.srt.multimodal._core"
-path = "../rust/sglang-mm/Cargo.toml"
-binding = "PyO3"
+# Rust extension modules are auto-discovered by setup.py from the cargo
+# workspace in ../rust; this allowlist restricts which of them this platform
+# builds (case-insensitive substrings of the target module). grpc is
+# intentionally omitted here (it needs proto/tonic); ROCm only builds mm.
+# NOTE: setup.py reads this with a line regex, not a TOML parser — keep the
+# assignment on a single line.
+[tool.sglang]
+rust-extensions = ["multimodal"]
 
 [tool.setuptools.package-data]
 "sglang" = [

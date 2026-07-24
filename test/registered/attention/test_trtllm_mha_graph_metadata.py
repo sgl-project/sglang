@@ -41,6 +41,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend._swa_full_to_swa_mapping = None
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
+    backend.expand_encoder_only_verify = False
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
