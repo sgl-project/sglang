@@ -24,11 +24,6 @@ mod tokenizer_manager;
 
 use std::net::SocketAddr;
 
-mod environ;
-mod error;
-mod fsm;
-mod ids;
-
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
