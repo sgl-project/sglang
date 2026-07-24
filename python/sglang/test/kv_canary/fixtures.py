@@ -6,8 +6,8 @@ from typing import List, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
