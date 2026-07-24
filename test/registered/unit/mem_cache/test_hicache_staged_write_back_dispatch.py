@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
+from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupBroadcaster
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -178,6 +179,64 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
             ),
         )
 
+    def test_mla_dedup_dummy_host_pools_are_allocator_only(self):
+        mla_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+        )
+        mla_host = MLATokenToKVPoolHost(
+            mla_device_pool,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=2,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(mla_host._is_dummy)
+        self.assertIsNone(mla_host.kv_buffer)
+        self.assertIsNone(mla_host.data_ptrs)
+        self.assertEqual(mla_host.get_contiguous_buf_infos(), ([], [], []))
+        slots = mla_host.alloc(2)
+        self.assertIsNotNone(slots)
+        self.assertEqual(slots.tolist(), [0, 1])
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            mla_host.load_to_device_per_layer(
+                mla_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
+        dsa_device_pool = _device_pool_stub(
+            layer_num=2,
+            store_dtype=torch.float16,
+            size=8,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=8,
+            quant_block_size=4,
+        )
+        indexer_host = DSAIndexerPoolHost(
+            dsa_device_pool,
+            mla_host,
+            layout="page_first",
+            pin_memory=False,
+            is_dummy=True,
+        )
+
+        self.assertTrue(indexer_host._is_dummy)
+        self.assertIsNone(indexer_host.index_k_with_scale_buffer)
+        self.assertIsNone(indexer_host.index_k_device_ptrs)
+        self.assertEqual(indexer_host.size, mla_host.size)
+        with self.assertRaisesRegex(AssertionError, "load on a dummy"):
+            indexer_host.load_to_device_per_layer(
+                dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
+            )
+
     def test_mha_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         head_num = 1
@@ -321,6 +380,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.token_stride_size = kv_cache_dim
         host.layout_dim = host.token_stride_size * layer_num
         host.dtype = torch.uint8
+        host._is_dummy = False
         host.can_use_jit = True
         host.can_use_write_back_jit = True
         host.kv_buffer = torch.zeros(8, layer_num, 1, kv_cache_dim, dtype=torch.uint8)
@@ -615,6 +675,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         host.index_k_with_scale_buffer = torch.zeros(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
+        host._is_dummy = False
         host.staging_buffer = torch.empty(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
@@ -855,6 +916,369 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_mla_dedup_peer_still_writes_local_draft_pool(self):
+        target_writes = []
+        draft_writes = []
+
+        class FakeTargetHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = False
+
+            def backup_from_device_all_layer(self, *args):
+                target_writes.append(args)
+
+        class FakeDraftHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = True
+
+            def backup_from_device_all_layer(self, *args):
+                draft_writes.append(args)
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.write_stream = object()
+        controller.ack_write_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        self.assertEqual(target_writes, [])
+        self.assertEqual(len(draft_writes), 1)
+        self.assertEqual(draft_writes[0][1].device.type, "cpu")
+
+    def test_mla_dedup_load_restores_draft_on_every_rank(self):
+        draft_loads = []
+        broadcasts = []
+
+        class FakeDraftHostPool:
+            layer_num = 2
+
+            def load_to_device_per_layer(self, *args):
+                draft_loads.append(args)
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def __init__(self):
+                self.completed_layers = []
+
+            def complete(self, layer_index):
+                self.completed_layers.append(layer_index)
+
+        producer_event = FakeProducerEvent()
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.layer_num = 3
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[producer_event]
+        )
+        controller.mla_broadcaster = SimpleNamespace(
+            is_src=False,
+            prepare_broadcast=lambda device_indices, stream: (
+                device_indices,
+                None,
+            ),
+            broadcast_loaded_layer=lambda layer_id, prepared: broadcasts.append(
+                (layer_id, prepared)
+            ),
+        )
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        self.assertEqual([layer_id for layer_id, _ in broadcasts], [0, 1, 2])
+        self.assertEqual(len(draft_loads), 2)
+        self.assertEqual(producer_event.completed_layers, [0, 1, 2])
+        self.assertEqual(len(controller.ack_load_queue), 1)
+        ack = controller.ack_load_queue[0]
+        self.assertEqual(ack.num_tokens, 4)
+        self.assertIsNot(ack.start_event, producer_event.start_event)
+        self.assertIsNot(ack.finish_event, producer_event.finish_event)
+
+    def test_mla_dedup_source_load_and_broadcast_are_layerwise(self):
+        operations = []
+
+        class FakeTargetHostPool:
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("target", layer_id))
+
+        class FakeDraftHostPool:
+            layer_num = 2
+
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            ):
+                operations.append(("draft", layer_id))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def complete(self, layer_index):
+                operations.append(("complete", layer_index))
+
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.layer_num = 3
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[FakeProducerEvent()]
+        )
+        controller.mla_broadcaster = SimpleNamespace(
+            is_src=True,
+            prepare_broadcast=lambda device_indices, stream: operations.append(
+                ("prepare", None)
+            )
+            or (device_indices, None),
+            broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
+                ("broadcast", layer_id)
+            ),
+        )
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+        controller.move_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices)
+        )
+
+        with mock.patch.object(
+            manager_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_loading()
+
+        self.assertEqual(
+            operations,
+            [
+                ("prepare", None),
+                ("target", 0),
+                ("broadcast", 0),
+                ("draft", 0),
+                ("complete", 0),
+                ("target", 1),
+                ("broadcast", 1),
+                ("draft", 1),
+                ("complete", 1),
+                ("target", 2),
+                ("broadcast", 2),
+                ("complete", 2),
+            ],
+        )
+
+    def test_mla_layer_broadcast_reuses_full_staging_capacity(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+
+        layer_buffers = [
+            torch.arange(24, dtype=torch.float32).reshape(6, 1, 4),
+            torch.arange(24, 48, dtype=torch.float32).reshape(6, 1, 4),
+        ]
+        target = torch.tensor([0, 2, 5], dtype=torch.int64)
+        # Capacity is six rows, modeling the retained 2 layers * 3-row chunk.
+        staging = torch.empty(2 * 3 * 4, dtype=torch.float32)
+
+        with mock.patch.object(torch.distributed, "broadcast") as broadcast:
+            broadcaster._bcast_layer(layer_buffers, staging, target, 4, layer_id=1)
+
+        broadcast.assert_called_once()
+        expected = layer_buffers[1].index_select(0, target)
+        torch.testing.assert_close(
+            staging[: expected.numel()].view_as(expected), expected
+        )
+
+        broadcaster.is_src = False
+        received = [torch.zeros_like(layer) for layer in layer_buffers]
+        with mock.patch.object(torch.distributed, "broadcast"):
+            broadcaster._bcast_layer(received, staging, target, 4, layer_id=1)
+        torch.testing.assert_close(received[1].index_select(0, target), expected)
+
+    def test_hybrid_mla_dedup_peer_still_writes_local_draft_pool(self):
+        target_writes = []
+        draft_writes = []
+
+        class FakeTargetHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = False
+
+            def backup_from_device_all_layer(self, *args, **kwargs):
+                target_writes.append((args, kwargs))
+
+        class FakeDraftHostPool:
+            layout = "page_first"
+            can_use_write_back_jit = True
+
+            def backup_from_device_all_layer(self, *args):
+                draft_writes.append(args)
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.mem_pool_host_draft = FakeDraftHostPool()
+        controller.mem_pool_device_draft = object()
+        controller.has_draft = True
+        controller.mla_broadcaster = SimpleNamespace(is_src=False)
+        controller.write_stream = object()
+        controller.ack_write_queue = []
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, None)
+        )
+        controller._record_transfer_indices_on_stream = lambda *args: None
+
+        with mock.patch.object(
+            hybrid_cache_controller, "device_module", _FakeDeviceModule
+        ):
+            controller.start_writing()
+
+        self.assertEqual(target_writes, [])
+        self.assertEqual(len(draft_writes), 1)
+        self.assertEqual(draft_writes[0][1].device.type, "cpu")
+
+    def test_hybrid_mla_dedup_loads_extra_pools_layerwise(self):
+        operations = []
+        pool_transfers = [mock.sentinel.pool_transfer]
+
+        class FakeTargetHostPool:
+            def load_to_device_per_layer(
+                self,
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+                pool_transfers=None,
+            ):
+                operations.append(("load", layer_id, pool_transfers))
+
+        class FakeProducerEvent:
+            start_event = _FakeEvent()
+            finish_event = _FakeEvent()
+
+            def complete(self, layer_index):
+                operations.append(("complete", layer_index))
+
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.load_queue = [op]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeTargetHostPool()
+        controller.mem_pool_device = object()
+        controller.has_draft = False
+        controller.layer_num = 2
+        controller.layer_done_counter = SimpleNamespace(
+            update_producer=lambda: 0, events=[FakeProducerEvent()]
+        )
+        controller.mla_broadcaster = SimpleNamespace(
+            is_src=True,
+            prepare_broadcast=lambda device_indices, stream: (
+                device_indices,
+                None,
+            ),
+            broadcast_loaded_layer=lambda layer_id, prepared: operations.append(
+                ("broadcast", layer_id)
+            ),
+        )
+        controller.load_stream = object()
+        controller.ack_load_queue = []
+        controller.move_hybrid_indices = mock.Mock(
+            return_value=(op.host_indices, op.device_indices, pool_transfers)
+        )
+        controller._record_transfer_indices_on_stream = mock.Mock()
+
+        with (
+            mock.patch.object(
+                hybrid_cache_controller, "device_module", _FakeDeviceModule
+            ),
+            mock.patch.object(
+                manager_cache_controller, "device_module", _FakeDeviceModule
+            ),
+        ):
+            controller.start_loading()
+
+        self.assertEqual(
+            operations,
+            [
+                ("load", 0, pool_transfers),
+                ("broadcast", 0),
+                ("complete", 0),
+                ("load", 1, pool_transfers),
+                ("broadcast", 1),
+                ("complete", 1),
+            ],
+        )
+        controller._record_transfer_indices_on_stream.assert_called_once_with(
+            controller.load_stream,
+            op.host_indices,
+            op.device_indices,
+            pool_transfers,
+        )
 
 
 if __name__ == "__main__":
