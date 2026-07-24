@@ -207,9 +207,16 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         for ratio in (4, 128):
             if ratio not in ratio_lists:
                 continue
-            bundle_loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
-            expected_count = sum(x.numel() for x in ratio_lists[ratio])
-            setattr(fm, f"c{ratio}_loc", bundle_loc.to(torch.int32))
+            bundle_loc = (
+                (bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc)
+                if bundle is not None
+                else None
+            )
+            setattr(
+                fm,
+                f"c{ratio}_loc",
+                bundle_loc.to(torch.int32) if bundle_loc is not None else None,
+            )
 
         # req_to_token_c*_state is not re-zeroed on slot reuse; zero pre-tail page cols so the kernel block-0 skip masks stale entries
         page_size = self.page_size

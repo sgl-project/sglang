@@ -857,7 +857,7 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if hasattr(token_to_kv_pool, "get_pd_state_components"):
+    if is_npu() and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
         # Pool ships each sub-pool as its own page-indexed component (fixed order
         # so prefill and decode register identically); skips get_state_buf_infos.
         for (

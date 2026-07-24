@@ -57,34 +57,6 @@ def maybe_write_dsv4_extend(
     if not hasattr(req_to_token_pool, "write_c4"):
         return  # non-DSV4 pool; skip defensively (shouldn't happen)
 
-    # SWA writes: prefix..seq token positions, one slot per raw token.
-    _write_per_req_slice(
-        req_to_token_pool.write_swa,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_swa_loc,
-        ratio=1,
-    )
-
-    # c4 / c128 writes: prefix//ratio .. seq//ratio compressed positions.
-    _write_per_req_slice(
-        req_to_token_pool.write_c4,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_c4_loc,
-        ratio=4,
-    )
-    _write_per_req_slice(
-        req_to_token_pool.write_c128,
-        req_pool_indices_cpu,
-        prefix_lens_cpu,
-        seq_lens_cpu,
-        bundle.out_c128_loc,
-        ratio=128,
-    )
-
     # c4_state / c128_state writes: tail-only. Bundle length is
     # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens. Normal extend
     # uses the per-Req low-water marks; reserve callers can pass explicit raw
@@ -101,26 +73,15 @@ def maybe_write_dsv4_extend(
             )
             for r in batch.reqs
         ]
-    if bundle.out_c4_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c4_state"
-    ):
-        _write_state_tail_per_req(
-            req_to_token_pool.write_c4_state,
-            req_pool_indices_cpu,
-            c4_state_alloc_offsets,
-            seq_lens_cpu,
-            bundle.out_c4_state_loc,
-        )
-    if bundle.out_c128_state_loc is not None and hasattr(
-        req_to_token_pool, "write_c128_state"
-    ):
-        _write_state_tail_per_req(
-            req_to_token_pool.write_c128_state,
-            req_pool_indices_cpu,
-            c128_state_alloc_offsets,
-            seq_lens_cpu,
-            bundle.out_c128_state_loc,
-        )
+    _write_dsv4_tables(
+        req_to_token_pool,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle,
+        c4_state_offsets=c4_state_alloc_offsets,
+        c128_state_offsets=c128_state_alloc_offsets,
+    )
 
 
 def dsv4_state_payloads(
@@ -267,14 +228,51 @@ def write_dsv4_prealloc_tables(
     pl = torch.tensor([prefix_len])
     sl = torch.tensor([fill_len])
 
+    _write_dsv4_tables(
+        req_to_token_pool,
+        rp,
+        pl,
+        sl,
+        bundle,
+        c4_state_offsets=[getattr(req, "c4_state_alloc_offset", 0)],
+        c128_state_offsets=[getattr(req, "c128_state_alloc_offset", 0)],
+    )
+
+
+def _write_dsv4_tables(
+    req_to_token_pool,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    bundle,
+    *,
+    c4_state_offsets: Sequence[int] | torch.Tensor,
+    c128_state_offsets: Sequence[int] | torch.Tensor,
+) -> None:
+    """Write DSV4 SWA, compressed-KV, and compression-state tables."""
     _write_per_req_slice(
-        req_to_token_pool.write_swa, rp, pl, sl, bundle.out_swa_loc, ratio=1
+        req_to_token_pool.write_swa,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_swa_loc,
+        ratio=1,
     )
     _write_per_req_slice(
-        req_to_token_pool.write_c4, rp, pl, sl, bundle.out_c4_loc, ratio=4
+        req_to_token_pool.write_c4,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c4_loc,
+        ratio=4,
     )
     _write_per_req_slice(
-        req_to_token_pool.write_c128, rp, pl, sl, bundle.out_c128_loc, ratio=128
+        req_to_token_pool.write_c128,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c128_loc,
+        ratio=128,
     )
 
     if bundle.out_c4_state_loc is not None and hasattr(
@@ -282,9 +280,9 @@ def write_dsv4_prealloc_tables(
     ):
         _write_state_tail_per_req(
             req_to_token_pool.write_c4_state,
-            rp,
-            [getattr(req, "c4_state_alloc_offset", 0)],
-            sl,
+            req_pool_indices_cpu,
+            c4_state_offsets,
+            seq_lens_cpu,
             bundle.out_c4_state_loc,
         )
     if bundle.out_c128_state_loc is not None and hasattr(
@@ -292,9 +290,9 @@ def write_dsv4_prealloc_tables(
     ):
         _write_state_tail_per_req(
             req_to_token_pool.write_c128_state,
-            rp,
-            [getattr(req, "c128_state_alloc_offset", 0)],
-            sl,
+            req_pool_indices_cpu,
+            c128_state_offsets,
+            seq_lens_cpu,
             bundle.out_c128_state_loc,
         )
 

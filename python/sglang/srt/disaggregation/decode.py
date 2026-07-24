@@ -1619,7 +1619,7 @@ def alloc_for_decode_prealloc(
     prefix_indices: Optional[torch.Tensor],
     uses_swa_tail: bool,
     swa_tail_len: int,
-    req_to_token_pool: ReqToTokenPool,
+    req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
     if req.kv is None:
         req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
@@ -1634,15 +1634,16 @@ def alloc_for_decode_prealloc(
             if prefix_len > 0
             else torch.tensor([-1], dtype=torch.int64, device=device)
         )
-        dsv4_kwargs = {}
+        extra_kwargs = {}
         dsv4_unwrap_prealloc = None
         if hasattr(allocator, "c4_attn_allocator"):
+            assert req_to_token_pool is not None
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                 dsv4_prealloc_kwargs,
                 dsv4_unwrap_prealloc,
             )
 
-            dsv4_kwargs = dsv4_prealloc_kwargs(
+            extra_kwargs = dsv4_prealloc_kwargs(
                 allocator,
                 req,
                 fill_len,
@@ -1662,7 +1663,7 @@ def alloc_for_decode_prealloc(
                 last_loc=last_loc,
                 extend_num_tokens=fill_len,
                 swa_tail_len=swa_tail_len,
-                **dsv4_kwargs,
+                **extra_kwargs,
             )
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
@@ -1675,7 +1676,7 @@ def alloc_for_decode_prealloc(
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
-                **dsv4_kwargs,
+                **extra_kwargs,
             )
         if dsv4_unwrap_prealloc is not None:
             kv_loc = dsv4_unwrap_prealloc(
