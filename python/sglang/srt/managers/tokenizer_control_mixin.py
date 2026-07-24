@@ -541,6 +541,26 @@ class TokenizerControlMixin:
 
         return success, message
 
+    def _validate_dynamic_lora_supported(self: TokenizerManager):
+        """Reject dynamic LoRA updates that would leave tokenizer workers inconsistent.
+
+        With `--tokenizer-worker-num > 1`, each tokenizer worker process holds its
+        own `lora_registry` / `lora_ref_cache`, and dynamic updates are applied only
+        by the worker that serves the HTTP request. There is no cross-worker
+        synchronization, so a dynamically loaded adapter would fail for requests
+        routed to any other worker. See
+        https://github.com/sgl-project/sglang/issues/31084.
+        """
+        if self.server_args.tokenizer_worker_num > 1:
+            raise ValueError(
+                "Dynamic LoRA loading is currently not supported with "
+                "--tokenizer-worker-num > 1: each tokenizer worker keeps its own "
+                "LoRA registry and dynamic updates are not synchronized across "
+                "workers (https://github.com/sgl-project/sglang/issues/31084). "
+                "Please launch the server with --tokenizer-worker-num 1, or "
+                "preload adapters at startup via --lora-paths."
+            )
+
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -573,6 +593,8 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
+
+            self._validate_dynamic_lora_supported()
 
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
@@ -652,6 +674,8 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            self._validate_dynamic_lora_supported()
+
             assert (
                 self.server_args.dp_size == 1
             ), "dp_size must be 1 for dynamic lora loading"
@@ -725,6 +749,8 @@ class TokenizerControlMixin:
             assert (
                 obj.lora_name is not None
             ), "lora_name must be provided to unload LoRA adapter"
+
+            self._validate_dynamic_lora_supported()
 
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
             # with dp_size > 1.
