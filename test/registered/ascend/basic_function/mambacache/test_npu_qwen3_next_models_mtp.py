@@ -24,7 +24,6 @@ class TestQwen3NextMTPTopk(GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerB
     kl_div_thres = 0.008
     other_args = [
         "--trust-remote-code",
-        # "--disable-cuda-graph",
         "--speculative-algorithm",
         "NEXTN",
         "--speculative-num-steps",
@@ -34,7 +33,7 @@ class TestQwen3NextMTPTopk(GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerB
         "--speculative-num-draft-tokens",
         "4",
         "--mem-fraction-static",
-        "0.75",
+        "0.7",
         "--tp",
         "8",
         "--chunked-prefill-size",
@@ -56,7 +55,6 @@ class TestQwen3NextMTPV2(GSM8KMixin, DefaultServerBase):
     kl_div_thres = 0.0035
     other_args = [
         "--trust-remote-code",
-        # "--disable-cuda-graph",
         "--speculative-algorithm",
         "NEXTN",
         "--speculative-num-steps",
@@ -66,7 +64,7 @@ class TestQwen3NextMTPV2(GSM8KMixin, DefaultServerBase):
         "--speculative-num-draft-tokens",
         "4",
         "--mem-fraction-static",
-        "0.8",
+        "0.7",
         "--tp",
         "4",
         "--chunked-prefill-size",
