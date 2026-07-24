@@ -372,9 +372,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            get_fused_compressor_rope_cos_sin,
-        )
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -401,11 +399,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             compressor.layer_id, compressor.is_in_indexer
         )
 
-        cos, sin = get_fused_compressor_rope_cos_sin(
-            compressor.freqs_cis,
+        cos, sin = Dsv4NpuRoPE.for_freqs(
+            compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
+        ).get_cos_sin(
             positions_cmp,
-            dtype=torch.float32,
-            cache_owner=getattr(compressor, "rotary_emb", None),
+            torch.float32,
+            view_4d=False,
             allow_build=False,
         )
 
@@ -724,13 +723,11 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             pos_out = torch.cat(kv_out_positions, dim=0)
             kv_out = compressor.norm(kv_out)
             rope_dim = compressor.rope_head_dim
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
-                get_npu_interleaved_rope_cos_sin,
-            )
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-            cos, sin = get_npu_interleaved_rope_cos_sin(
-                getattr(compressor, "rotary_emb", None),
-                compressor.freqs_cis,
+            cos, sin = Dsv4NpuRoPE.for_freqs(
+                compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
+            ).get_cos_sin(
                 pos_out,
                 kv_out.dtype,
                 view_4d=True,
@@ -961,10 +958,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            get_npu_interleaved_rope_cos_sin,
-            npu_partial_rotary_mul_inplace,
-        )
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
@@ -973,16 +967,16 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         # Position-gathered RoPE values are forward-local.  The rotary embedding
         # object is shared, so retaining them there can leak target positions into
         # NextN (or a previous graph replay) when the next batch has the same shape.
-        cos4, sin4 = get_npu_interleaved_rope_cos_sin(
-            c4_indexer.rotary_emb,
-            c4_indexer.freqs_cis,
+        cos4, sin4 = Dsv4NpuRoPE.for_freqs(
+            c4_indexer.freqs_cis, getattr(c4_indexer, "rotary_emb", None)
+        ).get_cos_sin(
             positions,
             q.dtype,
             view_4d=True,
             allow_build=False,
             cache_dtype=torch.float32,
         )
-        npu_partial_rotary_mul_inplace(
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
             q,
             None,
             cos4,

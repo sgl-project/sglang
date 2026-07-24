@@ -23,11 +23,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    ensure_npu_interleaved_rope_cache,
-    get_npu_interleaved_rope_cos_sin,
-    npu_partial_rotary_mul_inplace,
-)
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -49,6 +44,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -581,9 +577,9 @@ class MQALayer(MqaAttentionBase):
         )
 
         if _is_npu:
-            ensure_npu_interleaved_rope_cache(
-                self.rotary_emb, self.freqs_cis, torch.float32
-            )
+            Dsv4NpuRoPE.for_freqs(
+                self.freqs_cis, getattr(self, "rotary_emb", None)
+            ).ensure_tables(torch.float32)
 
         if _is_hip:
             cos_cache = (
@@ -657,9 +653,9 @@ class MQALayer(MqaAttentionBase):
         # immutable full table on it.  A position-gathered tensor is specific to
         # this forward and reusing it based on shape alone gives MTP decode the
         # previous step's RoPE values when positions change but batch size does not.
-        return get_npu_interleaved_rope_cos_sin(
-            self.rotary_emb,
-            self.freqs_cis,
+        return Dsv4NpuRoPE.for_freqs(
+            self.freqs_cis, getattr(self, "rotary_emb", None)
+        ).get_cos_sin(
             positions,
             dtype,
             view_4d=True,
@@ -1035,7 +1031,7 @@ class MQALayer(MqaAttentionBase):
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, q.dtype, inverse=False
             )
-            npu_partial_rotary_mul_inplace(
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 q,
                 kv.unsqueeze(1),
                 cos4,
@@ -1247,7 +1243,7 @@ class MQALayer(MqaAttentionBase):
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
             )
-            npu_partial_rotary_mul_inplace(
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
                 o,
                 None,
                 cos4,
