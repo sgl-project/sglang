@@ -193,6 +193,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             x_shapes = x.shape
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
+            # weight_packed_linear needs contiguous x - audio inputs may not be
             output = torch.ops.sgl_kernel.weight_packed_linear(
                 x.contiguous(),
                 layer.weight,
