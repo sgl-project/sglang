@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -277,14 +276,13 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
+class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.enable_session_radix_cache = params.enable_session_radix_cache
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
@@ -339,7 +337,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        self._reset_session_radix_state()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -467,21 +464,17 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            session_leaf = result.last_device_node
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
-            session_leaf = None
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
-        self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -552,8 +545,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
-
-        self._tag_session_leaf(req, radix_key, node=new_last_node)
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -781,7 +772,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        self._discard_session_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
