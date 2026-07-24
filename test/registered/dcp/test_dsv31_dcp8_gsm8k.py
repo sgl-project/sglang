@@ -5,6 +5,7 @@ Test classes:
     TestDSV31DCP8TP8GSM8K          — CI gate: DCP=8 + TP=8 GSM8K accuracy + decode sanity
     TestDSV31DCP8LogprobParity     — (manual) DCP=8 vs non-DCP logprob equivalence
     TestDSV31DCP4TP8GSM8K          — (manual) DCP=4 + TP=8, different all-gather path
+    TestFlashMLAFP8DCP2GSM8K       — (manual) FlashMLA + FP8 KV cache + DCP=2 accuracy
 
 CI coverage & known gaps
 ------------------------
@@ -21,6 +22,7 @@ What the CI test does NOT cover (and the manual tests address):
   - DCP=4 code path (different all-gather pattern; TestDSV31DCP4TP8GSM8K)
   - MHA extend path (all_gather_kv_cache_for_mha_extend / mha_chunk_extend)
     — DeepSeek-V3.1 uses MLA, so these paths are never exercised
+  - FlashMLA backend + FP8 KV cache + DCP (TestFlashMLAFP8DCP2GSM8K)
 
 Future improvements:
   - Add dcp_world_size to /server_info so tests can assert DCP is active without
@@ -415,6 +417,54 @@ class TestDSV31DCP4TP8GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestC
             0,
             "max_total_num_tokens should be positive",
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: FlashMLA + FP8 KV cache + DCP=2 (manual-only)
+# ---------------------------------------------------------------------------
+@unittest.skipIf(
+    is_in_ci(), "Requires 8 GPUs + DeepSeek-V3; run locally for FlashMLA FP8+DCP coverage."
+)
+class TestFlashMLAFP8DCP2GSM8K(GSM8KMixin, BasicDecodeCorrectnessMixin, CustomTestCase):
+    """FlashMLA + FP8 KV cache + DCP=2 — validates lifting the DCP guard in
+    flashmla_backend.py for FP8 kv cache.
+
+    Verified locally on DeepSeek-V4-Flash-FP8 (TP=4, DCP=2, 8x H20):
+      non-DCP baseline: 0.955
+      DCP=2:            0.960
+    The DCP=2 score is within normal variance of the non-DCP baseline,
+    confirming that FP8 descale + LSE merge is numerically correct.
+    """
+
+    model = os.environ.get("FLASHMLA_FP8_DCP_MODEL_PATH", "deepseek-ai/DeepSeek-V3")
+    base_url = "http://127.0.0.1:31502"
+
+    gsm8k_accuracy_thres = 0.90
+    gsm8k_num_questions = 200
+    gsm8k_num_threads = 128
+    gsm8k_num_shots = 5
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=[
+                "--tp-size", "8",
+                "--dcp-size", "2",
+                "--attention-backend", "flashmla",
+                "--kv-cache-dtype", "fp8_e4m3",
+                "--mem-fraction-static", "0.85",
+                "--trust-remote-code",
+                "--disable-radix-cache",
+                "--random-seed", "0",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid, wait_timeout=60)
 
 
 if __name__ == "__main__":
