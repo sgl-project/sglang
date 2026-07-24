@@ -93,13 +93,6 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
-    prefill_runner = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
-    )
-
     decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
     if capture_decode_cuda_graph:
         if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
@@ -110,6 +103,13 @@ def capture_cuda_graphs(
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
+
+    # Capture prefill after decode. Both still coalesce onto the eager
+    # buffer allocated above, while decode-side graph initialization cannot
+    # invalidate already-captured prefill BCG state.
+    prefill_runner = capture_prefill_graph(
+        model_runner=model_runner, eager_runner=eager_runner
+    )
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks
