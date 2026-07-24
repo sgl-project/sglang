@@ -33,6 +33,14 @@ MAMBA = ComponentType.MAMBA
 
 
 class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
+    def test_dsv4_state_pool_lookup_uses_global_layer_ids(self):
+        self.assertEqual(
+            hybrid_pool_assembler._state_pool_global_layer_ids_in_order(
+                {2: 1, 0: 0}, start_layer=20
+            ),
+            [20, 22],
+        )
+
     def test_strategy_registry_ordering(self):
         order = [type(s) for s in _STRATEGIES]
         # DeepSeekV4 inherits from SWAKVPool, so it must resolve before _SwaStrategy.

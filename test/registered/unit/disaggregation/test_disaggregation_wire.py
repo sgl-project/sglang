@@ -5,24 +5,45 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
+    pack_int_list,
     pack_int_lists,
     pack_list_of_buffers,
+    pack_nested_transfer_layout,
+    pack_transfer_layout,
+    unpack_int_list,
     unpack_int_lists,
     unpack_list_of_buffers,
+    unpack_nested_transfer_layout,
+    unpack_transfer_layout,
 )
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    append_draft_kv_data,
     get_dsv4_c128_state_indices,
     setup_state_kv_args,
+    should_transfer_draft_cache,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
+    CpCacheLayerSplitPoolBase,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DSV4_TRANSFER_C128_STATE,
+    DSV4_TRANSFER_SWA_KV,
+    DeepSeekV4TokenToKVPool,
+)
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -46,6 +67,11 @@ class TestDisaggregationWire(unittest.TestCase):
         packed = pack_int_lists(arrs, "i")
         self.assertEqual(unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
 
+    def test_flat_int_list_roundtrip(self):
+        self.assertEqual(unpack_int_list(pack_int_list([7, 8, 9], "I"), "I"), [7, 8, 9])
+        self.assertEqual(pack_int_list([], "I"), b"")
+        self.assertEqual(unpack_int_list(b"", "I"), [])
+
     def test_empty_outer_list(self):
         self.assertEqual(pack_int_lists([], "Q"), b"")
         self.assertEqual(unpack_int_lists(b"", "Q"), [])
@@ -57,6 +83,59 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
+
+
+class TestCpCacheLayerSplitTransferLayoutWire(CustomTestCase):
+    def test_layer_split_transfer_layout_roundtrip_preserves_none_slots(self):
+        layout = [("dsv4_c4_kv", 1), None, ("dsv4_c128_kv", 3)]
+
+        self.assertEqual(unpack_transfer_layout(pack_transfer_layout(layout)), layout)
+        self.assertEqual(pack_transfer_layout([]), b"")
+        self.assertEqual(unpack_transfer_layout(b""), [])
+
+    def test_layer_split_state_layout_roundtrip_preserves_component_boundaries(self):
+        layouts = [
+            [("dsv4_swa_kv", 0), None],
+            [("dsv4_attention_state", 1), ("dsv4_indexer_state", 1)],
+        ]
+
+        self.assertEqual(
+            unpack_nested_transfer_layout(pack_nested_transfer_layout(layouts)),
+            layouts,
+        )
+        self.assertEqual(pack_nested_transfer_layout([]), b"")
+        self.assertEqual(unpack_nested_transfer_layout(b""), [])
+
+
+class TestCpCacheLayerSplitDescriptorMatching(CustomTestCase):
+    def _build_params(self, **kwargs):
+        params = dict(
+            src_data_ptrs=[100],
+            dst_data_ptrs=[200],
+            item_lens=[16],
+            src_data_layout=[("dsv4_c4_kv", 1)],
+            dst_data_layout=[("dsv4_c4_kv", 1)],
+            dst_item_lens=[16],
+        )
+        params.update(kwargs)
+        return CommonKVManager.build_descriptor_matched_transfer_params(**params)
+
+    def test_descriptor_matching_checks_destination_item_size(self):
+        with self.assertRaisesRegex(RuntimeError, "item size mismatch"):
+            self._build_params(dst_item_lens=[32])
+
+    def test_required_descriptor_matching_rejects_missing_layouts(self):
+        with self.assertRaisesRegex(RuntimeError, "descriptors on both"):
+            self._build_params(
+                src_data_layout=[],
+                dst_data_layout=[],
+            )
+
+    def test_descriptor_matching_returns_pointer_item_len_tuples(self):
+        self.assertEqual(
+            self._build_params(),
+            [(100, 200, 16)],
+        )
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
@@ -229,6 +308,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
     pool.get_state_buf_infos = lambda: _buf_infos(11)
+    pool.get_state_transfer_layout = lambda: []
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
@@ -248,6 +328,9 @@ def _make_dsv4_draft(*, unified, mapping=None):
     pool.unified_swa_pages = 524
     pool.compress_state_pools = [None]
     pool.indexer_compress_state_pools = [None]
+    pool.get_state_transfer_layout = lambda: (
+        [] if unified else [(DSV4_TRANSFER_SWA_KV, 0)]
+    )
     if unified:
         pool.unified_kv_pool = SimpleNamespace(
             swa_pages=524,
@@ -260,7 +343,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
     return pool
 
 
-class TestDSV4DraftStateRegistration(unittest.TestCase):
+class TestDSV4DraftStateRegistration(CustomTestCase):
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [
@@ -270,6 +353,7 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 _make_dsv4_draft(unified=False, mapping=mapping),
                 [StateType.SWA, StateType.SWA],
                 [[11]],
+                [(DSV4_TRANSFER_SWA_KV, 0)],
             ),
             (
                 "unified",
@@ -277,10 +361,11 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 _make_dsv4_draft(unified=True),
                 [StateType.SWA, StateType.SWA_RING, StateType.SWA_RING],
                 [[11], [12]],
+                [],
             ),
         ]
 
-        for name, target, draft, expected_types, target_ptrs in cases:
+        for name, target, draft, expected_types, target_ptrs, draft_layout in cases:
             with self.subTest(name=name):
                 if draft._unified_kv:
                     expected_infos = draft.get_unified_swa_ring_buf_infos()
@@ -295,6 +380,97 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+                self.assertEqual(kv_args.state_data_layouts[-1], draft_layout)
+
+
+class TestDSV4DraftLayerSplitTransfer(CustomTestCase):
+    def test_empty_draft_kv_data_preserves_target_descriptors(self):
+        ptrs, lens, item_lens = [1], [2], [3]
+        layout = [("dsv4_c4_kv", 4)]
+        draft = SimpleNamespace(get_contiguous_buf_infos=lambda: ([], [], []))
+
+        added = append_draft_kv_data(ptrs, lens, item_lens, layout, draft)
+
+        self.assertEqual(added, 0)
+        self.assertEqual(layout, [("dsv4_c4_kv", 4)])
+
+    def test_only_last_layer_split_rank_transfers_replicated_draft(self):
+        pool = object.__new__(CpCacheLayerSplitPoolBase)
+        pool.cp_size = 4
+
+        pool.cp_rank = 0
+        self.assertFalse(should_transfer_draft_cache(pool))
+        pool.cp_rank = 3
+        self.assertTrue(should_transfer_draft_cache(pool))
+        self.assertTrue(should_transfer_draft_cache(object()))
+
+    def test_empty_layer_split_c128_component_is_not_transferred(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.C128_STATE],
+            state_data_ptrs=[[]],
+            state_item_lens=[[]],
+            require_descriptor_matched_transfer=True,
+        )
+        req = SimpleNamespace(dst_state_indices=[[0]])
+
+        self.assertEqual(
+            manager.maybe_send_extra(req, [[0]], executor=None),
+            0,
+        )
+
+
+class TestDSV4C128StateRegistration(CustomTestCase):
+    def test_c128_state_layout_is_registered_as_separate_component(self):
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool.get_state_buf_infos = lambda: _buf_infos(11)
+        pool.get_state_transfer_layout = lambda: [(DSV4_TRANSFER_SWA_KV, 0)]
+        pool.get_c128_state_buf_infos = lambda: _buf_infos(12)
+        pool.get_c128_state_transfer_layout = lambda: [(DSV4_TRANSFER_C128_STATE, 5)]
+        kv_args = KVArgs()
+
+        setup_state_kv_args(kv_args, pool)
+
+        self.assertEqual(kv_args.state_types, [StateType.SWA, StateType.C128_STATE])
+        self.assertEqual(
+            kv_args.state_data_layouts,
+            [
+                [(DSV4_TRANSFER_SWA_KV, 0)],
+                [(DSV4_TRANSFER_C128_STATE, 5)],
+            ],
+        )
+
+    def test_layer_split_keeps_empty_c128_slot_before_draft_state(self):
+        mapping = torch.arange(16)
+        target = object.__new__(CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+        target._unified_kv = False
+        target.compression_ratios = [0, 128]
+        target.page_size = 256
+        target.sliding_window = 128
+        target.full_to_swa_index_mapping = mapping
+        target.get_state_buf_infos = lambda: _buf_infos(11)
+        target.get_state_transfer_layout = lambda: [(DSV4_TRANSFER_SWA_KV, 0)]
+        target.get_c128_state_buf_infos = lambda: ([], [], [])
+        target.get_c128_state_transfer_layout = lambda: []
+        draft = _make_dsv4_draft(unified=False, mapping=mapping)
+        kv_args = KVArgs()
+
+        setup_state_kv_args(kv_args, target, draft)
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.C128_STATE, StateType.SWA],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1], [])
+        self.assertEqual(
+            kv_args.state_data_layouts,
+            [
+                [(DSV4_TRANSFER_SWA_KV, 0)],
+                [],
+                [(DSV4_TRANSFER_SWA_KV, 0)],
+            ],
+        )
 
 
 if __name__ == "__main__":

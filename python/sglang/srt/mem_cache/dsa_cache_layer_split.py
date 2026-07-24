@@ -23,8 +23,7 @@ buffer into a small per-rank remote scratch buffer.
 This subclass keeps the core ``KVCache`` / ``MLATokenToKVPool`` /
 ``DSATokenToKVPool`` pools untouched: all sharding, broadcast, and remote-scratch
 bookkeeping lives here. Layer split is only ever enabled for DSA MLA models on
-PD prefill workers under prefill-CP (see
-``sglang.srt.layers.cp.utils.is_glm_dsa_cache_layer_split_enabled``).
+PD prefill workers under prefill-CP.
 """
 
 from __future__ import annotations
@@ -36,7 +35,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.mem_cache.cp_cache_layer_split.broadcast import BroadcastSlots
+from sglang.srt.mem_cache.cp_cache_layer_split.pool_base import (
+    CpCacheLayerSplitPoolBase,
+)
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
@@ -53,7 +55,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
+def get_dsa_layer_split_effective_num_layers(num_layers: int, shard_size: int) -> int:
+    """Per-rank DSA layers used for KV cell sizing, including remote scratch."""
+    if shard_size <= 1:
+        return num_layers
+    owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
+    return max(1, owned_layers_upper_bound + 1)
+
+
+class LayerSplitDSATokenToKVPool(CpCacheLayerSplitPoolBase, DSATokenToKVPool):
     """DSA KV pool that shards layers across CP ranks with owner-broadcast reads."""
 
     def __init__(
@@ -66,49 +76,24 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         assert (
             layer_shard_rank is not None and layer_shard_size > 1
         ), "LayerSplitDSATokenToKVPool requires layer_shard_size > 1"
+
+        layer_num = kwargs["layer_num"]
+        start_layer = kwargs.get("start_layer") or 0
+
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        self._init_cp_cache_layer_split(
+            cp_rank=layer_shard_rank,
+            cp_size=layer_shard_size,
+            layer_shard_start_layer=start_layer,
+            layer_shard_layer_num=layer_num,
+        )
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
-        my_start, _ = self._owned_local_layer_range()
-        self.layer_shard_start = self.start_layer + my_start
-
-    # ---- layer ownership helpers ------------------------------------------
-
-    def _local_layer_idx(self, layer_id: int) -> int:
-        return layer_id - self.start_layer
-
-    def _owned_local_layer_range(self) -> tuple[int, int]:
-        return get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
-        )
-
-    def _is_layer_owned(self, layer_id: int) -> bool:
-        local_idx = self._local_layer_idx(layer_id)
-        owned_start, owned_end = self._owned_local_layer_range()
-        return owned_start <= local_idx < owned_end
-
-    def _get_layer_owner_rank(self, layer_id: int) -> int:
-        return get_layer_owner(
-            self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
-        )
-
-    def _log_layer_shard_plan(self) -> None:
-        partitions = []
-        for rank in range(self.layer_shard_size):
-            st, ed = get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
-            partitions.append(f"r{rank}:[{st},{ed})")
-        my_start, my_end = self._owned_local_layer_range()
-        logger.info(
-            "Layer shard plan (continuous): "
-            f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
-            f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
-            f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
-            f"partitions={'; '.join(partitions)}"
-        )
+        self.layer_shard_start, _ = self._owned_global_layer_range()
 
     # ---- broadcast plumbing -----------------------------------------------
 
@@ -197,10 +182,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                     device=self.device,
                 )
                 self.remote_kv_layer_id: Optional[int] = None
-                self.device_module = torch.get_device_module(self.device)
-                self.kv_broadcast_stream = self.device_module.Stream()
-                self.pending_remote_kv_layer_id: Optional[int] = None
-                self.pending_remote_kv_broadcast = False
+                self._broadcast_slots = BroadcastSlots(("kv",))
         self._init_layer_broadcast_comm()
 
     def _create_index_buffers(self):
@@ -288,7 +270,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
         # A write invalidates any cached remote copy for this layer.
-        if self.pending_remote_kv_layer_id == layer_id:
+        if self._broadcast_slots.pending("kv").layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
         if self.remote_kv_layer_id == layer_id:
             self.remote_kv_layer_id = None
@@ -312,7 +294,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     ):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
-        if self.pending_remote_kv_layer_id == layer_id:
+        if self._broadcast_slots.pending("kv").layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
         if remote_kv_updatable:
@@ -333,13 +315,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     def _finalize_pending_kv_broadcast(
         self, *, set_remote_layer_id: bool = True
     ) -> None:
-        if not self.pending_remote_kv_broadcast:
+        pending = self._broadcast_slots.pending("kv")
+        if not pending.active:
             return
-        self.device_module.current_stream().wait_stream(self.kv_broadcast_stream)
-        self.pending_remote_kv_broadcast = False
-        if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
-            self.remote_kv_layer_id = self.pending_remote_kv_layer_id
-        self.pending_remote_kv_layer_id = None
+        pending_layer_id = pending.layer_id
+        self._broadcast_slots.clear("kv")
+        if set_remote_layer_id and pending_layer_id is not None:
+            self.remote_kv_layer_id = pending_layer_id
 
     def prefetch_kv_buffer(
         self,
@@ -355,8 +337,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         """
         if self.remote_kv_layer_id == layer_id:
             return
-        if self.pending_remote_kv_broadcast:
-            if self.pending_remote_kv_layer_id == layer_id:
+        pending = self._broadcast_slots.pending("kv")
+        if pending.active:
+            if pending.layer_id == layer_id:
                 return
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
 
@@ -374,8 +357,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_broadcast_stream):
+        with self._broadcast_slots.launch("kv", layer_id, self.remote_kv_buffer.device):
             if layer_transfer_counter is not None and layer_transfer_idx is not None:
                 layer_transfer_counter.wait_until(layer_transfer_idx)
             self._broadcast_tensor_from_owner(
@@ -384,13 +366,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 src_tensor=src_tensor,
                 use_layer_broadcast_comm=True,
             )
-        self.pending_remote_kv_layer_id = layer_id
-        self.pending_remote_kv_broadcast = True
 
     def _get_broadcastable_kv_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.pending_remote_kv_broadcast:
+        pending = self._broadcast_slots.pending("kv")
+        if pending.active:
             self._finalize_pending_kv_broadcast(
-                set_remote_layer_id=self.pending_remote_kv_layer_id == layer_id
+                set_remote_layer_id=pending.layer_id == layer_id
             )
         if self.remote_kv_layer_id != layer_id:
             local_idx = self._local_layer_idx(layer_id)

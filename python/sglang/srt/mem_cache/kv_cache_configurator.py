@@ -39,6 +39,13 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    get_cp_cache_layer_shard_info,
+    should_use_cp_cache_layer_split_pool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -921,11 +928,15 @@ class KVCacheConfigurator:
                 max_num_reqs=max_running_requests,
             )
         else:
-            pool_cls = DeepSeekV4TokenToKVPool
+            layer_shard_rank, layer_shard_size = get_cp_cache_layer_shard_info(self)
+            if layer_shard_rank is not None:
+                pool_cls = CpCacheLayerSplitDeepSeekV4TokenToKVPool
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
             c4_state_pool_size = c4_state_pool_size
             c128_state_pool_size = c128_state_pool_size
 
-        token_to_kv_pool = pool_cls(
+        pool_kwargs = dict(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -955,6 +966,14 @@ class KVCacheConfigurator:
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
         )
+        if pool_cls is CpCacheLayerSplitDeepSeekV4TokenToKVPool:
+            token_to_kv_pool = pool_cls(
+                cp_rank=layer_shard_rank,
+                cp_size=layer_shard_size,
+                **pool_kwargs,
+            )
+        else:
+            token_to_kv_pool = pool_cls(**pool_kwargs)
         return token_to_kv_pool
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1094,12 +1113,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
-        ) = get_glm_dsa_cp_layer_shard_info(self)
+        ) = get_cp_cache_layer_shard_info(self)
         pool_kwargs = {}
         if self.server_args.enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
@@ -1614,6 +1631,17 @@ class KVCacheConfigurator:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        # Keep capacity identical across CP ranks so sharded pools and their
+        # preallocated staging buffers use a consistent capacity bound.
+        if should_use_cp_cache_layer_split_pool(self):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_cp_group.cpu_group,
             )
             token_capacity = tensor.item()
 
