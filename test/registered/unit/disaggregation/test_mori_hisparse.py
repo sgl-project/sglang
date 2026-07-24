@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
     MoriKVReceiver,
     TransferInfo,
+    _select_rank_local_ib_device,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -24,6 +25,27 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMoriHiSparseTransfer(unittest.TestCase):
+    def test_rank_local_rdma_device_selection(self):
+        devices = ",".join(f"ionic_{i}" for i in range(8))
+        self.assertEqual(
+            _select_rank_local_ib_device(
+                devices,
+                attn_dp_size=8,
+                attn_dp_rank=5,
+                attn_tp_rank=0,
+            ),
+            "ionic_5",
+        )
+        self.assertEqual(
+            _select_rank_local_ib_device(
+                devices,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_tp_rank=9,
+            ),
+            "ionic_1",
+        )
+
     def test_transfer_metadata_carries_host_indices(self):
         device_pages = np.array([7, 8], dtype=np.int32)
         host_rows = np.array([21, 22, 31], dtype=np.int32)

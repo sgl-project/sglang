@@ -533,6 +533,9 @@ class Envs:
     # so the same chunks can be individually cudaHostRegister'd on hugetlb
     # storage and registered with MoRI without subrange peer-memory mappings.
     SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES = EnvInt(256 * (1 << 20))
+    # Spread independent DP/TP scheduler processes over the configured RDMA
+    # device list instead of concentrating every host MR on the first HCA.
+    SGLANG_MORI_RANK_LOCAL_IB_DEVICE = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.
     SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
