@@ -572,6 +572,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr = MagicMock()
         mgr.waiting_timeout = 5
         mgr.check_status.return_value = status
+        mgr.check_transfer_done.return_value = False
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
@@ -617,6 +618,24 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.record_failure.assert_called_once()
         self.assertIn("timed out", mgr.record_failure.call_args[0][1])
         mgr.update_status.assert_called_once_with(11, KVPoll.Failed)
+
+    @patch("sglang.srt.disaggregation.nixl.conn.time.time")
+    def test_queued_completion_wins_over_waiting_timeout(self, mock_time):
+        # Past the deadline, but the completion is already queued/observed:
+        # draining before the timeout check must yield Success, not a false
+        # timeout, and must not send an abort.
+        mock_time.return_value = 20.0
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.check_transfer_done.return_value = True
+
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+        mgr.update_transfer_status.assert_called_once_with()
+        mgr.record_failure.assert_not_called()
+        mgr.update_status.assert_not_called()
+        self.assertNotIn(11, mgr.transfer_statuses)
 
     @patch("sglang.srt.disaggregation.nixl.conn.time.time")
     def test_transfer_done_returns_success_and_cleans_room_state(self, mock_time):
