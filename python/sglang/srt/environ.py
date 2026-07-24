@@ -210,6 +210,22 @@ class ToolStrictLevel(IntEnum):
     PARAMETER = 2
 
 
+class InvariantCheckLevel(IntEnum):
+    """Signal level for value/index validity checks (see invariants.py).
+
+    OFF: data layer only (sanitize/containment); no detection, no signal.
+    WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
+    STRICT: detect + crash on GUARD/FATAL violations (CI default).
+
+    The data layer is unconditional and independent of this level; only the
+    detection + signal layer is gated here.
+    """
+
+    OFF = 0
+    WARN = 1
+    STRICT = 2
+
+
 class Envs:
 
     # Raise on bare server_args field assignments after resolution; mutation
@@ -786,6 +802,12 @@ class Envs:
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
     SGLANG_ENABLE_ASYNC_ASSERT = EnvBool(False)
+    # Signal level for value/index validity checks (nan/inf/oob/...); see
+    # invariants.py. OFF (prod default) runs only the free data layer, WARN
+    # adds throttled logging, STRICT (CI default) crashes on violations.
+    # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
+    # every callsite migrates.
+    SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
