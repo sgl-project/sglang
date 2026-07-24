@@ -100,12 +100,37 @@ def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
                     "model %s does not support loading scaling factors.",
                     model.__class__,
                 )
+        elif _checkpoint_kv_cache_scales_loaded(model):
+            logger.info(
+                "Using FP8 KV cache with per-layer scaling factors "
+                "loaded from the model checkpoint."
+            )
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
                 "provided. Defaulting to scaling factors of 1.0. "
                 "This may lead to less accurate results!"
             )
+
+
+def _checkpoint_kv_cache_scales_loaded(model) -> bool:
+    """Whether any attention layer carries per-layer k/v scales loaded from the
+    checkpoint (set by BaseKVCacheMethod.process_weights_after_loading).
+
+    A checkpoint scale of exactly 1.0 is indistinguishable from the no-scales
+    fallback, so it is treated as not loaded: a spurious warning is preferred
+    over silently masking a real fallback.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    for module in model.modules():
+        if (
+            isinstance(module, RadixAttention)
+            and module.k_scale_float is not None
+            and (module.k_scale_float != 1.0 or module.v_scale_float != 1.0)
+        ):
+            return True
+    return False
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
