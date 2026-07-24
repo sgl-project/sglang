@@ -296,6 +296,29 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
+
+DECODE_STEP_MAX_US = 2_000_000
+
+
+def _accumulate_decode_moment(
+    totals: list[float],
+    batch_size: int,
+    step_us: int,
+    generated: int,
+) -> None:
+    if batch_size <= 0 or step_us <= 0:
+        return
+    b = float(batch_size)
+    t = float(step_us)
+    g = float(generated)
+    totals[0] += 1.0
+    totals[1] += b
+    totals[2] += t
+    totals[3] += b * b
+    totals[4] += b * t
+    totals[5] += g
+
+
 _is_npu = is_npu()
 _is_hip = is_hip()
 
@@ -1842,6 +1865,10 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
+        self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -1862,6 +1889,9 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
     def init_output_streamer(self) -> None:
@@ -3313,6 +3343,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3602,6 +3633,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._record_step_counters(batch, result)
+
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3611,6 +3644,33 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _record_step_counters(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        mode = batch.forward_mode
+        is_prefill = mode.is_extend_without_speculative()
+        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+            return
+        if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill:
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
+        else:
+            batch_size = len(batch.reqs)
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
