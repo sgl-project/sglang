@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import flatten_nested_list, is_hip, is_npu, print_warning_once
+from sglang.srt.utils import flatten_nested_list, is_cuda, is_hip, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -150,7 +150,13 @@ class TransportProxyTensor(torch.Tensor):
         }
         transport_mode = self._metadata.get("transport_mode", "default")
 
-        if transport_mode == "cuda_ipc" and self.is_cuda:
+        # `self.is_cuda` is torch.Tensor's own device-namespace check, which is True
+        # on both real CUDA and ROCm/HIP builds (PyTorch exposes HIP tensors under
+        # the "cuda" device type for API compatibility). `storage._share_cuda_()`
+        # below does real CUDA IPC handle creation, which isn't valid on ROCm — gate
+        # on `is_cuda()` too, which checks `torch.version.cuda is not None` and is
+        # only true on an actual CUDA build.
+        if transport_mode == "cuda_ipc" and self.is_cuda and is_cuda():
             try:
                 storage = self.untyped_storage()
                 handle = storage._share_cuda_()
