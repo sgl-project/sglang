@@ -863,6 +863,10 @@ class ChatCompletionRequest(BaseModel):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        # An explicit null parallel_tool_calls means "use the default" (True),
+        # not False; omitted values should keep the model field default.
+        if "parallel_tool_calls" in values and values["parallel_tool_calls"] is None:
+            values["parallel_tool_calls"] = True
         return values
 
     @field_validator("reasoning_effort", mode="before")
