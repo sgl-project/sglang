@@ -48,12 +48,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def get_draft_kv_pool(
     *,
-    draft_worker: BaseTpWorker,
+    draft_worker: BaseSpecWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
@@ -70,27 +71,13 @@ def get_draft_kv_pool(
     return draft_runner.token_to_kv_pool
 
 
-def maybe_register_hicache_draft(
+def _register_legacy_hicache_draft(
     *,
     tree_cache: BasePrefixCache,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
+    draft_kv_pool,
     server_args: ServerArgs,
-    enable_hierarchical_cache: bool,
     page_size: int,
 ) -> None:
-    """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
-    if not enable_hierarchical_cache:
-        return
-
-    draft_kv_pool = get_draft_kv_pool(
-        draft_worker=draft_worker,
-        spec_algorithm=spec_algorithm,
-        server_args=server_args,
-    )
-    if draft_kv_pool is None:
-        return
-
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MHATokenToKVPool,
@@ -125,6 +112,54 @@ def maybe_register_hicache_draft(
         return
 
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+
+def maybe_register_hicache_draft(
+    *,
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseSpecWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    enable_hierarchical_cache: bool,
+    page_size: int,
+) -> None:
+    """Register draft KV pools for piggyback HiCache L2/L3 operations."""
+    if not enable_hierarchical_cache:
+        return
+
+    draft_kv_pool = get_draft_kv_pool(
+        draft_worker=draft_worker,
+        spec_algorithm=spec_algorithm,
+        server_args=server_args,
+    )
+    if draft_kv_pool is None:
+        return
+
+    if tree_cache.supports_dynamic_hicache_sidecars():
+        # UnifiedRadixCache and HiRadixCache backed by HybridCacheController
+        # describe every draft pool as a sidecar. The tree supplies transfer
+        # descriptors, while the controller owns the physical host pools.
+        draft_pool_specs, draft_pool_entries = draft_worker.build_hicache_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=tree_cache,
+            server_args=server_args,
+        )
+        if not draft_pool_specs and not draft_pool_entries:
+            return
+        tree_cache.register_hicache_draft_pools(draft_pool_specs, draft_pool_entries)
+        logger.info(
+            "HiCache draft pools registered: %s",
+            [str(spec.pool_name) for spec in draft_pool_specs],
+        )
+    else:
+        # A regular HiRadixCache uses the legacy HiCacheController, which only
+        # supports one full draft KV pool through its has_draft fallback.
+        _register_legacy_hicache_draft(
+            tree_cache=tree_cache,
+            draft_kv_pool=draft_kv_pool,
+            server_args=server_args,
+            page_size=page_size,
+        )
 
 
 def build_kv_cache(

@@ -232,6 +232,15 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if not hasattr(self.mem_pool_host, "add_entry"):
+            raise TypeError("Dynamic HiCache pool registration requires HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
     @staticmethod
     def parse_storage_backend_extra_config(
         storage_backend_extra_config: Optional[str],
@@ -423,6 +432,8 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
+            # Unified sidecars are carried by pool_transfers above. This is the
+            # existing single-draft fallback for non-Unified caches.
             if self.has_draft and host_indices.numel() > 0:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,

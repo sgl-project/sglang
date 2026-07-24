@@ -1088,6 +1088,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self._draft_worker.draft_runner.attn_backend,
         )
 
+    def hicache_draft_pool_builders(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
+        # Draft full KV/DSA reuses target KV slots; draft SWA reuses target SWA slots.
+        # This lets each target cache transfer restore its corresponding draft state.
+        return (
+            build_full_draft_pools,
+            build_swa_draft_pools,
+        )
+
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
