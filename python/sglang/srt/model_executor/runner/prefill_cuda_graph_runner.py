@@ -675,15 +675,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    def _has_unsupported_mha_prefix(self, forward_batch: ForwardBatch) -> bool:
-        return (
-            self.prefill_backend_name == Backend.BREAKABLE
-            and self.has_mha_companion_layers
-            and not self.dsa_sparse_prefill_forced
-            and forward_batch.extend_prefix_lens_cpu is not None
-            and any(forward_batch.extend_prefix_lens_cpu)
-        )
-
     @staticmethod
     def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
         """Restore Python state omitted from breakable graph segments."""
@@ -691,49 +682,95 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
-    def schedule_batch_replay_eligible(self, batch) -> bool:
-        """Rank-local replay eligibility, evaluated on the ScheduleBatch
-        BEFORE the dp mlp-sync so it joins the min()-reduced
-        can_run_breakable_cuda_graph consensus. Under DP attention every
-        rank must reach the same replay-vs-eager decision: a lone eager
-        rank re-derives its own attention path (e.g. MHA on DSA models)
-        and its collectives mismatch the replaying ranks' captured ones,
-        deadlocking the batch. Mirrors the rank-local checks of
-        can_run_graph -- keep the two in sync.
+    def _replay_ineligible_locally(
+        self,
+        *,
+        batch_size: int,
+        num_tokens: Optional[int],
+        input_embeds,
+        replace_embeds,
+        prefix_lens,
+        is_target_verify: bool,
+        capture_hidden_mode,
+        return_logprob: bool,
+    ) -> bool:
+        """Single source of truth for the rank-local prefill replay
+        eligibility conditions. Two adapters call it: ``can_run_graph``
+        (ForwardBatch fields, at forward time) and
+        ``schedule_batch_replay_eligible`` (ScheduleBatch fields, before
+        the dp mlp-sync, so the verdict joins the min()-reduced
+        can_run_dp_breakable_cuda_graph consensus). Under DP attention
+        every rank must reach the same replay-vs-eager decision: a lone
+        eager rank re-derives its own attention path (e.g. MHA on DSA
+        models) and its collectives mismatch the replaying ranks'
+        captured ones, deadlocking the batch.
+
+        Pass ``capture_hidden_mode=None`` when the value is not known at
+        the call site; it is rank-uniform (derived from the spec-decoding
+        configuration), so checking it at forward time only cannot split
+        the dp group.
         """
-        if batch.input_embeds is not None:
-            return False
+        if self._is_full_backend and batch_size > self._capture_req_slots:
+            return True
+        if input_embeds is not None:
+            return True
+        if replace_embeds is not None:
+            return True
+        # A prefix forces the MHA companion path, whose captured state is
+        # frozen prefix-free; DSA models are exempt (capture/replay force
+        # the sparse path, which takes any prefix via device metadata).
         if (
             self.prefill_backend_name == Backend.BREAKABLE
             and self.has_mha_companion_layers
             and not self.dsa_sparse_prefill_forced
-            and batch.prefix_lens is not None
-            and any(batch.prefix_lens)
+            and prefix_lens is not None
+            and any(prefix_lens)
         ):
-            return False
-        num_tokens = batch.extend_num_tokens
-        if num_tokens is None:
             return True
-        if num_tokens > self.max_num_tokens:
+        # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
+        if is_target_verify:
+            return True
+        if (
+            capture_hidden_mode is not None
+            and capture_hidden_mode != self.capture_hidden_mode
+        ):
+            return True
+        if return_logprob and not self._uses_eager_prefill_tail():
+            return True
+        if num_tokens is None:
             return False
+        if num_tokens > self.max_num_tokens:
+            return True
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
-        return True
+            return True
+        return False
+
+    def schedule_batch_replay_eligible(self, batch) -> bool:
+        """ScheduleBatch adapter for ``_replay_ineligible_locally`` (dp
+        mlp-sync vote)."""
+        return not self._replay_ineligible_locally(
+            batch_size=batch.batch_size(),
+            num_tokens=batch.extend_num_tokens,
+            input_embeds=batch.input_embeds,
+            replace_embeds=None,
+            prefix_lens=batch.prefix_lens,
+            is_target_verify=batch.forward_mode.is_target_verify(),
+            capture_hidden_mode=None,
+            return_logprob=batch.return_logprob,
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
-            return False
-        if forward_batch.input_embeds is not None:
-            return False
-        if forward_batch.replace_embeds is not None:
-            return False
-        if self._has_unsupported_mha_prefix(forward_batch):
-            return False
-        # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
-        if forward_batch.forward_mode.is_target_verify():
-            return False
-        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+        if self._replay_ineligible_locally(
+            batch_size=forward_batch.batch_size,
+            num_tokens=len(forward_batch.input_ids),
+            input_embeds=forward_batch.input_embeds,
+            replace_embeds=forward_batch.replace_embeds,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            capture_hidden_mode=forward_batch.capture_hidden_mode,
+            return_logprob=forward_batch.return_logprob,
+        ):
             return False
         # BCG-with-captured-metadata under DP attention: every rank must
         # have local tokens, and the batch must declare itself replayable.
@@ -745,14 +782,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
-            return False
-        num_tokens = len(forward_batch.input_ids)
-        if forward_batch.return_logprob and not self._uses_eager_prefill_tail():
-            return False
-        if num_tokens > self.max_num_tokens:
-            return False
-        padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
         # No exact-shape check here: load_batch bucket-pads to the nearest
         # captured shape. The factor above only rejects replays whose padded
