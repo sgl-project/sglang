@@ -1562,6 +1562,19 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class PullWeightsReqInput(BaseReq, kw_only=True):
+    """Request to materialize a published weight version."""
+
+    local_checkpoint_dir: str
+    source_dir: str
+    target_version: int
+
+
+class PullWeightsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]

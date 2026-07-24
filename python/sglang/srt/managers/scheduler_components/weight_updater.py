@@ -28,6 +28,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PullWeightsReqInput,
+    PullWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -84,6 +86,7 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    _pull_weights_base_dir: Optional[str] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -121,6 +124,40 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def pull_weights(self, recv_req: PullWeightsReqInput):
+        """Materialize a published weight version on every host."""
+        from sglang.srt.weight_sync import local_checkpoint
+
+        server_args = self.tp_worker.model_runner.server_args
+        if self._pull_weights_base_dir is None:
+            self._pull_weights_base_dir = server_args.model_path
+        try:
+            local_checkpoint.pull(
+                local_checkpoint_dir=recv_req.local_checkpoint_dir,
+                base_dir=self._pull_weights_base_dir,
+                source_dir=recv_req.source_dir,
+                target_version=recv_req.target_version,
+                pre_read_hook=server_args.custom_pull_weights_pre_read_hook,
+            )
+            success, message = True, "Success."
+        except Exception:
+            success, message = False, traceback.format_exc()
+            logger.error(message)
+
+        world_size = (
+            torch.distributed.get_world_size(group=self.tp_cpu_group)
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        if world_size > 1:
+            results = [None] * world_size
+            torch.distributed.all_gather_object(
+                results, (success, message), group=self.tp_cpu_group
+            )
+            success = all(ok for ok, _ in results)
+            message = "; ".join(msg for ok, msg in results if not ok) or message
+        return PullWeightsReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
