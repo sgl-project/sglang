@@ -27,7 +27,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -196,11 +200,16 @@ class GlmImageVisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         # x shape: (S, B, H) where B=1
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
-        attn = self.attn(hidden_states, cu_seqlens=cu_seqlens)
+        attn = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            forward_metadata=forward_metadata,
+        )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
 
@@ -294,6 +303,9 @@ class GlmImageVisionModel(nn.Module):
             cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         else:
             cu_seqlens = cu_seqlens.to("cpu")
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
 
@@ -309,7 +321,11 @@ class GlmImageVisionModel(nn.Module):
         hidden_states = hidden_states.unsqueeze(1)
 
         for blk in self.blocks:
-            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens)
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
+            )
 
         # (S, 1, H) -> (S, H)
         return hidden_states.squeeze(1)

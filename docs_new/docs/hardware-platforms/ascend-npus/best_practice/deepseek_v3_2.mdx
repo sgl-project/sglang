@@ -14,14 +14,14 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-26ms) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 26ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs8) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
+| DeepSeek-V3.2 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 107ms | W8A8 INT8 | [Optimal Configuration](#deepseek-v3-2-w8a8-1p1d-32p-in128k-out1k-bs16) |
 
 ## Optimal Configuration
 
@@ -39,7 +39,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 26ms
 
@@ -148,7 +148,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -238,7 +237,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 107ms
 
@@ -347,7 +346,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 
@@ -437,7 +435,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
 **TPOT**: 26ms
 
@@ -546,7 +544,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=0
 

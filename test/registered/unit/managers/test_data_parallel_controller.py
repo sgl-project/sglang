@@ -5,8 +5,8 @@ test/registered/disaggregation/test_disaggregation_dp_attention.py; its
 tie-break on `total_requests` transitively covers that state.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via
-`__new__` and inject only the attrs the schedulers read (`workers`,
-`status`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
+`__new__` and inject only the attrs the schedulers read (`workers`, `status`,
+`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
 if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
 is exercised as the real method, no mock.
 """
@@ -48,6 +48,7 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl = DataParallelController.__new__(DataParallelController)
     ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(dp_size)]
     ctl.status = [True] * dp_size
+    ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
     return ctl

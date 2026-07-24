@@ -38,7 +38,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.swa_out_cache_loc = None
 
         self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
+            model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
         )
 
         # [NB]: `layer_id` set to 0 for qwen3-next models, as not all attn layers require kv pool
@@ -212,6 +212,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -255,6 +258,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
