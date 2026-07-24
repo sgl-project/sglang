@@ -369,6 +369,8 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
+        if indices is None:
+            return
         if indices.shape[0] == 0:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via

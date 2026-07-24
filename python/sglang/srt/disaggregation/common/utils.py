@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -25,9 +25,125 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    kv_sent: bool = False
+    pd_hidden_packet_idx: int = 0
+    pd_hidden_sent: bool = False
+    pd_hidden_ready_sent: bool = False
+    pd_hidden_ack_ready: bool = False
+    pd_hidden_ack_expected_count: int = 0
+    pd_hidden_ack_timed_out: bool = False
+    pd_hidden_start: Optional[int] = None
+    pd_hidden_row_len: int = 0
+    pd_hidden_is_last_chunk: bool = False
+    pd_hidden_release_indices: Optional[List[int]] = None
+    enqueue_time: float = 0.0
+    source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
+
+
+@dataclasses.dataclass
+class PDHiddenChunk:
+    """Transport-neutral PD hidden chunk descriptor."""
+
+    room: int
+    prefill_rank: int
+    hidden_start: int
+    row_len: int
+    is_last_hidden_chunk: bool
+    dst_indices: List[int]
+    ack_host: Optional[str] = None
+    ack_port: Optional[int] = None
+
+
+@dataclasses.dataclass
+class PDHiddenRequestState:
+    """Decode-side request state for hidden transfer, separate from KV status."""
+
+    enabled: bool = False
+    streaming: bool = False
+    start: int = 0
+    next_start: int = 0
+    end: int = 0
+    hidden_done: bool = True
+    kv_done: bool = False
+
+    @classmethod
+    def disabled(cls) -> "PDHiddenRequestState":
+        return cls()
+
+    @classmethod
+    def full(cls, start: int, end: int) -> "PDHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=False,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=True,
+        )
+
+    @classmethod
+    def streaming_state(cls, start: int, end: int) -> "PDHiddenRequestState":
+        return cls(
+            enabled=True,
+            streaming=True,
+            start=int(start),
+            next_start=int(start),
+            end=int(end),
+            hidden_done=False,
+        )
+
+    def reset(self) -> None:
+        self.enabled = False
+        self.streaming = False
+        self.start = 0
+        self.next_start = 0
+        self.end = 0
+        self.hidden_done = True
+        self.kv_done = False
+
+    def mark_kv_done(self) -> None:
+        self.kv_done = True
+
+    def mark_hidden_done(self) -> None:
+        self.hidden_done = True
+
+    def hidden_request_done(self) -> bool:
+        return self.hidden_done
+
+    def kv_request_done(self) -> bool:
+        return self.kv_done
+
+    def request_done(self) -> bool:
+        return self.kv_request_done() and self.hidden_request_done()
+
+    def accept_chunk(
+        self, chunk: PDHiddenChunk, *, defer_hidden_done: bool = False
+    ) -> str:
+        """Return accepted/future/stale for a streaming hidden chunk."""
+        hidden_start = int(chunk.hidden_start)
+        if hidden_start > self.next_start:
+            return "future"
+        if hidden_start < self.next_start:
+            return "stale"
+        next_start = hidden_start + int(chunk.row_len)
+        if next_start > self.end:
+            raise RuntimeError(
+                "PD streaming hidden chunk exceeds request range: "
+                f"next_start={next_start}, expected_end={self.end}"
+            )
+        if chunk.is_last_hidden_chunk:
+            if next_start != self.end:
+                raise RuntimeError(
+                    "PD streaming hidden ended at an unexpected offset: "
+                    f"next_start={next_start}, expected_end={self.end}"
+                )
+            if not defer_hidden_done:
+                self.mark_hidden_done()
+        self.next_start = next_start
+        return "accepted"
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

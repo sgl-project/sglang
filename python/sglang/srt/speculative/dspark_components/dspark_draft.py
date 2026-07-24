@@ -142,8 +142,19 @@ def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
+    prefill_tail_hidden_states: torch.Tensor | None = None,
+    prefill_tail_valid_mask: torch.Tensor | None = None,
+    prefill_tail_start_positions: torch.Tensor | None = None,
+    prefill_tail_hidden_projected: bool = True,
 ) -> DFlashDraftInputV2:
-    return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
+    return make_draft_input_v2(
+        bonus_tokens=bonus_tokens,
+        new_seq_lens=new_seq_lens,
+        prefill_tail_hidden_states=prefill_tail_hidden_states,
+        prefill_tail_valid_mask=prefill_tail_valid_mask,
+        prefill_tail_start_positions=prefill_tail_start_positions,
+        prefill_tail_hidden_projected=prefill_tail_hidden_projected,
+    )
 
 
 def resolve_greedy_mask(
@@ -423,6 +434,7 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(

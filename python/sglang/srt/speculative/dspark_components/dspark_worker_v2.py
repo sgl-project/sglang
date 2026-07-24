@@ -452,6 +452,29 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
         )
 
+    def inject_pd_hidden_chunk(
+        self,
+        req,
+        hidden: torch.Tensor,
+        hidden_start: int,
+    ) -> Optional[torch.cuda.Event]:
+        if hidden is None or hidden.numel() == 0:
+            return None
+        row_len = int(hidden.shape[0])
+        pos = torch.arange(
+            int(hidden_start),
+            int(hidden_start) + row_len,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        req_pool_idx = int(req.req_pool_idx)
+        cache_loc = self.model_runner.req_to_token_pool.req_to_token[req_pool_idx, pos]
+        return self._kv_injector.inject_target_hidden(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=pos,
+        )
+
     def _decode_idle_result(
         self,
         *,

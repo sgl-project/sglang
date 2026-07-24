@@ -1,0 +1,169 @@
+import unittest
+
+import torch
+
+from sglang.srt.disaggregation.common.utils import (
+    PDHiddenChunk,
+    PDHiddenRequestState,
+)
+from sglang.srt.disaggregation.utils import PDHiddenRowPool
+
+
+def _chunk(start: int, rows: int, is_last: bool = False) -> PDHiddenChunk:
+    return PDHiddenChunk(
+        room=1,
+        prefill_rank=0,
+        hidden_start=start,
+        row_len=rows,
+        is_last_hidden_chunk=is_last,
+        dst_indices=list(range(rows)),
+    )
+
+
+class TestPDHiddenRequestState(unittest.TestCase):
+    def test_disabled_state_is_done_for_hidden_but_not_kv(self):
+        state = PDHiddenRequestState.disabled()
+
+        self.assertFalse(state.enabled)
+        self.assertFalse(state.streaming)
+        self.assertTrue(state.hidden_request_done())
+        self.assertFalse(state.kv_request_done())
+        self.assertFalse(state.request_done())
+
+        state.mark_kv_done()
+        self.assertTrue(state.request_done())
+
+    def test_full_state_waits_only_for_kv_done(self):
+        state = PDHiddenRequestState.full(2, 6)
+
+        self.assertTrue(state.enabled)
+        self.assertFalse(state.streaming)
+        self.assertEqual(state.start, 2)
+        self.assertEqual(state.next_start, 2)
+        self.assertEqual(state.end, 6)
+        self.assertTrue(state.hidden_request_done())
+        self.assertFalse(state.request_done())
+
+        state.mark_kv_done()
+        self.assertTrue(state.request_done())
+
+    def test_streaming_hidden_done_is_separate_from_request_done(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+
+        self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
+        self.assertFalse(state.hidden_request_done())
+        self.assertFalse(state.request_done())
+
+        self.assertEqual(state.accept_chunk(_chunk(4, 4, is_last=True)), "accepted")
+        self.assertTrue(state.hidden_request_done())
+        self.assertFalse(state.request_done())
+
+        state.mark_kv_done()
+        self.assertTrue(state.kv_request_done())
+        self.assertTrue(state.request_done())
+
+    def test_streaming_hidden_completion_can_wait_for_ack(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+
+        self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
+        self.assertEqual(
+            state.accept_chunk(_chunk(4, 4, is_last=True), defer_hidden_done=True),
+            "accepted",
+        )
+        self.assertEqual(state.next_start, 8)
+        self.assertFalse(state.hidden_request_done())
+
+        state.mark_hidden_done()
+        self.assertTrue(state.hidden_request_done())
+
+    def test_streaming_hidden_rejects_future_and_stale_chunks(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+
+        self.assertEqual(state.accept_chunk(_chunk(4, 4)), "future")
+        self.assertEqual(state.accept_chunk(_chunk(0, 4)), "accepted")
+        self.assertEqual(state.accept_chunk(_chunk(0, 4)), "stale")
+
+    def test_streaming_hidden_last_chunk_must_end_at_expected_offset(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected offset"):
+            state.accept_chunk(_chunk(0, 4, is_last=True))
+
+    def test_streaming_hidden_chunk_cannot_exceed_expected_range(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+
+        with self.assertRaisesRegex(RuntimeError, "exceeds request range"):
+            state.accept_chunk(_chunk(0, 9))
+
+    def test_streaming_hidden_reset_returns_to_disabled_state(self):
+        state = PDHiddenRequestState.streaming_state(0, 8)
+        self.assertEqual(state.accept_chunk(_chunk(0, 8, is_last=True)), "accepted")
+        state.mark_kv_done()
+        self.assertTrue(state.request_done())
+
+        state.reset()
+
+        self.assertFalse(state.enabled)
+        self.assertFalse(state.streaming)
+        self.assertEqual(state.start, 0)
+        self.assertEqual(state.next_start, 0)
+        self.assertEqual(state.end, 0)
+        self.assertTrue(state.hidden_request_done())
+        self.assertFalse(state.kv_request_done())
+        self.assertFalse(state.request_done())
+
+    def test_hidden_chunk_descriptor_keeps_ack_endpoint_metadata(self):
+        chunk = PDHiddenChunk(
+            room=3,
+            prefill_rank=7,
+            hidden_start=16,
+            row_len=2,
+            is_last_hidden_chunk=True,
+            dst_indices=[4, 5],
+            ack_host="127.0.0.1",
+            ack_port=12345,
+        )
+
+        self.assertEqual(chunk.room, 3)
+        self.assertEqual(chunk.prefill_rank, 7)
+        self.assertEqual(chunk.hidden_start, 16)
+        self.assertEqual(chunk.row_len, 2)
+        self.assertTrue(chunk.is_last_hidden_chunk)
+        self.assertEqual(chunk.dst_indices, [4, 5])
+        self.assertEqual(chunk.ack_host, "127.0.0.1")
+        self.assertEqual(chunk.ack_port, 12345)
+
+
+class TestPDHiddenRowPool(unittest.TestCase):
+    def test_alloc_prefers_contiguous_rows_and_merges_frees(self):
+        pool = PDHiddenRowPool(8, 1, torch.float32)
+
+        self.assertEqual(pool.alloc(3), [0, 1, 2])
+        self.assertEqual(pool.alloc(2), [3, 4])
+        pool.free([1, 2, 3])
+
+        self.assertEqual(pool.alloc(3), [1, 2, 3])
+        self.assertEqual(pool.available_size(), 3)
+
+    def test_alloc_falls_back_to_fragmented_rows_without_global_sorting(self):
+        pool = PDHiddenRowPool(8, 1, torch.float32)
+
+        self.assertEqual(pool.alloc(8), list(range(8)))
+        pool.free([0, 1, 4, 5, 7])
+
+        self.assertEqual(pool.alloc(3), [0, 1, 4])
+        self.assertEqual(pool.available_size(), 2)
+
+    def test_free_ignores_duplicate_and_already_free_rows(self):
+        pool = PDHiddenRowPool(4, 1, torch.float32)
+
+        allocated = pool.alloc(2)
+        self.assertEqual(allocated, [0, 1])
+        pool.free([0, 0, 1, 3])
+
+        self.assertEqual(pool.available_size(), 4)
+        self.assertEqual(pool.alloc(4), [0, 1, 2, 3])
+
+
+if __name__ == "__main__":
+    unittest.main()
