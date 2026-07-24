@@ -149,8 +149,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
-        self._next_batch_wait_s = self._batching_delay_s
-        self._last_batch_wait_s = self._batching_delay_s
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
@@ -304,9 +302,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         error_msg=output_batch.error,
                     )
 
-                if self.gpu_id != 0:
-                    return [OutputBatch() for _ in reqs]
-
                 split_outputs = self._split_batched_output(output_batch, reqs)
                 if split_outputs is None:
                     logger.error(
@@ -318,10 +313,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     )
 
                 logger.info(
-                    "Processed dynamic batch of %d/%d request(s) with wait_limit=%.2fms",
+                    "Processed dynamic batch of %d/%d request(s) with max_delay=%.2fms",
                     batch_size,
                     self._batching_max_size,
-                    self._last_batch_wait_s * 1000.0,
+                    self._batching_delay_s * 1000.0,
                 )
                 return split_outputs
             except Exception as e:
@@ -349,9 +344,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     error_msg=output_batch.error,
                 )
 
-            if self.gpu_id != 0:
-                return [OutputBatch() for _ in reqs]
-
             split_outputs = self._split_batched_output(output_batch, reqs)
             if split_outputs is None:
                 logger.error(
@@ -363,10 +355,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
 
             logger.info(
-                "Processed native grouped batch of %d/%d request(s) with wait_limit=%.2fms",
+                "Processed native grouped batch of %d/%d request(s) with max_delay=%.2fms",
                 batch_size,
                 self._batching_max_size,
-                self._last_batch_wait_s * 1000.0,
+                self._batching_delay_s * 1000.0,
             )
             return split_outputs
         except Exception as e:
@@ -914,20 +906,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         oldest_wait_s = time.monotonic() - enqueue_time
 
-        effective_max_batch_size = self._batch_admission.max_admissible_batch_size(
-            compatible_reqs[0]
-        )
-        batch_wait_s = self._batching_delay_s
         should_wait_for_more = (
-            batch_len < effective_max_batch_size
+            batch_len < self._batching_max_size
             and not self._batch_admission.batch_is_full(compatible_reqs)
-            and oldest_wait_s < batch_wait_s
+            and oldest_wait_s < self._batching_delay_s
         )
         if should_wait_for_more:
-            self._next_batch_wait_s = batch_wait_s
             return None
-
-        self._last_batch_wait_s = batch_wait_s
 
         batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
         for pos, idx in enumerate(reversed(compatible_indices)):
@@ -940,7 +925,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 stop_reason = "max_size"
             elif reject_reasons:
                 stop_reason = reject_reasons[0]
-            elif oldest_wait_s >= batch_wait_s:
+            elif oldest_wait_s >= self._batching_delay_s:
                 stop_reason = "delay"
             else:
                 stop_reason = "ready"
@@ -1085,9 +1070,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
-                    remaining_ms = max(
-                        0, self._next_batch_wait_s * 1000.0 - elapsed_ms
-                    )
+                    remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
                     if remaining_ms > 0 and self.receiver is not None:
                         self._poller.poll(timeout=remaining_ms)
                     elif remaining_ms > 0:

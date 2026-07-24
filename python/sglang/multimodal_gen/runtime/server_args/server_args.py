@@ -1747,7 +1747,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--batching-delay-ms",
             type=float,
             default=ServerArgs.batching_delay_ms,
-            help="Time (in ms) to wait for a larger batch.",
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
         )
         parser.add_argument(
             "--batching-config",
