@@ -5,8 +5,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import argparse
+from collections import defaultdict
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -19,14 +19,6 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
-
-
-class _RecordingAllocator:
-    def __init__(self):
-        self.freed = []
-
-    def free(self, value):
-        self.freed.extend(value.tolist())
 
 
 class _FakeTreeCore:
@@ -62,13 +54,6 @@ class _FakeTreeCore:
 
 class _FakeUnifiedCache:
     tree_components = _FakeTreeCore.tree_components
-
-    def __init__(self):
-        self.req_to_token_pool = SimpleNamespace(mamba_allocator=_RecordingAllocator())
-
-    def _drain_frees(self, device_frees, host_frees):
-        for value in device_frees.get(ComponentType.MAMBA, []):
-            self.req_to_token_pool.mamba_allocator.free(value)
 
 
 def _build_unified_chain(cap, length=3):
@@ -125,14 +110,16 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, core, cache = _build_unified_chain(cap=2)
 
-        component._evict_excess_path_states(nodes[-1])
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
 
         self.assertEqual(core.evicted, [nodes[0]])
         self.assertEqual(core.cascaded, [nodes[0]])
         self.assertIsNone(nodes[0].component_data[ComponentType.MAMBA].value)
         self.assertIsNotNone(nodes[-1].component_data[ComponentType.MAMBA].value)
         self.assertEqual(
-            cache.req_to_token_pool.mamba_allocator.freed,
+            [v.item() for v in device_frees[ComponentType.MAMBA]],
             [0],
         )
         self.assertEqual(core.component_evictable_size_[ComponentType.MAMBA], 2)
@@ -151,7 +138,9 @@ class TestMambaPathStateCap(unittest.TestCase):
         nodes[0].children["fork"] = fork_child
         nodes[1].component_data[ComponentType.MAMBA].lock_ref = 1
 
-        component._evict_excess_path_states(nodes[-1])
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
 
         self.assertEqual(core.evicted, [nodes[2]])
         self.assertIsNotNone(nodes[0].component_data[ComponentType.MAMBA].value)
@@ -164,7 +153,9 @@ class TestMambaPathStateCap(unittest.TestCase):
         mamba_data = nodes[0].component_data[ComponentType.MAMBA]
         mamba_data.host_value = torch.tensor([10])
 
-        component._evict_excess_path_states(nodes[-1])
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
 
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
@@ -173,8 +164,11 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, core, cache = _build_unified_chain(cap=-1)
 
-        component._evict_excess_path_states(nodes[-1])
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        component._evict_excess_path_states(nodes[-1], device_frees, host_frees)
 
+        self.assertEqual(dict(device_frees), {})
         self.assertEqual(core.evicted, [])
         self.assertTrue(
             all(

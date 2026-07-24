@@ -58,10 +58,21 @@ class FreeComponentHostSlot(ComponentAction):
 
 
 class BackupKV(NamedTuple):
-    """Back up node_ids device->host in order, stopping at the first failure; the caller
-    orders them parent-before-child for write-through and child-first for write-back."""
+    """Back up node_ids device->host in order, stopping at the first failure; write-through
+    ids form a contiguous root-first parent chain (each id's parent precedes it), write-back
+    actions carry a single eviction victim."""
 
     node_ids: list[NodeId]
+
+
+@dataclass(frozen=True)
+class MambaEvictExcessPathStates(ComponentAction):
+    """Deferred per-path Mamba state-cap eviction from the tail's root path;
+    ordered after the insert's BackupKVs so in-flight write-through locks
+    shield the pending backup chain."""
+
+    tail_node_id: NodeId
+    component_type: ComponentType = field(default=ComponentType.MAMBA, kw_only=True)
 
 
 @dataclass(frozen=True)

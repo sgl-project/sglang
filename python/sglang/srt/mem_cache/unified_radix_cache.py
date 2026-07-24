@@ -764,9 +764,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+        """Run a backup action top-down, stopping at the first failed backup; a
+        failure is a deterministic host-space shortfall, so no intra-drain retry."""
         written = 0
         for node_id in action.node_ids:
+            # Overlapping chain actions: skip already-backed nodes.
+            if self.tree_core.is_backuped(node_id):
+                continue
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(

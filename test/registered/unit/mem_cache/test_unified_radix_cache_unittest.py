@@ -4179,6 +4179,103 @@ class UnifiedRadixCacheSuite:
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.mamba_pool_idx), int(retry_slot[0]))
 
+    def test_write_through_backup_survives_mamba_path_cap(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.write_through_threshold = 2
+        cache.components[ComponentType.MAMBA].mamba_max_states_per_path = 1
+
+        # The first insert creates the ancestor with a mamba state (hit_count 1).
+        self._insert(cache, allocator, req_to_token_pool, [1, 2])
+        ancestor = next(iter(cache.root_node.children.values()))
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].value)
+
+        # The extending insert crosses the ancestor's write-through threshold in
+        # the same walk whose commit runs the path-cap eviction; the cap must
+        # leave the pending-backup node's device state for the deferred BackupKV.
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(ancestor.backuped)
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].host_value)
+
+    def test_write_through_backup_chain_survives_mamba_path_cap(self):
+        """A failed backup leaves an unbacked ancestor inside a later deferred
+        backup chain; the cap walk must spare the whole chain, not just its tip."""
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.write_through_threshold = 3
+        mamba_comp = cache.components[ComponentType.MAMBA]
+
+        self._insert(cache, allocator, req_to_token_pool, [1, 2])
+        ancestor = next(iter(cache.root_node.children.values()))
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        middle = next(iter(ancestor.children.values()))
+
+        # The ancestor crosses the threshold here; a host-exhaustion failure
+        # leaves it unbacked with hit_count past the bar and its state intact.
+        with mock.patch.object(cache, "_execute_kv_backup", return_value=None):
+            self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
+        self.assertFalse(ancestor.backuped)
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].value)
+
+        # The middle node crosses next, so the deferred chain is
+        # [ancestor, middle]; the extending insert adopts a new leaf state,
+        # firing the now-enabled cap walk before the chain executes — it must
+        # not evict either chain node's device state.
+        mamba_comp.mamba_max_states_per_path = 1
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6, 7, 8])
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(ancestor.backuped)
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].host_value)
+        self.assertTrue(middle.backuped)
+        self.assertIsNotNone(middle.component_data[ComponentType.MAMBA].host_value)
+
+    def test_backup_retry_after_mamba_cap_skips_tombstoned_state(self):
+        """A backup that fails before the cap and retries via the leaf action
+        rebuilds its spec post-cap: KV backs up, the tombstoned mamba arm stays gone."""
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.write_through_threshold = 1
+        mamba_comp = cache.components[ComponentType.MAMBA]
+
+        # A failed write-through leaves the ancestor unbacked with device state.
+        with mock.patch.object(cache, "_execute_kv_backup", return_value=None):
+            self._insert(cache, allocator, req_to_token_pool, [1, 2])
+        ancestor = next(iter(cache.root_node.children.values()))
+        self.assertFalse(ancestor.backuped)
+        self.assertIsNotNone(ancestor.component_data[ComponentType.MAMBA].value)
+
+        # The walk backup fails again, the cap tombstones the unlocked
+        # ancestor's mamba state, then the leaf-action retry succeeds.
+        mamba_comp.mamba_max_states_per_path = 1
+        real_backup = cache._execute_kv_backup
+        attempts = []
+
+        def fail_once(*args, **kwargs):
+            attempts.append(args)
+            if len(attempts) == 1:
+                return None
+            return real_backup(*args, **kwargs)
+
+        with mock.patch.object(cache, "_execute_kv_backup", side_effect=fail_once):
+            self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        leaf = next(iter(ancestor.children.values()))
+        cache.writing_check(write_back=True)
+
+        # Post-cap spec rebuild: no resurrection of the tombstoned mamba state.
+        self.assertTrue(ancestor.backuped)
+        ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
+        self.assertIsNone(ancestor_cd.value)
+        self.assertIsNone(ancestor_cd.host_value)
+        self.assertTrue(leaf.backuped)
+        self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
+        cache.sanity_check()
+
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""
         if not self.cfg.has_swa:
