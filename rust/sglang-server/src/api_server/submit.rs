@@ -12,7 +12,7 @@ use super::AppState;
 use crate::fsm::RequestState;
 use crate::ids::RidHash;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
-use crate::runtime::channels::TmEvent;
+use crate::tokenizer_manager::TmEvent;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
 /// receiver. Rid policy by kind: generate health probes get the Python server's

@@ -16,8 +16,8 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::runtime::ServerArgs;
-use crate::runtime::channels::Senders;
 use crate::tokenizer_manager::ActivityCounter;
+use crate::tokenizer_manager::Senders;
 
 /// Shared handler state: the submit machinery (`senders`, `egress_buf`)
 /// + shared tokenizer.

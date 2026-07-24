@@ -331,14 +331,6 @@ pub fn abort_req_msgpack(rid: &str) -> Result<Bytes, Error> {
     Ok(Bytes::from(buf))
 }
 
-/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
-/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
-#[derive(Debug)]
-pub struct IngressMsg {
-    pub header: Bytes,
-    pub ids: Bytes,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

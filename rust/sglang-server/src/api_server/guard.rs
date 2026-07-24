@@ -4,7 +4,7 @@
 //! `is_disconnected` abort).
 
 use crate::ids::RidHash;
-use crate::runtime::channels::{Senders, TmEvent};
+use crate::tokenizer_manager::{Senders, TmEvent};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
