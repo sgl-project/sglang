@@ -133,6 +133,11 @@ class SpeculativeAlgorithm(Enum):
         graphs in the decode cuda graph runner."""
         return self.is_dspark()
 
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        return self.is_eagle()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no

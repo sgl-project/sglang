@@ -429,6 +429,8 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         tl.store(p_Akkd11, b_Akk_d1.to(Akkd.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_Akkd22, b_Akk_d2.to(Akkd.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_Akkd33, b_Akk_d3.to(Akkd.dtype.element_ty), boundary_check=(0, 1))
+        # Forward substitution reloads these global tiles across warps below.
+        tl.debug_barrier()
 
         b_Ai00 = b_Akk_d0
         b_Ai11 = b_Akk_d1

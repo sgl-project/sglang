@@ -273,7 +273,9 @@ class SchedulerBatchResultProcessor:
 
                     if req.grammar is not None:
                         self._apply_prefill_grammar(
-                            req=req, next_token_id=next_token_id
+                            req=req,
+                            next_token_id=next_token_id,
+                            already_advanced=result.grammar_advanced,
                         )
 
                 else:
@@ -487,17 +489,24 @@ class SchedulerBatchResultProcessor:
         )
         return hidden_state_offset
 
-    def _apply_prefill_grammar(self, *, req: Req, next_token_id: int) -> None:
-        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-        try:
-            req.grammar.accept_token(next_token_id)
-        except ValueError as e:
-            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-            # This can happen if the grammar is not set correctly or the token is invalid.
-            logger.error(
-                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-            )
-            req.to_finish = FINISH_ABORT()
+    def _apply_prefill_grammar(
+        self, *, req: Req, next_token_id: int, already_advanced: bool = False
+    ) -> None:
+        # The grammar barrier may have already advanced the FSM over this prefilled
+        # token (spec overlap path); only advance if not, but always sync
+        # grammar.finished.
+        if not already_advanced:
+            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+            try:
+                req.grammar.accept_token(next_token_id)
+            except ValueError as e:
+                # Grammar accept_token can raise ValueError if the token is not in the
+                # grammar. This can happen if the grammar is not set correctly or the
+                # token is invalid.
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                )
+                req.to_finish = FINISH_ABORT()
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -565,6 +574,13 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )
 
+        # Advance the grammar FSM over this batch's committed tokens (idempotent):
+        # the EAGLE overlap path already did this inside verify() via the grammar
+        # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
+        # grammar (the queued batch.copy() does not carry has_grammar) and consumes
+        # result.grammar_retained_tokens below instead of re-advancing.
+        self.advance_grammar_fsm(result, batch)
+
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
         # delayed result is processed. Use the draft token count recorded on result.
@@ -580,11 +596,9 @@ class SchedulerBatchResultProcessor:
                 pass
             else:
                 if req.grammar is not None:
-                    # Stop accepting once the grammar terminates, so the
-                    # over-drafted suffix is never committed to KV nor emitted.
-                    # This advances the grammar FSM; the result loop only syncs
-                    # grammar.finished.
-                    accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
+                    # FSM already advanced + truncated by advance_grammar_fsm; reuse
+                    # the retained (grammar-legal) run instead of advancing again.
+                    accept_tokens = result.grammar_retained_tokens[i]
 
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
@@ -635,6 +649,64 @@ class SchedulerBatchResultProcessor:
             )
             req.to_finish = FINISH_ABORT()
         return retained
+
+    def advance_grammar_fsm(
+        self, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        """Advance each req's grammar FSM over the tokens THIS batch committed, and
+        (for decode) memoize the grammar-truncated run on ``result``.
+
+        This is the single place the spec-v2 FSM advances. It is idempotent
+        (``result.grammar_advanced``) so it runs either eagerly — inside ``verify(N)``
+        via the scheduler's grammar barrier, so the advance overlaps the target-verify
+        forward — or lazily from the result processors on the non-overlap / non-EAGLE
+        paths. It handles both decode (the accepted spec run) and extend (the single
+        prefilled token) results, so the barrier can resolve whatever the previous
+        batch was — e.g. the extend->decode boundary.
+        """
+        if result.grammar_advanced or not batch.has_grammar:
+            return
+        is_decode = batch.forward_mode.is_decode()
+        if not (is_decode or batch.forward_mode.is_extend()):
+            return
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+
+        if not is_decode:
+            # Extend: advance over the single token each completed-prefill req emitted
+            # (mirrors process_batch_result_prefill's per-req token indexing).
+            for i, req in enumerate(batch.reqs):
+                if (
+                    req.grammar is None
+                    or req.is_retracted
+                    or req.finished()
+                    or req.inflight_middle_chunks > 0
+                ):
+                    continue
+                self._accept_grammar_tokens(req, next_token_ids[i])
+            result.grammar_advanced = True
+            return
+
+        # Decode: only the spec-v2 path reaches here (the grammar barrier for
+        # spec-overlap workers and _resolve_spec_v2_tokens). Non-spec grammar decode
+        # advances its FSM in process_batch_result_decode and has no accept_lens, so
+        # bail out defensively.
+        if result.accept_lens is None:
+            return
+        accept_lens = result.accept_lens.tolist()
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        retained = [None] * len(batch.reqs)
+        for i, req in enumerate(batch.reqs):
+            if req.grammar is None or req.is_retracted or req.finished():
+                continue
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            # Stop accepting once the grammar terminates so the over-drafted suffix
+            # is never committed to KV nor emitted; this advances the FSM.
+            retained[i] = self._accept_grammar_tokens(req, accept_tokens)
+        result.grammar_retained_tokens = retained
+        result.grammar_advanced = True
 
     def process_batch_result_idle(
         self,
@@ -956,20 +1028,13 @@ class SchedulerBatchResultProcessor:
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
 
-        Returns (at_boundary, track_seqlen).  ``track_seqlen`` must equal the
-        seq_len the forward's tracking mask used, so the tracked state and its
-        recorded ``mamba_last_track_seqlen`` describe the same token position.
-        That seq_len is a pure function of the tokens the request has produced:
-        ``len(origin_input_ids) + len(output_ids) - 1`` (the just-decoded token
-        is already appended to ``output_ids`` before this runs).
-
-        ``kv_committed_len`` must NOT be used here: under the overlap scheduler,
-        ``prepare_for_decode`` for the *next* batch increments it before this
-        result is processed, so it leads seq_len by a jittering lookahead
-        (0 or 1 depending on prefill interleaving). Using it fires the boundary
-        one decode step early on most steps, mislabeling the tracked mamba
-        state; a later request that reuses/donates that tracked prefix then
-        extends from a state a cold prefill recompute would not produce.
+        Returns (at_boundary, track_seqlen).  The boundary condition
+        matches what the forward's tracking mask used:
+        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
+        ``kv_committed_len`` by 1, then checks
+        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
+        here reproduces that check exactly, and the value is always a
+        multiple of ``interval`` (hence page-aligned).
 
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
@@ -977,9 +1042,8 @@ class SchedulerBatchResultProcessor:
         interval = get_server_args().mamba_track_interval
 
         if batch.spec_algorithm.is_none():
-            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-            if seq_len % interval == 0:
-                return True, seq_len
+            if req.kv_committed_len % interval == 0:
+                return True, req.kv_committed_len
         elif result.num_correct_drafts_per_req_cpu is not None:
             cur = req.seqlen - 1
             prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1

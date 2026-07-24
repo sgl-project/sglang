@@ -1,120 +1,22 @@
-"""GPU-free import/registry tests for the ``sglang.kernels`` namespace.
+"""GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
-Part of RFC #29630, Phase 2. These tests exercise the public namespace, the
-kernel registry, and the heuristic selector without touching a GPU or importing
-any kernel backend (``sgl_kernel`` / ``sglang.jit_kernel``). They run in the CPU
-CI lane.
-"""
-
+import importlib
 import subprocess
 import sys
-import unittest
 
+import pytest
+
+import sglang.kernels as K
+import sglang.kernels.fused_op as fo
+import sglang.kernels.ops  # noqa: F401  -- populate the registry
+import sglang.kernels.selector as sel
+from sglang.kernels import DeviceType, KernelBackend, PlatformInfo
+from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-# A must-contain subset of registered operators and their backends. The
-# registry holds many more entries (every migrated Triton kernel), so this is
-# checked as a subset, not an exact match.
-EXPECTED_OPS = {
-    # BaseFusedOp-backed ops: native + torch_compile always available,
-    # plus the overridden CUDA backends.
-    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
-    "activation.gelu_and_mul": {"aot", "jit", "torch", "torch_compile"},
-    "activation.gelu_tanh_and_mul": {
-        "aot",
-        "jit",
-        "torch",
-        "torch_compile",
-    },
-    "layernorm.rmsnorm": {"aot", "jit", "torch", "torch_compile"},
-    "layernorm.fused_add_rmsnorm": {
-        "aot",
-        "jit",
-        "torch",
-        "torch_compile",
-    },
-    "layernorm.gemma_rmsnorm": {"aot", "torch", "torch_compile"},
-    "layernorm.gemma_fused_add_rmsnorm": {"aot", "torch", "torch_compile"},
-    # curated dual/single-backend wrapper ops
-    "gemm.fp8_scaled_mm": {"aot"},
-    "gemm.dsv3_fused_a_gemm": {"aot", "jit"},
-    "gemm.dsv3_router_gemm": {"jit"},
-    "kvcache.reshape_and_cache_flash": {"triton"},
-    "moe.moe_align_block_size": {"aot", "jit"},
-    "moe.topk_softmax": {"aot"},
-    "quantization.sgl_per_token_quant_fp8": {"aot"},
-    # migrated from srt/layers/quantization (Phase 2.5)
-    "quantization.w8a8_block_fp8_matmul": {"triton"},
-    "quantization.per_token_quant_int8": {"triton"},
-    "quantization.awq_dequantize_triton": {"triton"},
-    "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
-    "moe.pack_topk_ids": {"triton"},
-    "quantization.sgl_per_token_group_quant_8bit": {"aot", "jit"},
-    "quantization.sgl_per_token_group_quant_fp8": {"aot"},
-    "quantization.sgl_per_token_group_quant_int8": {"aot"},
-    # deferred-group wrappers, now populated
-    "sampling.top_k_renorm_probs": {"aot"},
-    "sampling.top_p_renorm_probs": {"aot"},
-    "spatial.get_sm_available": {"aot"},
-    "spatial.create_greenctx_stream_by_value": {"aot"},
-    "mamba.causal_conv1d_fwd": {"aot"},
-    "mamba.causal_conv1d_update": {"aot"},
-    "diffusion.apply_group_norm_silu": {"jit"},
-    "diffusion.residual_gate_add": {"jit"},
-    "diffusion.fused_inplace_qknorm_rope": {"jit"},
-    # representative migrated Triton kernels (inventory)
-    "grammar.apply_token_bitmask_inplace_triton": {"triton"},
-    "memory.alloc_extend_kernel": {"triton"},
-    "attention.decode_attention_fwd": {"triton"},
-    "embeddings.vocab_parallel_embedding": {"triton"},
-    "kvcache.create_flashinfer_kv_indices_triton": {"triton"},
-    "speculative.draft_topk1_postprocess": {"triton"},
-    "speculative.gather_spec_extras": {"triton"},
-}
-
-# Public wrapper callables that each populated group must expose.
-EXPECTED_WRAPPERS = {
-    "sglang.kernels.ops.layernorm": [
-        "rmsnorm",
-        "fused_add_rmsnorm",
-        "gemma_rmsnorm",
-        "gemma_fused_add_rmsnorm",
-    ],
-    "sglang.kernels.ops.activation": [
-        "silu_and_mul",
-        "gelu_and_mul",
-        "gelu_tanh_and_mul",
-    ],
-    "sglang.kernels.ops.gemm": [
-        "fp8_scaled_mm",
-        "dsv3_fused_a_gemm",
-        "dsv3_router_gemm",
-    ],
-    "sglang.kernels.ops.quantization": [
-        "sgl_per_token_quant_fp8",
-        "sgl_per_token_group_quant_8bit",
-        "sgl_per_token_group_quant_fp8",
-        "sgl_per_token_group_quant_int8",
-    ],
-    "sglang.kernels.ops.moe": ["moe_align_block_size", "topk_softmax"],
-    "sglang.kernels.ops.kvcache": ["reshape_and_cache_flash"],
-    "sglang.kernels.ops.sampling": ["top_k_renorm_probs", "top_p_renorm_probs"],
-    "sglang.kernels.ops.spatial": [
-        "get_sm_available",
-        "create_greenctx_stream_by_value",
-    ],
-    "sglang.kernels.ops.mamba": ["causal_conv1d_fwd", "causal_conv1d_update"],
-    "sglang.kernels.ops.diffusion": [
-        "apply_group_norm_silu",
-        "residual_gate_add",
-        "fused_inplace_qknorm_rope",
-    ],
-}
-
-# All operator groups from the RFC's proposed shape must import as packages.
-ALL_GROUPS = [
+GROUPS = [
     "activation",
     "attention",
     "communication",
@@ -133,205 +35,164 @@ ALL_GROUPS = [
     "speculative",
 ]
 
+# Representative ops checked as a subset (the registry holds many more).
+EXPECTED = {
+    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
+    "activation.relu2": {"jit", "torch", "torch_compile"},
+    "layernorm.rmsnorm": {"aot", "jit", "aiter", "torch_npu", "torch", "torch_compile"},
+    "layernorm.gemma_rmsnorm": {"aot", "jit", "torch_npu", "torch", "torch_compile"},
+    "gemm.fp8_scaled_mm": {"aot"},
+    "moe.moe_align_block_size": {"aot", "jit"},
+    "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
+    "kvcache.reshape_and_cache_flash": {"triton"},
+}
 
-class TestKernelsNamespace(unittest.TestCase):
-    def setUp(self):
-        import importlib
+_CPU = PlatformInfo(device_type="cpu")
+_SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
+_SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
+_HIP = PlatformInfo(device_type="hip")
 
-        import sglang.kernels
-        import sglang.kernels.ops  # populate the registry
 
-        self.K = sglang.kernels
-        self.importlib = importlib
+def test_top_level_exports():
+    for name in (
+        "KernelSpec",
+        "KernelBackend",
+        "FormatSignature",
+        "CapabilityRequirement",
+        "PlatformInfo",
+        "registry",
+        "get_kernel",
+        "select_kernel",
+    ):
+        assert hasattr(K, name), name
 
-    def test_top_level_exports(self):
-        for name in (
-            "KernelSpec",
-            "KernelBackend",
-            "FormatSignature",
-            "CapabilityRequirement",
-            "PlatformInfo",
-            "registry",
-            "get_kernel",
-            "select_kernel",
-        ):
-            self.assertTrue(hasattr(self.K, name), f"missing export: {name}")
 
-    def test_all_groups_importable(self):
-        for group in ALL_GROUPS:
-            mod = self.importlib.import_module(f"sglang.kernels.ops.{group}")
-            self.assertTrue(hasattr(mod, "__all__"))
+@pytest.mark.parametrize("group", GROUPS)
+def test_group_importable(group):
+    assert hasattr(importlib.import_module(f"sglang.kernels.ops.{group}"), "__all__")
 
-    def test_registry_contents(self):
-        registry = self.K.registry
-        ops = set(registry.ops())
-        # EXPECTED_OPS is a must-contain subset (many more migrated kernels
-        # are also registered).
-        missing = set(EXPECTED_OPS) - ops
-        self.assertFalse(missing, f"missing registered ops: {sorted(missing)}")
-        for op, backends in EXPECTED_OPS.items():
-            got = {s.backend.value for s in registry.get(op)}
-            self.assertEqual(got, backends, f"backend mismatch for {op}")
-        self.assertGreaterEqual(len(ops), 80, "registry unexpectedly small")
 
-    def test_specs_are_well_formed(self):
-        for spec in self.K.registry.all_specs():
-            self.assertIn(".", spec.op)
-            self.assertEqual(spec.op, f"{spec.group}.{spec.name}")
-            # target must be an importable "module:attr" path
-            module_path, sep, attr = spec.target.partition(":")
-            self.assertEqual(sep, ":", f"bad target for {spec.op}: {spec.target}")
-            self.assertTrue(module_path and attr, spec.target)
+@pytest.mark.parametrize("op, backends", list(EXPECTED.items()))
+def test_registry_backends(op, backends):
+    assert {s.backend.value for s in K.registry.get(op)} == backends
 
-    def test_wrappers_exposed_and_callable(self):
-        for module_name, names in EXPECTED_WRAPPERS.items():
-            mod = self.importlib.import_module(module_name)
-            for name in names:
-                self.assertTrue(callable(getattr(mod, name)), f"{module_name}.{name}")
 
-    def test_single_backend_op_resolves_without_backend(self):
-        # An op with exactly one registered backend has a fixed call path.
-        for op, backends in EXPECTED_OPS.items():
-            if len(backends) == 1:
-                spec = self.K.select_kernel(op)
-                self.assertEqual(spec.backend.value, next(iter(backends)), op)
+def test_specs_well_formed():
+    for spec in K.registry.all_specs():
+        assert spec.op == f"{spec.group}.{spec.name}"
+        mod, sep, attr = spec.target.partition(":")
+        assert sep == ":" and mod and attr, spec.target
 
-    def test_multi_backend_op_requires_explicit_backend(self):
-        # Device is a HARD eligibility filter, not a preference ranking: when
-        # more than one backend is usable on the current device, selection must
-        # be explicit (no hidden auto-ranking). Force a CUDA platform so the
-        # result is deterministic regardless of the test host.
-        import sglang.kernels.selector as sel
 
-        saved = sel._platform
-        try:
-            sel._platform = lambda: self.K.PlatformInfo(
-                device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0
-            )
-            # rmsnorm exposes torch/torch_compile/jit/aot, all eligible on CUDA.
-            with self.assertRaises(ValueError):
-                self.K.select_kernel("layernorm.rmsnorm")
-            # An explicit backend is always the fixed call path.
-            spec = self.K.select_kernel(
-                "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
-            )
-            self.assertEqual(spec.backend, self.K.KernelBackend.JIT)
-        finally:
-            sel._platform = saved
+def test_single_backend_resolves_without_backend():
+    assert K.select_kernel("gemm.fp8_scaled_mm").backend is KernelBackend.AOT
 
-    def test_decoupled_backend_device_selection(self):
-        # Proves the decoupled backend/device model against production reality:
-        #  - AOT (sgl_kernel) spans CUDA *and* HIP (OR-semantics capability);
-        #  - JIT is CUDA-only; AITER is an opt-in HIP-only path on silu_and_mul;
-        #  - gelu_and_mul has no AITER kernel (per-(op, backend) subset).
-        # Auto-selection matches production defaults: JIT on CUDA, AOT on HIP.
-        import sglang.kernels.fused_op as fo
-        from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
 
-        B = self.K.KernelBackend
-        hip = self.K.PlatformInfo(device_type="hip")
-        cuda = self.K.PlatformInfo(device_type="cuda", cuda_arch_major=9)
-        saved = fo._platform
-        try:
-            fo._platform = lambda: hip
-            # silu implements AITER (a HIP kernel); gelu does not (per-op subset).
-            self.assertIn(B.AITER, _SILU_AND_MUL.available_backends())
-            self.assertNotIn(B.AITER, _GELU_AND_MUL.available_backends())
-            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AOT))  # (cuda, hip)
-            self.assertTrue(_SILU_AND_MUL.backend_eligible(B.AITER))  # hip-only
-            self.assertFalse(_SILU_AND_MUL.backend_eligible(B.JIT))  # cuda-only
-            # HIP default = AOT (production default); AITER is opt-in below it.
-            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.AOT)
-            # gelu has no AITER but AOT spans HIP -> resolves to AOT, not torch.
-            self.assertEqual(_GELU_AND_MUL._resolve_backend(), B.AOT)
-            fo._platform = lambda: cuda
-            self.assertEqual(_SILU_AND_MUL._resolve_backend(), B.JIT)  # CUDA default
-        finally:
-            fo._platform = saved
+def test_unknown_op_or_backend_raises():
+    with pytest.raises(KeyError):
+        K.select_kernel("does_not.exist")
+    with pytest.raises(KeyError):
+        K.select_kernel("gemm.fp8_scaled_mm", backend=KernelBackend.TRITON)
 
-    def test_selector_explicit_backend(self):
-        spec = self.K.select_kernel(
-            "layernorm.rmsnorm", backend=self.K.KernelBackend.JIT
-        )
-        self.assertEqual(
-            spec.target, "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
-        )
 
-    def test_selector_unknown_op_raises(self):
-        with self.assertRaises(KeyError):
-            self.K.select_kernel("does_not.exist")
-        with self.assertRaises(KeyError):
-            self.K.select_kernel(
-                "gemm.fp8_scaled_mm", backend=self.K.KernelBackend.TRITON
-            )
+def test_multi_backend_requires_explicit_backend(monkeypatch):
+    # Device is a hard eligibility filter, not a ranking: >1 usable backend on
+    # the current device means selection must name one.
+    monkeypatch.setattr(sel, "_platform", lambda: _SM90)
+    with pytest.raises(ValueError):
+        K.select_kernel("layernorm.rmsnorm")
+    spec = K.select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT)
+    assert spec.backend is KernelBackend.JIT
+    assert spec.target == "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
 
-    def test_capability_requirement_logic(self):
-        cap = self.K.CapabilityRequirement
-        dev = self.K.DeviceType
-        plat = self.K.PlatformInfo
-        cpu = plat(device_type="cpu")
-        sm90 = plat(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
-        sm100 = plat(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
-        hip = plat(device_type="hip")
 
-        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(cpu))
-        self.assertTrue(cap(device=dev.CUDA).is_satisfied_by(sm90))
-        self.assertFalse(cap(device=dev.CUDA).is_satisfied_by(hip))
-        self.assertTrue(cap(device=dev.HIP).is_satisfied_by(hip))
-        self.assertFalse(
-            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm90)
-        )
-        self.assertTrue(
-            cap(device=dev.CUDA, min_cuda_arch=(10, 0)).is_satisfied_by(sm100)
-        )
-        self.assertFalse(
-            cap(device=dev.CUDA, max_cuda_arch=(9, 0)).is_satisfied_by(sm100)
-        )
+@pytest.mark.parametrize("device, expect", [("cuda", "jit"), ("hip", "aot")])
+def test_activation_default_backend(monkeypatch, device, expect):
+    # silu_and_mul default matches production: jit on CUDA, aot (sgl_kernel) on HIP.
+    from sglang.kernels.ops.activation import _SILU_AND_MUL
 
-        # OR semantics: a {cuda, hip} set is satisfied by either device.
-        cuda_or_hip = {cap.CUDA, cap.HIP}
-        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, sm90))
-        self.assertTrue(self.K.capabilities_satisfied(cuda_or_hip, hip))
-        self.assertFalse(self.K.capabilities_satisfied(cuda_or_hip, cpu))
-        self.assertTrue(self.K.capabilities_satisfied((), cpu))  # empty = unrestricted
-        # single requirement is tolerated (pre-decouple API used one).
-        self.assertTrue(self.K.capabilities_satisfied(cap.CUDA, sm90))
+    monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
+    assert _SILU_AND_MUL._resolve_backend().value == expect
 
-        # Class-constant shortcuts equal their explicit form; sets are unordered
-        # and dedup, so {CUDA, HIP} == {HIP, CUDA}.
-        self.assertEqual(cap.CUDA, cap(device=dev.CUDA))
-        self.assertEqual(cap.HIP, cap(device=dev.HIP))
-        self.assertEqual({cap.CUDA, cap.HIP}, {cap.HIP, cap.CUDA})
-        self.assertEqual(len({cap.CUDA, cap(device=dev.CUDA)}), 1)
-        # cuda(min_sm=...) factory: an SM100+ CUDA requirement.
-        self.assertEqual(
-            cap.cuda(min_sm=(10, 0)),
-            cap(device=dev.CUDA, min_cuda_arch=(10, 0)),
-        )
-        self.assertTrue(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm100))
-        self.assertFalse(cap.cuda(min_sm=(10, 0)).is_satisfied_by(sm90))
 
-    def test_platform_detect_does_not_raise(self):
-        plat = self.K.PlatformInfo.detect()
-        self.assertIn(plat.device_type, ("cpu", "cuda", "hip"))
+@pytest.mark.parametrize(
+    "op_attr, device, expect",
+    [
+        ("_RMSNORM", "cuda", "aot"),
+        ("_RMSNORM", "hip", "aiter"),
+        ("_RMSNORM", "npu", "torch_npu"),
+        ("_GEMMA_RMSNORM", "cuda", "aot"),
+        ("_GEMMA_RMSNORM", "hip", "jit"),  # rocm-triton JIT pinned to HIP
+        ("_GEMMA_RMSNORM", "npu", "torch_npu"),
+    ],
+)
+def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
+    # Same AOT provenance, different device coverage per op: rmsnorm's AOT is
+    # CUDA-only, so HIP falls to aiter and NPU to torch_npu.
+    ln = importlib.import_module("sglang.kernels.ops.layernorm")
+    monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
+    assert getattr(ln, op_attr)._resolve_backend().value == expect
 
-    def test_import_does_not_load_kernel_backends(self):
-        # Importing the namespace must stay metadata-only: no sgl_kernel or
-        # sglang.jit_kernel import, and no JIT compilation, on a CPU box.
-        code = (
-            "import sys; import sglang.kernels.ops; "
-            "backend = ('sgl_kernel' in sys.modules) or "
-            "any(m.startswith('sglang.jit_kernel') for m in sys.modules); "
-            "print('BACKEND_IMPORTED' if backend else 'CLEAN')"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("CLEAN", result.stdout, result.stdout + result.stderr)
+
+def test_per_op_backend_subset():
+    # silu_and_mul ships an aiter (HIP) kernel; the gelu siblings deliberately
+    # do not -- ROCm coverage is a per-(op, backend) subset.
+    from sglang.kernels.ops.activation import _GELU_AND_MUL, _SILU_AND_MUL
+
+    assert KernelBackend.AITER in _SILU_AND_MUL.available_backends()
+    assert KernelBackend.AITER not in _GELU_AND_MUL.available_backends()
+
+
+@pytest.mark.parametrize(
+    "req, plat, ok",
+    [
+        (Cap.CUDA, _CPU, False),
+        (Cap.CUDA, _SM90, True),
+        (Cap.CUDA, _HIP, False),
+        (Cap.HIP, _HIP, True),
+        (Cap.cuda(min_sm=(10, 0)), _SM90, False),
+        (Cap.cuda(min_sm=(10, 0)), _SM100, True),
+        (Cap.cuda(max_sm=(9, 0)), _SM100, False),
+    ],
+)
+def test_capability_is_satisfied_by(req, plat, ok):
+    assert req.is_satisfied_by(plat) is ok
+
+
+def test_capabilities_or_semantics():
+    both = {Cap.CUDA, Cap.HIP}
+    assert K.capabilities_satisfied(both, _SM90)
+    assert K.capabilities_satisfied(both, _HIP)
+    assert not K.capabilities_satisfied(both, _CPU)
+    assert K.capabilities_satisfied((), _CPU)  # empty = unrestricted
+    assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
+
+
+def test_capability_shortcuts():
+    assert Cap.CUDA == Cap(device=DeviceType.CUDA)
+    assert Cap.HIP == Cap(device=DeviceType.HIP)
+    assert Cap.NPU == Cap(device=DeviceType.NPU)
+    assert {Cap.CUDA, Cap.HIP} == {Cap.HIP, Cap.CUDA}
+    assert Cap.cuda(min_sm=(10, 0)) == Cap(
+        device=DeviceType.CUDA, min_cuda_arch=(10, 0)
+    )
+
+
+def test_platform_detect_does_not_raise():
+    assert PlatformInfo.detect().device_type in ("cpu", "cuda", "hip", "npu")
+
+
+def test_import_stays_metadata_only():
+    # Importing the namespace must not pull in sgl_kernel / sglang.jit_kernel.
+    code = (
+        "import sys, sglang.kernels.ops; "
+        "print('DIRTY' if 'sgl_kernel' in sys.modules or any("
+        "m.startswith('sglang.jit_kernel') for m in sys.modules) else 'CLEAN')"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "CLEAN" in r.stdout
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

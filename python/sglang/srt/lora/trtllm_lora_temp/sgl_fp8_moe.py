@@ -1,7 +1,4 @@
-"""Copy of upstream flashinfer-trtllm FP8 MoE dispatch, wired to experimental_sgl_trtllm_moe
-block-scale wrappers (LoRA-capable) so moe_runner/flashinfer_trtllm.py stays pristine. Body is
-verbatim from upstream; helper imports are call-time (cycle-safe); two FP8 wrappers shadowed.
-"""
+"""FP8 MoE dispatch using LoRA-capable block-scale wrappers."""
 
 from __future__ import annotations
 

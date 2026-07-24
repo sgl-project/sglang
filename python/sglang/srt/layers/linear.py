@@ -66,7 +66,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
     "GPTQLinearIntelAMXMethod",
     "GPTQMoEAscendMethod",

@@ -399,6 +399,11 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             _permute_bias(w2_bias_data), requires_grad=False
         )
 
+    # Marlin uses the repacked scales; release the loader-format parameters.
+    for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        if hasattr(layer, stale):
+            delattr(layer, stale)
+
 
 def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     if layer.quant_config.group_size != 16:

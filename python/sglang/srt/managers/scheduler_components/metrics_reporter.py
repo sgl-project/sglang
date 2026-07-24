@@ -1100,9 +1100,18 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        # The running-reqs gauge holds the last batch report until the next
+        # one (on PD prefill that is the last forward-batch snapshot, which
+        # no later report zeroes). If it disagrees with running_batch -- the
+        # true idle value -- publish now instead of waiting out the window.
+        gauge_stale = self.stats.num_running_reqs.total != len(
+            self.scheduler.running_batch.reqs
+        )
         if (
-            not self.current_scheduler_metrics_enabled
-            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not gauge_stale
+            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 

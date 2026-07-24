@@ -302,6 +302,9 @@ class MooncakeBaseStore:
             raise RuntimeError("Mooncake store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
+        if size == 0:
+            # conv-only models have a 0-element ssm state; nothing to register
+            return
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
@@ -716,10 +719,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         suffixes = []
         if pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
+            # conv-only models have no ssm state; drop the 0-element temporal
+            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
+            # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_temporal"] + [
-                f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)
-            ]
+            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the

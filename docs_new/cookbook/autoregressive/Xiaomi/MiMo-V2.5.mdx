@@ -54,16 +54,7 @@ tag: NEW
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
-**Docker Images by Variant × Hardware:**
-
-| Variant | Hardware | Docker Image |
-| --- | --- | --- |
-| **MiMo-V2.5 (310B)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:nightly-dev-20260511-044bb88a` |
-| **MiMo-V2.5 (310B)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:nightly-dev-cu13-20260511-044bb88a` |
-| **MiMo-V2.5-Pro (1.02T)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:nightly-dev-20260511-044bb88a` |
-| **MiMo-V2.5-Pro (1.02T)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:nightly-dev-cu13-20260511-044bb88a` |
-
-> Pull the image matching your GPU's CUDA driver. `lmsysorg/sglang:latest` will not load either checkpoint.
+**Docker Image:** All variants (MiMo-V2.5 310B and MiMo-V2.5-Pro 1.02T) use `lmsysorg/sglang:latest`, which ships CUDA 13.0 and runs on both Hopper (H100 / H200) and Blackwell (B200 / GB300).
 
 **TPU (sgl-jax):** MiMo-V2.5-Pro can also be served on TPU via the JAX-based [sgl-jax](https://github.com/sgl-project/sglang-jax) runtime. The container image and `pip install` steps are listed in [§3.3 TPU Deployment](#3-3-tpu-deployment-mimo-v2-5-pro-sgl-jax).
 

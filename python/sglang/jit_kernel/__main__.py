@@ -1,16 +1,30 @@
 import argparse
 import logging
 import os
+import re
+import shutil
+import subprocess
 
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
-from sglang.jit_kernel.utils import (
-    _REGISTERED_DEPENDENCIES,
-    DEFAULT_INCLUDE,
-    _get_default_target_flags,
-    get_jit_cuda_arch,
-    override_jit_cuda_arch,
-)
+from sglang.jit_kernel.utils import get_jit_cuda_arch, override_jit_cuda_arch
+from sglang.jit_kernel.utils.arch import get_default_target_flags
+from sglang.jit_kernel.utils.compile import DEFAULT_INCLUDE
+from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
+
+
+def _clangd_major_version() -> int | None:
+    clangd = shutil.which("clangd")
+    if clangd is None:
+        return None
+    try:
+        result = subprocess.run(
+            [clangd, "--version"], capture_output=True, text=True, check=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r"clangd version (\d+)", result.stdout)
+    return int(match.group(1)) if match else None
 
 
 def generate_clangd():
@@ -28,7 +42,7 @@ def generate_clangd():
         "--dep",
         nargs="*",
         default=[],
-        choices=_REGISTERED_DEPENDENCIES.keys(),
+        choices=REGISTERED_DEPENDENCIES.keys(),
         help="Extra dependency libraries to include.",
     )
     parser.add_argument(
@@ -42,9 +56,9 @@ def generate_clangd():
 
     dep_include_paths = []
     for dep in args.dependencies:
-        if dep not in _REGISTERED_DEPENDENCIES:
+        if dep not in REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
-        dep_include_paths += _REGISTERED_DEPENDENCIES[dep]()
+        dep_include_paths += REGISTERED_DEPENDENCIES[dep]()
 
     include_paths = [
         *DEFAULT_INCLUDE,
@@ -70,9 +84,15 @@ def generate_clangd():
         f"--cuda-gpu-arch=sm_{major}{minor}",
         "-Wall",
         "-Wextra",
-        *_get_default_target_flags(),
+        *get_default_target_flags(),
         *[f"-isystem{path}" for path in include_paths],
     ]
+
+    # NOTE: for local clangd (fix the missing cluster related macros)
+    if major >= 9:
+        compile_flags.append("-D_CG_LIMIT_INCLUDED_DEPENDENCIES=1")
+        compile_flags.append("-D_CG_HAS_CLUSTER_GROUP=1")
+
     # NOTE: skip these flags because clangd don't recognize them
     UNSUPPORTED_FLAGS = {"--expt-relaxed-constexpr"}
     compile_flags = [flag for flag in compile_flags if flag not in UNSUPPORTED_FLAGS]
@@ -83,6 +103,10 @@ CompileFlags:
     {compile_flags_str}
   ]
 """
+    # Documentation.CommentFormat lands in clangd 21.
+    clangd_major = _clangd_major_version()
+    if clangd_major is not None and clangd_major >= 21:
+        clangd_content += "Documentation:\n  CommentFormat: Doxygen\n"
     if os.path.exists(".clangd") and not args.overwrite:
         logger.warning(".clangd file already exists, nothing done.")
         logger.warning("Use --overwrite to force overwrite the existing .clangd file.")
