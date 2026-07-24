@@ -12,8 +12,7 @@ Arms (aliases in parentheses):
 
 Sweeps either concurrency (default) or image-count (`--image-counts`),
 launching each selected arm once with identical server args. Outputs a
-table, raw.json, and sweep.png (TTFT and ITL panels; mean solid, p99
-dashed).
+table, raw.json, and sweep.png (TTFT and ITL panels; mean only).
 
 Partial re-runs keep the same raw.json shape: pass `--arms native` (or
 `--arms rust`) and either reuse `--output-dir` (merges existing
@@ -37,7 +36,7 @@ the plot without re-running.
     # floor (0 = random-ids); mm stage times land in the server logs
     python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 0 \
         --arms python rust py_mm py_mm_proc --concurrencies 1 \
-        --image-counts 0 1 2 4 8 --num-prompts 32 --output-len 32
+        --image-counts 0 1 2 4 8 --num-prompts 32 --output-len 256
 
     # ITL vs throughput + scheduler GIL-steal per level (needs py-spy)
     python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 0 \
@@ -356,10 +355,15 @@ def load_raw_json(path):
 
 
 def merge_results(base, overlay):
-    """Keep prior arms; overlay arms overwrite on conflict."""
+    """Keep prior arms/levels; overlay levels overwrite on conflict.
+
+    Partial re-runs of a subset of concurrencies (or image-counts) on an
+    existing output-dir therefore fill in missing points instead of dropping
+    the levels that were not re-measured.
+    """
     merged = {arm: dict(levels) for arm, levels in base.items()}
     for arm, levels in overlay.items():
-        merged[arm] = dict(levels)
+        merged.setdefault(arm, {}).update(levels)
     return {arm: merged[arm] for arm in sorted(merged, key=_arm_sort_key)}
 
 
@@ -411,13 +415,12 @@ def plot_itl_vs_throughput(results, args, out_dir):
                     ha="center",
                     color=color,
                 )
-        ax.set_yscale("log")
         ax.set(
             xlabel="request throughput (req/s)",
             ylabel="ms",
             title=f"{stat} ITL vs throughput",
         )
-        ax.grid(True, which="both", alpha=0.3)
+        ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
     fig.suptitle(
         f"{args.model} — {args.image_count} image/req, "
@@ -483,34 +486,38 @@ def plot(results, args, out_dir, levels):
 
     xs = [lv[0] for lv in levels]
     xlabel = "image count" if args.image_counts else "max concurrency"
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    # Image-count sweep is a TTFT decomposition; ITL at concurrency 1 is noise.
+    metrics = ("ttft",) if args.image_counts else ("ttft", "itl")
+    fig, axes = plt.subplots(
+        1, len(metrics), figsize=(6.5 if len(metrics) == 1 else 12, 4.5), squeeze=False
+    )
+    axes = axes[0]
     colors = ARM_COLORS
     xpos = {x: i for i, x in enumerate(xs)}
-    for ax, metric in zip(axes, ("ttft", "itl")):
+    for ax, metric in zip(axes, metrics):
         for arm in sorted(results, key=_arm_sort_key):
             arm_results = results[arm]
             color = colors.get(arm, "tab:gray")
-            for stat, style in (("mean", "-o"), ("p99", "--s")):
-                pts = [
-                    (xpos[x], r[f"{stat}_{metric}_ms"])
-                    for x, r in sorted(arm_results.items())
-                    if r and x in xpos
-                ]
-                if pts:
-                    ax.plot(*zip(*pts), style, color=color, label=f"{arm} {stat}")
-                    for px, y in pts:
-                        ax.annotate(
-                            f"{y:.1f}",
-                            (px, y),
-                            xytext=(0, 5),
-                            fontsize=7,
-                            textcoords="offset points",
-                            ha="center",
-                            color=color,
-                        )
+            pts = [
+                (xpos[x], r[f"mean_{metric}_ms"])
+                for x, r in sorted(arm_results.items())
+                if r and x in xpos
+            ]
+            if pts:
+                ax.plot(*zip(*pts), "-o", color=color, label=arm)
+                for px, y in pts:
+                    ax.annotate(
+                        f"{y:.1f}",
+                        (px, y),
+                        xytext=(0, 5),
+                        fontsize=7,
+                        textcoords="offset points",
+                        ha="center",
+                        color=color,
+                    )
         ax.set_xticks(list(xpos.values()), [str(x) for x in xs])
         ax.set_yscale("log")
-        ax.set(xlabel=xlabel, ylabel="ms", title=metric.upper())
+        ax.set(xlabel=xlabel, ylabel="ms", title=f"mean {metric.upper()}")
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(fontsize=8)
     if args.image_counts:
