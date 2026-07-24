@@ -1,0 +1,136 @@
+---
+title: "Distributed Weight Data Parallelism (DWDP)"
+metatags:
+    description: "SGLang DWDP: asynchronous MoE weight prefetch for prefill, eliminating inter-rank synchronization on NVLink-connected GPUs."
+---
+
+Distributed Weight Data Parallelism (DWDP) is an inference parallelism strategy for MoE models that eliminates collective inter-rank synchronization from the critical inference path. Instead of shuffling tokens across GPUs via all-to-all communication (as in Expert Parallelism), DWDP keeps tokens on their local GPU and asynchronously prefetches missing expert weights from peer GPUs over NVLink. Each rank executes inference independently without waiting for other ranks, directly mitigating the performance loss caused by workload imbalance.
+
+For the design details and evaluation, refer to the [DWDP paper (arXiv:2604.01621)](https://arxiv.org/abs/2604.01621).
+
+## Why DWDP?
+
+In conventional DEP (Data Parallelism with Expert Parallelism), all ranks must synchronize at every MoE layer boundary via all-to-all communication. When per-rank workloads are imbalanced — due to different input sequence lengths or skewed expert routing — the slowest rank becomes the bottleneck, and all other ranks waste time waiting. Measurements on DeepSeek-R1 show that synchronization overhead can reach **~12%** of iteration latency at realistic imbalance levels.
+
+DWDP addresses this by removing the synchronization requirement entirely:
+
+- **Tokens stay local**: Each rank processes its own tokens without sending them to other GPUs.
+- **Weights are prefetched**: Before executing an MoE layer, each rank fetches the missing remote expert weights from peer GPUs via asynchronous NVLink copies.
+- **Fully asynchronous execution**: Ranks run independently, so imbalance on one rank does not stall others.
+
+## How It Works
+
+Within a DWDP group, attention weights are fully replicated on each rank, while MoE expert weights are partitioned across ranks. At runtime, DWDP uses a **double-buffered asynchronous prefetch** pipeline:
+
+1. Before executing MoE layer `l+1`, the rank begins asynchronously fetching remote expert weights for that layer.
+2. The compute window of MoE layer `l` and the attention block of layer `l+1` provides time to hide the prefetch latency.
+3. Before the MoE computation begins, the rank waits until all required remote experts have arrived.
+4. After the computation finishes, the prefetched remote experts are released, and the next prefetch is triggered.
+
+To avoid NCCL-based collectives (which would reintroduce synchronization), DWDP uses **copy-engine-based `cudaMemcpyAsync` peer-to-peer pulls** that do not occupy SM resources.
+
+## Requirements
+
+- **High-bandwidth GPU interconnect**: DWDP requires NVLink connectivity between all GPUs in the DWDP group (e.g., NVL72, NVL36). The prefetch overhead must be hidden behind computation, which demands high peer-to-peer bandwidth.
+- **MoE models**: DWDP targets the MoE expert weights, which dominate the model memory footprint. Attention weights remain fully replicated.
+- **PD Disaggregation**: DWDP is designed for the **prefill (context) phase** and is used together with PD disaggregation. The decode phase uses DP attention without DWDP.
+
+## Usage
+
+DWDP is used with PD disaggregation. The prefill server uses DWDP, while the decode server uses DP attention.
+
+### Single Node (GPT-OSS)
+
+```bash
+# Prefill server (2 GPUs with DWDP)
+python -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --disaggregation-mode prefill \
+  --tp 2 \
+  --dwdp-size 2 \
+  --mem-fraction-static 0.85 \
+  --port 30000 \
+  --trust-remote-code
+
+# Decode server (2 GPUs with DP attention)
+python -m sglang.launch_server \
+  --model-path openai/gpt-oss-120b \
+  --disaggregation-mode decode \
+  --tp 2 \
+  --dp 2 \
+  --enable-dp-attention \
+  --mem-fraction-static 0.85 \
+  --base-gpu-id 2 \
+  --port 30001 \
+  --trust-remote-code
+
+# Router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30000 \
+  --decode http://127.0.0.1:30001 \
+  --host 0.0.0.0 --port 8000
+```
+
+### Single Node (MiMo with Multimodal)
+
+For multimodal models, add `--mm-enable-dp-encoder` on the prefill side and explicitly set `--moe-dense-tp-size 1 --ep-size N` on the decode side:
+
+```bash
+# Prefill server (4 GPUs with DWDP)
+python -m sglang.launch_server \
+  --model-path XiaomiMiMo/MiMo-V2.5 \
+  --disaggregation-mode prefill \
+  --tp 4 \
+  --dwdp-size 4 \
+  --mm-enable-dp-encoder \
+  --attention-backend fa4 \
+  --mem-fraction-static 0.78 \
+  --port 30000 \
+  --trust-remote-code
+
+# Decode server (4 GPUs with DP attention)
+python -m sglang.launch_server \
+  --model-path XiaomiMiMo/MiMo-V2.5 \
+  --disaggregation-mode decode \
+  --tp 4 \
+  --dp 4 \
+  --enable-dp-attention \
+  --moe-dense-tp-size 1 \
+  --ep-size 4 \
+  --attention-backend fa4 \
+  --mem-fraction-static 0.78 \
+  --base-gpu-id 4 \
+  --port 30001 \
+  --trust-remote-code
+
+# Router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30000 \
+  --decode http://127.0.0.1:30001 \
+  --host 0.0.0.0 --port 8000
+```
+
+## Performance Characteristics
+
+Based on the [DWDP paper](https://arxiv.org/abs/2604.01621), evaluated with DeepSeek-R1 on GB200 NVL72:
+
+**Context-only (prefill phase)**:
+- **1.09–1.11x** TPS/GPU speedup and **1.11–1.27x** TTFT speedup across input sequence lengths from 1K to 32K.
+- Higher workload imbalance yields larger gains: up to **1.18x** TPS/GPU speedup at high imbalance.
+- DWDP eliminates synchronization cost (~12% of DEP iteration latency) and removes all-to-all communication from the critical path.
+
+**End-to-end (disaggregated serving)**:
+- **8.8%** improvement in output TPS/GPU at comparable TPS/user in the 20–100 TPS/user serving range.
+- The gain comes primarily from reduced context GPU requirements: DWDP achieves the same throughput with fewer prefill GPUs.
+
+**Trade-offs**:
+- **TTFT may increase** when using fewer context GPUs, due to higher queueing delay. This is a resource-efficiency trade-off, not a per-GPU regression.
+- **Best with long sequences**: DWDP requires a sufficiently large compute window to hide weight prefetch latency. Shorter sequences benefit less.
+
+## Related Documentation
+
+- [Expert Parallelism](./expert_parallelism) — EP backends, all-to-all communication, EPLB
+- [PD Disaggregation](./pd_disaggregation) — Prefill-decode separation, transfer engines
+- [DP, DPA and SGLang DP Router](./dp_dpa_smg_guide) — Data parallelism attention, SMG routing
