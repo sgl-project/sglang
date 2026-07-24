@@ -1086,6 +1086,11 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
+    enable_cp_decode_attn_tp: A[
+        bool,
+        "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+        NS("parallel"),
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -4795,6 +4800,19 @@ class ServerArgs:
                 "(DeepSeek Sparse Attention) models."
             )
 
+        if self.enable_cp_decode_attn_tp:
+            from sglang.srt.layers.cp.cp_decode_attn_tp import (
+                CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
+            )
+
+            if model_arch not in CP_DECODE_ATTN_TP_SUPPORTED_ARCHS:
+                raise ValueError(
+                    "--enable-cp-decode-attn-tp is only supported for models "
+                    "whose attention linears are replicated across CP ranks "
+                    f"(attn_tp_size=1). Got {model_arch}; supported: "
+                    f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
+                )
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -4999,9 +5017,13 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_cp,
+                validate_deepseek_v4_mega_moe_token_budget,
+            )
 
             validate_deepseek_v4_cp(self)
+            validate_deepseek_v4_mega_moe_token_budget(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
