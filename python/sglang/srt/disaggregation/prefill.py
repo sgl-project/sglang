@@ -232,6 +232,9 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if getattr(self.scheduler.server_args, "enable_dsa_shared_kv_cache", False):
+            kv_buffers, state_buffers = self.token_to_kv_pool.get_pd_transfer_tensors()
+            kv_manager.set_dsa_shared_buffer_tensors(kv_buffers, state_buffers)
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

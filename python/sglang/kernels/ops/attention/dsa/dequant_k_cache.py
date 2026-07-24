@@ -248,7 +248,8 @@ def _dequantize_k_cache_paged_kernel(
     DIM_ROPE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
+    # Shared VMM slab offsets can exceed the int32 address range.
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:

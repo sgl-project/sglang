@@ -138,6 +138,67 @@ def test_k_store_matches_unfused(strided):
     assert torch.equal(buf_ref, buf_fused)
 
 
+def test_k_store_owner_write_matches_full_buffer():
+    _skip_if_unavailable()
+    if not can_use_dsa_fused_store(torch.bfloat16, torch.int64, PAGE_SIZE):
+        pytest.skip("fused store JIT unavailable")
+
+    dev = "cuda"
+    cp_size = 4
+    pages_per_rank = 2
+    loc = torch.arange(cp_size * pages_per_rank, device=dev, dtype=torch.int64)
+    loc = loc * PAGE_SIZE + 3
+    B = loc.numel()
+    _, _, cos_sin_cache, positions = _make_inputs(B)
+    key = torch.randn(B, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
+
+    full = torch.zeros(
+        cp_size * pages_per_rank,
+        BYTES_PER_TOKEN * PAGE_SIZE,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    fused_k_indexer_norm_rope_store(
+        key, full, loc, weight, bias, EPS, cos_sin_cache, positions, PAGE_SIZE
+    )
+
+    key_bf16 = fused_k_indexer_norm_rope(
+        key, weight, bias, EPS, cos_sin_cache, positions
+    )
+    for rank in range(cp_size):
+        expected = full[rank::cp_size]
+        fused_owner = torch.zeros_like(expected)
+        store_owner = torch.zeros_like(expected)
+
+        fused_k_indexer_norm_rope_store(
+            key,
+            fused_owner,
+            loc,
+            weight,
+            bias,
+            EPS,
+            cos_sin_cache,
+            positions,
+            PAGE_SIZE,
+            owner_rank=rank,
+            owner_size=cp_size,
+        )
+        fused_store_index_k_cache(
+            key_bf16,
+            store_owner,
+            loc,
+            PAGE_SIZE,
+            owner_rank=rank,
+            owner_size=cp_size,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(fused_owner, expected)
+        assert torch.equal(store_owner, expected)
+
+
 # ----------------------------------------------------------------------------
 # Q kernel: rope-first + fp8 quant + head-gate fold
 # ----------------------------------------------------------------------------

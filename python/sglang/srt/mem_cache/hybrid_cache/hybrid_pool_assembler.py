@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def build_shared_dsa_hicache_stack(**kwargs):
+    from sglang.srt.mem_cache.dsa_shared_host import (
+        build_shared_dsa_hicache_stack as build,
+    )
+
+    return build(**kwargs)
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -1088,6 +1096,37 @@ class _DsaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        if server_args.enable_dsa_shared_kv_cache:
+            full_kv_pool = kvcache
+            full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+            host_pool_group, cache_controller = build_shared_dsa_hicache_stack(
+                params=params,
+                server_args=server_args,
+                kv_pool=full_kv_pool,
+                full_layer_mapping=full_layer_mapping,
+                load_cache_event=load_cache_event,
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=model_name,
+                storage_backend_extra_config=storage_backend_extra_config,
+                enable_storage_metrics=enable_storage_metrics,
+            )
+            return StackBuildResult(
+                host_pool_group=host_pool_group,
+                cache_controller=cache_controller,
+                component_host_pools={
+                    ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                },
+                sidecars=[
+                    SidecarPoolSpec(
+                        pool_name=PoolName.INDEXER,
+                        indices_from_pool=PoolName.KV,
+                    ),
+                ],
+                transfer_layer_num=len(full_layer_mapping),
+                pools_desc="KV + INDEXER",
+            )
+
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
         full_kv_pool = kvcache
@@ -1530,6 +1569,29 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        if server_args.enable_dsa_shared_kv_cache:
+            host_pool_group, cache_controller = build_shared_dsa_hicache_stack(
+                params=params,
+                server_args=server_args,
+                kv_pool=kv,
+                full_layer_mapping=layer_mapping,
+                load_cache_event=load_cache_event,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                enable_storage_metrics=enable_storage_metrics,
+            )
+            radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            radix_cache.token_to_kv_pool_host = host_pool_group
+            radix_cache.cache_controller = cache_controller
+            logger.info(
+                "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+                "transfer_layer_num=%s",
+                len(layer_mapping),
+            )
+            return
+
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,

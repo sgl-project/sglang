@@ -21,6 +21,8 @@ struct FusedStoreCacheParam {
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
+  uint32_t owner_rank;
+  uint32_t owner_size;
 };
 
 [[maybe_unused]]
@@ -42,7 +44,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, owner_rank, owner_size] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -53,7 +55,16 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
 
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[global_wid];
-  // always load the value from input (don't store if invalid)
+  if (index < 0) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  auto page = static_cast<int32_t>(index >> kPageBits);
+  if (page % owner_size != owner_rank) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+  page /= owner_size;
   using KeyT2 = packed_t<KeyT>;
   using InStorage = AlignedVector<KeyT2, 2>;
   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
@@ -65,7 +76,6 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   // use normal fp32 scale
   const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
   const auto inv_scale = 1.0f / scale;
-  const int32_t page = index >> kPageBits;
   const int32_t offset = index & ((1 << kPageBits) - 1);
   const auto page_ptr = pointer::offset(cache, page * kPageBytes);
   const auto value_ptr = pointer::offset(page_ptr, offset * 128);
@@ -89,7 +99,12 @@ struct FusedStoreCacheIndexerKernel {
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
 
-  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+  static void
+  run(tvm::ffi::TensorView input,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView indices,
+      int64_t owner_rank,
+      int64_t owner_size) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -114,6 +129,8 @@ struct FusedStoreCacheIndexerKernel {
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+        .owner_size = static_cast<uint32_t>(owner_size),
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

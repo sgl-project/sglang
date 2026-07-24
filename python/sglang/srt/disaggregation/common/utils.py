@@ -20,7 +20,7 @@ class TransferKVChunk:
 
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
-    index_slice: slice
+    index_slice: Union[slice, npt.NDArray[np.int64]]
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]

@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 """
 k: data, 128 item per token, fp8
 s: scale, 1 item per token, fp32
+
+Page tables stay int32, but address arithmetic uses int64 because shared VMM
+slabs can span more than 2 GiB.
 """
 
 
@@ -259,7 +262,16 @@ class SetKAndS:
         cls.triton(*args, **kwargs, buf=buf)
 
     @classmethod
-    def triton(cls, pool, buf, loc, index_k, index_k_scale):
+    def triton(
+        cls,
+        pool,
+        buf,
+        loc,
+        index_k,
+        index_k_scale,
+        owner_rank: int = 0,
+        owner_size: int = 1,
+    ):
         loc = loc.to(torch.int64)
 
         _set_k_and_s_triton(
@@ -268,6 +280,8 @@ class SetKAndS:
             index_k=index_k,
             index_k_scale=index_k_scale,
             page_size=pool.page_size,
+            owner_rank=owner_rank,
+            owner_size=owner_size,
         )
 
 
@@ -277,6 +291,8 @@ def _set_k_and_s_triton(
     index_k: torch.Tensor,
     index_k_scale: torch.Tensor,
     page_size: int,
+    owner_rank: int = 0,
+    owner_size: int = 1,
 ):
     """
     :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
@@ -323,6 +339,7 @@ def _set_k_and_s_triton(
     assert loc.is_contiguous()
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
+    assert 0 <= owner_rank < owner_size
 
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
@@ -341,6 +358,8 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        OWNER_RANK=owner_rank,
+        OWNER_SIZE=owner_size,
     )
 
 
@@ -356,6 +375,8 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    OWNER_RANK: tl.constexpr,
+    OWNER_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
@@ -363,12 +384,13 @@ def _set_k_and_s_triton_kernel(
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
-    # no need for `mask`, since we read 128B for k and 4B for scale, both pow of 2
-    k = tl.load(index_k_ptr + in_k_offsets)
-    k_scale = tl.load(index_k_scale_ptr + token_id)
-
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
+    owned = (loc >= 0) & ((loc_page_index % OWNER_SIZE) == OWNER_RANK)
+    loc_page_index = loc_page_index // OWNER_SIZE
+
+    k = tl.load(index_k_ptr + in_k_offsets, mask=owned)
+    k_scale = tl.load(index_k_scale_ptr + token_id, mask=owned)
 
     out_k_offsets = (
         loc_page_index * BUF_NUMEL_PER_PAGE
@@ -383,8 +405,8 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
-    tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+    tl.store(buf_fp8_ptr + out_k_offsets, k, mask=owned)
+    tl.store(buf_fp32_ptr + out_s_offset, k_scale, mask=owned)
 
 
 def _get_k_triton(
@@ -447,7 +469,7 @@ def _get_k_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # buf[page_index, token_offset_in_page * index_head_dim : ...]
@@ -524,7 +546,7 @@ def _get_s_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # Scales are stored after K data: page_size * index_head_dim offset
@@ -657,7 +679,7 @@ def _get_k_and_s_triton_kernel(
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+    ).to(tl.int64)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
