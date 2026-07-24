@@ -523,9 +523,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), 2)
-        self.assertEqual([list(e.token_ids) for e in stored], [[1, 2], [3, 4]])
-        stored_hashes = [e.block_hashes[0] for e in stored]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(list(stored[0].token_ids), [1, 2, 3, 4])
+        stored_hashes = self._event_hashes(stored)
 
         result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
@@ -539,7 +539,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._insert(cache, allocator, [1, 2, 3, 4])
         first_insert = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(first_insert), 2)
+        self.assertEqual(len(first_insert), 1)
         split_parent_hash = first_insert[0].block_hashes[0]
 
         self._insert(cache, allocator, [1, 2, 5, 6])
@@ -563,13 +563,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertCountEqual([e.block_hashes[0] for e in stored_cpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(stored_cpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         removed_gpu = self._removed_events(cache, StorageMedium.GPU)
@@ -577,7 +577,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._load_back_node(cache, node)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
         cache.evict(EvictParams(num_tokens=len(seq)))
         self._removed_events(cache, StorageMedium.GPU)
@@ -612,14 +612,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             [[1, 2], [3, 4]],
         )
 
-        # Both split fragments must be published, with intact parentage.
+        # Both split fragments must be published as one parent-linked batch.
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
-        self.assertEqual(
-            [list(e.token_ids) for e in stored_cpu],
-            [[1, 2], [3, 4]],
-        )
+        self.assertEqual(len(stored_cpu), 1)
+        self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])
         self.assertIsNone(stored_cpu[0].parent_block_hash)
-        self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+        self.assertEqual(len(stored_cpu[0].block_hashes), 2)
 
     def test_hicache_reinsert_evicted_node_emits_gpu_store(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -629,8 +627,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         seq = [1, 2, 3, 4]
         self._insert(cache, allocator, seq)
         stored_gpu = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored_gpu), 2)
-        stored_hashes = [e.block_hashes[0] for e in stored_gpu]
+        self.assertEqual(len(stored_gpu), 1)
+        stored_hashes = self._event_hashes(stored_gpu)
 
         node = self._leaf_for(cache, seq)
         self._backup_node(cache, node)
@@ -644,7 +642,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, seq)
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
-        self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
 
 
 class UnifiedRadixCacheSuite:

@@ -465,9 +465,11 @@ class TestMamba(unittest.TestCase):
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 3)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [1, 2, 3])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [1, 2, 3])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 3, 4, 5]))
@@ -480,9 +482,11 @@ class TestMamba(unittest.TestCase):
         )
         events = tree.take_events()
         stored_events = [e for e in events if isinstance(e, BlockStored)]
-        self.assertEqual(len(stored_events), 2)
-        self.assertEqual([e.token_ids[0] for e in stored_events], [4, 5])
-        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+        self.assertEqual(len(stored_events), 1)
+        self.assertEqual(list(stored_events[0].token_ids), [4, 5])
+        stored_hashes.extend(
+            block_hash for event in stored_events for block_hash in event.block_hashes
+        )
 
         # Evicting an internal mamba state creates a tombstone but does not
         # remove full-attention KV blocks, so it must not emit BlockRemoved.
@@ -518,8 +522,8 @@ class TestMamba(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        split_parent_hash = first_insert_events[1].block_hashes[0]
+        self.assertEqual(len(first_insert_events), 1)
+        split_parent_hash = first_insert_events[0].block_hashes[1]
 
         req2 = make_dummy_req()
         key2 = RadixKey(array("q", [1, 2, 5, 6]))
@@ -533,8 +537,8 @@ class TestMamba(unittest.TestCase):
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):

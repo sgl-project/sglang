@@ -30,19 +30,107 @@ from array import array
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    StorageMedium,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.utils import get_device
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
+
+
+class _KVCacheEventQueue(KVCacheEventMixin):
+    def __init__(self):
+        self.enable_kv_cache_events = True
+        self.kv_event_queue = []
+
+
+class TestKVCacheEventQueue(unittest.TestCase):
+    @staticmethod
+    def _store(
+        block_hash: int,
+        parent_block_hash: int | None,
+        *,
+        block_size: int = 2,
+        medium: StorageMedium = StorageMedium.GPU,
+        lora_id: int | None = None,
+    ) -> BlockStored:
+        return BlockStored(
+            block_hashes=[block_hash],
+            parent_block_hash=parent_block_hash,
+            token_ids=[block_hash, block_hash + 1][:block_size],
+            block_size=block_size,
+            lora_id=lora_id,
+            medium=medium,
+        )
+
+    def test_enqueue_coalesces_compatible_stores(self):
+        queue = _KVCacheEventQueue()
+        queue._enqueue_kv_event(self._store(1, None))
+        queue._enqueue_kv_event(self._store(2, 1))
+
+        events = queue.take_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].block_hashes, [1, 2])
+        self.assertEqual(events[0].parent_block_hash, None)
+        self.assertEqual(events[0].token_ids, [1, 2, 2, 3])
+
+    def test_enqueue_coalesces_compatible_removes(self):
+        queue = _KVCacheEventQueue()
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[2, 3], medium=StorageMedium.GPU)
+        )
+
+        events = queue.take_events()
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], BlockRemoved)
+        self.assertEqual(events[0].block_hashes, [1, 2, 3])
+
+    def test_enqueue_preserves_fusion_boundaries(self):
+        incompatible_stores = [
+            self._store(2, 1, medium=StorageMedium.CPU),
+            self._store(3, 1, lora_id=1),
+            self._store(4, 1, block_size=1),
+            self._store(5, None),
+        ]
+        for incoming in incompatible_stores:
+            queue = _KVCacheEventQueue()
+            queue._enqueue_kv_event(self._store(1, None))
+            queue._enqueue_kv_event(incoming)
+            self.assertEqual(len(queue.take_events()), 2)
+
+        queue = _KVCacheEventQueue()
+        queue._enqueue_kv_event(self._store(1, None))
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
+        queue._enqueue_kv_event(AllBlocksCleared())
+        queue._enqueue_kv_event(self._store(2, None))
+        self.assertEqual(len(queue.take_events()), 4)
+
+        queue = _KVCacheEventQueue()
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU)
+        )
+        queue._enqueue_kv_event(
+            BlockRemoved(block_hashes=[2], medium=StorageMedium.CPU)
+        )
+        self.assertEqual(len(queue.take_events()), 2)
 
 
 class TestRadixKey(unittest.TestCase):
@@ -421,7 +509,11 @@ class TestRadixCache(unittest.TestCase):
                     ]
                     self.assertGreater(len(block_stored_events), 0)
                     for event in block_stored_events:
-                        self.assertLessEqual(len(event.token_ids), page_size)
+                        self.assertLessEqual(event.block_size, page_size)
+                        self.assertEqual(
+                            len(event.token_ids),
+                            event.block_size * len(event.block_hashes),
+                        )
                 else:
                     self.assertEqual(len(events), 0)
 
@@ -461,7 +553,10 @@ class TestRadixCache(unittest.TestCase):
         self.assertIn("BlockStored", event_types)
 
         stored_hashes = [
-            event.block_hashes[0] for event in events if isinstance(event, BlockStored)
+            block_hash
+            for event in events
+            if isinstance(event, BlockStored)
+            for block_hash in event.block_hashes
         ]
         self.assertEqual(len(stored_hashes), 2)
 
@@ -718,12 +813,12 @@ class TestRadixCache(unittest.TestCase):
         events = cache.take_events()
         block_stored_events = [e for e in events if isinstance(e, BlockStored)]
 
-        # Should have 2 blocks (2 pages of size 4)
-        self.assertEqual(len(block_stored_events), 2)
+        # The two pages should be represented by one parent-linked store event.
+        self.assertEqual(len(block_stored_events), 1)
+        self.assertEqual(len(block_stored_events[0].block_hashes), 2)
 
         # Extract block hashes
-        block_hash_1 = block_stored_events[0].block_hashes[0]
-        block_hash_2 = block_stored_events[1].block_hashes[0]
+        block_hash_1, block_hash_2 = block_stored_events[0].block_hashes
 
         # The two blocks should have DIFFERENT hashes despite same content
         # because they are at different positions (sequence-aware hashing)
@@ -733,11 +828,8 @@ class TestRadixCache(unittest.TestCase):
             "Repeating token patterns should get different sequence-aware hashes",
         )
 
-        # First block should have no parent
+        # The coalesced event keeps the original root parent and ordered hashes.
         self.assertIsNone(block_stored_events[0].parent_block_hash)
-
-        # Second block's parent should be the first block's hash
-        self.assertEqual(block_stored_events[1].parent_block_hash, block_hash_1)
 
     def test_hash_value_split(self):
         """Test that hash_value is split correctly when nodes are split."""
