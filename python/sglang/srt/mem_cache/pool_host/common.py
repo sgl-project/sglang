@@ -16,6 +16,11 @@ class HostTensorAllocator:
         self.dtype = None
         self.dims = None
 
+    @property
+    def is_mooncake_compatible(self) -> bool:
+        """Whether tensors from this allocator can be registered with Mooncake."""
+        return False
+
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         assert (
             device == "cpu"
