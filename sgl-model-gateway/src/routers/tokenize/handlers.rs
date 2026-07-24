@@ -10,16 +10,21 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
     core::{steps::TokenizerConfigRequest, Job, UNKNOWN_MODEL_ID},
-    protocols::tokenize::{
-        AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
-        DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
-        TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+    protocols::{
+        chat::ChatCompletionRequest,
+        tokenize::{
+            AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
+            DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
+            TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+        },
     },
+    routers::grpc::utils::process_chat_messages,
     tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry},
 };
 
@@ -76,29 +81,79 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
 // Tokenize / Detokenize Handlers
 // ============================================================================
 
-/// Handle POST /v1/tokenize
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
-    debug!("Tokenize request for model: {}", request.model);
+/// Handle POST /v1/tokenize.
+///
+/// Accepts exactly one of `prompt` (text/batch) or `messages` (chat-style). The
+/// raw body is deserialized into the upstream `openai-protocol` `TokenizeRequest`
+/// / `ChatCompletionRequest` (discriminated on which key is present, since
+/// `TokenizeRequest.prompt` is required and it has no `messages` field), so the
+/// gateway tracks the upstream schemas without a hand-maintained mirror.
+/// `messages` is rendered locally via the gRPC router's `process_chat_messages`.
+pub async fn tokenize(registry: &Arc<TokenizerRegistry>, body: Value) -> Response {
+    // Match the Python validator: exactly one of `prompt` / `messages`.
+    let has_prompt = body.get("prompt").is_some_and(|v| !v.is_null());
+    let has_messages = body.get("messages").is_some_and(|v| !v.is_null());
+    if has_prompt == has_messages {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Exactly one of 'prompt' or 'messages' must be provided.",
+            "invalid_request",
+        );
+    }
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
-        Ok(t) => t,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
+    // Deserialize into the matching upstream type, look up the tokenizer, and
+    // resolve the text(s) to encode. `messages` renders the chat template once
+    // (a conversation is a single, non-batch result); `prompt` may be a batch.
+    // Both feed the shared encode loop below.
+    let (tokenizer, texts, is_batch): (Arc<dyn Tokenizer>, Vec<String>, bool) = if has_messages {
+        let chat: ChatCompletionRequest = match serde_json::from_value(body) {
+            Ok(c) => c,
+            Err(e) => {
+                return error_response(StatusCode::BAD_REQUEST, &e.to_string(), "invalid_request")
+            }
+        };
+        let tokenizer = match get_tokenizer(registry, &chat.model) {
+            Ok(t) => t,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found"),
+        };
+        match process_chat_messages(&chat, tokenizer.as_ref()) {
+            Ok(p) => (tokenizer, vec![p.text], false),
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e, "chat_template_error"),
         }
+    } else {
+        let req: TokenizeRequest = match serde_json::from_value(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_response(StatusCode::BAD_REQUEST, &e.to_string(), "invalid_request")
+            }
+        };
+        let tokenizer = match get_tokenizer(registry, &req.model) {
+            Ok(t) => t,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found"),
+        };
+        let is_batch = req.prompt.is_batch();
+        (
+            tokenizer,
+            req.prompt
+                .as_strings()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            is_batch,
+        )
     };
 
-    let texts = request.prompt.as_strings();
-    let is_batch = request.prompt.is_batch();
-
-    // Tokenize each text
+    // Encode each text without special tokens: the chat template emits BOS/EOS
+    // as text, and the gateway's generate/chat paths also encode with `false`,
+    // so `/tokenize` output matches what the engine actually consumes (the
+    // tokenize API has used `false` since #16087). This differs from the Python
+    // server's prompt-path default of `True`, but is intentional and pre-existing.
     let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
     let mut all_counts: Vec<i32> = Vec::with_capacity(texts.len());
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
-
-    for text in texts {
-        // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding = match tokenizer.encode(text, false) {
-            Ok(enc) => enc,
+    for text in &texts {
+        let token_ids = match tokenizer.encode(text, false) {
+            Ok(enc) => enc.token_ids().to_vec(),
             Err(e) => {
                 error!("Tokenization failed: {}", e);
                 return error_response(
@@ -108,16 +163,13 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
                 );
             }
         };
-
-        let token_ids: Vec<u32> = encoding.token_ids().to_vec();
-        let count = token_ids.len() as i32;
-
-        all_tokens.push(token_ids);
-        all_counts.push(count);
+        all_counts.push(token_ids.len() as i32);
         all_char_counts.push(text.chars().count() as i32);
+        all_tokens.push(token_ids);
     }
 
-    // Format response based on single vs batch
+    // Single (non-batch) result collapses the one-element vectors. `char_count`
+    // reflects the encoded text(s); the Python server returns `max_model_len`.
     let (tokens, count, char_count) = if is_batch {
         (
             TokensResult::Batch(all_tokens),
@@ -391,4 +443,128 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         &format!("Tokenizer '{}' not found and no pending job", tokenizer_id),
         "not_found",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn empty_registry() -> Arc<TokenizerRegistry> {
+        Arc::new(TokenizerRegistry::new())
+    }
+
+    /// Registry holding a single (non-HF) MockTokenizer registered under `name`.
+    async fn registry_with_mock(name: &str) -> Arc<TokenizerRegistry> {
+        let registry = Arc::new(TokenizerRegistry::new());
+        registry
+            .load("mock-id", name, "mock", || async {
+                Ok(Arc::new(crate::tokenizer::MockTokenizer::new()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .expect("register mock tokenizer");
+        registry
+    }
+
+    async fn read(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn rejects_both_prompt_and_messages() {
+        let r = tokenize(
+            &empty_registry(),
+            json!({
+                "model": "m",
+                "prompt": "hi",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn rejects_neither_prompt_nor_messages() {
+        let r = tokenize(&empty_registry(), json!({ "model": "m" })).await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn messages_with_non_hf_tokenizer_returns_400() {
+        // MockTokenizer has no chat template / is not an HF tokenizer, so
+        // process_chat_messages must reject it cleanly (not 500).
+        let r = tokenize(
+            &registry_with_mock("test-model").await,
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }),
+        )
+        .await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "chat_template_error");
+    }
+
+    #[tokio::test]
+    async fn prompt_path_unchanged() {
+        // Regression: a single text input returns a single (non-batch) result.
+        let r = tokenize(
+            &registry_with_mock("test-model").await,
+            json!({ "model": "test-model", "prompt": "hello world" }),
+        )
+        .await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::OK);
+        // Single result: `tokens` is a flat list of ints, not a list of lists.
+        assert!(
+            body["tokens"][0].is_number(),
+            "single (non-batch) token list"
+        );
+        assert!(body["count"].is_number());
+    }
+
+    #[tokio::test]
+    async fn prompt_batch_returns_batch() {
+        // A list `prompt` returns a batch: `tokens` is a list of token lists and
+        // `count` is a list. This is the branch most sensitive to the refactor.
+        let r = tokenize(
+            &registry_with_mock("test-model").await,
+            json!({ "model": "test-model", "prompt": ["a b", "c d e"] }),
+        )
+        .await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["tokens"].as_array().map(Vec::len), Some(2));
+        assert!(body["tokens"][0].is_array(), "batch => list of token lists");
+        assert!(body["count"].is_array());
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_tokenizer_not_found() {
+        // Validation (exactly-one) passes, then tokenizer lookup fails -> 400.
+        let r = tokenize(
+            &empty_registry(),
+            json!({ "model": "missing", "prompt": "hi" }),
+        )
+        .await;
+        let (status, body) = read(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "tokenizer_not_found");
+    }
+
+    // The successful `messages` path requires a real HuggingFace tokenizer with a
+    // chat template, so it is covered by the e2e / transformers-parity checks
+    // rather than these unit tests (which use a non-HF MockTokenizer).
 }
