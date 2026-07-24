@@ -175,9 +175,6 @@ class DiffusionServer:
         self._glm_ar_stage = None
         self._glm_batch_max_size = 1
         self._glm_batch_delay_s = 0.0
-        self._glm_adaptive_delay_max_s = None
-        self._glm_arrival_ewma_s = None
-        self._glm_last_arrival_s = None
 
         if glm_ar_fanout:
             if server_args is None:
@@ -198,10 +195,6 @@ class DiffusionServer:
                 else 1
             )
             self._glm_batch_delay_s = server_args.batching_delay_ms / 1000.0
-            adaptive_ms = getattr(server_args, "batching_adaptive_delay_max_ms", None)
-            self._glm_adaptive_delay_max_s = (
-                adaptive_ms / 1000.0 if adaptive_ms is not None else None
-            )
             self._glm_ar_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="glm-ar-fanout"
             )
@@ -475,14 +468,6 @@ class DiffusionServer:
             pass
         if self._glm_ar_fanout:
             now = time.monotonic()
-            if self._glm_last_arrival_s is not None:
-                interval = now - self._glm_last_arrival_s
-                self._glm_arrival_ewma_s = (
-                    interval
-                    if self._glm_arrival_ewma_s is None
-                    else 0.8 * self._glm_arrival_ewma_s + 0.2 * interval
-                )
-            self._glm_last_arrival_s = now
             self._glm_ar_queue.append(
                 _GlmClientEntry(request_id, client_identity, req, now)
             )
@@ -500,20 +485,6 @@ class DiffusionServer:
             request_id,
         )
 
-    def _glm_wait_limit_s(self, batch_size: int) -> float:
-        if self._glm_adaptive_delay_max_s is None:
-            return self._glm_batch_delay_s
-        if self._glm_arrival_ewma_s is None:
-            return min(
-                self._glm_adaptive_delay_max_s,
-                max(self._glm_batch_delay_s, self._glm_batch_delay_s * 4),
-            )
-        missing = max(0, self._glm_batch_max_size - batch_size)
-        return min(
-            self._glm_adaptive_delay_max_s,
-            max(self._glm_batch_delay_s, self._glm_arrival_ewma_s * missing),
-        )
-
     def _drain_glm_ar_queue(self) -> None:
         if self._glm_ar_future is not None or not self._glm_ar_queue:
             return
@@ -528,8 +499,9 @@ class DiffusionServer:
                 indices.append(index)
 
         waited = time.monotonic() - base.enqueue_time
-        if len(indices) < self._glm_batch_max_size and waited < self._glm_wait_limit_s(
-            len(indices)
+        if (
+            len(indices) < self._glm_batch_max_size
+            and waited < self._glm_batch_delay_s
         ):
             return
 

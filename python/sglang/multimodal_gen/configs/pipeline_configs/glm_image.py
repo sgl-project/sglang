@@ -48,7 +48,7 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
-    def supports_dynamic_batching(self):
+    def supports_native_grouped_requests(self):
         return True
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
@@ -68,11 +68,6 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        prompt_embeds_mask = getattr(batch, "prompt_embeds_mask", None)
-        prompt_seq_lens = getattr(batch, "prompt_seq_lens", None)
-        if prompt_embeds_mask and prompt_embeds_mask[0] is not None and prompt_seq_lens:
-            kwargs["attention_mask"] = prompt_embeds_mask[0]
-            kwargs["text_seq_lens"] = prompt_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "read"
@@ -86,11 +81,6 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             "target_size": batch.target_size,
             "freqs_cis": self.get_freqs_cis(batch, device, rotary_emb, dtype),
         }
-        neg_embeds_mask = getattr(batch, "negative_prompt_embeds_mask", None)
-        neg_seq_lens = getattr(batch, "negative_prompt_seq_lens", None)
-        if neg_embeds_mask and neg_embeds_mask[0] is not None and neg_seq_lens:
-            kwargs["attention_mask"] = neg_embeds_mask[0]
-            kwargs["text_seq_lens"] = neg_seq_lens[0]
         if getattr(batch, "prior_token_image_ids", None) is not None:
             kwargs["kv_caches"] = batch.kv_caches
             kwargs["kv_caches_mode"] = "skip"
@@ -108,9 +98,6 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean
-
-    def get_vae_decode_batch_size(self, latents):
-        return 1
 
     def post_denoising_loop(self, latents, batch):
         if getattr(batch, "kv_caches", None) is not None:

@@ -346,7 +346,6 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_mode: str = "dynamic"
     batching_max_size: int = 1
     batching_delay_ms: float = 0.0
-    batching_adaptive_delay_max_ms: float | None = None
     batching_config: str | None = None
     enable_batching_metrics: bool = False
 
@@ -1748,19 +1747,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "--batching-delay-ms",
             type=float,
             default=ServerArgs.batching_delay_ms,
-            help=(
-                "Time (in ms) to wait for a larger batch, or the minimum wait "
-                "when adaptive delay is enabled."
-            ),
-        )
-        parser.add_argument(
-            "--batching-adaptive-delay-max-ms",
-            type=float,
-            default=ServerArgs.batching_adaptive_delay_max_ms,
-            help=(
-                "Enable adaptive batching delay. --batching-delay-ms becomes the "
-                "minimum wait and this value is the maximum wait."
-            ),
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
         )
         parser.add_argument(
             "--batching-config",
@@ -2397,13 +2384,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
-        if (
-            self.batching_adaptive_delay_max_ms is not None
-            and self.batching_adaptive_delay_max_ms < self.batching_delay_ms
-        ):
-            raise ValueError(
-                "batching_adaptive_delay_max_ms must be >= batching_delay_ms"
-            )
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
