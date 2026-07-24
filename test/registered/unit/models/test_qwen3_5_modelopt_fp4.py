@@ -7,8 +7,7 @@ CustomTestCase, register_cpu_ci (no GPU / no real checkpoint needed), and testin
 against the REAL sglang classes (ModelOptFp4Config, RadixAttention) rather than
 mocks wherever the real class is CPU-safe.
 
-Covers the three changes in commits d6ee507be7 and 718a48a433 on branch
-qwen35-modelopt-fp4-quantized-attention:
+Covers the three changes on branch qwen35-modelopt-fp4-quantized-attention:
 
   1. Per-prefix quantized/BF16 decision (ModelOptFp4Config.is_layer_excluded) is
      honored for attention instead of being hard-overridden to "always BF16".
@@ -16,16 +15,14 @@ qwen35-modelopt-fp4-quantized-attention:
      quant_config carrying kv_cache_quant_algo="FP8" (Qwen3_5AttentionDecoderLayer
      now passes quant_config through instead of always passing None).
   3. The checkpoint's baked k_scale/v_scale tensors get remapped from their
-     "...k_proj.k_scale" / "...v_proj.v_scale" checkpoint names onto the
-     RadixAttention module's "...attn.k_scale" / "...attn.v_scale" parameter names
-     and loaded into them, in load_weights().
+     "...self_attn.k_proj.k_scale" / "...self_attn.v_proj.v_scale" checkpoint
+     names onto the RadixAttention module's "...attn.k_scale" / "...attn.v_scale"
+     parameter names, in load_weights().
 
-Change 3 targets `remap_and_load_qwen3_5_kv_scale(name, loaded_weight, params_dict)`,
-a module-level helper in sglang.srt.models.qwen3_5 (mirroring the stock
-`maybe_remap_kv_scale_name(name, params_dict)` signature/style) that was extracted
-from two byte-identical ~26-line inline blocks previously copy-pasted between
-Qwen3_5MoeForCausalLM.load_weights and Qwen3_5MoeForConditionalGeneration.load_weights.
-Pure dedup + testability extraction; no behavior change.
+Change 3 targets `QWEN3_5_KV_SCALE_MAPPER`, a module-level WeightsMapper in
+sglang.srt.models.qwen3_5 (the same type the loader-facing hf_to_sglang_mapper
+class attribute uses) that every Qwen3_5* load_weights() applies to the incoming
+weight stream before its name-munging loop.
 """
 
 import unittest
@@ -34,7 +31,8 @@ import torch
 
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.models.qwen3_5 import remap_and_load_qwen3_5_kv_scale
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,119 +166,78 @@ class TestRadixAttentionKvScaleRegistration(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Change 3: baked k_scale/v_scale checkpoint tensors remap onto RadixAttention
+# Change 3: baked k_scale/v_scale checkpoint names remap onto RadixAttention
 # ---------------------------------------------------------------------------
-class TestQwen3_5KvScaleRemap(CustomTestCase):
-    """load_weights() strips ".self_attn" from parameter names BEFORE the stock
-    maybe_remap_kv_scale_name() would see them, so that helper can never match
-    (it keys off ".self_attn."/".mixer." still being present). This PR adds an
-    explicit remap step right after the strip. These tests target the extracted
-    `remap_and_load_qwen3_5_kv_scale` helper (see the report's proposed diff)
-    rather than re-deriving the two inline blocks that used to live in
-    Qwen3_5MoeForCausalLM.load_weights / Qwen3_5MoeForConditionalGeneration.load_weights.
+class TestQwen3_5KvScaleMapper(CustomTestCase):
+    """Every Qwen3_5* load_weights() strips ".self_attn" out of checkpoint names
+    early, so the stock maybe_remap_kv_scale_name() can never match (its modelopt
+    branch keys off ".self_attn."/".mixer." still being present, and its
+    params_dict membership check fails either way because the sglang module tree
+    has no self_attn level). QWEN3_5_KV_SCALE_MAPPER is therefore applied to the
+    weight stream BEFORE the loop: the mapped name "...attn.k_scale" no longer
+    contains "k_proj", so the stacked-params qkv_proj matching (which used to
+    consume and silently drop the scale) never fires, and the name loads through
+    the loop's generic fallback branch.
     """
 
-    def _make_param_dict_with_attn_scale(self, key: str, weight_loader=None):
-        scale = torch.nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))
-        if weight_loader is not None:
-            scale.weight_loader = weight_loader
-        return {key: scale}, scale
+    def test_maps_baked_kv_scale_names_onto_radix_attention(self):
+        # Checkpoint-name shape is dictated by ModelOpt's export format (scales
+        # baked under the HF attention projections); target-name shape by the
+        # RadixAttention attribute path in the sglang module tree. Both sides
+        # are external contracts -- a typo in either silently zeroes the scales.
+        weights = [
+            ("model.layers.3.self_attn.k_proj.k_scale", torch.tensor(0.0347)),
+            ("model.layers.3.self_attn.v_proj.v_scale", torch.tensor(0.0128)),
+        ]
 
-    def test_remaps_k_proj_scale_to_attn_and_loads_value(self):
-        # Name as it arrives in load_weights AFTER ".self_attn" has already been
-        # stripped a few lines above the remap block -- see qwen3_5.py L1523-24 /
-        # L2015-16 (`if ".self_attn." in name: name = name.replace(".self_attn", "")`).
-        name = "model.layers.3.k_proj.k_scale"
-        params_dict, scale_param = self._make_param_dict_with_attn_scale(
-            "model.layers.3.attn.k_scale"
+        mapped = list(QWEN3_5_KV_SCALE_MAPPER.apply(weights))
+
+        self.assertEqual(
+            [name for name, _ in mapped],
+            ["model.layers.3.attn.k_scale", "model.layers.3.attn.v_scale"],
         )
-        loaded_weight = torch.tensor(0.0347, dtype=torch.float32)
+        torch.testing.assert_close(mapped[0][1], torch.tensor(0.0347))
+        torch.testing.assert_close(mapped[1][1], torch.tensor(0.0128))
 
-        remapped_name = remap_and_load_qwen3_5_kv_scale(
-            name, loaded_weight, params_dict
+    def test_all_other_names_pass_through_unchanged(self):
+        # Negative-branch contract: the mapper must be a strict no-op for every
+        # non-KV-scale weight -- including the self_attn projections themselves
+        # (still needed by the qkv_proj stacked matching), the GDN linear-attn
+        # projections, and per-projection quant scales like input_scale /
+        # weight_scale that modelopt also emits under self_attn. A key that is
+        # too broad (or a None mapping, which WeightsMapper.apply DROPS from the
+        # stream) would corrupt regular weight loading.
+        names = [
+            "model.layers.3.self_attn.k_proj.weight",
+            "model.layers.3.self_attn.k_proj.input_scale",
+            "model.layers.3.self_attn.k_proj.weight_scale",
+            "model.layers.2.linear_attn.in_proj_qkvz.weight",
+            "model.layers.0.mlp.experts.5.down_proj.weight",
+            "lm_head.weight",
+        ]
+        weights = [(name, torch.zeros(1)) for name in names]
+
+        mapped = list(QWEN3_5_KV_SCALE_MAPPER.apply(weights))
+
+        self.assertEqual([name for name, _ in mapped], names)
+
+    def test_mapped_scale_loads_via_default_weight_loader(self):
+        # After mapping, load_weights' generic fallback branch does
+        # `getattr(param, "weight_loader", default_weight_loader)`; RadixAttention
+        # scale params carry no weight_loader (BaseKVCacheMethod.create_weights),
+        # so default_weight_loader must land the value. Its scalar path
+        # (numel()==1 -> fill_) is what tolerates the 0-dim param vs shape-[1]
+        # checkpoint tensor -- a future shape-strictness change there would
+        # silently break exactly this load.
+        scale_param = torch.nn.Parameter(
+            torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
         )
+        loaded_weight = torch.tensor([0.0347], dtype=torch.float32)
 
-        self.assertEqual(remapped_name, "model.layers.3.attn.k_scale")
-        torch.testing.assert_close(
-            scale_param.data, torch.tensor(0.0347, dtype=torch.float32)
-        )
+        weight_loader = getattr(scale_param, "weight_loader", default_weight_loader)
+        weight_loader(scale_param, loaded_weight)
 
-    def test_remaps_v_proj_scale_to_attn_and_loads_value(self):
-        name = "model.layers.3.v_proj.v_scale"
-        params_dict, scale_param = self._make_param_dict_with_attn_scale(
-            "model.layers.3.attn.v_scale"
-        )
-        loaded_weight = torch.tensor(0.0128, dtype=torch.float32)
-
-        remapped_name = remap_and_load_qwen3_5_kv_scale(
-            name, loaded_weight, params_dict
-        )
-
-        self.assertEqual(remapped_name, "model.layers.3.attn.v_scale")
-        torch.testing.assert_close(
-            scale_param.data, torch.tensor(0.0128, dtype=torch.float32)
-        )
-
-    def test_uses_weight_loader_when_target_param_has_one(self):
-        # RadixAttention's k_scale/v_scale are plain nn.Parameters with no
-        # weight_loader (BaseKVCacheMethod.create_weights sets none), so the
-        # .data.copy_ fallback is the common path today -- but other call sites
-        # (or a future refactor) may attach a weight_loader, so the loader path
-        # must be preferred when present, matching the non-stacked fallback
-        # convention used elsewhere in load_weights.
-        calls = []
-
-        def spy_loader(param, weight):
-            calls.append(weight.item())
-            param.data.copy_(weight)
-
-        name = "model.layers.7.k_proj.k_scale"
-        params_dict, scale_param = self._make_param_dict_with_attn_scale(
-            "model.layers.7.attn.k_scale", weight_loader=spy_loader
-        )
-        loaded_weight = torch.tensor(0.021, dtype=torch.float32)
-
-        remap_and_load_qwen3_5_kv_scale(name, loaded_weight, params_dict)
-
-        # exactly one call, value compared with float32-precision tolerance
-        # (torch.tensor(0.021, float32).item() == 0.020999999716...)
-        self.assertEqual(len(calls), 1)
-        self.assertAlmostEqual(calls[0], 0.021, places=6)
-
-    def test_no_op_when_target_attn_param_absent(self):
-        # NVIDIA's MoE-only NVFP4 checkpoint never emits k_scale/v_scale for
-        # attention at all (this code path never even runs for it in practice,
-        # since load_weights only enters the remap branch when
-        # name.endswith(".k_scale"/".v_scale")). This test instead covers the
-        # defensive case: a checkpoint DOES emit the scale key, but the running
-        # model has no matching RadixAttention param under that prefix (e.g. a
-        # pipeline-parallel rank that does not own this layer) -- must not raise,
-        # must signal "not consumed" so the caller's generic fallback / warning
-        # path can still see it.
-        name = "model.layers.99.k_proj.k_scale"
-        params_dict = {}  # no "model.layers.99.attn.k_scale" present
-        loaded_weight = torch.tensor(0.05, dtype=torch.float32)
-
-        remapped_name = remap_and_load_qwen3_5_kv_scale(
-            name, loaded_weight, params_dict
-        )
-
-        self.assertIsNone(remapped_name)
-
-    def test_non_kv_scale_name_is_left_untouched(self):
-        # Sanity: the helper is only ever invoked from inside the
-        # `name.endswith(".k_scale") or name.endswith(".v_scale")` guard in
-        # load_weights, but assert its own behavior is a safe no-op if that
-        # invariant is ever violated (e.g. future refactor calls it more broadly).
-        name = "model.layers.0.mlp.experts.5.down_proj.weight"
-        params_dict = {}
-        loaded_weight = torch.zeros(4)
-
-        remapped_name = remap_and_load_qwen3_5_kv_scale(
-            name, loaded_weight, params_dict
-        )
-
-        self.assertIsNone(remapped_name)
+        self.assertAlmostEqual(scale_param.item(), 0.0347, places=6)
 
 
 if __name__ == "__main__":

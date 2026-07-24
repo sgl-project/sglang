@@ -87,6 +87,7 @@ from sglang.srt.models.qwen2_moe import (
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import (
+    WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
@@ -1242,6 +1243,22 @@ ALL_DECODER_LAYER_TYPES = {
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
 
+# ModelOpt FP4 checkpoints that quantize attention bake the per-layer KV-cache
+# scales under the HF attention projections ("...self_attn.k_proj.k_scale"); in
+# the sglang module tree they live on RadixAttention ("...attn.k_scale"). Must
+# be applied to the weight stream before load_weights() strips ".self_attn",
+# otherwise the stacked-params qkv_proj matching consumes the name and silently
+# drops the scale. Applied per-load_weights rather than exposed as a
+# hf_to_sglang_mapper class attribute: the loader feeds that attribute into
+# quant_config.apply_weight_name_mapper(), which rewrites exclude_modules --
+# a side effect the VL classes deliberately disable (hf_to_sglang_mapper=None).
+QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".self_attn.k_proj.k_scale": ".attn.k_scale",
+        ".self_attn.v_proj.v_scale": ".attn.v_scale",
+    },
+)
+
 
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
@@ -1482,6 +1499,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1560,44 +1578,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
-def remap_and_load_qwen3_5_kv_scale(
-    name: str, loaded_weight: torch.Tensor, params_dict: dict
-) -> Optional[str]:
-    """Remap a ModelOpt FP4 checkpoint's attention KV-scale name onto the
-    RadixAttention scale param and load it, if the target exists.
-
-    ModelOpt FP4 checkpoints that quantize attention bake per-layer k_scale/
-    v_scale under q/k_proj, e.g. "layers.N.self_attn.k_proj.k_scale". By the time
-    names reach this point in load_weights(), ".self_attn" has already been
-    stripped, so the stock maybe_remap_kv_scale_name() (which keys off
-    ".self_attn."/".mixer." still being present) cannot match. Remap directly to
-    the RadixAttention scale param instead and copy the value.
-
-    No-op (returns None, does not raise) for names that are not a k_scale/v_scale
-    suffix, or whose remapped target is not present in params_dict -- e.g.
-    NVIDIA's MoE-only NVFP4 checkpoints never emit these keys for attention at
-    all, so this function is never meaningfully invoked for them.
-
-    Returns:
-        The remapped, loaded param name (add this to loaded_params), or None if
-        nothing was loaded.
-    """
-    if not (name.endswith(".k_scale") or name.endswith(".v_scale")):
-        return None
-    attn_scale_name = name.replace(".k_proj.k_scale", ".attn.k_scale").replace(
-        ".v_proj.v_scale", ".attn.v_scale"
-    )
-    scale_param = params_dict.get(attn_scale_name)
-    if scale_param is None:
-        return None
-    scale_weight_loader = getattr(scale_param, "weight_loader", None)
-    if scale_weight_loader is not None:
-        scale_weight_loader(scale_param, loaded_weight)
-    else:
-        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
-    return attn_scale_name
-
-
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -1608,6 +1588,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1697,13 +1678,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
-                continue
-
-            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
-                name, loaded_weight, params_dict
-            )
-            if remapped_kv_scale_name is not None:
-                loaded_params.add(remapped_kv_scale_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1876,6 +1850,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2035,6 +2010,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -2170,13 +2146,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
-                continue
-
-            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
-                name, loaded_weight, params_dict
-            )
-            if remapped_kv_scale_name is not None:
-                loaded_params.add(remapped_kv_scale_name)
                 continue
 
             if self.enable_shared_expert_fusion:
