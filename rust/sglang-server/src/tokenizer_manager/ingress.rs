@@ -21,7 +21,7 @@ use bytes::Bytes;
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RidHash;
-use crate::message::sampling::normalize_sampling_params;
+use crate::message::normalize_sampling_params;
 use crate::message::{
     EgressItem, IngressMsg, Request, RequestKind, abort_req_msgpack, control_req_msgpack,
 };
