@@ -2,7 +2,8 @@
 
 Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
 fetch, resize, patchify, normalize, and content hash — all parallel and
-GIL-released.
+GIL-released. For the end-to-end server story (request flow, failure
+semantics, adding a model family) see [`rust/NATIVE_MM.md`](../NATIVE_MM.md).
 
 Built two ways:
 
