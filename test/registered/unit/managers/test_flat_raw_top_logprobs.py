@@ -72,6 +72,15 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
             req = GenerateReqInput(text="hello", **kwargs)
             req.normalize_batch_and_arguments()
 
+    def test_flat_rejects_multi_item_scoring(self):
+        req = GenerateReqInput(
+            text="a<sep>b",
+            return_flat_raw_top_logprobs=True,
+            multi_item_delimiter_indices=[1],
+        )
+        with self.assertRaisesRegex(ValueError, "multi-item"):
+            req.normalize_batch_and_arguments()
+
     def test_flag_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["a", "b"],

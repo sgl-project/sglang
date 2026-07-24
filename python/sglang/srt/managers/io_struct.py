@@ -372,6 +372,15 @@ class GenerateReqInput:
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
+        if (
+            self.return_flat_raw_top_logprobs
+            and self.multi_item_delimiter_indices is not None
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs does not support multi-item "
+                "scoring: delimiter-sparse top logprob rows have no contiguous "
+                "position mapping."
+            )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
