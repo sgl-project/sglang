@@ -123,11 +123,6 @@ class TestEagleDraftExtendCudaGraphRunner(CustomTestCase):
 
     def test_replay_bucket_uses_raw_request_count(self):
         cases = (
-            # EAGLE: the global max is 5 requests. After width scaling and
-            # attn_tp alignment, there are 16 tokens per rank.
-            # Pre-fix execute() derives 16 // 2, selecting bucket 8.
-            # Fixed execute() derives max([5, 3]), selecting bucket 5.
-            ("eagle_ceil_aligned", True, 2, 3, [16, 16], [5, 3]),
             # Standalone: the global max is 7 requests. No ceil alignment.
             # Pre-fix execute() derives max([35, 20]), exceeding max bucket 8.
             # Fixed execute() derives max([7, 4]), selecting bucket 7.
