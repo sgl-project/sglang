@@ -240,6 +240,36 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
 
 
+class _PiecewiseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    """PISA (piecewise sparse) attention backend resolver.
+
+    The kernels are Triton-based and CUDA-only. If Triton / the tensor
+    descriptor API is unavailable we fall back to dense FlashAttention so
+    the ``ltx_full_opt`` preset stays runnable in reduced-capability envs.
+    """
+
+    backend = AttentionBackendEnum.PIECEWISE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        try:
+            import triton  # noqa: F401
+            from triton.tools.tensor_descriptor import TensorDescriptor  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.piecewise_attn import (  # noqa: F401
+                PiecewiseAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.piecewise_attn.PiecewiseAttentionBackend"
+        except ImportError as e:
+            logger.info(
+                "Piecewise (PISA) Attention backend is not available (%s); "
+                "falling back to Flash Attention.",
+                e,
+            )
+            return AttentionBackendEnum.FA
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -278,6 +308,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VideoSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _VMOBAAttentionBackendResolver,
+        _PiecewiseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )

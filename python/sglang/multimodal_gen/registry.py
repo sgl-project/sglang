@@ -87,6 +87,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -153,6 +156,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
@@ -1049,6 +1053,21 @@ def _register_configs():
         model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
     )
 
+    # SANA-Video must be registered before the generic SANA image detector.
+    register_configs(
+        sampling_param_cls=SanaVideoSamplingParams,
+        pipeline_config_cls=SanaVideoPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
+            )
+            and "720" not in hf_id.lower()
+        ],
+    )
+
     # SANA
     register_configs(
         sampling_param_cls=SanaSamplingParams,
@@ -1066,6 +1085,8 @@ def _register_configs():
                 "sana" in hf_id.lower()
                 and "sana-wm" not in hf_id.lower()
                 and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
             )
         ],
     )
