@@ -713,6 +713,9 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Fused indexer top-k (LiteTopk, SM100 only): prefill scoring + top-k in
+    # one pass, never materializing the [num_q, seq_len] logits. Opt-in.
+    SGLANG_ENABLE_DSA_LITETOPK = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
