@@ -37,21 +37,19 @@ def _combine_lse(m_a, l_a, m_b, l_b):
     return m_new, l_new
 
 
-@triton.jit(do_not_specialize=["num_rows"])
+@triton.jit
 def _row_logsumexp_kernel(
     x_ptr,
     out_max_ptr,
     out_log_sum_ptr,
     row_stride,
     col_stride,
-    num_rows,
     # int rather than tl.constexpr so triton does not unroll the loop
     num_cols,
     BLOCK_N: tl.constexpr,
 ):
+    # One program per row.
     row = tl.program_id(0).to(tl.int64)
-    if row >= num_rows:
-        return
     row_ptr = x_ptr + row * row_stride
 
     m_i = float("-inf")
@@ -94,7 +92,6 @@ def row_logsumexp(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         out_log_sum,
         x.stride(0),
         x.stride(1),
-        num_rows,
         num_cols,
         BLOCK_N=BLOCK_N,
         num_warps=8,
@@ -134,7 +131,7 @@ def _unpack_idx(keys):
     return 2147483647 - (keys & 0x7FFFFFFF).to(tl.int32)
 
 
-@triton.jit(do_not_specialize=["num_rows"])
+@triton.jit
 def _row_logsumexp_topk_kernel(
     x_ptr,
     out_max_ptr,
@@ -143,7 +140,6 @@ def _row_logsumexp_topk_kernel(
     out_top_idx_ptr,
     row_stride,
     col_stride,
-    num_rows,
     # int rather than tl.constexpr so triton does not unroll the loop
     num_cols,
     K: tl.constexpr,
@@ -152,9 +148,8 @@ def _row_logsumexp_topk_kernel(
     K_PAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    # One program per row.
     row = tl.program_id(0).to(tl.int64)
-    if row >= num_rows:
-        return
     row_ptr = x_ptr + row * row_stride
 
     m_i = float("-inf")
@@ -275,7 +270,6 @@ def row_logsumexp_topk(
         top_idx,
         x.stride(0),
         x.stride(1),
-        num_rows,
         num_cols,
         K=k,
         # Floor 2: K_PAD=1 would degenerate the kernel's [BLOCK_N // K_PAD,
