@@ -1,0 +1,287 @@
+---
+title: "PD commit-gated preallocation: Execution walkthrough"
+description: "A plain-language walkthrough of the proposed PD optimistic prefill commit gate."
+sidebarTitle: "PD commit-gate walkthrough"
+tag: "DRAFT"
+---
+
+<Warning>
+  This document explains a proposed design. The protocol is not implemented or
+  enabled. The [main RFC](/docs/developer_guide/pd_optimistic_prefill_commit_rfc)
+  remains the normative specification.
+</Warning>
+
+## The design in one sentence
+
+Decode may prepare networking early, but it cannot reserve decode KV or a
+request slot until the prefill scheduler has irrevocably admitted the matching
+request.
+
+In shorthand:
+
+```text
+P final scheduler admission
+          happens before
+D scarce-capacity preallocation
+```
+
+This changes resource ordering without serializing the two HTTP requests or
+making prefill wait for decode.
+
+## Why the current order can stall
+
+There are three participants:
+
+| Participant | Responsibility |
+| --- | --- |
+| SMG | Selects one prefill worker and one decode worker and dispatches both requests |
+| P | Admits the prompt, runs prefill, and owns the source KV until transfer |
+| D | Reserves destination KV, receives transferred KV, and runs decode |
+
+Today, P and D can make their scarce allocations independently. Two requests
+can therefore acquire the two stages in opposite orders:
+
+```text
+Request A:
+  P admitted A and holds P KV
+  D cannot reserve space for A
+
+Request B:
+  D reserved KV for B
+  P cannot admit B
+
+P capacity held by A blocks B
+D capacity held by B blocks A
+```
+
+Neither polling nor another notification breaks that dependency. A timeout or
+unrelated request eventually releases capacity, but until then useful capacity
+is stranded.
+
+## The important scope: one allocator domain
+
+The ordering rule belongs to a shared allocator domain, not to an individual
+request.
+
+An allocator domain is the set of requests that compete for the same request
+slots, KV pools, model/metadata buffers, or cache partitions. A participating
+domain is in one of two modes for its complete serving epoch:
+
+```text
+LEGACY_ONLY        all execution requests use the current D-first-capable path
+ENFORCE_EXCLUSIVE  all execution requests pass the new commit gate
+```
+
+The two modes cannot share allocators. In particular, a canary cannot randomly
+enable the protocol for 10% of requests on the same workers. That would still
+allow this cycle:
+
+```text
+A is enforce: P(A) committed and waits for D capacity
+B is legacy:  D(B) preallocated and waits for P capacity
+```
+
+Instead, a canary routes traffic to a separate, allocator-disjoint worker pool
+before selecting a P/D pair. An unsupported request sent to an enforce worker
+fails before execution-capable state or allocation; it cannot fall back to the
+legacy protocol on that worker.
+
+## Normal request flow
+
+### 1. SMG validates and binds one pair
+
+SMG reads P and D discovery records and verifies that both workers advertise
+the same supported policy, compatible capabilities, healthy serving epochs,
+and `ENFORCE_EXCLUSIVE` allocator domains.
+
+It creates one immutable pair identity, prepares both role-specific requests,
+and crosses `PAIR_BOUND` immediately before either request can perform network
+I/O. P and D HTTP dispatch can then proceed concurrently.
+
+### 2. D registers without taking model capacity
+
+D may receive its request first. It validates the envelope, creates bounded
+control state, initializes the Mooncake receiver/topology, reserves the
+pair's bounded control/channel resources, and starts waiting for P's commit
+result.
+
+At this point D is `D_REGISTERED`. It owns no decode request slot, device or
+host KV, model metadata buffer, or cache lock, and it is not in the existing
+decode preallocation queue.
+
+### 3. P reaches final scheduler admission
+
+P validates its request and lets the existing scheduler decide when it can be
+admitted. Immediately after final admission succeeds, and before launching the
+GPU forward, the scheduler verifies that P already owns every finite
+per-request prerequisite needed to finish prefill:
+
+- request slot and source KV;
+- required model/metadata buffer and cache ownership;
+- sender/session state;
+- bounded protocol commands, correlations, replay state, and cleanup credit.
+
+The scheduler then publishes an immutable `P_COMMITTED` snapshot with an O(1)
+local state change.
+
+`P_COMMITTED` means P will not retract, requeue, or ask for another finite P
+admission resource. It does **not** mean prefill compute has completed.
+
+### 4. P launches immediately
+
+After the local commit publication, P launches the prefill forward. It does not
+wait for D, for a commit response, or for network acknowledgment.
+
+This preserves the useful overlap: while P is computing, D can learn about the
+commit and prepare the destination.
+
+### 5. D becomes eligible and preallocates
+
+D retries the same logical commit wait until it receives P's immutable result
+or its local deadline expires. The D scheduler validates the complete pair
+identity, both serving epochs, allocator-domain records, policy, generation,
+and remaining validity window.
+
+Only when the commit matches and D's non-scarce receiver/channel setup is ready
+does D enter `D_ELIGIBLE`. Only `D_ELIGIBLE` may enter the existing decode
+preallocation queue and call the existing allocator.
+
+The causal chain is now:
+
+```text
+D owns scarce decode capacity
+  => D verified P_COMMITTED for the same pair
+  => P already completed final admission for that request
+  => P does not need another finite P admission resource to finish it
+```
+
+That implication is what removes the cross-request capacity cycle.
+
+### 6. D sends destination metadata
+
+After preallocation, D freezes the destination indices into one immutable V1
+metadata message. It sends that message to P and retries the exact same bytes
+on an ambiguous send or reconnect. A retry does not create a new pair,
+generation, buffer, or logical correlation.
+
+D also starts one logical wait for the transfer result.
+
+### 7. P joins compute and metadata
+
+Two events may arrive in either order:
+
+| First event | P behavior |
+| --- | --- |
+| Prefill compute finishes first | Keep source ownership and wait for destination metadata |
+| Destination metadata arrives first | Register it once and wait for prefill compute |
+
+Both events set scheduler-owned readiness bits. Only when both are true does P
+submit one KV transfer. A transport thread reports completion through a bounded
+scheduler command; it cannot directly change protocol state.
+
+### 8. D validates success and starts decoding
+
+P fixes one immutable `SUCCESS` or `FAILED` transfer snapshot. If the first
+response is lost, D repeats the same logical status wait and P replays the same
+snapshot.
+
+Only a matching `SUCCESS` lets D enter `D_RUNNING`. P releases its source
+request/KV/metadata/cache/session owners exactly once and retains only bounded
+replay state for the specified TTL. Failure, cancellation, and deadlines use
+the same ownership ledger and cleanup path.
+
+The complete fast path is:
+
+```text
+SMG: bind pair -> dispatch P and D concurrently
+
+D: validate -> REGISTERED -> receiver/channel ready -> wait for commit
+P: validate -> scheduler admission -> COMMITTED -> launch prefill
+D: verify commit -> ELIGIBLE -> preallocate -> send metadata -> wait for status
+P: compute done + metadata ready -> transfer -> publish immutable status
+D: verify SUCCESS -> RUNNING
+P: release source ownership -> retain bounded replay snapshot
+```
+
+## What happens when messages race or disappear
+
+The protocol separates a semantic result from a transport attempt:
+
+| Event | Result |
+| --- | --- |
+| D's commit wait arrives before P's HTTP body | P creates bounded control-only waiter state; no model capacity |
+| P's HTTP body arrives first | P creates precommit state; the later wait attaches to it |
+| Commit response is lost | D retries the same logical wait; P replays the immutable commit snapshot |
+| First metadata send is ambiguous | D resends byte-identical metadata through the reserved logical delivery |
+| Transfer-status response is lost | D retries the same logical status wait; P replays the immutable result snapshot |
+| Duplicate or late message | Matching fixed result is replayed, or stale input is rejected; state is not resurrected |
+| Worker restarts | A new serving epoch fences all frames and pair state from the old process |
+
+Logical sequence and generation values are fixed to one in version 1. A
+reconnect changes only the transport attempt, not the logical operation.
+
+## What happens on failure
+
+Every non-running phase has a local, non-refreshable monotonic deadline. A
+retry or reconnect cannot extend the pair's lifetime. On failure, cancel, or
+deadline, the scheduler removes the request from every owner and publishes
+terminal state only after local resources are actually released.
+
+SMG has a separate safety rule:
+
+- Before `PAIR_BOUND`, selection/preparation may retry only if neither worker
+  request performed network I/O.
+- At or after `PAIR_BOUND`, version 1 never selects a replacement P/D pair.
+  It sends bounded best-effort cancellation to the originally pinned workers
+  and returns an error.
+
+The second rule avoids old and new executions overlapping after an ambiguous
+HTTP failure. It also means version 1 may expose more transient worker failures
+than today's Router, which can reselect workers. Safe transparent rerouting is a
+separate follow-up that needs terminal proof from both old workers.
+
+## Performance and availability expectations
+
+P's GPU launch does not wait for the new control exchange. D performs receiver
+and channel setup in parallel, but scarce D preallocation starts only after the
+commit snapshot reaches D's scheduler.
+
+For a long prefill, that control latency is normally hidden under compute. For
+a very short prompt or cache hit, delaying D allocation by a fraction of a
+millisecond can be visible. The implementation therefore requires persistent
+multiplexed channels, O(1) scheduler hooks, bounded mailbox work, and no
+per-request connections or registry scans.
+
+The Router rule is a separate availability trade-off: after `PAIR_BOUND`, a
+transient connect error or retryable 5xx becomes user-visible instead of
+selecting another pair. Rollout must measure this under controlled fault load,
+record how many failures legacy would have retried, and stop or roll back the
+isolated enforce pool if either the configured added-error-rate or error-budget
+threshold is exceeded.
+
+## Safe rollout shape
+
+```text
+legacy traffic  -> LEGACY_ONLY P/D pool  -> existing behavior
+canary traffic  -> ENFORCE_EXCLUSIVE pool -> commit-gated behavior
+```
+
+Workers are drained before changing allocator-domain mode or membership, and a
+new serving epoch/domain record is published after the change. Rollout is not a
+request flag flip inside one pool.
+
+The enforce pool remains disabled until it passes:
+
+1. The original A/B reproducer and a mixed enforce/legacy isolation test.
+2. State, identity, restart, cancellation, replay, and bounded-memory fault
+   tests.
+3. Cross-process Mooncake integration.
+4. Real-GPU throughput, TTFT, inter-token latency, scheduler CPU, and memory
+   gates.
+5. Transient-fault availability and automatic rollback gates.
+
+Detailed wire contracts, resource credits, retention formulas, and the full
+test matrix are intentionally omitted here. See the
+[main RFC](/docs/developer_guide/pd_optimistic_prefill_commit_rfc) and
+[reservation and validation appendix](/docs/developer_guide/pd_optimistic_prefill_commit_rfc_appendix)
+for the normative design.
