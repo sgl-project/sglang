@@ -52,7 +52,7 @@ if USE_AITER:
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_norm_rope_with_cos_sin_cache_inplace
+    from sgl_kernel import fused_inplace_qknorm_rope
 
 if not _is_cpu:
     from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
@@ -1048,6 +1048,8 @@ def apply_qk_norm_rope(
         )
         return q, k
 
+    # TODO: Once CUDA fused_inplace_qknorm_rope supports last-dimension-contiguous q/k,
+    # merge this path with the CUDA fused qknorm+rope branch.
     if (
         _is_xpu
         and allow_inplace
@@ -1058,7 +1060,7 @@ def apply_qk_norm_rope(
         and head_dim in (64, 128, 256)
         and rope_dim in (32, 64, 128, 256)
     ):
-        fused_qk_norm_rope_with_cos_sin_cache_inplace(
+        fused_inplace_qknorm_rope(
             q=q,
             k=k,
             q_weight=q_norm.weight,
