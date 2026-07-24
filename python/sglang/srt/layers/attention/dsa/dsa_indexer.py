@@ -566,6 +566,16 @@ class Indexer(MultiPlatformOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
+            # Decode k-only skip (both the captured dual-graph "dense" variant
+            # and the eager per-step skip below) is currently HIP-only. On CUDA
+            # this common code keeps the original behavior (decode never skips
+            # the indexer, i.e. always runs the full logits path) because the
+            # decode k-only path has not been validated on CUDA yet. Mirrors the
+            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
+            # already prevents the CUDA capture path from setting a "dense"
+            # variant.
+            if not _is_hip:
+                return False
             if get_is_capture_mode():
                 # Under a captured decode cuda graph the taken branch is frozen at
                 # capture time, so we must NOT branch on a runtime seq_len (also a
