@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -1648,9 +1649,10 @@ class PreshardedModelLoader(DefaultModelLoader):
     First run loads weights normally then ranks coordinate to dump a
     deduplicated, content-hashed safetensors set. Subsequent runs with the
     same parallelism + quantization config skip the source ckpt entirely:
-    each rank reads only the files containing tensors it needs, then
-    computes a single per-rank SHA1 over all loaded tensors (multi-threaded)
-    and compares against the per-rank checksums in ``checksum.json``.
+    each rank reads only the files containing tensors it needs. Optional
+    ``verify_on_load`` re-hashes loaded tensors (xxh3-128) and compares
+    against the per-rank checksums in ``checksum.json``; off by default so
+    reload stays a pure safetensors→device copy.
     """
 
     DEFAULT_SUBDIR = "presharded"
@@ -1658,8 +1660,12 @@ class PreshardedModelLoader(DefaultModelLoader):
     CHECKSUM_FILENAME = "checksum.json"
     READY_FILENAME = "READY"
     TMP_SUBDIR = "_tmp_presharding"
+    # Content digests are xxh3-128 (non-crypto). Feature not yet released, so
+    # keep version at 1; bump only if an on-disk plan format breaks later.
     PLAN_VERSION = 1
     DEFAULT_HASH_NUM_THREADS = 8
+    # Hex length of xxhash.xxh3_128(...).hexdigest().
+    _CONTENT_HASH_HEX_LEN = 32
 
     def __init__(self, load_config: LoadConfig):
         extra = (
@@ -1672,7 +1678,15 @@ class PreshardedModelLoader(DefaultModelLoader):
         self._hash_num_threads = int(
             extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
         )
-        self._verify_on_load = bool(extra.pop("verify_on_load", True))
+        # Default False: reload is I/O + copy_ only. Set true to re-hash and
+        # check rank_checksums (useful after transport/storage concerns).
+        self._verify_on_load = bool(extra.pop("verify_on_load", False))
+        # Same knobs as DefaultModelLoader's source-weight path; left in
+        # ``extra`` so first-time dump still multi-threads the HF load.
+        self._enable_multithread_load = bool(extra.get("enable_multithread_load", True))
+        self._num_threads = int(extra.get("num_threads", self.DEFAULT_NUM_THREADS))
+        if self._num_threads < 1:
+            raise ValueError(f"num_threads must be >= 1, got {self._num_threads}")
         load_config.model_loader_extra_config = extra
         # Switch to AUTO so DefaultModelLoader's source-ckpt discovery
         # accepts the format; PRESHARDED is consumed by get_model_loader's
@@ -1954,69 +1968,55 @@ class PreshardedModelLoader(DefaultModelLoader):
         except (AssertionError, AttributeError):
             pass
 
-    # Chunk size for pinned D2H streaming SHA-1 of CUDA tensors (bytes).
+    # Chunk size for pinned D2H streaming hash of CUDA tensors (bytes).
     _HASH_STREAM_CHUNK_BYTES = 8 << 20  # 8 MiB
-    # Below this size, optional CUDA JIT SHA-1 is competitive with host path.
-    _HASH_CUDA_JIT_MAX_BYTES = 4 << 20  # 4 MiB
+
+    @staticmethod
+    def _new_content_hasher():
+        """xxh3-128 hasher for tensor content digests (non-cryptographic).
+
+        Chosen for throughput (~10× SHA-1 on host) while still giving a
+        128-bit fingerprint for content-dedup and optional load verify.
+        Collision risk is negligible for accidental corruption of self-dumped
+        weights; not intended as a defense against adversarial inputs.
+        """
+        import xxhash
+
+        return xxhash.xxh3_128()
 
     @staticmethod
     def _hash_tensor(tensor: torch.Tensor) -> str:
-        """Full SHA1 over (shape, dtype, raw bytes); shared by content-dedup
-        and verification — collisions would silently corrupt loaded weights,
-        so a probabilistic fingerprint is unsafe.
+        """xxh3-128 over (shape, dtype, raw little-endian bytes).
 
-        Digests always match
-        ``hashlib.sha1(shape_str + dtype_str + raw_le_bytes).hexdigest()``.
-
-        CUDA tensors default to **pinned streaming D2H + host SHA-1** (avoids
-        peak host allocation of the full tensor). Optional CUDA JIT SHA-1
-        (``SGLANG_PRESHARDED_USE_CUDA_SHA1``) hashes on-device with identical
-        digests; sequential SHA-1 on GPU is slower for multi-GB weights, so
-        it is off by default and auto-used only for small tensors when enabled.
+        Shared by dump-time content-dedup (``stored_key``) and optional
+        ``verify_on_load``. Digests are device-independent: CUDA tensors use
+        pinned streaming D2H + the same host hasher so multi-GB weights never
+        need a single contiguous host allocation of the full tensor.
         """
         t = tensor.detach()
         prefix = str(tuple(t.shape)).encode() + str(t.dtype).encode()
+        h = PreshardedModelLoader._new_content_hasher()
+        h.update(prefix)
 
         if t.numel() == 0:
-            return hashlib.sha1(prefix).hexdigest()
+            return h.hexdigest()
 
         cont = t.contiguous()
         flat_u8 = cont.reshape(-1).view(torch.uint8)
-        nbytes = flat_u8.numel()
-        force_cpu = envs.SGLANG_PRESHARDED_FORCE_CPU_SHA1.get()
-        use_cuda_sha1 = envs.SGLANG_PRESHARDED_USE_CUDA_SHA1.get()
+        if cont.is_cuda:
+            return PreshardedModelLoader._hash_tensor_cuda_streamed(h, flat_u8)
 
-        # CUDA JIT path: identical digests; sequential on-device compress is
-        # slower than host for multi-GB tensors, so only use when opted in.
-        if cont.is_cuda and not force_cpu and use_cuda_sha1:
-            try:
-                from sglang.kernels.jit.sha1 import sha1_prefix_data_cuda
-
-                return sha1_prefix_data_cuda(prefix, flat_u8).hex()
-            except Exception as e:
-                logger.warning(
-                    "CUDA SHA-1 JIT unavailable (%s); falling back to host SHA-1",
-                    e,
-                )
-
-        if cont.is_cuda and not force_cpu:
-            return PreshardedModelLoader._hash_tensor_cuda_streamed(prefix, flat_u8)
-
-        h = hashlib.sha1()
-        h.update(prefix)
         cpu = flat_u8.to(device="cpu", copy=False).contiguous()
         h.update(memoryview(cpu.numpy()))
         return h.hexdigest()
 
     @staticmethod
-    def _hash_tensor_cuda_streamed(prefix: bytes, flat_u8: torch.Tensor) -> str:
-        """SHA-1 via double-buffered pinned D2H + host hashlib (identical digest).
+    def _hash_tensor_cuda_streamed(hasher, flat_u8: torch.Tensor) -> str:
+        """Double-buffered pinned D2H + host hasher (identical to full .cpu()).
 
         Overlaps the next chunk's device-to-host copy with hashing the current
         chunk so multi-GB weights never need a single contiguous host allocation.
         """
-        h = hashlib.sha1()
-        h.update(prefix)
         nbytes = int(flat_u8.numel())
         chunk = PreshardedModelLoader._HASH_STREAM_CHUNK_BYTES
         pins = [
@@ -2039,15 +2039,15 @@ class PreshardedModelLoader(DefaultModelLoader):
                 # Hash previous chunk while this copy runs.
                 if prev_event is not None:
                     prev_event.synchronize()
-                    h.update(memoryview(pins[prev_idx][:prev_n].numpy()))
+                    hasher.update(memoryview(pins[prev_idx][:prev_n].numpy()))
                 prev_event, prev_n, prev_idx = ev, n, idx
                 off += n
                 i += 1
             else:
                 prev_event.synchronize()
-                h.update(memoryview(pins[prev_idx][:prev_n].numpy()))
+                hasher.update(memoryview(pins[prev_idx][:prev_n].numpy()))
                 prev_event = None
-        return h.hexdigest()
+        return hasher.hexdigest()
 
     def _verify_rank_checksum(
         self,
@@ -2056,7 +2056,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         rank: int,
         presharded_dir: str,
     ) -> None:
-        """Combine pre-computed per-tensor (name, content-SHA) pairs into the
+        """Combine pre-computed per-tensor (name, content-hash) pairs into the
         rank-level aggregate checksum and compare against the dump plan. The
         aggregate is a sum (mod 2^64) of per-tensor 64-bit digests; addition
         is commutative so order doesn't matter. See ``_build_dump_plan`` for
@@ -2073,7 +2073,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         total = 0
         for name, content_hash in verify_hashes:
-            d = hashlib.sha1((name + ":" + content_hash).encode("utf-8")).digest()
+            d = PreshardedModelLoader._fold_name_content_digest(name, content_hash)
             total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
         actual = format(total, "016x")
 
@@ -2085,6 +2085,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 f"verification with --model-loader-extra-config "
                 f"'{{\"verify_on_load\": false}}'."
             )
+
+    @staticmethod
+    def _fold_name_content_digest(name: str, content_hash: str) -> bytes:
+        """64-bit-usable digest of ``name:content_hash`` for rank aggregates."""
+        h = PreshardedModelLoader._new_content_hasher()
+        h.update((name + ":" + content_hash).encode("utf-8"))
+        return h.digest()
 
     @staticmethod
     def _collect_extra_tensors(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -2242,8 +2249,8 @@ class PreshardedModelLoader(DefaultModelLoader):
             os.makedirs(tmp_dir, exist_ok=True)
         self._world_barrier()
 
-        # hashlib.update releases the GIL on bytes-like buffers, so threading
-        # gives real parallel SHA1 across tensors.
+        # xxhash releases the GIL on update, so threading parallelizes content
+        # digests across tensors (needed for stored_key content-dedup).
         items: List[Tuple[str, torch.Tensor, bool]] = []
         items.extend((n, t, False) for n, t in state_dict.items())
         items.extend((n, t, True) for n, t in extras.items())
@@ -2448,8 +2455,8 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         # Per-rank aggregate checksum: sum (mod 2^64) of per-tensor 64-bit
         # digests for every tensor a rank owns. Each per-tensor digest is the
-        # first 8 bytes of SHA1(name + ":" + content_sha) interpreted big-
-        # endian. The sum is commutative, so reload can accumulate
+        # first 8 bytes of xxh3-128(name + ":" + content_hash) interpreted
+        # big-endian. The sum is commutative, so reload can accumulate
         # concurrently without sorting. 64 bits is ample for non-adversarial
         # corruption detection; collision probability is ~2^-64 per pair of
         # distinct tensor sets.
@@ -2457,9 +2464,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         for r in range(world_size):
             total = 0
             for rec in rank_to_reads.get(r, []):
-                d = hashlib.sha1(
-                    (rec["name"] + ":" + rec["stored_key"]).encode("utf-8")
-                ).digest()
+                d = cls._fold_name_content_digest(rec["name"], rec["stored_key"])
                 total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
             rank_checksums[str(r)] = format(total, "016x")
 
@@ -2501,14 +2506,164 @@ class PreshardedModelLoader(DefaultModelLoader):
                 tensors_to_save[t["stored_key"]] = tensor
             save_file(tensors_to_save, os.path.join(presharded_dir, f["filename"]))
 
+    @staticmethod
+    def _read_presharded_file(
+        full_path: str, stored_keys: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """Disk→CPU load of the unique tensors needed from one safetensors file.
+
+        Safe to call from worker threads: pure host I/O, no model mutation.
+        """
+        from safetensors.torch import safe_open
+
+        with safe_open(full_path, framework="pt") as fh:
+            return {key: fh.get_tensor(key) for key in stored_keys}
+
+    def _apply_presharded_file(
+        self,
+        *,
+        items: List[Dict[str, Any]],
+        cached: Dict[str, torch.Tensor],
+        model: nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        target_device: torch.device,
+        loaded_param_keys: set,
+        verify_hashes: List[Tuple[str, str]],
+    ) -> None:
+        """Install one file's host tensors into the model (main thread).
+
+        No mid-load ``empty_cache``: ``copy_`` overwrites existing param
+        storage in place, so the caching allocator does not grow; a single
+        sync+empty_cache after all files matches DefaultModelLoader.
+        """
+        if self._verify_on_load:
+            # Hash each unique stored_key in parallel. Also page-faults
+            # mmap'd safetensors into RAM before copy_.
+            keys = list(cached.keys())
+            n_workers = min(max(1, len(keys)), self._hash_num_threads)
+
+            def _hash_one(key, _cached=cached):
+                return key, self._hash_tensor(_cached[key])
+
+            if n_workers <= 1:
+                key_to_hash = dict(_hash_one(k) for k in keys)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=n_workers,
+                    thread_name_prefix="presharded-verify",
+                ) as ex:
+                    key_to_hash = dict(ex.map(_hash_one, keys))
+            for r in items:
+                verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
+
+        for r in items:
+            tensor = cached[r["stored_key"]]
+            if r.get("is_extra"):
+                # Install immediately and drop the existing placeholder so
+                # the model-init GPU tensor can be freed before the next
+                # batch of extras allocates. Avoids holding old + new
+                # simultaneously across the whole load.
+                module_path, _, attr_name = r["name"].rpartition(".")
+                module = model.get_submodule(module_path) if module_path else model
+                if hasattr(module, attr_name):
+                    try:
+                        delattr(module, attr_name)
+                    except AttributeError:
+                        pass
+                setattr(module, attr_name, tensor.to(target_device))
+                continue
+            if r["name"] not in state_dict:
+                # Legacy dumps may omit Parameter aliases that the re-init
+                # model still exposes (or vice versa). Skip unknown names;
+                # missing required keys are checked after the loop.
+                # View-only aliases are rebound below.
+                continue
+            param_data = state_dict[r["name"]].data
+            param_shape = state_dict[r["name"]].shape
+            for dim, size in enumerate(tensor.shape):
+                if size < param_shape[dim]:
+                    param_data = param_data.narrow(dim, 0, size)
+            if tensor.shape != param_shape:
+                logger.warning(
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
+                    tensor.shape,
+                    r["name"],
+                    param_shape,
+                )
+            param_data.copy_(tensor)
+            loaded_param_keys.add(r["name"])
+
+        # Drop host-side refs so multi-thread prefetch can reclaim RAM.
+        cached.clear()
+        del cached
+
+    def _iter_presharded_files(
+        self,
+        by_file: Dict[str, List[Dict[str, Any]]],
+        presharded_dir: str,
+    ) -> Generator[Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]], None, None]:
+        """Yield (items, host_tensors) per file, multi-threaded when enabled.
+
+        Worker threads only perform disk→CPU reads. The consumer (main
+        thread) applies tensors to the model so CUDA state stays single-
+        threaded. Peak host RAM is bounded to roughly
+        ``num_threads`` in-flight files.
+        """
+        file_items = list(by_file.items())
+        if not file_items:
+            return
+
+        use_mt = self._enable_multithread_load and self._num_threads > 1
+        if not use_mt or len(file_items) == 1:
+            for filename, items in file_items:
+                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+                full_path = os.path.join(presharded_dir, filename)
+                yield items, self._read_presharded_file(full_path, stored_keys)
+            return
+
+        max_workers = min(self._num_threads, len(file_items))
+        logger.info(
+            "Multi-thread loading %d presharded files with %d workers",
+            len(file_items),
+            max_workers,
+        )
+
+        def _job(
+            filename: str, items: List[Dict[str, Any]]
+        ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
+            stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+            full_path = os.path.join(presharded_dir, filename)
+            return items, self._read_presharded_file(full_path, stored_keys)
+
+        # Sliding window: at most max_workers files resident in host RAM.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="presharded-load",
+        ) as executor:
+            file_iter = iter(file_items)
+            pending: set = set()
+            for filename, items in itertools.islice(file_iter, max_workers):
+                pending.add(executor.submit(_job, filename, items))
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    pending.remove(fut)
+                    yield fut.result()
+                    next_item = next(file_iter, None)
+                    if next_item is not None:
+                        filename, items = next_item
+                        pending.add(executor.submit(_job, filename, items))
+
     def _load_from_presharded(
         self,
         model_config: ModelConfig,
         device_config: DeviceConfig,
         presharded_dir: str,
     ) -> nn.Module:
-        from safetensors.torch import safe_open
-
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
 
@@ -2546,95 +2701,23 @@ class PreshardedModelLoader(DefaultModelLoader):
                 by_file[r["filename"]].append(r)
 
             loaded_param_keys: set = set()
-            # (name, content-SHA) pairs accumulated across files. Per-tensor
-            # SHAs are computed eagerly inside the per-file loop so we can
-            # release tensor references after each file (otherwise the rank
-            # would hold every loaded tensor in memory until end-of-load).
-            # Always populated — not gated by verify_on_load — so that both
-            # code paths traverse items identically before the copy loop,
-            # ensuring the same CPU-cache warming effect for all items.
-            # Only the final aggregate comparison is gated by verify_on_load.
+            # Optional verify: (name, content-hash) pairs. Only computed when
+            # verify_on_load is True — the default path is pure get_tensor +
+            # copy_ so reload stays I/O-bound rather than hash-bound.
             verify_hashes: List[Tuple[str, str]] = []
-            for filename, items in by_file.items():
-                full_path = os.path.join(presharded_dir, filename)
-                with safe_open(full_path, framework="pt") as fh:
-                    # Read each unique stored_key once; dedup'd entries
-                    # reference the same key under multiple param names.
-                    cached: Dict[str, torch.Tensor] = {}
-                    for r in items:
-                        if r["stored_key"] not in cached:
-                            cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
-
-                # Hash each unique stored_key in parallel (multi-threaded).
-                # Primary purpose: parallel mmap page-faults so the
-                # subsequent ``param_data.copy_`` finds pages already in RAM
-                # rather than paying serial faults on the critical path on a
-                # network FS. Secondary purpose: populate ``key_to_hash`` for
-                # the always-run accumulation loop below.
-                keys = list(cached.keys())
-                n_workers = min(max(1, len(keys)), self._hash_num_threads)
-
-                def _hash_one(key, _cached=cached):
-                    return key, self._hash_tensor(_cached[key])
-
-                if n_workers <= 1:
-                    key_to_hash = dict(_hash_one(k) for k in keys)
-                else:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=n_workers,
-                        thread_name_prefix="presharded-readahead",
-                    ) as ex:
-                        key_to_hash = dict(ex.map(_hash_one, keys))
-                for r in items:
-                    verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
-
-                for r in items:
-                    tensor = cached[r["stored_key"]]
-                    if r.get("is_extra"):
-                        # Install immediately and drop the existing
-                        # placeholder so the model-init GPU tensor can be
-                        # freed before the next batch of extras allocates.
-                        # Avoids holding old + new simultaneously across the
-                        # whole load.
-                        module_path, _, attr_name = r["name"].rpartition(".")
-                        module = (
-                            model.get_submodule(module_path) if module_path else model
-                        )
-                        if hasattr(module, attr_name):
-                            try:
-                                delattr(module, attr_name)
-                            except AttributeError:
-                                pass
-                        setattr(module, attr_name, tensor.to(target_device))
-                        continue
-                    if r["name"] not in state_dict:
-                        # Legacy dumps may omit Parameter aliases that the
-                        # re-init model still exposes (or vice versa). Skip
-                        # unknown names; missing required keys are checked
-                        # after the loop. View-only aliases are rebound below.
-                        continue
-                    param_data = state_dict[r["name"]].data
-                    param_shape = state_dict[r["name"]].shape
-                    for dim, size in enumerate(tensor.shape):
-                        if size < param_shape[dim]:
-                            param_data = param_data.narrow(dim, 0, size)
-                    if tensor.shape != param_shape:
-                        logger.warning(
-                            "loading tensor of shape %s into "
-                            "parameter '%s' of shape %s",
-                            tensor.shape,
-                            r["name"],
-                            param_shape,
-                        )
-                    param_data.copy_(tensor)
-                    loaded_param_keys.add(r["name"])
-                # Drop per-file references and drain in-flight copies before
-                # advancing to the next file; otherwise CUDA-stream pinned
-                # buffers and dropped placeholder tensors accumulate.
-                cached.clear()
-                del cached
+            for items, cached in self._iter_presharded_files(by_file, presharded_dir):
+                self._apply_presharded_file(
+                    items=items,
+                    cached=cached,
+                    model=model,
+                    state_dict=state_dict,
+                    target_device=target_device,
+                    loaded_param_keys=loaded_param_keys,
+                    verify_hashes=verify_hashes,
+                )
+            # One-shot cleanup after all files (same as DefaultModelLoader).
+            if torch.cuda.is_available():
                 torch.cuda.synchronize()
-                gc.collect()
                 torch.cuda.empty_cache()
 
             # A Parameter may appear under multiple state_dict names that

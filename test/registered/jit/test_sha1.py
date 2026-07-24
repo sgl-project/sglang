@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from sglang.kernels.jit.sha1 import sha1_bytes_cuda, sha1_prefix_data_cuda
-from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -63,37 +62,6 @@ def test_sha1_prefix_data_matches_hashlib(n: int, prefix: bytes):
     )
     got = sha1_prefix_data_cuda(prefix, data)
     assert got == _ref_sha1(prefix + raw)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(1,), (17,), (64, 64), (3, 7, 11)])
-def test_presharded_hash_tensor_paths_agree(dtype, shape):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    from sglang.srt.environ import envs
-
-    t = torch.randn(*shape, dtype=dtype, device="cuda")
-    with envs.SGLANG_PRESHARDED_FORCE_CPU_SHA1.override(True):
-        cpu_digest = PreshardedModelLoader._hash_tensor(t.cpu())
-    with envs.SGLANG_PRESHARDED_USE_CUDA_SHA1.override(True):
-        with envs.SGLANG_PRESHARDED_FORCE_CPU_SHA1.override(False):
-            jit_digest = PreshardedModelLoader._hash_tensor(t)
-    # Default CUDA path: pinned streaming host SHA-1
-    with envs.SGLANG_PRESHARDED_USE_CUDA_SHA1.override(False):
-        with envs.SGLANG_PRESHARDED_FORCE_CPU_SHA1.override(False):
-            stream_digest = PreshardedModelLoader._hash_tensor(t)
-    assert jit_digest == cpu_digest
-    assert stream_digest == cpu_digest
-
-
-def test_presharded_hash_tensor_empty():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    t = torch.empty(0, dtype=torch.float32, device="cuda")
-    d_gpu = PreshardedModelLoader._hash_tensor(t)
-    d_cpu = PreshardedModelLoader._hash_tensor(t.cpu())
-    assert d_gpu == d_cpu
-    assert len(d_gpu) == 40
 
 
 if __name__ == "__main__":

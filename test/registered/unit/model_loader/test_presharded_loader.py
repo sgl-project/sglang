@@ -58,7 +58,21 @@ class TestPreshardedHashTensor(unittest.TestCase):
         a = torch.empty(0, dtype=torch.float32)
         digest = PreshardedModelLoader._hash_tensor(a)
         self.assertIsInstance(digest, str)
-        self.assertEqual(len(digest), 40)  # sha1 hex
+        self.assertEqual(
+            len(digest), PreshardedModelLoader._CONTENT_HASH_HEX_LEN
+        )  # xxh3-128 hex
+
+    def test_cuda_and_cpu_digests_agree(self):
+        # Streaming D2H + host xxh3 must match a full CPU hash of the same
+        # bytes; otherwise dump/reload verify would false-fail across devices.
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        cpu = torch.arange(10_000, dtype=torch.float32)
+        gpu = cpu.cuda()
+        self.assertEqual(
+            PreshardedModelLoader._hash_tensor(cpu),
+            PreshardedModelLoader._hash_tensor(gpu),
+        )
 
 
 class TestPreshardedFilename(unittest.TestCase):
@@ -787,6 +801,77 @@ class TestShardConfig(unittest.TestCase):
             "trivial",
         )
 
+    def test_iter_presharded_files_multithread_matches_sequential(self):
+        # Multi-thread disk reads must surface the same tensors as the
+        # single-thread path; a race or key-dedup bug would silently drop
+        # or swap weights across files.
+        from safetensors.torch import save_file
+
+        loader = object.__new__(PreshardedModelLoader)
+        loader._enable_multithread_load = True
+        loader._num_threads = 4
+
+        with tempfile.TemporaryDirectory() as tmp:
+            by_file = {}
+            expected = {}
+            for i in range(6):
+                filename = f"shard_{i:03d}.safetensors"
+                tensors = {
+                    f"k{i}_a": torch.full((4,), float(i), dtype=torch.float32),
+                    f"k{i}_b": torch.full((2, 2), float(i + 0.5), dtype=torch.float32),
+                }
+                save_file(tensors, os.path.join(tmp, filename))
+                items = [
+                    {
+                        "filename": filename,
+                        "stored_key": "k{}_a".format(i),
+                        "name": f"p{i}a",
+                    },
+                    {
+                        "filename": filename,
+                        "stored_key": "k{}_b".format(i),
+                        "name": f"p{i}b",
+                    },
+                    # Duplicate stored_key: must be read once, applied twice.
+                    {
+                        "filename": filename,
+                        "stored_key": "k{}_a".format(i),
+                        "name": f"p{i}a_alias",
+                    },
+                ]
+                by_file[filename] = items
+                expected[filename] = {k: v.clone() for k, v in tensors.items()}
+
+            got_mt = {
+                items[0]["filename"]: cached
+                for items, cached in loader._iter_presharded_files(by_file, tmp)
+            }
+            loader._enable_multithread_load = False
+            got_seq = {
+                items[0]["filename"]: cached
+                for items, cached in loader._iter_presharded_files(by_file, tmp)
+            }
+
+        self.assertEqual(set(got_mt), set(expected))
+        self.assertEqual(set(got_seq), set(expected))
+        for filename, tensors in expected.items():
+            self.assertEqual(set(got_mt[filename]), set(tensors))
+            self.assertEqual(set(got_seq[filename]), set(tensors))
+            for key, t in tensors.items():
+                self.assertTrue(torch.equal(got_mt[filename][key], t))
+                self.assertTrue(torch.equal(got_seq[filename][key], t))
+
+    def test_num_threads_must_be_positive(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+
+        with self.assertRaisesRegex(ValueError, "num_threads"):
+            PreshardedModelLoader(
+                LoadConfig(
+                    load_format=LoadFormat.PRESHARDED,
+                    model_loader_extra_config={"num_threads": 0},
+                )
+            )
+
     def test_redump_clears_ready_before_rewrite(self):
         # Config-mismatch re-dump into an already-ready dir must drop READY
         # before mutating files, otherwise concurrent readers can observe
@@ -813,7 +898,7 @@ class TestShardConfig(unittest.TestCase):
                 PreshardedModelLoader,
                 "_build_dump_plan",
                 return_value={
-                    "version": 1,
+                    "version": PreshardedModelLoader.PLAN_VERSION,
                     "files": [],
                     "rank_to_reads": {"0": []},
                     "rank_checksums": {"0": "0"},
