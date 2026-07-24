@@ -12,11 +12,23 @@ import dataclasses
 import logging
 import struct
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# How long a prefill transfer worker waits on a deferred staging chunk before
+# re-sending STAGING_REQ. The staging control plane (STAGING_REQ/STAGING_RSP/
+# WATERMARK) is fire-and-forget ZMQ with no ack: a single lost message would
+# otherwise wedge the chunk in the re-enqueue loop forever, because the ring
+# allocator overcommits and relies entirely on watermark messages for overlap
+# safety. handle_staging_req on the decode side is idempotent (it replays the
+# cached allocation and re-broadcasts the current watermark), so periodic
+# re-request heals both loss modes. Normal waits resolve in milliseconds, so
+# 5s never fires on the happy path.
+STAGING_STALL_RESEND_INTERVAL_SECS = 5.0
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -388,8 +400,20 @@ class DecodeStagingHandler:
                         sock.send_multipart(
                             [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Do not raise: other subscribers must still be notified.
+                    # A lost watermark stalls the prefill until it re-sends
+                    # STAGING_REQ (see STAGING_STALL_RESEND_INTERVAL_SECS),
+                    # so make the loss visible instead of silent.
+                    logger.warning(
+                        "[Staging] Failed to send WATERMARK (round=%s, tail=%s) "
+                        "to session=%s room=%s: %s",
+                        wm_round,
+                        wm_tail,
+                        session_id,
+                        room,
+                        e,
+                    )
 
 
 def is_watermark_ready(
@@ -502,6 +526,15 @@ class PrefillStagingStrategy:
         page_size = kv_manager.kv_buffer_tensors["page_size"]
         cps = kv_manager.server_args.chunked_prefill_size or 8192
         self.full_chunk_pages = max(1, cps // page_size)
+        # (room, chunk_idx, session_id) -> monotonic time of the last
+        # STAGING_REQ (re-)send for a chunk deferred by check_ready.
+        # Worker-local (strategies are never shared across workers), so no
+        # locking is needed.
+        self._stall_since: dict = {}
+        # Worker-local PUSH socket cache for stall-triggered re-sends; kept
+        # separate from the scheduler-thread prefetch sockets because ZMQ
+        # sockets are not thread-safe.
+        self._resend_sockets: dict = {}
 
     def check_ready(
         self,
@@ -549,7 +582,71 @@ class PrefillStagingStrategy:
         if not self.kv_manager._is_watermark_ready(session_id, c_round, c_end):
             return (False, chunk_idx, c_offset, c_round, c_end)
 
+        self._stall_since.pop((req.room, chunk_idx, session_id), None)
         return (True, chunk_idx, c_offset, c_round, c_end)
+
+    def maybe_resend_staging_req(
+        self,
+        room: int,
+        chunk_idx: int,
+        num_chunk_pages: int,
+        session_id: str,
+        endpoint: str,
+        dst_port: int,
+    ) -> bool:
+        """Re-send STAGING_REQ for a chunk stalled on STAGING_RSP/WATERMARK.
+
+        Called by the transfer worker every time a chunk is deferred by
+        check_ready. The first call only arms the stall timer; a send happens
+        when the chunk has been stalled for STAGING_STALL_RESEND_INTERVAL_SECS
+        since the previous (re-)send. This makes the fire-and-forget staging
+        control plane self-healing: handle_staging_req on decode replays the
+        cached allocation (STAGING_RSP) and re-broadcasts the current
+        watermark, recovering from either message being lost.
+
+        Returns True if a STAGING_REQ was re-sent.
+        """
+        key = (room, chunk_idx, session_id)
+        now = time.monotonic()
+        last_send = self._stall_since.get(key)
+        if last_send is None:
+            self._stall_since[key] = now
+            return False
+        if now - last_send < STAGING_STALL_RESEND_INTERVAL_SECS:
+            return False
+        self._stall_since[key] = now
+        try:
+            send_staging_req(
+                self._resend_sockets,
+                endpoint,
+                dst_port,
+                room,
+                chunk_idx,
+                num_chunk_pages,
+                session_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Staging] Failed to re-send STAGING_REQ room=%s chunk=%s "
+                "session=%s to %s:%s: %s",
+                room,
+                chunk_idx,
+                session_id,
+                endpoint,
+                dst_port,
+                e,
+            )
+            return False
+        logger.warning(
+            "[Staging] Chunk stalled >%.0fs waiting for staging "
+            "allocation/watermark; re-sent STAGING_REQ room=%s chunk=%s "
+            "session=%s",
+            STAGING_STALL_RESEND_INTERVAL_SECS,
+            room,
+            chunk_idx,
+            session_id,
+        )
+        return True
 
     def transfer(
         self,
@@ -754,6 +851,15 @@ def handle_staging_req(
                 infos.append((-1, -1, 0, -1, 0))
             infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
 
+    # Re-broadcast the current watermark together with the response. The
+    # original WATERMARK broadcast (sent when an allocation is freed) is
+    # fire-and-forget; if it was lost and no further frees happen, the
+    # prefill would wait forever. Since prefill re-sends STAGING_REQ for
+    # stalled chunks and this handler replays cached allocations, attaching
+    # the watermark here makes that retry path heal watermark loss too.
+    # handle_watermark_msg applies monotonic-max, so stale values are safe.
+    wm_round, wm_tail = staging_allocator.get_watermark()
+
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
         for bi in bootstrap_infos:
@@ -771,8 +877,64 @@ def handle_staging_req(
                             session_id.encode("ascii"),
                         ]
                     )
-            except Exception:
-                pass
+                    sock.send_multipart(
+                        [
+                            b"WATERMARK",
+                            str(wm_round).encode("ascii"),
+                            str(wm_tail).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ]
+                    )
+            except Exception as e:
+                # Do not raise: remaining prefill ranks must still get their
+                # response. The prefill side re-sends STAGING_REQ for stalled
+                # chunks, so a lost response is recoverable — but log it,
+                # since silent loss used to wedge the transfer forever.
+                logger.warning(
+                    "[Staging] Failed to send STAGING_RSP room=%s chunk=%s "
+                    "session=%s: %s",
+                    room,
+                    chunk_idx,
+                    session_id,
+                    e,
+                )
+
+
+def send_staging_req(
+    sockets: dict,
+    endpoint: str,
+    dst_port: int,
+    room: int,
+    chunk_idx: int,
+    chunk_pages: int,
+    session_id: str,
+) -> None:
+    """Send one STAGING_REQ to decode over a cached PUSH socket.
+
+    ``sockets`` maps tcp endpoint -> zmq socket and must only be used from a
+    single thread (ZMQ sockets are not thread-safe). Raises on send failure.
+    """
+    import zmq
+
+    from sglang.srt.utils.network import NetworkAddress
+
+    na = NetworkAddress(endpoint, dst_port)
+    ep = na.to_tcp()
+    if ep not in sockets:
+        sock = zmq.Context().socket(zmq.PUSH)
+        if na.is_ipv6:
+            sock.setsockopt(zmq.IPV6, 1)
+        sock.connect(ep)
+        sockets[ep] = sock
+    sockets[ep].send_multipart(
+        [
+            b"STAGING_REQ",
+            str(room).encode("ascii"),
+            str(chunk_idx).encode("ascii"),
+            str(chunk_pages).encode("ascii"),
+            session_id.encode("ascii"),
+        ]
+    )
 
 
 def prefetch_staging_reqs(
@@ -788,10 +950,6 @@ def prefetch_staging_reqs(
     Called from the scheduler right after batch formation, so that decode
     allocates staging during the GPU forward pass.
     """
-    import zmq
-
-    from sglang.srt.utils.network import NetworkAddress
-
     page_size = kv_buffer_tensors["page_size"]
     cps = chunked_prefill_size or 8192
     full_chunk_pages = max(1, cps // page_size)
@@ -819,22 +977,24 @@ def prefetch_staging_reqs(
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
             try:
-                na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
-                ep = na.to_tcp()
-                if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
+                send_staging_req(
+                    prefetch_sockets,
+                    tinfo.endpoint,
+                    tinfo.dst_port,
+                    room,
+                    chunk_idx,
+                    chunk_pages,
+                    session_id,
                 )
-            except Exception:
+            except Exception as e:
                 staging_requested.discard(stg_key)
+                logger.warning(
+                    "[Staging] Failed to prefetch STAGING_REQ room=%s chunk=%s "
+                    "session=%s to %s:%s: %s",
+                    room,
+                    chunk_idx,
+                    session_id,
+                    tinfo.endpoint,
+                    tinfo.dst_port,
+                    e,
+                )
