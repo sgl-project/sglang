@@ -1030,8 +1030,10 @@ class HiRadixCache(RadixCache):
             ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
-                end_node = self.ongoing_load_back.pop(ack_id)
+                end_node, protected_host_nodes = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
+                for host_node in protected_host_nodes:
+                    host_node.release_host()
 
             if self.metrics_collector is not None:
                 self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
@@ -1306,6 +1308,13 @@ class HiRadixCache(RadixCache):
         else:
             ancester_node = node
 
+        # HiRadix host eviction is prefix-tree leaf-first: protecting the
+        # deepest load-back leaf is enough to keep its evicted ancestor chain
+        # from being released while the async host->device copy is pending.
+        # If a future non-prefix KV cache can evict middle nodes directly,
+        # protect every node whose host_value is included in host_indices.
+        last_hit_node.protect_host()
+
         # protect the ancestor nodes from eviction
         result = self.inc_lock_ref(ancester_node)
         delta = result.delta
@@ -1317,11 +1326,8 @@ class HiRadixCache(RadixCache):
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
+            last_hit_node.release_host()
             return None
-
-        # Protect the nodes being loaded from host eviction.
-        for n in nodes_to_load:
-            n.protect_host()
 
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
@@ -1338,8 +1344,6 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
-            for n in nodes_to_load:
-                n.release_host()
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -1347,11 +1351,13 @@ class HiRadixCache(RadixCache):
                 last_hit_node.id,
                 self.evictable_size_,
             )
+            last_hit_node.release_host()
             return None
 
-        for n in nodes_to_load:
-            n.release_host()
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = (
+            last_hit_node,
+            [last_hit_node],
+        )
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
