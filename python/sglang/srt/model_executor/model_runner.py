@@ -162,6 +162,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_global_dwdp_manager,
+    get_parallel,
     get_server_args,
     set_global_dwdp_manager,
 )
@@ -863,11 +864,10 @@ class ModelRunner:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
         # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
-        from sglang.srt.distributed.parallel_state import get_dcp_group
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
-        dcp_group = get_dcp_group()
+        dcp_group = get_parallel().dcp_group
         if dcp_group.world_size <= 1:
             return
         n_prepared = 0

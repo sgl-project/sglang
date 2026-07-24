@@ -1048,6 +1048,7 @@ class ServerArgs:
             "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
             choices=["ag_rs", "a2a", "fi_a2a"],
         ),
+        NS("parallel"),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
         bool,
@@ -1058,6 +1059,7 @@ class ServerArgs:
             "the per-layer head-dim all-gather of Q. Trades a small amount of "
             "extra GEMM for one fewer collective per layer.",
         ),
+        NS("parallel"),
     ] = False
     enable_prefill_cp: A[
         bool,

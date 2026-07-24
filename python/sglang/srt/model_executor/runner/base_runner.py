@@ -266,10 +266,9 @@ class BaseRunner(ABC):
         if mr.server_args.dcp_size <= 1 or mr.server_args.dcp_comm_backend != "fi_a2a":
             return
 
-        from sglang.srt.distributed.parallel_state import get_dcp_group
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
-        init_fi_a2a_workspace(get_dcp_group())
+        init_fi_a2a_workspace(get_parallel().dcp_group)
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
