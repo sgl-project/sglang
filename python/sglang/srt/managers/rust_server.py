@@ -151,6 +151,13 @@ class MmProcessorHost:
 
         from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
+        if envs.SGLANG_DISABLE_NATIVE_MM.get():
+            logger.info(
+                "rust server: native MM pipeline disabled "
+                "(SGLANG_DISABLE_NATIVE_MM=1; Python mm_processor path)"
+            )
+            return None
+
         hf_config = self.model_config.hf_config
         if (
             type(self.mm_processor) is not QwenVLImageProcessor
