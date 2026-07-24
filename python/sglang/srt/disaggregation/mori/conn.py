@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import msgspec
 import numpy as np
 import numpy.typing as npt
+import torch
 import zmq
 from mori.cpp import TransferStatus
 from mori.io import (
@@ -320,6 +321,19 @@ class MoriKVManager(CommonKVManager):
         self._socket_local = threading.local()
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
+        # Reusable CUDA-event pool for early-send completion tracking. Each
+        # torch.cuda.Event is backed by an HSA/KFD signal; minting one per
+        # early-send (prefill.maybe_send_cached_prefix_chunk) and never reusing
+        # it lets the live-signal count grow with cumulative sends under
+        # sustained PD warmup and eventually exhausts the per-process signal
+        # pool -> HSA_STATUS_ERROR_OUT_OF_RESOURCES (raised even with GPU memory
+        # free). Pooling + a hard cap keep live events bounded by in-flight
+        # early sends. Cap overridable via SGLANG_MORI_EVENT_POOL_CAP.
+        self._send_event_pool: List[torch.cuda.Event] = []
+        self._send_event_pool_lock = threading.Lock()
+        self._send_event_pool_cap = max(
+            1, int(os.environ.get("SGLANG_MORI_EVENT_POOL_CAP", "512"))
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
             self._transfer_queues: List[FastQueue] = [
@@ -431,6 +445,28 @@ class MoriKVManager(CommonKVManager):
 
     def enqueue_transfer(self, task: _TransferChunk) -> None:
         self._transfer_queues[task.sender.bootstrap_room % self._num_shards].put(task)
+
+    def acquire_send_event(self) -> torch.cuda.Event:
+        """Return a reusable CUDA event for early-send completion tracking.
+
+        Reuses a pooled event when one is free so the number of live hipEvents
+        (each backed by an HSA/KFD signal) stays bounded by the number of
+        in-flight early sends instead of growing with cumulative sends. See
+        MoriKVManager.__init__ for the failure mode this avoids.
+        """
+        with self._send_event_pool_lock:
+            if self._send_event_pool:
+                return self._send_event_pool.pop()
+        return torch.cuda.Event()
+
+    def release_send_event(self, event: Optional[torch.cuda.Event]) -> None:
+        """Return an early-send event to the pool once it has been waited on."""
+        if event is None:
+            return
+        with self._send_event_pool_lock:
+            if len(self._send_event_pool) < self._send_event_pool_cap:
+                self._send_event_pool.append(event)
+            # Above cap: drop the reference so Python GC frees the surplus event.
 
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
@@ -1452,46 +1488,56 @@ class MoriKVSender(CommonKVSender):
             self._finalize_failure()
 
     def _run_chunk(self, task: _TransferChunk) -> None:
-        if self.conclude_state is not None:
-            return
-        if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
-            self._finalize_failure()
-            return
+        wait_event = task.wait_event
+        try:
+            if self.conclude_state is not None:
+                return
+            if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+                self._finalize_failure()
+                return
 
-        # Wait for the prefill forward that produced these KV pages before
-        # issuing the RDMA read (early-send overlaps that forward).
-        if task.wait_event is not None:
-            task.wait_event.synchronize()
+            # Wait for the prefill forward that produced these KV pages before
+            # issuing the RDMA read (early-send overlaps that forward).
+            if wait_event is not None:
+                wait_event.synchronize()
 
-        statuses, infos = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            task.kv_indices,
-            task.index_slice,
-            task.is_last_chunk,
-            aux_index=task.aux_index,
-            state_indices=task.normalized_state,
-        )
-        self.transfer_statuses.extend(statuses)
-        if infos is not None:
-            self.pending_infos = infos
+            statuses, infos = self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                task.kv_indices,
+                task.index_slice,
+                task.is_last_chunk,
+                aux_index=task.aux_index,
+                state_indices=task.normalized_state,
+            )
+            self.transfer_statuses.extend(statuses)
+            if infos is not None:
+                self.pending_infos = infos
 
-        if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
-            self._finalize_failure()
-            return
+            if self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed:
+                self._finalize_failure()
+                return
 
-        rc = self._wait_chunk(statuses)
-        if self.conclude_state is not None:
-            return
-        if rc != StatusCode.SUCCESS:
-            self._finalize_failure(self._collect_failure_reason())
-            return
-        if task.is_last_chunk:
-            self._notify_decode(KVPoll.Success)
-            with self._notify_lock:
-                if self.conclude_state is None:
-                    self.conclude_state = self._notified_status
-                if self._notified_status == KVPoll.Success:
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+            rc = self._wait_chunk(statuses)
+            if self.conclude_state is not None:
+                return
+            if rc != StatusCode.SUCCESS:
+                self._finalize_failure(self._collect_failure_reason())
+                return
+            if task.is_last_chunk:
+                self._notify_decode(KVPoll.Success)
+                with self._notify_lock:
+                    if self.conclude_state is None:
+                        self.conclude_state = self._notified_status
+                    if self._notified_status == KVPoll.Success:
+                        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+        finally:
+            # Once waited on (or the chunk short-circuited), return the
+            # early-send event to the pool so the live hipEvent/HSA-signal
+            # count stays bounded under sustained load. Safe to recycle even
+            # if not synchronized here: the next user re-records before waiting.
+            if wait_event is not None:
+                task.wait_event = None
+                self.kv_mgr.release_send_event(wait_event)
 
     def _wait_chunk(self, statuses: List[TransferStatus]) -> StatusCode:
         if not statuses:

@@ -1043,9 +1043,15 @@ class SchedulerDisaggregationPrefillMixin:
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         if self.enable_overlap:
-            ev = torch.cuda.Event()
+            # Reuse a pooled CUDA event when the disaggregation backend provides
+            # one (mori) so the live hipEvent/HSA-signal count stays bounded
+            # under sustained early-send; other backends keep per-send events.
+            sender = req.disagg_kv_sender
+            kv_mgr = getattr(sender, "kv_mgr", None)
+            acquire = getattr(kv_mgr, "acquire_send_event", None)
+            ev = acquire() if acquire is not None else torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+            sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
