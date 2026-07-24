@@ -700,13 +700,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
+        # already decides per-prefix whether a layer is quantized or kept in BF16,
+        # so forcing this to None here would break checkpoints that DO quantize
+        # linear attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
+        # attention modules in exclude_modules, so is_layer_excluded() returns
+        # UnquantizedLinearMethod for them and behavior is unchanged for those.
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, layer_id, linear_attn_quant_config, alt_stream, prefix
+            config, layer_id, quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
@@ -886,11 +887,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        # Pass quant_config through unchanged. ModelOptFp4Config.is_layer_excluded()
+        # already decides per-prefix whether a layer is quantized or kept in BF16,
+        # so forcing this to None here would break checkpoints that DO quantize
+        # full attention (uniform W4A4). NVIDIA's MoE-only NVFP4 checkpoints list
+        # attention modules in exclude_modules, so is_layer_excluded() returns
+        # UnquantizedLinearMethod for them and behavior is unchanged for those.
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -898,7 +900,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
@@ -908,13 +910,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=attn_quant_config,
+            quant_config=quant_config,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
 
+        # Also pass quant_config to RadixAttention so a FP8-KV quant method (if
+        # any) registers k_scale/v_scale params here; otherwise baked KV scales
+        # from the checkpoint have nowhere to load into and default to 1.0.
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -922,6 +927,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
+            quant_config=quant_config,
         )
 
         # Dense MLP for non-MoE variant
@@ -1554,6 +1560,44 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
+def remap_and_load_qwen3_5_kv_scale(
+    name: str, loaded_weight: torch.Tensor, params_dict: dict
+) -> Optional[str]:
+    """Remap a ModelOpt FP4 checkpoint's attention KV-scale name onto the
+    RadixAttention scale param and load it, if the target exists.
+
+    ModelOpt FP4 checkpoints that quantize attention bake per-layer k_scale/
+    v_scale under q/k_proj, e.g. "layers.N.self_attn.k_proj.k_scale". By the time
+    names reach this point in load_weights(), ".self_attn" has already been
+    stripped, so the stock maybe_remap_kv_scale_name() (which keys off
+    ".self_attn."/".mixer." still being present) cannot match. Remap directly to
+    the RadixAttention scale param instead and copy the value.
+
+    No-op (returns None, does not raise) for names that are not a k_scale/v_scale
+    suffix, or whose remapped target is not present in params_dict -- e.g.
+    NVIDIA's MoE-only NVFP4 checkpoints never emit these keys for attention at
+    all, so this function is never meaningfully invoked for them.
+
+    Returns:
+        The remapped, loaded param name (add this to loaded_params), or None if
+        nothing was loaded.
+    """
+    if not (name.endswith(".k_scale") or name.endswith(".v_scale")):
+        return None
+    attn_scale_name = name.replace(".k_proj.k_scale", ".attn.k_scale").replace(
+        ".v_proj.v_scale", ".attn.v_scale"
+    )
+    scale_param = params_dict.get(attn_scale_name)
+    if scale_param is None:
+        return None
+    scale_weight_loader = getattr(scale_param, "weight_loader", None)
+    if scale_weight_loader is not None:
+        scale_weight_loader(scale_param, loaded_weight)
+    else:
+        scale_param.data.copy_(loaded_weight.to(scale_param.dtype))
+    return attn_scale_name
+
+
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
         self,
@@ -1653,6 +1697,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+
+            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
+                name, loaded_weight, params_dict
+            )
+            if remapped_kv_scale_name is not None:
+                loaded_params.add(remapped_kv_scale_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -2119,6 +2170,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
+                continue
+
+            remapped_kv_scale_name = remap_and_load_qwen3_5_kv_scale(
+                name, loaded_weight, params_dict
+            )
+            if remapped_kv_scale_name is not None:
+                loaded_params.add(remapped_kv_scale_name)
                 continue
 
             if self.enable_shared_expert_fusion:
