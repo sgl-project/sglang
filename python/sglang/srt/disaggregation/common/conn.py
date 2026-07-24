@@ -713,26 +713,32 @@ class CommonKVManager(BaseKVManager):
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
+        # Locate the main-model V section inside dst_kv_ptrs. The decode side
+        # may carry extra draft/MTP KV layers that this prefill stage does not
+        # (layout [K_main, V_main, draft_K, draft_V]); when it does, V_main
+        # starts at the main-model layer count rather than at
+        # dst_num_total_layers. Do NOT infer "draft present" from a modulo
+        # relation (num_kv_layers < dst_num_total_layers and
+        # dst_num_total_layers % num_kv_layers != 0): an uneven PP split of a
+        # plain full-attention model (e.g. 15 layers served as 7 + 8) also
+        # satisfies it, which mis-slices the V pointers and silently corrupts
+        # the transferred KV (issue #27740). Use the model's true main
+        # full-attention layer count instead.
+        total_main_layers = getattr(self.kv_args, "prefill_num_total_layers", None)
         if num_kv_layers == dst_num_total_layers:
             dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
             dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
-        elif (
-            num_kv_layers < dst_num_total_layers
-            and dst_num_total_layers % num_kv_layers != 0
-        ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
-            multiplier_ratio = dst_num_total_layers // num_kv_layers
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-            v_ptr_offset = num_kv_layers * multiplier_ratio
-            dst_v_ptrs = dst_kv_ptrs[
-                v_ptr_offset + start_layer : v_ptr_offset + end_layer
-            ]
         else:
-            # Decode pp size should be equal to prefill pp size or 1
+            has_draft_kv = (
+                total_main_layers is not None
+                and dst_num_total_layers > total_main_layers
+            )
+            v_section_start = (
+                total_main_layers if has_draft_kv else dst_num_total_layers
+            )
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                v_section_start + start_layer : v_section_start + end_layer
             ]
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
