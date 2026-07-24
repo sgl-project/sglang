@@ -69,9 +69,6 @@ pub struct ServerArgs {
     /// in minimal standalone blobs — then boot requires `skip_tokenizer_init`.
     #[serde(default)]
     pub tokenizer_path: String,
-    /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
-    #[serde(default)]
-    pub revision: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     #[serde(default = "default_host")]
     pub host: String,
