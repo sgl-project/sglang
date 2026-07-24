@@ -2206,14 +2206,21 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
-        weight = getattr(
-            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
-        )
+        proj = getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+        weight = getattr(proj, "weight", None)
         if weight is None:
             return ""
         if weight.dtype == torch.uint8:
             return "mxfp4"
         if weight.dtype == getattr(torch, "float8_e4m3fn", None):
+            # quark fp8 quantizes activations itself; the group-128 fused
+            # RMSNorm+quant does not match its scheme, so use bf16 RMSNorm ("").
+            from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+                is_quark_w8a8_fp8_layer,
+            )
+
+            if is_quark_w8a8_fp8_layer(proj):
+                return ""
             return "fp8"
         return ""
 

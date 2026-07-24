@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
-__all__ = ["QuarkW8A8Fp8"]
+__all__ = ["QuarkW8A8Fp8", "is_quark_w8a8_fp8_layer"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
@@ -174,7 +174,14 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        # Activations arrive as a plain bf16 tensor: callers route quark layers
+        # away from the fused fp8 RMSNorm+quant kernel (is_quark_w8a8_fp8_layer),
+        # so the per-token activation quant happens inside apply_fp8_linear.
+        assert not isinstance(x, tuple), (
+            "quark W8A8 FP8 linear received a pre-quantized tuple when it needs a "
+            "plain bf16 tensor; likely a fused RMSNorm+quant producer not gated by "
+            "is_quark_w8a8_fp8_layer."
+        )
         return apply_fp8_linear(
             x,
             layer.weight,
@@ -184,3 +191,13 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.per_token,
         )
+
+
+def is_quark_w8a8_fp8_layer(layer) -> bool:
+    """True if ``layer`` is a linear quantized with the quark W8A8 FP8 scheme.
+
+    Quark W8A8 FP8 uses per-tensor or per-token activation quant, neither of which
+    the aiter group-128 fused RMSNorm+quant kernel produces. Callers use this to
+    skip that fused path and feed the quark linear a plain bf16 tensor instead.
+    """
+    return isinstance(getattr(layer, "scheme", None), QuarkW8A8Fp8)
