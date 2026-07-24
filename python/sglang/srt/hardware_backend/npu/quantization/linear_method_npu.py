@@ -54,6 +54,19 @@ def _get_float4_e2m1fn_x2_dtype():
     return getattr(torch, "float4_e2m1fn_x2", None)
 
 
+def _prepare_mxfp4_w4a8_bias(
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match the A8W4 ``npu_quant_matmul`` bias contract."""
+    if bias is None:
+        return None
+    if bias.dtype != torch.bfloat16:
+        bias = bias.to(torch.bfloat16)
+    if bias.dim() == 1:
+        bias = bias.unsqueeze(0)
+    return bias
+
+
 class _NPULinearMethodBase(LinearMethodBase):
 
     def __init__(
@@ -454,17 +467,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             w_scale = w_scale.reshape(n, k // 2, 2)
         layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        if (
-            getattr(layer, "bias", None) is not None
-            and layer.bias.dtype != torch.float32
-        ):
-            layer.bias_fp32 = Parameter(
-                layer.bias.data.to(torch.float32), requires_grad=False
-            )
-        else:
-            layer.bias_fp32 = None
-
     def apply(
         self,
         layer: torch.nn.Module,
@@ -488,17 +490,9 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        if bias is None:
-            quant_bias = None
-        elif (
-            bias is getattr(layer, "bias", None)
-            and getattr(layer, "bias_fp32", None) is not None
-        ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
+        # A8W4 requires BF16 bias with shape [1, out_features]. Qwen3 text
+        # layers normally have no bias; Qwen3.5 vision QKV projections do.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
         output = torch.ops.npu.npu_quant_matmul(
@@ -611,8 +605,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        # Keep the offline path on the same A8W4 bias contract as online.
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul, mirroring vllm-ascend exactly.
         output = torch.ops.npu.npu_quant_matmul(
@@ -622,7 +616,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
             pertoken_scale_dtype=e8m0_dtype,
-            bias=bias,
+            bias=quant_bias,
             output_dtype=original_dtype,
             x2_dtype=fp4_dtype,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
