@@ -473,16 +473,13 @@ class LogitsProcessor(nn.Module):
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
         )
 
-        return LogitsProcessorOutput(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
-            input_token_logprobs=logprobs_result.input_token_logprobs,
-            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
-            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
-            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+        logprobs_result.write_input_to(logits_output)
+        return logits_output
 
     def _get_pruned_states(
         self,
