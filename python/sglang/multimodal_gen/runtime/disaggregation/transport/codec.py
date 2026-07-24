@@ -53,10 +53,13 @@ class TensorWrapper:
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.tensor = tensor
-        data_ptr = tensor.data_ptr()
-        total_bytes = tensor.numel() * tensor.element_size()
-        self._c_buf = (ctypes.c_char * total_bytes).from_address(data_ptr)
-        self._view = memoryview(self._c_buf)
+
+    def __buffer__(self, flags=0):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        c_obj._keep_alive_ref = self  # prevent GC while ZMQ holds the buffer
+        return memoryview(c_obj)
 
 
 @dataclass
@@ -144,8 +147,8 @@ def send_tensors(
     """Send tensors over ZMQ using multipart with zero-copy."""
     metadata_bytes, buffers = pack_tensors(tensor_fields, scalar_fields)
     parts: list = [metadata_bytes]
-    parts.extend(w._view if isinstance(w, TensorWrapper) else w for w in buffers)
-    socket.send_multipart(parts, flags=flags, copy=True)
+    parts.extend(buffers)
+    socket.send_multipart(parts, flags=flags, copy=False)
 
 
 def unpack_tensors(
@@ -183,9 +186,11 @@ def unpack_tensors(
 
     for i, desc in enumerate(descriptors):
         frame = parts[i + 1]
-        buf = frame.buffer if hasattr(frame, "buffer") else bytes(frame)
+        raw_buf = frame.buffer if hasattr(frame, "buffer") else bytes(frame)
+        # torch.frombuffer warns on read-only buffers; make a writable view first,
+        # then clone so the tensor lifetime is decoupled from the ZMQ frame.
+        buf = bytearray(raw_buf)
         dtype = str_to_dtype(desc.dtype)
-        # clone() to own the memory (decouple from ZMQ buffer lifetime)
         tensor = torch.frombuffer(buf, dtype=dtype).reshape(desc.shape).clone()
         if device != "cpu" and device != torch.device("cpu"):
             tensor = tensor.to(device)
