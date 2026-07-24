@@ -185,8 +185,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
+            )
+
             cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
+                    server_args=kvc.server_args,
+                )
                 * effective_num_layers
                 * kv_size
             )
@@ -212,8 +220,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += (
-                    indexer_size_per_token * effective_num_layers * element_size
+                indexer_ratio = 1
+                if kvc.server_args.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        kvc.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token
+                    * effective_num_layers
+                    * element_size
+                    * indexer_ratio
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
