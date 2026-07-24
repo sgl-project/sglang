@@ -9,6 +9,10 @@ class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    # Pure-torch fallback for CUDA archs that neither DeepGEMM nor CuTe DSL
+    # cover (e.g. SM120/SM121 consumer Blackwell). No arch gate by design;
+    # opt-in only (never selected by "auto"), see resolve() below.
+    TORCH = "torch"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -18,6 +22,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_torch(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TORCH
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -39,4 +46,9 @@ class DSAPagedMQALogitsBackend(Enum):
                     "dsa_paged_mqa_logits_backend='cutedsl' requires SM100 (Blackwell)."
                 )
             return DSAPagedMQALogitsBackend.CUTEDSL
+        if value == "torch":
+            # No arch gate: that is the whole point of this backend. Not
+            # selected by "auto" (opt-in only) so archs where DeepGEMM/CuteDSL
+            # already work keep their existing (faster) default.
+            return DSAPagedMQALogitsBackend.TORCH
         raise ValueError(f"Unknown dsa_paged_mqa_logits_backend: {value!r}")
