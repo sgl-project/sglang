@@ -70,8 +70,14 @@ def make_timing_event_pair():
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        # enable_timing=True: needed for start_event.elapsed_time(finish_event)
+        # to derive load-back PCIe bandwidth (sglang:load_back_bandwidth_gb_s).
+        self.load_events = [
+            device_module.Event(enable_timing=True) for _ in range(num_layers)
+        ]
+        self.start_event = device_module.Event(
+            enable_timing=True
+        )  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -161,6 +167,9 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
+    # Tokens moved by this batch; paired with start_event.elapsed_time(finish_event)
+    # to derive PCIe bandwidth (sglang:eviction_bandwidth_gb_s / load_back_bandwidth_gb_s)
+    # when timing_enabled.
     num_tokens: int = 0
     timing_enabled: bool = False
 
@@ -713,8 +722,9 @@ class HiCacheController:
             )
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        # timing_enabled gates elapsed_time() use downstream: derives eviction
+        # (L1->L2) PCIe bandwidth (sglang:eviction_bandwidth_gb_s) where supported.
+        start_event, finish_event, timing_enabled = make_timing_event_pair()
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -738,7 +748,15 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event,
+                finish_event,
+                op.node_ids,
+                num_tokens=len(device_indices),
+                timing_enabled=timing_enabled,
+            )
+        )
 
     def load(
         self,
@@ -828,7 +846,7 @@ class HiCacheController:
                 start_event=ack_start_event,
                 finish_event=ack_finish_event,
                 node_ids=op.node_ids,
-                num_tokens=len(op.device_indices),
+                num_tokens=len(device_indices),
                 timing_enabled=timing_enabled,
             )
         )
