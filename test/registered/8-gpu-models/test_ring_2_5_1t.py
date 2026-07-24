@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_combined_tests import run_combined_tests
@@ -10,6 +12,7 @@ register_cuda_ci(est_time=510, suite="nightly-8-gpu-common", nightly=True)
 RING_2_5_1T_MODEL_PATH = "inclusionAI/Ring-2.5-1T"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestRing2_5_1T(unittest.TestCase):
     """Accuracy test for Ring-2.5-1T.
 

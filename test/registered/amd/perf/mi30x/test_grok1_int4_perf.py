@@ -14,6 +14,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -60,6 +62,7 @@ GROK1_TOKENIZER_PATH = os.environ.get("GROK1_TOKENIZER_PATH", "Xenova/grok-1-tok
 PROFILE_DIR = "performance_profiles_grok1_int4"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyGrok1INT4Performance(unittest.TestCase):
     """Nightly performance benchmark for Grok-1 INT4 (W4A8KV8).
 

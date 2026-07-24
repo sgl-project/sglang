@@ -1,4 +1,5 @@
 import os
+import torch
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -12,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=200, suite="nightly-16-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     """
     Testcase:Test the Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot model with DeepEP's auto mode enabled,

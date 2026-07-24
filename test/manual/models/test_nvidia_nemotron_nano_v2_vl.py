@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -12,12 +14,14 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 MODEL = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2VLTextOnly(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.85
     model = MODEL
     other_args = ["--max-mamba-cache-size", "256", "--trust-remote-code"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNvidiaNemotronNanoV2VLMMMU(MMMUMixin, MMMUServerBase):
     accuracy = 0.444
     model = MODEL

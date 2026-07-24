@@ -22,7 +22,10 @@ register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 
-SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
+SKIP_TEST = not torch.cuda.is_available() or torch.cuda.get_device_capability() < (
+    10,
+    0,
+)
 SKIP_REASON = "Requires Blackwell (B200, sm_100a) or above."
 
 

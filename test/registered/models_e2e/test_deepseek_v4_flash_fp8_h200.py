@@ -10,6 +10,8 @@ Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used b
 
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -29,6 +31,7 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP8H200(
     SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,

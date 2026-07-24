@@ -25,6 +25,7 @@ _CASES = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(_use_aiter, reason="SGLANG_USE_AITER=1 will not use vllm path.")
 class TestRotaryEmbeddingNative(CustomTestCase):
     # Compare RotaryEmbedding.forward_hip() to forward_native().
@@ -70,6 +71,7 @@ class TestRotaryEmbeddingNative(CustomTestCase):
                 self._run_case(*case)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
 class TestRotaryEmbeddingAITer(CustomTestCase):
     # NOTE: Slightly relaxed tolerance (2e-2 vs 1e-2) for AITER RoPE kernel.

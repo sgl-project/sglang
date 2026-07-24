@@ -34,6 +34,7 @@ register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAOverlapLoading(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
         run_lora_batch_splitting_equivalence_test(
@@ -41,6 +42,7 @@ class TestLoRAOverlapLoading(CustomTestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
     mock_lora_manager: MagicMock

@@ -3,9 +3,12 @@ from typing import Callable
 
 import pytest
 import torch
-from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
-from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-from sgl_kernel import silu_and_mul
+
+if torch.cuda.is_available():
+    from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from sgl_kernel import silu_and_mul
+
 from torch.nn import functional as F
 
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -13,7 +16,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
 
-if torch.cuda.get_device_capability() < (10, 0):
+if torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
         reason="Nvfp4 Requires compute capability of 10 or above.",
         allow_module_level=True,
@@ -358,11 +361,13 @@ def check_moe(
     torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @torch.inference_mode()
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_flashinfer_fp4_moe_no_graph(
     m: int, n: int, k: int, e: int, topk: int, dtype: torch.dtype
 ):

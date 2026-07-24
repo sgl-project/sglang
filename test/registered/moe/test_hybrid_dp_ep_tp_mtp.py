@@ -3,6 +3,9 @@
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -18,6 +21,10 @@ from sglang.test.test_utils import (
 # 60 test classes testing hybrid parallelism configurations
 # Each test launches server + runs MMLU eval (~90s per test)
 register_cuda_ci(est_time=5400, suite="weekly-8-gpu-h200", nightly=True)
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 class Test00(CustomTestCase):

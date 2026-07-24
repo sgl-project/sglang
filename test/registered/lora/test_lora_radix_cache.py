@@ -38,6 +38,7 @@ PROMPTS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRARadixCache(CustomTestCase):
 
     def test_lora_radix_cache(self):

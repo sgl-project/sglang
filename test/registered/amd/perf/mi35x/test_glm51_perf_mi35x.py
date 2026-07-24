@@ -10,6 +10,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -48,6 +50,7 @@ GLM51_MODEL_PATH = os.environ.get("GLM51_MODEL_PATH", "zai-org/GLM-5.1-FP8")
 PROFILE_DIR = "performance_profiles_glm51_mi35x"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM51PerfMI35x(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.1 on MI35x.
 
