@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
+import ctypes
 import logging
 from contextlib import contextmanager
-from typing import Optional, Union
+from typing import Optional, Sequence, Tuple, Union
 
 # ===================== import region =====================
 import torch
@@ -12,10 +13,14 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
+    NCCL_API_MAGIC,
+    NCCL_CONFIG_UNDEF_INT,
+    NCCL_WIN_COLL_SYMMETRIC,
     NCCLLibrary,
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    ncclConfig_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -24,6 +29,10 @@ from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
+
+# ncclPutSignal / one-sided RMA shipped in NCCL 2.30; raw ncclGetVersion() for
+# 2.30.x is MAJOR*10000+MINOR*100+PATCH (e.g. 2.30.7 -> 23007).
+_NCCL_RMA_MIN_VERSION = 23000
 
 
 class PyNcclCommunicator:
@@ -329,11 +338,159 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def register_comm_window_raw(self, ptr: int, size: int):
-        return self.nccl.ncclCommWindowRegister(self.comm, buffer_type(ptr), size, 1)
+    def register_comm_window_raw(
+        self, ptr: int, size: int, win_flags: int = NCCL_WIN_COLL_SYMMETRIC
+    ):
+        """Register ptr..ptr+size as an NCCL symmetric-memory window and return
+        the opaque window handle (ncclWindow_t). On RMA-unavailable HW (no
+        NVLink, vGPU) NCCL returns success but a NULL handle; callers using
+        the handle for one-sided RMA must treat NULL as unavailable."""
+        return self.nccl.ncclCommWindowRegister(
+            self.comm, buffer_type(ptr), size, win_flags
+        )
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)
+
+    def supports_rma(self) -> bool:
+        """Whether the loaded NCCL exposes one-sided RMA at a usable version.
+        A capability gate only; does not guarantee the HW can serve RMA."""
+        return getattr(self.nccl, "has_rma", False) and (
+            self.nccl_version >= _NCCL_RMA_MIN_VERSION
+        )
+
+    # ---- one-sided RMA primitives (NCCL 2.29-2.30+) -------------------------
+
+    def put_signal(
+        self,
+        local_ptr: int,
+        count: int,
+        dtype: int,
+        peer: int,
+        peer_win,
+        peer_win_offset: int = 0,
+        sig_idx: int = 0,
+        ctx: int = 0,
+        flags: int = 0,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        """Put count elements of dtype from local_ptr into the peer's window
+        peer_win at peer_win_offset (bytes) and send a signal. peer_win must be
+        the peer's handle, allgathered across ranks."""
+        stream = stream or self._resolve_stream()
+        return self.nccl.ncclPutSignal(
+            buffer_type(local_ptr),
+            count,
+            dtype,
+            peer,
+            peer_win,
+            peer_win_offset,
+            sig_idx,
+            ctx,
+            flags,
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
+    def signal(
+        self,
+        peer: int,
+        sig_idx: int = 0,
+        ctx: int = 0,
+        flags: int = 0,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        stream = stream or self._resolve_stream()
+        return self.nccl.ncclSignal(
+            peer, sig_idx, ctx, flags, self.comm, cudaStream_t(stream.cuda_stream)
+        )
+
+    def wait_signal(
+        self,
+        descs_ptr: int,
+        n_desc: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        """Wait for signals described by n_desc contiguous ncclWaitSignalDesc_t
+        at descs_ptr (built via make_wait_descs)."""
+        stream = stream or self._resolve_stream()
+        return self.nccl.ncclWaitSignal(
+            n_desc,
+            ctypes.c_void_p(descs_ptr),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
+    def win_get_user_ptr(self, window):
+        out = buffer_type()
+        self.nccl.ncclWinGetUserPtr(self.comm, window, ctypes.byref(out))
+        return out.value
+
+    def nccl_mem_alloc(self, size: int) -> int:
+        """Allocate a symmetric-memory buffer (ncclMemAlloc); eligible for
+        window registration. Free with nccl_mem_free."""
+        ptr = buffer_type()
+        self.nccl.ncclMemAlloc(ctypes.byref(ptr), size)
+        return ptr.value
+
+    def nccl_mem_free(self, ptr: int) -> None:
+        if ptr:
+            self.nccl.ncclMemFree(buffer_type(ptr))
+
+    def get_peer_device_pointer(self, window, offset: int, peer: int):
+        out = buffer_type()
+        self.nccl.ncclGetPeerDevicePointer(window, offset, peer, ctypes.byref(out))
+        return out.value
+
+    @staticmethod
+    def make_wait_descs(peers_opcnt: Sequence[Tuple[int, int]]):
+        """Build a contiguous ncclWaitSignalDesc_t[] buffer for wait_signal.
+        peers_opcnt: [(peer_rank, op_cnt), ...]; returns (buffer_ptr, n_desc)."""
+        import numpy as np
+
+        n_desc = len(peers_opcnt)
+        dtype = np.dtype(
+            [("op_cnt", "i4"), ("peer", "i4"), ("sig_idx", "i4"), ("ctx", "i4")]
+        )
+        arr = np.zeros(n_desc, dtype=dtype)
+        for i, (peer, op_cnt) in enumerate(peers_opcnt):
+            arr[i]["peer"] = peer
+            arr[i]["op_cnt"] = op_cnt
+        return np.ascontiguousarray(arr).ctypes.data, n_desc
+
+    def make_nccl_config(
+        self, num_rma_ctx: int = NCCL_CONFIG_UNDEF_INT
+    ) -> "ncclConfig_t":
+        """Build an ncclConfig_t matching NCCL_CONFIG_INITIALIZER for the loaded
+        library. num_rma_ctx defaults to UNDEF (inherit NCCL default); setting
+        it is not required for RMA to work but sizes the RMA contexts."""
+        cfg = ncclConfig_t()
+        cfg.size = ctypes.sizeof(ncclConfig_t)
+        cfg.magic = NCCL_API_MAGIC
+        cfg.version = self.nccl_version
+        for fld in (
+            "blocking",
+            "cgaClusterSize",
+            "minCTAs",
+            "maxCTAs",
+            "splitShare",
+            "trafficClass",
+            "collnetEnable",
+            "CTAPolicy",
+            "shrinkShare",
+            "nvlsCTAs",
+            "nChannelsPerNetPeer",
+            "nvlinkCentricSched",
+            "graphUsageMode",
+            "numRmaCtx",
+            "maxP2pPeers",
+            "graphStreamOrdering",
+        ):
+            setattr(cfg, fld, NCCL_CONFIG_UNDEF_INT)
+        cfg.netName = None
+        cfg.commName = None
+        cfg.numRmaCtx = num_rma_ctx
+        return cfg
 
     def group_start(self):
         self.nccl.ncclGroupStart()

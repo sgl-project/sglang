@@ -88,6 +88,13 @@ static std::mutex g_segment_mutex;
 // Key: comm_ptr, Value: the next segment index to register for this comm.
 static std::unordered_map<uintptr_t, size_t> g_comm_registration_index;
 
+// Per-comm registered window handles (ncclWindow_t values), in registration
+// order. Only non-NULL handles are recorded: on RMA-unavailable hardware (no
+// NVLink, vGPU) ncclCommWindowRegister returns success but a NULL handle,
+// which is unusable for one-sided RMA; an empty handle list lets the Python
+// layer detect "RMA unavailable".
+static std::unordered_map<uintptr_t, std::vector<uintptr_t>> g_comm_windows;
+
 // Add a segment to the tracking (appends to end, maintaining FIFO order)
 static void track_segment(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
@@ -136,12 +143,42 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
             fprintf(stderr, "ERROR: NCCL symmetric memory registration failed. '%s'\\n", ncclGetErrorString(res));
             return res;
         }
+        // Record non-NULL window handles for one-sided RMA use. NULL handles
+        // (RMA-unavailable HW) are skipped so callers see an empty list.
+        if (win != nullptr) {
+            g_comm_windows[comm_ptr].push_back(reinterpret_cast<uintptr_t>(win));
+        }
     }
 
     // Update the registration index for this communicator
     g_comm_registration_index[comm_ptr] = g_segments.size();
 
     return ncclSuccess;
+}
+
+// Copy the recorded window handles for `comm_ptr` into the caller-provided
+// array `out` (capacity `cap`, in uintptr_t slots). Returns the number of
+// handles written. Callers should size `cap` to the expected segment count;
+// handles beyond `cap` are dropped (use a follow-up call or size generously).
+int nccl_allocator_get_windows_for_comm(uintptr_t comm_ptr, uintptr_t* out, int cap) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    auto it = g_comm_windows.find(comm_ptr);
+    if (it == g_comm_windows.end() || out == nullptr || cap <= 0) {
+        return 0;
+    }
+    const std::vector<uintptr_t>& wins = it->second;
+    int n = static_cast<int>(wins.size());
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; ++i) out[i] = wins[i];
+    return n;
+}
+
+// Clear the recorded window handles for `comm_ptr` (e.g. after the caller has
+// consumed/deregistered them). Returns 0 on success.
+int nccl_allocator_clear_windows_for_comm(uintptr_t comm_ptr) {
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    g_comm_windows.erase(comm_ptr);
+    return 0;
 }
 
 }
@@ -155,6 +192,8 @@ _active_symmetric_memory_context = None
 
 # Reference to the C registration function (with arg types set)
 _register_func = None
+_get_windows_func = None
+_clear_windows_func = None
 
 
 def is_symmetric_memory_enabled():
@@ -228,6 +267,19 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
         _register_func.restype = ctypes.c_int
         _register_func.argtypes = [ctypes.c_uint64]
 
+        # Accessors for the per-comm recorded window handles (one-sided RMA).
+        _get_windows_func = nccl_allocator_lib.nccl_allocator_get_windows_for_comm
+        _get_windows_func.restype = ctypes.c_int
+        _get_windows_func.argtypes = [
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_int,
+        ]
+
+        _clear_windows_func = nccl_allocator_lib.nccl_allocator_clear_windows_for_comm
+        _clear_windows_func.restype = ctypes.c_int
+        _clear_windows_func.argtypes = [ctypes.c_uint64]
+
     return _mem_pool
 
 
@@ -261,6 +313,11 @@ class SymmetricMemoryContext:
         # Get comm ptr for tracking registrations
         # Use the comm pointer value as unique identifier
         self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
+
+        # Registered window handles (ncclWindow_t values), populated at context
+        # exit. Empty means RMA is unavailable on this comm/HW (NCCL returned
+        # NULL handles).
+        self.windows: list = []
 
     def __enter__(self):
         assert (
@@ -321,6 +378,11 @@ class SymmetricMemoryContext:
             result == 0
         ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
 
+        # Collect the per-comm window handles for one-sided RMA. The C++ layer
+        # records only non-NULL handles, so an empty result means RMA is
+        # unavailable on this comm/HW.
+        self.windows = _collect_windows_for_comm(self._comm_ptr)
+
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
     disabled = (
@@ -329,6 +391,23 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
         or group_coordinator.world_size == 1
     )
     return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
+
+
+def _collect_windows_for_comm(comm_ptr: int) -> list:
+    """Read the per-comm recorded window handles (ncclWindow_t values) from the
+    C++ layer. Empty when RMA is unavailable (NULL handles) or the accessor is
+    not yet bound."""
+    if _get_windows_func is None or comm_ptr is None:
+        return []
+    cap = 64
+    while True:
+        buf = (ctypes.c_uint64 * cap)()
+        n = _get_windows_func(comm_ptr, buf, cap)
+        if n < cap:
+            return [int(buf[i]) for i in range(n)]
+        cap *= 2
+        if cap > 1 << 20:
+            return [int(buf[i]) for i in range(n)]
 
 
 # --- Debug mode for symmetric memory validation ---
