@@ -206,6 +206,7 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
+    dst_kv_layer_ids: list[int]
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -250,6 +251,11 @@ class KVArgsRegisterInfo:
         dst_state_layer_ids = (
             unpack_int_lists(msg[19], "I") if len(msg) > 19 and len(msg[19]) > 0 else []
         )
+        dst_kv_layer_ids = (
+            list(struct.unpack(f"{len(msg[20]) // 4}I", msg[20]))
+            if len(msg) > 20 and msg[20] != b""
+            else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -266,6 +272,7 @@ class KVArgsRegisterInfo:
             decode_tp_rank=int(msg[10].decode("ascii")),
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
+            dst_kv_layer_ids=dst_kv_layer_ids,
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -984,8 +991,20 @@ class NixlKVManager(CommonKVManager):
                 else self._num_slots_src
             )
 
-            dst_kv_ptrs = peer_info.dst_kv_ptrs[:n_src]
-            dst_kv_item_lens = peer_info.dst_kv_item_lens[:n_src]
+            if self.kv_args.kv_layer_ids and peer_info.dst_kv_layer_ids:
+                pairs = build_state_entry_pairs(
+                    self.kv_args.kv_layer_ids,
+                    peer_info.dst_kv_layer_ids,
+                    n_src,
+                    n_dst,
+                )
+                dst_indices = [j for _, j in pairs]
+            else:
+                dst_indices = list(range(n_src))
+            dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
+            dst_kv_item_lens = [
+                peer_info.dst_kv_item_lens[j] for j in dst_indices
+            ]
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
@@ -2724,6 +2743,10 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", item_len)
                 for item_len in self.kv_mgr.kv_args.kv_item_lens
             )
+            packed_kv_layer_ids = b"".join(
+                struct.pack("I", layer_id)
+                for layer_id in getattr(self.kv_mgr.kv_args, "kv_layer_ids", [])
+            )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
@@ -2780,6 +2803,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_kv_data_mem_kinds,
                         packed_kv_item_lens,
                         packed_state_layer_ids,
+                        packed_kv_layer_ids,
                     ]
                 )
 
