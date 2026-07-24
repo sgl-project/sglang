@@ -27,7 +27,13 @@ _is_hip = is_hip()
 
 
 if _is_hip:
-    from aiter.ops.shuffle import shuffle_weight
+    # aiter is optional, so is_hip() does not imply this kernel is importable,
+    # and a version-skewed build can ship the module without the symbol. This
+    # file is imported unconditionally at startup by the quantization registry.
+    try:
+        from aiter.ops.shuffle import shuffle_weight
+    except ImportError:
+        shuffle_weight = None
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -143,6 +149,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         if not _is_hip:
             raise NotImplementedError(
                 "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+            )
+
+        if shuffle_weight is None:
+            raise NotImplementedError(
+                "The quark_int4fp8_moe online quantization scheme requires aiter. "
+                "Please make sure a compatible aiter is installed on your AMD device."
             )
 
     def get_weight_loader(self, layer, original_weight_loader):
