@@ -166,7 +166,7 @@ class SchedulerBatchResultProcessor:
             maybe_cache_unfinished_req(req, self.tree_cache)
             return
 
-        page_size = getattr(self.tree_cache, "page_size", 1)
+        page_size = self.tree_cache.page_size
         # prompt-once flag was armed (decode.py), so get_fill_ids() already
         # returns exactly the committed prompt snapshot.
         prompt_fill_ids = req.get_fill_ids()
@@ -174,14 +174,14 @@ class SchedulerBatchResultProcessor:
             RadixKey(
                 prompt_fill_ids,
                 req.extra_key,
-                is_bigram=getattr(self.tree_cache, "is_eagle", False),
+                is_bigram=self.tree_cache.is_eagle,
             ).page_aligned(page_size)
         )
         if radix_key_len <= 0:
             req.allow_radix_cache_insert_once = False
             return
 
-        old_cache_protected_len = getattr(req, "cache_protected_len", 0)
+        old_cache_protected_len = req.cache_protected_len
         old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
 
@@ -195,7 +195,7 @@ class SchedulerBatchResultProcessor:
         req.force_radix_leaf_creation = True
         try:
             maybe_cache_unfinished_req(req, self.tree_cache)
-            protected_len = min(getattr(req, "cache_protected_len", 0), radix_key_len)
+            protected_len = min(req.cache_protected_len, radix_key_len)
             if protected_len > 0 and hasattr(
                 self.token_to_kv_pool_allocator, "free_swa"
             ):
