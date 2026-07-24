@@ -181,7 +181,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             else "token_type_ids"
         )
         if token_type_key in processor_output:
-            ret.token_type_ids = processor_output[token_type_key].flatten().tolist()
+            ret.token_type_ids = processor_output[token_type_key].flatten()
 
         if self.mm_tokens.image_token_id is not None:
             ret.im_token_id = self.mm_tokens.image_token_id

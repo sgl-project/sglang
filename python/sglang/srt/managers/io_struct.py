@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import pickle
+import struct
 import uuid
 from array import array
 from collections import Counter
@@ -38,6 +39,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     Union,
 )
@@ -52,10 +54,16 @@ from pydantic import PlainValidator
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+)
+from sglang.srt.managers.schedule_batch import (
+    MultimodalProcessorOutput as MMProcessorPayload,
+)
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
@@ -107,6 +115,14 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     """
 
     data: bytes
+
+
+# Stable wire IDs. Changing these requires updating the golden-wire test.
+_MSGPACK_EXT_ARRAY = 1
+_MSGPACK_EXT_TORCH_TENSOR = 2
+_MSGPACK_EXT_NP_ARRAY = 3
+_MSGPACK_EXT_SHM_POINTER_MM_DATA = 4
+_MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY = 5
 
 
 # Parameters for a session
@@ -792,7 +808,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # The input embeds
     input_embeds: Optional[List[List[float]]]
     # The multimodal inputs
-    mm_inputs: Optional[PickleWrapper]  # Pickled Optional[MultimodalProcessorOutput]
+    mm_inputs: Optional[MMProcessorPayload]
     token_type_ids: Optional[List[int]]
     # The sampling parameters
     sampling_params: SamplingParams
@@ -882,12 +898,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
 
     def wrap_pickle_fields(self):
-        self.mm_inputs = wrap_as_pickle(self.mm_inputs)
         self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
-        self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
         self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
@@ -1145,7 +1159,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     # The input token ids
     input_ids: Optional[array]  # array[int]
     # The multimodal inputs
-    mm_inputs: Optional[PickleWrapper]  # Pickled Optional[MultimodalProcessorOutput]
+    mm_inputs: Optional[MMProcessorPayload]
     # The token type ids
     token_type_ids: Optional[List[int]]
     # Dummy sampling params for compatibility
@@ -1170,11 +1184,9 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
 
     def wrap_pickle_fields(self):
-        self.mm_inputs = wrap_as_pickle(self.mm_inputs)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
-        self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
@@ -2150,20 +2162,175 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
     return pickle.loads(obj.data)
 
 
+def _pack_ext(code: int, obj: object) -> msgspec.msgpack.Ext:
+    return msgspec.msgpack.Ext(code, msgspec.msgpack.encode(obj, enc_hook=enc_hook))
+
+
+def _unpack_ext(data: memoryview) -> object:
+    return msgspec.msgpack.decode(data, ext_hook=ext_hook)
+
+
+_MSGPACK_BUFFER_METADATA_SIZE = struct.Struct(">I")
+
+
+def _pack_buffer_ext(
+    code: int, metadata: object, raw_data: memoryview
+) -> msgspec.msgpack.Ext:
+    metadata_bytes = msgspec.msgpack.encode(metadata)
+    payload = bytearray(_MSGPACK_BUFFER_METADATA_SIZE.pack(len(metadata_bytes)))
+    payload.extend(metadata_bytes)
+    payload.extend(raw_data)
+    return msgspec.msgpack.Ext(code, payload)
+
+
+def _unpack_buffer_ext(data: memoryview) -> Tuple[object, memoryview]:
+    if len(data) < _MSGPACK_BUFFER_METADATA_SIZE.size:
+        raise msgspec.DecodeError("MessagePack buffer extension is missing metadata")
+
+    (metadata_size,) = _MSGPACK_BUFFER_METADATA_SIZE.unpack_from(data)
+    raw_data_offset = _MSGPACK_BUFFER_METADATA_SIZE.size + metadata_size
+    if raw_data_offset > len(data):
+        raise msgspec.DecodeError("MessagePack buffer extension has invalid metadata")
+
+    metadata = msgspec.msgpack.decode(
+        data[_MSGPACK_BUFFER_METADATA_SIZE.size : raw_data_offset]
+    )
+    return metadata, data[raw_data_offset:]
+
+
+def _torch_dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _torch_dtype_from_name(name: str) -> torch.dtype:
+    return getattr(torch, name)
+
+
+def _restore_torch_tensor(
+    shape, dtype: str, data: Union[bytes, memoryview], device: str = "cpu"
+):
+    tensor_dtype = _torch_dtype_from_name(dtype)
+    if len(data) == 0:
+        tensor = torch.empty(shape, dtype=tensor_dtype, device="cpu")
+    else:
+        tensor = torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
+    if device != "cpu":
+        tensor = tensor.to(device)
+    return tensor
+
+
+def _to_msgpack_state(obj: object) -> object:
+    if isinstance(obj, torch.dtype):
+        return {"__torch_dtype__": _torch_dtype_name(obj)}
+    if isinstance(obj, torch.device):
+        return {"__torch_device__": str(obj)}
+    if isinstance(obj, np.dtype):
+        return {"__np_dtype__": obj.str}
+    if isinstance(obj, dict):
+        return {key: _to_msgpack_state(value) for key, value in obj.items()}
+    if isinstance(obj, torch.Size):
+        return {"__torch_size__": list(obj)}
+    if isinstance(obj, tuple):
+        return {"__tuple__": [_to_msgpack_state(value) for value in obj]}
+    if isinstance(obj, list):
+        return [_to_msgpack_state(value) for value in obj]
+    return obj
+
+
+def _from_msgpack_state(obj: object) -> object:
+    if isinstance(obj, dict):
+        if "__torch_dtype__" in obj:
+            return _torch_dtype_from_name(obj["__torch_dtype__"])
+        if "__torch_device__" in obj:
+            return torch.device(obj["__torch_device__"])
+        if "__np_dtype__" in obj:
+            return np.dtype(obj["__np_dtype__"])
+        if "__torch_size__" in obj:
+            return torch.Size(obj["__torch_size__"])
+        if "__tuple__" in obj:
+            return tuple(_from_msgpack_state(value) for value in obj["__tuple__"])
+        return {key: _from_msgpack_state(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_from_msgpack_state(value) for value in obj]
+    return obj
+
+
+def _is_shm_pointer_mm_data(obj: object) -> bool:
+    cls = type(obj)
+    return cls.__name__ == "ShmPointerMMData" and cls.__module__.endswith(
+        ".managers.mm_utils"
+    )
+
+
+def _encode_shm_pointer_mm_data(obj: Any) -> object:
+    return _to_msgpack_state(obj.__getstate__())
+
+
+def _decode_shm_pointer_mm_data(state: Dict[str, object]) -> object:
+    from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+    obj = ShmPointerMMData.__new__(ShmPointerMMData)
+    obj.__setstate__(_from_msgpack_state(state))
+    return obj
+
+
+def _encode_cuda_ipc_tensor_proxy(obj: CudaIpcTensorTransportProxy) -> object:
+    return {
+        "proxy_state": _to_msgpack_state(obj.proxy_state),
+        "sync_data_meta": _to_msgpack_state(obj.sync_data_meta),
+    }
+
+
+def _decode_cuda_ipc_tensor_proxy(
+    state: Dict[str, object],
+) -> CudaIpcTensorTransportProxy:
+    obj = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+    obj.proxy_state = _from_msgpack_state(state["proxy_state"])
+    obj.reconstruct_tensor = None
+    obj.sync_data_meta = _from_msgpack_state(state["sync_data_meta"])
+    obj.sync_buffer = None
+    obj._consumer_acknowledged = False
+    return obj
+
+
 def enc_hook(obj: Any) -> Any:
     if isinstance(obj, array):
-        return (obj.typecode, obj.tobytes())
-    elif isinstance(obj, torch.Tensor):
-        tensor_dtype = str(obj.dtype).removeprefix("torch.")
-        raw_data = (
-            obj.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+        return _pack_buffer_ext(
+            _MSGPACK_EXT_ARRAY, obj.typecode, memoryview(obj).cast("B")
         )
-        return (obj.shape, tensor_dtype, raw_data)
+    elif isinstance(obj, torch.Tensor):
+        tensor_dtype = _torch_dtype_name(obj.dtype)
+        tensor = obj.cpu().contiguous()
+        raw_data = tensor.reshape(-1).view(torch.uint8).numpy().data
+        return _pack_buffer_ext(
+            _MSGPACK_EXT_TORCH_TENSOR,
+            (tuple(obj.shape), tensor_dtype, str(obj.device)),
+            raw_data,
+        )
     elif isinstance(obj, np.ndarray):
-        raw_data = np.ascontiguousarray(obj).reshape(-1).view(np.uint8).data
-        return (obj.shape, obj.dtype.str, raw_data)
+        arr = np.ascontiguousarray(obj)
+        raw_data = arr.reshape(-1).view(np.uint8).data
+        return _pack_buffer_ext(
+            _MSGPACK_EXT_NP_ARRAY,
+            (arr.shape, arr.dtype.str),
+            raw_data,
+        )
     elif isinstance(obj, np.floating):
         return float(obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, CudaIpcTensorTransportProxy):
+        return _pack_ext(
+            _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
+            _encode_cuda_ipc_tensor_proxy(obj),
+        )
+    elif _is_shm_pointer_mm_data(obj):
+        return _pack_ext(
+            _MSGPACK_EXT_SHM_POINTER_MM_DATA,
+            _encode_shm_pointer_mm_data(obj),
+        )
     else:
         raise TypeError(
             f"Cannot msgpack encode object of type {type(obj)} with enc_hook. "
@@ -2173,18 +2340,17 @@ def enc_hook(obj: Any) -> Any:
         )
 
 
-def dec_hook(tp: Type, obj: Any) -> Any:
+def dec_hook(tp: Type, obj: object) -> object:
+    if isinstance(obj, tp):
+        return obj
     if tp is array:
         typecode, raw_data = obj
         res = array(typecode)
         res.frombytes(raw_data)
         return res
     elif tp is torch.Tensor:
-        shape, dtype, data = obj
-        tensor_dtype = getattr(torch, dtype)
-        if len(data) == 0:
-            return torch.empty(shape, dtype=tensor_dtype)
-        return torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
+        shape, dtype, data, *device = obj
+        return _restore_torch_tensor(shape, dtype, data, device[0] if device else "cpu")
     elif tp is np.ndarray:
         shape, dtype, data = obj
         return np.frombuffer(data, dtype=np.dtype(dtype)).copy().reshape(shape)
@@ -2195,6 +2361,36 @@ def dec_hook(tp: Type, obj: Any) -> Any:
             "and unwrap_from_pickle(...) for arbitrary payloads, or add a "
             "dedicated enc_hook/dec_hook branch for this transport type."
         )
+
+
+def ext_hook(code: int, data: memoryview) -> object:
+    if code not in (
+        _MSGPACK_EXT_ARRAY,
+        _MSGPACK_EXT_TORCH_TENSOR,
+        _MSGPACK_EXT_NP_ARRAY,
+        _MSGPACK_EXT_SHM_POINTER_MM_DATA,
+        _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
+    ):
+        return msgspec.msgpack.Ext(code, bytes(data))
+
+    if code == _MSGPACK_EXT_ARRAY:
+        typecode, raw_data = _unpack_buffer_ext(data)
+        res = array(typecode)
+        res.frombytes(raw_data)
+        return res
+    elif code == _MSGPACK_EXT_TORCH_TENSOR:
+        metadata, raw_data = _unpack_buffer_ext(data)
+        shape, dtype, device = metadata
+        return _restore_torch_tensor(shape, dtype, raw_data, device)
+    elif code == _MSGPACK_EXT_NP_ARRAY:
+        metadata, raw_data = _unpack_buffer_ext(data)
+        shape, dtype = metadata
+        return np.frombuffer(raw_data, dtype=np.dtype(dtype)).copy().reshape(shape)
+    elif code == _MSGPACK_EXT_SHM_POINTER_MM_DATA:
+        return _decode_shm_pointer_mm_data(_unpack_ext(data))
+    elif code == _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY:
+        return _decode_cuda_ipc_tensor_proxy(_unpack_ext(data))
+    raise AssertionError(f"Unhandled known MessagePack extension code: {code}")
 
 
 _struct_types = tuple(
@@ -2211,14 +2407,18 @@ _primitive_types = (int, float, bool, bytes)
 _all_types = _struct_types + _primitive_types
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
-_msgpack_decoder = msgspec.msgpack.Decoder(Union[_all_types], dec_hook=dec_hook)
+_msgpack_decoder = msgspec.msgpack.Decoder(
+    Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
+)
 _USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
 
 
 def hook_custom_types(*new_types: Type):
     global _msgpack_decoder, _all_types
     _all_types = tuple(dict.fromkeys(_all_types + new_types))
-    _msgpack_decoder = msgspec.msgpack.Decoder(Union[_all_types], dec_hook=dec_hook)
+    _msgpack_decoder = msgspec.msgpack.Decoder(
+        Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
+    )
 
 
 def _maybe_wrap_pickle(obj: Any) -> Any:
