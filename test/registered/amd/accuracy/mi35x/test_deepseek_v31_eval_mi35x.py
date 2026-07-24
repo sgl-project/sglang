@@ -1,8 +1,8 @@
-"""AMD DeepSeek-V3.1 GSM8K Completion Evaluation Test (8-GPU)
+"""MI35x DeepSeek-V3.1 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests DeepSeek-V3.1 model using few-shot completion benchmark on MI300X.
+Tests DeepSeek-V3.1 model using few-shot completion benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-deepseek-v31 suite
+Registry: nightly-amd-8-gpu-mi35x-deepseek-v31 suite
 """
 
 import ast
@@ -23,9 +23,9 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - DeepSeek-V3.1 accuracy tests (~60 min)
+# Register for AMD CI - MI35x DeepSeek-V3.1 accuracy tests (~60 min)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-deepseek-v31", nightly=True
+    est_time=3600, suite="nightly-amd-8-gpu-mi35x-deepseek-v31", nightly=True
 )
 
 INVALID = -9999999
@@ -97,8 +97,8 @@ def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
     return float(acc), float(latency)
 
 
-class TestDeepSeekV31EvalAMD(unittest.TestCase):
-    """DeepSeek-V3.1 GSM8K Completion Evaluation Test for AMD MI300X."""
+class TestDeepSeekV31EvalMI35x(unittest.TestCase):
+    """DeepSeek-V3.1 GSM8K Completion Evaluation Test for AMD MI35x."""
 
     @classmethod
     def setUpClass(cls):
@@ -139,7 +139,7 @@ class TestDeepSeekV31EvalAMD(unittest.TestCase):
             status = "✅ PASS" if passed else "❌ FAIL"
             print(f"  accuracy={acc:.3f} threshold={self.accuracy_threshold} {status}")
 
-            summary = f"### DeepSeek-V3.1 (MI300X)\n\n"
+            summary = f"### DeepSeek-V3.1 (MI35x)\n\n"
             summary += f"| Model | Accuracy | Threshold | Status |\n"
             summary += f"| ----- | -------- | --------- | ------ |\n"
             summary += f"| {DEEPSEEK_V31_MODEL_PATH} | {acc:.3f} | {self.accuracy_threshold} | {status} |\n"
