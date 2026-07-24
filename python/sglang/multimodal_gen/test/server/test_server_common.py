@@ -841,6 +841,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
 
+        if case.server_args.modality == "3d":
+            logger.info("Skipping GT save for mesh (3d) case: %s", case.id)
+            return
+
         if case.server_args.modality == "action":
             output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"
             output_path.write_bytes(content)
