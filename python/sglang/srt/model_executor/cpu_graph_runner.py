@@ -173,8 +173,7 @@ def register_fake_ops(tp_size: int):
         "decode_attention_cpu",
         "extend_attention_cpu",
         "gemma_fused_add_rmsnorm_cpu",
-        "layernorm_cpu",
-        "fused_add_layernorm_cpu",
+        "store_cache_cpu",
     ]
     for op in none_return_ops:
 
@@ -193,6 +192,8 @@ def register_fake_ops(tp_size: int):
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
         "gemma4_rmsnorm_cpu",
+        "layernorm_cpu",
+        "fused_add_layernorm_cpu",
     ]:
 
         @register_cpu_compile_fake(op)
