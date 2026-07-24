@@ -2,6 +2,15 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8,
+    CompressedTensorsWNA16,
+)
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +80,60 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+    def test_compressed_tensors_parallel_lm_head_dispatch(self):
+        cfg = CompressedTensorsConfig(
+            target_scheme_map={"lm_head": {"weights": None, "input_activations": None}},
+            ignore=[],
+            quant_format="pack-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        sentinel = MagicMock(spec=CompressedTensorsWNA16)
+        cfg.get_linear_scheme = MagicMock(return_value=sentinel)
+        layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        method = cfg.get_quant_method(layer, prefix="lm_head")
+
+        self.assertIsInstance(method, CompressedTensorsLinearMethod)
+        self.assertIs(layer.scheme, sentinel)
+        cfg.get_linear_scheme.assert_called_once_with(layer=layer, layer_name="lm_head")
+
+        w8a8_cfg = CompressedTensorsConfig(
+            target_scheme_map={"lm_head": {"weights": None, "input_activations": None}},
+            ignore=[],
+            quant_format="pack-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        w8a8_cfg.get_linear_scheme = MagicMock(
+            return_value=MagicMock(spec=CompressedTensorsW8A8Fp8)
+        )
+        w8a8_layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        w8a8_method = w8a8_cfg.get_quant_method(w8a8_layer, prefix="lm_head")
+
+        self.assertIsNone(w8a8_method)
+        self.assertFalse(hasattr(w8a8_layer, "scheme"))
+
+        fallback_cfg = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=[],
+            quant_format="pack-quantized",
+            sparsity_scheme_map={},
+            sparsity_ignore_list=[],
+        )
+        fallback_cfg.get_linear_scheme = MagicMock(
+            side_effect=ValueError("Not targeted")
+        )
+        fallback_layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        fallback_method = fallback_cfg.get_quant_method(
+            fallback_layer, prefix="lm_head"
+        )
+
+        self.assertIsNone(fallback_method)
+        self.assertFalse(hasattr(fallback_layer, "scheme"))
 
 
 if __name__ == "__main__":
