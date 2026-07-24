@@ -1,13 +1,13 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -53,10 +53,51 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import draft_tp_context, generate_token_bitmask
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+def apply_grammar_vocab_mask(
+    reqs: List[Req],
+    draft_input: DFlashDraftInputV2,
+    verify_ids_2d: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    vocab_size: int,
+) -> None:
+    """Mask the target verify logits to the grammar-allowed vocabulary in place.
+
+    DSPARK's verify chain is linear (a degenerate tree, where each position's
+    only child is the next one), so EAGLE's tree-based mask builder applies
+    directly with a straight-line ``retrieve_next_token`` and no siblings. The
+    mask is built over ``verify_ids_2d`` (the same ``(bs, block_size + 1)``
+    tensor that produced ``next_token_logits``), so mask rows and logit rows
+    line up one-for-one. ``generate_token_bitmask`` records the batch grammar on
+    ``draft_input.grammar``; when no request in the batch carries one it returns
+    ``None`` and the logits are left untouched.
+    """
+    bs, chain_len = verify_ids_2d.shape
+    retrieve_next_token_cpu = torch.full((bs, chain_len), -1, dtype=torch.int64)
+    if chain_len > 1:
+        retrieve_next_token_cpu[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+    retrieve_next_sibling_cpu = torch.full((bs, chain_len), -1, dtype=torch.int64)
+    draft_tokens_cpu = verify_ids_2d.to(device="cpu", dtype=torch.int64)
+
+    vocab_mask = generate_token_bitmask(
+        reqs,
+        draft_input,
+        retrieve_next_token_cpu,
+        retrieve_next_sibling_cpu,
+        draft_tokens_cpu,
+        vocab_size,
+    )
+    if vocab_mask is None or draft_input.grammar is None:
+        return
+    vocab_mask = vocab_mask.to(next_token_logits.device)
+    draft_input.grammar.apply_vocab_mask(
+        logits=next_token_logits, vocab_mask=vocab_mask
+    )
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -568,11 +609,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # A live grammar forces the eager path: the folded epilogue runs
+        # accept/finalize inside the target-verify cuda graph off its own
+        # buffers, so a vocab mask applied to next_token_logits below would be
+        # silently ignored and the grammar would not be enforced.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+            and not batch.has_grammar
         )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -597,6 +643,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
+        if batch.has_grammar and logits_output.next_token_logits is not None:
+            apply_grammar_vocab_mask(
+                reqs=batch.reqs,
+                draft_input=draft_input,
+                verify_ids_2d=verify_ids_2d,
+                next_token_logits=logits_output.next_token_logits,
+                vocab_size=sampling_info.vocab_size,
+            )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
