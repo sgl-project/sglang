@@ -28,6 +28,26 @@ class BatchedPenalizerOrchestrator:
             is_required |= pen_is_required
         self.is_required = is_required
 
+        self._active_penalizers: tuple["_BatchedPenalizer", ...] = ()
+        self._active_additive_penalizers: tuple["_BatchedPenalizer", ...] = ()
+        self._active_scaling_penalizers: tuple["_BatchedPenalizer", ...] = ()
+        self._refresh_active_penalizers()
+
+    def _refresh_active_penalizers(self) -> None:
+        """Recompute the cached prepared-penalizer tuples.
+
+        Must be called after any orchestrator method that can flip
+        `_is_prepared` (init, filter, merge, release).
+        """
+        active = tuple(p for p in self.penalizers.values() if p._is_prepared)
+        self._active_penalizers = active
+        self._active_additive_penalizers = tuple(
+            p for p in active if not p.is_multiplicative
+        )
+        self._active_scaling_penalizers = tuple(
+            p for p in active if p.is_multiplicative
+        )
+
     @property
     def batch(self) -> ScheduleBatch | None:
         return self._batch_ref()
@@ -49,8 +69,8 @@ class BatchedPenalizerOrchestrator:
         Args:
             output_ids (torch.Tensor): The output tokens.
         """
-        for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+        for penalizer in self._active_penalizers:
+            penalizer._cumulate_output_tokens(output_ids=output_ids)
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -65,38 +85,38 @@ class BatchedPenalizerOrchestrator:
                 applied directly.
         """
         if repeat is None:
-            for penalizer in self.penalizers.values():
-                penalizer.apply(logits)
-        else:
-            # Additive: capture into zeros, expand, add
+            for penalizer in self._active_penalizers:
+                penalizer._apply(logits)
+            return
+
+        # Additive: capture into zeros, expand, add
+        if self._active_additive_penalizers:
             bs = logits.shape[0] // repeat
             additive = torch.zeros(
                 (bs, logits.shape[1]), dtype=torch.float32, device=logits.device
             )
             self.accumulate_additive_penalties(additive)
             logits.add_(torch.repeat_interleave(additive, repeat, dim=0))
-            # Scaling: accumulate, expand, apply
-            accumulated = self.accumulate_scaling_penalties()
-            if accumulated is not None:
-                from sglang.srt.sampling.penaltylib.repetition_penalty import (
-                    apply_scaling_penalties,
-                )
 
-                expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
-                apply_scaling_penalties(logits, expanded)
+        # Scaling: accumulate, expand, apply
+        accumulated = self.accumulate_scaling_penalties()
+        if accumulated is not None:
+            from sglang.srt.sampling.penaltylib.repetition_penalty import (
+                apply_scaling_penalties,
+            )
+
+            expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
+            apply_scaling_penalties(logits, expanded)
 
     def accumulate_additive_penalties(self, logits: torch.Tensor):
         """Apply only additive (non-multiplicative) penalizers."""
-        for penalizer in self.penalizers.values():
-            if not penalizer.is_multiplicative:
-                penalizer.apply(logits)
+        for penalizer in self._active_additive_penalizers:
+            penalizer._apply(logits)
 
     def accumulate_scaling_penalties(self) -> Optional[torch.Tensor]:
         """Accumulate all multiplicative penalty tensors into one, or None if none active."""
         result = None
-        for penalizer in self.penalizers.values():
-            if not penalizer._is_prepared or not penalizer.is_multiplicative:
-                continue
+        for penalizer in self._active_scaling_penalizers:
             if result is None:
                 result = penalizer.get_scaling_penalties().clone()
             else:
@@ -127,6 +147,7 @@ class BatchedPenalizerOrchestrator:
             else:
                 penalizer.teardown()
         self.is_required = is_required
+        self._refresh_active_penalizers()
 
     # Resource management helpers
     def release(self) -> None:
@@ -137,6 +158,9 @@ class BatchedPenalizerOrchestrator:
         # Break reference to ScheduleBatch
         self._batch_ref = None
         self.is_required = False
+        self._active_penalizers = ()
+        self._active_additive_penalizers = ()
+        self._active_scaling_penalizers = ()
 
     # Context manager support
     def __enter__(self) -> BatchedPenalizerOrchestrator:
@@ -162,6 +186,8 @@ class BatchedPenalizerOrchestrator:
         self.is_required = True
         for penalizer, their_penalizer in their.penalizers.items():
             self.penalizers[penalizer].merge(their_penalizer)
+        # merge() may prepare previously-unprepared penalizers, so refresh.
+        self._refresh_active_penalizers()
 
 
 class _BatchedPenalizer(abc.ABC):
