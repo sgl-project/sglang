@@ -280,10 +280,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
+        supports_dspark_dp_moe = server_args.moe_a2a_backend == "none" or (
+            server_args.moe_a2a_backend == "deepep"
+            and server_args.moe_runner_backend == "deep_gemm"
+        )
+        if not supports_dspark_dp_moe:
             raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+                "DSpark with dp attention only supports moe_a2a_backend='none' "
+                "or moe_a2a_backend='deepep' with moe_runner_backend='deep_gemm'; "
+                f"got moe_a2a_backend={server_args.moe_a2a_backend!r}, "
+                f"moe_runner_backend={server_args.moe_runner_backend!r}."
             )
         if server_args.attn_cp_size > 1:
             raise ValueError(
