@@ -30,6 +30,7 @@ class TestGLM52CPInterleave(GSM8KMixin, CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={"SGLANG_ENABLE_CP_V2": "0"},
             other_args=[
                 "--tp",
                 "4",
