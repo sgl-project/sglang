@@ -53,6 +53,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.idle_gc import IdleGCFreezeGate
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -322,6 +323,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+        self.maybe_init_idle_gc()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -555,6 +557,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 hf_config=self.model_config.hf_config,
                 encode_urls=self.encoder_urls,
             )
+
+    def maybe_init_idle_gc(self) -> None:
+        if self.server_args.gc_freeze_on_idle:
+            self.idle_gc_gate = IdleGCFreezeGate()
+        else:
+            self.idle_gc_gate = None
 
     def init_metric_collector_watchdog(self):
         # Metrics
@@ -1842,6 +1850,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         freeze_gc("Tokenizer Manager")
         return None
 
+    async def idle_gc_freeze_watcher(self):
+        """Broadcast gc.freeze() after sustained idle (see IdleGCFreezeGate)."""
+        while True:
+            await asyncio.sleep(2.0)
+            now = time.monotonic()
+            if self.idle_gc_gate.note(busy=bool(self.rid_to_state), now=now):
+                await self.freeze_gc()
+                self.idle_gc_gate.mark_frozen(now)
+
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
@@ -1880,6 +1897,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+        if self.idle_gc_gate is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.idle_gc_freeze_watcher))
+            )
 
     async def handle_loop(self):
         """The event loop that handles requests"""
