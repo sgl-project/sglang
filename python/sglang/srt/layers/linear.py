@@ -1438,6 +1438,8 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
+        self.use_decode_attn_tp: bool = False
 
         self.quant_method.create_weights(
             layer=self,
@@ -1585,8 +1587,7 @@ class RowParallelLinear(LinearBase):
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
         # the decoder — callers should not thread those flags into modules.
         if (
-            self.reduce_results
-            and self.tp_size > 1
+            ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
             and not skip_all_reduce
             and not should_skip_mlp_all_reduce()
         ):
