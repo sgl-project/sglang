@@ -129,7 +129,16 @@ class CompressStatePool:
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
         if not online:
-            self.kv_score_buffer[-1].clear()
+            if _is_hip and ratio == 128:
+                # Request-scoped C128 state is addressed by req_pool_idx (or a
+                # per-request ring).  The pool is allocated with torch.empty(),
+                # so a cold server can otherwise read uninitialized partial
+                # states before a request slot has been written for the first
+                # time.  Initialize all C128 rows to the empty-state sentinel;
+                # C4 keeps the historical last-row sentinel behavior.
+                self.kv_score_buffer.clear()
+            else:
+                self.kv_score_buffer[-1].clear()
 
     def _alloc_kv_score_buffer(
         self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
@@ -195,6 +204,13 @@ class CompressStatePool:
         swa_pages = swa_loc // self.swa_page_size
         state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
         state_loc = torch.where(swa_loc < 0, -1, state_loc)
+        return state_loc
+
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        state_loc = req_pool_indices * self.ring_size + positions % self.ring_size
+        state_loc = torch.where(positions < 0, -1, state_loc)
         return state_loc
 
     def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:

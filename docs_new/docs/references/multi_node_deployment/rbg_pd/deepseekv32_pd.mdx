@@ -285,7 +285,7 @@ spec:
                   - "2048"
                   - --tp-size
                   - "8" # Size of Tensor Parallelism
-                  - --cuda-graph-max-bs
+                  - --cuda-graph-max-bs-decode
                   - "16"
                   - --dist-init-addr
                   - $(LWS_LEADER_ADDRESS):20102
@@ -356,7 +356,7 @@ spec:
                 -  mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
                 - --max-running-requests
                 - "4096"
-                - --cuda-graph-max-bs
+                - --cuda-graph-max-bs-decode
                 - "16"
                 - --tp-size
                 - "8" # Size of Tensor Parallelism

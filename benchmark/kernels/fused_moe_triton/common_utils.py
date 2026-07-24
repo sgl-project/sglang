@@ -84,6 +84,7 @@ def get_model_config(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
+        "MellumForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -95,6 +96,7 @@ def get_model_config(
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -166,6 +168,10 @@ def get_model_config(
             0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
         )
         intermediate_size = config.intermediate_size
+    elif architecture == "UnlimitedOCRForCausalLM":
+        E = config.n_routed_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size

@@ -216,9 +216,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
@@ -235,6 +235,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+
+    def release_host_resources(self) -> None:
+        """Release pinned host buffers in userspace on graceful shutdown.
+
+        Kernel-side unpinning during process reclaim can stall teardown for
+        tens of seconds (see HostKVCache.destroy). Idempotent.
+        """
 
     @abstractmethod
     def reset(self):
@@ -328,6 +335,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def swa_reprefill_tail_tokens(self) -> int:
+        # Only the unified_kv compress-only HiCache layout needs to hold back a
+        # trailing sliding window for re-prefill; every other cache keeps SWA
+        # content-stable and overrides this where relevant.
+        return 0
+
     def supports_mamba(self) -> bool:
         return False
 
@@ -335,6 +348,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def release_session(self, session_id: str) -> None:
+        pass
+
+    def release_radix_session(self, session_id: str) -> None:
         pass
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:

@@ -181,9 +181,9 @@ class Gemma4VisionAttention(nn.Module):
     @staticmethod
     def _select_backend() -> str:
         """Mirror VisionAttention._determine_attention_backend for consistency."""
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_server_args
 
-        override = get_global_server_args().mm_attention_backend
+        override = get_server_args().mm_attention_backend
         if override is not None:
             return override
         if is_cuda():

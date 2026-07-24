@@ -215,19 +215,25 @@ class TestBuildEagleTree(unittest.TestCase):
         ]
         parents_list = [
             torch.tensor(
-                [[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]], dtype=torch.int64, device="cuda"
+                [[-1, 0, 1, 2, 3], [-1, 0, 1, 2, 3]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
             torch.tensor(
-                [[4, 8, 9, 10], [4, 5, 6, 7]], dtype=torch.int64, device="cuda"
+                [[4, 8, 9, 10], [4, 5, 6, 7]], dtype=torch.int64, device=get_device()
             ),
             torch.tensor(
-                [[20, 24, 21, 28], [24, 28, 20, 21]], dtype=torch.int64, device="cuda"
+                [[20, 24, 21, 28], [24, 28, 20, 21]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
             torch.tensor(
-                [[36, 40, 41, 44], [36, 40, 44, 45]], dtype=torch.int64, device="cuda"
+                [[36, 40, 41, 44], [36, 40, 44, 45]],
+                dtype=torch.int64,
+                device=get_device(),
             ),
         ]
-        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([5, 10], dtype=torch.int64, device=get_device())
         topk = 4
         depth = 4
         num_draft_token = 8

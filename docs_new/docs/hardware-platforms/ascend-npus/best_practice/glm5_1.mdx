@@ -6,26 +6,28 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for GLM-5.1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [GLM-5.1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65k+1.5k (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5k+1.5k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128k+1k | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64k+1k | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65k+1.5k (100% prefix cache hit rate) | 33ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64k+1k (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -43,7 +45,7 @@ This page focuses on optimal configuration and benchmark results for GLM-5.1 on 
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -82,7 +84,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -112,7 +113,7 @@ do
         --trust-remote-code \
         --mem-fraction-static 0.65 \
         --served-model-name glm-5 \
-        --cuda-graph-max-bs 16 \
+        --cuda-graph-max-bs-decode 16 \
         --max-running-requests 256 \
         --quantization modelslim \
         --speculative-draft-model-quantization unquant \
@@ -122,7 +123,9 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47
         break
     fi
 done
@@ -132,7 +135,7 @@ done
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -147,7 +150,7 @@ python -m sglang.bench_serving \
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K 20ms
+### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K 56.4ms
 
 **Model**: GLM-5.1
 
@@ -159,9 +162,11 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K
+**Dataset**: 128k+1k
 
-**TPOT**: 20ms
+**TPOT**: 56.4ms
+
+**TTFT**: 13.1s
 
 #### Model Deployment
 
@@ -241,7 +246,7 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
+        --chunked-prefill-size 8192 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -255,6 +260,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -272,7 +279,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -306,6 +312,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -313,7 +321,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -333,7 +341,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -358,7 +366,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 16K+1K
+**Dataset**: 16k+1k
 
 **TPOT**: 50ms
 
@@ -452,6 +460,8 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -469,7 +479,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -507,6 +516,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -514,7 +525,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -534,7 +545,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -547,7 +558,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### GLM-5.1 W4A8 1P1D 32P IN64K OUT1K 20ms
+### GLM-5.1 W4A8 1P1D 32P IN64K OUT1K 55.2ms
 
 **Model**: GLM-5.1
 
@@ -559,9 +570,11 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
-**TPOT**: 20ms
+**TPOT**: 55.2ms
+
+**TTFT**: 7.58s
 
 #### Model Deployment
 
@@ -641,7 +654,7 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
+        --chunked-prefill-size 8192 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -655,6 +668,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -672,7 +687,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -706,6 +720,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -713,7 +729,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -733,7 +749,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -758,7 +774,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K
+**Dataset**: 64k+1k
 
 **TPOT**: 50ms
 
@@ -854,6 +870,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -871,7 +889,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -905,6 +922,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -912,7 +931,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -932,7 +951,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -957,7 +976,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (90% prefix cache hit rate)
+**Dataset**: 65k+1.5k (90% prefix cache hit rate)
 
 **TPOT**: 25ms
 
@@ -1051,6 +1070,8 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1068,7 +1089,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1106,6 +1126,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1113,7 +1135,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1133,10 +1155,10 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (`repeat_rate = 0.9`):
 `--gsp-system-prompt-len 59904` = `int(66560 * 0.9)` is the shared prefix portion.
-`--gsp-question-len 6655` = `int(66560 * (1 - 0.9))` is the unique per-request suffix.
+`--gsp-question-len 6656` = `int(66560 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1145,7 +1167,7 @@ python -m sglang.bench_serving \
     --gsp-num-groups 1 \
     --gsp-prompts-per-group 480 \
     --gsp-system-prompt-len 59904 \
-    --gsp-question-len 6655 \
+    --gsp-question-len 6656 \
     --gsp-output-len 1536 \
     --max-concurrency 100 \
     --num-prompts 480 \
@@ -1164,7 +1186,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 65K+1.5K (100% prefix cache hit rate)
+**Dataset**: 65k+1.5k (100% prefix cache hit rate)
 
 **TPOT**: 33ms
 
@@ -1248,6 +1270,8 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1265,7 +1289,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=48
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
@@ -1289,7 +1312,6 @@ do
         --quantization modelslim \
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -1307,6 +1329,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1314,7 +1338,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -1334,7 +1358,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1359,7 +1383,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 128K+1K (90% prefix cache hit rate)
+**Dataset**: 128k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1455,6 +1479,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1472,7 +1498,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1510,6 +1535,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1517,7 +1544,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1541,7 +1568,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 13107` = `int(131072 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \
@@ -1569,7 +1596,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 64K+1K (90% prefix cache hit rate)
+**Dataset**: 64k+1k (90% prefix cache hit rate)
 
 **TPOT**: 50ms
 
@@ -1664,6 +1691,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1681,7 +1710,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=40
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SPEC_ENABLE_OVERLAP_REFLOW=1
         export TASK_QUEUE_ENABLE=0
 
@@ -1719,6 +1747,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1726,7 +1756,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>, <your prefill ip3>, <your prefill ip4>: prefill node IP addresses
@@ -1752,7 +1782,7 @@ We tested it based on the `generated-shared-prefix` dataset with 90% cache hit (
 `--gsp-question-len 6553` = `int(65536 * (1 - 0.9))` is the unique per-request suffix.
 `--gsp-num-groups 1` keeps all requests in one prefix group for maximum cache reuse.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name generated-shared-prefix \
     --backend sglang \

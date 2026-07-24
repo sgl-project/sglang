@@ -6,28 +6,30 @@ metatags:
 
 <Note>
 This page focuses on optimal configuration and benchmark results for DeepSeek-R1 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [DeepSeek-R1 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_r1).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 18.9ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-18-9ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6K+1.6K | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 16ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-16ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9k+1k | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6k+1.6k | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.5K+1.5K | 41ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-41ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.36ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50-36ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
-### DeepSeek-R1 W4A8 1P1D 16P IN3K5 OUT1K5 41ms
+### DeepSeek-R1 W4A8 1P1D 16P IN3K5 OUT1K5 50ms
 
 **Model**: DeepSeek-R1
 
@@ -39,9 +41,9 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
-**TPOT**: 41ms
+**TPOT**: 50ms
 
 #### Model Deployment
 
@@ -127,6 +129,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -147,7 +151,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -177,6 +180,8 @@ do
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -187,7 +192,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
@@ -207,7 +212,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -223,7 +228,7 @@ python -m sglang.bench_serving \
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
-### DeepSeek-R1 W4A8 8P IN3K5 OUT1K5 50.36ms
+### DeepSeek-R1 W4A8 8P IN3K5 OUT1K5 50ms
 
 **Model**: DeepSeek-R1
 
@@ -235,9 +240,9 @@ python -m sglang.bench_serving \
 
 **Quantization**: W4A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
-**TPOT**: 50.36ms
+**TPOT**: 50ms
 
 #### Model Deployment
 
@@ -273,7 +278,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
@@ -305,14 +309,16 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser deepseek-r1 \
+    --tool-call-parser deepseekv3
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -327,7 +333,7 @@ python -m sglang.bench_serving \
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 18.9ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 16ms
 
 **Model**: DeepSeek-R1
 
@@ -339,9 +345,9 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
-**TPOT**: 18.9ms
+**TPOT**: 16ms
 
 #### Model Deployment
 
@@ -427,6 +433,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -447,7 +455,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -481,6 +488,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -491,7 +500,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -514,7 +523,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -540,7 +549,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 50ms
 
@@ -602,7 +611,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
-        export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export TASK_QUEUE_ENABLE=2
 
@@ -616,13 +624,12 @@ do
         --nnodes 1 \
         --tp-size 16 \
         --mem-fraction-static 0.778 \
-        --quantization modelslim \
         --max-running-requests 16 \
         --disable-radix-cache \
         --chunked-prefill-size -1 \
         --max-prefill-tokens 60000 \
         --moe-a2a-backend ascend_fuseep \
-        --deepep-mode normal \
+        --fuseep-mode 2 \
         --speculative-algorithm NEXTN \
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
@@ -632,6 +639,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -652,9 +661,7 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_LM_HEAD_TP=8
-        export SGLANG_NPU_FUSED_MOE_MODE=1
         export TASK_QUEUE_ENABLE=1
 
         python3 -m sglang.launch_server \
@@ -669,8 +676,8 @@ do
         --dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
-        --quantization modelslim \
         --moe-a2a-backend ascend_fuseep \
+        --fuseep-mode 1 \
         --enable-dp-attention \
         --deepep-mode low_latency \
         --moe-dense-tp 1 \
@@ -686,6 +693,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -696,7 +705,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -719,7 +728,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -745,7 +754,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1K
+**Dataset**: 3.5k+1k
 
 **TPOT**: 19.0ms
 
@@ -833,6 +842,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -853,7 +864,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -887,6 +897,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -897,7 +909,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -920,7 +932,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -946,7 +958,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.9K+1K
+**Dataset**: 3.9k+1k
 
 **TPOT**: 19.0ms
 
@@ -1034,6 +1046,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1054,7 +1068,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1088,6 +1101,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1098,7 +1113,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1121,7 +1136,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -1147,7 +1162,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 6K+1.6K
+**Dataset**: 6k+1.6k
 
 **TPOT**: 20.5ms
 
@@ -1234,6 +1249,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1254,7 +1271,6 @@ do
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-        export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export TASK_QUEUE_ENABLE=1
 
@@ -1287,6 +1303,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1297,7 +1315,7 @@ do
 done
 ```
 
-```shell Command
+```bash Command
 # ============================================================
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
@@ -1320,7 +1338,7 @@ python -m sglang_router.launch_router \
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

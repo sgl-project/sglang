@@ -171,7 +171,7 @@ if __name__ == "__main__":
         "--limit",
         type=int,
         default=None,
-        help="If set, only evaluate this many samples (debug / smoke runs).",
+        help="If set, only evaluate this many samples (debug / quick runs).",
     )
     EvalArgs.add_cli_args(parser)
     args = parser.parse_args()

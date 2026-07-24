@@ -30,7 +30,7 @@ _SPEC_EAGLE_SERVER_ARGS = (
     "token_oracle",
     "--speculative-algorithm",
     "EAGLE",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     str(_CUDA_GRAPH_MAX_BS),
     "--max-running-requests",
     "32",

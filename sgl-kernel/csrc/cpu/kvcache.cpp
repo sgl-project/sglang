@@ -128,3 +128,57 @@ void store_cache_cpu(
     });
   });
 }
+
+// CPU counterpart of the Triton kernel `copy_all_layer_kv_cache_tiled`:
+// for every K/V buffer b, copy the slot rows `src_loc` to `tgt_loc`:
+//   buf_b[tgt_loc[i], :] = buf_b[src_loc[i], :]  for i in [0, num_locs)
+//
+//   data_ptrs : [2 * layer_num] uint64; base address of each K/V buffer
+//   strides   : [2 * layer_num] int64; bytes per slot row of each buffer
+//   tgt_loc   : [num_locs] int64/int32 slot indices
+//   src_loc   : [num_locs] int64/int32 slot indices
+//
+// Like the Triton kernel, the copy is safe when tgt_loc and src_loc overlap
+// arbitrarily: all source rows of a buffer are staged before any target row
+// of that buffer is written (gather then scatter).
+void copy_all_layer_kv_cache_cpu(
+    const at::Tensor& data_ptrs, const at::Tensor& strides, const at::Tensor& tgt_loc, const at::Tensor& src_loc) {
+  CHECK_INPUT(data_ptrs);
+  CHECK_INPUT(strides);
+  CHECK_INPUT(tgt_loc);
+  CHECK_INPUT(src_loc);
+  CHECK_EQ(data_ptrs.scalar_type(), at::kUInt64);
+  CHECK_EQ(strides.scalar_type(), at::kLong);
+  CHECK_EQ(tgt_loc.scalar_type(), src_loc.scalar_type());
+
+  int64_t num_bufs = data_ptrs.numel();
+  CHECK_EQ(strides.numel(), num_bufs);
+  int64_t num_locs = tgt_loc.numel();
+  CHECK_EQ(src_loc.numel(), num_locs);
+  if (num_bufs == 0 || num_locs == 0) {
+    return;
+  }
+
+  const uint64_t* __restrict__ ptrs = reinterpret_cast<const uint64_t*>(data_ptrs.data_ptr());
+  const int64_t* __restrict__ stride_ptr = strides.data_ptr<int64_t>();
+
+  AT_DISPATCH_INDEX_TYPES(tgt_loc.scalar_type(), "copy_all_layer_kv_cache_cpu", [&] {
+    const index_t* __restrict__ tgt_ptr = tgt_loc.data_ptr<index_t>();
+    const index_t* __restrict__ src_ptr = src_loc.data_ptr<index_t>();
+
+    at::parallel_for(0, num_bufs, 0, [&](int64_t begin, int64_t end) {
+      std::vector<uint8_t> staging;
+      for (int64_t b = begin; b < end; ++b) {
+        uint8_t* base = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(ptrs[b]));
+        const int64_t stride = stride_ptr[b];
+        staging.resize(num_locs * stride);
+        for (int64_t i = 0; i < num_locs; ++i) {
+          std::memcpy(staging.data() + i * stride, base + src_ptr[i] * stride, stride);
+        }
+        for (int64_t i = 0; i < num_locs; ++i) {
+          std::memcpy(base + tgt_ptr[i] * stride, staging.data() + i * stride, stride);
+        }
+      }
+    });
+  });
+}

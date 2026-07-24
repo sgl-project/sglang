@@ -44,7 +44,7 @@ class TestEagleLlama2Fa3Page256(
     attention_backend = "fa3"
     page_size = 256
     chunked_prefill_size = 4096  # must be divisible by page_size (256)
-    cuda_graph_max_bs = 5
+    cuda_graph_max_bs_decode = 5
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

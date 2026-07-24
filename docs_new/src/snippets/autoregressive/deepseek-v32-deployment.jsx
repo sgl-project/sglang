@@ -209,7 +209,7 @@ export const DeepSeekV32Deployment = () => {
       cmd += ' \\\n  --trust-remote-code';
       cmd += ' \\\n  --dsa-prefill-backend tilelang';
       cmd += ' \\\n  --dsa-decode-backend tilelang';
-      cmd += ' \\\n  --cuda-graph-max-bs 64';
+      cmd += ' \\\n  --cuda-graph-max-bs-decode 64';
     }
 
     // Strategy configurations

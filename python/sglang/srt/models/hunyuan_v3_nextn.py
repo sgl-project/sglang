@@ -32,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
+from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class HYV3ModelNextN(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
+        self.alt_stream = get_stream("alt") if is_cuda() else None
 
         # Force MoE for the MTP layer: first_k_dense_replace=1 would make
         # layer_id=0 pick a dense MLP instead of MoE, so override it.
@@ -185,6 +186,10 @@ class HYV3ForCausalLMNextN(nn.Module):
                 subname = name[len(nextn_prefix) :]
                 if any(subname.startswith(s) for s in spec_weight_names):
                     name = f"model.{subname}"
+                elif subname.startswith("final_layernorm"):
+                    # Released checkpoints store the draft head's output norm
+                    # as model.layers.<N>.final_layernorm.weight.
+                    name = "model.shared_head.norm.weight"
                 else:
                     name = f"model.decoder.{subname}"
             elif name == "model.shared_head.norm.weight":

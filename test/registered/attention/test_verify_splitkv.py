@@ -20,10 +20,10 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
+from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
-from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
+from sglang.kernels.ops.attention.verify_splitkv import (
     can_handle,
     verify_splitkv_fwd,
 )

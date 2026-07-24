@@ -24,7 +24,7 @@ into the allocator itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -37,6 +37,9 @@ def maybe_write_dsv4_extend(
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
+    *,
+    c4_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
+    c128_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
 ) -> None:
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
@@ -87,15 +90,24 @@ def maybe_write_dsv4_extend(
     )
 
     # c4_state / c128_state writes: tail-only. Bundle length is
-    # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens; each req's slots
-    # go at raw positions [req.c{N}_state_alloc_offset, seq_len).
+    # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens. Normal extend
+    # uses the per-Req low-water marks; reserve callers can pass explicit raw
+    # offsets for the pre-reserved interval.
+    if c4_state_alloc_offsets is None:
+        c4_state_alloc_offsets = [
+            getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs
+        ]
+    if c128_state_alloc_offsets is None:
+        c128_state_alloc_offsets = [
+            getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs
+        ]
     if bundle.out_c4_state_loc is not None and hasattr(
         req_to_token_pool, "write_c4_state"
     ):
         _write_state_tail_per_req(
             req_to_token_pool.write_c4_state,
             req_pool_indices_cpu,
-            [getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs],
+            c4_state_alloc_offsets,
             seq_lens_cpu,
             bundle.out_c4_state_loc,
         )
@@ -105,7 +117,7 @@ def maybe_write_dsv4_extend(
         _write_state_tail_per_req(
             req_to_token_pool.write_c128_state,
             req_pool_indices_cpu,
-            [getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs],
+            c128_state_alloc_offsets,
             seq_lens_cpu,
             bundle.out_c128_state_loc,
         )
@@ -185,6 +197,42 @@ def maybe_write_dsv4_decode(
             bundle.out_c128_state_loc,
             ratio=1,
         )
+
+
+def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
+    """Build the DSV4 cache-location view for one target-verify pass.
+
+    Spec-v2 reserves cache ahead of time, so target verify must select only the
+    current draft interval from the per-request DSV4 tables instead of reusing
+    the larger allocation bundle produced during decode preparation.
+    """
+    pool = batch.req_to_token_pool
+    if not hasattr(pool, "req_to_token_c4"):
+        return None
+    reserve_bundle = batch.out_cache_loc_dsv4
+    if reserve_bundle is None:
+        return None
+
+    req_indices = batch.req_pool_indices_cpu.tolist()
+    seq_lens = batch.seq_lens_cpu.tolist()
+
+    def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
+        chunks = []
+        for req_idx, seq_len in zip(req_indices, seq_lens):
+            start = int(seq_len) // ratio
+            end = (int(seq_len) + draft_token_num) // ratio
+            if end > start:
+                chunks.append(table[int(req_idx), start:end])
+        return torch.cat(chunks) if chunks else table.new_empty((0,))
+
+    return type(reserve_bundle)(
+        out_full_loc=batch.out_cache_loc,
+        out_swa_loc=flatten_interval(pool.req_to_token_swa, 1),
+        out_c4_loc=flatten_interval(pool.req_to_token_c4, 4),
+        out_c128_loc=flatten_interval(pool.req_to_token_c128, 128),
+        out_c4_state_loc=flatten_interval(pool.req_to_token_c4_state, 1),
+        out_c128_state_loc=flatten_interval(pool.req_to_token_c128_state, 1),
+    )
 
 
 def _write_per_req(

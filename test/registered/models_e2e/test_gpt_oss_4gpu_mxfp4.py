@@ -18,7 +18,7 @@ class TestGptOss4GpuMxfp4(BaseTestGptOss):
             other_args=[
                 "--tp",
                 "4",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "200",
             ],
         )

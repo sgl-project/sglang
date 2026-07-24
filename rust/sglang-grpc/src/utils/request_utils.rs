@@ -66,6 +66,26 @@ fn trace_headers_to_json(headers: &HashMap<String, String>) -> Option<serde_json
     }
 }
 
+fn insert_disaggregated_params(
+    request: &mut HashMap<String, serde_json::Value>,
+    params: &Option<proto::DisaggregatedParams>,
+) {
+    if let Some(params) = params {
+        request.insert(
+            "bootstrap_host".into(),
+            serde_json::json!(params.bootstrap_host),
+        );
+        request.insert(
+            "bootstrap_port".into(),
+            serde_json::json!(params.bootstrap_port),
+        );
+        request.insert(
+            "bootstrap_room".into(),
+            serde_json::json!(params.bootstrap_room),
+        );
+    }
+}
+
 fn now_timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -128,6 +148,10 @@ pub(crate) fn build_text_generate_dict(
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
     }
+    if let Some(ref session_id) = req.session_id {
+        d.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -172,6 +196,10 @@ pub(crate) fn build_generate_dict(
     if let Some(rank) = req.routed_dp_rank {
         d.insert("routed_dp_rank".into(), serde_json::json!(rank));
     }
+    if let Some(ref session_id) = req.session_id {
+        d.insert("session_id".into(), serde_json::json!(session_id));
+    }
+    insert_disaggregated_params(&mut d, &req.disaggregated_params);
     if let Some(trace) = trace_headers_to_json(&req.trace_headers) {
         d.insert("external_trace_header".into(), trace);
     }
@@ -236,4 +264,79 @@ pub(crate) fn build_classify_dict(
     }
     d.insert("received_time".into(), serde_json::json!(now_timestamp()));
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_dicts_include_session_id() {
+        let session_id = Some("session-1".to_string());
+        let text_req = proto::TextGenerateRequest {
+            session_id: session_id.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            session_id,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_text_generate_dict("request-1", &text_req).get("session_id"),
+            Some(&serde_json::json!("session-1"))
+        );
+        assert_eq!(
+            build_generate_dict("request-2", &token_req).get("session_id"),
+            Some(&serde_json::json!("session-1"))
+        );
+    }
+
+    #[test]
+    fn generate_dicts_include_disaggregated_params() {
+        let disaggregated_params = Some(proto::DisaggregatedParams {
+            bootstrap_host: "10.0.0.1".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: i64::MAX,
+        });
+        let text_req = proto::TextGenerateRequest {
+            disaggregated_params: disaggregated_params.clone(),
+            ..Default::default()
+        };
+        let token_req = proto::GenerateRequest {
+            disaggregated_params,
+            ..Default::default()
+        };
+
+        for request in [
+            build_text_generate_dict("request-1", &text_req),
+            build_generate_dict("request-2", &token_req),
+        ] {
+            assert_eq!(
+                request.get("bootstrap_host"),
+                Some(&serde_json::json!("10.0.0.1"))
+            );
+            assert_eq!(
+                request.get("bootstrap_port"),
+                Some(&serde_json::json!(8998))
+            );
+            assert_eq!(
+                request.get("bootstrap_room"),
+                Some(&serde_json::json!(i64::MAX))
+            );
+        }
+    }
+
+    #[test]
+    fn generate_dicts_omit_disaggregated_params_when_absent() {
+        let text_request =
+            build_text_generate_dict("request-1", &proto::TextGenerateRequest::default());
+        let token_request = build_generate_dict("request-2", &proto::GenerateRequest::default());
+
+        for request in [text_request, token_request] {
+            assert!(!request.contains_key("bootstrap_host"));
+            assert!(!request.contains_key("bootstrap_port"));
+            assert!(!request.contains_key("bootstrap_room"));
+        }
+    }
 }

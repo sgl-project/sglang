@@ -28,7 +28,7 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
     spec_topk = 16
     spec_tokens = 64
     disable_overlap = True  # synchronous baseline; SpecV2 subclass flips overlap on
-    cuda_graph_max_bs = 5
+    cuda_graph_max_bs_decode = 5
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75
     gsm8k_accept_len_thres = 2.4  # EAGLE3 topk16 gsm8k accept ~2.48
@@ -69,7 +69,7 @@ class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
     draft_model = "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B"
     spec_topk = 4
     spec_tokens = 8
-    cuda_graph_max_bs = 5
+    cuda_graph_max_bs_decode = 5
     gsm8k_accept_len_thres = 2.5  # FR-Spec token map lowers accept (~2.57)
     extra_args = (
         "--speculative-token-map",

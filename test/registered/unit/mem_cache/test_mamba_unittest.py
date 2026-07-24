@@ -3,10 +3,10 @@ from array import array
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MambaPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -60,7 +64,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=None,
@@ -154,6 +157,61 @@ class TestMamba(unittest.TestCase):
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
+
+    def test_mamba_pool_deduplicated_conv_window_axis(self):
+        class WindowFirstMambaPool(MambaPool):
+            conv_window_axis = 0
+
+        num_mamba_layers = 2
+        spec_state_size = 3
+        speculative_num_draft_tokens = 4
+        window_size = 3
+        conv_dim = 5
+
+        pool = object.__new__(WindowFirstMambaPool)
+        physical, view = pool._allocate_deduplicated_conv_window(
+            conv_shape=(window_size, conv_dim),
+            num_mamba_layers=num_mamba_layers,
+            spec_state_size=spec_state_size,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            conv_dtype=torch.float32,
+        )
+
+        shared_window_size = speculative_num_draft_tokens + window_size - 1
+        self.assertEqual(
+            physical.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                shared_window_size,
+                conv_dim,
+            ),
+        )
+        self.assertEqual(
+            view.shape,
+            (
+                num_mamba_layers,
+                spec_state_size + 1,
+                speculative_num_draft_tokens,
+                window_size,
+                conv_dim,
+            ),
+        )
+
+        physical.copy_(
+            torch.arange(
+                physical.numel(), dtype=physical.dtype, device=physical.device
+            ).reshape_as(physical)
+        )
+        for step in range(speculative_num_draft_tokens):
+            torch.testing.assert_close(
+                view[:, :, step],
+                physical[:, :, step : step + window_size],
+            )
+        torch.testing.assert_close(view[:, :, :-1, 1:], view[:, :, 1:, :-1])
+
+        view[0, 0, 0, 1, 0] = -1
+        self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
 
     def test_mamba_radix_cache_1(self):
         tree, allocator, req_to_token_pool, make_dummy_req = (
@@ -329,6 +387,65 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
+    def test_mamba_lru_match_refreshes_only_used_node(self):
+        """A prefix-cache hit must refresh only the matched leaf's mamba state in
+        the mamba LRU, not its ancestors. Whole-chain refresh clustered a session's
+        states adjacently, so under mamba-pool pressure eviction dropped whole cold
+        sessions instead of the intermediate states reuse never needs. Guards against
+        reverting the mamba list to reset_node_and_parents_mru.
+        """
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator()
+        )
+
+        def insert(token_ids):
+            req = make_dummy_req()
+            kv = allocator.alloc(len(token_ids))
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", token_ids)),
+                    value=kv,
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        def match_leaf(token_ids):
+            return tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+            ).last_device_node
+
+        def mamba_lru_mru_to_lru():
+            lst = tree.mamba_lru_list
+            order, x = [], getattr(lst.head, lst.nxt)
+            while x is not None and x is not lst.tail and x.id in lst.cache:
+                order.append(x)
+                x = getattr(x, lst.nxt)
+            return order
+
+        # Two independent sessions, each a 2-node mamba chain:
+        #   root -> a1 -> b1  and  root -> a2 -> b2
+        insert([1, 2, 3])
+        insert([1, 2, 3, 4, 5, 6])
+        insert([7, 8, 9])
+        insert([7, 8, 9, 10, 11, 12])
+
+        b1 = match_leaf([1, 2, 3, 4, 5, 6])
+        a1 = b1.parent
+        b2 = match_leaf([7, 8, 9, 10, 11, 12])
+        a2 = b2.parent
+        # Session 2 was matched last, so session 1's ancestor a1 is older than a2.
+        order = mamba_lru_mru_to_lru()
+        self.assertGreater(order.index(a1), order.index(a2))
+
+        # Re-access session 1. Only its consumed leaf (b1) moves to MRU; its ancestor
+        # a1 must stay put -- whole-chain reset would bump a1 right behind b1, making
+        # it newer than a2.
+        self.assertIs(match_leaf([1, 2, 3, 4, 5, 6]), b1)
+        order = mamba_lru_mru_to_lru()
+        self.assertIs(order[0], b1)
+        self.assertGreater(order.index(a1), order.index(a2))
+        tree.sanity_check()
+
     def test_mamba_radix_cache_kv_events(self):
         tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
             enable_kv_cache_events=True
@@ -475,7 +592,6 @@ class TestMamba(unittest.TestCase):
             head_num=head_num,
             head_dim=head_dim,
             full_attention_layer_ids=full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
