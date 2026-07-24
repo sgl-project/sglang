@@ -34,6 +34,9 @@ import triton.language as tl
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
 )
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    use_flydsl_decode,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
 )
@@ -127,6 +130,12 @@ def decode(
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
 ) -> torch.Tensor:
+    if use_flydsl_decode():
+        from aiter.ops.flydsl.v4_decode_bf16 import flydsl_decode
+
+        return flydsl_decode(
+            q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        )
     return sparse_attn_v4_paged_decode(
         q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
