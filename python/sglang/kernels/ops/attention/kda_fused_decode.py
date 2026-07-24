@@ -10,7 +10,7 @@ and the sigmoid-gated output RMSNorm.
 Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
-H = HV in {6, 12}, K = V = 128, kernel width 4, T = 1 per request.
+H = HV = 12, K = V = 128, kernel width 4, no lower bound, T = 1 per request.
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -33,18 +33,17 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_HEADS = frozenset((6, 12))
-_HEAD_DIM = 128
+_H = 12  # q/k/v heads per rank (TP8) — the compiled static layout
+_SEG = _H * 128  # 1536: per-segment width of q, k and v
+_CONV_DIM = 3 * _SEG
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
 @cache_once
-def _jit_kda_fused_decode_module(heads: int) -> Module:
-    if heads not in _SUPPORTED_HEADS:
-        raise ValueError(f"unsupported KDA fused decode local heads: {heads}")
-    args = make_cpp_args(heads, is_arch_support_pdl())
+def _jit_kda_fused_decode_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        f"kda_fused_decode_h{heads}",
+        "kda_fused_decode",
         *args,
         cuda_files=["attention/kda_fused_decode.cuh"],
         cuda_wrappers=[("run", f"KdaFusedDecodeKernel<{args}>::run")],
@@ -61,27 +60,25 @@ def covered(
     cache_indices: torch.Tensor,
     onorm_g: torch.Tensor,
 ) -> bool:
-    """Check a statically specialized K3 TP8/TP16 fused-decode layout."""
-    if ssm_states.ndim < 4:
+    """The kernel is compiled for the K3 KDA decode regime: 12 heads of 128,
+    packed [T, 4608] qkv rows, transposed [slots, 3, 4608] conv pool, fp32
+    [slots, 12, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
+    kernel reads the real slot stride), one token per request."""
+    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != _CONV_DIM:
         return False
-    heads, V, K = ssm_states.shape[-3:]
-    if heads not in _SUPPORTED_HEADS:
-        return False
-    seg = heads * _HEAD_DIM
-    conv_dim = 3 * seg
-    if mixed_qkv.ndim != 2 or mixed_qkv.shape[-1] != conv_dim:
-        return False
+    HV, V, K = ssm_states.shape[-3:]
     return (
-        V == _HEAD_DIM
-        and K == _HEAD_DIM
+        HV == _H
+        and V == 128
+        and K == 128
         and a.ndim == 2
-        and a.shape[-1] == seg
+        and a.shape[-1] == _SEG
         and b.ndim == 2
-        and b.shape[-1] == heads
+        and b.shape[-1] == _H
         and onorm_g.ndim == 2
-        and onorm_g.shape[-1] == seg
+        and onorm_g.shape[-1] == _SEG
         and conv_states.ndim == 3
-        and conv_states.shape[-2:] == (_CONV_STATE_W, conv_dim)
+        and conv_states.shape[-2:] == (_CONV_STATE_W, _CONV_DIM)
         and mixed_qkv.dtype == torch.bfloat16
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
@@ -132,10 +129,8 @@ def kda_fused_decode(
     attention output [1, B, HV, V] (the packed-decode output layout).
     Caller must have checked covered()."""
     B = mixed_qkv.shape[0]
-    heads = int(ssm_states.shape[-3])
-    seg = heads * _HEAD_DIM
-    out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
-    _jit_kda_fused_decode_module(heads).run(
+    out = torch.empty((B, _SEG), dtype=torch.bfloat16, device=mixed_qkv.device)
+    _jit_kda_fused_decode_module().run(
         mixed_qkv,
         a,
         b,
@@ -150,7 +145,7 @@ def kda_fused_decode(
         onorm_weight,
         # Pass the pool view as-is (already [slots, HV, V, K]); the kernel
         # binding reads its real slot stride via state.stride(0). A
-        # .view(-1, heads, 128, 128) here would break on envelope-strided pools
+        # .view(-1, _H, 128, 128) here would break on envelope-strided pools
         # (unified / page-major) — the reshape can't fold a non-dense slot
         # pitch and would raise / silently copy.
         ssm_states,
@@ -161,4 +156,4 @@ def kda_fused_decode(
         float(lower_bound) if lower_bound is not None else 0.0,
         lower_bound is not None,
     )
-    return out.view(1, B, heads, _HEAD_DIM)
+    return out.view(1, B, _H, 128)

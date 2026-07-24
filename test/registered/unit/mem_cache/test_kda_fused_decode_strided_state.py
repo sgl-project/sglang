@@ -39,23 +39,20 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.kda_fused_decode import _CONV_STATE_W, covered
+from sglang.kernels.ops.attention.kda_fused_decode import _CONV_DIM, _CONV_STATE_W, _H, _SEG, covered
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
 )
-from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 
 # The kernel is compiled for the K3 KDA decode regime; covered() enforces it,
 # so HV/V/K are fixed. Multi-layer + several slots so the envelope slot pitch
 # differs from the dense HV*V*K pitch.
-_HV = 12
+_HV = _H  # 12
 _V = 128
 _K = 128
-_SEG = _HV * _K
-_CONV_DIM = 3 * _SEG
 _LAYERS = 3
 _LAYER_UNDER_TEST = 1
 _SLOTS = 6
@@ -95,45 +92,14 @@ def _make_covered_side_args(batch: int):
     bf16 = torch.bfloat16
     mixed_qkv = torch.zeros((batch, _CONV_DIM), dtype=bf16, device=_DEV)
     a = torch.zeros((batch, _SEG), dtype=bf16, device=_DEV)
-    b = torch.zeros((batch, _HV), dtype=bf16, device=_DEV)
+    b = torch.zeros((batch, _H), dtype=bf16, device=_DEV)
     onorm_g = torch.zeros((batch, _SEG), dtype=bf16, device=_DEV)
-    conv_states = torch.zeros(
-        (_SLOTS, _CONV_STATE_W, _CONV_DIM), dtype=bf16, device=_DEV
-    )
+    conv_states = torch.zeros((_SLOTS, _CONV_STATE_W, _CONV_DIM), dtype=bf16, device=_DEV)
     cache_indices = torch.zeros((batch,), dtype=torch.int32, device=_DEV)
     return mixed_qkv, a, b, conv_states, onorm_g, cache_indices
 
 
-class TestKdaFusedDecodeStridedState(CustomTestCase):
-    def test_covered_accepts_tp8_and_tp16_but_rejects_unsupported_heads(self):
-        for heads, expected in ((12, True), (6, True), (3, False)):
-            batch = 2
-            seg = heads * _K
-            conv_dim = 3 * seg
-            mixed_qkv = torch.zeros((batch, conv_dim), dtype=torch.bfloat16)
-            a = torch.zeros((batch, seg), dtype=torch.bfloat16)
-            b = torch.zeros((batch, heads), dtype=torch.bfloat16)
-            conv_states = torch.zeros(
-                (_SLOTS, _CONV_STATE_W, conv_dim), dtype=torch.bfloat16
-            )
-            ssm_states = torch.zeros((_SLOTS, heads, _V, _K), dtype=torch.float32)
-            cache_indices = torch.zeros((batch,), dtype=torch.int32)
-            onorm_g = torch.zeros((batch, seg), dtype=torch.bfloat16)
-
-            self.assertEqual(
-                covered(
-                    mixed_qkv,
-                    a,
-                    b,
-                    conv_states,
-                    ssm_states,
-                    cache_indices,
-                    onorm_g,
-                ),
-                expected,
-                f"unexpected fused-decode coverage for {heads} local heads",
-            )
-
+class TestKdaFusedDecodeStridedState(unittest.TestCase):
     def test_covered_accepts_envelope_strided_and_rejects_noncontiguous_inner(self):
         _raw, temporal = _make_strided_temporal_view()
         ssm = temporal[_LAYER_UNDER_TEST]  # what mamba2_layer_cache serves
@@ -147,13 +113,9 @@ class TestKdaFusedDecodeStridedState(CustomTestCase):
         )
         # Inner [HV, V, K] IS contiguous — the contract the kernel's float4
         # state loads rely on and all covered() must still require.
-        self.assertEqual(
-            (ssm.stride(-1), ssm.stride(-2), ssm.stride(-3)), (1, _K, _V * _K)
-        )
+        self.assertEqual((ssm.stride(-1), ssm.stride(-2), ssm.stride(-3)), (1, _K, _V * _K))
 
-        mixed_qkv, a, b, conv_states, onorm_g, cache_indices = _make_covered_side_args(
-            batch=2
-        )
+        mixed_qkv, a, b, conv_states, onorm_g, cache_indices = _make_covered_side_args(batch=2)
 
         # (1) Accept the envelope-strided view — pre-fix .view(...).is_contiguous()
         # would reject this and drop decode to the unfused chain.
@@ -192,9 +154,7 @@ class TestKdaFusedDecodeStridedState(CustomTestCase):
             (2, 5, 3, 7),
         ]
         for slot, i_hv, v, k in samples:
-            intra = (
-                i_hv * (_V * _K) + v * _K + k
-            )  # kernel's hardcoded intra-slot offset
+            intra = i_hv * (_V * _K) + v * _K + k  # kernel's hardcoded intra-slot offset
             kernel_off = base + slot * slot_stride + intra
 
             # (2a) The kernel formula names exactly the element torch indexing

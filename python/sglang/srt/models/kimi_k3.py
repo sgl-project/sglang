@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import k3_ar_fusion, k3_gemm_ar, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
@@ -1268,23 +1269,14 @@ class KimiK3DeltaAttention(nn.Module):
         loaded, before cuda graph capture)."""
         layer = self.attn
         w = layer.conv_weights
-        heads = layer.num_q_heads
-        supported_heads = (6, 12)
-        if heads not in supported_heads:
-            rank0_log(
-                "K3 fused KDA decode does not support "
-                f"{heads} local heads; supported local-head counts are "
-                f"{supported_heads}. Falling back to the unfused decode chain."
-            )
-            return
-        seg = heads * 128
+        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != heads
+            or layer.A_log.numel() != 12
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -1311,7 +1303,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
