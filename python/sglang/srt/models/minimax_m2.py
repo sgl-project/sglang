@@ -477,10 +477,26 @@ class MiniMaxM2QKRMSNorm:
         return q, k
 
     def _forward_cpu(self, q: torch.Tensor, k: torch.Tensor):
-        # TODO: add c++ kernel for cpu
-        q = self._q_norm(q.contiguous())
-        k = self._k_norm(k.contiguous())
-        return q, k
+        if self._world_size > 1:
+            sum_sq = torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q, k)
+            sum_sq = attn_tp_all_reduce(sum_sq)
+            return torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q,
+                k,
+                self._q_norm.weight,
+                self._k_norm.weight,
+                sum_sq,
+                self._world_size,
+                self._eps,
+            )
+
+        return torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
 
 
 class MiniMaxM2MoE(nn.Module):
