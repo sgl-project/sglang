@@ -244,8 +244,7 @@ def cp_shard_model_inputs(
     complete_position_ids: Any,
     forward_batch,
 ):
-    """Temporarily shard speculative hidden states with the model inputs.
-    Restoring the shared batch keeps logits processing on full-batch metadata."""
+    """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
     sharded_hidden_states = cp_shard_hidden_states(
         complete_hidden_states, forward_batch

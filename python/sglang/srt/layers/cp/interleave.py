@@ -106,7 +106,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return pad_local_rows(local_positions, metadata, dim=0)
 
     def _interleave_shard(self, input_: Any) -> Any:
-        """Split tokens evenly by the rule ``token_idx % cp_size``."""
         cp_size = self.cp_size
         cp_rank = self.cp_rank
         if isinstance(input_, (tuple, list)):
@@ -131,8 +130,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
     ):
-        """Return nonempty per-request lengths and indices for this CP rank.
-        The shared kernel builds device outputs to keep the split graph-safe."""
+        """Build device outputs in the shared kernel to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import (
             dsa_cp_round_robin_split_q_seqs_kernel,
         )
