@@ -27,9 +27,9 @@ class TestNativeMmDrainAdapter(CustomTestCase):
             "video_token_id": 13,
         }
 
-    def build(self):
+    def build(self, adapter=None):
         features = np.arange(30, dtype=np.float32)
-        output = self.host.build_native_mm(
+        output = (adapter or self.host).build_native_mm(
             (
                 features,
                 [(1, 2, 2), (1, 1, 1)],
@@ -74,6 +74,39 @@ class TestNativeMmDrainAdapter(CustomTestCase):
         self.assertEqual(
             [item.pad_value for item in output.mm_items],
             [_compute_pad_value(101), _compute_pad_value(202)],
+        )
+
+    def test_standalone_client_adapter_matches_host(self):
+        """``RustServer.drain`` duck-types ``build_native_mm`` across the
+        in-process host and the standalone client; the client must produce
+        the same wrapping from the handshake-provided native dict (guards a
+        regression where the client wires the dict wrong — no other test
+        covers its adapter path)."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.standalone_mm_host import StandaloneMmClient
+
+        client = StandaloneMmClient(
+            ipc_name="ipc:///dev/null",
+            proc=SimpleNamespace(is_alive=lambda: True),
+            spec="spec",
+            native=dict(self.host._native),
+        )
+        host_out, _ = self.build()
+        client_out, _ = self.build(adapter=client)
+        for name in ("im_token_id", "im_start_id", "im_end_id", "video_token_id"):
+            self.assertEqual(getattr(client_out, name), getattr(host_out, name))
+        self.assertEqual(
+            [tuple(i.feature.shape) for i in client_out.mm_items],
+            [tuple(i.feature.shape) for i in host_out.mm_items],
+        )
+        self.assertEqual(
+            [i.hash for i in client_out.mm_items],
+            [i.hash for i in host_out.mm_items],
+        )
+        self.assertEqual(
+            client_out.mrope_position_delta.item(),
+            host_out.mrope_position_delta.item(),
         )
 
 

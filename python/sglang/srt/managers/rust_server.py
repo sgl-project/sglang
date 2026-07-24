@@ -36,10 +36,73 @@ from sglang.version import __version__
 if TYPE_CHECKING:
     from sglang_server import Server
 
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_input_ids(input_ids) -> bytes:
+    """Final placeholder-expanded prompt ids → raw little-endian int64 bytes
+    (the Rust MM worker's return contract)."""
+    if hasattr(input_ids, "tolist"):  # tensor-shaped processor output
+        input_ids = input_ids.tolist()
+    return array("q", input_ids or []).tobytes()
+
+
+def _build_native_mm(*, native: Dict[str, Any], entry: tuple):
+    """Drain-time adapter: wrap the Rust-produced buffers into the scheduler's
+    ``MultimodalProcessorOutput``. Only tensor wrapping happens here — all
+    processing (load, resize, patchify, token expansion, M-RoPE) already ran
+    in Rust. This runs on the scheduler loop, so it must stay copy-free AND
+    hash-free: the numpy arrays from ``take_native_mm`` own the Rust buffers
+    (zero copy), ``torch.from_numpy`` only wraps them, and each item's
+    ``hash`` is the worker-precomputed feature hash so the scheduler's
+    ``set_pad_value`` skips ``hash_feature`` (the Python processor path
+    precomputes it at process time the same way). Any per-byte work here
+    (memcpy, sha256 — tens of MB per image-heavy request) measurably stalls
+    every running request's inter-token latency."""
+    import torch
+
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalProcessorOutput,
+    )
+
+    features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
+    features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
+    items = []
+    row = 0
+    for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
+        n = t * h * w
+        items.append(
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=features[row : row + n],
+                hash=item_hash,
+                offsets=[tuple(offset)],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+                },
+            )
+        )
+        row += n
+    if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+        for item in items:
+            item.set_pad_value()
+    mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
+    return MultimodalProcessorOutput(
+        mm_items=items,
+        im_token_id=native["image_token_id"],
+        im_start_id=native["vision_start_token_id"],
+        im_end_id=native["vision_end_token_id"],
+        video_token_id=native["video_token_id"],
+        mrope_positions=mrope_positions,
+        mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
+    )
 
 
 class MmProcessorHost:
@@ -75,7 +138,14 @@ class MmProcessorHost:
     # (GIL-contention bound).
     MM_WORKERS = 8
 
-    def __init__(self, scheduler: Scheduler):
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        max_req_input_len: int,
+        processor: Any = None,
+    ):
         # Lazy imports: this class is only instantiated for multimodal models
         # under SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import (
@@ -90,25 +160,23 @@ class MmProcessorHost:
             get_tokenizer_from_processor,
         )
 
-        self.server_args = scheduler.server_args
-        self.model_config = scheduler.model_config
-        self.max_req_input_len = getattr(scheduler, "max_req_input_len", None)
+        self.server_args = server_args
+        self.model_config = model_config
+        self.max_req_input_len = max_req_input_len
 
         # rid -> (mm_inputs, token_type_ids); popped by RustServer.drain.
         self.results: Dict[str, Tuple[Any, Optional[List[int]]]] = {}
 
         # Same processor stack the Python TokenizerManager builds
         # (init_tokenizer_and_processor, multimodal branch). The HF
-        # AutoProcessor is reused from the scheduler's init_tokenizer (already
+        # AutoProcessor is reused from the caller's init_tokenizer (already
         # loaded, identical construction args) when available; under
         # skip_tokenizer_init the scheduler has none, so load one — the mm
         # processor still needs it to encode images.
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        _processor = getattr(scheduler, "processor", None) or _get_processor_wrapper(
-            self.server_args
-        )
+        _processor = processor or _get_processor_wrapper(self.server_args)
         transport_mode = _determine_tensor_transport_mode(self.server_args)
         self.mm_processor = get_mm_processor(
             self.model_config.hf_config,
@@ -219,60 +287,8 @@ class MmProcessorHost:
         return self._native is not None
 
     def build_native_mm(self, entry: tuple):
-        """Drain-time adapter: wrap the Rust-produced buffers into the
-        scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
-        here — all processing (load, resize, patchify, token expansion, M-RoPE)
-        already ran in Rust. This runs on the scheduler loop, so it must stay
-        copy-free AND hash-free: the numpy arrays from ``take_native_mm`` own
-        the Rust buffers (zero copy), ``torch.from_numpy`` only wraps them,
-        and each item's ``hash`` is the worker-precomputed feature hash so the
-        scheduler's ``set_pad_value`` skips ``hash_feature`` (the Python
-        processor path precomputes it at process time the same way). Any
-        per-byte work here (memcpy, sha256 — tens of MB per image-heavy
-        request) measurably stalls every running request's inter-token
-        latency."""
-        import torch
-
-        from sglang.srt.managers.schedule_batch import (
-            Modality,
-            MultimodalDataItem,
-            MultimodalProcessorOutput,
-        )
-
-        features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
-        native = self._native
-        features = torch.from_numpy(
-            features_arr.reshape(-1, native["feature_dim"])
-        )
-        items = []
-        row = 0
-        for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
-            n = t * h * w
-            items.append(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=features[row : row + n],
-                    hash=item_hash,
-                    offsets=[tuple(offset)],
-                    model_specific_data={
-                        "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-                    },
-                )
-            )
-            row += n
-        if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
-            for item in items:
-                item.set_pad_value()
-        mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
-        return MultimodalProcessorOutput(
-            mm_items=items,
-            im_token_id=native["image_token_id"],
-            im_start_id=native["vision_start_token_id"],
-            im_end_id=native["vision_end_token_id"],
-            video_token_id=native["video_token_id"],
-            mrope_positions=mrope_positions,
-            mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
-        )
+        """Drain-time adapter — see :func:`_build_native_mm`."""
+        return _build_native_mm(native=self._native, entry=entry)
 
     def handle_sync(self, rid: str, payload: bytes) -> bytes:
         """Entry point called by the Rust MM workers: process one mm request and
@@ -285,9 +301,7 @@ class MmProcessorHost:
         # Store BEFORE returning — the Rust worker resumes the request (and the
         # scheduler drains it) strictly after, so the entry is always there.
         self.results[rid] = (mm_inputs, token_type_ids)
-        if hasattr(input_ids, "tolist"):  # tensor-shaped processor output
-            input_ids = input_ids.tolist()
-        return array("q", input_ids or []).tobytes()
+        return _encode_input_ids(input_ids)
 
     async def _process(self, rid: str, payload: bytes):
         """The tokenize-then-mm-process sequence of
@@ -404,9 +418,28 @@ class RustServer:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
                     )
-            mm_host = MmProcessorHost(scheduler)
+            if envs.SGLANG_ENABLE_STANDALONE_MM.get():
+                # Host the Python mm fallback in a standalone process: the
+                # heavy processing runs under its own GIL, and the scheduler
+                # process only pays the IPC hop per request.
+                from sglang.srt.managers.standalone_mm_host import (
+                    launch_standalone_mm_host,
+                )
+
+                mm_host = launch_standalone_mm_host(
+                    server_args=server_args,
+                    max_req_input_len=scheduler.max_req_input_len,
+                    cores=server_cores,
+                )
+            else:
+                mm_host = MmProcessorHost(
+                    server_args=server_args,
+                    model_config=scheduler.model_config,
+                    max_req_input_len=scheduler.max_req_input_len,
+                    processor=scheduler.processor,
+                )
             server.start_mm_workers(
-                mm_host.handle_sync, MmProcessorHost.MM_WORKERS, mm_host.native_spec()
+                mm_host.handle_sync, mm_host.MM_WORKERS, mm_host.native_spec()
             )
 
         # Narrow the scheduler thread only after the server threads are launched.

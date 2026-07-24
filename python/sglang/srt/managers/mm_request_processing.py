@@ -12,7 +12,9 @@ handling.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+import threading
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -25,6 +27,45 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class StageTimes:
+    """Per-stage latency aggregator for mm processing, logged every
+    ``SGLANG_LOG_MM_STAGE_INTERVAL`` requests (0 disables). Used to decompose
+    TTFT across the mm arms (shared processing vs per-mode hop overhead)."""
+
+    def __init__(self, name: str):
+        self._name = name
+        self._interval = envs.SGLANG_LOG_MM_STAGE_INTERVAL.get()
+        self._lock = threading.Lock()
+        self._n = 0
+        self._sums: Dict[str, float] = {}
+        self._maxs: Dict[str, float] = {}
+
+    def add(self, **stages_s: float) -> None:
+        if not self._interval:
+            return
+        with self._lock:
+            self._n += 1
+            for k, v in stages_s.items():
+                self._sums[k] = self._sums.get(k, 0.0) + v
+                self._maxs[k] = max(self._maxs.get(k, 0.0), v)
+            if self._n % self._interval:
+                return
+            n, stats = self._n, {k: (self._sums[k], self._maxs[k]) for k in self._sums}
+        logger.info(
+            "%s stage times over %d reqs (mean/max ms): %s",
+            self._name,
+            n,
+            " ".join(
+                f"{k}={s / n * 1e3:.1f}/{m * 1e3:.1f}" for k, (s, m) in stats.items()
+            ),
+        )
+
+
+# Times the shared mm-processing block itself, uniformly for every frontend
+# that drives it (Python TM, in-process Rust host, standalone mm host).
+_process_times = StageTimes("mm processor")
 
 
 def validate_mm_limits(
@@ -75,6 +116,7 @@ async def run_mm_processor_for_request(
     )
     if not should_run_mm_processor:
         return input_ids, None, token_type_ids
+    _t0 = time.monotonic()
 
     if obj.image_data is not None and not isinstance(obj.image_data, list):
         obj.image_data = [obj.image_data]
@@ -168,4 +210,5 @@ async def run_mm_processor_for_request(
             if isinstance(item, MultimodalDataItem):
                 item.set_pad_value()
 
+    _process_times.add(mm_process=time.monotonic() - _t0)
     return input_ids, mm_inputs, token_type_ids

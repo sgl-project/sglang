@@ -246,6 +246,9 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Log aggregated multimodal stage times (mm processing, IPC hop) every N
+    # requests; 0 disables. Used to decompose TTFT in mm benchmarks.
+    SGLANG_LOG_MM_STAGE_INTERVAL = EnvInt(200)
 
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
@@ -801,6 +804,10 @@ class Envs:
     # Force Rust TM MM workers onto the Python mm_processor path even when a
     # native family pipeline (e.g. qwen_vl) is available. Benchmark / debug.
     SGLANG_DISABLE_NATIVE_MM = EnvBool(False)
+    # Run the Rust TM's Python MM fallback in a standalone process instead of
+    # in-scheduler threads (no GIL contention with the scheduler loop; small
+    # TTFT cost from the IPC hop).
+    SGLANG_ENABLE_STANDALONE_MM = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;

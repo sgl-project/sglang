@@ -1963,24 +1963,32 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
+def wrap_mm_inputs_shm(mm_inputs):
+    """Wrap a ``MultimodalProcessorOutput``'s feature tensors in SHM pointers
+    (in place). No-op when the transport is default or tokenizer init is
+    skipped — the same gate as :func:`wrap_shm_features`."""
+    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
+        return mm_inputs
+
+    for item in mm_inputs.mm_items:
+        item_hash = item.hash
+        if item.feature is not None:
+            item.feature = _wrap_tensor_or_list(
+                item.feature, precomputed_hash=item_hash
+            )
+        if item.precomputed_embeddings is not None:
+            item.precomputed_embeddings = _wrap_tensor_or_list(
+                item.precomputed_embeddings, precomputed_hash=item_hash
+            )
+    return mm_inputs
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_server_args().skip_tokenizer_init:
-        return obj
-
     if obj.mm_inputs:
-        for item in obj.mm_inputs.mm_items:
-            item_hash = item.hash
-            if item.feature is not None:
-                item.feature = _wrap_tensor_or_list(
-                    item.feature, precomputed_hash=item_hash
-                )
-            if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings, precomputed_hash=item_hash
-                )
+        wrap_mm_inputs_shm(obj.mm_inputs)
     return obj
 
 
@@ -2023,6 +2031,21 @@ def _unwrap_tensor_or_list(value):
     return value
 
 
+def unwrap_mm_inputs_shm(mm_inputs):
+    """Materialize any ShmPointerMMData wrappers in a
+    ``MultimodalProcessorOutput`` back into owned torch.Tensors (in place).
+    Unlike the wrap side there is no transport gate: pointers are unwrapped
+    wherever they are found (materializing is always safe)."""
+    for item in mm_inputs.mm_items:
+        if item.feature is not None:
+            item.feature = _unwrap_tensor_or_list(item.feature)
+        if item.precomputed_embeddings is not None:
+            item.precomputed_embeddings = _unwrap_tensor_or_list(
+                item.precomputed_embeddings
+            )
+    return mm_inputs
+
+
 def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
@@ -2040,11 +2063,5 @@ def unwrap_shm_features(obj):
         isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
         and obj.mm_inputs
     ):
-        for item in obj.mm_inputs.mm_items:
-            if item.feature is not None:
-                item.feature = _unwrap_tensor_or_list(item.feature)
-            if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _unwrap_tensor_or_list(
-                    item.precomputed_embeddings
-                )
+        unwrap_mm_inputs_shm(obj.mm_inputs)
     return obj
