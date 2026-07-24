@@ -298,27 +298,20 @@ Test Environment:
   <Tab title="Ascend A3">
     **Server Command**:
     ```shell Command
-    SGLANG_CACHE_DIT_FN=2 \
-    SGLANG_CACHE_DIT_BN=1 \
-    SGLANG_CACHE_DIT_WARMUP=4 \
-    SGLANG_CACHE_DIT_RDT=0.4 \
-    SGLANG_CACHE_DIT_MC=4 \
-    SGLANG_CACHE_DIT_TAYLORSEER=true \
-    SGLANG_CACHE_DIT_TS_ORDER=2 \
-    SGLANG_CACHE_DIT_ENABLED=true \
-    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \
+    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
+    sglang serve \
       --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
       --tp-size 2 \
       --sp-degree 4 \
       --num-gpus 8 \
-      --port 30006 \
+      --port 30000 \
       --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 30006 \
+    python -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 1 \
@@ -329,7 +322,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-video
-    Model:                                        /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/
+    Model:                                        Wan-AI/Wan2.2-T2V-A14B-Diffusers/
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       214.50
@@ -350,7 +343,7 @@ Test Environment:
     Peak Memory Max (MB):                         46692.00
     Peak Memory Mean (MB):                        46692.00
     Peak Memory Median (MB):                      46692.00
-    ============================================================
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>
@@ -411,6 +404,7 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
+    #One A3 card has 2 npu chips. Using four A3 cards in benchmarking
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \
@@ -418,21 +412,20 @@ Test Environment:
     SGLANG_CACHE_DIT_MC=4 \
     SGLANG_CACHE_DIT_TAYLORSEER=true \
     SGLANG_CACHE_DIT_TS_ORDER=2 \
-    SGLANG_CACHE_DIT_ENABLED=true \
-    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve \
       --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \
       --tp-size 2 \
       --sp-degree 4 \
       --num-gpus 8 \
-      --port 30006 \
+      --port 30000 \
       --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 30006 \
+    python -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 20 \
@@ -444,7 +437,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-video
-    Model:                                        /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/
+    Model:                                        Wan-AI/Wan2.2-T2V-A14B-Diffusers/
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       4384.65
@@ -465,7 +458,7 @@ Test Environment:
     Peak Memory Max (MB):                         46692.00
     Peak Memory Mean (MB):                        46691.90
     Peak Memory Median (MB):                      46692.00
-    ============================================================
+    ------------------------------------------------------------
     ```
   </Tab>
 </Tabs>

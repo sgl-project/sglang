@@ -229,20 +229,21 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     **Server Command**:
 
     ```bash Command
-    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \
+    #One A3 card has 2 npu chips. Benchmark was did with two A3 cards
+    sglang serve \
       --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
       --tp-size 2 \
       --sp-degree 2 \
       --num-gpus 4 \
-      --port 20006 \
+      --port 30000 \
       --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```bash Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 20006 \
+    python -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 1 \
@@ -254,7 +255,7 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-video
-    Model:                                        /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/
+    Model:                                        Wan-AI/Wan2.1-T2V-14B-Diffusers/
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       1282.90
@@ -334,6 +335,7 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     **Server Command**:
 
     ```bash Command
+    #One A3 card has 2 npu chips. Benchmark was did with two Atlas 3 cards
     SGLANG_CACHE_DIT_FN=2 \
     SGLANG_CACHE_DIT_BN=1 \
     SGLANG_CACHE_DIT_WARMUP=4 \
@@ -341,21 +343,20 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     SGLANG_CACHE_DIT_MC=4 \
     SGLANG_CACHE_DIT_TAYLORSEER=true \
     SGLANG_CACHE_DIT_TS_ORDER=2 \
-    SGLANG_CACHE_DIT_ENABLED=true \
-    ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \
+    SGLANG_CACHE_DIT_ENABLED=true sglang serve \
       --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \
       --tp-size 2 \
       --sp-degree 2 \
       --num-gpus 4 \
-      --port 20006 \
+      --port 30000 \
       --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
 
     ```bash Command
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 20006 \
+    python -m sglang.multimodal_gen.benchmarks.bench_serving \
+      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 1 \
@@ -367,7 +368,7 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-video
-    Model:                                        /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/
+    Model:                                        Wan-AI/Wan2.1-T2V-14B-Diffusers/
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       413.88

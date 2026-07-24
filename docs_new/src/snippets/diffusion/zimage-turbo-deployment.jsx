@@ -22,9 +22,18 @@ export const ZImageTurboDeployment = () => {
     generateCommand: function(values) {
       const { hardware } = values;
 
-      if (hardware === 'ascend2' || hardware === 'ascend3') {
+      if (hardware === 'ascend2') {
         return `sglang serve \\
-  --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo \\
+  --model-path Tongyi-MAI/Z-Image-Turbo \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus 4`;
+      }
+
+      if (hardware === 'ascend3') {
+        return `#One A3 card has 2 npu chips
+sglang serve \\
+  --model-path Tongyi-MAI/Z-Image-Turbo \\
   --tp-size 2 \\
   --sp-degree 1 \\
   --num-gpus 2 \\

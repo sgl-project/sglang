@@ -265,13 +265,14 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/Qwen/Qwen-Image" --port 8764 --num-gpus 2
+    #One A3 card has 2 npu chips
+    sglang serve --tp-size 2 --sp-degree 1 --model-path Qwen/Qwen-Image --port 30000 --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30000 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -279,7 +280,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/Qwen/Qwen-Image
+    Model:                                        Qwen/Qwen-Image
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       36.26
@@ -344,7 +345,7 @@ Test Environment:
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30000 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
@@ -352,7 +353,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/Qwen/Qwen-Image
+    Model:                                        Qwen/Qwen-Image
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       300.81

@@ -14,7 +14,6 @@ export const FluxDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi300x', label: 'MI300X', default: false },
-          { id: 'ascend2', label: 'A2', default: false },
           { id: 'ascend3', label: 'A3', default: false }
         ]
       },
@@ -37,25 +36,13 @@ export const FluxDeployment = () => {
       const { hardware, version } = values;
       const config = this.modelConfigs[version];
 
-      if (hardware === 'ascend2' || hardware === 'ascend3') {
-        const numGpus = 2;
-        const tpSize = 2;
-
-        if (version === 'flux2-dev') {
-          return `sglang serve \\
-  --tp-size ${tpSize} \\
+      if (hardware === 'ascend3') {
+        return `#One A3 card has 2 npu chips
+sglang serve \\
+  --tp-size 2 \\
   --sp-degree 1 \\
-  --model-path "/models/black-forest-labs/FLUX.2-dev/FLUX.2-dev" \\
-  --port 30008 \\
-  --num-gpus ${numGpus}`;
-        }
-
-        return `sglang serve \\
-  --tp-size ${tpSize} \\
-  --sp-degree 1 \\
-  --model-path "/models/black-forest-labs/FLUX.1-dev" \\
-  --port 8764 \\
-  --num-gpus ${numGpus}`;
+  --model-path ${config.repoId} \\
+  --num-gpus 2`;
       }
 
       return `sglang serve \\
@@ -132,8 +119,8 @@ export const FluxDeployment = () => {
   }, []);
 
   useEffect(() => {
-    const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
-    const targetTabName = isAscend ? 'Ascend A2 / A3' : 'NVIDIA B200';
+    const isAscend = values.hardware === 'ascend3';
+    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
     allTabs.forEach((tab) => {

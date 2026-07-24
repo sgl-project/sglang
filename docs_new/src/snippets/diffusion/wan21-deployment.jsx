@@ -181,30 +181,28 @@ export const Wan21Deployment = () => {
     }
 
     if (hardware === 'ascend2' || hardware === 'ascend3') {
-      if (task === 't2v' && modelsize === '14b') {
-        const hardConfig = bestPractice === 'on'
-          ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
-          : '';
+      const comment = hardware === 'ascend3'
+        ? '#One A3 card has 2 npu chips\n'
+        : '';
+      const isBestPractice = bestPractice === 'on';
 
-        return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \\
-  --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \\
-  --tp-size 2 \\
-  --sp-degree 2 \\
-  --num-gpus 4 \\
-  --port 20006 \\
+      if (task === 't2v' && modelsize === '1_3b' && hardware === 'ascend2' && !isBestPractice) {
+        return `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --num-gpus 1 \\
   --attention-backend laser_attn`;
       }
 
-      if (task === 't2v' && modelsize === '1_3b') {
-        return `sglang serve \\
-  --model-path /models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/ \\
-  --tp-size 2 \\
-  --sp-degree 1 \\
-  --num-gpus 2 \\
-  --port 8764`;
-      }
+      const tpSize = modelsize === '1_3b' ? (isBestPractice ? 4 : 1) : 2;
+      const spDegree = modelsize === '14b' && isBestPractice ? 4 : 2;
+      const numGpus = isBestPractice ? 8 : (modelsize === '1_3b' ? 2 : 4);
 
-      return `ЗАГЛУШКА: Ascend supports Wan2.1, but this launch command is not ready for the selected model variant.`;
+      return `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --tp-size ${tpSize} \\
+  --sp-degree ${spDegree} \\
+  --num-gpus ${numGpus} \\
+  --attention-backend laser_attn`;
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;

@@ -37,18 +37,16 @@ export const QwenImageDeployment = () => {
     generateCommand: function(values) {
       if (values.hardware === 'ascend2') {
         return `sglang serve \\
-  --tp-size 2 \\
-  --sp-degree 1 \\
-  --model-path "/models/Qwen/Qwen-Image" \\
-  --port 8764 \\
-  --num-gpus 2`;
+  --model-path Qwen/Qwen-Image \\
+  --num-gpus 1`;
       }
 
       if (values.hardware === 'ascend3') {
-        return `sglang serve \\
-  --tp-size 2 \\
-  --sp-degree 1 \\
-  --model-path "/models/Qwen/Qwen-Image" \\
+        return `#One A3 card has 2 npu chips
+sglang serve \\
+  --model-path Qwen/Qwen-Image \\
+  --tp-size 1 \\
+  --sp-degree 2 \\
   --port 8764 \\
   --num-gpus 2`;
       }

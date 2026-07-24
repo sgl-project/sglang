@@ -253,7 +253,8 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
+    #One A3 card has 2 npu chips
+    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
     ```
 
     **Benchmark Command**:
@@ -267,7 +268,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
+    Model:                                        Tongyi-MAI/Z-Image-Turbo
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       2.43

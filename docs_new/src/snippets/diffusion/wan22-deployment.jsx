@@ -137,38 +137,30 @@
 
 
         if (hardware === 'ascend2' || hardware === 'ascend3') {
-          const numGpus = bestPractice === 'on' ? 4 : 2;
+          const comment = hardware === 'ascend3'
+            ? '#One A3 card has 2 npu chips\n'
+            : '';
+          const isBestPractice = bestPractice === 'on';
 
-          if (task === 't2v') {
-            const hardConfig = bestPractice === 'on'
-              ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
-              : '';
-
-            return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \\
-  --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \\
-  --tp-size 2 \\
-  --sp-degree 4 \\
+          if (task === 'ti2v' && isBestPractice) {
+            return `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
+  --sp-degree 8 \\
   --num-gpus 8 \\
-  --port 30006 \\
   --attention-backend laser_attn`;
           }
 
-          if (task === 'i2v') {
-            return `sglang serve \\
-  --model-path /home/weights/Wan2.2-I2V-A14B-Diffusers/ \\
-  --tp-size 2 \\
-  --sp-degree 2 \\
-  --num-gpus ${numGpus}`;
-          }
+          const spDegree = isBestPractice ? 4 : 2;
+          const numGpus = isBestPractice ? 8 : 4;
 
-          if (task === 'ti2v') {
-            return `sglang serve \\
-  --model-path /home/weights/Wan2.2-TI2V-5B-Diffusers/ \\
+          return `${comment}sglang serve \\
+  --model-path ${config.repoId} \\
   --tp-size 2 \\
-  --sp-degree 2 \\
-  --num-gpus ${numGpus}`;
-          }
+  --sp-degree ${spDegree} \\
+  --num-gpus ${numGpus} \\
+  --attention-backend laser_attn`;
         }
+
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
           if (hardware === 'b300') {

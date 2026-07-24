@@ -44,7 +44,7 @@ This section provides deployment configurations optimized for different hardware
 
 FLUX models are optimized for high-quality image generation. The recommended launch configurations vary by hardware and model version.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving FLUX on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs and Ascend A2, A3 NPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving FLUX on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs and Ascend A3 NPUs.
 
 <FluxDeployment />
 
@@ -221,7 +221,7 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 8764
     ```
 
     **Benchmark Command**:
@@ -260,7 +260,8 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
+    #One A3 card has 2 npu chips
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --port 8764 --num-gpus 2
     ```
 
     **Benchmark Command**:
@@ -274,7 +275,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/black-forest-labs/FLUX.1-dev
+    Model:                                        black-forest-labs/FLUX.1-dev
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       16.30
@@ -307,7 +308,7 @@ Test Environment:
     **Server Command** :
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 8764
     ```
 
     **Benchmark Command** :
@@ -346,7 +347,8 @@ Test Environment:
     **Server Command** :
 
     ```shell Command
-    sglang serve --tp-size 2 --sp-degree 1 --model-path "/models/black-forest-labs/FLUX.1-dev" --port 8764 --num-gpus 2
+    #One A3 card has 2 npu chips
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --port 8764 --num-gpus 2
     ```
 
     **Benchmark Command** :
@@ -360,7 +362,7 @@ Test Environment:
     ```text Output
     ================= Serving Benchmark Result =================
     Task:                                         text-to-image
-    Model:                                        /models/black-forest-labs/FLUX.1-dev
+    Model:                                        black-forest-labs/FLUX.1-dev
     Dataset:                                      vbench
     --------------------------------------------------
     Benchmark duration (s):                       300.85
