@@ -321,6 +321,20 @@ def _register_for(*architectures: str):
     return decorator
 
 
+def _dspark_verify_on_decode_backend(
+    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
+) -> bool:
+    """Whether the MLA decode backend can serve a q_len-wide target verify."""
+    if backend == "trtllm_mla":
+        return True
+    if backend == "tokenspeed_mla":
+        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
+    if backend == "cutedsl_mla":
+        # The cute-dsl kernel rejects q_len >= 5 with no fallback.
+        return q_len <= 4
+    return False
+
+
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.dcp_size > 1:
@@ -378,13 +392,12 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["dcp_comm_backend"] = dcp_comm_backend
         return overrides
 
-    if not (
-        is_sm100_supported()
-        and get_device_sm() in (100, 103)
-        and server_args.is_attention_backend_not_set()
-    ):
+    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
         return {}
+    backends_unset = server_args.is_attention_backend_not_set()
     if server_args.speculative_algorithm != "DSPARK":
+        if not backends_unset:
+            return {}
         logger.info(
             "Use trtllm_mla as the default prefill and decode attention "
             "backend for Kimi-K3 on SM100/SM103."
@@ -393,29 +406,44 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             "decode_attention_backend": "trtllm_mla",
             "prefill_attention_backend": "trtllm_mla",
         }
-    # DSPARK: verify runs on the decode backend (mode=decode), so this picks the
-    # verify kernel. cutedsl rejects verify q_len > 4, mode=prefill flashinfer
-    # verify is slow, and plain decode is cold under dspark. tokenspeed verify is
-    # fastest on fp8 KV but hard-requires fp8_e4m3 and caps q_len <= 8.
+    # DSPARK: verify runs on the decode backend (mode=decode below), so this
+    # picks the verify kernel -- mode=prefill routes it to flashinfer, which is
+    # slow and syncs, while plain decode is cold under dspark. tokenspeed is
+    # fastest on fp8 KV, trtllm-gen otherwise.
     q_len = server_args.speculative_num_draft_tokens or (
         server_args.speculative_dspark_block_size + 1
         if server_args.speculative_dspark_block_size is not None
         # Checkpoint auto-infer happens after overrides; K3 draft uses block 7.
         else 8
     )
-    if server_args.kv_cache_dtype == "fp8_e4m3" and q_len <= 8:
-        backend = "tokenspeed_mla"
+    overrides = {}
+    if backends_unset:
+        if server_args.kv_cache_dtype == "fp8_e4m3" and q_len <= 8:
+            backend = "tokenspeed_mla"
+        else:
+            backend = "trtllm_mla"
+        overrides["decode_attention_backend"] = backend
+        overrides["prefill_attention_backend"] = "trtllm_mla"
     else:
-        backend = "trtllm_mla"
-    logger.info(
-        "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
-        f"{backend} (speculative_attention_mode=decode)."
-    )
-    return {
-        "decode_attention_backend": backend,
-        "prefill_attention_backend": "trtllm_mla",
-        "speculative_attention_mode": "decode",
-    }
+        # Explicit backend knobs keep priority, but the mode is a separate knob
+        # that still needs declaring -- else verify stays on the prefill backend,
+        # whose host-side plan (flashinfer by default) forces a per-step D2H.
+        _, backend = attention_backends_of(server_args)
+    if _dspark_verify_on_decode_backend(backend, q_len, server_args.kv_cache_dtype):
+        overrides["speculative_attention_mode"] = "decode"
+        logger.info(
+            "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
+            f"{backend} (speculative_attention_mode=decode)."
+        )
+    else:
+        logger.warning(
+            f"Kimi-K3 DSPARK: decode attention backend {backend!r} cannot serve "
+            f"target verify at q_len={q_len}, so verify runs on the prefill "
+            "backend (speculative_attention_mode=prefill). A host-plan prefill "
+            "backend costs a per-step seq_lens D2H sync; leave the attention "
+            "backend knobs unset for the sync-free default."
+        )
+    return overrides
 
 
 def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
