@@ -17,7 +17,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import RMSNorm
@@ -163,6 +167,7 @@ class MossVLVisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -170,6 +175,7 @@ class MossVLVisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -545,12 +551,20 @@ class MossVLVisionModel(nn.Module):
                 cu_seqlens.to(torch.int32),
             ]
         )
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         x = x.unsqueeze(1)
 
         deepstack_features = []
         for layer_idx, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                forward_metadata=forward_metadata,
+            )
             if layer_idx in self.deepstack_visual_indexes:
                 deepstack_features.append(x)
 
