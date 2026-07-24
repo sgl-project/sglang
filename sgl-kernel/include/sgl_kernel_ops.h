@@ -52,6 +52,9 @@ using fptr_t = int64_t;
  * From csrc/allreduce
  */
 #ifdef USE_ROCM
+// ROCM custom/deterministic/quick all-reduce: CDNA-only, guarded out on RDNA
+// (single-GPU). The .hip sources are also omitted from the RDNA build.
+#ifndef SGL_IS_RDNA
 // ROCM custom allreduce
 fptr_t init_custom_ar(
     torch::Tensor& meta,
@@ -78,6 +81,7 @@ torch::Tensor qr_get_handle(fptr_t _fa);
 void qr_open_handles(fptr_t _fa, const std::vector<torch::Tensor>& handles);
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
+#endif  // !SGL_IS_RDNA
 #else
 // custom allreduce
 fptr_t

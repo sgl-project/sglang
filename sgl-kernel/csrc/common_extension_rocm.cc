@@ -67,8 +67,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("dsv4_fused_q_indexer_rope_hadamard_quant", torch::kCUDA, &dsv4_fused_q_indexer_rope_hadamard_quant);
 
   /*
-   * From csrc/allreduce
+   * From csrc/allreduce -- custom/deterministic/quick all-reduce are CDNA-only
+   * (cross-GPU peer-IPC + wave64). Guarded out on RDNA (single-GPU); the .hip
+   * sources are also omitted from the RDNA build in setup_rocm.py, and multi-GPU
+   * all-reduce falls back to RCCL.
    */
+#ifndef SGL_IS_RDNA
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -128,6 +132,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // !SGL_IS_RDNA
 
   /*
    * From csrc/moe
