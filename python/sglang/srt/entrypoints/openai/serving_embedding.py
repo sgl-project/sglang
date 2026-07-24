@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import jinja2
+import numpy as np
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
@@ -41,6 +43,12 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        if request.encoding_format not in ("float", "base64"):
+            return (
+                f"Unsupported encoding_format: {request.encoding_format!r}. "
+                "Expected 'float' or 'base64'."
+            )
+
         if not (input := request.input):
             return "Input cannot be empty"
 
@@ -254,18 +262,25 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_embedding_response(ret)
+        response = self._build_embedding_response(ret, request.encoding_format)
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
-        """Build the embedding response"""
+    def _build_embedding_response(
+        self, ret: List[Dict[str, Any]], encoding_format: str
+    ) -> EmbeddingResponse:
+        """Build the embedding response (encoding_format validated upstream)."""
         embedding_objects = []
         prompt_tokens = 0
 
         for idx, ret_item in enumerate(ret):
+            embedding = ret_item["embedding"]
+            if encoding_format == "base64":
+                embedding = base64.b64encode(
+                    np.asarray(embedding, dtype="<f4").tobytes()
+                ).decode("ascii")
             embedding_objects.append(
                 EmbeddingObject(
-                    embedding=ret_item["embedding"],
+                    embedding=embedding,
                     index=idx,
                 )
             )
