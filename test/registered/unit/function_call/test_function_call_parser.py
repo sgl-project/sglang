@@ -1,5 +1,6 @@
 import json
 import unittest
+import warnings
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -390,6 +391,26 @@ class TestPythonicDetector(unittest.TestCase):
         # detect_and_parse does not exercise in isolation.
         self.assertTrue(self.detector.has_tool_call('[get_weather(location="Tokyo")]'))
         self.assertFalse(self.detector.has_tool_call("plain text only"))
+
+    def test_invalid_escape_sequence_still_parses(self):
+        """An invalid Python escape (e.g. "\\d+") must not drop the tool call.
+
+        CPython keeps the backslash and only warns; if the warning were
+        promoted to an error the whole call would fall out as normal text."""
+        text = '[search(query="\\d+")]'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "\\d+")
+        self.assertEqual(result.normal_text, "")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
 
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
@@ -3045,6 +3066,55 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>"\\C|\\."</arg_value>\n'
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """PEP 515 makes ast.literal_eval strip underscores ("123_456"->123456);
+        a string-typed arg must keep the raw value. See #30644."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
+
+    def test_parse_arguments_object_with_invalid_escape(self):
+        """A dict arg containing an invalid escape ("\\d+") must stay a dict.
+
+        If safe_literal_eval raised on the escape warning, Strategy 3 would
+        fail and Strategy 4 would degrade the whole value to one string."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("{'pattern': '\\d+'}", arg_type="object")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value, {"pattern": "\\d+"})
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3309,6 +3379,51 @@ class TestGlm47MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather<arg_key>city</arg_key><arg_value>"\\C|\\."</arg_value>'
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """Same PEP 515 guard as the GLM-4 detector, on the GLM-4.7 parser."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
+
+    def test_parse_arguments_object_with_invalid_escape(self):
+        """Same object-arg escape guard as the GLM-4 detector."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("{'pattern': '\\d+'}", arg_type="object")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value, {"pattern": "\\d+"})
 
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
@@ -3615,6 +3730,22 @@ class TestLfm2Detector(unittest.TestCase):
 
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["city"], "Paris")
+
+    def test_detect_and_parse_pythonic_invalid_escape(self):
+        """An invalid Python escape (e.g. "\\d+") must not drop the tool call."""
+        text = '<|tool_call_start|>[search(query="\\d+")]<|tool_call_end|>'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "\\d+")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
 
     def test_detect_and_parse_pythonic_multiple_args(self):
         """Test parsing with multiple arguments."""
