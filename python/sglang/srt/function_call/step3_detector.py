@@ -28,16 +28,67 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -
     return properties[arg_key].get("type", None)
 
 
-def parse_arguments(value: str) -> tuple[Any, bool]:
-    """Parse a string value to appropriate type. Returns (parsed_value, success)."""
-    try:
+# Schema type names that mean "coerce a numeric-looking value to a number".
+# For any other (or unknown) type we preserve numeric-looking strings so that
+# string IDs like "007" or long digit strings keep their type instead of being
+# silently turned into ints/floats (dropping leading zeros, overflowing, etc.).
+# Matched by exact membership (like the sibling GLM detectors' ``== "number"``
+# checks) rather than prefix — a prefix match coerces bogus names such as
+# "interval"/"internal_id" (both start with "int") into numbers.
+_NUMERIC_TYPES = frozenset(
+    {
+        "int",
+        "integer",
+        "uint",
+        "long",
+        "short",
+        "unsigned",
+        "num",
+        "number",
+        "numeric",
+        "float",
+        "double",
+    }
+)
+
+
+def parse_arguments(value: str, arg_type=None) -> tuple[Any, bool]:
+    """Parse a string value to appropriate type. Returns (parsed_value, success).
+
+    A numeric-looking string is only coerced to a number when ``arg_type`` says
+    the argument is numeric; otherwise the original string is preserved so IDs
+    round-trip unchanged. Structured values (lists/dicts/bools) still parse.
+    """
+    # ``type`` in JSON Schema may be a string ("integer") or a list for
+    # union/nullable types (["integer", "null"]); treat as numeric if any
+    # member is a numeric type.
+    if isinstance(arg_type, str):
+        is_numeric = arg_type in _NUMERIC_TYPES
+    elif isinstance(arg_type, list):
+        is_numeric = any(isinstance(t, str) and t in _NUMERIC_TYPES for t in arg_type)
+    else:
+        is_numeric = False
+    for parser in (json.loads, ast.literal_eval):
         try:
-            parsed_value = json.loads(value)
-        except:
-            parsed_value = ast.literal_eval(value)
+            parsed_value = parser(value)
+        except Exception:
+            # Broad guard: pathological inputs (deeply nested / huge strings)
+            # can raise RecursionError / MemoryError from json.loads /
+            # ast.literal_eval; those escape a narrow tuple and would crash the
+            # worker (DoS on untrusted tool-call output). ``continue`` falls
+            # through to ``return value, False``, preserving the raw string on
+            # any parse failure. ``except Exception`` still lets
+            # KeyboardInterrupt / SystemExit (BaseException) propagate.
+            continue
+        if (
+            not is_numeric
+            and isinstance(parsed_value, (int, float))
+            and not isinstance(parsed_value, bool)
+        ):
+            # Bare number but schema is non-numeric/unknown: keep it as a string.
+            return value, True
         return parsed_value, True
-    except:
-        return value, False
+    return value, False
 
 
 class Step3Detector(BaseFormatDetector):
@@ -106,7 +157,7 @@ class Step3Detector(BaseFormatDetector):
             if tools:
                 arg_type = get_argument_type(func_name, param_name, tools)
                 if arg_type and arg_type != "string":
-                    parsed_value, _ = parse_arguments(param_value)
+                    parsed_value, _ = parse_arguments(param_value, arg_type)
                     params[param_name] = parsed_value
                 else:
                     params[param_name] = param_value
@@ -324,7 +375,7 @@ class Step3Detector(BaseFormatDetector):
                     self._current_function_name, param_name, tools
                 )
                 if arg_type and arg_type != "string":
-                    parsed_value, _ = parse_arguments(param_value)
+                    parsed_value, _ = parse_arguments(param_value, arg_type)
                     new_params[param_name] = parsed_value
                 else:
                     new_params[param_name] = param_value
