@@ -5,6 +5,11 @@ export the same request gauges, so Prometheus summed num_running_reqs by
 attn_cp_size.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+
 
 def test_is_stats_logging_rank_requires_attn_cp_rank_zero():
     # Predicate used in SchedulerMetricsCollectorContext.init_new
@@ -38,9 +43,9 @@ def test_init_new_disables_metrics_on_non_zero_cp_rank():
         enable_metrics=True,
         enable_metrics_for_all_schedulers=False,
         kv_events_config=None,
-        disaggregation_mode=DisaggregationMode.NULL
-        if hasattr(DisaggregationMode, "NULL")
-        else "null",
+        disaggregation_mode=(
+            DisaggregationMode.NULL if hasattr(DisaggregationMode, "NULL") else "null"
+        ),
         served_model_name="test",
         extra_metric_labels=None,
         enable_streaming_session=False,
