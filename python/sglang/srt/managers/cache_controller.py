@@ -276,6 +276,8 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        self.prefetch_io_workers = 1
+        self.prefetch_io_aux_threads: List[threading.Thread] = []
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -401,7 +403,8 @@ class HiCacheController:
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
+                for _ in range(self._prefetch_io_worker_count()):
+                    self.prefetch_buffer.put_nowait(None)
         except Exception:
             pass
 
@@ -413,6 +416,9 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        for t in getattr(self, "prefetch_io_aux_threads", []):
+            if t not in threads:
+                threads.append(t)
 
         for t in threads:
             try:
@@ -427,6 +433,7 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        self.prefetch_io_aux_threads = []
 
     def attach_storage_backend(
         self,
@@ -443,6 +450,11 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
+        else:
+            storage_backend_extra_config = dict(storage_backend_extra_config)
+
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
         try:
@@ -451,6 +463,10 @@ class HiCacheController:
             raise RuntimeError(
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
+
+        self.prefetch_io_workers = self._parse_prefetch_io_workers(
+            storage_backend_extra_config.pop("prefetch_io_workers", 1)
+        )
 
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
@@ -527,6 +543,7 @@ class HiCacheController:
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
+            self.prefetch_io_workers = 1
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             self.draft_page_get_func = None
@@ -576,6 +593,7 @@ class HiCacheController:
         self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
+        self.prefetch_io_workers = 1
 
     def _generate_storage_config(
         self,
@@ -640,6 +658,22 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
         )
 
+    def _parse_prefetch_io_workers(self, value) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "prefetch_io_workers must be a positive integer, got "
+                f"{type(value).__name__}"
+            )
+        if value < 1:
+            raise ValueError("prefetch_io_workers must be >= 1")
+        return value
+
+    def _prefetch_io_worker_count(self) -> int:
+        threads = getattr(self, "prefetch_io_aux_threads", [])
+        if threads:
+            return len(threads)
+        return max(1, int(getattr(self, "prefetch_io_workers", 1)))
+
     def reset(self):
         self.storage_stop_event.set()
 
@@ -648,12 +682,13 @@ class HiCacheController:
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
+            self._stop_storage_threads()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
+            if hasattr(self, "prefetch_buffer"):
+                self.prefetch_buffer.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
@@ -661,14 +696,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+            self._start_storage_threads()
 
     def write(
         self,
@@ -993,22 +1021,52 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+    def _release_prefetch_remainder(self, operation):
+        try:
+            self.append_host_mem_release(
+                operation.host_indices[operation.completed_tokens :]
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release unfinished HiCache prefetch host memory for request %s.",
+                getattr(operation, "request_id", "<unknown>"),
+            )
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
         """
         while not self.storage_stop_event.is_set():
+            operation = None
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
                 self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
             except Empty:
                 continue
+            except Exception:
+                if operation is None:
+                    logger.exception(
+                        "HiCache prefetch IO worker failed before receiving an operation."
+                    )
+                    continue
+                logger.exception(
+                    "HiCache prefetch IO worker failed for request %s.",
+                    getattr(operation, "request_id", "<unknown>"),
+                )
+                try:
+                    operation.mark_terminate()
+                except Exception:
+                    logger.exception(
+                        "Failed to mark HiCache prefetch operation %s as terminated.",
+                        getattr(operation, "request_id", "<unknown>"),
+                    )
+                self._release_prefetch_remainder(operation)
+            else:
+                # Operation terminated by controller or completed normally; release
+                # any pre-allocated host memory that was not filled.
+                self._release_prefetch_remainder(operation)
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1049,10 +1107,21 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
+        self.prefetch_io_aux_threads = [
+            threading.Thread(
+                target=self.prefetch_io_aux_func,
+                daemon=True,
+                name=f"hicache-prefetch-io-{i}",
+            )
+            for i in range(self.prefetch_io_workers)
+        ]
+        self.prefetch_io_aux_thread = self.prefetch_io_aux_threads[0]
+        for thread in self.prefetch_io_aux_threads:
+            thread.start()
+        logger.info(
+            "Started %d HiCache prefetch IO worker(s).",
+            self.prefetch_io_workers,
         )
-        self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
