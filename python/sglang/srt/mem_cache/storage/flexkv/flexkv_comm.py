@@ -30,8 +30,9 @@ import os
 import pickle
 import socket
 import struct
+import time
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -525,7 +526,22 @@ class FlexKVLayerLoadingEvent:
             eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK) for _ in range(num_layers)
         ]
         self._finished = True
-        self.wait_remaining: List[int] = [1] * num_layers
+        self._wait_started = False
+        self.wait_remaining: List[int] = [0] * num_layers
+
+    def _drain(self) -> None:
+        """Consume all pending eventfd signals without blocking."""
+        import os
+
+        for fd in self.load_event_fds:
+            while True:
+                try:
+                    if not os.read(fd, 8):
+                        break
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
 
     def reset_for_new_transfer(self) -> None:
         """Drain any leftover signals from prior transfers, then arm.
@@ -538,22 +554,62 @@ class FlexKVLayerLoadingEvent:
         the FlexKV worker hasn't actually finished that layer's H2D
         yet — and forward proceeds with wrong KV data.
         """
-        import os
-
-        for fd in self.load_event_fds:
-            # The fd is NONBLOCK: read until EAGAIN. Each read is 8 bytes.
-            while True:
-                try:
-                    if not os.read(fd, 8):
-                        break
-                except BlockingIOError:
-                    break
-                except OSError:
-                    break
+        self._drain()
         self._finished = False
-        self.wait_remaining = [1] * self._num_layers
+        self._wait_started = False
+        self.wait_remaining = [0] * self._num_layers
 
-    def wait(self, layer_index: int) -> None:
+    def add_transfer(self) -> None:
+        """Add one load to the current prefill batch.
+
+        Several requests may restore into the same SGLang prefill batch. They
+        share one eventfd set, and the layer hook consumes one signal per load
+        before allowing that layer's forward to proceed.
+        """
+        if self._finished or self._wait_started:
+            raise RuntimeError("Cannot add a transfer after layer waits have started")
+        for layer_index in range(self._num_layers):
+            self.wait_remaining[layer_index] += 1
+
+    def mark_reusable(self) -> None:
+        """Return this slot to the producer ring after transfer quiescence.
+
+        The caller must first ensure that the FlexKV worker can no longer write
+        to this event set. This method is used by the connector's flush path
+        after it has completely waited for every launched layerwise task.
+        """
+        self._drain()
+        self._finished = True
+        self._wait_started = False
+        self.wait_remaining = [0] * self._num_layers
+
+    def pending_transfers(self) -> int:
+        """Return the number of signals still expected for every layer."""
+        if self._wait_started:
+            raise RuntimeError("Layer waits have already started")
+        counts = set(self.wait_remaining)
+        if len(counts) != 1:
+            raise RuntimeError(
+                "Layerwise event has inconsistent per-layer transfer counts"
+            )
+        return self.wait_remaining[0]
+
+    def remove_transfer(self) -> None:
+        """Undo one pre-launch ``add_transfer`` during coordinated rollback."""
+        if self._wait_started:
+            raise RuntimeError(
+                "Cannot remove a transfer after layer waits have started"
+            )
+        if self.pending_transfers() <= 0:
+            raise RuntimeError("Layerwise event has no transfer to remove")
+        self.wait_remaining = [count - 1 for count in self.wait_remaining]
+
+    def wait(
+        self,
+        layer_index: int,
+        count: int = 1,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Block until the FlexKV worker signals layer ``layer_index``.
 
         The fd was created with EFD_NONBLOCK so reset can drain it. We
@@ -565,16 +621,27 @@ class FlexKVLayerLoadingEvent:
         import select
 
         assert 0 <= layer_index < self._num_layers
+        assert count > 0
+        self._wait_started = True
         fd = self.load_event_fds[layer_index]
-        while True:
-            select.select([fd], [], [])
-            try:
-                buf = os.read(fd, 8)
-                if buf:
-                    break
-            except BlockingIOError:
-                # Spurious wakeup; loop and re-select.
-                continue
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        for _ in range(count):
+            while True:
+                timeout = None
+                if deadline is not None:
+                    timeout = max(0.0, deadline - time.monotonic())
+                readable, _, _ = select.select([fd], [], [], timeout)
+                if not readable:
+                    raise TimeoutError(
+                        "Timed out waiting for a FlexKV layerwise eventfd signal"
+                    )
+                try:
+                    buf = os.read(fd, 8)
+                    if buf:
+                        break
+                except BlockingIOError:
+                    # Spurious wakeup; loop and re-select.
+                    continue
         if layer_index == self._num_layers - 1:
             self._finished = True
 
@@ -596,62 +663,218 @@ class FlexKVLayerLoadingEvent:
 class FlexKVLayerDoneCounter:
     """Triple-buffered slot-based layerwise counter.
 
-    The KV pool calls ``wait_until(layer_id)`` once per layer during
-    forward. We track which producer slot the current task is using and
-    block on that slot's ``layer_id``-th eventfd. Producer rotation lets
-    the next prefetch start before the current one finishes consuming.
+    The KV pool calls ``wait_until(layer_id)`` once per layer during forward.
+    All restores collected while SGLang builds one prefill batch share a
+    producer slot. The layer hook consumes one eventfd signal per restore for
+    each layer. Producer rotation therefore happens per prefill batch, not per
+    request, and the fixed-size ring remains sufficient for large batches.
     """
 
-    def __init__(self, num_layers: int, num_counters: int = 3):
+    def __init__(self, num_layers: int, num_counters: int = 3, world_rank: int = -1):
         self.num_layers = num_layers
         self.num_counters = num_counters
+        self.world_rank = world_rank
+        timeout_raw = os.environ.get("FLEXKV_LAYERWISE_WAIT_TIMEOUT_S", "240")
+        try:
+            timeout_s = float(timeout_raw)
+        except ValueError:
+            logger.warning(
+                "[FlexKV] Invalid FLEXKV_LAYERWISE_WAIT_TIMEOUT_S=%r; using 240s",
+                timeout_raw,
+            )
+            timeout_s = 240.0
+        self.wait_timeout_s: Optional[float] = timeout_s if timeout_s > 0 else None
         self.events: List[FlexKVLayerLoadingEvent] = [
             FlexKVLayerLoadingEvent(num_layers) for _ in range(num_counters)
         ]
         self.producer_index = -1
         self.consumer_index = -1
         self._task_to_producer: Dict[int, int] = {}
+        self._consumer_task_ids: List[int] = []
 
     def register_task(self, task_id: int, producer_id: int) -> None:
+        if task_id in self._task_to_producer:
+            raise RuntimeError(f"Task {task_id} is already registered")
         self._task_to_producer[task_id] = producer_id
 
-    def register_task_with_explicit_counter_id(
-        self, task_id: int, counter_id: int
-    ) -> None:
+    def expected_transfer_count(
+        self, counter_id: int, *, allow_unclaimed_active: bool = False
+    ) -> int:
+        """Validate a counter selection without mutating local state.
+
+        The sync leader may have just armed a fresh producer event, while
+        followers only accept either their current open batch or a reusable
+        event.  Returning the next signal count lets the connector detect
+        rank-skewed batch boundaries before launching FlexKV.
+        """
         if not 0 <= counter_id < self.num_counters:
             raise ValueError(
                 f"Invalid counter_id={counter_id}, must be in [0, {self.num_counters})"
             )
+        event = self.events[counter_id]
+        if self.consumer_index == counter_id:
+            if event._finished:
+                raise RuntimeError(
+                    f"Counter {counter_id} is marked finished but is still the consumer"
+                )
+            if event._wait_started:
+                raise RuntimeError(
+                    f"Counter {counter_id} has already started layer waits"
+                )
+            return event.pending_transfers() + 1
+
+        if self.consumer_index >= 0:
+            raise RuntimeError(
+                f"Counter {self.consumer_index} is still the active consumer; "
+                f"cannot select counter {counter_id}"
+            )
+
+        if event._finished:
+            return 1
+
+        if event._wait_started:
+            raise RuntimeError(f"Counter {counter_id} has already started layer waits")
+
+        if allow_unclaimed_active and self.producer_index == counter_id:
+            pending = event.pending_transfers()
+            if pending != 0:
+                raise RuntimeError(
+                    f"Unclaimed counter {counter_id} unexpectedly has {pending} transfers"
+                )
+            return 1
+
+        raise RuntimeError(f"Counter {counter_id} is still active on a previous batch")
+
+    def register_task_with_explicit_counter_id(
+        self, task_id: int, counter_id: int
+    ) -> None:
+        self.expected_transfer_count(counter_id)
+        if task_id in self._task_to_producer:
+            raise RuntimeError(f"Task {task_id} is already registered")
+        event = self.events[counter_id]
+        if event._finished:
+            event.reset_for_new_transfer()
         self._task_to_producer[task_id] = counter_id
-        self.events[counter_id].reset_for_new_transfer()
 
     def update_producer(self) -> int:
+        if self.consumer_index >= 0:
+            event = self.events[self.consumer_index]
+            if not event._finished and not event._wait_started:
+                return self.consumer_index
+
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ]._finished, "Producer event should be finished before reuse"
+        assert self.events[self.producer_index]._finished, (
+            "Producer event should be finished before reuse"
+        )
+        self.events[self.producer_index].reset_for_new_transfer()
         return self.producer_index
 
     def set_consumer(self, task_id: int) -> None:
         if task_id < 0:
-            self.consumer_index = -1
             return
         producer_id = self._task_to_producer.pop(task_id, None)
-        self.consumer_index = producer_id if producer_id is not None else -1
+        if producer_id is None:
+            return
+        if self.consumer_index < 0:
+            self.consumer_index = producer_id
+        elif self.consumer_index != producer_id:
+            raise RuntimeError(
+                "FlexKV restores from different producer slots cannot share "
+                "one prefill batch"
+            )
+        self.events[producer_id].add_transfer()
+        self._consumer_task_ids.append(task_id)
+
+    def rollback_prepared_transfer(
+        self, task_id: int, producer_id: int, *, transfer_added: bool
+    ) -> None:
+        """Undo local counter state when an all-rank preflight fails."""
+        if not 0 <= producer_id < self.num_counters:
+            raise ValueError(
+                f"Invalid producer_id={producer_id}, must be in "
+                f"[0, {self.num_counters})"
+            )
+        self._task_to_producer.pop(task_id, None)
+        event = self.events[producer_id]
+        if transfer_added:
+            event.remove_transfer()
+            try:
+                self._consumer_task_ids.remove(task_id)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Task {task_id} is missing from the active consumer batch"
+                ) from exc
+
+        if not event._wait_started and event.pending_transfers() == 0:
+            if self.consumer_index == producer_id:
+                self.consumer_index = -1
+            event.mark_reusable()
+
+    def abort_unregistered_selection(self, producer_id: int) -> None:
+        """Release a freshly selected leader counter before registration."""
+        if not 0 <= producer_id < self.num_counters:
+            raise ValueError(
+                f"Invalid producer_id={producer_id}, must be in "
+                f"[0, {self.num_counters})"
+            )
+        event = self.events[producer_id]
+        if self.consumer_index == producer_id or event._wait_started:
+            raise RuntimeError(f"Counter {producer_id} is already being consumed")
+        if event.pending_transfers() != 0:
+            raise RuntimeError(
+                f"Counter {producer_id} already has registered transfers"
+            )
+        event.mark_reusable()
 
     def wait_until(self, threshold: int) -> None:
         if self.consumer_index < 0:
             return
         event = self.events[self.consumer_index]
-        if event.wait_remaining[threshold] <= 0:
+        wait_count = event.wait_remaining[threshold]
+        if wait_count <= 0:
             return
-        event.wait_remaining[threshold] -= 1
-        event.wait(threshold)
+        event.wait_remaining[threshold] = 0
+        try:
+            event.wait(
+                threshold,
+                wait_count,
+                timeout_s=getattr(self, "wait_timeout_s", None),
+            )
+        except TimeoutError as exc:
+            task_ids = list(getattr(self, "_consumer_task_ids", []))
+            rank = getattr(self, "world_rank", -1)
+            timeout_s = getattr(self, "wait_timeout_s", None)
+            logger.error(
+                "[ERROR][FlexKV-SGLang] operation=load action=wait "
+                "status=timeout direction=H2D flexkv_task_ids=%s "
+                "transfer_mode=layerwise rank=%d counter_id=%d layer=%d "
+                "wait_count=%d timeout=%s",
+                task_ids,
+                rank,
+                self.consumer_index,
+                threshold,
+                wait_count,
+                "-" if timeout_s is None else f"{timeout_s}s",
+            )
+            raise TimeoutError(
+                "FlexKV layerwise wait timed out: "
+                f"rank={rank}, task_ids={task_ids}, counter_id={self.consumer_index}, "
+                f"layer={threshold}, wait_count={wait_count}"
+            ) from exc
+        if threshold == self.num_layers - 1:
+            self.consumer_index = -1
+            self._consumer_task_ids.clear()
 
     def reset(self) -> None:
+        # FlexKVConnector.reset() completely waits for every launched transfer
+        # before calling this method, so no worker can signal these eventfds
+        # after they are drained and returned to the producer ring.
+        for event in self.events:
+            event.mark_reusable()
         self.producer_index = -1
         self.consumer_index = -1
         self._task_to_producer.clear()
+        self._consumer_task_ids.clear()
 
     def __del__(self) -> None:
         try:

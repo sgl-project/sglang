@@ -237,8 +237,13 @@ Either flag also sets `FLEXKV_CONFIG_PATH` so you can omit
 * When `host_hit_length > 0`, the scheduler later calls
   `init_load_back`, which allocates the uncached slots and fires
   `retrieve_kv` (FlexKV `launch` + `wait`).
-* `cache_finished_req` runs `put_match` + `launch` and stashes the
-  in-flight FlexKV task id. Source-node lock is held until
+* `cache_unfinished_req` stores the page-aligned prefill boundary so hybrid
+  models have an exact SWA/compress-state snapshot for prompt-prefix reuse.
+  Chunked-prefill boundaries are skipped because their state is still changing.
+* `cache_finished_req` also stores the final committed boundary. Each store runs
+  `put_match` + `launch` and gets an independent tracking key, so a short request
+  cannot overwrite an in-flight prefill store from the same request. The
+  source-node lock is held until
   `check_completed_stores` (called from `check_hicache_events` /
   `evict`) signals completion.
 
@@ -253,6 +258,9 @@ This is the path you'll use under any non-trivial deployment topology
   `register_layer_transfer_counter`; the per-layer hook blocks each
   forward layer on its own eventfd until the FlexKV transfer worker
   signals the layer is staged.
+* For a detailed explanation of CP rank synchronization, failure modes,
+  diagnostics, and validation, see
+  [`LAYERWISE_CP_RESTORE_HANG.md`](LAYERWISE_CP_RESTORE_HANG.md).
 * Layerwise mode requires the FlexKV transfer worker's UDS socket
   (`/tmp/flexkv_layerwise_eventfd.sock` by default) to be reachable —
   the connector handshakes with it at startup. The socket path is
@@ -267,6 +275,8 @@ This is the path you'll use under any non-trivial deployment topology
 * `flexkv_radix_cache.py` — `FlexKVRadixCache(RadixCache)`. Overrides
   `match_prefix`, `init_load_back`, `cache_finished_req`, `evict`,
   `check_hicache_events`, `reset`.
+* `flexkv_hybrid_radix_cache.py` — composes FlexKV I/O with
+  `UnifiedRadixCache` for hybrid SWA models such as DeepSeek V4.
 * `flexkv_connector.py` — `FlexKVConnector`. Owns the `KVManager`,
   `KVTPClient`, and the cross-rank sync context. Public methods:
   `lookup_kv`, `retrieve_kv`, `start_load_kv_layerwise`, `store_kv`,
@@ -310,6 +320,8 @@ Supported:
 * `FLEXKV_CONFIG_PATH` — full FlexKV YAML / JSON config (also set
   automatically by `--flexkv-config-file`).
 * `FLEXKV_ENABLE_LAYERWISE_TRANSFER` — `1` to enable layerwise mode.
+* `FLEXKV_LAYERWISE_WAIT_TIMEOUT_S` — maximum time to wait for one layer's
+  eventfd signals (default `240`; set `0` to disable the timeout).
 * `FLEXKV_LAYERWISE_EVENTFD_SOCKET` — UDS socket path (default
   `/tmp/flexkv_layerwise_eventfd.sock`); auto-suffixed per
   `(pp_rank, dp_client_id)` when those dims are > 1.
@@ -319,6 +331,10 @@ Supported:
   `server_args.dist_init_addr`'s host.
 * `FLEXKV_KV_CACHE_DTYPE` — override KV dtype when sglang uses
   `--kv-cache-dtype auto`.
+* `swa_multi_group` (FlexKV config file) — omitted or `true` stores and
+  restores DeepSeek V4 SWA KV together with the C4 attention/indexer
+  compress states. Explicit `false` keeps SWA KV I/O but disables the
+  state sidecars.
 * `SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK` — bypass the prebuilt
   `sglang-kernel` version assertion (not FlexKV-specific).
 
@@ -373,11 +389,10 @@ Supported:
 
 ### Known limitations
 
-* Hybrid models (Mamba / SWA / DSV4 indexer auxiliary pools) are not
-  supported through this connector — only the primary KV pool is
-  hooked up. HiCache's multi-pool `batch_*_v2` interface would map
-  here but requires `PoolTransfer` + `PoolHitPolicy` plumbing in
-  `FlexKVConnector`.
+* DeepSeek V4's split c4/c128/SWA layout is supported, including the C4
+  indexer KV and attention/indexer compress-state sidecars. The unified-KV
+  layout, `--enable-hisparse`, other hybrid SWA models, and Mamba/SSM pools
+  are not supported yet.
 * Write-back acks are per-request (one `dec_lock_ref` per
   `cache_finished_req`), not per-page like HiCache's
   `flush_write_through_acks`.

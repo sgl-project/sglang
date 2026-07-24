@@ -58,23 +58,46 @@ def _flexkv_factory(ctx):
     # fall back to 0 for single-rank dims.
     pp_rank = pp_group.rank_in_group if pp_group is not None else 0
     attn_cp_rank = attn_cp_group.rank_in_group if attn_cp_group is not None else 0
+    parallel_state = getattr(ctx.tp_worker, "ps", None)
+    if server_args.enable_dp_attention:
+        dp_rank = getattr(parallel_state, "attn_dp_rank", 0)
+    else:
+        dp_rank = getattr(parallel_state, "dp_rank", 0) or 0
 
-    return FlexKVRadixCache(
+    common_kwargs = dict(
         params=ctx.params,
         model_config=ctx.model_config,
         server_args=server_args,
         tp_rank=ctx.tp_rank,
-        tp_size=ctx.tp_size,
-        # ``dp_rank`` isn't carried on TreeCacheBuildContext or ServerArgs
-        # at construction time; the connector normalizes ``None`` to 0
-        # for the single-DP-rank case that this factory targets.
-        dp_rank=None,
+        dp_rank=dp_rank,
         pp_rank=pp_rank,
         attn_cp_rank=attn_cp_rank,
         tp_group=ctx.tp_group,
         pp_group=pp_group,
         attn_tp_group=attn_tp_group,
         attn_cp_group=attn_cp_group,
+    )
+
+    if ctx.is_hybrid_ssm:
+        raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
+
+    if ctx.is_hybrid_swa:
+        from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (
+            FlexKVHybridRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        ctx.params.tree_components = (ComponentType.FULL, ComponentType.SWA)
+        inner_cache = UnifiedRadixCache(ctx.params)
+        return FlexKVHybridRadixCache(
+            inner_cache=inner_cache,
+            **common_kwargs,
+        )
+
+    return FlexKVRadixCache(
+        tp_size=ctx.tp_size,
+        **common_kwargs,
     )
 
 
