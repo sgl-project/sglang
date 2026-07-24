@@ -66,6 +66,148 @@ def _usp_all_to_all_single_varlen(
     return output
 
 
+def _ipc_ready_group():
+    """The ulysses group when the 2-rank IPC transport is usable, else None."""
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        ipc_a2a_ready,
+    )
+
+    group = get_sp_group().ulysses_group
+    return group if ipc_a2a_ready(group) else None
+
+
+def _ipc_varlen_fast(x, seq_lens, head_dim, direction):
+    """2-rank IPC path for the varlen A2A pair; None when unavailable."""
+    if head_dim != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    r = IPC_A2A.rank
+    off = [0, seq_lens[0]]
+    if direction == "input":
+        # [b, s_local, h_global, d] -> [b, sum(seq_lens), h_global/2, d]
+        b, s_local, h_global, d = x.shape
+        half = h_global // 2
+        peer_len = seq_lens[1 - r]
+        send = x[:, :, (1 - r) * half : (2 - r) * half].contiguous()
+        out = x.new_empty(b, seq_lens[0] + seq_lens[1], half, d)
+        out.narrow(1, off[r], s_local).copy_(x[:, :, r * half : (r + 1) * half])
+        theirs = IPC_A2A.exchange(group, send, (b, peer_len, half, d))
+        out.narrow(1, off[1 - r], peer_len).copy_(theirs)
+        return out
+    # output: [b, s_global, h_local, d] -> [b, seq_lens[r], 2*h_local, d].
+    # The staging buffer IS the gathered result: each rank writes its head
+    # half of the peer's slot directly; no intermediate copy.
+    b, s_global, h_local, d = x.shape
+    my_len = seq_lens[r]
+    peer_len = seq_lens[1 - r]
+    n_out = b * my_len * 2 * h_local * d
+    n_peer_out = b * peer_len * 2 * h_local * d
+    local, peer = IPC_A2A.get_staging(n_out, n_peer_out, x.dtype, group)
+    slot = IPC_A2A.next_slot()
+    pst = peer[slot].narrow(0, 0, n_peer_out).view(b, peer_len, 2 * h_local, d)
+    pst[:, :, r * h_local : (r + 1) * h_local].copy_(
+        x.narrow(1, off[1 - r], peer_len), non_blocking=True
+    )
+    IPC_A2A.signal()
+    out = local[slot].narrow(0, 0, n_out).view(b, my_len, 2 * h_local, d)
+    out[:, :, r * h_local : (r + 1) * h_local].copy_(x.narrow(1, off[r], my_len))
+    IPC_A2A.wait()
+    return out
+
+
+def _ipc_input_a2a_qkv(q, k, v):
+    """The three input A2As of one attention as a single IPC exchange;
+    None when unavailable."""
+    if get_ulysses_parallel_world_size() != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    b, s_local, h_global, d = q.shape
+    half = h_global // 2
+    r = IPC_A2A.rank
+    n = b * s_local * half * d
+    local, peer = IPC_A2A.get_staging(3 * n, 3 * n, q.dtype, group)
+    slot = IPC_A2A.next_slot()
+    outs = []
+    for i, t in enumerate((q, k, v)):
+        send = t[:, :, (1 - r) * half : (2 - r) * half].contiguous()
+        peer[slot].narrow(0, i * n, n).copy_(send.view(-1), non_blocking=True)
+        out = t.new_empty(b, 2 * s_local, half, d)
+        out.narrow(1, r * s_local, s_local).copy_(t[:, :, r * half : (r + 1) * half])
+        outs.append(out)
+    IPC_A2A.signal_and_wait()
+    for i, out in enumerate(outs):
+        theirs = local[slot].narrow(0, i * n, n).view(b, s_local, half, d)
+        out.narrow(1, (1 - r) * s_local, s_local).copy_(theirs)
+    return tuple(outs)
+
+
+def _ipc_input_a2a_qkv_segmented(txt_q, img_q, txt_k, img_k, txt_v, img_v, local_pad):
+    """Joint-attention input A2A that reads the (txt, img) pair directly in
+    join_seqs layout [txt_real | img | txt_pad], skipping the per-projection
+    joint cats. The staging buffer IS the gathered q/k/v: each rank writes its
+    own sequence span of the peer's slot; returns (q, k, v) staging views or
+    None when unavailable."""
+    if get_ulysses_parallel_world_size() != 2:
+        return None
+    group = _ipc_ready_group()
+    if group is None:
+        return None
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
+        IPC_A2A,
+    )
+
+    b, txt_len, h_global, d = txt_q.shape
+    img_len = img_q.shape[1]
+    half = h_global // 2
+    r = IPC_A2A.rank
+    L = txt_len + img_len
+    real = txt_len - local_pad
+    n = b * 2 * L * half * d
+    local, peer = IPC_A2A.get_staging(3 * n, 3 * n, txt_q.dtype, group)
+    slot = IPC_A2A.next_slot()
+    ph = slice((1 - r) * half, (2 - r) * half)
+    lh = slice(r * half, (r + 1) * half)
+    base = r * L
+    outs = []
+    peer_dsts, peer_srcs = [], []
+    loc_dsts, loc_srcs = [], []
+    for i, (txt, img) in enumerate(((txt_q, img_q), (txt_k, img_k), (txt_v, img_v))):
+        pst = peer[slot].narrow(0, i * n, n).view(b, 2 * L, half, d)
+        pspan = pst[:, base : base + L]
+        peer_dsts += [pspan[:, 0:real], pspan[:, real : real + img_len]]
+        peer_srcs += [txt[:, 0:real, ph], img[:, :, ph]]
+        if local_pad:
+            peer_dsts.append(pspan[:, real + img_len :])
+            peer_srcs.append(txt[:, real:, ph])
+        out = local[slot].narrow(0, i * n, n).view(b, 2 * L, half, d)
+        lspan = out[:, base : base + L]
+        loc_dsts += [lspan[:, 0:real], lspan[:, real : real + img_len]]
+        loc_srcs += [txt[:, 0:real, lh], img[:, :, lh]]
+        if local_pad:
+            loc_dsts.append(lspan[:, real + img_len :])
+            loc_srcs.append(txt[:, real:, lh])
+        outs.append(out)
+    torch._foreach_copy_(peer_dsts, peer_srcs)
+    # signal as soon as the peer's data is in flight; our local-half writes
+    # overlap with the peer's wait
+    IPC_A2A.signal()
+    torch._foreach_copy_(loc_dsts, loc_srcs)
+    IPC_A2A.wait()
+    return tuple(outs)
+
+
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
@@ -87,6 +229,11 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if world_size == 2 and head_dim == 2:
+        fast = _ipc_varlen_fast(x, [x.shape[1], x.shape[1]], 2, "input")
+        if fast is not None:
+            return fast
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
@@ -147,6 +294,11 @@ def _usp_input_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if world_size == 2:
+        fast = _ipc_varlen_fast(x, seq_lens, head_dim, "input")
+        if fast is not None:
+            return fast
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
@@ -221,6 +373,12 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
+        half_len = x.shape[1] // 2
+        fast = _ipc_varlen_fast(x, [half_len, half_len], 2, "output")
+        if fast is not None:
+            return fast
+
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
 
@@ -280,6 +438,11 @@ def _usp_output_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if world_size == 2:
+        fast = _ipc_varlen_fast(x, seq_lens, head_dim, "output")
+        if fast is not None:
+            return fast
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
