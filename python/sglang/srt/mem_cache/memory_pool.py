@@ -811,6 +811,7 @@ class MambaPool:
         # Full (unsharded) conv sub-block dims for PD transfer across different
         # attn_tp_size (GDN: [key_dim, key_dim, value_dim]); None otherwise.
         self.conv_shard_groups = getattr(cache_params.shape, "conv_shard_groups", None)
+        self.conv_slice_axis = getattr(cache_params.shape, "conv_slice_axis", 0)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -984,39 +985,34 @@ class MambaPool:
             )
         current_platform.synchronize()
 
+    _NON_TRANSFER_STATE_FIELDS = frozenset(
+        {
+            "intermediate_ssm",
+            "intermediate_conv_window",
+            "replayssm_d",
+            "replayssm_k",
+            "replayssm_g",
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_beta",
+        }
+    )
+
+    def _iter_transfer_state_tensors(self):
+        """Yield transferable state tensors with their per-slot slice axis."""
+        for field, value in vars(self.mamba_cache).items():
+            if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            slice_axis = self.conv_slice_axis if field == "conv" else 0
+            for state_tensor in tensors:
+                yield field, state_tensor, slice_axis
+
     def get_contiguous_buf_infos(self):
-        """
-        Get buffer info for RDMA registration.
-        Only returns conv and temporal state buffers, excluding intermediate buffers
-        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
-        """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Skip intermediate buffers used only for speculative decoding
-            # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
-                continue
-            # Skip GDN ReplaySSM ring buffers: they are derived/transient decode
-            # scratch, not part of the persistent transferable state.
-            if field in (
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-                "replayssm_rawv",
-                "replayssm_rawk",
-                "replayssm_beta",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
+        """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor in enumerate(state_tensors):
+        for _, state_tensor, _ in self._iter_transfer_state_tensors():
             data_ptrs += [
                 state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
@@ -1029,44 +1025,26 @@ class MambaPool:
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each state tensor.
 
-        For mamba state, the layout is:
-        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
-        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
-
-        The 3rd dimension (index 2) is the one that gets sliced by TP.
-        Returns the size of this dimension for each tensor (repeated for each layer).
+        The slice axis is tensor-specific: normally the first per-slot axis,
+        while Kimi conv state uses the second per-slot axis.
         """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Mirror the exclusions in get_contiguous_buf_infos so the returned
-            # dims line up element-wise with the RDMA buffer list.
-            if field in (
-                "intermediate_ssm",
-                "intermediate_conv_window",
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-                "replayssm_rawv",
-                "replayssm_rawk",
-                "replayssm_beta",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
-
         dim_per_tensor = []
-        for state_tensor in state_tensors:
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
             # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
+            # Kimi conv state transposes the two per-slot axes to [K-1, dim].
+            axis = 2 + slice_axis
+            sliceable_dim = state_tensor.shape[axis]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_slice_outer_counts(self):
+        """Get the number of rows preceding each tensor's TP slice axis."""
+        outer_counts = []
+        for _, state_tensor, slice_axis in self._iter_transfer_state_tensors():
+            outer_count = math.prod(state_tensor.shape[2 : 2 + slice_axis])
+            outer_counts += [outer_count] * self.num_mamba_layers
+        return outer_counts
 
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims, aligned element-wise with
@@ -1080,29 +1058,14 @@ class MambaPool:
         those tensors keep the single contiguous slice.
         """
         subdims_per_tensor = []
-        for field in vars(self.mamba_cache):
-            # Mirror the exclusions in get_state_dim_per_tensor so the returned
-            # sub-dims line up element-wise with the RDMA buffer list.
-            if field in (
-                "intermediate_ssm",
-                "intermediate_conv_window",
-                "replayssm_d",
-                "replayssm_k",
-                "replayssm_g",
-            ):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
-            tensors = value if isinstance(value, list) else [value]
-            for _ in tensors:
-                # Only conv_state carries a q/k/v decomposition.
-                subdims = (
-                    list(self.conv_shard_groups)
-                    if field == "conv" and self.conv_shard_groups is not None
-                    else None
-                )
-                subdims_per_tensor += [subdims] * self.num_mamba_layers
+        for field, _, _ in self._iter_transfer_state_tensors():
+            # Only conv_state carries a q/k/v decomposition.
+            subdims = (
+                list(self.conv_shard_groups)
+                if field == "conv" and self.conv_shard_groups is not None
+                else None
+            )
+            subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
 
 
@@ -1339,6 +1302,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_slice_outer_counts(self):
+        return self.mamba_pool.get_state_slice_outer_counts()
 
     def get_state_conv_shard_groups(self):
         return self.mamba_pool.get_state_conv_shard_groups()
@@ -3636,6 +3602,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_slice_outer_counts(self):
+        """Get the row count preceding each mamba state slice axis."""
+        return self.mamba_pool.get_state_slice_outer_counts()
 
     def get_state_conv_shard_groups(self):
         """Per-tensor conv sub-block dims (GDN) aligned with the state list."""
