@@ -186,6 +186,10 @@ class SamplingParams:
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
 
+    # Spectrum parameters
+    enable_spectrum: bool = False
+    spectrum_params: Any = None  # SpectrumParams
+
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
     num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
@@ -308,6 +312,16 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+        if self.enable_spectrum and isinstance(self.spectrum_params, dict):
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams(**self.spectrum_params)
+
+        if self.enable_spectrum and self.spectrum_params is None:
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams()
 
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
@@ -461,6 +475,11 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        if self.enable_teacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
 
         RLRolloutArgs.validate_sampling_params(self)
 
@@ -783,6 +802,69 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-spectrum",
+            action="store_true",
+        )
+        add_argument("--w", type=float)
+        add_argument(
+            "--taylor-order",
+            "--taylor_order",
+            dest="taylor_order",
+            type=int,
+        )
+        add_argument(
+            "--history-size",
+            "--history_size",
+            dest="history_size",
+            type=int,
+        )
+        add_argument(
+            "--spectrum-window-size",
+            "--spectrum_window_size",
+            "--window-size",
+            "--window_size",
+            dest="spectrum_window_size",
+            type=float,
+            help="Spectrum initial skip window size.",
+        )
+        add_argument(
+            "--spectrum-flex-window",
+            "--spectrum_flex_window",
+            "--flex-window",
+            "--flex_window",
+            dest="spectrum_flex_window",
+            type=float,
+            help="Spectrum adaptive window growth slope.",
+        )
+        add_argument(
+            "--spectrum-warmup-steps",
+            "--spectrum_warmup_steps",
+            dest="spectrum_warmup_steps",
+            type=int,
+            help="Spectrum warmup denoising steps before caching.",
+        )
+        add_argument(
+            "--spectrum-m",
+            "--spectrum_m",
+            dest="spectrum_m",
+            type=int,
+            help="Spectrum Chebyshev polynomial degree (M).",
+        )
+        add_argument(
+            "--spectrum-lam",
+            "--spectrum_lam",
+            dest="spectrum_lam",
+            type=float,
+            help="Spectrum ridge regularization strength.",
+        )
+        add_argument(
+            "--spectrum-tau-num-steps",
+            "--spectrum_tau_num_steps",
+            dest="spectrum_tau_num_steps",
+            type=int,
+            help="Spectrum tau normalization horizon.",
         )
 
         # profiling
@@ -1199,6 +1281,30 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        spectrum_overrides = {}
+        spectrum_flag_map = {
+            "w": "w",
+            "taylor_order": "taylor_order",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
+            "history_size": "history_size",
+            "warmup_steps": "spectrum_warmup_steps",
+            "m": "spectrum_m",
+            "lam": "spectrum_lam",
+            "tau_num_steps": "spectrum_tau_num_steps",
+        }
+        for field_name, arg_name in spectrum_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                spectrum_overrides[field_name] = getattr(args, arg_name)
+        if spectrum_overrides:
+            if not cli_args.get("enable_spectrum", False):
+                cli_args["enable_spectrum"] = True
+            existing_spectrum_params = cli_args.get("spectrum_params")
+            if isinstance(existing_spectrum_params, dict):
+                spectrum_overrides = {**existing_spectrum_params, **spectrum_overrides}
+            cli_args["spectrum_params"] = spectrum_overrides
+
         return cli_args
 
     def output_file_path(self):
