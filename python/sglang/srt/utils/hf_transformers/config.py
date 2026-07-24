@@ -72,6 +72,38 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _remap_gemma4_local_global_head_dims(target) -> None:
+    """Remap Gemma4's local/global attention head-dim naming in place.
+
+    Gemma4 configs (both the multimodal `text_config` and standalone
+    `gemma4_text` checkpoints) use base attributes (`head_dim`,
+    `num_key_value_heads`) for the sliding-window (local) layers and
+    `global_*` variants for the full-attention layers. SGLang's Gemma4
+    model code expects the opposite convention: base attributes hold the
+    full-attention values and `swa_*` variants hold the sliding-window
+    overrides.
+    """
+    global_head_dim = getattr(target, "global_head_dim", None)
+    global_kv_heads = getattr(target, "num_global_key_value_heads", None)
+
+    swa_head_dim = target.head_dim
+    swa_kv_heads = target.num_key_value_heads
+
+    target.swa_head_dim = swa_head_dim
+    target.swa_v_head_dim = swa_head_dim
+    target.swa_num_key_value_heads = swa_kv_heads
+
+    if global_head_dim is not None:
+        target.head_dim = global_head_dim
+    if global_kv_heads is not None:
+        target.num_key_value_heads = global_kv_heads
+
+    if not hasattr(target, "v_head_dim"):
+        target.v_head_dim = target.head_dim
+    if not hasattr(target, "swa_v_head_dim"):
+        target.swa_v_head_dim = target.swa_head_dim
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -162,29 +194,7 @@ class HfModelConfigParser(ModelConfigParserBase):
             "gemma4_unified",
             "gemma4_unified_assistant",
         ):
-            # Gemma4 configs use base attributes for SWA layers and `global_*`
-            # variants for full-attention layers.  SGLang expects the opposite:
-            # base = full-attention, `swa_*` = sliding-window overrides.
-            text_config = config.text_config
-            global_head_dim = getattr(text_config, "global_head_dim", None)
-            global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
-
-            swa_head_dim = text_config.head_dim
-            swa_kv_heads = text_config.num_key_value_heads
-
-            text_config.swa_head_dim = swa_head_dim
-            text_config.swa_v_head_dim = swa_head_dim
-            text_config.swa_num_key_value_heads = swa_kv_heads
-
-            if global_head_dim is not None:
-                text_config.head_dim = global_head_dim
-            if global_kv_heads is not None:
-                text_config.num_key_value_heads = global_kv_heads
-
-            if not hasattr(text_config, "v_head_dim"):
-                text_config.v_head_dim = text_config.head_dim
-            if not hasattr(text_config, "swa_v_head_dim"):
-                text_config.swa_v_head_dim = text_config.swa_head_dim
+            _remap_gemma4_local_global_head_dims(config.text_config)
 
             # Unified Gemma4 names the end-of-audio token `eoa_token_index`,
             # but the multimodal processor expects `eoa_token_id`.
@@ -192,6 +202,12 @@ class HfModelConfigParser(ModelConfigParserBase):
                 config, "eoa_token_index"
             ):
                 config.eoa_token_id = config.eoa_token_index
+        elif config.model_type == "gemma4_text":
+            # Standalone text-only Gemma4 checkpoints (`Gemma4ForCausalLM`,
+            # e.g. a multimodal checkpoint with the vision tower dropped)
+            # carry the same local/global naming inversion directly on the
+            # top-level config -- there is no nested `text_config` here.
+            _remap_gemma4_local_global_head_dims(config)
 
         if config.model_type == "longcat_flash":
             _set_architectures(config, "LongcatFlashForCausalLM")
