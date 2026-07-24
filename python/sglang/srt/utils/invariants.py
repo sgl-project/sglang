@@ -1,21 +1,14 @@
 """Value/index validity checks -- the invariant-check model.
 
-Each check has two layers:
-
+Two layers per check:
   * data layer (sanitize / containment): unconditional, branchless, ~free.
-    Belongs to correctness / memory-safety; NOT gated. It may live in `recover`
-    here, or inside the kernel itself (then declare `recover=None`, signal-only).
-  * signal layer (detect + log/crash): the costly reduction + report. Gated by
-    SGLANG_INVARIANT_CHECK (off / warn / strict).
+    May live in `recover` here or inside the kernel (then `recover=None`).
+  * signal layer (detect + log/crash): gated by SGLANG_INVARIANT_CHECK
+    (off / warn / strict).
 
-A `Bucket` classifies an invariant by blast radius and recoverability; the
-(bucket x level) matrix decides whether a hit crashes, logs, or is silent.
-Invariants are declared once as module-level `Invariant` objects and passed to
-`expect` at each site; declaring one registers it so a CI meta-test can require
-it has a triggering test.
-
-Detection stays async (no GPU-CPU sync): violations surface via torch's async
-assert at the next sync point, and counts via a pinned-memory readback.
+A `Bucket` (blast radius x recoverability) and the level decide whether a hit
+crashes, logs, or is silent. Detection is async (no GPU-CPU sync): crashes via
+torch's async assert, counts via a pinned-memory readback.
 """
 
 from __future__ import annotations
@@ -116,11 +109,10 @@ _REGISTRY: dict[str, Invariant] = {}
 
 
 class Invariant:
-    """A declared invariant. Constructing one registers it.
+    """A declared invariant; constructing one registers it.
 
-    `recover` is the optional python-side data layer (branchless, idempotent on
-    clean input). Leave it None when the data layer lives inside the kernel;
-    the call is then signal-only. FATAL_UNCONTAINABLE must not have a recover.
+    `recover` is the optional python-side data layer (None = signal-only, data
+    layer in the kernel). FATAL_UNCONTAINABLE must not have a recover.
     """
 
     def __init__(
@@ -157,11 +149,11 @@ _FLUSH_EVERY = 512
 
 
 class _CheckReporter:
-    """Sync-free per-(rank, name) hit counter that logs on a call cadence.
+    """Sync-free per-(rank, name) hit counter, logged on a call cadence.
 
-    Detection is accumulated on the device and mirrored to pinned host memory
-    with a non-blocking copy; the host reads the (slightly stale) count on a
-    later call. First hit logs immediately; subsequent hits are batched.
+    Counts accumulate on-device and mirror to pinned host memory via a
+    non-blocking copy; the host reads the (stale) count on a later call. First
+    hit logs immediately; the rest are batched.
     """
 
     def __init__(self):

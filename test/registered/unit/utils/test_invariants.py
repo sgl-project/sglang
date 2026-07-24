@@ -1,8 +1,7 @@
-"""Unit tests for the invariant-check model (CPU).
+"""Unit tests for srt/utils/invariants.py -- CPU, no server.
 
-Proves the (bucket x level) matrix, the unconditional data layer, the throttled
-reporter, and the self-registration used by the CI coverage meta-test -- all on
-CPU tensors so it runs on the base-a-test-cpu stage without a GPU.
+Covers the (bucket x level) crash matrix, the unconditional data layer, the
+throttled reporter, and self-registration / injection-coverage.
 """
 
 import unittest
@@ -26,8 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-# Test-only invariants (namespaced under "test." so the coverage meta-test can
-# isolate them from real codebase invariants imported by other tests).
+# "test." namespace so the coverage meta-test isolates these from real invariants.
 _SOFTEN = Invariant("test.soften", Bucket.SOFTEN, Finite(), recover=torch.nan_to_num)
 _GUARD = Invariant("test.guard", Bucket.GUARD, Finite(), recover=torch.nan_to_num)
 _FATAL_C = Invariant("test.fatal_containable", Bucket.FATAL_CONTAINABLE, InRange(0, 10))
@@ -35,12 +33,11 @@ _FATAL_U = Invariant(
     "test.fatal_uncontainable", Bucket.FATAL_UNCONTAINABLE, InRange(0, 10)
 )
 
-# name -> which test method injects a violation into it (regression-closure
-# manifest). Every "test." GUARD/SOFTEN/FATAL invariant must appear here.
+# Injection manifest: every "test." invariant must have a test that triggers it.
 _INJECTION_COVERAGE = {
     "test.soften": "test_soften_never_crashes",
     "test.guard": "test_guard_crashes_in_strict",
-    "test.fatal_containable": "test_crash_matrix",
+    "test.fatal_containable": "test_fatal_containable_crashes_in_strict",
     "test.fatal_uncontainable": "test_fatal_uncontainable_crashes_in_warn",
 }
 
@@ -79,15 +76,15 @@ class TestInvariants(CustomTestCase):
         with self._off():
             with mock.patch.object(torch, "_assert_async") as m:
                 out = expect(_GUARD, bad.clone())
-        self.assertTrue(torch.isfinite(out).all())  # data layer ran
-        m.assert_not_called()  # no signal / no reduction in OFF
+        self.assertTrue(torch.isfinite(out).all())
+        m.assert_not_called()
 
     def test_soften_never_crashes(self):
         bad = torch.tensor([[float("nan"), 1.0]])
         with self._strict():
             with mock.patch.object(torch, "_assert_async") as m:
                 out = expect(_SOFTEN, bad.clone())
-        m.assert_not_called()  # SOFTEN logs, never crashes -- even in strict
+        m.assert_not_called()
         self.assertTrue(torch.isfinite(out).all())
 
     def test_guard_crashes_in_strict(self):
@@ -97,7 +94,14 @@ class TestInvariants(CustomTestCase):
                 expect(_GUARD, bad.clone())
         m.assert_called_once()
         (cond, _msg), _ = m.call_args
-        self.assertFalse(bool(cond))  # asserted on a failing condition
+        self.assertFalse(bool(cond))
+
+    def test_fatal_containable_crashes_in_strict(self):
+        bad = torch.tensor([5, 20], dtype=torch.int64)  # 20 is out of [0, 10)
+        with self._strict():
+            with mock.patch.object(torch, "_assert_async") as m:
+                expect(_FATAL_C, bad)
+        m.assert_called_once()
 
     def test_fatal_uncontainable_crashes_in_warn(self):
         bad = torch.tensor([5, 20], dtype=torch.int64)  # 20 is out of [0, 10)
@@ -112,7 +116,7 @@ class TestInvariants(CustomTestCase):
             with mock.patch.object(torch, "_assert_async") as m:
                 with self.assertLogs(ic.logger, level="WARNING") as cap:
                     expect(_GUARD, bad.clone())
-        m.assert_not_called()  # warn counts, does not crash
+        m.assert_not_called()
         self.assertTrue(any("test.guard" in line for line in cap.output))
 
     def test_registry_and_validation(self):
