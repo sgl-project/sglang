@@ -43,7 +43,7 @@ export const config = {
 }'`,
 
   dockerImages: {
-    h100: "lmsysorg/sglang:dev",
+    h100: "lmsysorg/sglang:latest",
   },
 
   github: {
