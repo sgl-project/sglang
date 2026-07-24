@@ -1408,7 +1408,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-prefill-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek DSA-style attention).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (hardware-dependent)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>flashmla_sparse</code>, <code>flashmla_sparse_q8</code>, <code>flashmla_kv</code>, <code>flashmla_auto</code>, <code>fa3</code>, <code>tilelang</code>, <code>aiter</code>, <code>trtllm</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-decode-backend`</td>
@@ -1439,6 +1439,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects <code>flashinfer_cutedsl</code> on SM100, <code>marlin</code> on SM80-SM90, <code>flashinfer_cutlass</code> otherwise (including SM120)), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80-SM90). Requires FlashInfer to be installed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>flashinfer_cudnn</code>, <code>flashinfer_cutedsl</code>, <code>flashinfer_cutlass</code>, <code>flashinfer_trtllm</code>, <code>marlin</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--bf16-gemm-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects <code>cutedsl</code> on SM100/SM103 (Blackwell), otherwise uses cuBLAS via `torch.nn.functional.linear`), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10X; dispatches between the CuTe DSL kernel and cuBLAS).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>cutedsl</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-flashinfer-autotune`</td>

@@ -218,6 +218,13 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's contiguous shard."""
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -227,15 +234,27 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_parallel().attn_tp_rank
-    attn_tp_size = get_parallel().attn_tp_size
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - rank_offset,
         0,
         tokens_per_rank,
     )
+
+
+def compute_local_num_token_non_padded_cpu(
+    global_num_token_non_padded: int,
+    num_tokens_per_dp: int,
+) -> int:
+    """Int-scalar twin of ``compute_local_num_token_non_padded``.
+
+    Replay-time hooks hold the global count as a host int
+    (``num_token_non_padded_cpu``) and write the localized result into a
+    device buffer; keeping the math on ints lets them use ``Tensor.fill_``
+    instead of staging a CPU tensor through a host-to-device copy per replay.
+    """
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
+    return min(max(global_num_token_non_padded - rank_offset, 0), tokens_per_rank)
 
 
 @dataclass
@@ -1160,8 +1179,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local import: a module-level cp_utils import here is circular (#27014).
-        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+        # Local imports: module-level CP helper imports here are circular (#27014).
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import enable_cp_v2
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
@@ -1181,9 +1201,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
         # prefill with NaN draft logits, see #23269).
         # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        cp_align_size = get_cp_padding_align_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+        if not enable_cp_v2():
+            cp_align_size = get_cp_padding_align_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1235,7 +1256,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len,
+            num_tokens,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
@@ -1640,7 +1664,7 @@ def _clamp_position_native(seq_lens):
 
 
 if is_cuda() or is_hip():
-    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+    from sglang.kernels.ops.attention.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
