@@ -237,7 +237,10 @@ class MetadataBuffers:
         max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
+        output_ids_width: int = 16,
     ):
+        if output_ids_width < 16:
+            raise ValueError("output_ids_width must be at least 16")
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         if max_sampling_mask_tokens is None:
@@ -266,7 +269,9 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_ids = torch.zeros(
+                (size, output_ids_width), dtype=torch.int32, device=device
+            )
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
@@ -380,9 +385,24 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+    def set_buf(self, req: Req, token_handoff_ready: bool = True):
+        output_row = self.output_ids[req.metadata_buffer_index]
+        output_row.zero_()
+        if getattr(req, "token_handoff_enabled", False):
+            token_log = list(req.output_ids)
+            max_log_tokens = output_row.shape[0] - 1
+            if not 1 <= len(token_log) <= max_log_tokens:
+                raise RuntimeError(
+                    f"Token handoff log length must be in [1, {max_log_tokens}], got "
+                    f"{len(token_log)} for request {req.rid}"
+                )
+            output_row[: len(token_log)] = torch.tensor(
+                token_log, dtype=torch.int32, device=output_row.device
+            )
+            # The final slot is the protocol discriminator and exact count.
+            output_row[-1] = len(token_log)
+        else:
+            output_row[0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
@@ -401,6 +421,13 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # In token-handoff mode, output_ids contains the full sealed token log,
+        # while this slot records the prefix whose text was already handed to
+        # the Prefill HTTP stream.  Decode validates the whole log but only
+        # suppresses this client-owned prefix.
+        self.cached_tokens[req.metadata_buffer_index][7] = getattr(
+            req, "token_handoff_prefill_owned_tokens", 0
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -496,9 +523,11 @@ class MetadataBuffers:
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        self.bootstrap_room[req.metadata_buffer_index].zero_()
+        if token_handoff_ready:
+            self.bootstrap_room[req.metadata_buffer_index, 0] = (
+                req.bootstrap_room if req.bootstrap_room is not None else 0
+            )
 
 
 #########################

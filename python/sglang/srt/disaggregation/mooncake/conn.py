@@ -1721,6 +1721,46 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
+    def capture_aux_targets(self, bootstrap_room: int):
+        """Snapshot late-publish destinations before the transfer worker retires them."""
+
+        targets = []
+        for session_id, req in self.transfer_infos.get(bootstrap_room, {}).items():
+            if req.is_dummy:
+                continue
+            register_info = self.decode_kv_args_table.get(session_id)
+            if register_info is None:
+                raise RuntimeError(
+                    f"No Mooncake KV registration for session {session_id}"
+                )
+            targets.append((req, register_info.dst_aux_ptrs))
+        return targets
+
+    def resend_aux(self, prefill_aux_index: int, targets) -> None:
+        """Rewrite the tiny metadata row after the prompt KV copy completes.
+
+        Token handoff intentionally sends the initial metadata with
+        ``bootstrap_room=0`` so Decode's metadata gate cannot commit a partial
+        token log. Once Prefill seals the log, this synchronous rewrite
+        publishes the final token IDs and non-zero room without retransmitting
+        prompt KV.
+        """
+
+        if not targets:
+            raise RuntimeError("No Mooncake aux destinations captured for late publish")
+
+        for req, dst_aux_ptrs in targets:
+            ret = self.send_aux(
+                req,
+                prefill_aux_index,
+                dst_aux_ptrs,
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"Failed to rewrite token handoff metadata for "
+                    f"bootstrap_room={req.room}, endpoint={req.endpoint}"
+                )
+
     def get_session_id(self):
         return self.engine.get_session_id()
 
@@ -1790,6 +1830,7 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self.aux_targets = None
         self._init_trace_ctx()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
@@ -1813,6 +1854,7 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
+            self.aux_targets = self.kv_mgr.capture_aux_targets(self.bootstrap_room)
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
@@ -1838,6 +1880,11 @@ class MooncakeKVSender(CommonKVSender):
             return status
         else:
             return self.conclude_state
+
+    def resend_aux(self) -> None:
+        if self.aux_index is None:
+            raise RuntimeError("Cannot resend Mooncake aux data before sender init")
+        self.kv_mgr.resend_aux(self.aux_index, self.aux_targets)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

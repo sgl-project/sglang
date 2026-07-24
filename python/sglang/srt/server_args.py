@@ -2940,6 +2940,22 @@ class ServerArgs:
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
         NS("disagg"),
     ] = 0
+    enable_disaggregation_token_handoff: A[
+        bool,
+        "EXPERIMENTAL: let a PD prefill worker temporarily decode while prompt KV is in flight, then replay the emitted token log on decode. Restricted to Mooncake, page_size=1, greedy 1P1D requests.",
+    ] = False
+    disaggregation_token_handoff_max_tokens: A[
+        int,
+        "Maximum number of output tokens carried by the experimental PD token handoff log.",
+    ] = 15
+    disaggregation_token_handoff_min_tokens: A[
+        int,
+        "Minimum number of bridge tokens Prefill emits before sealing an already-transferred request. Keep this at 1 unless a client-side playback buffer needs a larger floor.",
+    ] = 1
+    disaggregation_token_handoff_replay_mode: A[
+        str,
+        "Replay engine for PD token handoff: 'decode' preserves bitwise greedy behavior with native Decode steps; 'extend' teacher-forces the bridge in one batch but may differ numerically from sequential Decode.",
+    ] = "decode"
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

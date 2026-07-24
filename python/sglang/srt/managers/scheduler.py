@@ -1148,6 +1148,14 @@ class Scheduler(
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
             self.model_config.hf_config
         )
+        disagg_output_ids_width = max(
+            16,
+            (
+                self.server_args.disaggregation_token_handoff_max_tokens + 1
+                if self.server_args.enable_disaggregation_token_handoff
+                else 16
+            ),
+        )
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1165,6 +1173,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                output_ids_width=disagg_output_ids_width,
             )
 
             # The decode requests polling kv cache
@@ -1176,7 +1185,6 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1211,6 +1219,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                output_ids_width=disagg_output_ids_width,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

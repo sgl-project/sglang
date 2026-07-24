@@ -75,6 +75,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def token_handoff_eligible(req: Req, scheduler: Scheduler) -> bool:
+    """Return whether a request fits the deliberately narrow E2E MVP."""
+
+    if not scheduler.server_args.enable_disaggregation_token_handoff:
+        return False
+    return (
+        req.stream
+        and not req.return_logprob
+        and req.grammar is None
+        and req.multimodal_inputs is None
+        and scheduler.page_size == 1
+        and scheduler.ps.pp_size == 1
+        and scheduler.spec_algorithm.is_none()
+        # SamplingParams.normalize rewrites temperature=0 to
+        # temperature=1/top_k=1, so top_k is the stable greedy marker here.
+        and req.sampling_params.top_k == 1
+        and req.sampling_params.max_new_tokens > 1
+    )
+
+
 def should_force_retry(req: Req) -> bool:
     """Test hook to force a request into optimistic prefill retry."""
     retry_prob = envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
@@ -328,7 +348,41 @@ class PrefillBootstrapQueue:
         """
         Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
         """
-        req.sampling_params.max_new_tokens = 1
+        handoff_eligible = token_handoff_eligible(req, self.scheduler)
+        if self.scheduler.server_args.enable_disaggregation_token_handoff:
+            logger.info(
+                "Token handoff admission rid=%s eligible=%s stream=%s "
+                "return_logprob=%s grammar=%s multimodal=%s temperature=%s "
+                "max_new_tokens=%s",
+                req.rid,
+                handoff_eligible,
+                req.stream,
+                req.return_logprob,
+                req.grammar is not None,
+                req.multimodal_inputs is not None,
+                req.sampling_params.temperature,
+                req.sampling_params.max_new_tokens,
+            )
+        if handoff_eligible:
+            req.token_handoff_enabled = True
+            req.token_handoff_original_max_new_tokens = (
+                req.sampling_params.max_new_tokens
+            )
+            req.token_handoff_max_tokens = min(
+                req.sampling_params.max_new_tokens - 1,
+                self.scheduler.server_args.disaggregation_token_handoff_max_tokens,
+            )
+            req.token_handoff_min_tokens = min(
+                req.token_handoff_max_tokens,
+                self.scheduler.server_args.disaggregation_token_handoff_min_tokens,
+            )
+            # Keep one unreachable token beyond the bridge budget so the
+            # generic finish-state logic does not finalize and release this
+            # request while its already-started prompt KV transfer is pending.
+            req.sampling_params.max_new_tokens = req.token_handoff_max_tokens + 1
+        else:
+            req.token_handoff_enabled = False
+            req.sampling_params.max_new_tokens = 1
 
     def pop_bootstrapped(
         self,
@@ -492,9 +546,56 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
 
+        if (
+            self.server_args.enable_disaggregation_token_handoff
+            and last_batch
+            and last_batch.forward_mode.is_extend()
+        ):
+            bridge_indices = [
+                i
+                for i, req in enumerate(last_batch.reqs)
+                if getattr(req, "token_handoff_enabled", False)
+                and not req.finished()
+                and len(req.output_ids) < req.token_handoff_max_tokens
+            ]
+            if bridge_indices:
+                # Match the normal scheduler's prefill-to-decode transition:
+                # the live ScheduleBatch owns allocator/cache state, while
+                # ScheduleBatch.copy() is only a result-processing snapshot.
+                bridge_batch = last_batch
+                bridge_batch.filter_batch(keep_indices=bridge_indices)
+                if running_batch.is_empty():
+                    running_batch = bridge_batch
+                else:
+                    running_batch.merge_batch(bridge_batch)
+
+        if not running_batch.is_empty():
+            running_batch.filter_batch(
+                keep_indices=[
+                    i
+                    for i, req in enumerate(running_batch.reqs)
+                    if not getattr(req, "token_handoff_enabled", False)
+                    or (
+                        not req.finished()
+                        and len(req.output_ids) < req.token_handoff_max_tokens
+                        and (
+                            not getattr(req, "token_handoff_kv_ready", False)
+                            or len(req.output_ids) < req.token_handoff_min_tokens
+                        )
+                    )
+                ]
+            )
+
+        # Follow the regular scheduler's prefill-first policy: retain bridge
+        # Decode requests in running_batch, but admit ready prompt work before
+        # taking another bridge step. This prevents one in-flight handoff from
+        # monopolizing a Prefill worker under concurrent load.
         prefill_plan = self.get_new_batch_prefill(running_batch)
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
+        if batch is None and not running_batch.is_empty():
+            running_batch = self.update_running_batch(running_batch)
+            batch = running_batch if not running_batch.is_empty() else None
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
@@ -625,6 +726,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        handoff_stream_reqs = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -658,6 +760,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
+                if getattr(req, "token_handoff_enabled", False):
+                    handoff_stream_reqs.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
@@ -692,7 +796,13 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=True,
+                        token_handoff_ready=not getattr(
+                            req, "token_handoff_enabled", False
+                        ),
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -756,6 +866,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = result.can_run_cuda_graph
+        if handoff_stream_reqs:
+            self.output_streamer.stream_output(handoff_stream_reqs, False)
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
@@ -817,9 +929,73 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if getattr(req, "token_handoff_enabled", False):
+                    req.token_handoff_kv_ready = True
+                    if req.finished():
+                        # EOS/stop/abort won on Prefill before ownership could
+                        # transfer. Keep its terminal reason and leave the
+                        # metadata gate closed; the Router forwards Prefill's
+                        # final [DONE] and cancels the speculative Decode HTTP
+                        # request.
+                        logger.info(
+                            "Token handoff finished on Prefill before commit "
+                            "rid=%s reason=%s bridge_tokens=%d",
+                            req.rid,
+                            req.finished_reason,
+                            len(req.output_ids),
+                        )
+                        # A terminal sample can already have released its KV
+                        # allocation before the asynchronous transfer poll
+                        # observes Success. Avoid releasing the same request a
+                        # second time; non-Mamba caches reject that state.
+                        if (
+                            req.req_pool_idx is not None
+                            or req.kv is not None
+                            or req.mamba_pool_idx is not None
+                        ):
+                            release_kv_cache(req, self.tree_cache)
+                        req.disagg_kv_sender.clear()
+                        done_reqs.append(req)
+                        req.time_stats.set_prefill_kv_transfer_finish_time()
+                        continue
+                    if len(req.output_ids) < req.token_handoff_min_tokens:
+                        undone_reqs.append(req)
+                        continue
+                    # Seal the live producer before publishing the final token
+                    # log. Decode's metadata gate is still closed because the
+                    # initial aux row carried bootstrap_room=0.
+                    req.token_handoff_prefill_owned_tokens = req.send_token_offset
+                    req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+                    req.finished_len = len(req.output_ids)
+                    self.disagg_metadata_buffers.set_buf(req, token_handoff_ready=True)
+                    # The final Prefill message only closes this half of the
+                    # chained stream. Tokens generated ahead of the last
+                    # streamed result are owned by Decode and must not be
+                    # emitted here as a racing detokenizer tail.
+                    req.send_token_offset = len(req.output_ids)
+                    decode_ids, _ = req.init_incremental_detokenize()
+                    req.send_decode_id_offset = len(decode_ids)
+                    try:
+                        req.disagg_kv_sender.resend_aux()
+                        logger.info(
+                            "Token handoff sealed rid=%s bridge_tokens=%d "
+                            "prefill_owned_tokens=%d",
+                            req.rid,
+                            len(req.output_ids),
+                            req.token_handoff_prefill_owned_tokens,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to publish sealed token handoff log for rid=%s",
+                            req.rid,
+                        )
+                        self.handle_inflight_transfer_failure(req)
+                        done_reqs.append(req)
+                        continue
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
+                    if not getattr(req, "token_handoff_enabled", False):
+                        req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1053,6 +1229,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        token_handoff_ready: bool = True,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1081,7 +1258,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            self.disagg_metadata_buffers.set_buf(
+                req, token_handoff_ready=token_handoff_ready
+            )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
