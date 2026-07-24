@@ -1909,6 +1909,25 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _resolve_nvfp4_moe_runner_backend(
+    moe_runner_backend: MoeRunnerBackend,
+) -> MoeRunnerBackend:
+    """Resolve the NVFP4 MoE backend selected by ``auto``."""
+    if not moe_runner_backend.is_auto():
+        return moe_runner_backend
+
+    if not is_cuda():
+        raise ValueError("NVFP4 MoE backend resolution requires CUDA")
+
+    capability = get_device_capability()
+    if (8, 0) <= capability < (10, 0):
+        return MoeRunnerBackend.MARLIN
+    if capability >= (10, 0):
+        # The TRT-LLM FP4 MoE path is not supported for NVFP4 on SM100+.
+        return MoeRunnerBackend.FLASHINFER_CUTLASS
+    return MoeRunnerBackend.FLASHINFER_TRTLLM
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -1938,10 +1957,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
+        """Whether the effective backend uses the FlashInfer CUTLASS path."""
+        backend = getattr(self, "_moe_runner_backend", None)
+        if backend is None:
+            from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+            backend = get_moe_runner_backend()
+        return backend.is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
@@ -2454,15 +2476,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+        moe_runner_backend = _resolve_nvfp4_moe_runner_backend(get_moe_runner_backend())
 
         self._moe_runner_backend = moe_runner_backend
 
