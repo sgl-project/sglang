@@ -595,7 +595,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
+        # State pools are addressed by the SWA storage page size (page_size=256),
+        # not the model window (cfg.window_size=128); the latter over-allocates ~2x.
+        self.swa_storage_page_size = kvc.page_size
         self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
         self.is_speculative = kvc.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
@@ -691,7 +693,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
-        c4_state_ratio = self.c4_ring_size / self.swa_page_size
+        c4_state_ratio = self.c4_ring_size / self.swa_storage_page_size
         # C128 state is request-scoped and is finalized after
         # max_running_requests is known, so it should not scale with
         # full-token capacity here.
@@ -719,7 +721,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
             c128_max_total_num_tokens=full_token // 128,
-            c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,
+            c4_state_pool_size=swa_tokens // self.swa_storage_page_size * self.c4_ring_size,
             c128_state_pool_size=0,
         )
 
