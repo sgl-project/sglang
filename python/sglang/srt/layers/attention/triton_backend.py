@@ -438,6 +438,7 @@ class TritonAttnBackend(AttentionBackend):
                 token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
                 skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+                include_current_token=True,
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
@@ -737,6 +738,7 @@ class TritonAttnBackend(AttentionBackend):
                             bs,
                             self.device,
                             self.token_to_kv_pool,
+                            include_current_token=True,
                         )
                     )
                     window_num_kv_splits = torch.empty(
@@ -1996,6 +1998,7 @@ def update_sliding_window_buffer(
     token_to_kv_pool=None,
     window_kv_indices=None,
     skip_full_to_swa_translation=False,
+    include_current_token=False,
 ):
     """Fill window KV buffers for sliding-window attention.
 
@@ -2010,10 +2013,25 @@ def update_sliding_window_buffer(
     ``init_forward_metadata_out_graph``, BEFORE ``graph.replay()``), which reads
     the live v2p and rewrites the static window buffer to swa-physical in place;
     baseline SWA leaves it False (eager).
+
+    ``include_current_token=True`` gathers ``sliding_window_size + 1`` tokens
+    instead of ``sliding_window_size``. ``sliding_window_size`` is stored as
+    ``config.sliding_window - 1`` (a radius), and the window is two-side
+    inclusive: a query at position ``p`` attends keys ``[p - sliding_window_size,
+    p]``, i.e. ``sliding_window_size + 1`` of them. The decode path passes this
+    because its kernel consumes the gathered window verbatim with no per-query
+    masking, so the buffer must already hold the exact window (this matches
+    FlashInfer's ``min(seq_lens, sliding_window_size + 1)`` and FlashAttention's
+    two-side-inclusive window). The extend / target-verify paths leave it False:
+    their kernels re-apply the window mask per query, so gathering the radius of
+    prior context tokens is correct there and a wider gather would be wrong.
     """
+    window_cap = (
+        sliding_window_size + 1 if include_current_token else sliding_window_size
+    )
     window_kv_lens = torch.minimum(
         seq_lens,
-        torch.tensor(sliding_window_size),
+        torch.tensor(window_cap),
     )
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
