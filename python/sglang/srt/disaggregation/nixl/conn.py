@@ -995,7 +995,7 @@ class NixlKVManager(CommonKVManager):
                 else self._num_slots_src
             )
 
-            if self.kv_args.kv_layer_ids and peer_info.dst_kv_layer_ids:
+            if self.kv_args.kv_layer_ids or peer_info.dst_kv_layer_ids:
                 pairs = build_state_entry_pairs(
                     self.kv_args.kv_layer_ids,
                     peer_info.dst_kv_layer_ids,
@@ -1791,7 +1791,7 @@ class NixlKVManager(CommonKVManager):
 
         notif_tag = (
             f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
-            f"_{self.kv_args.engine_rank}_{chunk_idx}"
+            f"_{self.transfer_source_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
         handle = self.send_kvcache_staged(

@@ -862,9 +862,19 @@ def build_state_entry_pairs(
     n_dst: int,
 ) -> List[Tuple[int, int]]:
     """Pair prefill-local transfer entries with decode entries by layer id."""
-    if src_layer_ids and dst_layer_ids:
-        # Layer ids repeat once per state tensor (tensor-major x layer flatten),
-        # so pair the k-th occurrence on each side rather than a plain id lookup.
+    if bool(src_layer_ids) != bool(dst_layer_ids):
+        raise RuntimeError(
+            "Layer metadata must be provided by both PD peers or neither"
+        )
+    if src_layer_ids:
+        if len(src_layer_ids) != n_src or len(dst_layer_ids) != n_dst:
+            raise RuntimeError(
+                "Layer metadata length must match transfer entries: "
+                f"src metadata={len(src_layer_ids)} entries={n_src}, "
+                f"dst metadata={len(dst_layer_ids)} entries={n_dst}"
+            )
+        # Layer ids can repeat across tensor groups (for example K/V or multiple
+        # state tensors), so pair occurrences in order rather than by plain lookup.
         dst_pos = {}
         for j, lid in enumerate(dst_layer_ids):
             dst_pos.setdefault(lid, deque()).append(j)
@@ -872,7 +882,7 @@ def build_state_entry_pairs(
         for i, lid in enumerate(src_layer_ids):
             if not dst_pos.get(lid):
                 raise RuntimeError(
-                    f"Decode peer is missing mamba state for model layer {lid}"
+                    f"Decode peer is missing a transfer entry for model layer {lid}"
                 )
             pairs.append((i, dst_pos[lid].popleft()))
         return pairs

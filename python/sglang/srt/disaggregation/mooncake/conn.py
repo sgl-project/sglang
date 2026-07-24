@@ -627,7 +627,7 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
-            if src_layer_ids and dst_layer_ids:
+            if src_layer_ids or dst_layer_ids:
                 pairs = build_state_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
