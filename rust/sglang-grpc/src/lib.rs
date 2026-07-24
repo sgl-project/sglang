@@ -53,10 +53,10 @@ struct TokenizerInfo {
 /// fall back to Python tokenization.
 fn try_get_attr(
     py: Python<'_>,
-    obj: &PyObject,
+    obj: &Py<PyAny>,
     attr: &'static str,
     context: &'static str,
-) -> Option<PyObject> {
+) -> Option<Py<PyAny>> {
     obj.getattr(py, attr).map(Some).unwrap_or_else(|err| {
         tracing::debug!("{}.{} is unavailable: {}", context, attr, err);
         None
@@ -65,7 +65,7 @@ fn try_get_attr(
 
 fn try_get_attr_str(
     py: Python<'_>,
-    obj: &PyObject,
+    obj: &Py<PyAny>,
     attr: &'static str,
     context: &'static str,
 ) -> Option<String> {
@@ -79,7 +79,7 @@ fn try_get_attr_str(
 
 fn try_get_attr_i32(
     py: Python<'_>,
-    obj: &PyObject,
+    obj: &Py<PyAny>,
     attr: &'static str,
     context: &'static str,
 ) -> Option<i32> {
@@ -91,8 +91,8 @@ fn try_get_attr_i32(
     })
 }
 
-fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> {
-    Python::with_gil(|py| {
+fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo> {
+    Python::attach(|py| {
         let tm = runtime_handle
             .getattr(py, "tokenizer_manager")
             .map_err(|err| {
@@ -152,7 +152,7 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> 
 fn start_server(
     host: String,
     port: u16,
-    runtime_handle: PyObject,
+    runtime_handle: Py<PyAny>,
     worker_threads: usize,
     response_channel_capacity: usize,
     response_timeout_secs: u64,

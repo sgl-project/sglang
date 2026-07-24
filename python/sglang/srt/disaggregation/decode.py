@@ -1260,6 +1260,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if (
+                self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
+                and decode_req.kv_receiver.require_staging
+            ):
+                # Register before send_metadata, which triggers the STAGING_REQ
+                # prefetch (dropped for an unregistered room); tiny race, correct order.
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1270,14 +1280,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
-                )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1751,13 +1753,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        if self.enable_staging:
-            for dr in decode_reqs:
-                if (
-                    hasattr(dr.kv_receiver, "require_staging")
-                    and dr.kv_receiver.require_staging
-                ):
-                    self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
