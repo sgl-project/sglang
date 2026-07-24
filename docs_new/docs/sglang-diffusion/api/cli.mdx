@@ -95,6 +95,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image)
+- `--original-dtype {auto|bfloat16}`: Original data type of model, `auto` will use original published weights. Use other options if the data type of weights differs from the original one and weights do not have a quantization config.
 
 ### Sampling and output
 
