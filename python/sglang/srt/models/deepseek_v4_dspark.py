@@ -30,7 +30,7 @@ from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
-    _dequant_fp8_wo_a,
+    _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -758,9 +758,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
