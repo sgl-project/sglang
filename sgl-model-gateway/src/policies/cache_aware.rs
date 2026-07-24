@@ -328,7 +328,7 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
+            .min_by_key(|&&idx| (workers[idx].load(), workers[idx].processed_requests(), idx))
             .copied()?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
@@ -438,10 +438,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
+                // Low cache match: use worker with minimum load, then smallest
+                // approximate tree size so cold traffic does not always pick the
+                // first equally idle worker.
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .min_by_key(|&&idx| {
+                        (workers[idx].load(), workers[idx].processed_requests(), idx)
+                    })
                     .copied()
             };
 
