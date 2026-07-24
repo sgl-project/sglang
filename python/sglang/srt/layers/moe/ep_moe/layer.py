@@ -60,62 +60,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 logger = logging.getLogger(__name__)
 
 
-def _a2a_moe_forward_eager(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    router_logits: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    """Run the whole a2a MoE (dispatch -> experts -> combine) eagerly
-    between BCG segments, for any model using an a2a dispatcher.
-
-    The prefill graph runner pins is_extend_in_batch=False so MoE captured
-    inside a graph resolves to the capture-safe low-latency a2a mode
-    (required by PCG, which captures the MoE). This block is never captured
-    under BCG - it re-runs on every replay - so NORMAL mode is legal here
-    (its host-synchronizing dispatch happens between segments) and is the
-    bandwidth-efficient transport for prefill-sized payloads.
-
-    Mutates ``output`` (allocated by the caller inside the captured region,
-    i.e. graph-pool storage the pool reuses across shapes) and returns None,
-    so eager_on_graph retains no per-shape bridge tensor for this break.
-    """
-    saved_is_extend_in_batch = get_is_extend_in_batch()
-    set_is_extend_in_batch(True)
-    try:
-        output.copy_(
-            moe_layer.forward_impl(
-                hidden_states,
-                StandardTopKOutput(topk_weights, topk_ids, router_logits),
-            )
-        )
-    finally:
-        set_is_extend_in_batch(saved_is_extend_in_batch)
-
-
-def _a2a_moe_forward_capture_stub(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    router_logits: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    # Capture-pass stand-in: zero the bridge buffer instead of running the
-    # real dispatch -> experts -> combine. The capture pass discards break
-    # outputs (only the buffer address is recorded), while the real body
-    # performs a rank-coupled NORMAL a2a whose per-break rendezvous during
-    # capture amplifies rank jitter and risks DeepEP's 100s CPU timeout.
-    output.zero_()
-
-
-bcg_a2a_moe_forward = eager_on_graph(True, capture_stub=_a2a_moe_forward_capture_stub)(
-    _a2a_moe_forward_eager
-)
-
-
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -225,6 +169,46 @@ class DeepEPMoE(FusedMoE):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
 
+    def _a2a_forward_with_output_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Runs eagerly between BCG segments at every replay. Scope
+        # is_extend_in_batch=True so a2a resolves NORMAL (capture pins
+        # False for PCG). Mutate caller-allocated output: the next
+        # segment reads its recorded address.
+        saved_is_extend_in_batch = get_is_extend_in_batch()
+        set_is_extend_in_batch(True)
+        try:
+            output.copy_(
+                self.forward_impl(
+                    hidden_states,
+                    StandardTopKOutput(topk_weights, topk_ids, router_logits),
+                )
+            )
+        finally:
+            set_is_extend_in_batch(saved_is_extend_in_batch)
+
+    def _a2a_forward_capture_stub(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Capture pass only: record the buffer address, skip the
+        # rank-coupled a2a. Warmup and replay run the real body.
+        output.zero_()
+
+    a2a_forward_with_output = eager_on_graph(
+        True, capture_stub=_a2a_forward_capture_stub
+    )(_a2a_forward_with_output_impl)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -235,8 +219,7 @@ class DeepEPMoE(FusedMoE):
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
             output = torch.empty_like(hidden_states)
-            bcg_a2a_moe_forward(
-                self,
+            self.a2a_forward_with_output(
                 hidden_states,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
