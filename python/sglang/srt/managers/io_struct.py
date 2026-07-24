@@ -38,6 +38,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Tuple,
     Type,
     Union,
 )
@@ -208,6 +209,11 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Return prompt top logprobs as flat arrays plus shape metadata instead of
+    # the nested per-position [logprob, token_id, text] lists.
+    return_flat_raw_top_logprobs: bool = False
+    # Base64-encode the flat arrays. Requires return_flat_raw_top_logprobs.
+    return_flat_raw_top_logprobs_b64: bool = False
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -368,6 +374,22 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
+            )
+        if (
+            self.return_flat_raw_top_logprobs
+            and self.multi_item_delimiter_indices is not None
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs does not support multi-item "
+                "scoring: delimiter-sparse top logprob rows have no contiguous "
+                "position mapping."
+            )
+        if (
+            self.return_flat_raw_top_logprobs_b64
+            and not self.return_flat_raw_top_logprobs
+        ):
+            raise ValueError(
+                "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
 
     def _determine_batch_size(self):
@@ -724,6 +746,8 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+            return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
             return_hidden_states=(
@@ -808,6 +832,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     stream: bool
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
+    # Assemble prompt top logprobs as flat arrays scheduler-side (see
+    # GenerateReqInput.return_flat_raw_top_logprobs). The b64 flag stays
+    # tokenizer-manager-side: the scheduler ships arrays either way.
+    return_flat_raw_top_logprobs: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1206,6 +1234,39 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
+def build_flat_input_top_logprobs_arrays(
+    input_top_logprobs_val: List[Optional[List[float]]],
+    input_top_logprobs_idx: List[Optional[List[int]]],
+    top_logprobs_num: int,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Convert nested per-position prompt top logprob rows into the flat
+    arrays of the `return_flat_raw_top_logprobs` response format.
+
+    Returns (float32 values [rows, k], int32 token ids [rows, k],
+    null_prefix). The leading null rows are counted into null_prefix and
+    excluded from the arrays. Raises ValueError when the rows are not
+    representable by (shape, null_prefix): interior nulls or ragged k,
+    e.g. multi-item scoring.
+    """
+    num_rows = len(input_top_logprobs_val)
+    null_prefix = 0
+    while null_prefix < num_rows and not input_top_logprobs_val[null_prefix]:
+        null_prefix += 1
+    val_rows = input_top_logprobs_val[null_prefix:]
+    idx_rows = input_top_logprobs_idx[null_prefix:]
+    k = len(val_rows[0]) if val_rows else top_logprobs_num
+    for offset, row in enumerate(val_rows):
+        if row is None or len(row) != k:
+            raise ValueError(
+                "return_flat_raw_top_logprobs requires rectangular top logprob "
+                f"rows with nulls only in the leading prefix; row {null_prefix + offset} "
+                f"has {None if row is None else len(row)} entries (expected {k})."
+            )
+    val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
+    idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
+    return val_arr, idx_arr, null_prefix
+
+
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1296,6 +1357,15 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
+    # Scheduler-side flat assembly of prompt top logprobs for requests with
+    # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
+    # leading-null count (see build_flat_input_top_logprobs_arrays). For such
+    # requests the nested input_top_logprobs_val/idx entry is empty. None when
+    # no request in the batch uses the flat format.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1377,6 +1447,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
+    # Detokenizer pass-through for the scheduler-side flat prompt top logprob
+    # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.
+    input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
+    input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

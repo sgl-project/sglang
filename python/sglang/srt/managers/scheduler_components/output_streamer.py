@@ -299,6 +299,12 @@ class _GenerationStreamAccumulator:
     output_token_logprobs_idx: Optional[list] = None
     input_top_logprobs_val: Optional[list] = None
     input_top_logprobs_idx: Optional[list] = None
+    # Per-request flat prompt top logprob arrays (return_flat_raw_top_logprobs);
+    # None entries for requests on the nested format.
+    input_top_logprobs_val_flat: Optional[list] = None
+    input_top_logprobs_idx_flat: Optional[list] = None
+    input_top_logprobs_flat_null_prefix: Optional[list] = None
+    has_input_top_logprobs_flat: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
@@ -323,6 +329,9 @@ class _GenerationStreamAccumulator:
             self.output_token_logprobs_idx = []
             self.input_top_logprobs_val = []
             self.input_top_logprobs_idx = []
+            self.input_top_logprobs_val_flat = []
+            self.input_top_logprobs_idx_flat = []
+            self.input_top_logprobs_flat_null_prefix = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
@@ -441,6 +450,17 @@ class _GenerationStreamAccumulator:
                 )
                 self.input_top_logprobs_val.append(req.logprob.input_top_logprobs_val)
                 self.input_top_logprobs_idx.append(req.logprob.input_top_logprobs_idx)
+                self.input_top_logprobs_val_flat.append(
+                    req.logprob.input_top_logprobs_val_flat
+                )
+                self.input_top_logprobs_idx_flat.append(
+                    req.logprob.input_top_logprobs_idx_flat
+                )
+                self.input_top_logprobs_flat_null_prefix.append(
+                    req.logprob.input_top_logprobs_flat_null_prefix
+                )
+                if req.logprob.input_top_logprobs_val_flat is not None:
+                    self.has_input_top_logprobs_flat = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -453,6 +473,9 @@ class _GenerationStreamAccumulator:
                 self.input_token_logprobs_idx.append([])
                 self.input_top_logprobs_val.append([])
                 self.input_top_logprobs_idx.append([])
+                self.input_top_logprobs_val_flat.append(None)
+                self.input_top_logprobs_idx_flat.append(None)
+                self.input_top_logprobs_flat_null_prefix.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
@@ -590,6 +613,23 @@ class _GenerationStreamAccumulator:
             output_token_logprobs_idx=self.output_token_logprobs_idx,
             input_top_logprobs_val=self.input_top_logprobs_val,
             input_top_logprobs_idx=self.input_top_logprobs_idx,
+            # None on the common path so the wire payload is unchanged when no
+            # request in the batch uses the flat format.
+            input_top_logprobs_val_flat=(
+                self.input_top_logprobs_val_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_idx_flat=(
+                self.input_top_logprobs_idx_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_flat_null_prefix=(
+                self.input_top_logprobs_flat_null_prefix
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
             output_top_logprobs_val=self.output_top_logprobs_val,
             output_top_logprobs_idx=self.output_top_logprobs_idx,
             input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
