@@ -96,6 +96,7 @@ struct BridgeState {
 struct ActiveChannel {
     incarnation: u64,
     sender: Sender<ResponseChunk>,
+    metadata_mode: ResponseMetadataMode,
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +186,11 @@ impl PyBridge {
     // Channel + callback helpers
     // ------------------------------------------------------------------
 
-    fn create_channel(&self, rid: &str) -> PyResult<SubmittedRequest> {
+    fn create_channel(
+        &self,
+        rid: &str,
+        metadata_mode: ResponseMetadataMode,
+    ) -> PyResult<SubmittedRequest> {
         let (sender, receiver) = mpsc::channel(self.response_channel_capacity);
         let mut state = lock_or_recover(self.state.as_ref(), "state");
         if state.abort_all_in_progress {
@@ -208,6 +213,7 @@ impl PyBridge {
             ActiveChannel {
                 incarnation: key.incarnation,
                 sender,
+                metadata_mode,
             },
         );
         Ok(SubmittedRequest { key, receiver })
@@ -256,7 +262,7 @@ impl PyBridge {
         req_dict: HashMap<String, serde_json::Value>,
         metadata_mode: ResponseMetadataMode,
     ) -> PyResult<SubmittedRequest> {
-        let submitted = self.create_channel(rid)?;
+        let submitted = self.create_channel(rid, metadata_mode)?;
 
         let result = Python::attach(|py| -> PyResult<()> {
             let py_req_dict = json_map_to_pydict(py, &req_dict)?;
@@ -330,14 +336,7 @@ impl PyBridge {
 
         let mut state = lock_or_recover(self.state.as_ref(), "state");
         for key in &keys {
-            if remove_channel_refs_locked(&mut state, key) {
-                state.terminal_errors.insert(
-                    key.clone(),
-                    TerminalError::Aborted {
-                        rid: key.rid.clone(),
-                    },
-                );
-            }
+            finalize_explicit_abort_locked(&mut state, key);
         }
         if abort_all {
             state.abort_all_in_progress = false;
@@ -437,7 +436,7 @@ impl PyBridge {
         F: for<'py> FnOnce(Python<'py>, &Py<PyAny>, Py<PyAny>) -> PyResult<()>,
     {
         // Closure args are: current Python token, RuntimeHandle, and the JSON chunk callback.
-        let submitted = self.create_channel(rid)?;
+        let submitted = self.create_channel(rid, ResponseMetadataMode::LegacyStringMap)?;
 
         let result = Python::attach(|py| -> PyResult<()> {
             let callback = self.make_json_callback(py, submitted.key.clone())?;
@@ -598,6 +597,24 @@ fn remove_channel_refs_locked(state: &mut BridgeState, key: &RequestKey) -> bool
     }
     remove_auxiliary_refs_locked(state, key);
     is_active
+}
+
+fn finalize_explicit_abort_locked(state: &mut BridgeState, key: &RequestKey) {
+    let expects_typed_terminals = state.channels.get(key.rid()).is_some_and(|channel| {
+        channel.incarnation == key.incarnation
+            && channel.metadata_mode == ResponseMetadataMode::TypedGenerate
+    });
+    if expects_typed_terminals {
+        return;
+    }
+    if remove_channel_refs_locked(state, key) {
+        state.terminal_errors.insert(
+            key.clone(),
+            TerminalError::Aborted {
+                rid: key.rid.clone(),
+            },
+        );
+    }
 }
 
 fn remove_channel_refs(key: &RequestKey, state: &BridgeStateRef) {
