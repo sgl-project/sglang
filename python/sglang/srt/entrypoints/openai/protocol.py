@@ -342,6 +342,7 @@ class CompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -426,12 +427,18 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -460,12 +467,18 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -746,6 +759,7 @@ class ChatCompletionRequest(BaseModel):
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
+    return_token_ids: bool = False
     return_meta_info: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
@@ -1056,6 +1070,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
+    token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -1065,6 +1080,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data

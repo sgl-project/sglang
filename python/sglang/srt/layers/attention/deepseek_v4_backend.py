@@ -18,13 +18,13 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
+from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -32,6 +32,11 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildBlockSeqLensCausal,
+    BuildDsparkSwaPageIndices,
+    ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -55,11 +60,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.kernels.dspark_attn_metadata import (
-    BuildBlockSeqLensCausal,
-    BuildDsparkSwaPageIndices,
-    ComputeDsparkWindowGather,
-)
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
