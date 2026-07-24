@@ -811,8 +811,8 @@ class SchedulerPPMixin:
             good_reqs, failed_reqs = (
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
                     return_failed_reqs=True,
-                    rids_to_check=good_consensus_bootstrapped_rids
-                    + bad_consensus_bootstrapped_rids,
+                    pp_good_rids=good_consensus_bootstrapped_rids,
+                    pp_bad_rids=bad_consensus_bootstrapped_rids,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -1417,8 +1417,8 @@ class SchedulerPPMixin:
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
             good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                rids_to_check=good_consensus_prealloc_rids
-                + bad_consensus_prealloc_rids,
+                pp_good_rids=good_consensus_prealloc_rids,
+                pp_bad_rids=bad_consensus_prealloc_rids,
             )
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [

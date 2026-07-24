@@ -5,7 +5,16 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -32,6 +41,24 @@ if TYPE_CHECKING:
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
