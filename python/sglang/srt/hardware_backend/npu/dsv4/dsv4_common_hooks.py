@@ -13,13 +13,9 @@ these hooks then:
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
 
-TODO: the disagg DSV4 path bypasses these hooks — it calls
-``allocator.alloc_extend`` directly then ``req_to_token_pool.write`` without
-going through ``mem_cache/common.py`` (see ``disaggregation/decode.py``). The
-DSV4OutCacheLoc bundle is still produced but never written into the per-req
-tables, so disagg + DSV4 is unsupported here (c-pages leak). Fixing requires
-calling these hooks from disagg's per-req alloc loop, or moving the write
-into the allocator itself.
+The disagg per-req prealloc path does not build a ``ScheduleBatch`` and so
+bypasses the batch hook; it writes the same tables via
+``write_dsv4_prealloc_tables`` (driven by ``dsv4_unwrap_prealloc``).
 """
 
 from __future__ import annotations
@@ -95,11 +91,15 @@ def maybe_write_dsv4_extend(
     # offsets for the pre-reserved interval.
     if c4_state_alloc_offsets is None:
         c4_state_alloc_offsets = [
-            getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs
+            getattr(r, "c4_state_write_offset", getattr(r, "c4_state_alloc_offset", 0))
+            for r in batch.reqs
         ]
     if c128_state_alloc_offsets is None:
         c128_state_alloc_offsets = [
-            getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs
+            getattr(
+                r, "c128_state_write_offset", getattr(r, "c128_state_alloc_offset", 0)
+            )
+            for r in batch.reqs
         ]
     if bundle.out_c4_state_loc is not None and hasattr(
         req_to_token_pool, "write_c4_state"
@@ -119,6 +119,182 @@ def maybe_write_dsv4_extend(
             req_pool_indices_cpu,
             c128_state_alloc_offsets,
             seq_lens_cpu,
+            bundle.out_c128_state_loc,
+        )
+
+
+def dsv4_state_payloads(
+    req_to_token_pool,
+    req_pool_idx: int,
+    seq_len: int,
+    page_size: int,
+    window_size: int,
+    *,
+    prefix_len: int = 0,
+):
+    """Per-StateType PD-payload builders for DSV4-on-NPU.
+
+    For chunked prefill, intermediate chunks can leave old C4/C128 state pages in
+    the req table. PD only needs the final active tail state; scanning the whole
+    prompt span would transfer stale state pages and can perturb decode accuracy.
+    """
+    if not hasattr(req_to_token_pool, "req_to_token_c4"):
+        return {}
+
+    import numpy as np
+
+    from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+    seq_len = max(0, int(seq_len))
+    prefix_len = max(0, min(int(prefix_len), seq_len))
+
+    def empty_pages():
+        return np.empty((0,), dtype=np.int32)
+
+    def pages(table, lo: int, hi: int, *, drop_zero_pages: bool = False):
+        if hi <= lo:
+            return empty_pages()
+
+        lo = max(0, int(lo))
+        hi = max(lo, int(hi))
+        page_lo = (lo // page_size) * page_size
+        page_hi = ((hi + page_size - 1) // page_size) * page_size
+        if page_hi <= page_lo:
+            return empty_pages()
+
+        slots = table[req_pool_idx, page_lo:page_hi:page_size].cpu().numpy()
+        if slots.size == 0:
+            return empty_pages()
+
+        page_indices = (slots // page_size).astype(np.int32)
+        if drop_zero_pages:
+            page_indices = page_indices[page_indices > 0]
+        return page_indices
+
+    def state_tail_range(compress_ratio: int):
+        tail_len = seq_len % 128
+        if compress_ratio == 4:
+            state_len = tail_len + 128 if tail_len <= 3 and seq_len >= 128 else tail_len
+        elif compress_ratio == 128:
+            state_len = tail_len
+        else:
+            raise ValueError(f"Unsupported DSV4 state compress ratio: {compress_ratio}")
+
+        if state_len == 0:
+            return None
+
+        start = max(prefix_len, seq_len - state_len)
+        if start >= seq_len:
+            return None
+        return start, seq_len
+
+    def state_pages(table, compress_ratio: int):
+        state_range = state_tail_range(compress_ratio)
+        if state_range is None:
+            return empty_pages()
+        lo, hi = state_range
+        return pages(table, lo, hi, drop_zero_pages=True)
+
+    if window_size is None or window_size <= 0:
+        window_start = prefix_len
+    else:
+        window_start = max(prefix_len, seq_len - window_size)
+    window_start = (window_start // page_size) * page_size
+
+    # DSV4_INDEXER shares the c4 slot space (written at the c4 loc).
+    return {
+        AscendStateType.DSV4_SWA: lambda: pages(
+            req_to_token_pool.req_to_token_swa,
+            window_start,
+            seq_len,
+            drop_zero_pages=True,
+        ),
+        AscendStateType.DSV4_C4: lambda: pages(
+            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+        ),
+        AscendStateType.DSV4_C128: lambda: pages(
+            req_to_token_pool.req_to_token_c128, prefix_len // 128, seq_len // 128
+        ),
+        AscendStateType.DSV4_INDEXER: lambda: pages(
+            req_to_token_pool.req_to_token_c4, prefix_len // 4, seq_len // 4
+        ),
+        AscendStateType.DSV4_C4_STATE: lambda: state_pages(
+            req_to_token_pool.req_to_token_c4_state, 4
+        ),
+        AscendStateType.DSV4_C128_STATE: lambda: state_pages(
+            req_to_token_pool.req_to_token_c128_state, 128
+        ),
+    }
+
+
+def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
+    """Extra ``alloc_extend(_swa_tail)`` kwargs for the DSV4 allocator; ``{}`` for
+    non-DSV4 so callers can splat it unconditionally."""
+    if not hasattr(allocator, "c4_attn_allocator"):
+        return {}
+    return dict(
+        req_pool_indices=torch.tensor(
+            [req.req_pool_idx], dtype=torch.int64, device=device
+        ),
+        dsv4_state_lens=allocator.compute_dsv4_state_lens_extend(
+            [req], [fill_len], [0]
+        ),
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
+def dsv4_unwrap_prealloc(kv_loc, req_to_token_pool, req, prefix_len, fill_len):
+    """Unwrap a DSV4OutCacheLoc bundle to its full-pool loc and write the five
+    per-req tables; a plain tensor (non-DSV4) passes through unchanged."""
+    if kv_loc is None or not hasattr(kv_loc, "out_full_loc"):
+        return kv_loc
+    write_dsv4_prealloc_tables(req_to_token_pool, req, prefix_len, fill_len, kv_loc)
+    return kv_loc.out_full_loc
+
+
+def write_dsv4_prealloc_tables(
+    req_to_token_pool,
+    req: Req,
+    prefix_len: int,
+    fill_len: int,
+    bundle,
+) -> None:
+    """Write the five DSV4 per-req tables for one request on the disagg-decode
+    prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
+    if bundle is None or not hasattr(req_to_token_pool, "write_c4"):
+        return
+    rp = torch.tensor([req.req_pool_idx])
+    pl = torch.tensor([prefix_len])
+    sl = torch.tensor([fill_len])
+
+    _write_per_req_slice(
+        req_to_token_pool.write_swa, rp, pl, sl, bundle.out_swa_loc, ratio=1
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c4, rp, pl, sl, bundle.out_c4_loc, ratio=4
+    )
+    _write_per_req_slice(
+        req_to_token_pool.write_c128, rp, pl, sl, bundle.out_c128_loc, ratio=128
+    )
+
+    if bundle.out_c4_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c4_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c4_state,
+            rp,
+            [getattr(req, "c4_state_alloc_offset", 0)],
+            sl,
+            bundle.out_c4_state_loc,
+        )
+    if bundle.out_c128_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c128_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c128_state,
+            rp,
+            [getattr(req, "c128_state_alloc_offset", 0)],
+            sl,
             bundle.out_c128_state_loc,
         )
 
@@ -400,5 +576,7 @@ def _free_state_range(
     if state_allocator is None or not hasattr(pool, table_attr) or watermark <= offset:
         return
     free_slots = getattr(pool, table_attr)[req.req_pool_idx, offset:watermark]
-    state_allocator.free(free_slots.to(torch.int64))
+    free_slots = free_slots[free_slots > 0]
+    if free_slots.numel() > 0:
+        state_allocator.free(free_slots.to(torch.int64))
     setattr(req, offset_attr, watermark)

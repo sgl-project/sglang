@@ -682,7 +682,12 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        if _is_npu and is_deepseek_v4(self.model_config.hf_config):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
+                DSV4NPUDecodeReqToTokenPool as DecodeReqToTokenPool,
+            )
+        else:
+            from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 
         req_to_token_pool = DecodeReqToTokenPool(
             size=max_num_reqs,

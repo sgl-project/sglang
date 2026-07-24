@@ -684,11 +684,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens_cpu[:bs].int()
+            seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1).to(self.device)
-            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            start_exp = starts.unsqueeze(1)
+            seq_exp = seq_lens_int.unsqueeze(1)
             mask = (indices.unsqueeze(0) < start_exp) | (
                 indices.unsqueeze(0) >= seq_exp
             )
