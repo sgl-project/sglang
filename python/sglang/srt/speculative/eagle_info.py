@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -211,44 +210,21 @@ class EagleDraftInput(SpecInput):
     def filter_batch(
         self,
         new_indices: torch.Tensor,
-        has_been_filtered: bool = True,
         new_indices_cpu: Optional[List[int]] = None,
     ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
 
-        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
-
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            if self.draft_probs is not None:
-                self.draft_probs = self.draft_probs[: len(new_indices)]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
-            if self.dsa_topk_indices is not None:
-                self.dsa_topk_indices = self.dsa_topk_indices[: len(new_indices)]
-        else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            if self.draft_probs is not None:
-                self.draft_probs = self.draft_probs[new_indices]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[new_indices]
-            self.bonus_tokens = self.bonus_tokens[new_indices]
-            if self.dsa_topk_indices is not None:
-                self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
+        self.topk_p = self.topk_p[new_indices]
+        self.topk_index = self.topk_index[new_indices]
+        if self.draft_probs is not None:
+            self.draft_probs = self.draft_probs[new_indices]
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
+        if self.dsa_topk_indices is not None:
+            self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
