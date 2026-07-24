@@ -926,6 +926,14 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    enable_dense_fp8: A[
+        bool,
+        "[AMD/aiter] Quantize eligible large bf16 dense projections that the "
+        "checkpoint leaves unquantized (e.g. quark MXFP4 shared_expert.down_proj) to "
+        "online w8a8 FP8, and fuse their SiluAndMul + per-token activation quant into "
+        "a single aiter kernel. Requires SGLANG_USE_AITER and "
+        "SGLANG_USE_AITER_FP8_PER_TOKEN. Default off.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
