@@ -48,14 +48,24 @@ have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/conte
 Currently SGLang XPU only supports installation from source. Please refer to ["Getting Started on Intel GPU"](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) to install XPU dependency.
 
 ```bash Command
+# Install curl
+apt install -y curl
+
+# Install Rust (non-interactive)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Make cargo available in the current shell
+source "$HOME/.cargo/env"
+
+# Install protobuf compiler
+apt install -y protobuf-compiler
+
 # Create and activate a conda environment
 conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.12.0+xpu torchao==0.17.0+xpu torchvision==0.27.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
-pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
-pip3 install apache-tvm-ffi # xgrammar requires apache-tvm-ffi
+pip3 install torch==2.13.0+xpu torchao==0.17.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+pip3 install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
