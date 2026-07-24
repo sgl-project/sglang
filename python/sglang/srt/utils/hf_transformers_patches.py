@@ -23,8 +23,9 @@ all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
 import inspect
+import logging
 
-from sglang.srt.utils import logger
+logger = logging.getLogger(__name__)
 
 _applied = False
 
