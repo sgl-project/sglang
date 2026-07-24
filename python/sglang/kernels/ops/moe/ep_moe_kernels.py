@@ -1544,9 +1544,28 @@ def standard_contig_all_tokens_upper_bound(
     max_routed_slots: int,
     num_local_experts: int,
     block_e: int = 128,
+    top_k: int | None = None,
+    num_fused_shared_experts: int = 0,
 ) -> int:
     if max_routed_slots <= 0 or num_local_experts <= 0:
         return 0
+
+    if num_fused_shared_experts:
+        # Every token hits every fused shared expert, so reserve those dense
+        # rows separately instead of treating them as arbitrary routed slots.
+        assert top_k is not None
+        assert 0 < num_fused_shared_experts <= min(top_k, num_local_experts)
+        num_tokens, remainder = divmod(max_routed_slots, top_k)
+        assert remainder == 0
+        routed_bound = standard_contig_all_tokens_upper_bound(
+            num_tokens * (top_k - num_fused_shared_experts),
+            num_local_experts - num_fused_shared_experts,
+            block_e,
+        )
+        shared_bound = (
+            num_fused_shared_experts * ceil_div(num_tokens, block_e) * block_e
+        )
+        return routed_bound + shared_bound
 
     first_blocks = min(max_routed_slots, num_local_experts)
     extra_blocks = (max_routed_slots - first_blocks) // block_e

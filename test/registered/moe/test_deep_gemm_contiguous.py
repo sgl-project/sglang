@@ -7,6 +7,9 @@ import pytest
 import torch
 
 import sglang.srt.layers.moe.moe_runner.deep_gemm as deep_gemm_runner
+from sglang.kernels.ops.moe.ep_moe_kernels import (
+    standard_contig_all_tokens_upper_bound,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -43,6 +46,32 @@ def test_standard_contiguous_layout_requires_pure_tp():
         assert not _should_use_standard_contiguous_layout(
             MoeRunnerConfig(moe_ep_size=2)
         )
+
+
+@pytest.mark.parametrize(
+    "tokens,top_k,experts,shared,block_e,expected",
+    [
+        (1, 5, 129, 1, 128, 640),
+        (32, 5, 129, 1, 128, 16512),
+        (33, 5, 129, 1, 128, 16512),
+        (128, 5, 129, 1, 128, 16896),
+        (129, 5, 129, 1, 128, 17024),
+        (16, 6, 130, 2, 128, 8448),
+    ],
+)
+def test_standard_contig_shared_expert_upper_bound(
+    tokens, top_k, experts, shared, block_e, expected
+):
+    assert (
+        standard_contig_all_tokens_upper_bound(
+            tokens * top_k,
+            experts,
+            block_e,
+            top_k=top_k,
+            num_fused_shared_experts=shared,
+        )
+        == expected
+    )
 
 
 def _make_packed_scale(

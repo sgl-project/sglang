@@ -844,6 +844,8 @@ def _pre_permute_standard_to_deep_gemm_contig(
             topk_ids.numel(),
             num_local_experts,
             block_e=block_e,
+            top_k=runner_config.top_k,
+            num_fused_shared_experts=runner_config.num_fused_shared_experts or 0,
         )
     else:
         all_tokens = int(all_tokens_t.item())
