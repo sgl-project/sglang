@@ -1192,7 +1192,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
-        if batch.forward_mode.is_extend():
+        # Under PP + DP attention, a rank with no local requests must still run
+        # in lockstep with the DP peers that are prefilling. On a global prefill
+        # step (some peer is extending, so the dp-attn all-gather sets
+        # is_extend_in_batch) the idle batch has to follow the *prefill* path so
+        # every DP rank emits the same MoE cross-DP collective sequence (target
+        # forward + a single draft_extend). Falling into the verify path below
+        # would add speculative_num_steps extra draft-decode collectives on the
+        # idle rank and desync the MoE all-gather -> hang. _draft_extend_for_prefill
+        # already short-circuits its input_ids build for idle batches.
+        run_as_prefill = batch.forward_mode.is_extend() or (
+            self._pp_enabled
+            and batch.forward_mode.is_idle()
+            and batch.is_extend_in_batch
+        )
+        if run_as_prefill:
             # Target prefill. Only the last PP rank needs to capture hidden
             # states for the draft; non-last ranks relay upstream without capture.
             if not self._pp_enabled or self._pp_is_last_rank:
