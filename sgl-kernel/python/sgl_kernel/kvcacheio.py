@@ -192,6 +192,19 @@ def transfer_kv_direct(
     )
 
 
+def transfer_embedding_ranges_direct(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_starts: List[int],
+    dst_starts: List[int],
+    lengths: List[int],
+) -> None:
+    """Copy embedding ranges between host and CUDA tensors."""
+    torch.ops.sgl_kernel.transfer_embedding_ranges_direct.default(
+        src, dst, src_starts, dst_starts, lengths
+    )
+
+
 def transfer_kv_per_layer_direct_pf_lf(
     src_ptrs: List[torch.Tensor],
     dst_ptrs: List[torch.Tensor],
