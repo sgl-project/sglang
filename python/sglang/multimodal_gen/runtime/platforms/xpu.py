@@ -103,23 +103,9 @@ class XpuPlatform(Platform):
         if empty_cache:
             torch.xpu.empty_cache()
 
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(device_id)
-            used_memory = float(torch.xpu.memory_allocated(device_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(device_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(device_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(device_id)
+        total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
         if distributed:
             import torch.distributed as dist
