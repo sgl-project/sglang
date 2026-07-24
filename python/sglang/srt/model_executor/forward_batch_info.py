@@ -1394,11 +1394,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.lora_ids is not None:
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
-        from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
-
         seq_len_fill_value = (
             model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
-            if isinstance(model_runner.attn_backend, IntelAMXAttnBackend)
+            if _is_cpu
             else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
