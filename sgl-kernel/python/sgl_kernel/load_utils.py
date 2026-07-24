@@ -98,6 +98,24 @@ def _load_architecture_specific_ops():
             spec.loader.exec_module(common_ops)
             logger.debug(f"[sgl_kernel] ✓ Successfully loaded {variant_name}")
             logger.debug(f"[sgl_kernel] ✓ Module file: {common_ops.__file__}")
+            try:
+                # Try to load CPU kernels to facilitate cooperation from CUDA+CPU hetero architectures
+                cpu_kernel_pattern = str(
+                    Path(__file__).parent.parent / "sgl_kernel_cpu" / "common_ops.*"
+                )
+                cpu_kernel_path = Path(
+                    _filter_compiled_extensions(glob.glob(cpu_kernel_pattern))[0]
+                )
+                spec = importlib.util.spec_from_file_location(
+                    "common_ops", str(cpu_kernel_path)
+                )
+                common_ops_cpu = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(common_ops_cpu)
+                logger.info(
+                    f"[sgl_kernel] ✓ CPU kernels loaded in addition to CUDA kernels."
+                )
+            except Exception as e:
+                logger.debug(f"[sgl_kernel] CPU kernels are not available.")
             return common_ops
 
         except Exception as e:
