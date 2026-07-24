@@ -14,7 +14,13 @@ pub fn env_bool(name: &str, default: bool) -> bool {
     })
 }
 
-/// Python `EnvInt.parse`: any `int()`-parsable string.
+/// Deliberately restricted unsigned parser — NOT Python `int()` semantics.
+/// Accepts only what `u64::from_str` does: ASCII digits with an optional
+/// leading `+`, up to `u64::MAX`. Inputs Python's `EnvInt` would accept —
+/// surrounding whitespace (`" 45 "`), digit-group underscores (`"4_5"`),
+/// negatives, values above `u64::MAX`, non-ASCII digits — warn and fall back
+/// to the default, like any other invalid value. Callers are counts/sizes, so
+/// strictness over parity is intentional here.
 pub fn env_u64(name: &str, default: u64) -> u64 {
     read(name, default, |raw| raw.parse().ok())
 }
@@ -66,13 +72,30 @@ mod tests {
         assert!(!env_bool("SGLANG_TEST_ENV_BOOL_UNSET", false));
     }
 
-    /// `env_u64`: parsable → value, unset/invalid → default.
+    /// `env_u64`: strict `u64::from_str` grammar; everything else — including
+    /// int()-valid inputs the doc calls out as deliberately rejected — → default.
     #[test]
     fn env_u64_parses_or_defaults() {
-        unsafe { std::env::set_var("SGLANG_TEST_ENV_U64_OK", "45") };
-        assert_eq!(env_u64("SGLANG_TEST_ENV_U64_OK", 20), 45);
-        unsafe { std::env::set_var("SGLANG_TEST_ENV_U64_BAD", "20s") };
-        assert_eq!(env_u64("SGLANG_TEST_ENV_U64_BAD", 20), 20);
+        for (i, (raw, want)) in [
+            ("45", 45),
+            ("+45", 45), // u64::from_str allows a leading `+`
+            // Invalid → default.
+            ("20s", 20),
+            ("", 20),
+            // int()-valid but deliberately rejected → default.
+            (" 45 ", 20),
+            ("4_5", 20),
+            ("-1", 20),
+            ("18446744073709551616", 20), // u64::MAX + 1
+            ("١٢", 20),                   // non-ASCII digits
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("SGLANG_TEST_ENV_U64_{i}");
+            unsafe { std::env::set_var(&name, raw) };
+            assert_eq!(env_u64(&name, 20), want, "value {raw:?}");
+        }
         assert_eq!(env_u64("SGLANG_TEST_ENV_U64_UNSET", 20), 20);
     }
 }
