@@ -39,7 +39,12 @@ if _is_npu:
     import torch_npu
 
 if _is_xpu:
-    from sgl_kernel import multimodal_rotary_embedding
+    try:
+        from sgl_kernel import multimodal_rotary_embedding
+    except ImportError:
+        # Optional on older/CUDA sgl_kernel builds; forward_xpu() falls back to
+        # forward_native when None.
+        multimodal_rotary_embedding = None
 
 from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
 from sglang.srt.runtime_context import get_server_args
@@ -101,19 +106,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-        # MRoPE axis_map interleaving pattern depends on mrope_section sizes.
-        # The algorithm cycles through axes [0(T), 1(H), 2(W)] round-robin,
-        # skipping any axis that has exhausted its allocated pairs.
-        #
-        # For GLM-V (mrope_section=[8,12,12]):
-        #   T(8) < H(12) = W(12), so T exhausts first at pair 24.
-        #   Result: [0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 1,1,2, 1,1,2, 2,2]
-        #   After T runs out, only H and W fill the remaining slots.
-        #
-        # For Qwen3-VL (mrope_section=[24,20,20]):
-        #   T(24) > H(20) = W(20), so H and W exhaust first near the tail.
-        #   Result: [0,1,2, 0,1,2, ...repeated evenly..., 0,1, 0,1, 0,0]
-        #   After H/W run out, T fills the remaining slots.
+        # Interleave axes T/H/W round-robin, dropping any axis once it exhausts its mrope_section pairs.
 
         if self.mrope_interleaved_glm:
             num_pairs = rotary_dim // 2
@@ -303,8 +296,11 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
-        self._match_cos_sin_cache_dtype(query)
-        if positions.ndim == 2 and self.mrope_section:
+        if (
+            multimodal_rotary_embedding is not None
+            and positions.ndim == 2
+            and self.mrope_section
+        ):
             multimodal_rotary_embedding(
                 query,
                 key,

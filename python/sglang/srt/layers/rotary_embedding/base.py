@@ -61,9 +61,8 @@ if _is_npu:
     except ImportError:
         fused_rope_qk_mqa = None
         logger.warning(
-            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
-            "falling back to the generic rope implementation. Upgrade "
-            "sgl_kernel_npu to enable the fused kernel."
+            "fused_rope_qk_mqa unavailable; using generic rope. "
+            "Upgrade sgl_kernel_npu to enable the fused kernel."
         )
 
 if _is_hip:
@@ -72,7 +71,15 @@ if _is_hip:
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    try:
+        from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        # Optional on older/CUDA sgl_kernel builds; forward_xpu() handles None.
+        fused_qk_rope_with_cos_sin_cache_inplace = None
+        logger.warning(
+            "fused_qk_rope_with_cos_sin_cache_inplace unavailable; using generic "
+            "rope on XPU. Upgrade sgl_kernel to enable the fused XPU kernel."
+        )
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -148,10 +155,8 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
-        # NOTE(woosuk): To exactly match the HF implementation, we need to
-        # use CPU to compute the cache and then move it to GPU. However, we
-        # create the cache on GPU for faster initialization. This may cause
-        # a slight numerical difference between the HF implementation and ours.
+        # NOTE(woosuk): Computing the cache on GPU is faster but differs slightly
+        # from HF numerically; use CPU for an exact match.
         init_device = (
             "cpu" if get_server_args().rl_on_policy_target is not None else None
         )
@@ -311,9 +316,7 @@ class RotaryEmbedding(MultiPlatformOp):
             rotary_mode = "interleave"
 
         mrope_section = [0, 0, 0]
-        # The npu_mrope kernel only supports 1D or 2D tensors for query and key.
-        # Therefore, when their dimensions exceed 2D, we flatten query and key to 2D tensors before computation
-        # and reshape their original shapes afterward.
+        # npu_mrope only accepts 2D query/key, so flatten to 2D and restore shape after.
         query_shape = query.shape
         key_shape = key.shape
         query = query.reshape(query.shape[0], -1)
@@ -454,8 +457,11 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._match_cos_sin_cache_dtype(query)
 
-        # Fused_qk_rope only supports aligned head_size
-        if self.head_size in [128, 256, 512]:
+        # Fused path needs the sgl_kernel XPU kernel and an aligned head_size.
+        if (
+            fused_qk_rope_with_cos_sin_cache_inplace is not None
+            and self.head_size in [128, 256, 512]
+        ):
             num_tokens = positions.size(0)
             q_rope = query.view(num_tokens, -1, self.head_size)
             k_rope = key.view(num_tokens, -1, self.head_size)
@@ -538,10 +544,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         # Each offset corresponds to the same index in scaling_factors.
         offsets: List[int] = []
         for scaling_factor in self.scaling_factors:
-            # NOTE(woosuk): self.max_position_embeddings is the original
-            # maximum length before applying the rope scaling.
-            # Thus, the maximum length after applying the rope scaling is
-            # self.max_position_embeddings * self.scaling_factor.
+            # NOTE(woosuk): max_position_embeddings is the pre-scaling length, so the scaled length is max_position_embeddings * scaling_factor.
             max_len = self.max_position_embeddings * scaling_factor
             t = torch.arange(max_len, dtype=torch.float)
             t = t / scaling_factor

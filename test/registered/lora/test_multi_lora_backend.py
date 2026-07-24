@@ -16,7 +16,11 @@ import multiprocessing as mp
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
@@ -27,6 +31,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=99, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=120, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestMultiLoRABackend(CustomTestCase):
