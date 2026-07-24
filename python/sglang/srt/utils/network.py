@@ -3,10 +3,11 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import random
 import socket
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Set, Tuple, Union
 
 import psutil
 import zmq
@@ -187,10 +188,36 @@ def is_port_available(port):
         return False
 
 
-def get_free_port():
-    sock = try_bind_socket()
-    port = sock.getsockname()[1]
-    sock.close()
+_allocated_free_ports: Set[int] = set()
+
+
+FREE_PORT_RANGE = (20000, 30000)
+
+
+def get_free_port(avoid: Optional[Set[int]] = None) -> int:
+    full_avoid = (
+        _allocated_free_ports if avoid is None else (_allocated_free_ports | avoid)
+    )
+    lo, hi = FREE_PORT_RANGE
+    start = random.randrange(lo, hi)
+    for i in range(hi - lo):
+        port = lo + (start - lo + i) % (hi - lo)
+        if port in full_avoid:
+            continue
+        try:
+            sock = try_bind_socket(port=port)
+        except OSError:
+            continue
+        sock.close()
+        _allocated_free_ports.add(port)
+        return port
+    for _ in range(100):
+        sock = try_bind_socket()
+        port = sock.getsockname()[1]
+        sock.close()
+        if port not in full_avoid:
+            break
+    _allocated_free_ports.add(port)
     return port
 
 

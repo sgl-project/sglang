@@ -8861,6 +8861,18 @@ class PortArgs:
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
+
+            derived_ports = {
+                dist_init_port,
+                port_base,
+                detokenizer_port,
+                rpc_port,
+                metrics_port,
+                port_base + 4,
+                load_collector_port,
+            }
+            if server_args.nccl_port is None and nccl_port in derived_ports:
+                nccl_port = get_free_port(avoid=derived_ports)
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
