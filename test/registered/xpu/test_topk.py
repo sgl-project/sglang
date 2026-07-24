@@ -1,7 +1,8 @@
-from typing import Optional
 import unittest
+from typing import Optional
 
 import torch
+
 torch.use_deterministic_algorithms(True)
 
 from sglang.srt.layers.moe.topk import (
@@ -34,6 +35,7 @@ def _scatter_by_expert(
     dense.scatter_(1, indices.long(), weights.float())
     return dense
 
+
 def assert_equal(
     score: torch.Tensor,
     indices_ref: torch.Tensor,
@@ -65,6 +67,7 @@ def assert_equal(
                     f"{bs=}, {k=}, {seq_len=}, {i=}, {more=}, {less=} failed, with {more_values=}, {less_values=}"
                 )
         assert wrong_values <= max_permit_error, f"{wrong_values=}, {max_permit_error=}"
+
 
 # Nemotron-3 uses biased_grouped_topk
 class TestBiasedGroupedTopK(CustomTestCase):
