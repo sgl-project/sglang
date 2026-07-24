@@ -478,6 +478,17 @@ class MlxModelRunner:
                 f"MLX SwiGLU activation fusion enabled: patched {n_patched} blocks"
             )
 
+        # Optional: fuse the MoE combine (sum_k y[..,k,h] * scores[..,k]) into
+        # one Metal kernel. Activated by SGLANG_MLX_FUSE_MOE_COMBINE=1.
+        # See: python/sglang/srt/hardware_backend/mlx/moe/fused_combine.py
+        if envs.SGLANG_MLX_FUSE_MOE_COMBINE.get():
+            from sglang.srt.hardware_backend.mlx.moe.fused_combine import (
+                patch_moe_combine_with_fused,
+            )
+
+            n_patched = patch_moe_combine_with_fused(self.model)
+            logger.info(f"MLX MoE combine fusion enabled: patched {n_patched} blocks")
+
     def _attention_module_for_layer(self, layer_idx: int) -> Any:
         attn = getattr(
             self._cache_layout.layers[layer_idx],

@@ -1,7 +1,5 @@
 """Path B fusion for SwitchGLU: gate gather_qmv with silu(gate) * x_up epilogue.
 
-Why this exists
----------------
 The existing `FusedSwitchUpGate` (fused_switch_glu.py) concatenates up_proj
 and gate_proj weights along the output dim and runs one gather_qmm. That saves
 one kernel launch per layer but doubles the matmul's output dim, which pushes
@@ -28,13 +26,12 @@ K=12 interleaved trials on Qwen3-30B-A3B-4bit: on minus off 0.4%, a quarter of
 the noise band), so v1 lands off by default as a correct fusion substrate, not
 a measured speedup.
 
-Scope of v1
------------
-Targets the configuration shared by Qwen3-30B-A3B-4bit and Qwen1.5-MoE-A2.7B-4bit:
+Scope of v1 targets the configuration shared by Qwen3-30B-A3B-4bit and
+Qwen1.5-MoE-A2.7B-4bit:
 - bits=4, mode='affine', group_size=64
 - K (input_dim) divisible by 512  (Qwen3: 2048, Qwen1.5: 2048)
 - N (output_dim) divisible by 8   (Qwen3: 768, Qwen1.5: 1408)
-- Scales/biases dtype matches the input dtype (bf16 or fp16)
+- Scales/biases dtype matches the input dtype; see `_DTYPES`
 
 Anything outside that falls back to the unfused mlx_lm path.
 
@@ -49,6 +46,9 @@ import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from sglang.srt.hardware_backend.mlx import metal_jit
+from sglang.srt.hardware_backend.mlx.metal_jit import NotFusable
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,10 @@ _RESULTS_PER_SIMDGROUP = 4
 _VALUES_PER_THREAD = _PACK_FACTOR * _PACKS_PER_THREAD  # 16
 _BLOCK_SIZE = _VALUES_PER_THREAD * _SIMD_SIZE  # 512
 _ROWS_PER_TG = _NUM_SIMDGROUPS * _RESULTS_PER_SIMDGROUP  # 8
+
+# Scope of v1 (see module docstring): scales/biases dtype matches the input
+# dtype, bf16 or fp16.
+_DTYPES = (mx.float16, mx.bfloat16)
 
 
 # Metal source for the fused kernel.
@@ -197,34 +201,163 @@ _KERNEL_SOURCE = r"""
 """
 
 
-# Build kernel lazily so import-time on non-MLX systems doesn't fail.
-_kernel_cache: dict = {}
+@metal_jit.kernel(
+    name="affine_gather_qmv_silu_mul_4bit_gs64",
+    name_template="affine_gather_qmv_silu_mul_4bit_gs64_{0}",
+    input_names=["x", "w", "s", "b", "idx", "x_up"],
+    output_names=["y"],
+)
+class FusedGateQmvSiluMulKernel(metal_jit.MetalJitOp):
+    """Registered op for the Path B gate fusion; owns the guards and geometry."""
 
-# AOT pre-compile cache: tracks which (dtype, K, N, T) tuples have been warmed.
-# MLX specializes the Metal kernel on template args at first dispatch, so the
-# first call per unique tuple pays a ~3ms compile cost. Pre-warming at patch
-# time moves that cost out of the first forward pass.
-_aot_warmed: set = set()
+    source = _KERNEL_SOURCE
 
+    def _check_eligibility(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+    ) -> None:
+        """Regime checks shared by dispatch_fused (pre-flight) and
+        dispatch_fallback (the diagnostic path _fused_gate_or_fallback catches).
+        """
+        K = gate_s.shape[-1] * _GROUP_SIZE
+        N = gate_w.shape[-2]
+        if K % _BLOCK_SIZE != 0:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
+                f"Use the unfused path."
+            )
+        if N % _ROWS_PER_TG != 0:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
+            )
+        if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
+                f"s={gate_s.dtype} b={gate_b.dtype}"
+            )
+        if x.dtype not in _DTYPES:
+            raise NotFusable(
+                f"fused_gate_qmv_silu_mul: dtype {x.dtype} not in {_DTYPES}."
+            )
 
-def _get_kernel(dtype: mx.Dtype):
-    """Return a compiled mx.fast.metal_kernel for the given input dtype.
+    def dispatch_fused(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+        indices: mx.array,
+        x_up: mx.array,
+    ) -> mx.array:
+        """Compute ``silu(gather_qmm(x, W_gate)) * x_up`` in one kernel.
 
-    Kept per-dtype because mx.fast.metal_kernel specializes on template args
-    at first call, and we want clean separation between fp16 / bf16 variants.
-    """
-    if dtype not in _kernel_cache:
-        # Strip the `mlx.core.` prefix and any dots from the dtype repr so the
-        # kernel name is a valid C identifier (Metal's host_name attribute and
-        # function-name slot don't accept '.').
-        dtype_tag = str(dtype).replace("mlx.core.", "").replace(".", "_")
-        _kernel_cache[dtype] = mx.fast.metal_kernel(
-            name=f"affine_gather_qmv_silu_mul_4bit_gs64_{dtype_tag}",
-            input_names=["x", "w", "s", "b", "idx", "x_up"],
-            output_names=["y"],
-            source=_KERNEL_SOURCE,
+        Shapes:
+            x       : (..., 1, 1, K)               input activations (pre-gather)
+            gate_w  : (E, N, K // PACK_FACTOR)     packed 4-bit weights
+            gate_s  : (E, N, K // GROUP_SIZE)      affine scales
+            gate_b  : (E, N, K // GROUP_SIZE)      affine biases
+            indices : (..., T)                     expert per (token, topk) pair
+            x_up    : (..., T, 1, N)               pre-computed up output
+            y       : (..., T, 1, N)               returned
+
+        Numerical contract: equivalent within floating point tolerance to::
+
+            x_gate = mx.gather_qmm(x, gate_w, gate_s, gate_b, rhs_indices=indices,
+                                   transpose=True, group_size=GROUP_SIZE, bits=BITS,
+                                   mode='affine')
+            y = nn.silu(x_gate) * x_up
+
+        up to floating-point ordering of accumulations (which matches MLX's own
+        qmv_fast_impl exactly).
+        """
+        self._check_eligibility(x, gate_w, gate_s, gate_b)
+        K = gate_s.shape[-1] * _GROUP_SIZE
+        N = gate_w.shape[-2]
+
+        # Shape handling: x always has K as its last axis. M_tok is the number of
+        # distinct pre-gather tokens (= x.size // K). T is the top_k axis carried
+        # by `indices`. In the unsorted SwitchGLU path x has shape (B, 1, 1, K) and
+        # indices is (B, T); in the sorted path x has shape (B*T, 1, K) and
+        # indices is (B*T, 1) after our reshape. Either way: M_tok * T == idx.size
+        # and M_tok * K == x.size.
+        assert x.shape[-1] == K, f"x last dim {x.shape[-1]} != K={K}"
+        M_tok = x.size // K
+        T = indices.shape[-1]
+        assert (
+            M_tok * T == indices.size
+        ), f"M_tok({M_tok}) * T({T}) != indices.size({indices.size})"
+        x_flat = x.reshape(M_tok, K)
+        idx_flat = indices.reshape(M_tok * T)
+        if idx_flat.dtype != mx.uint32:
+            idx_flat = idx_flat.astype(mx.uint32)
+
+        # x_up has N as its last axis and total size M_tok * T * N. The singleton
+        # rank dims (1 or 2 of them) get folded away by reshape.
+        assert (
+            x_up.shape[-1] == N and x_up.size == M_tok * T * N
+        ), f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
+        x_up_flat = x_up.reshape(M_tok * T, N)
+
+        kernel = metal_jit.get("affine_gather_qmv_silu_mul_4bit_gs64", x.dtype)
+        (y_flat,) = kernel(
+            inputs=[x_flat, gate_w, gate_s, gate_b, idx_flat, x_up_flat],
+            template=[
+                ("T", x.dtype),
+                ("IN_VEC_SIZE", K),
+                ("OUT_VEC_SIZE", N),
+                ("TOP_K", T),
+            ],
+            # grid is in *threads*, not threadgroups: total threads = product of
+            # (grid_x, grid_y, grid_z). One threadgroup processes one (mt, row_block).
+            # Threadgroup is 64 = 2 simdgroups × 32 lanes.
+            grid=(M_tok * T * 64, N // _ROWS_PER_TG, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(M_tok * T, N)],
+            output_dtypes=[x.dtype],
         )
-    return _kernel_cache[dtype]
+
+        # Reshape to x_up's shape, which is exactly what self.activation(x_up,
+        # x_gate) would have returned (silu*mul is shape-preserving).
+        return y_flat.reshape(x_up.shape)
+
+    def dispatch_fallback(
+        self,
+        x: mx.array,
+        gate_w: mx.array,
+        gate_s: mx.array,
+        gate_b: mx.array,
+        indices: mx.array,
+        x_up: mx.array,
+    ):
+        """Always raise; this op has no in-op reference path.
+
+        The unfused gate path needs the gate module and the sorted flag,
+        neither of which the op receives; _fused_gate_or_fallback catches
+        this NotFusable and runs it. Re-raises the regime diagnostic when
+        the inputs are themselves ineligible; otherwise dispatch_fused's
+        NotFusable came from something eligibility cannot see (e.g. a
+        Metal compile failure), so raise the "unavailable" diagnostic
+        instead of falling off the end and returning None.
+        """
+        self._check_eligibility(x, gate_w, gate_s, gate_b)
+        raise NotFusable(
+            "fused_gate_qmv_silu_mul: eligible inputs but fused path "
+            "unavailable (kernel compile failed); falling back"
+        )
+
+    def warmup_specs(self, model) -> list[metal_jit.WarmupSpec]:
+        """One spec per dtype this op's affine gs64 regime accepts.
+
+        Shapes are left empty: K and N are not derivable from ``model``
+        without introspection no existing code in this backend performs.
+        """
+        return [metal_jit.WarmupSpec(dtypes=(dtype,)) for dtype in _DTYPES]
+
+
+_OP = FusedGateQmvSiluMulKernel()
 
 
 def fused_gate_qmv_silu_mul(
@@ -235,104 +368,22 @@ def fused_gate_qmv_silu_mul(
     indices: mx.array,
     x_up: mx.array,
 ) -> mx.array:
-    """Compute ``silu(gather_qmm(x, W_gate)) * x_up`` in one kernel.
+    """Path B gate fusion entry point used by the patched forwards.
 
-    Shapes:
-        x       : (..., 1, 1, K)               input activations (pre-gather)
-        gate_w  : (E, N, K // PACK_FACTOR)     packed 4-bit weights
-        gate_s  : (E, N, K // GROUP_SIZE)      affine scales
-        gate_b  : (E, N, K // GROUP_SIZE)      affine biases
-        indices : (..., T)                     expert per (token, topk) pair
-        x_up    : (..., T, 1, N)               pre-computed up output
-        y       : (..., T, 1, N)               returned
-
-    Numerical contract: equivalent within floating point tolerance to::
-
-        x_gate = mx.gather_qmm(x, gate_w, gate_s, gate_b, rhs_indices=indices,
-                               transpose=True, group_size=GROUP_SIZE, bits=BITS,
-                               mode='affine')
-        y = nn.silu(x_gate) * x_up
-
-    up to floating-point ordering of accumulations (which matches MLX's own
-    qmv_fast_impl exactly).
+    Thin wrapper over the registered op; see FusedGateQmvSiluMulKernel.dispatch
+    for shapes, the numerical contract, and the regime guards.
     """
-    # Validate the regime this kernel supports. Outside it, the caller should
-    # fall back to the unfused MLX path.
-    K = gate_s.shape[-1] * _GROUP_SIZE
-    N = gate_w.shape[-2]
-    if K % _BLOCK_SIZE != 0:
-        raise ValueError(
-            f"fused_gate_qmv_silu_mul: K={K} not divisible by {_BLOCK_SIZE}. "
-            f"Use the unfused path."
-        )
-    if N % _ROWS_PER_TG != 0:
-        raise ValueError(
-            f"fused_gate_qmv_silu_mul: N={N} not divisible by {_ROWS_PER_TG}."
-        )
-    # Sanity: scales/biases dtype must match x dtype for in-kernel float() conversion.
-    if gate_s.dtype != x.dtype or gate_b.dtype != x.dtype:
-        raise ValueError(
-            f"fused_gate_qmv_silu_mul: dtype mismatch x={x.dtype} "
-            f"s={gate_s.dtype} b={gate_b.dtype}"
-        )
-
-    # Shape handling: x always has K as its last axis. M_tok is the number of
-    # distinct pre-gather tokens (= x.size // K). T is the top_k axis carried
-    # by `indices`. In the unsorted SwitchGLU path x has shape (B, 1, 1, K) and
-    # indices is (B, T); in the sorted path x has shape (B*T, 1, K) and
-    # indices is (B*T, 1) after our reshape. Either way: M_tok * T == idx.size
-    # and M_tok * K == x.size.
-    assert x.shape[-1] == K, f"x last dim {x.shape[-1]} != K={K}"
-    M_tok = x.size // K
-    T = indices.shape[-1]
-    assert (
-        M_tok * T == indices.size
-    ), f"M_tok({M_tok}) * T({T}) != indices.size({indices.size})"
-    x_flat = x.reshape(M_tok, K)
-    idx_flat = indices.reshape(M_tok * T)
-    if idx_flat.dtype != mx.uint32:
-        idx_flat = idx_flat.astype(mx.uint32)
-
-    # x_up has N as its last axis and total size M_tok * T * N. The singleton
-    # rank dims (1 or 2 of them) get folded away by reshape.
-    assert (
-        x_up.shape[-1] == N and x_up.size == M_tok * T * N
-    ), f"x_up shape {x_up.shape} does not match M_tok({M_tok})*T({T})*N({N})"
-    x_up_flat = x_up.reshape(M_tok * T, N)
-
-    kernel = _get_kernel(x.dtype)
-    (y_flat,) = kernel(
-        inputs=[x_flat, gate_w, gate_s, gate_b, idx_flat, x_up_flat],
-        template=[
-            ("T", x.dtype),
-            ("IN_VEC_SIZE", K),
-            ("OUT_VEC_SIZE", N),
-            ("TOP_K", T),
-        ],
-        # grid is in *threads*, not threadgroups: total threads = product of
-        # (grid_x, grid_y, grid_z). One threadgroup processes one (mt, row_block).
-        # Threadgroup is 64 = 2 simdgroups × 32 lanes.
-        grid=(M_tok * T * 64, N // _ROWS_PER_TG, 1),
-        threadgroup=(64, 1, 1),
-        output_shapes=[(M_tok * T, N)],
-        output_dtypes=[x.dtype],
-    )
-
-    # Reshape to x_up's shape, which is exactly what self.activation(x_up,
-    # x_gate) would have returned (silu*mul is shape-preserving).
-    return y_flat.reshape(x_up.shape)
+    return _OP.dispatch(x, gate_w, gate_s, gate_b, indices, x_up)
 
 
 def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
     """Pre-compile the fused kernel for the (dtype, K, N, T) tuples this
     layer will dispatch at runtime.
 
-    MLX's mx.fast.metal_kernel specializes Metal source on template args
-    at first dispatch (one Metal compile per unique tuple, ~3ms each).
-    Issuing one dummy dispatch per shape moves that compile out of the
-    first forward pass and into model init. The module-level _aot_warmed
-    set means only the first layer per shape actually compiles; the
-    remaining 47 hit the cache and no-op.
+    MLX specializes Metal source on template args at first dispatch (~3ms
+    per unique tuple). One dummy dispatch per shape moves that compile into
+    model init; MetalJitKernel.warm_once dedupes across layers, so only the
+    first layer per shape actually compiles.
 
     Warms both the unsorted decode shape (T=top_k) and the sorted
     large-batch shape (T=1) used by the gather-sort path.
@@ -342,30 +393,46 @@ def _aot_warm_kernel(switch_mlp, top_k: int) -> None:
     N = gate.weight.shape[-2]
     dtype = gate.scales.dtype
     for T in (top_k, 1):
-        key = (dtype, K, N, T)
-        if key in _aot_warmed:
+
+        def _dispatch(T=T):
+            x_dummy = mx.zeros((1, 1, 1, K), dtype=dtype)
+            idx_dummy = mx.zeros((1, T), dtype=mx.uint32)
+            x_up_dummy = mx.zeros((1, T, 1, N), dtype=dtype)
+            return fused_gate_qmv_silu_mul(
+                x_dummy,
+                gate["weight"],
+                gate["scales"],
+                gate.get("biases"),
+                idx_dummy,
+                x_up_dummy,
+            )
+
+        try:
+            warmed = metal_jit.warm_once(
+                "affine_gather_qmv_silu_mul_4bit_gs64", (dtype, K, N, T), _dispatch
+            )
+        except NotFusable as e:
+            # can_fuse already validated K/N before the patch loop reaches
+            # here, so this is the dtype membership check: skip the warm for
+            # out-of-regime dtypes and let the runtime path fall back.
+            logger.debug(
+                "Path B AOT: skipping warm for dtype=%s K=%d N=%d T=%d (%s); "
+                "out of regime, runtime falls back.",
+                dtype,
+                K,
+                N,
+                T,
+                e,
+            )
             continue
-        M_tok = 1
-        x_dummy = mx.zeros((M_tok, 1, 1, K), dtype=dtype)
-        idx_dummy = mx.zeros((M_tok, T), dtype=mx.uint32)
-        x_up_dummy = mx.zeros((M_tok, T, 1, N), dtype=dtype)
-        out = fused_gate_qmv_silu_mul(
-            x_dummy,
-            gate["weight"],
-            gate["scales"],
-            gate.get("biases"),
-            idx_dummy,
-            x_up_dummy,
-        )
-        mx.eval(out)
-        _aot_warmed.add(key)
-        logger.info(
-            "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
-            dtype,
-            K,
-            N,
-            T,
-        )
+        if warmed:
+            logger.info(
+                "Path B AOT: warmed fused kernel dtype=%s K=%d N=%d T=%d",
+                dtype,
+                K,
+                N,
+                T,
+            )
 
 
 def can_fuse(switch_mlp) -> bool:
@@ -440,7 +507,7 @@ _fallback_warned = False
 
 
 def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
-    """silu(gate_qmv(x)) * x_up via the fused kernel; on ValueError fall back to
+    """silu(gate_qmv(x)) * x_up via the fused kernel; on NotFusable fall back to
     the unfused gate projection. gather_qmm tolerates the activation dtype the
     fused kernel rejects, which can_fuse cannot pre-check at patch time. Warns
     once.
@@ -456,7 +523,7 @@ def _fused_gate_or_fallback(gate_proj, x, idx, x_up, sorted_indices=False):
     gb = gate_proj.get("biases")
     try:
         return fused_gate_qmv_silu_mul(x, gw, gs, gb, gate_idx, x_up)
-    except ValueError as e:
+    except NotFusable as e:
         global _fallback_warned
         if not _fallback_warned:
             logger.warning(
