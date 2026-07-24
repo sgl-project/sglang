@@ -455,14 +455,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
             return prefix_len
 
-        compression_ratios = getattr(self.token_to_kv_pool, "compression_ratios", [])
+        compression_ratios = self.token_to_kv_pool.compression_ratios
         max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
         page_size = self.token_to_kv_pool_allocator.page_size
         alignment = math.lcm(page_size, max_compression_ratio)
         return (prefix_len // alignment) * alignment
 
     def _dsv4_singleflight_min_prefix_len(self) -> int:
-        compression_ratios = getattr(self.token_to_kv_pool, "compression_ratios", [])
+        compression_ratios = self.token_to_kv_pool.compression_ratios
         max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
         alignment = math.lcm(
             self.token_to_kv_pool_allocator.page_size, max_compression_ratio
