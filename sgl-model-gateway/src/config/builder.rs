@@ -126,6 +126,14 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn lmetric_policy(mut self, eviction_interval_secs: u64, max_tree_size: usize) -> Self {
+        self.config.policy = PolicyConfig::LMetric {
+            eviction_interval_secs,
+            max_tree_size,
+        };
+        self
+    }
+
     pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
             load_check_interval_secs,
@@ -861,6 +869,26 @@ mod tests {
                 assert!((cache_threshold - 0.8).abs() < 0.0001);
             }
             _ => panic!("Expected CacheAware policy"),
+        }
+    }
+
+    #[test]
+    fn test_builder_lmetric_policy() {
+        let config = RouterConfigBuilder::new()
+            .regular_mode(vec!["http://worker1:8000".to_string()])
+            .lmetric_policy(300, 1000)
+            .build()
+            .unwrap();
+
+        match config.policy {
+            PolicyConfig::LMetric {
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                assert_eq!(eviction_interval_secs, 300);
+                assert_eq!(max_tree_size, 1000);
+            }
+            _ => panic!("Expected LMetric policy"),
         }
     }
 }
