@@ -1,13 +1,11 @@
 import asyncio
 import concurrent.futures
-import contextlib
 import ctypes
 import logging
 import os
 import pickle
 import time
 import traceback
-from collections import defaultdict
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -40,8 +38,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     async_sock_recv,
-    sock_send,
-    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
@@ -237,7 +233,7 @@ class MMEncoder:
         self.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         self.rank = rank
-        # DP rank for metric labels; overridden by run_dp_worker in DP mode.
+        # DP rank for metric labels; overridden by encoder_runtime.run_dp_worker.
         # 0 in the single-instance (non-DP) path.
         self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
@@ -1853,233 +1849,6 @@ class EncoderProfiler:
         return True, None
 
 
-class PendingRequest:
-    __slots__ = ("request", "future", "submit_time")
-
-    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
-        self.request = request
-        self.future: asyncio.Future = loop.create_future()
-        self.submit_time = time.time()
-
-
-# VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
-# vary per request and can't merge into one HF processor call.
-_BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
-
-
-class EncoderScheduler:
-    """Aggregate concurrent /encode requests into bounded image/audio batches."""
-
-    def __init__(
-        self,
-        encoder: "MMEncoder",
-        send_sockets: List[zmq.Socket],
-        max_batch_size: int,
-        request_timeout: float = ENCODER_REQ_TIMEOUT,
-    ):
-        self.encoder = encoder
-        self.send_sockets = send_sockets
-        self.max_batch_size = max(1, int(max_batch_size))
-        self.request_timeout = max(1.0, float(request_timeout))
-        self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
-        self._worker_task: Optional[asyncio.Task] = None
-
-    def start(self) -> None:
-        if self._worker_task is None:
-            self._worker_task = asyncio.create_task(self._batch_worker())
-            logger.info(
-                f"EncoderScheduler started with max_batch_size={self.max_batch_size}"
-            )
-
-    async def stop(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._worker_task
-            self._worker_task = None
-        # Reject any requests still queued so their HTTP handlers don't hang.
-        while True:
-            try:
-                pending = self.pending_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if not pending.future.done():
-                pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
-
-    async def submit(self, request: dict) -> Tuple:
-        pending = PendingRequest(request, asyncio.get_running_loop())
-        await self.pending_queue.put(pending)
-        try:
-            return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
-        except asyncio.TimeoutError:
-            if not pending.future.done():
-                pending.future.cancel()
-            req_id = request.get("req_id")
-            logger.error(
-                f"EncoderScheduler.submit timed out after {self.request_timeout}s "
-                f"for req_id={req_id}"
-            )
-            raise
-
-    async def _collect_batch(self) -> List[PendingRequest]:
-        batch = [await self.pending_queue.get()]
-        while len(batch) < self.max_batch_size:
-            try:
-                batch.append(self.pending_queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        return batch
-
-    async def _batch_worker(self) -> None:
-        while True:
-            batch: List[PendingRequest] = []
-            try:
-                batch = await self._collect_batch()
-                groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
-                for p in batch:
-                    groups[
-                        Modality.from_str(p.request.get("modality", "image"))
-                    ].append(p)
-                for modality, group in groups.items():
-                    await self._dispatch_group(group, modality)
-            except asyncio.CancelledError:
-                for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(RuntimeError("EncoderScheduler stopped"))
-                raise
-            except Exception as e:
-                logger.error(
-                    f"Error in EncoderScheduler batch worker: {e}", exc_info=True
-                )
-                for p in batch:
-                    if not p.future.done():
-                        p.future.set_exception(e)
-
-    @staticmethod
-    def _validate_request_shape(req: dict) -> Optional[str]:
-        # Cheap pre-broadcast checks: shape errors that don't require running
-        # the HF processor. Once a request reaches TP workers they enter
-        # batch_encode and expect to join its collectives — a malformed batch
-        # that makes rank-0 bail mid-flight would deadlock the workers.
-        if not isinstance(req, dict):
-            return f"request is not a dict: {type(req).__name__}"
-        if not req.get("req_id"):
-            return "missing req_id"
-        if not req.get("mm_items"):
-            return "missing or empty mm_items"
-        if "num_parts" not in req or "part_idx" not in req:
-            return "missing num_parts / part_idx"
-        h = req.get("hashes")
-        if h is not None and not isinstance(h, (list, tuple, str, int, bytes)):
-            return f"hashes must be list/scalar, got {type(h).__name__}"
-        return None
-
-    async def _dispatch_group(
-        self, group: List[PendingRequest], modality: Modality
-    ) -> None:
-        # Video can't fuse (per-video preprocess kwargs vary).
-        if modality not in _BATCHABLE_MODALITIES:
-            await self._dispatch_per_request(group, modality)
-            return
-
-        # Drop structurally-bad requests before broadcasting; otherwise TP
-        # workers would join batch_encode collectives that rank-0 has already
-        # abandoned.
-        valid: List[PendingRequest] = []
-        for p in group:
-            err = self._validate_request_shape(p.request)
-            if err is None:
-                valid.append(p)
-                continue
-            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
-            if not p.future.done():
-                p.future.set_exception(BadRequestError(err))
-        if not valid:
-            return
-        group = valid
-
-        requests = [p.request for p in group]
-        start = time.time()
-        modality_str = modality.name.lower()
-        if encoder_metrics_collector is not None:
-            for p in group:
-                encoder_metrics_collector.observe_queue_wait(
-                    max(0.0, start - p.submit_time), modality=modality_str
-                )
-        for sock in self.send_sockets:
-            sock_send(
-                sock,
-                wrap_as_pickle(
-                    {
-                        "type": "batch_encode",
-                        "modality": modality.name,
-                        "requests": requests,
-                        "enter_time": start,
-                    }
-                ),
-            )
-
-        logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
-
-        try:
-            results = await self.encoder.batch_encode(requests, modality)
-            if len(group) > 1:
-                logger.info(
-                    f"Batch of {len(group)} {modality.name} requests completed in "
-                    f"{(time.time() - start) * 1000:.1f}ms"
-                )
-        except Exception as e:
-            # batch_encode normally catches and returns errors via _batch_set_error.
-            # If it raised, rank-0 may have skipped a collective broadcast, leaving
-            # TP workers stuck. Don't try to recover — fail every pending future
-            # and let the client retry. Re-broadcasting would risk a deadlock.
-            logger.error(f"batch_encode raised: {e}", exc_info=True)
-            for p in group:
-                if not p.future.done():
-                    p.future.set_exception(e)
-            return
-
-        if len(results) != len(group):
-            err = RuntimeError(
-                f"batch_encode returned {len(results)} results for {len(group)} requests"
-            )
-            logger.error(str(err))
-            for p in group:
-                if not p.future.done():
-                    p.future.set_exception(err)
-            return
-
-        for p, result in zip(group, results):
-            if not p.future.done():
-                p.future.set_result(result)
-
-    async def _dispatch_per_request(
-        self,
-        group: List[PendingRequest],
-        modality: Modality,
-    ) -> None:
-        modality_str = modality.name.lower()
-        for p in group:
-            req = p.request
-            try:
-                start = time.time()
-                if encoder_metrics_collector is not None:
-                    encoder_metrics_collector.observe_queue_wait(
-                        max(0.0, start - p.submit_time), modality=modality_str
-                    )
-                for sock in self.send_sockets:
-                    sock_send(sock, wrap_as_pickle(req))
-                result = await self.encoder.encode_request(req, modality)
-                if not p.future.done():
-                    p.future.set_result(result)
-            except Exception as e:
-                logger.error(
-                    f"Per-request encode failed for req_id={req.get('req_id')}: {e}"
-                )
-                if not p.future.done():
-                    p.future.set_exception(e)
-
-
 async def run_encoder(
     server_args: ServerArgs, schedule_path, dist_init_method, rank: int
 ):
@@ -2128,7 +1897,8 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
         traceback.print_exc()
 
 
-# Per-process encoder metrics collector. Set by encode_http_server in
-# launch_server (non-DP) and run_dp_worker (DP mode). None when metrics
-# disabled. Kept here because MMEncoder GPU methods reference it directly.
+# Per-process encoder metrics collector. Set by
+# encoder_runtime.launch_local_runtime (non-DP) and
+# encoder_runtime.run_dp_worker (DP mode). None when metrics disabled. Kept
+# here because MMEncoder GPU methods reference it directly.
 encoder_metrics_collector: Optional[EncoderMetricsCollector] = None
