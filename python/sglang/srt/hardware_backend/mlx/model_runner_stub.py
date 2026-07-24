@@ -296,3 +296,12 @@ class MlxModelRunnerStub(ModelRunner):
     def alloc_memory_pool(self, memory_pool_config=None):
         """No-op: MLX manages its own KV cache."""
         pass
+
+    def init_attention_backends(self):
+        """No-op: attention runs inside the MLX runner.
+
+        The backend named by ``server_args.attention_backend`` would never
+        be used, and building one can crash: some backends read real KV
+        buffers in ``__init__``, which this stub never allocates.
+        """
+        self.attn_backend = None

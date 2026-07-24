@@ -5073,28 +5073,30 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Attention backend selection + XPU dtype validation moved to the
             # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
-
-            supported_backends = [
-                "triton",
-                "trtllm_mha",
-                "fa3",
-                "fa4",
-                "ascend",
-                "intel_amx",
-                "intel_xpu",
-                "aiter",
-            ]
-            prefill_attn_backend, decode_attn_backend = (
-                self._resolved_attention_backends()
-            )
-            assert (
-                prefill_attn_backend in supported_backends
-                and decode_attn_backend in supported_backends
-            ), (
-                f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
-                f"- Prefill: {prefill_attn_backend}\n"
-                f"- Decode: {decode_attn_backend}\n"
-            )
+            # None of these backends exist on MPS; attention_backend is still
+            # unset there at this point (the torch_native default fills later).
+            if not is_mps():
+                supported_backends = [
+                    "triton",
+                    "trtllm_mha",
+                    "fa3",
+                    "fa4",
+                    "ascend",
+                    "intel_amx",
+                    "intel_xpu",
+                    "aiter",
+                ]
+                prefill_attn_backend, decode_attn_backend = (
+                    self._resolved_attention_backends()
+                )
+                assert (
+                    prefill_attn_backend in supported_backends
+                    and decode_attn_backend in supported_backends
+                ), (
+                    f"GptOssForCausalLM requires one of {supported_backends} attention backend, but got the following backends\n"
+                    f"- Prefill: {prefill_attn_backend}\n"
+                    f"- Decode: {decode_attn_backend}\n"
+                )
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"

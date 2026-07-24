@@ -5,8 +5,10 @@ scheduler (``TokenToKVPoolAllocator`` / ``RadixCache``).  This runner
 reads cached attention KV from ``MlxAttentionKVPool``, restores any
 native auxiliary layer state, runs the forward pass, and writes the new
 cache state back.  Each request keeps model-shaped cache entries:
-attention layers use ``ContiguousAttentionKVCache`` and auxiliary layers
-use native ``mlx-lm`` cache objects.
+attention layers use ``ContiguousAttentionKVCache`` (or, on the
+per-request path with ``disable_radix_cache``, a fixed-size
+``WindowedAttentionKVCache`` for sliding-window layers) and auxiliary
+layers use native ``mlx-lm`` cache objects.
 
 The module also exposes a lazy-eval (`*_start` / `*_finalize`) surface
 used by the MLX overlap scheduler to pipeline CPU bookkeeping with
@@ -40,9 +42,11 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     MLXAttentionWrapper,
     MlxModelCacheLayout,
     PoolBackedAttentionKVCache,
+    WindowedAttentionKVCache,
     clear_context,
     find_attention_layers,
     get_head_dim,
+    get_layer_window_sizes,
     get_num_kv_heads,
     patch_model_attention,
     set_context,
@@ -115,6 +119,11 @@ _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
+    # Class-level fallback (never mutated): tests build runners via
+    # object.__new__ without __init__, and "no windowed layers" is the safe
+    # default for such surgically constructed instances.
+    _layer_window_sizes: dict[int, int | None] = {}
+
     def __init__(
         self,
         model_path: str,
@@ -168,6 +177,14 @@ class MlxModelRunner:
             )
         self._max_seq_len = 4096  # doubles on overflow
 
+        # Per-layer sliding windows (container convention, e.g. gpt-oss).
+        # Only consulted on the per-request path: pool-backed radix reuse
+        # stores full-history KV for windowed layers, so windowed caches
+        # would desync `_sync_new_kv_to_pool`'s absolute slicing.
+        self._layer_window_sizes: dict[int, int | None] = (
+            get_layer_window_sizes(self.model) if self.disable_radix_cache else {}
+        )
+
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
         self._cache_pool: list[list[Any]] = []  # reusable full-attention caches
@@ -204,7 +221,13 @@ class MlxModelRunner:
         """Create a model-shaped cache list with attention KV adapters."""
         cache = self._new_cache_skeleton()
         for layer_idx in self._cache_layout.attention_layer_indices:
-            cache[layer_idx] = ContiguousAttentionKVCache(max_seq_len=self._max_seq_len)
+            window = self._layer_window_sizes.get(layer_idx)
+            if window is not None:
+                cache[layer_idx] = WindowedAttentionKVCache(window)
+            else:
+                cache[layer_idx] = ContiguousAttentionKVCache(
+                    max_seq_len=self._max_seq_len
+                )
         return cache
 
     def _acquire_cache(self) -> list[Any]:
@@ -212,7 +235,7 @@ class MlxModelRunner:
         if not self._cache_layout.has_auxiliary_state and self._cache_pool:
             cache = self._cache_pool.pop()
             for c in cache:
-                c.offset = 0
+                c.reset()
             return cache
         return self._new_native_cache()
 
