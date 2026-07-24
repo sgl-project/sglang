@@ -78,14 +78,14 @@ class TestKimiLinearDSpark(CustomTestCase):
             model.set_dspark_layers_to_capture([1])
 
     @patch("sglang.srt.utils.is_sm100_supported", return_value=True)
-    def test_dspark_defaults_use_ragged_capable_kda_and_dense_draft(self, _):
+    def test_dspark_defaults_use_cutedsl_kda_and_dense_draft(self, _):
         args = SimpleNamespace(
             speculative_algorithm="DSPARK",
             linear_attn_verify_backend=None,
             speculative_draft_attention_backend=None,
         )
         apply_kimi_k3_spec_backend_defaults(args)
-        self.assertEqual(args.linear_attn_verify_backend, "triton")
+        self.assertEqual(args.linear_attn_verify_backend, "nv_cutedsl")
         self.assertEqual(args.speculative_draft_attention_backend, "trtllm_mha")
 
 

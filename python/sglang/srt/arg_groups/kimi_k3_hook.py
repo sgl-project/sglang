@@ -16,16 +16,15 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     if server_args.speculative_algorithm is None:
         return
 
-    # Keep KDA target-verify on triton: flashinfer recurrent_kda verify is slower on
-    # all measured shapes and can't run ragged/compact layouts (uniform [N,T]).
+    # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
     if server_args.linear_attn_verify_backend is None:
-        server_args.linear_attn_verify_backend = "triton"
+        server_args.linear_attn_verify_backend = "nv_cutedsl"
         logger.info(
             "Kimi hybrid model with speculative decoding: pinning "
-            "--linear-attn-verify-backend to triton (keeps KDA verify on "
-            "the triton kernel)."
+            "--linear-attn-verify-backend to nv_cutedsl (uses the fused "
+            "Kimi-K3/DSPARK CuTeDSL kernel)."
         )
 
     # dspark's draft is dense MQA; trtllm_mha avoids flashinfer's blocking
