@@ -30,7 +30,9 @@ def _reference_append(topk_ids, topk_weights, s, scale_factor, n_base):
     appended as ``n_base + arange(s)`` with weight ``scale_factor``."""
     m, k = topk_ids.shape
     out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
-    out_w = torch.empty((m, k + s), dtype=topk_weights.dtype, device=topk_weights.device)
+    out_w = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
     out_ids[:, :k] = topk_ids
     out_w[:, :k] = topk_weights
     shared = n_base + torch.arange(s, device=topk_ids.device)
