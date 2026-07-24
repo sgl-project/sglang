@@ -1049,7 +1049,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        # Keep the experts on native MXFP8 (per-1x32) when the aiter FlyDSL MoE
+        # runner is selected: it consumes the native weights + 1x32 scales
+        # directly, so the block-fp8 conversion (SGLANG_FORCE_MXFP8_BLOCK_CONVERT
+        # on gfx950 / always on gfx942) must skip the MoE even when it converts
+        # the linear layers -- giving block-fp8 linear + native FlyDSL MoE.
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8
+            and _mxfp8_to_block_fp8_required
+            and not (
+                get_moe_runner_backend().is_aiter()
+                and not mxfp8_block_convert_required()
+            )
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
@@ -1955,6 +1967,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        # Native MXFP8 experts on the aiter FlyDSL MoE (afp8_wfp8, per_1x32): the
+        # kernel consumes gate/up-interleaved pre-shuffled weights + correspondingly
+        # shuffled 1x32 scales, and (with MoeRunner passing ActivationType.Swiglu +
+        # swiglu_limit) computes the clamped SwiGLU. Shuffle here for the aiter runner;
+        # other runners (triton/cutlass/deepgemm) keep the canonical layout.
+        _moe_runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if _use_aiter and _moe_runner_is_aiter:
+            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            for _sn, _is_w13 in (
+                ("w13_weight_scale_inv", True),
+                ("w2_weight_scale_inv", False),
+            ):
+                _s = getattr(layer, _sn)
+                _s.data = shuffle_scale(
+                    _s.reshape(-1, _s.shape[-1]), _s.shape[0], gu_intv, _is_w13
+                )
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight, is_guinterleave=gu_intv, gate_up=True
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight, is_guinterleave=gu_intv, gate_up=False
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2524,9 +2564,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_weight = layer.w2_weight
 
         if self.block_quant:
+            # Native MXFP8 experts use per-1x32 scales (aiter FlyDSL afp8_wfp8
+            # SwiGLU MoE), same granularity as fp4 experts; only true block-fp8
+            # (128x128) weights use PER_128X128. Without this, mxfp8 experts fall
+            # through to PER_128X128 and the CK per-1x128 SwiGLU kernel (which
+            # fails to JIT-build), instead of the cached FlyDSL per-1x32 kernel.
             quant_type = (
                 AiterQuantType.PER_1X32
-                if self.is_fp4_expert
+                if (self.is_fp4_expert or self.use_mxfp8)
                 else AiterQuantType.PER_128X128
             )
 
