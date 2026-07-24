@@ -28,6 +28,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "KVarNAttnBackend",
     }
 )
 
@@ -94,6 +95,78 @@ def scale_kv_cell_size_per_token_for_dflash(
     return (
         int(target_cell_size_per_token) * int(total_layers) + int(target_num_layers) - 1
     ) // int(target_num_layers)
+
+
+def resolve_dflash_draft_kv_element_size(
+    *,
+    draft_model_dtype: torch.dtype,
+    server_args_kv_cache_dtype: str,
+    speculative_draft_attention_backend: Optional[str],
+    speculative_draft_kv_cache_dtype: str = "auto",
+) -> int:
+    """Bytes per draft KV element, mirroring the draft worker's dtype resolution.
+
+    See `configure_kv_cache_dtype` and the override logic in
+    `draft_worker_common`: an explicit --speculative-draft-kv-cache-dtype wins;
+    otherwise the draft inherits the target's dtype, except KVarN targets which
+    fall back to the draft model dtype (no real pool to inherit). fa4 drafts
+    always use the model compute dtype. Does NOT touch the parallel state.
+    """
+    dtype_str = speculative_draft_kv_cache_dtype
+    if dtype_str == "auto":
+        dtype_str = (
+            "auto"
+            if server_args_kv_cache_dtype.startswith("kvarn_")
+            else server_args_kv_cache_dtype
+        )
+
+    if dtype_str == "auto":
+        kv_dtype = draft_model_dtype
+    elif dtype_str == "fp8_e4m3":
+        kv_dtype = torch.float8_e4m3fn
+    elif dtype_str == "fp8_e5m2":
+        kv_dtype = torch.float8_e5m2
+    elif dtype_str in ("bf16", "bfloat16"):
+        kv_dtype = torch.bfloat16
+    else:
+        # Unknown/exotic dtype: reserve at model dtype (safe over-estimate).
+        kv_dtype = draft_model_dtype
+
+    # fa4 draft attention needs K.dtype == Q.dtype, so its pool is always
+    # model dtype regardless of the requested KV dtype.
+    if speculative_draft_attention_backend == "fa4":
+        kv_dtype = draft_model_dtype
+
+    return torch._utils._element_size(kv_dtype)
+
+
+def compute_dflash_draft_kv_cell_size_per_token(
+    *,
+    draft_total_num_kv_heads: int,
+    draft_head_dim: int,
+    draft_v_head_dim: int,
+    draft_num_layers: int,
+    draft_kv_element_size: int,
+    attn_tp_size: int,
+) -> int:
+    """Actual bytes/token of the DFLASH draft KV pool (MHA draft: K+V, all layers).
+
+    The draft pool spans the full shared token-index space (draft and target
+    share one allocator so radix-cache/prefix-hit KV stays reusable), so the
+    target's pool configurator must reserve
+    `max_total_num_tokens * <this value>` for the draft pool on top of the
+    target's own per-token cost. The layer-ratio heuristic in
+    `scale_kv_cell_size_per_token_for_dflash` assumes the draft's per-layer KV
+    cost equals the target's, which under-reserves badly when the target uses
+    a compressed cache (e.g. KVarN) while the draft keeps a dense bf16 pool.
+    """
+    num_kv_heads = max(1, int(draft_total_num_kv_heads) // int(attn_tp_size))
+    return (
+        num_kv_heads
+        * (int(draft_head_dim) + int(draft_v_head_dim))
+        * int(draft_num_layers)
+        * int(draft_kv_element_size)
+    )
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:

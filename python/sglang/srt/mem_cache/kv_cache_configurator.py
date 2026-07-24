@@ -787,6 +787,13 @@ class KVCacheConfigurator:
                 c128_state_dtype=sizes.c128_state_dtype,
                 req_to_token_pool=req_to_token_pool,
             )
+        elif self.server_args.kv_cache_dtype.startswith("kvarn_"):
+            # KVarN: use NoOp pool. The real K/V storage is in the KVarN
+            # backend's tail pool (fp16, small) + int4 compressed cache.
+            token_to_kv_pool = self._build_kvarn_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+                req_to_token_pool=req_to_token_pool,
+            )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 token_to_kv_pool = self._build_oot_dsa_kv_pool(
@@ -1365,6 +1372,59 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_kvarn_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> KVCache:
+        """Build the KV pool for KVarN.
+
+        KVarN uses a NoOp pool as the scheduler-facing pool (full logical
+        capacity), while the real K/V storage lives in the KVarN backend's
+        tail pool (fp16) + int4 compressed cache. Using the standard pool
+        (HybridLinearKVPool for hybrid models, MHATokenToKVPool for dense)
+        would double-allocate GPU memory.
+        """
+        from sglang.srt.layers.quantization.kvarn.config import KVarNConfig
+
+        kvarn_config = KVarNConfig.from_cache_dtype(
+            self.server_args.kv_cache_dtype,
+            head_dim=self.model_config.head_dim,
+        )
+
+        if self.mambaish_config is not None:
+            # Hybrid GDN model: NoOp pool covers only the full-attention layers.
+            full_attn_ids = (
+                [0]
+                if self.is_draft_worker
+                else [
+                    i
+                    for i in self.mambaish_config.full_attention_layer_ids
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                ]
+            )
+            layer_num = len(full_attn_ids)
+        else:
+            layer_num = self.layer_info.num_effective_layers
+
+        token_to_kv_pool = NoOpMHATokenToKVPool(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=layer_num,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+        )
+        return token_to_kv_pool
+
     def _build_token_to_kv_pool_allocator(
         self,
         *,
@@ -1545,8 +1605,62 @@ class KVCacheConfigurator:
                 )
                 / 1024,
             )
+
+        # Transient runtime workspace for prefill: activations, GDN
+        # conv/recurrent buffers, attention and Triton autotune workspaces all
+        # scale with the per-forward prefill chunk, and the (1 - mem_fraction)
+        # slack alone can be too small in absolute terms on small GPUs to cover
+        # them. Measured on a 24 GB GPU (hybrid GDN 9B, chunk=8192,
+        # hidden=4096, bf16): ~1.2 GB of runtime growth before an OOM in
+        # fused_qkv_split_gdn_prefill — i.e. ~20x (chunk x hidden x dtype).
+        # Reserve it explicitly so pool sizing can't spend it on KV capacity.
+        # Target worker only: GPU memory is shared, and this term is sized on
+        # total runtime demand (the draft's window-capped prefill is included
+        # in the measurement).
+        if not self.is_draft_worker:
+            prefill_chunk = self.server_args.chunked_prefill_size
+            if prefill_chunk is None or prefill_chunk <= 0:
+                prefill_chunk = self.server_args.max_prefill_tokens
+            if self.server_args.kv_cache_dtype.startswith("kvarn_"):
+                runtime_reserve_multiplier = 3
+            else:
+                runtime_reserve_multiplier = 20
+            runtime_reserve_gb = (
+                prefill_chunk
+                * self.model_config.hidden_size
+                * torch._utils._element_size(self.model_config.dtype)
+                * runtime_reserve_multiplier
+                / (1024**3)
+            )
+            slack_gb += runtime_reserve_gb
+            logger.info(
+                "Prefill runtime workspace reserve: %.2f GB "
+                "(chunk=%d, hidden=%d, multiplier=%d), total slack %.2f GB",
+                runtime_reserve_gb,
+                prefill_chunk,
+                self.model_config.hidden_size,
+                runtime_reserve_multiplier,
+                slack_gb,
+            )
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
+            # When KVarN is enabled, the KV pool is a NoOp placeholder and the
+            # real K/V storage (tail pool + int4 compressed cache) is allocated
+            # later by KVarNAttnBackend. The default mamba auto-sizing would
+            # give mamba ~47% of rest_memory (via mamba_full_memory_ratio),
+            # which over-allocates mamba and starves KVarN's compressed cache.
+            #
+            # Mamba only needs max_running * ratio slots (ratio = 3 base +
+            # 2 for overlap ping-pong). Cap it there so the rest goes to KVarN.
+            if (
+                self.server_args.kv_cache_dtype.startswith("kvarn_")
+                and self.server_args.max_mamba_cache_size is None
+                and self.server_args.max_running_requests is not None
+            ):
+                ratio = self._calculate_mamba_ratio()
+                self.server_args.max_mamba_cache_size = (
+                    self.server_args.max_running_requests * ratio
+                )
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget

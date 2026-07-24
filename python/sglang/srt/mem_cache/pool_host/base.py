@@ -21,8 +21,16 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
-HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+# Tunable via SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB; default 10 GB is
+# conservative for shared hosts. On a dedicated/managed box with known
+# memory headroom, operators can lower it to reclaim otherwise-wasted RAM.
+def hicache_host_memory_reserve_bytes() -> int:
+    from sglang.srt.environ import envs
+
+    return int(envs.SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB.get() * (1024**3))
+
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -125,7 +133,7 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_mem.available - hicache_host_memory_reserve_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

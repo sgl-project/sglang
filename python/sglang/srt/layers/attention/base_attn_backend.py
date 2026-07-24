@@ -44,6 +44,11 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    # Whether the backend's TARGET_VERIFY forward can be CUDA-graph-captured.
+    # The KVarN fused verify path allocates fresh tensors per call (block
+    # tables, vq_req, vq_seqlen, ...) and is eager-only; capturing it crashes.
+    supports_target_verify_cuda_graph: bool = True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

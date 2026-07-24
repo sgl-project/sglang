@@ -1254,10 +1254,88 @@ class _PlainKvStrategy(StackStrategy):
         )
 
 
+class _KVarNNopaStrategy(StackStrategy):
+    """HiCache strategy for KVarN with hybrid GDN models.
+
+    The NoOpMHATokenToKVPool handles full-attention layers via KVarN's own
+    compressed int4 + fp16 tail pool. It exposes get_cpu_copy/load_cpu_copy
+    that delegate to the KVarN backend for HiCache eviction/loading. The
+    mamba/linear-attention layers use the standard mamba pool.
+    """
+
+    def matches(self, kvcache, components):
+        from sglang.srt.mem_cache.memory_pool import NoOpMHATokenToKVPool
+
+        return isinstance(kvcache, NoOpMHATokenToKVPool) and components == {
+            ComponentType.FULL,
+            ComponentType.MAMBA,
+        }
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        # Build full_layer_mapping: model layer ID -> 0-based pool layer index.
+        # The KVarN backend stores the actual full attention layer IDs from the
+        # model config (e.g. [3, 7, 11, 15, 19, ...] for Qwen3.5). We map each
+        # to its 0-based compressed layer index (0, 1, 2, ...).
+        kvarn_backend = getattr(kvcache, "_kvarn_backend", None)
+        assert (
+            kvarn_backend is not None
+        ), "KVarNNopaStrategy requires the NoOp pool to have a KVarN backend"
+        full_attn_ids = kvarn_backend.full_attn_layer_ids
+        full_layer_mapping = {
+            model_id: pool_id for pool_id, model_id in enumerate(full_attn_ids)
+        }
+        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        host_pool_group, cache_controller = build_hybrid_mamba_stack(
+            params=params,
+            server_args=server_args,
+            kv_pool=kvcache,
+            mamba_pool=params.req_to_token_pool.mamba_pool,
+            full_layer_mapping=full_layer_mapping,
+            mamba_layer_mapping=mamba_layer_mapping,
+            load_cache_event=load_cache_event,
+            storage_backend=storage_backend,
+            use_mla=False,
+            host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
+            device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={
+                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
+                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+            },
+            register_req_to_token_counter=True,
+            transfer_layer_num=max(max(full_layer_mapping), max(mamba_layer_mapping))
+            + 1,
+            pools_desc="KVarN KV + MAMBA",
+        )
+
+
 # Resolved first-to-last; _PlainKvStrategy is the catch-all fallback.
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     _MambaStrategy(),
+    _KVarNNopaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
     _DsaStrategy(),
