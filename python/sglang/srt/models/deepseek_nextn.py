@@ -347,11 +347,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 return None
             return quant_config
 
-        # The nextn layer is built with the sglang prefix "model.decoder.*", but
-        # an fp8 ignore-list keys the un-quantized nextn attention by its on-disk
-        # name "model.layers.{N}.*", so is_layer_skipped("model.decoder", ...)
-        # never matches and the nextn attention is wrongly quantized (then crashes
-        # loading the bf16 weights). Mirror that rename onto the ignore list.
+        # FP8 ignore lists use checkpoint names, while the NextN layer is built
+        # with the mapped "model.decoder" prefix.
         if isinstance(quant_config, Fp8Config) and quant_config.ignored_layers:
             remapped = [
                 entry.replace(ckpt_prefix, "model.decoder", 1)
