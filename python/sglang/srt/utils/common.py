@@ -539,6 +539,12 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Intel XPU supports pinned host memory but has no dedicated in-tree
+    # platform class yet, so it falls back to the base SRTPlatform (which
+    # reports False). Short-circuit here, mirroring CUDA semantics: pinned
+    # memory is available for XPU targets but not when the target is CPU.
+    if is_xpu():
+        return device is None or str(device) != "cpu"
     return current_platform.is_pin_memory_available(device)
 
 
