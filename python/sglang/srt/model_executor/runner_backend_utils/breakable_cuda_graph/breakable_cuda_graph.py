@@ -34,6 +34,9 @@ try:
 except ImportError:
     rt = None
 
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph_debug import (
+    check_non_explicit_outputs,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
@@ -233,7 +236,12 @@ def eager_on_graph(enable: bool):
 
             # Run the eager function once so it allocates its outputs and
             # writes real data into them.
-            output = inner(*args, **kwargs)
+            if capture.debug:
+                output, error_msg = check_non_explicit_outputs(inner, args, kwargs)
+                if error_msg is not None:
+                    capture._non_explicit_output_errors.append(error_msg)
+            else:
+                output = inner(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -308,6 +316,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
+        debug: bool = False,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -316,6 +325,8 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self.debug = debug
+        self._non_explicit_output_errors: list[str] = []
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None
@@ -347,6 +358,8 @@ class BreakableCUDAGraphCapture:
                 self._stream_ctx.__exit__(*args)
                 self._stream_ctx = None
             _uninstall_wait_stream_hook()
+        if self._non_explicit_output_errors and (not args or args[0] is None):
+            raise RuntimeError("\n\n".join(self._non_explicit_output_errors))
         return False
 
     def _begin_new_segment(self) -> None:
