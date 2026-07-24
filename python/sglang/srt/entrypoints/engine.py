@@ -624,11 +624,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 "Please set --dp-size 1 when using --weight-cache-mode daemon."
             )
 
-        # Mirror the standalone launcher's multi-node guard: without an explicit
-        # rendezvous address every node would fall through to a local
-        # tcp://127.0.0.1:<own free port> init method (below), so the per-node
-        # daemons could never form the joint process group and would hang in
-        # distributed init until the readiness timeout.
+        # Multi-node needs an explicit rendezvous address; otherwise each node
+        # picks its own local 127.0.0.1 port (below) and the per-node daemons
+        # can never form the joint process group.
         if server_args.nnodes > 1 and not server_args.dist_init_addr:
             raise ValueError(
                 "Multi-node weight cache daemons (nnodes > 1) require "
@@ -646,19 +644,15 @@ class Engine(EngineScoreMixin, EngineBase):
             )
         )
 
-        # Build the distributed init method.
-        # For multi-node, use the user-provided dist_init_addr so all nodes
-        # can reach the same rendezvous endpoint.
+        # Build the distributed init method (multi-node uses the user-provided
+        # dist_init_addr so all nodes reach the same endpoint).
         if server_args.dist_init_addr:
             host, port = server_args.dist_init_addr.rsplit(":", 1)
             dist_init_method = f"tcp://{host}:{port}"
         else:
-            # Allocate a *fresh* free port for the daemons' own distributed
-            # rendezvous rather than reusing the engine's nccl_port. The daemons
-            # stand up their own TCPStore for this group; if the user pinned
-            # --nccl-port (or we reused it here), the engine's own NCCL TCPStore
-            # would later try to bind the same port and collide. A private
-            # ephemeral port keeps the daemon group independent of the engine.
+            # Fresh free port for the daemons' own rendezvous, not the engine's
+            # nccl_port: a pinned --nccl-port would otherwise collide with the
+            # engine's own NCCL TCPStore.
             dist_init_method = NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
 
         num_daemons = len(pp_rank_range) * len(tp_rank_range)
@@ -1040,10 +1034,9 @@ class Engine(EngineScoreMixin, EngineBase):
         ):
             resolve_auto_parsers(server_args)
 
-        # Launch weight cache daemons if in daemon mode. Keep the handles on a
-        # local (threaded back to the owning Engine instance via the return
-        # tuple) rather than a class attribute, so two Engines in one process
-        # (e.g. RL setups) don't clobber each other's daemon list.
+        # Launch daemons (daemon mode only). Handles are threaded back to the
+        # owning Engine instance (not a class attr) so two Engines in one process
+        # don't clobber each other's daemon list.
         weight_cache_daemon_procs: List = []
         if server_args.weight_cache_mode == "daemon":
             weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)

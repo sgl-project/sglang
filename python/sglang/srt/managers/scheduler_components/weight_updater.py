@@ -185,9 +185,9 @@ class SchedulerWeightUpdaterManager:
 
     def _assert_weight_cache_inactive(self, op: str) -> None:
         """Reject freeing/restoring model weights while the CUDA IPC weight
-        cache is active. The weights are shared with the daemon via CUDA IPC, so
-        pausing (freeing) them would leave the daemon and every co-attached
-        engine pointing at released memory.
+        cache is active: the weights are shared with the daemon via CUDA IPC, so
+        freeing them would leave the daemon and every peer pointing at released
+        memory.
         """
         mode = self.tp_worker.model_runner.server_args.weight_cache_mode
         if mode != "off":

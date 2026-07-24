@@ -105,12 +105,9 @@ class WeightUpdater:
             return False, message
 
     def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
-        """Reject weight mutations while the CUDA IPC weight cache is active.
-
-        In daemon/client mode the model's param.data is the daemon's master
-        copy, shared with every co-attached engine via CUDA IPC. An in-place
-        update here (copy_/load_weights + re-run post-processing) would silently
-        corrupt the daemon and all peers, so fail loud instead.
+        """Reject weight mutations while the CUDA IPC weight cache is active:
+        param.data is the daemon's master copy shared with every co-attached
+        engine, so an in-place update would silently corrupt them all.
         """
         mode = self.get_model_runner().server_args.weight_cache_mode
         if mode != "off":

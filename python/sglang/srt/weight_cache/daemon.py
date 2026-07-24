@@ -357,11 +357,9 @@ class WeightCacheDaemon:
         self.state_entries.clear()
 
         # remove_duplicate=False so tied weights are recognized as parameters
-        # under *every* name they appear as. named_parameters() dedups by
-        # default, but state_dict() below emits both tied keys (e.g. a tied
-        # lm_head that shares storage with the input embedding) — with the
-        # deduped set the duplicate name would get is_param=False and the client
-        # would register it as a buffer instead of a parameter.
+        # under every name. state_dict() below emits both tied keys, and with the
+        # deduped set the duplicate would be mis-registered as a buffer, not a
+        # parameter, on the client.
         param_names = set(
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
@@ -409,12 +407,10 @@ class WeightCacheDaemon:
 
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
-        # Do NOT unlink an existing socket here. Stale-file cleanup is the launch
-        # path's job (cleanup_stale_daemon_files), which refuses to remove a
-        # socket whose .ready still points at a live PID. Blindly unlinking here
-        # would let a second daemon for the same rank silently steal a live
-        # daemon's socket; instead, a leftover live socket makes bind() fail
-        # loudly with "address already in use".
+        # Do NOT unlink an existing socket here: stale-file cleanup is the launch
+        # path's job (cleanup_stale_daemon_files refuses to remove a socket whose
+        # .ready still points at a live PID). A leftover live socket makes bind()
+        # fail loudly instead of silently stealing another daemon's socket.
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old_umask = os.umask(0o177)
         try:

@@ -216,15 +216,10 @@ def maybe_enable_ipc_weight_cache(
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
-    When the weight cache is enabled we override the load format to
-    ``IPC_CACHE`` and remember the original format as the disk fallback, then
-    derive the per-rank daemon socket path if the user didn't pin one.
-
-    Idempotent: safe to call more than once on the same ``load_config`` (e.g.
-    if ``load_model`` runs twice for weight reloads). The second call must not
-    stamp ``fallback_load_format = IPC_CACHE`` — that would destroy the real
-    disk format captured on the first call — so the format swap only happens
-    while the format is not already ``IPC_CACHE``.
+    Overrides the load format to ``IPC_CACHE`` (remembering the original as the
+    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
+    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
+    weight reload) can't overwrite the captured fallback format.
     """
     if server_args.weight_cache_mode == "off":
         return

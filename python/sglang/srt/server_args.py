@@ -6854,20 +6854,12 @@ class ServerArgs:
                 self.validate_transfer_engine()
             )
 
-        # Cross-validate the weight cache:
-        # "ipc_cache" is an internal-only load format. It is set automatically
-        # by ModelRunner when the weight cache is enabled (weight_cache_mode !=
-        # "off" overrides load_format to LoadFormat.IPC_CACHE) and is not a
-        # public --load-format choice. Setting it directly is always wrong:
-        #  - with weight_cache_mode="off": IpcModelLoader gets selected but no
-        #    daemon is launched, and the CPU-backup guard (gated on
-        #    weight_cache_mode != "off") stays off -> CPU backup runs
-        #    over IPC-shared memory, corrupting it;
-        #  - with weight_cache_mode="client": fallback_load_format inherits
-        #    IPC_CACHE, so any disk fallback builds DefaultModelLoader with a
-        #    nonsensical format.
-        # Reject it here (defense-in-depth for programmatic construction; the
-        # CLI already rejects it via LOAD_FORMAT_CHOICES) and point at the knob.
+        # "ipc_cache" is an internal-only load format: ModelRunner sets it
+        # automatically when the weight cache is enabled, and it is not a public
+        # --load-format choice. Setting it directly is always wrong (no daemon is
+        # launched, and fallback_load_format inherits a nonsensical format), so
+        # reject it and point at the knob (defense-in-depth; the CLI already
+        # rejects it via LOAD_FORMAT_CHOICES).
         if self.load_format == "ipc_cache":
             raise ValueError(
                 "load_format='ipc_cache' is an internal-only format and must not "
@@ -6876,13 +6868,9 @@ class ServerArgs:
                 "that selects IPC loading automatically."
             )
 
-        # The weight cache serves a single main-model weight set over CUDA IPC.
         # Speculative decoding loads an extra draft model whose weights the
-        # daemon does not export, so the draft worker would fall through the
-        # meta-init IPC path with no tensors to map (or silently disk-load onto
-        # the shared GPU). Supporting it needs a separate draft-model daemon and
-        # is out of scope; refuse the combination up front instead of failing
-        # deep inside draft-worker load.
+        # daemon does not export, so refuse the combination up front instead of
+        # failing deep inside draft-worker load (draft-model daemon TBD).
         if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
             raise ValueError(
                 "--weight-cache-mode is not supported together with speculative "

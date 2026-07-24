@@ -120,20 +120,14 @@ def get_quant_method_name(quant_config: Any) -> str:
 # IPC quantization-method allowlist
 # ---------------------------------------------------------------------------
 #
-# CUDA IPC zero-copy sharing exports ONLY raw tensor data (state_dict + buffers).
-# It is correct only when process_weights_after_loading's entire effect is
-# captured by that tensor data. Several quant methods break this assumption:
-#   - They stamp Python-side metadata on tensors that does NOT cross IPC
-#     (e.g. block-FP8 sets `weight_scale_inv.format_ue8m0 = True`). The
-#     meta-initialized client never runs post-processing, so the flag is
-#     absent and the apply path silently selects the wrong kernel.
-#   - They repack / transpose weights into shapes the meta-init client cannot
-#     reproduce from create_weights alone (per-tensor FP8, Marlin, AWQ/GPTQ).
-#
-# Serving such weights over IPC yields silently-wrong numerics. Only methods
-# verified to round-trip through pure tensor export are allowed here; every
-# other method must hard-error. Extend the registry below only after a method
-# has been verified end-to-end.
+# CUDA IPC zero-copy sharing exports ONLY raw tensor data, so it is correct only
+# when process_weights_after_loading's entire effect is captured by that data.
+# Methods that stamp Python-side metadata (e.g. block-FP8's format_ue8m0) or
+# repack/transpose weights into shapes the meta-init client can't reproduce
+# (per-tensor FP8, Marlin, AWQ/GPTQ) would serve silently-wrong numerics. Only
+# methods verified to round-trip through pure tensor export are allowed; every
+# other method hard-errors. Extend the registry below only after verifying a
+# method end-to-end.
 
 
 class UnsupportedQuantForIPCError(RuntimeError):
@@ -174,10 +168,7 @@ def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
     predicate = IPC_QUANT_ALLOWLIST.get(quant_method)
     if predicate is None:
         return False
-    try:
-        return bool(predicate(quant_config))
-    except Exception:
-        return False
+    return bool(predicate(quant_config))
 
 
 def check_ipc_quant_support(

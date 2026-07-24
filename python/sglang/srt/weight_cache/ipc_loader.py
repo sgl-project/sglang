@@ -9,6 +9,7 @@ Engine depends on daemon staying alive.
 import logging
 import os
 import signal
+import stat
 import threading
 import time
 from typing import Optional
@@ -268,11 +269,8 @@ class IpcModelLoader(BaseModelLoader):
             obj = getattr(obj, part)
         leaf_name = parts[-1]
         if is_param:
-            # IPC-mapped tensors are read-only shared memory owned by the daemon
-            # (its master copy is shared with every peer). SGLang is inference-only
-            # and runs forward under torch.inference_mode(), so requires_grad has no
-            # functional effect anyway. Force it False to make the intent explicit
-            # and guarantee autograd can never write into the shared IPC memory.
+            # requires_grad=False: the IPC memory is shared/read-only and SGLang
+            # is inference-only, so autograd must never write into it.
             new_param = nn.Parameter(tensor, requires_grad=False)
             setattr(obj, leaf_name, new_param)
         else:
@@ -424,15 +422,6 @@ class IpcModelLoader(BaseModelLoader):
             f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
         )
 
-        # Verify model is on the expected device after IPC mapping
-        try:
-            first_param_device = next(model.parameters()).device
-            logger.info(
-                f"[IpcModelLoader] Model device after zero-copy: {first_param_device}"
-            )
-        except StopIteration:
-            pass
-
         return model
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
@@ -444,27 +433,29 @@ class IpcModelLoader(BaseModelLoader):
         """
         import socket as socket_mod
 
-        # Harden the well-known /tmp socket path: refuse to connect through a
-        # symlink so a link planted at the path cannot silently redirect us to a
-        # rogue daemon. A genuine daemon socket is a real AF_UNIX node created by
-        # bind(); the CacheConfig fingerprint check below still guards against a
-        # stale/foreign daemon that happens to bind here.
-        if os.path.islink(self.socket_path):
+        # Only connect to a real socket node owned by us: reject a symlink, a
+        # plain file, or another user's socket planted at this /tmp path. An
+        # absent socket means no daemon -> fall back to disk (return None).
+        try:
+            st = os.lstat(self.socket_path)
+        except FileNotFoundError:
+            logger.info(
+                f"[IpcModelLoader] Daemon socket not found at {self.socket_path}."
+            )
+            return None
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise RuntimeError(
-                f"[IpcModelLoader] Refusing to connect: weight cache socket path "
-                f"{self.socket_path} is a symlink, not a daemon socket."
+                f"[IpcModelLoader] Refusing to connect: {self.socket_path} is not "
+                f"a socket owned by this user."
             )
 
         sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
-            sock.settimeout(30)  # 30s timeout for large state dicts
+            sock.settimeout(30)
             sock.connect(self.socket_path)
         except FileNotFoundError:
+            # Raced: socket removed between lstat and connect -> treat as absent.
             sock.close()
-            logger.info(
-                f"[IpcModelLoader] Daemon socket not found at {self.socket_path}. "
-                f"The daemon may not be running."
-            )
             return None
         except ConnectionRefusedError:
             sock.close()
