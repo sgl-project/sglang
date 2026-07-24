@@ -22,6 +22,9 @@ import torch
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
+from sglang.srt.layers.attention.dsv4.compress_hip import CompressorHip
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -838,6 +841,213 @@ class _FakeHostLRU:
 
     def remove_node(self, node):
         self._nodes.discard(id(node))
+
+
+# ---------------------------------------------------------------------------
+# SWA-capture completion-event handshake (hazard H2), merged from
+# test_swa_capture_done.py. The capture D2H runs on the compute/forward stream
+# (same-stream-ordered vs the ring write/overwrite, hazard H1); a CROSS-stream
+# consumer (restore H2D, L3 write-through, device-landing check) must order
+# strictly after the page is fully written via record_capture_done /
+# wait_capture_done.
+# ---------------------------------------------------------------------------
+
+
+def _bare_pool(gpu_device):
+    """A DeepSeekV4PagedHostPool with only the attributes the capture-done event
+    facility touches, avoiding the heavy host-memory allocation of __init__."""
+    p = object.__new__(DeepSeekV4PagedHostPool)
+    p.gpu_device = gpu_device
+    p._capture_done_event = None
+    return p
+
+
+class TestCaptureDoneEventCPU(unittest.TestCase):
+    def test_cpu_device_record_is_noop(self):
+        p = _bare_pool("cpu")
+        p.record_capture_done()
+        self.assertIsNone(p._capture_done_event)
+        p.wait_capture_done()  # must not raise
+
+    def test_none_device_is_noop(self):
+        p = _bare_pool(None)
+        p.record_capture_done()
+        self.assertIsNone(p._capture_done_event)
+        p.wait_capture_done()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs GPU")
+class TestCaptureDoneEventGPU(unittest.TestCase):
+    """The capture keeps its D2H on the compute/forward stream (no side stream);
+    the completion event is created lazily and gates a cross-stream consumer."""
+
+    def test_records_event_and_orders_cross_stream_consumer(self):
+        p = _bare_pool(torch.device("cuda", 0))
+        self.assertIsNone(p._capture_done_event)
+        # emulate capture: non_blocking D2H on the current stream, then record.
+        src = torch.ones(8, device="cuda")
+        dst = torch.empty(8, device="cpu", pin_memory=True)
+        dst.copy_(src, non_blocking=True)
+        p.record_capture_done()
+        self.assertIsInstance(p._capture_done_event, torch.cuda.Event)
+        # a consumer on a DIFFERENT stream is ordered strictly after the D2H.
+        consumer = torch.cuda.Stream()
+        p.wait_capture_done(consumer)
+        consumer.synchronize()
+        self.assertTrue(bool((dst == 1).all().item()))
+
+    def test_event_is_reused_across_calls(self):
+        p = _bare_pool(torch.device("cuda", 0))
+        p.record_capture_done()
+        first = p._capture_done_event
+        p.record_capture_done()
+        self.assertIs(p._capture_done_event, first)
+
+    def test_wait_before_any_capture_is_noop(self):
+        p = _bare_pool(torch.device("cuda", 0))
+        # no capture recorded yet -> no event -> wait is a no-op, must not raise.
+        p.wait_capture_done()
+        self.assertIsNone(p._capture_done_event)
+
+
+# ---------------------------------------------------------------------------
+# Strict SWA-HiCache geometry regression + FlexKV coupling contract, merged from
+# test_swa_state_geometry_fixes.py.
+#   * off0=0 packing decouples the host state tile from the spec-padded SWA ring,
+#     so state capture stays byte-exact even when swa_ring % ring_size != 0 and
+#     page % swa_ring != 0 (spec-decode geometry: window + spec_extra = 131).
+#   * a reuse window reaching back into the overlap prefix (B - win < cs) is
+#     captured when the prefix is present (buf_lo >= 0) and never crashes.
+#   * get_swa_state_coupling_infos exposes (swa_page_size, ring_size) per sidecar
+#     state pool in the same order / filtering as get_state_buf_infos.
+# ---------------------------------------------------------------------------
+
+_CAPTURE = CompressorHip._capture_compress_state_windows
+
+
+def _state_host_pool(*, ring_size, slot_bytes, num_pages=16):
+    item_bytes = ring_size * slot_bytes
+    host_buf = torch.zeros((num_pages, item_bytes), dtype=torch.uint8)
+    counter = {"n": 0}
+
+    def alloc(need):
+        assert need == ring_size
+        p = counter["n"]
+        counter["n"] += 1
+        if p >= num_pages:
+            return None
+        return torch.arange(p * ring_size, p * ring_size + ring_size)
+
+    return types.SimpleNamespace(
+        slot_page_size=ring_size,
+        item_bytes=item_bytes,
+        data_refs=[host_buf],
+        _capture_staging={},
+        _capture_state_crc={},
+        alloc=alloc,
+    )
+
+
+def _state_backend(host_pool, *, page, swa_ring):
+    pool = types.SimpleNamespace(
+        unified_swa_ring_size=swa_ring,
+        _c4_state_layer_index={0: 0},
+        _c4_state_host_pool=host_pool,
+    )
+    return types.SimpleNamespace(token_to_kv_pool=pool, page_size=page)
+
+
+def _state_self(ratio=4):
+    return types.SimpleNamespace(ratio=ratio, is_in_indexer=False, layer_id=0)
+
+
+class TestGeometryDecoupleEagle(unittest.TestCase):
+    def test_capture_nondividing_swa_ring_byte_exact(self):
+        # EAGLE: window=128, spec_extra=3 -> swa_ring=131; page=256; ring_size=8.
+        # 131 % 8 = 3 and 256 % 131 = 125 -> the old geometry asserts crashed here.
+        ring_size, ratio, last_dim, page, swa_ring = 8, 4, 16, 256, 131
+        slot_bytes = last_dim * torch.tensor([], dtype=torch.bfloat16).element_size()
+        hp = _state_host_pool(ring_size=ring_size, slot_bytes=slot_bytes)
+        be = _state_backend(hp, page=page, swa_ring=swa_ring)
+        ext = 512
+        buf = types.SimpleNamespace(
+            kv_score=torch.randint(0, 255, (ext, last_dim), dtype=torch.int32).to(
+                torch.bfloat16
+            )
+        )
+        _CAPTURE(
+            _state_self(ratio),
+            kv_and_score_buffer=buf,
+            valid_kv_len=ext,
+            prefix_len=0,
+            extend_len=ext,
+            rid=7,
+            backend=be,
+        )
+        self.assertEqual(set(hp._capture_staging), {(7, 256), (7, 512)})
+        for B in (256, 512):
+            hidx = hp._capture_staging[(7, B)]
+            row = int(hidx[0].item()) // ring_size
+            got = hp.data_refs[0][row][0 : ratio * slot_bytes]
+            want = (
+                buf.kv_score[B - ratio : B].contiguous().view(torch.uint8).reshape(-1)
+            )
+            self.assertTrue(torch.equal(got, want))
+
+
+class TestReuseIntoOverlapPrefix(unittest.TestCase):
+    def test_window_reaching_into_prefix_is_captured(self):
+        # A tiny chunk crossing a page boundary: B - win < cs but buf_lo >= 0
+        # (prefix present in [pre|new]) -> capture, never crash (old B-win<cs bug).
+        ring_size, ratio, last_dim, page = 8, 4, 16, 8
+        slot_bytes = last_dim * torch.tensor([], dtype=torch.bfloat16).element_size()
+        hp = _state_host_pool(ring_size=ring_size, slot_bytes=slot_bytes)
+        be = _state_backend(hp, page=page, swa_ring=128)
+        cs, ext = 7, 2
+        pre = cs % ratio + ratio  # overlap prefix length
+        valid = pre + ext  # state_buf == [pre | new]
+        buf = types.SimpleNamespace(
+            kv_score=torch.randint(0, 255, (valid, last_dim), dtype=torch.int32).to(
+                torch.bfloat16
+            )
+        )
+        _CAPTURE(
+            _state_self(ratio),
+            kv_and_score_buffer=buf,
+            valid_kv_len=valid,
+            prefix_len=cs,
+            extend_len=ext,
+            rid=7,
+            backend=be,
+        )
+        self.assertIn((7, 8), hp._capture_staging)  # B=8, B-win=4 < cs=7
+        hidx = hp._capture_staging[(7, 8)]
+        row = int(hidx[0].item()) // ring_size
+        buf_lo = (valid - ext) + (8 - ratio - cs)
+        got = hp.data_refs[0][row][0 : ratio * slot_bytes]
+        want = (
+            buf.kv_score[buf_lo : buf_lo + ratio]
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(-1)
+        )
+        self.assertTrue(torch.equal(got, want))
+
+
+class TestFlexKVCouplingContract(unittest.TestCase):
+    def test_coupling_infos_order_and_filter(self):
+        def pool(ratio, swa_page_size, ring_size):
+            return types.SimpleNamespace(
+                ratio=ratio, swa_page_size=swa_page_size, ring_size=ring_size
+            )
+
+        fake = types.SimpleNamespace(
+            compress_state_pools=[pool(4, 256, 8), None, pool(128, 256, 1)],
+            indexer_compress_state_pools=[pool(4, 512, 8)],
+        )
+        infos = DeepSeekV4TokenToKVPool.get_swa_state_coupling_infos(fake)
+        # None and ratio==128 filtered; attn pools then indexer, order preserved.
+        self.assertEqual(infos, [(256, 8), (512, 8)])
 
 
 if __name__ == "__main__":
