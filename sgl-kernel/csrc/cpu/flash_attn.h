@@ -29,8 +29,7 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ inpu
     constexpr int col = i % COLS;
     // for COLS = 2, 4 use 512bit store
     if constexpr (col % 2 == 0) {
-      fVec a_fvec0 = fVec::loadu(input + col * 16);
-      fVec a_fvec1 = fVec::loadu(input + col * 16 + 16);
+      auto [a_fvec0, a_fvec1] = load_float_vec2(input + col * 16);
       bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
       out_bvec.store(out + col * 16);
     }
@@ -47,8 +46,9 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   int d = 0;
 #pragma GCC unroll 4
   for (; d <= size - kVecSize; d += kVecSize) {
-    fVec a_fvec0 = fVec::loadu(acc + d) * s_fvec;
-    fVec a_fvec1 = fVec::loadu(acc + d + fVec::size()) * s_fvec;
+    auto [a_fvec0, a_fvec1] = load_float_vec2(acc + d);
+    a_fvec0 = a_fvec0 * s_fvec;
+    a_fvec1 = a_fvec1 * s_fvec;
     bVec out_bvec = convert_from_float_ext<scalar_t>(a_fvec0, a_fvec1);
     out_bvec.store(out + d);
   }

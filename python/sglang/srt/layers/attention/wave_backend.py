@@ -58,7 +58,7 @@ class WaveAttnBackend(AttentionBackend):
         import wave_lang.kernel.wave.cache as cache
 
         base_cache_dir = cache.CACHE_BASE_DIR
-        new_dir = base_cache_dir / f"worker_{model_runner.tp_rank}"
+        new_dir = base_cache_dir / f"worker_{model_runner.ps.tp_rank}"
         logger.info(f"Setting Wave cache dir: {new_dir}")
         cache.CACHE_BASE_DIR = new_dir
 

@@ -14,12 +14,66 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.test.test_utils import CustomTestCase
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
 STRESS_ENABLED = bool(os.environ.get("SGLANG_RUN_NIXL_STRESS"))
+
+
+class MockHybridPool:
+    def __init__(
+        self,
+        num_pages: int = 4,
+        page_size: int = 1,
+        component_bytes: int = 8,
+        expose_zero_copy: bool = True,
+    ):
+        self.page_size = page_size
+        self.dtype = torch.uint8
+        self.device = "cpu"
+        self.pin_memory = False
+        self.temporal_buffer = torch.zeros(
+            (num_pages * page_size, component_bytes), dtype=self.dtype
+        )
+        self.conv_buffer = [
+            torch.zeros((num_pages * page_size, component_bytes), dtype=self.dtype)
+        ]
+        if expose_zero_copy:
+            self.get_hybrid_pool_buffer = self._get_hybrid_pool_buffer
+
+    def _get_hybrid_pool_buffer(self):
+        return [self.temporal_buffer, *self.conv_buffer]
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list = []
+        size_list = []
+        for index in indices.tolist():
+            ptr_list.append(self.temporal_buffer[index].data_ptr())
+            size_list.append(self.temporal_buffer[index].numel())
+            ptr_list.append(self.conv_buffer[0][index].data_ptr())
+            size_list.append(self.conv_buffer[0][index].numel())
+        return ptr_list, size_list
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(self.temporal_buffer.shape[1] * 2, dtype=self.dtype)
+
+    def get_data_page(self, index, flat=True):
+        data = torch.cat([self.temporal_buffer[index], self.conv_buffer[0][index]])
+        return data.flatten() if flat else data
+
+    def set_from_flat_data_page(self, index, data_page):
+        split = self.temporal_buffer.shape[1]
+        self.temporal_buffer[index].copy_(data_page[:split])
+        self.conv_buffer[0][index].copy_(data_page[split:])
+
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        return True
 
 
 class MockMemPoolHost:
@@ -510,6 +564,128 @@ class TestNixlUnified(CustomTestCase):
         ]
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
+
+    def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
+        pool = MockHybridPool(expose_zero_copy=True)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+        self.assertTrue(ctx.is_zero_copy)
+        self.assertIs(ctx.host_pool, pool)
+
+    def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
+        pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+        self.assertFalse(ctx.is_zero_copy)
+        self.assertIsNotNone(ctx.bounce_set)
+        self.assertIsNotNone(ctx.bounce_get)
+        self.assertEqual(ctx.bounce_page_bytes, pool.get_dummy_flat_data_page().numel())
+
+    def test_batch_set_v2_expands_zero_copy_mamba_component_keys(self):
+        pool = MockHybridPool(expose_zero_copy=True)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        captured = {}
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            captured["keys"] = key_strs
+            captured["host_buffers"] = host_buffers
+            captured["direction"] = direction
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["p0", "p1"],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.MAMBA], [True, True])
+        self.assertEqual(
+            captured["keys"],
+            [
+                self.hicache._get_suffixed_key("p0") + "_mamba_temporal",
+                self.hicache._get_suffixed_key("p0") + "_mamba_conv_0",
+                self.hicache._get_suffixed_key("p1") + "_mamba_temporal",
+                self.hicache._get_suffixed_key("p1") + "_mamba_conv_0",
+            ],
+        )
+        self.assertEqual(len(captured["host_buffers"]), 4)
+        self.assertEqual(captured["direction"], "WRITE")
+
+    def test_batch_get_v2_uses_bounce_buffer_for_non_zero_copy_pool(self):
+        pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+
+        def fake_batch_xfer(keys, key_strs, host_buffers, direction):
+            ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
+            ctx.bounce_get[0].fill_(3)
+            return [True] * len(key_strs)
+
+        self.hicache._batch_xfer = fake_batch_xfer
+        results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["p0"],
+                    host_indices=torch.tensor([0], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(results[PoolName.MAMBA], [True])
+        self.assertTrue(torch.all(pool.get_data_page(0) == 3))
+
+    def test_batch_set_get_v2_distinguishes_same_key_by_pool_name(self):
+        mamba_pool = MockHybridPool(expose_zero_copy=False)
+        swa_pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
+        self.hicache.register_mem_host_pool_v2(swa_pool, PoolName.SWA)
+
+        mamba_pool.temporal_buffer[0].fill_(11)
+        mamba_pool.conv_buffer[0][0].fill_(12)
+        swa_pool.temporal_buffer[0].fill_(21)
+        swa_pool.conv_buffer[0][0].fill_(22)
+        expected_mamba = mamba_pool.get_data_page(0).clone()
+        expected_swa = swa_pool.get_data_page(0).clone()
+
+        key = "shared_key"
+        host_indices = torch.tensor([0], dtype=torch.int64)
+        set_results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
+        )
+        self.assertEqual(set_results[PoolName.MAMBA], [True])
+        self.assertEqual(set_results[PoolName.SWA], [True])
+
+        mamba_pool.temporal_buffer.zero_()
+        mamba_pool.conv_buffer[0].zero_()
+        swa_pool.temporal_buffer.zero_()
+        swa_pool.conv_buffer[0].zero_()
+
+        get_results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
+        )
+
+        self.assertEqual(get_results[PoolName.MAMBA], [True])
+        self.assertEqual(get_results[PoolName.SWA], [True])
+        self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
+        self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
 
 
 @unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT not available on this platform")
