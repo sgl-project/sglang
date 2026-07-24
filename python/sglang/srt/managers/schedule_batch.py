@@ -2042,6 +2042,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def grammar_needs_sync(self) -> bool:
+        """Whether this batch's grammar work forces the synchronous path, i.e. the
+        previous batch's result is resolved before this forward. True when the spec
+        algorithm cannot advance the FSM inside verify() (see
+        SpeculativeAlgorithm.supports_grammar_overlap); the scheduler gates overlap
+        on it and NGRAM's host draft relies on the resulting ordering."""
+        return self.has_grammar and not self.spec_algorithm.supports_grammar_overlap()
+
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):

@@ -133,25 +133,19 @@ class SpeculativeAlgorithm(Enum):
         graphs in the decode cuda graph runner."""
         return self.is_dspark()
 
-    def has_gpu_draft(self) -> bool:
-        """Whether the draft phase is a GPU forward. NGRAM builds its tree from a
-        host n-gram corpus lookup instead, so it has no draft forward to overlap CPU
-        work with and its draft reads the previous batch's committed tokens from
-        CPU; see supports_grammar_overlap."""
-        return not self.is_ngram()
-
     def supports_grammar_overlap(self) -> bool:
         """Whether spec + grammar decode keeps cross-batch overlap on, with the worker
         advancing the grammar FSM inside verify() via the scheduler's grammar barrier.
+        The negation drives ScheduleBatch.grammar_needs_sync.
 
-        Two conditions: a GPU draft phase, so the grammar CPU work (FSM advance +
-        bitmask build) has a target-verify forward to hide under, and a worker that
-        threads the barrier through verify(). A host draft disqualifies outright --
-        it stays synchronous (need_grammar_sync) by design, not pending migration.
+        The precondition is a GPU draft phase: the grammar CPU work (FSM advance +
+        bitmask build) hides under the target-verify forward. NGRAM drafts from a
+        host n-gram corpus lookup, which has no such window and reads the previous
+        batch's committed tokens from CPU anyway, so it stays synchronous by design
+        rather than as a pending migration.
+
         STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         """
-        if not self.has_gpu_draft():
-            return False
         return self.is_eagle() or self.is_standalone()
 
     def has_draft_kv(self) -> bool:

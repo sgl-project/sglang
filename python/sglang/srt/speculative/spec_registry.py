@@ -95,10 +95,6 @@ class CustomSpecAlgo:
     def supports_ragged_verify(self) -> bool:
         return False
 
-    def has_gpu_draft(self) -> bool:
-        # Custom algorithms draft with a model forward by default.
-        return True
-
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
         # scheduler's grammar barrier), letting spec + grammar decode overlap.

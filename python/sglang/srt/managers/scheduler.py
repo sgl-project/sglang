@@ -1680,8 +1680,7 @@ class Scheduler(
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
