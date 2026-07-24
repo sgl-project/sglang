@@ -479,8 +479,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_group: dist.ProcessGroup = None,
     ):
         tp_group = tp_group or get_tp_group()
-        if get_group_size(tp_group) > 1:
-            self.output_sizes = output_sizes
+        # Set output_sizes BEFORE super().__init__() so ColumnParallelLinear derives
+        # per-shard output_partition_sizes.
+        self.output_sizes = output_sizes
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -492,7 +493,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             tp_group=tp_group,
         )
-        self.output_sizes = output_sizes
         assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(
