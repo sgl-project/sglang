@@ -229,9 +229,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             )
 
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer(
-                hidden_states
-            )
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
         elif pertoken_scale is not None:
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2

@@ -71,8 +71,7 @@ class ModelSlimW4A8MXFP4MoE(ModelSlimMoEScheme):
             torch.zeros(
                 num_experts,
                 output_size,
-                (input_size + W4A8_MXFP4_BLOCK_SIZE - 1)
-                // W4A8_MXFP4_BLOCK_SIZE,
+                (input_size + W4A8_MXFP4_BLOCK_SIZE - 1) // W4A8_MXFP4_BLOCK_SIZE,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
