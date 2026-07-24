@@ -87,6 +87,41 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
+_CTX_BUCKET_MAX = 2**31 - 1
+
+
+def _parse_ctx_bucket_key(key: str) -> tuple[int, int]:
+    if not isinstance(key, str) or "-" not in key:
+        raise ValueError(f"ctx_buckets key must be a 'lo-hi' string, got {key!r}")
+    lo_str, hi_str = key.split("-", 1)
+    try:
+        lo, hi = int(lo_str), int(hi_str)
+    except ValueError as e:
+        raise ValueError(f"ctx_buckets key {key!r} must contain integer 'lo-hi'") from e
+    if lo < 1 or hi < lo:
+        raise ValueError(f"ctx_buckets key {key!r} must satisfy 1 <= lo <= hi")
+    return lo, hi
+
+
+def _validate_ctx_bucket_coverage(
+    bs: int, ordered: list[tuple[int, int, dict]]
+) -> None:
+    if not ordered:
+        raise ValueError(f"BS {bs}: ctx_buckets must not be empty")
+    if ordered[0][0] != 1:
+        raise ValueError(
+            f"BS {bs}: ctx_buckets must start at 1, got lo={ordered[0][0]}"
+        )
+    for i in range(1, len(ordered)):
+        prev_hi = ordered[i - 1][1]
+        cur_lo = ordered[i][0]
+        if cur_lo != prev_hi + 1:
+            raise ValueError(
+                f"BS {bs}: ctx_buckets gap between "
+                f"{prev_hi} and {cur_lo}; ranges must be contiguous"
+            )
+
+
 def _load_adaptive_config(
     cfg_path: str | None,
 ) -> tuple[dict, dict[int, dict]]:
@@ -105,16 +140,40 @@ def _load_adaptive_config(
         if not key.isdigit():
             continue
 
-        steps = entry.get("candidate_steps")
-        if (
-            not isinstance(steps, list)
-            or not steps
-            or not all(isinstance(s, int) and s >= 0 for s in steps)
-        ):
-            raise ValueError(
-                f"BS {key}: candidate_steps must be a list of non-negative ints, "
-                f"got {steps!r}"
-            )
+        ctx_raw = entry.get("ctx_buckets")
+        if ctx_raw is not None:
+            if not isinstance(ctx_raw, dict) or not ctx_raw:
+                raise ValueError(
+                    f"BS {key}: ctx_buckets must be a non-empty dict, "
+                    f"got {ctx_raw!r}"
+                )
+            for bucket_key, bucket_entry in ctx_raw.items():
+                _parse_ctx_bucket_key(bucket_key)
+                steps = (
+                    bucket_entry.get("candidate_steps")
+                    if isinstance(bucket_entry, dict)
+                    else None
+                )
+                if (
+                    not isinstance(steps, list)
+                    or not steps
+                    or not all(isinstance(s, int) and s >= 0 for s in steps)
+                ):
+                    raise ValueError(
+                        f"BS {key} ctx bucket {bucket_key!r}: candidate_steps "
+                        f"must be a list of non-negative ints, got {steps!r}"
+                    )
+        else:
+            steps = entry.get("candidate_steps")
+            if (
+                not isinstance(steps, list)
+                or not steps
+                or not all(isinstance(s, int) and s >= 0 for s in steps)
+            ):
+                raise ValueError(
+                    f"BS {key}: candidate_steps must be a list of non-negative ints, "
+                    f"got {steps!r}"
+                )
         bs_entries[int(key)] = entry
 
     if not bs_entries:
@@ -133,7 +192,12 @@ def resolve_candidate_steps_from_config(
     _, bs_entries = _load_adaptive_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
-        all_steps.update(entry["candidate_steps"])
+        ctx_raw = entry.get("ctx_buckets")
+        if ctx_raw is not None:
+            for bucket_entry in ctx_raw.values():
+                all_steps.update(bucket_entry["candidate_steps"])
+        else:
+            all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
 
 
@@ -260,9 +324,11 @@ class AdaptiveStepSlot:
 
 
 class AdaptiveSpeculativeParams:
-    """Routes ``batch_size`` to the correct per-BS slot.
+    """Routes ``(batch_size, ctx_repr)`` to the correct per-(BS, ctx) slot.
 
-    A slot is a per-BS configuration of adaptive step selection.
+    A slot is a per-(BS, ctx-bucket) configuration of adaptive step
+    selection. Legacy 1D configs (no ``ctx_buckets`` key) degenerate to a
+    single ctx bucket covering ``[0, ∞)`` per BS.
     """
 
     def __init__(
@@ -273,13 +339,43 @@ class AdaptiveSpeculativeParams:
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
+        self._ctx_slots_by_bs: dict[int, dict[int, AdaptiveStepSlot]] = {}
+        self._ctx_lo_by_bs: dict[int, list[int]] = {}
+        self._ctx_hi_by_bs: dict[int, list[int]] = {}
         self._cuda_graph_bs: list[int] | None = None
 
         for bs, entry in sorted(bs_entries.items()):
-            self._slots[bs] = AdaptiveStepSlot(
-                initial_steps=initial_steps,
-                cfg={**cfg, **entry},
-            )
+            ctx_raw = entry.get("ctx_buckets")
+            bs_slots: dict[int, AdaptiveStepSlot] = {}
+            los: list[int] = []
+            his: list[int] = []
+            if ctx_raw is None:
+                bs_slots[1] = AdaptiveStepSlot(
+                    initial_steps=initial_steps,
+                    cfg={**cfg, **entry},
+                )
+                los.append(1)
+                his.append(_CTX_BUCKET_MAX)
+            else:
+                ordered: list[tuple[int, int, dict]] = []
+                for bucket_key, bucket_entry in ctx_raw.items():
+                    lo, hi = _parse_ctx_bucket_key(bucket_key)
+                    ordered.append((lo, hi, bucket_entry))
+                ordered.sort(key=lambda t: t[0])
+                _validate_ctx_bucket_coverage(bs, ordered)
+                for lo, hi, bucket_entry in ordered:
+                    merged = {**cfg, **entry, **bucket_entry}
+                    merged.pop("ctx_buckets", None)
+                    bs_slots[lo] = AdaptiveStepSlot(
+                        initial_steps=initial_steps,
+                        cfg=merged,
+                    )
+                    los.append(lo)
+                    his.append(hi)
+            self._ctx_slots_by_bs[bs] = bs_slots
+            self._slots[bs] = bs_slots[los[0]]
+            self._ctx_lo_by_bs[bs] = los
+            self._ctx_hi_by_bs[bs] = his
 
         first_slot = self._slots[self._bs_list[0]]
         log_info_on_rank0(
@@ -291,23 +387,33 @@ class AdaptiveSpeculativeParams:
 
     @cached_property
     def candidate_steps(self) -> list[int]:
-        """Union of all BS slots' candidate steps."""
-        return sorted({s for p in self._slots.values() for s in p.candidate_steps})
+        """Union of all (BS, ctx) slots' candidate steps."""
+        return sorted(
+            {
+                s
+                for buckets in self._ctx_slots_by_bs.values()
+                for slot in buckets.values()
+                for s in slot.candidate_steps
+            }
+        )
 
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
-    def get_steps_for_batch(self, batch_size: int) -> int:
-        return self._route(batch_size).current_steps
+    def get_steps_for_batch(self, batch_size: int, ctx_repr: int = 0) -> int:
+        return self._route(batch_size, ctx_repr).current_steps
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        ctx_repr: int = 0,
     ) -> int | None:
-        """Feed verify results to the matching BS slot's EMA.
+        """Feed verify results to the matching (BS, ctx) slot's EMA.
 
         Returns the new step if a switch is warranted, else ``None``.
         """
-        params = self._route(batch_size)
+        params = self._route(batch_size, ctx_repr)
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
@@ -316,21 +422,40 @@ class AdaptiveSpeculativeParams:
         """Return cuda_graph_bs values that can reach *step* at runtime.
 
         Returns ``None`` when CUDA graphs are disabled (``set_cuda_graph_bs``
-        was never called or was called with ``None``).
+        was never called or was called with ``None``). Under the 2D schema
+        the reachable step set at a given BS is the union of every ctx
+        bucket's ``candidate_steps`` — the capture set is BS-only, so the
+        pruning shape matches the 1D-union config.
         """
         if self._cuda_graph_bs is None:
             return None
         return [
             v
             for v in self._cuda_graph_bs
-            if step in self._slots[self._find_closest_bs(v)].candidate_steps
+            if step in self._steps_reachable_at_bs(self._find_closest_bs(v))
         ]
 
-    def _route(self, batch_size: int) -> AdaptiveStepSlot:
-        """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
-        return self._slots[
-            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        ]
+    def _steps_reachable_at_bs(self, bs: int) -> set[int]:
+        return {
+            s
+            for slot in self._ctx_slots_by_bs[bs].values()
+            for s in slot.candidate_steps
+        }
+
+    def _route(self, batch_size: int, ctx_repr: int = 0) -> AdaptiveStepSlot:
+        """Map *(batch_size, ctx_repr)* → pad to CUDA-graph BS → slot."""
+        bs = self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+        return self._slot_for_ctx(bs, ctx_repr)
+
+    def _slot_for_ctx(self, bs: int, ctx_repr: int) -> AdaptiveStepSlot:
+        buckets = self._ctx_slots_by_bs[bs]
+        if len(buckets) == 1:
+            return next(iter(buckets.values()))
+        his = self._ctx_hi_by_bs[bs]
+        idx = bisect.bisect_left(his, ctx_repr)
+        if idx == len(his):
+            idx = len(his) - 1
+        return buckets[self._ctx_lo_by_bs[bs][idx]]
 
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         if self._cuda_graph_bs is None:
