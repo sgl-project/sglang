@@ -29,9 +29,12 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        # Only the backends the spec decode loop runs: decode + verify.
+        # The FutureMap seq_lens mirror exists for the spec loop's variable
+        # accept_len, and target_verify is the only forward this backend serves
+        # there (plain decode advances seq_lens by 1 on the host).
         self.needs_cpu_seq_lens = (
-            decode_backend.needs_cpu_seq_lens or self.verify_backend.needs_cpu_seq_lens
+            model_runner.server_args.speculative_algorithm is not None
+            and self.verify_backend.needs_cpu_seq_lens
         )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
