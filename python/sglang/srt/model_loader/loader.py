@@ -12,7 +12,6 @@ import fnmatch
 import gc
 import glob
 import hashlib
-import itertools
 import json
 import logging
 import math
@@ -1668,11 +1667,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
         )
         self._verify_on_load = bool(extra.pop("verify_on_load", False))
-        # Left in extra for DefaultModelLoader's first-time HF load.
-        self._enable_multithread_load = bool(extra.get("enable_multithread_load", True))
-        self._num_threads = int(extra.get("num_threads", self.DEFAULT_NUM_THREADS))
-        if self._num_threads < 1:
-            raise ValueError(f"num_threads must be >= 1, got {self._num_threads}")
         load_config.model_loader_extra_config = extra
         # DefaultModelLoader discovers source weights under AUTO.
         load_config.load_format = LoadFormat.AUTO
@@ -2416,60 +2410,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         cached.clear()
         del cached
 
-    def _iter_presharded_files(
-        self,
-        by_file: Dict[str, List[Dict[str, Any]]],
-        presharded_dir: str,
-    ) -> Generator[Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]], None, None]:
-        """Yield (items, host_tensors); multi-thread disk reads when enabled."""
-        file_items = list(by_file.items())
-        if not file_items:
-            return
-
-        use_mt = self._enable_multithread_load and self._num_threads > 1
-        if not use_mt or len(file_items) == 1:
-            for filename, items in file_items:
-                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
-                full_path = os.path.join(presharded_dir, filename)
-                yield items, self._read_presharded_file(full_path, stored_keys)
-            return
-
-        max_workers = min(self._num_threads, len(file_items))
-        logger.info(
-            "Multi-thread loading %d presharded files with %d workers",
-            len(file_items),
-            max_workers,
-        )
-
-        def _job(
-            filename: str, items: List[Dict[str, Any]]
-        ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
-            stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
-            full_path = os.path.join(presharded_dir, filename)
-            return items, self._read_presharded_file(full_path, stored_keys)
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="presharded-load",
-        ) as executor:
-            file_iter = iter(file_items)
-            pending: set = set()
-            for filename, items in itertools.islice(file_iter, max_workers):
-                pending.add(executor.submit(_job, filename, items))
-
-            while pending:
-                done, _ = concurrent.futures.wait(
-                    pending,
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                for fut in done:
-                    pending.remove(fut)
-                    yield fut.result()
-                    next_item = next(file_iter, None)
-                    if next_item is not None:
-                        filename, items = next_item
-                        pending.add(executor.submit(_job, filename, items))
-
     def _load_from_presharded(
         self,
         model_config: ModelConfig,
@@ -2508,7 +2448,11 @@ class PreshardedModelLoader(DefaultModelLoader):
 
             loaded_param_keys: set = set()
             verify_hashes: List[Tuple[str, str]] = []
-            for items, cached in self._iter_presharded_files(by_file, presharded_dir):
+            for filename, items in by_file.items():
+                stored_keys = list(dict.fromkeys(r["stored_key"] for r in items))
+                cached = self._read_presharded_file(
+                    os.path.join(presharded_dir, filename), stored_keys
+                )
                 self._apply_presharded_file(
                     items=items,
                     cached=cached,
