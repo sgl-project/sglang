@@ -1322,6 +1322,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
