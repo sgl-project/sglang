@@ -12,9 +12,22 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu, print_warning_once
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+# For XPU, try to import JIT infrastructure from sgl_kernel
+try:
+    from sgl_kernel.jit import (
+        can_use_fused_inplace_qknorm as _xpu_can_use_fused_inplace_qknorm,
+    )
+    from sgl_kernel.jit import fused_inplace_qknorm as _xpu_fused_inplace_qknorm
+    from sgl_kernel.jit import rmsnorm as _xpu_rmsnorm
+
+    _HAS_SGL_KERNEL_JIT = True
+except ImportError:
+    _HAS_SGL_KERNEL_JIT = False
 
 
 logger = logging.getLogger(__name__)
@@ -103,8 +116,15 @@ def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
     try:
-        _jit_qknorm_module(head_dim, dtype)
-        return True
+        if is_xpu():
+            # XPU requires sgl-kernel-xpu
+            if _HAS_SGL_KERNEL_JIT:
+                return _xpu_can_use_fused_inplace_qknorm(head_dim, dtype)
+            else:
+                return False
+        else:
+            _jit_qknorm_module(head_dim, dtype)
+            return True
     except Exception as e:
         logger.warning(f"Failed to load JIT QK-Norm kernel: {e}")
         return False
@@ -121,6 +141,17 @@ def fused_inplace_qknorm(
     head_dim: int = 0,
 ) -> None:
     head_dim = head_dim or q.size(-1)
+    # XPU path - delegate to sgl_kernel.jit
+    if is_xpu() and q.device.type == "xpu":
+        if not _HAS_SGL_KERNEL_JIT:
+            raise RuntimeError(
+                "XPU JIT kernels require sgl-kernel-xpu to be installed.\n"
+                "Install it with: pip install sgl-kernel-xpu"
+            )
+        _xpu_fused_inplace_qknorm(q, k, q_weight, k_weight, eps, head_dim=head_dim)
+        return
+
+    # Original CUDA path
     module = _jit_qknorm_module(head_dim, q.dtype)
     module.qknorm(q, k, q_weight, k_weight, eps)
 
@@ -134,6 +165,30 @@ def rmsnorm(
 ) -> None:
     out = out if out is not None else input
     hidden_size = input.size(-1)
+    # XPU path - delegate to sgl_kernel.jit with fallback
+    if is_xpu() and input.device.type == "xpu":
+        if _HAS_SGL_KERNEL_JIT:
+            try:
+                _xpu_rmsnorm(input, weight, out, eps)
+                return
+            except (ValueError, RuntimeError) as e:
+                print_warning_once(
+                    f"XPU JIT rmsnorm kernel failed ({e}), "
+                    "falling back to native implementation"
+                )
+                # Fall through to generic implementation below
+        else:
+            logger.debug("sgl-kernel-xpu not installed, using native implementation")
+
+        # Generic PyTorch fallback for XPU
+        x = input.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        x = x * weight.float()  # keep in fp32
+        out.copy_(x)  # single round, to the output dtype
+        return
+
+    # CUDA path with hidden size validation
     if not _is_supported_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(
             f"jit rmsnorm: unsupported hidden_size={hidden_size}. "

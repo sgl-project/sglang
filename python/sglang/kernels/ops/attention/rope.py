@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -11,10 +12,67 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu, print_warning_once
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+# For XPU, try to import JIT infrastructure from sgl_kernel
+try:
+    from sgl_kernel.jit import apply_rope_inplace as _xpu_apply_rope_inplace
+    from sgl_kernel.jit import (
+        apply_rope_inplace_with_kvcache as _xpu_apply_rope_inplace_with_kvcache,
+    )
+
+    _HAS_SGL_KERNEL_JIT = True
+except ImportError:
+    _HAS_SGL_KERNEL_JIT = False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _native_rope_rotate(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool
+) -> None:
+    """Rotate the first ``rope_dim`` channels of ``x`` in place (PyTorch fallback).
+
+    ``x``: [num_tokens, num_heads, head_dim]; ``cos``/``sin``: [num_tokens, rope_dim // 2].
+    NeoX splits the rotary block into halves; non-NeoX (GPT-J) uses interleaved
+    even/odd pairs. Channels beyond ``rope_dim`` are left untouched.
+    """
+    rope_dim = cos.shape[-1] * 2
+    xf = x[..., :rope_dim].float()
+    cos = cos[:, None, :]
+    sin = sin[:, None, :]
+    if is_neox:
+        x1 = xf[..., : rope_dim // 2]
+        x2 = xf[..., rope_dim // 2 :]
+        rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    else:
+        x1 = xf[..., 0::2]
+        x2 = xf[..., 1::2]
+        rotated = torch.stack(
+            (x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1
+        ).flatten(-2)
+    x[..., :rope_dim] = rotated.to(x.dtype)
+
+
+def _native_apply_rope_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+    rope_dim: int,
+) -> None:
+    """Generic PyTorch RoPE applied in place to q/k (XPU fallback)."""
+    half = rope_dim // 2
+    gathered = cos_sin_cache[positions.long()]
+    cos, sin = gathered[..., :half], gathered[..., half:rope_dim]
+    _native_rope_rotate(q, cos, sin, is_neox)
+    _native_rope_rotate(k, cos, sin, is_neox)
 
 
 @cache_once
@@ -133,6 +191,27 @@ def apply_rope_inplace(
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
+
+    # Dispatch to XPU or CUDA based on device type
+    if is_xpu() and q.device.type == "xpu":
+        if _HAS_SGL_KERNEL_JIT:
+            try:
+                _xpu_apply_rope_inplace(
+                    q, k, cos_sin_cache, positions, is_neox=is_neox, rope_dim=rope_dim
+                )
+                return
+            except (ValueError, RuntimeError) as e:
+                print_warning_once(
+                    f"XPU JIT rope kernel failed ({e}), "
+                    "falling back to native implementation"
+                )
+        else:
+            logger.debug("sgl-kernel-xpu not installed, using native implementation")
+
+        # Generic PyTorch fallback for XPU
+        _native_apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox, rope_dim)
+        return
+
     module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
     module.run_rope(q, k, cos_sin_cache, positions)
 
@@ -171,6 +250,39 @@ def apply_rope_inplace_with_kvcache(
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     v = v.view_as(k)
+
+    # Dispatch to XPU or CUDA based on device type
+    if is_xpu() and q.device.type == "xpu":
+        if _HAS_SGL_KERNEL_JIT:
+            try:
+                _xpu_apply_rope_inplace_with_kvcache(
+                    q,
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    cos_sin_cache,
+                    positions,
+                    out_loc,
+                    is_neox=is_neox,
+                    rope_dim=rope_dim,
+                )
+                return
+            except (ValueError, RuntimeError) as e:
+                print_warning_once(
+                    f"XPU JIT rope+kvcache kernel failed ({e}), "
+                    "falling back to native implementation"
+                )
+        else:
+            logger.debug("sgl-kernel-xpu not installed, using native implementation")
+
+        # Generic PyTorch fallback for XPU: RoPE in place, then store k/v to cache.
+        _native_apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox, rope_dim)
+        loc = out_loc.long()
+        k_cache[loc] = k.reshape(k.shape[0], -1).to(k_cache.dtype)
+        v_cache[loc] = v.reshape(v.shape[0], -1).to(v_cache.dtype)
+        return
+
     module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
     module.run_rope_store(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
 
