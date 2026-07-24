@@ -67,6 +67,13 @@ _MLA_DECODE_MIN_BLOCK_KV = 32
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
+    # Diagnostic override: skip the MLA split floor so
+    # --triton-attention-num-kv-splits can force nsplit as low as 1. Used to test
+    # whether the decode split-KV online-softmax reduction over a long
+    # transferred prefix is the source of the non-MTP disagg accuracy drop
+    # (extend/verify uses no split-KV and is correct at ~0.95).
+    if get_bool_env_var("SGLANG_DEBUG_MLA_DECODE_NO_SPLIT_CAP", "false"):
+        return base_max_kv_splits
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
@@ -1783,6 +1790,12 @@ class TritonAttnBackend(AttentionBackend):
             )
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        from sglang.srt.debug_utils.disagg_decode_meta_probe import (
+            maybe_dump_decode_meta,
+        )
+
+        maybe_dump_decode_meta("triton", self, layer, forward_batch)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
