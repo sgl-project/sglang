@@ -585,8 +585,26 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Empty batch (e.g. an idle DP-attention rank or a 0-token cuda-graph
+        # bucket): launching the HIP kernel on 0 rows raises "HIP error: invalid
+        # configuration argument". forward_cuda and forward_aiter guard this the
+        # same way.
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
+
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
+            return self.forward_native(x, residual, post_residual_addition)
+
+        # vllm's kernels always take the variance over the full hidden size and
+        # apply the weight in fp32, so neither the variance-size override nor
+        # the HF multiplication order can be expressed through them.
+        # forward_cuda falls back to native for the same reason.
+        if self.variance_size_override is not None or self.cast_x_before_out_mul:
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
@@ -606,14 +624,12 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            # vllm's fused_add_rms_norm is in-place on (input, residual), the
+            # same contract as the sgl_kernel one used by forward_cuda.
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -949,18 +965,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         else:
             w = self.gemma_weight
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            #           fused_add_rms_norm(input, residual, weight, eps) -> None
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
+                # vllm's fused_add_rms_norm is in-place on (input, residual), the
+                # same contract as the sgl_kernel one used by forward_cuda.
+                fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+                return x, residual
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
             return out
