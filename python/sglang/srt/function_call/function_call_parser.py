@@ -37,6 +37,7 @@ from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.minimax_m3 import MinimaxM3Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
+from sglang.srt.function_call.plamo3_detector import Plamo3ToolDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
@@ -76,6 +77,7 @@ class FunctionCallParser:
         "mimo": MiMoDetector,
         "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
+        "plamo3": Plamo3ToolDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
         "qwen": Qwen25Detector,

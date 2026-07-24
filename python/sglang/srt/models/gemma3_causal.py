@@ -26,7 +26,7 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -95,13 +95,15 @@ class Gemma3MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
-        if hidden_activation != "gelu_pytorch_tanh":
+        if hidden_activation == "gelu_pytorch_tanh":
+            self.act_fn = GeluAndMul()
+        elif hidden_activation == "silu" or hidden_activation == "swiglu":
+            self.act_fn = SiluAndMul()
+        else:
             raise ValueError(
-                f"{self.__class__.__name__} uses `gelu_pytorch_tanh` as the hidden activation "
-                "function. Please set `hidden_activation` to "
-                "`gelu_pytorch_tanh`."
+                f"{self.__class__.__name__} supports `gelu_pytorch_tanh` or `silu` as the "
+                f"hidden activation function, but got {hidden_activation!r}."
             )
-        self.act_fn = GeluAndMul()
         self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -880,6 +882,10 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 # lm_head is not used in vllm as it is tied with embed_token.
                 # To prevent errors, skip loading lm_head.weight.
                 if "lm_head.weight" in name:
+                    continue
+                # Skip rotary embedding buffers (e.g. from PLaMo3 checkpoints
+                # that store mixer.rotary_emb.cos_cached / inv_freq / sin_cached).
+                if "rotary_emb" in name:
                     continue
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
