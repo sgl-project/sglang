@@ -3308,7 +3308,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.full_kv_hit_length, len(tokens))
         self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
 
-    def test_mamba_branching_seqlen_uses_host_full_hit_under_hicache(self):
+    def test_mamba_branching_from_host_full_is_reusable_after_insert(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -3346,7 +3346,21 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(result.device_indices), chunk_size)
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.full_kv_hit_length, len(tokens))
-        self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
+        branching_seqlen = 2 * chunk_size
+        self.assertEqual(result.mamba_branching_seqlen, branching_seqlen)
+
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[:branching_seqlen],
+        )
+        second_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+
+        self.assertEqual(len(second_match.device_indices), branching_seqlen)
+        self.assertIsNone(second_match.mamba_branching_seqlen)
 
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
