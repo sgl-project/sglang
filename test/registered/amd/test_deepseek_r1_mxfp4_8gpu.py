@@ -45,6 +45,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             "eager",
             "--piecewise-cuda-graph-max-tokens",
             "8192",
+            "--enable-aiter-allreduce-fusion",
         ]
         cls.process = popen_launch_server(
             cls.model,
