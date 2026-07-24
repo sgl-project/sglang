@@ -1,17 +1,15 @@
-"""v2 of the native-CUDA radix-select router for K3 routing (all batch sizes).
+"""Native-CUDA radix-select router for K3 routing (all batch sizes).
 
-Same selection semantics as moe_fused_gate_radix (v1), different execution strategy:
-keys/activations stay in registers (224 threads, 4 experts each), the split-bin
-search runs on warp scans instead of cub, rounds exit early when the top-k
-separates on a byte boundary, and the (biased desc, id asc) output sort is
-optional — consumers that only gather by expert id can pass sorted=False and
+Keys and activations stay in registers (224 threads, 4 experts each), the
+split-bin search runs on warp scans instead of cub, rounds exit early when the
+top-k separates on a byte boundary, and the (biased desc, id asc) output sort
+is optional. Consumers that only gather by expert id can pass sorted=False and
 skip the epilogue rank-sort entirely.
 
-Default ON via SGLANG_OPT_USE_ROUTE_RADIX_V2 (dispatched in moe_fused_gate for
-every batch size — v1 is no longer dispatched and is kept as a test reference;
-the production dispatch uses sorted=False). 3.1-3.5x over the triton router at
-[1..8192, 896] top-16 on B200. Correctness/benchmark coverage vs the v1 and
-triton baselines lives in test/registered/jit/test_moe_route_radix_v2.py and
+Dispatched automatically from moe_fused_gate for covered inputs; the production
+dispatch uses sorted=False. It is 3.1-3.5x faster than the Triton router at
+[1..8192, 896] top-16 on B200. Correctness and benchmark coverage against the
+Triton baseline lives in test/registered/jit/test_moe_route_radix.py and
 test/registered/jit/benchmark/bench_moe_route_radix.py.
 """
 
@@ -36,15 +34,15 @@ _TOPK = 16
 
 
 @cache_once
-def _jit_route_radix_v2_module() -> Module:
+def _jit_route_radix_module() -> Module:
     args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
-        "moe_route_radix_v2",
+        "moe_route_radix",
         *args,
-        cuda_files=["moe/route_radix_v2.cuh"],
-        cuda_wrappers=[("run", f"RouteRadixV2Kernel<{args}>::run")],
+        cuda_files=["moe/route_radix.cuh"],
+        cuda_wrappers=[("run", f"RouteRadixKernel<{args}>::run")],
         # No fast-math: expert-id selection must stay bit-identical to the
-        # triton router / v1 under ties/NaN.
+        # Triton router under ties/NaN.
         extra_cuda_cflags=["-O3"],
     )
 
@@ -64,7 +62,7 @@ def covered(scores: torch.Tensor, bias: torch.Tensor, topk: int) -> bool:
     )
 
 
-def route_radix_v2(
+def route_radix(
     scores: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
@@ -78,13 +76,14 @@ def route_radix_v2(
 
     Default sorted=False: winners come out in expert-id-ascending order
     (downstream MoE kernels are order-insensitive) and the epilogue rank-sort
-    is skipped. sorted=True restores v1's (biased desc, id asc) output order.
-    Either way the winner set matches v1 exactly; the renorm sum is taken in
-    the respective output order, so weights differ from v1 by <= ~1 ulp."""
+    is skipped. sorted=True restores the Triton router's (biased desc, id asc)
+    output order. Either way the winner set matches Triton exactly; the renorm
+    sum is taken in the respective output order, so weights may differ by
+    <= ~1 ulp."""
     M = scores.shape[0]
     out_w = torch.empty((M, topk), dtype=torch.float32, device=scores.device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=scores.device)
-    _jit_route_radix_v2_module().run(
+    _jit_route_radix_module().run(
         scores,
         bias,
         out_w,

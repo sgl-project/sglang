@@ -714,9 +714,6 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
-    # Collapse per-layer mamba prefix-cache track launches into one
-    # all-layers launch per decode step (see MambaAttnBackendBase).
-    SGLANG_MAMBA_TRACK_FUSED = EnvBool(True)
     # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to the private
     # FlashInfer snapshot checkout (internal collaboration artifact with
     # csrc/, include/, 3rdparty/, local_cubins/). Unset = feature off.
@@ -1089,13 +1086,6 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-    # v2 radix-select router for K3 routing ([M, 896] bf16 top-16, all batch
-    # sizes; 3.1-3.5x over the triton router on B200). Same winner set as the
-    # triton router, but winners come out in expert-id order (the
-    # biased-descending sort is skipped — downstream MoE kernels are
-    # order-insensitive) and the renorm sum may differ by ~1 ulp. Set to
-    # false to fall back to triton.
-    SGLANG_OPT_USE_ROUTE_RADIX_V2 = EnvBool(True)
 
     SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
@@ -1237,7 +1227,6 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
     _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
-    _print_deprecated_env("SGLANG_K3_TAIL_FUSE")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
