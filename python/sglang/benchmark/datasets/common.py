@@ -67,11 +67,11 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get valid token ids from the tokenizer vocabulary."""
-    return [
+    return sorted(
         token_id
         for token_id in tokenizer.get_vocab().values()
         if isinstance(token_id, int)
-    ]
+    )
 
 
 def gen_prompt(tokenizer, token_num):
