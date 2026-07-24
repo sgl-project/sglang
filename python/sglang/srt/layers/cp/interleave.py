@@ -262,7 +262,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         k_nope: Any,
         k_rope: Any,
     ) -> Any:
-        del layer
         kv_lora_rank = k_nope.shape[-1]
         latent_cache = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)
         full_latent = self.gather_kv_cache(
