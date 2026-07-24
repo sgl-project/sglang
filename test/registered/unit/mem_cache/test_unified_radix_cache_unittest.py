@@ -3689,6 +3689,62 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_splits_oversized_host_tombstone_before_load_back(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires Full+SWA")
+
+        cache, allocator, _ = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        window = (self.cfg.sliding_window_size + ps - 1) // ps * ps
+        if window <= ps:
+            self.skipTest("mixed device/host window requires more than one page")
+        tokens = self._make_seq(1, 2 * window // ps)
+        full = self._alloc(allocator, len(tokens))
+        self.assertIsNotNone(full)
+        host_node = cache._add_new_node(
+            cache.root_node,
+            RadixKey(array("q", tokens)),
+            full,
+        )
+        swa = allocator.translate_loc_from_full_to_swa(full)
+        swa_cd = host_node.component_data[ComponentType.SWA]
+        swa_cd.value = swa.clone()
+        cache.lru_lists[ComponentType.SWA].insert_mru(host_node)
+        cache.component_evictable_size_[ComponentType.SWA] += len(swa)
+        cache._update_evictable_leaf_sets(host_node)
+
+        self._backup_node(cache, host_node)
+        allocator.swa_attn_allocator.free(swa)
+        allocator.full_to_swa_index_mapping[full] = 0
+        swa_cd.value = None
+        cache.lru_lists[ComponentType.SWA].remove_node(host_node)
+        cache.host_lru_lists[ComponentType.SWA].insert_mru(host_node)
+        cache.component_evictable_size_[ComponentType.SWA] -= len(swa)
+
+        leaf_tokens = self._make_seq(10000, 1)
+        leaf_full = self._alloc(allocator, ps)
+        self.assertIsNotNone(leaf_full)
+        device_leaf = cache._add_new_node(
+            host_node,
+            RadixKey(array("q", leaf_tokens)),
+            leaf_full,
+        )
+        leaf_swa = allocator.translate_loc_from_full_to_swa(leaf_full)
+        device_leaf.component_data[ComponentType.SWA].value = leaf_swa.clone()
+        cache.lru_lists[ComponentType.SWA].insert_mru(device_leaf)
+        cache.component_evictable_size_[ComponentType.SWA] += ps
+        cache._update_evictable_leaf_sets(host_node)
+        cache._update_evictable_leaf_sets(device_leaf)
+        cache.sanity_check()
+
+        self.assertTrue(cache.load_back(device_leaf))
+        prefix_node = host_node.parent
+        self.assertIsNot(prefix_node, cache.root_node)
+        self.assertEqual(len(prefix_node.key), window + ps)
+        self.assertEqual(len(host_node.key), window - ps)
+        self._finish_pending_loads(cache)
+        cache.sanity_check()
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
