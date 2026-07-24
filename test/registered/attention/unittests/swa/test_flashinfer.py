@@ -42,12 +42,9 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
     HEAD_DIM = 64
     HIDDEN_SIZE = 256
 
-    CASES = make_swa_no_prefix_input_config_cases(
-        "flashinfer"
-    ) + make_swa_prefix_input_config_cases("flashinfer")
-    # Paged-only prefill has no ragged pass / custom prefix mask, so the kernel
-    # must enforce the window; the long case puts tokens past the window.
-    PAGED_MODE_CASES = CASES + (
+    # Exercise above-window correctness in default ragged execution and
+    # ordinary paged planning with a sequence that extends beyond the window.
+    ABOVE_WINDOW_CASES = (
         DenseAttentionCase(
             name="swa_extend_no_prefix_above_window_long",
             backend="flashinfer",
@@ -60,11 +57,17 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             sliding_window_size=4,
         ),
     )
+    CASES = (
+        make_swa_no_prefix_input_config_cases("flashinfer")
+        + make_swa_prefix_input_config_cases("flashinfer")
+        + ABOVE_WINDOW_CASES
+    )
+    PAGED_MODE_CASES = CASES
     # Above-window decode case requires the `extend_window` reference rule
     # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
-    # decode metadata uses `clamp(seq_lens, max=window+1)` per
-    # `flashinfer_backend.py:1031`. See `_SWA_DECODE_EXTEND_WINDOW` in
-    # `common/attention_methods/dense_attention.py`.
+    # decode metadata uses `clamp(seq_lens, max=window+1)` in
+    # `FlashInferIndicesUpdaterDecode.update_sliding_window`. See
+    # `_SWA_DECODE_EXTEND_WINDOW` in `common/attention_methods/dense_attention.py`.
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_within_window",
