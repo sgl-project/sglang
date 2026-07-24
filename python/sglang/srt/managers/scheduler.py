@@ -178,7 +178,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    SchedulerDPAttnAdapter,
+    make_local_breakable_eligible_fn,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -1789,6 +1792,9 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            local_breakable_eligible_fn=make_local_breakable_eligible_fn(
+                self.tp_worker
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:

@@ -4040,6 +4040,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         self._parse_cuda_graph_config()
         self._apply_cuda_graph_compatibility()
+        self._align_prefill_buckets_for_deepep_bcg()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -4050,6 +4051,37 @@ class ServerArgs:
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
             )
+
+    def _align_prefill_buckets_for_deepep_bcg(self):
+        """Non-multiple-of-8 prefill buckets deterministically hang DeepEP
+        a2a capture under BCG (root cause not isolated); align user bucket
+        lists up to multiples of 8 instead."""
+        from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
+
+        if (
+            self.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+            or _resolved_view(self).moe_a2a_backend != "deepep"
+        ):
+            return
+        bs = self.cuda_graph_config.prefill.bs
+        if bs is None:
+            # The default bucket list is derived later from max_bs and
+            # contains non-multiples of 8 (range(4, 33, 4)); materialize it
+            # now so alignment can apply.
+            # At cascade time both bs and max_bs can still be None on the
+            # pure-default path; 2048 is the documented prefill default.
+            max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+            bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+        aligned = sorted({((b + 7) // 8) * 8 for b in bs})
+        if aligned != sorted(bs):
+            logger.info(
+                "Breakable prefill CUDA graph with DeepEP requires bucket "
+                "sizes divisible by 8; aligning %s -> %s.",
+                sorted(bs),
+                aligned,
+            )
+            self.cuda_graph_config.prefill.bs = aligned
+            self.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4248,11 +4280,17 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG.
-            ("MLA attention", lambda: self.use_mla_backend()),
+            # MLA prefill under BCG takes forward_mha, which has no eager
+            # breaks. DSA is exempt: BCG forces the sparse path, whose
+            # indexer already splits eagerly.
+            (
+                "MLA attention (non-DSA)",
+                lambda: self.use_mla_backend()
+                and not is_deepseek_dsa(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -4269,12 +4307,23 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # TBO capture is unsupported: the prefill capture dummy has no
+            # extend lens for compute_split_seq_index, and a frozen split
+            # index would be wrong at replay anyway.
+            (
+                "two-batch overlap",
+                lambda: self.enable_two_batch_overlap,
+            ),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
+            # DeepEP is exempt: its MoE is an eager split node with NORMAL
+            # a2a between segments (DeepEPMoE.a2a_forward_with_output);
+            # buckets are 8-aligned below. Other a2a backends are
+            # unvalidated under BCG.
             (
-                "MoE A2A backend",
-                lambda: _resolved_view(self).moe_a2a_backend != "none",
+                "MoE A2A backend (non-DeepEP)",
+                lambda: _resolved_view(self).moe_a2a_backend not in ("none", "deepep"),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
@@ -4669,8 +4718,17 @@ class ServerArgs:
                 # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
             else:
-                # MLA backend overhead is much higher than expected with fa3.
+                # Breakable prefill pool: ~1.6 GB measured on GLM-5.2-FP8 tp8.
                 reserved_mem += 1.5 * 1024
+            from sglang.srt.arg_groups.overrides import resolved_view
+
+            if (
+                prefill_cuda_graph_config.backend == Backend.BREAKABLE
+                and resolved_view(self).moe_a2a_backend == "deepep"
+            ):
+                # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
+                # during capture); decode-side DeepEP is a baseline cost.
+                reserved_mem += 1 * 1024
 
         return reserved_mem
 

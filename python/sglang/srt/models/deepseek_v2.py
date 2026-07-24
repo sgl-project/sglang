@@ -1211,7 +1211,12 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
-                if self.alt_stream is not None:
+                # No gain under BCG: the a2a window worth hiding under runs
+                # inside the eager MoE break, and every break boundary fully
+                # joins the streams anyway — the cross-break wait_event would
+                # also be illegal (record and wait in different captures).
+                # Keep shared experts on the main stream.
+                if self.alt_stream is not None and not is_in_breakable_cuda_graph():
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
@@ -1400,6 +1405,7 @@ class DeepseekV2MoE(nn.Module):
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
+            and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 

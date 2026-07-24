@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -227,6 +228,7 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    local_breakable_eligible: Optional[Callable[[ScheduleBatch], bool]] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -263,10 +265,19 @@ def prepare_mlp_sync_batch_raw(
     # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
     # min()-reduces this across DP ranks, so a prefill batch with idle ranks
     # still resolves to True (idle ranks become a padded dummy extend).
+    # Vote transport only: the eligibility conditions themselves live in
+    # PrefillCudaGraphRunner.replay_ineligible_locally (reached through
+    # local_breakable_eligible); idle/None ranks stay permissive.
     can_run_breakable_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        or (
+            local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and (
+                local_breakable_eligible is None
+                or local_breakable_eligible(local_batch)
+            )
+        )
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
@@ -361,6 +372,33 @@ def prepare_mlp_sync_batch_raw(
     return local_batch
 
 
+def make_local_breakable_eligible_fn(
+    tp_worker,
+) -> Callable[[ScheduleBatch], bool]:
+    """Bind the rank-local breakable-replay eligibility check
+    (PrefillCudaGraphRunner.replay_ineligible_locally) to the worker's
+    target-model prefill graph runner, for the mlp-sync consensus.
+    """
+    if isinstance(tp_worker, BaseSpecWorker):
+        tp_worker = tp_worker.target_worker
+
+    def local_breakable_eligible(batch: ScheduleBatch) -> bool:
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            return True
+        return not tp_worker.model_runner.prefill_cuda_graph_runner.replay_ineligible_locally(
+            batch_size=batch.batch_size(),
+            num_tokens=batch.extend_num_tokens,
+            input_embeds=batch.input_embeds,
+            replace_embeds=None,
+            prefix_lens=batch.prefix_lens,
+            is_target_verify=batch.forward_mode.is_target_verify(),
+            capture_hidden_mode=None,
+            return_logprob=batch.return_logprob,
+        )
+
+    return local_breakable_eligible
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
     tp_group: GroupCoordinator
@@ -374,6 +412,7 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    local_breakable_eligible_fn: Optional[Callable[[ScheduleBatch], bool]] = None
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -388,6 +427,7 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=self.server_args.dwdp_size > 1,
+            local_breakable_eligible=self.local_breakable_eligible_fn,
         )
 
     def maybe_prepare_mlp_sync_batch(

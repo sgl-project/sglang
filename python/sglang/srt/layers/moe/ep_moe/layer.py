@@ -8,6 +8,10 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -21,10 +25,20 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -155,11 +169,64 @@ class DeepEPMoE(FusedMoE):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
 
+    def _a2a_forward_with_output_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Runs eagerly between BCG segments at every replay. Scope
+        # is_extend_in_batch=True so a2a resolves NORMAL (capture pins
+        # False for PCG). Mutate caller-allocated output: the next
+        # segment reads its recorded address.
+        saved_is_extend_in_batch = get_is_extend_in_batch()
+        set_is_extend_in_batch(True)
+        try:
+            output.copy_(
+                self.forward_impl(
+                    hidden_states,
+                    StandardTopKOutput(topk_weights, topk_ids, router_logits),
+                )
+            )
+        finally:
+            set_is_extend_in_batch(saved_is_extend_in_batch)
+
+    def _a2a_forward_capture_stub(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Capture pass only: record the buffer address, skip the
+        # rank-coupled a2a. Warmup and replay run the real body.
+        output.zero_()
+
+    a2a_forward_with_output = eager_on_graph(
+        True, capture_stub=_a2a_forward_capture_stub
+    )(_a2a_forward_with_output_impl)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        if is_in_breakable_cuda_graph():
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
+            ), "Only standard topk output is supported for breakable cuda graph"
+            output = torch.empty_like(hidden_states)
+            self.a2a_forward_with_output(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                output,
+            )
+            return output
         if is_in_tc_piecewise_cuda_graph():
             assert TopKOutputChecker.format_is_standard(
                 topk_output
