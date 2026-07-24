@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import (
+from sglang.kernels.ops.kv_canary.consts import MAX_REAL_KV_SOURCES, RealKvHashMode
+from sglang.kernels.ops.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
