@@ -253,6 +253,104 @@ Deferred to the gitapp:
 
 The probe just answers "does the engine boot at all in our environment?" — which unblocks the gitapp engineering.
 
+## Proof of concept
+
+Between the smoke probe above (~30 min, prove the engine boots) and the [full plan](#full-plan) below (~1 week, production chart), a proof-of-concept step proves the **gitapp plumbing** works end-to-end: SGLang + sgl-router deploy via ArgoCD, serve real requests, and tear down cleanly when disabled.
+
+Purpose: give clusterdOS maintainers a working artifact to review before we commit engineering to the full chart. The PoC hardcodes `values.yaml` defaults and skips production polish so the diff stays under ~200 lines.
+
+### PoC success criteria
+
+All four must hold:
+
+1. `sglang: enabled: true` in `install.yaml` deploys SGLang + sgl-router via ArgoCD (not raw `kubectl`).
+2. Both pods reach `Ready`; ArgoCD reports **Synced / Healthy**.
+3. Chat completion works through the router (not directly against the engine).
+4. Setting `enabled: false` cleanly removes everything — no leaked resources.
+
+### Explicitly out of scope
+
+Deferred to the full plan:
+
+- PD-disaggregation (single Deployment only)
+- AMD / ROCm support (NVIDIA only)
+- HPA, NetworkPolicy, ServiceMonitor
+- Full `values.yaml` surface (hardcode reasonable defaults)
+- PVC for HuggingFace cache (`emptyDir` is fine for a PoC)
+- HF token secret plumbing (no gated models)
+
+### PoC file layout
+
+Minimal chart, ~180 lines total across 7 files. Mirrors the `gitapps/vllm/` shape plus the router-side pieces:
+
+```
+gitapps/sglang/
+├── Chart.yaml                     # ~10 lines
+├── values.yaml                    # ~30 lines, hardcoded defaults
+└── templates/
+    ├── deployment.yaml            # SGLang engine (~60 lines)
+    ├── service.yaml               # engine ClusterIP (~10 lines)
+    ├── router-deployment.yaml     # sgl-router (~40 lines)
+    ├── router-service.yaml        # router ClusterIP (~10 lines)
+    └── router-rbac.yaml           # SA + Role + RoleBinding on endpointslices (~25 lines)
+```
+
+Plus one line in `install.yaml`: `sglang: enabled: false` under `gitapps:`.
+
+### PoC vs the smoke probe vs the full plan
+
+| Aspect | Smoke probe | **PoC** | Full plan |
+|---|---|---|---|
+| Effort | 30 min | **~4 days** | ~1 week |
+| Deploy path | `kubectl apply -f probe.yaml` | **ArgoCD + `install.yaml` toggle** | Same as PoC |
+| Engine | 1× SGLang pod | **1× SGLang pod** | Multi-replica configurable |
+| Router | None | **`sgl-router` + K8s discovery** | Same as PoC, plus PD toggle |
+| PD-disagg | No | **No** | Yes (values.yaml toggle) |
+| Values surface | N/A | **Hardcoded** | Full |
+| GPU vendor | NVIDIA | **NVIDIA** | NVIDIA + AMD |
+| Purpose | "Does SGLang boot?" | **"Does the gitapp plumbing work?"** | Production integration |
+
+### Demo playbook (~4 days)
+
+**Day 1 — Author the chart** (~4 hours)
+
+1. Fork `gitlab.com/aranya-tech/public/clusterdos`, branch off `develop` as `poc/sglang-inference`.
+2. Author the 7-file `gitapps/sglang/` skeleton — mirror the `gitapps/vllm/` layout for engine templates, use the sgl-router k8s discovery pattern (`--service-discovery --selector=app=sglang`) for the router side.
+3. Add `sglang: enabled: false` to `install.yaml`.
+4. Local dry-run: `helm template gitapps/sglang | kubectl apply --dry-run=client -f -`.
+
+**Day 2 — Deploy on a real cluster** (~4 hours)
+
+5. Point a test cluster's `install.yaml` at the PoC branch (`targetRevision: poc/sglang-inference`).
+6. Enable the gitapp: `sglang: enabled: true`.
+7. Watch ArgoCD sync — capture the `Synced / Healthy` state.
+8. Watch pods come up (~10-20 min for weights download + CUDA graph capture).
+9. Port-forward the router service and curl a chat completion:
+
+    ```bash
+    kubectl -n sglang port-forward svc/sgl-router 30000:30000 &
+    curl -s http://localhost:30000/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"hi"}],"max_tokens":20}' | jq
+    ```
+
+**Day 3 — Iterate + capture evidence** (~4 hours)
+
+10. Iterate on any startup / RBAC / networking issues.
+11. Test teardown: `sglang: enabled: false` → ArgoCD prunes → `kubectl get all -n sglang` returns empty.
+12. Screenshot the ArgoCD UI (Synced/Healthy state, and the successful prune).
+13. Capture the successful `curl` output and pod-ready logs.
+
+**Day 4 — PoC MR + writeup** (~4 hours)
+
+14. Open a draft MR on the clusterdOS repo, title `PoC: SGLang inference gitapp (not for merge)`.
+15. MR body: success-criteria checklist + evidence bundle + explicit gap list vs the full plan below.
+16. Ping maintainers for greenlight on the design.
+
+### PoC image caveat
+
+`sgl-router` currently publishes only a nightly image at `lmsysorg/sglang-staging:experimental-router-dev` (see [Decisions needed](#decisions-needed-before-chart-code-lands) item 2). The PoC uses this nightly to unblock the demo; the full plan expects a stable release tag before chart merge.
+
 ## Full plan
 
 ### Proposed file layout
