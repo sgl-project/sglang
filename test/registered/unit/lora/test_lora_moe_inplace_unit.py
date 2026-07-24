@@ -104,7 +104,9 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
             )
         core = getattr(layer._lora_runner, "runner_core", None)
         self.assertIsNotNone(core)
-        core_config = getattr(core, "config", None) or getattr(core, "runner_config", None)
+        core_config = getattr(core, "config", None) or getattr(
+            core, "runner_config", None
+        )
         self.assertIsNotNone(core_config)
         self.assertIs(core_config, base_layer.moe_runner_config)
         self.assertFalse(core_config.inplace)
