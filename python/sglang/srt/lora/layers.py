@@ -914,11 +914,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self,
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
+        lora_execution_engine: str = "legacy",
     ):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
         lora_backend.is_moe_lora = True
+        self.lora_execution_engine = lora_execution_engine
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
@@ -938,6 +940,15 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self._uses_interleaved_gate_up = (
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
+
+        if self.lora_execution_engine == "sgl_lora":
+            self._initialize_sgl_lora_execution(base_layer)
+            return
+        if self.lora_execution_engine != "legacy":
+            raise ValueError(
+                "FusedMoEWithLoRA received an unresolved LoRA execution engine: "
+                f"{self.lora_execution_engine!r}"
+            )
 
         # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
@@ -1015,6 +1026,126 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 f"LoRA MoE not supported for backend {runner_backend}"
             )
 
+    def _initialize_sgl_lora_execution(self, base_layer: FusedMoE) -> None:
+        """Attach a policy-free BF16 LoRA path to the resident MoE provider."""
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatcher,
+        )
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedFusedMoEMethod,
+        )
+        from sglang.srt.lora.sgl_lora.bf16 import Bf16MoeLaunchConfig
+
+        quant_method = base_layer.quant_method
+        if not isinstance(quant_method, UnquantizedFusedMoEMethod):
+            raise NotImplementedError(
+                "sgl_lora currently supports unquantized BF16 MoE only"
+            )
+        runner_backend = quant_method.runner.runner_backend
+        if (
+            not isinstance(base_layer.dispatcher, StandardDispatcher)
+            or base_layer.w13_weight.dtype != torch.bfloat16
+            or base_layer.w2_weight.dtype != torch.bfloat16
+            or getattr(base_layer, "w13_weight_bias", None) is not None
+            or getattr(base_layer, "w2_weight_bias", None) is not None
+        ):
+            raise NotImplementedError(
+                "sgl_lora BF16 currently requires Standard dispatch and a "
+                "bias-free resident BF16 provider"
+            )
+        runner_config = base_layer.moe_runner_config
+        if (
+            runner_config.activation != "silu"
+            or not runner_config.is_gated
+            or runner_config.gemm1_alpha is not None
+            or runner_config.gemm1_clamp_limit is not None
+            or runner_config.swiglu_limit is not None
+            or runner_config.apply_router_weight_on_input
+            or runner_config.no_combine
+        ):
+            raise NotImplementedError(
+                "sgl_lora BF16 currently supports canonical gated SiLU with "
+                "provider-owned route weighting/combine only"
+            )
+
+        # This is a provisional correctness baseline, not a serving selector.
+        launch_config = Bf16MoeLaunchConfig(
+            routing_block_size=16,
+            lora_a={
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+            lora_b={
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 2,
+            },
+        )
+        self._sgl_lora_launch_config = launch_config
+        self._lora_runner_backend = runner_backend
+
+        if runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+            from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+            from sglang.srt.lora.sgl_lora.deep_gemm_bf16 import (
+                DeepGemmBf16LoRAHookBuilder,
+            )
+
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_hook_builder=DeepGemmBf16LoRAHookBuilder(launch_config),
+            )
+            self._quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=base_layer.w13_weight,
+                w2_weight=base_layer.w2_weight,
+                use_fp8=False,
+            )
+            self._sgl_lora_factor_experts = int(base_layer.num_local_experts) - int(
+                runner_config.num_fused_shared_experts or 0
+            )
+        elif runner_backend.is_flashinfer_trtllm_routed():
+            if runner_config.num_fused_shared_experts:
+                raise NotImplementedError(
+                    "FlashInfer BF16 LoRA does not support fused shared experts"
+                )
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                FlashInferTrtllmBf16MoeQuantInfo,
+            )
+            from sglang.srt.lora.sgl_lora.flashinfer_bf16 import (
+                build_flashinfer_bf16_lora_factor_maps,
+            )
+
+            local_expert_offset = base_layer.moe_ep_rank * base_layer.num_local_experts
+            self._quant_info = FlashInferTrtllmBf16MoeQuantInfo(
+                gemm1_weights=base_layer.w13_weight,
+                gemm2_weights=base_layer.w2_weight,
+                global_num_experts=base_layer.num_experts,
+                local_expert_offset=local_expert_offset,
+            )
+            self._sgl_lora_factor_maps = build_flashinfer_bf16_lora_factor_maps(
+                global_num_experts=base_layer.num_experts,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=base_layer.num_local_experts,
+                device=base_layer.w13_weight.device,
+            )
+            self._sgl_lora_factor_experts = int(base_layer.num_local_experts)
+        else:
+            raise NotImplementedError(
+                "sgl_lora BF16 currently supports DeepGEMM and the public "
+                "FlashInfer TRT-LLM routed provider"
+            )
+        self.lora_use_virtual_experts = True
+
     def set_lora_info(
         self,
         gate_up_lora_a_weights: torch.Tensor,
@@ -1023,6 +1154,30 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         down_lora_b_weights: torch.Tensor = None,
     ):
         """Set LoRA weight tensors from memory pool."""
+        if self.lora_execution_engine == "sgl_lora":
+            expert_count = self._sgl_lora_factor_experts
+            outer_count = 1 if self.experts_shared_outer_loras else expert_count
+            expected_domains = (
+                outer_count,
+                expert_count,
+                expert_count,
+                outer_count,
+            )
+            actual_domains = tuple(
+                weight.shape[1]
+                for weight in (
+                    gate_up_lora_a_weights,
+                    gate_up_lora_b_weights,
+                    down_lora_a_weights,
+                    down_lora_b_weights,
+                )
+            )
+            if actual_domains != expected_domains:
+                raise ValueError(
+                    "SGL LoRA factor domains do not match the resident provider: "
+                    f"expected {expected_domains}, got {actual_domains}"
+                )
+
         self.set_lora = True
         self.gate_up_lora_a_weights = gate_up_lora_a_weights
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
@@ -1102,6 +1257,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         Run MoE forward with LoRA integration at the correct points.
         """
+        origin_hidden_states_dim = hidden_states.shape[-1]
+
         # Get the base layer's dispatch and combine logic
         base_layer = self.base_layer
 
@@ -1134,14 +1291,44 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 lora_info,
             )
         # ===== END TO BE REFACTORED ====
-        else:
-            combine_input = self._lora_runner.run(
-                dispatch_output, quant_info, lora_info=lora_info
+        elif (
+            self.lora_execution_engine == "sgl_lora"
+            and self._lora_runner_backend.is_flashinfer_trtllm_routed()
+        ):
+            from sglang.srt.lora.sgl_lora.flashinfer_bf16 import (
+                run_flashinfer_bf16_lora,
             )
 
-        final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
+            factor_map, shared_factor_map = self._sgl_lora_factor_maps
+            launch_config = self._sgl_lora_launch_config
+            combine_input = run_flashinfer_bf16_lora(
+                dispatch_output,
+                quant_info,
+                base_layer.moe_runner_config,
+                lora_info,
+                routing_block_size=launch_config.routing_block_size,
+                lora_a_config=launch_config.lora_a,
+                lora_b_config=launch_config.lora_b,
+                routed_expert_to_factor_id=factor_map,
+                routed_expert_to_shared_factor_id=shared_factor_map,
+                output_dtype=kwargs.pop("output_dtype", None),
+            )
+        else:
+            combine_input = self._lora_runner.run(
+                dispatch_output,
+                quant_info,
+                lora_info=lora_info,
+                output_dtype=(
+                    kwargs.pop("output_dtype", None)
+                    if self.lora_execution_engine == "sgl_lora"
+                    else None
+                ),
+            )
 
-        return final_hidden_states
+        return base_layer.combine_and_finalize(
+            combine_input=combine_input,
+            origin_hidden_states_dim=origin_hidden_states_dim,
+        )
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
@@ -1180,7 +1367,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def _slice_moe_a(
         self, A: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
-        shard_size = self.intermediate_size_per_partition
+        # FlashInfer may pad the resident provider width to 128. Adapter
+        # factors retain their semantic width, so derive TP slices from the
+        # factor itself rather than the provider's padded launch dimension.
+        shard_size = A.shape[-1] // self.tp_size
         start = tp_rank * shard_size
         end = start + shard_size
         return A[..., start:end].contiguous()
@@ -1232,16 +1422,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             is_gated = self.base_layer.moe_runner_config.is_gated
             if not is_gated:
                 if self.tp_size > 1:
-                    shard_size = self.intermediate_size_per_partition
+                    shard_size = B.shape[0] // self.tp_size
                     start = tp_rank * shard_size
                     end = start + shard_size
                     return B[start:end, :]
                 return B
 
-            shard_size = self.intermediate_size_per_partition
+            full_inter = B.shape[0] // 2
+            shard_size = full_inter // self.tp_size
             start = tp_rank * shard_size
             end = start + shard_size
-            full_inter = B.shape[0] // 2
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
             if self._uses_interleaved_gate_up:
@@ -1251,7 +1441,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_backend: BaseLoRABackend
+    layer: nn.Module,
+    lora_backend: BaseLoRABackend,
+    *,
+    lora_execution_engine: str = "legacy",
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
@@ -1270,6 +1463,12 @@ def get_lora_layer(
         return InklingQKVRLinearWithLoRA(layer, lora_backend)
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
+            if lora_layer_type is FusedMoEWithLoRA:
+                return lora_layer_type(
+                    layer,
+                    lora_backend,
+                    lora_execution_engine=lora_execution_engine,
+                )
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
