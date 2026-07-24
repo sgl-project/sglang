@@ -591,7 +591,7 @@ class CPUGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         # Static capture width: CPU graphs are decode-only.
-        self.num_tokens_per_req = 1
+        self.captured_req_width = 1
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if self.enable_return_hidden_states:
@@ -628,7 +628,7 @@ class CPUGraphRunner:
         self.captured_forward_batches_cross = {}
         # Attention backend
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_req
+        self.max_num_token = self.max_bs * self.captured_req_width
         self.model_runner.attn_backend.init_cpu_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -656,7 +656,7 @@ class CPUGraphRunner:
             self.custom_mask = torch.ones(
                 (
                     (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_req
+                    * self.captured_req_width
                 ),
                 dtype=torch.bool,
                 device=self.device,
@@ -735,7 +735,7 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.num_tokens_per_req,
+                num_tokens=bs * self.captured_req_width,
                 tp_group=self.model_runner.tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -777,7 +777,7 @@ class CPUGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, skip_cross_attention: bool = False
     ):
-        num_tokens = bs * self.num_tokens_per_req
+        num_tokens = bs * self.captured_req_width
 
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
@@ -926,7 +926,7 @@ class CPUGraphRunner:
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             return forward_batch
 
-        raw_num_token = raw_bs * self.num_tokens_per_req
+        raw_num_token = raw_bs * self.captured_req_width
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         assert bs > raw_bs

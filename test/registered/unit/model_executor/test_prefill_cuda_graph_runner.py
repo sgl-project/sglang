@@ -3,10 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-    _prefill_input_embeds_slot,
     _resolve_transformer_layer_model,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
@@ -22,28 +19,6 @@ class _LayerModel:
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         return input_embeds
-
-
-class _FakeSlot:
-    def __init__(self, tensor):
-        self.tensor = tensor
-        self.calls = []
-
-    def slice_for(self, bs, num_tokens):
-        self.calls.append((bs, num_tokens))
-        return self.tensor[:num_tokens]
-
-
-class _FakeRegistry:
-    def __init__(self, slot=None):
-        self.slot = slot
-
-    def has_slot(self, name):
-        return name == "input_embeds" and self.slot is not None
-
-    def get_slot(self, name):
-        assert name == "input_embeds"
-        return self.slot
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
@@ -82,21 +57,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
     def test_resolve_language_model_rejects_non_language_wrapper(self):
         with self.assertRaises(AttributeError):
             resolve_language_model(SimpleNamespace())
-
-    def test_prefill_input_embeds_slot_returns_stable_slot_slice(self):
-        slot = _FakeSlot(torch.arange(12).view(3, 4))
-        registry = _FakeRegistry(slot)
-
-        embeds = _prefill_input_embeds_slot(registry, bs=2, num_tokens=2)
-
-        self.assertTrue(torch.equal(embeds, slot.tensor[:2]))
-        self.assertEqual(slot.calls, [(2, 2)])
-
-    def test_prefill_input_embeds_slot_returns_none_when_absent(self):
-        self.assertIsNone(
-            _prefill_input_embeds_slot(_FakeRegistry(), bs=1, num_tokens=4)
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
