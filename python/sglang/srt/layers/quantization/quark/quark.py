@@ -91,7 +91,7 @@ class QuarkConfig(QuantizationConfig):
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
-        self._quantized_layers = set()
+        self._online_quantized_layers = set()
         self._dense_fp8_include: tuple[str, ...] = ()
         self._dense_fp8_exclude: tuple[str, ...] = ()
         self._dense_fp8_min_output_size: int = 0
