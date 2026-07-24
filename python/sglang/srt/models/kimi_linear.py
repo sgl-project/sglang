@@ -382,10 +382,8 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
-        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
-        # For decode and target_verify: gate activation is handled inside
-        # fused_recurrent / fused_sigmoid_gating_delta_rule_update kernel.
+        # Prefill passes raw gates to chunk KDA; decode and target-verify kernels
+        # apply the activation internally.
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()

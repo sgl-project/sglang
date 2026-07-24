@@ -384,12 +384,8 @@ class MambaPool:
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
     ) -> int:
-        """Locate the sliding-window axis (length ``win_len == conv_kernel-1``)
-        of the 2-D conv state so both channel-major (GDN ``(channel, K-1)``) and
-        window-major (KDA ``(K-1, channel)``) layouts build the dedup buffer over
-        the true window axis. Prefer the last axis so GDN keeps upstream's ``-1``
-        default when a shape is ambiguous. Every conv shape must agree, since a
-        single ``conv_window_axis`` is shared across all of them.
+        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
+        share one overlapping conv-window buffer.
         """
         axis = None
         for conv_shape in conv_state_shape:
@@ -708,19 +704,6 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
-                    # The sliding window is the (K-1)-wide axis; the other conv
-                    # axis is the independent channel axis. Different backends
-                    # order these two axes differently in their conv_state:
-                    #   GDN  -> (channel, K-1)  (channel-major, axis -1)
-                    #   KDA  -> (K-1, channel)  (window-major, axis  0; axes
-                    #           swapped in KimiLinearStateShape.create)
-                    # Detect the window axis by its length (conv_kernel - 1)
-                    # rather than assuming a fixed position, and record it in
-                    # self.conv_window_axis so _allocate_deduplicated_conv_window
-                    # builds the shared sliding buffer over the true K-1 window
-                    # axis (not the channel axis) for both layouts. The dedup
-                    # view then keeps the SAME last-two-dim order as conv_state,
-                    # and the layout-agnostic scatter/commit read it via strides.
                     win_len = cache_params.shape.conv_kernel - 1
                     self.conv_window_axis = self._detect_conv_window_axis(
                         conv_state_shape, win_len

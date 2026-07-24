@@ -255,7 +255,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
-            # target_verify specific parameters
             disable_state_update=True,
             intermediate_states_buffer=intermediate_states_buffer,
             intermediate_state_indices=intermediate_state_indices,

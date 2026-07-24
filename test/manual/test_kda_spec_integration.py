@@ -1,21 +1,3 @@
-"""Engine-level integration test for KDA speculative decoding path.
-
-Launches server with KDA model + no_buffer, sends requests,
-and verifies the forward path works correctly. Without a draft model,
-this verifies no regression in normal decode/extend paths after adding
-target_verify code.
-
-Usage:
-    # Start server first:
-    python -m sglang.launch_server \
-        --model-path /path/to/Kimi-Linear-48B-A3B-Instruct \
-        --tp 2 --trust-remote-code \
-        --mamba-scheduler-strategy no_buffer
-
-    # Then run this test:
-    python test/manual/test_kda_spec_integration.py
-"""
-
 import concurrent.futures
 import time
 
@@ -26,7 +8,6 @@ SHARED_PREFIX = "You are a helpful assistant. " * 20
 
 
 def test_normal_inference_no_regression():
-    """Normal inference still works after code changes."""
     resp = requests.post(
         f"{BASE_URL}/generate",
         json={
@@ -41,7 +22,6 @@ def test_normal_inference_no_regression():
 
 
 def test_prefix_caching_still_works():
-    """Prefix caching (radix cache) still works."""
     resp1 = requests.post(
         f"{BASE_URL}/generate",
         json={
@@ -65,7 +45,6 @@ def test_prefix_caching_still_works():
 
 
 def test_batch_inference():
-    """Multiple concurrent requests work."""
     prompts = [f"Count from 1 to {i + 3}" for i in range(8)]
 
     def send(p):
