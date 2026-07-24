@@ -247,6 +247,8 @@ def _run_standard_deep_gemm(
     "num_tokens",
     [
         pytest.param(1, id="baseline"),
+        pytest.param(25, id="presence-bincount"),
+        pytest.param(26, id="atomic-bincount"),
     ],
 )
 @torch.inference_mode()

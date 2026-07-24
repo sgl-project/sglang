@@ -1503,32 +1503,92 @@ def _pad_and_sum_kernel(
     tl.store(total_ptr, tl.sum(padded_masked, axis=0))
 
 
+@triton.jit
+def _bincount_pad_sum_presence_kernel(
+    ids_ptr,
+    padded_ptr,
+    total_ptr,
+    N,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    expert_range = tl.arange(0, BLOCK_K)
+    mask_k = expert_range < K
+    tl.store(padded_ptr + expert_range, tl.zeros((BLOCK_K,), tl.int32), mask=mask_k)
+    # Zero-fill and sparse BLOCK_E stores may be issued by different warps.
+    tl.debug_barrier()
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    ids = tl.load(ids_ptr + offs_n, mask=mask_n, other=-1).to(tl.int32)
+    valid = mask_n & (ids >= 0) & (ids < K)
+    previous_ids = tl.load(
+        ids_ptr + offs_n[:, None],
+        mask=offs_n[:, None] < offs_n[None, :],
+        other=-1,
+    ).to(tl.int32)
+    duplicate_before = tl.sum((previous_ids == ids[None, :]).to(tl.int32), axis=0) > 0
+    first = valid & ~duplicate_before
+    tl.store(padded_ptr + ids, BLOCK_E, mask=first)
+    tl.store(total_ptr, tl.sum(first.to(tl.int32), axis=0) * BLOCK_E)
+
+
 def fused_local_bincount_pad_sum(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     block_e: int = 128,
+    max_count_per_expert: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Count routed slots and round each expert count to ``block_e``.
+
+    Decode-sized inputs use a single presence kernel because every non-empty
+    expert occupies exactly one block. ``max_count_per_expert`` can provide a
+    tighter routing-aware upper bound; otherwise the total slot count is used.
+    Larger inputs fall back to exact atomic counts followed by padding and
+    reduction.
+    """
     K = num_local_experts
     flat = topk_ids.contiguous().view(-1)
     N = flat.numel()
     device = topk_ids.device
 
     block_k = max(triton.next_power_of_2(K), 8)
-    preferred_tile_n = 128 if N <= 65536 else 256
-    tile_n = max(1, min(preferred_tile_n, 131072 // block_k))
-    counts = torch.zeros(K, dtype=torch.int32, device=device)
+    block_n_for_n = 1 if N == 0 else triton.next_power_of_2(N)
     padded = torch.empty(K, dtype=torch.int32, device=device)
     total = torch.empty((), dtype=torch.int32, device=device)
 
-    if N > 0:
-        _bincount_atomic_kernel[(triton.cdiv(N, tile_n),)](
+    assert max_count_per_expert is None or max_count_per_expert >= 0
+    max_count = (
+        N if max_count_per_expert is None else min(N, max_count_per_expert)
+    )
+    # Duplicate suppression materializes a BLOCK_N x BLOCK_N comparison tile;
+    # beyond 128 the exact atomic path is faster despite the tighter bound.
+    if max_count <= block_e and block_n_for_n <= min(block_k, 128):
+        _bincount_pad_sum_presence_kernel[(1,)](
             flat,
-            counts,
+            padded,
+            total,
             N,
             K=K,
-            BLOCK_N=tile_n,
+            BLOCK_N=block_n_for_n,
             BLOCK_K=block_k,
+            BLOCK_E=block_e,
         )
+        return padded, total
+
+    preferred_tile_n = 128 if N <= 65536 else 256
+    tile_n = max(1, min(preferred_tile_n, 131072 // block_k))
+    counts = torch.zeros(K, dtype=torch.int32, device=device)
+    _bincount_atomic_kernel[(triton.cdiv(N, tile_n),)](
+        flat,
+        counts,
+        N,
+        K=K,
+        BLOCK_N=tile_n,
+        BLOCK_K=block_k,
+    )
     _pad_and_sum_kernel[(1,)](
         counts,
         padded,

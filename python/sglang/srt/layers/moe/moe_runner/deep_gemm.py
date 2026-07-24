@@ -834,10 +834,17 @@ def _pre_permute_standard_to_deep_gemm_contig(
         )
         input_dtype = torch.float8_e4m3fn
 
+    # Routed top-k IDs are unique within each token. Conservatively allow fused
+    # shared slots to map to the same physical expert.
+    max_count_per_expert = topk_ids.shape[0] * max(
+        runner_config.num_fused_shared_experts or 0,
+        1,
+    )
     padded_counts, all_tokens_t = fused_local_bincount_pad_sum(
         topk_ids,
         num_local_experts,
         block_e=block_e,
+        max_count_per_expert=max_count_per_expert,
     )
     if hidden_states_device.type == "cuda":
         all_tokens = standard_contig_all_tokens_upper_bound(
