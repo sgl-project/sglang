@@ -30,11 +30,14 @@ class HybridAttnBackend(AttentionBackend):
         self.spec_attn_is_prefill = (
             model_runner.server_args.speculative_attention_mode == "prefill"
         )
-        # decide_needs_cpu_seq_lens ORs this flag across backends; without the
-        # delegation the base-class default (True) forces a per-step seq_lens
-        # D2H + host sync even when both sub-backends opted out.
-        self.needs_cpu_seq_lens = (
-            prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
+        # decide_needs_cpu_seq_lens ORs this flag across the backends the spec
+        # decode loop actually touches. The decode backend always runs (decode,
+        # and target_verify when speculative_attention_mode=decode); the prefill
+        # backend serves the loop only when mode=prefill routes target_verify to
+        # it. Counting a cpu-seq-lens prefill backend on decode-mode steps it
+        # never serves forces a needless per-step seq_lens D2H + host sync.
+        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
+            self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
         )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
