@@ -18,6 +18,10 @@ import PIL.Image
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+    get_distilled_sigmas,
+    is_edge_checkpoint,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -79,6 +83,8 @@ COSMOS3_I2V_FLOW_SHIFT = 10.0
 COSMOS3_T2V_FLOW_SHIFT = 10.0
 COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
+# Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
+COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
 
 
 def _resize_crop_pil(
@@ -680,15 +686,14 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         super().__init__()
         self.scheduler = scheduler
 
-    def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
-        """Resolve the per-mode default flow_shift for the request.
-
-        Matches cosmos-framework's built-in per-mode sample defaults.
-        """
+    def _default_flow_shift_for_mode(self, batch: Req, is_edge: bool) -> float | None:
+        """Resolve the per-mode default flow_shift for the request."""
         if getattr(batch.sampling_params, "action_mode", None) is not None:
             return COSMOS3_ACTION_FLOW_SHIFT
         if batch.data_type == DataType.IMAGE:
             return COSMOS3_T2I_FLOW_SHIFT
+        if is_edge:
+            return COSMOS3_EDGE_VIDEO_FLOW_SHIFT
         if batch.preprocessed_image is not None:
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
@@ -698,12 +703,31 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
+
+        distilled_sigmas = get_distilled_sigmas(server_args.model_path)
+        if distilled_sigmas is not None:
+            # Distilled checkpoints carry an explicit fixed-step sigma schedule
+            # with the shift already baked in; drive the scheduler from it
+            # directly (step count == len(sigmas), num_inference_steps ignored).
+            # Reset shift so set_timesteps does not re-shift the baked-in sigmas.
+            if hasattr(self.scheduler, "set_shift"):
+                self.scheduler.set_shift(1.0)
+            self.scheduler.set_timesteps(sigmas=distilled_sigmas, device=device)
+            batch.timesteps = self.scheduler.timesteps
+            self.log_info(
+                f"Prepared {len(batch.timesteps)} distilled timesteps "
+                f"(sigmas={distilled_sigmas})"
+            )
+            return batch
+
         num_inference_steps = batch.num_inference_steps
         flow_shift = getattr(batch, "flow_shift", None)
         if flow_shift is None:
             flow_shift = server_args.pipeline_config.flow_shift
         if flow_shift is None:
-            flow_shift = self._default_flow_shift_for_mode(batch)
+            flow_shift = self._default_flow_shift_for_mode(
+                batch, is_edge_checkpoint(server_args.model_path)
+            )
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
 
@@ -917,6 +941,13 @@ class Cosmos3DenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
+        # Seed the scheduler's stochastic (SDE) noise from the request seed so it
+        # is identical on every sequence-parallel rank; otherwise each rank draws
+        # its own noise and the sharded latents diverge at the shard boundary.
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
+
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]
         uncond_text_ids = batch.extra["uncond_text_ids"]
@@ -1102,6 +1133,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 noise_pred,
                 t,
                 latents,
+                generator=generator,
                 return_dict=False,
             )[0]
 
