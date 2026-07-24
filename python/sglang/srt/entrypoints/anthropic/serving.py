@@ -594,6 +594,22 @@ class AnthropicServing:
                     "emitted to the client"
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
+        else:
+            # The Anthropic Messages API treats extended thinking as opt-in:
+            # an absent ``thinking`` field means off, regardless of the chat
+            # template's own default (Qwen3 etc. default
+            # ``enable_thinking=True``). Best-effort only: always-on
+            # reasoning models cannot be disabled, so keep them as-is
+            # instead of rejecting the request the way an explicit
+            # ``thinking: disabled`` does.
+            try:
+                self.openai_serving_chat.apply_reasoning_enabled(chat_request, False)
+            except ValueError:
+                logger.warning(
+                    "Anthropic request without a thinking field defaults to "
+                    "thinking off, but the reasoning parser is always-on; "
+                    "leaving reasoning enabled"
+                )
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
         # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
