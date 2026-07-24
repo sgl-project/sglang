@@ -214,9 +214,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 )
         self._batching_last_arrival_s = now
 
-    def _batch_wait_limit_s(
-        self, batch_size: int, max_batch_size: int, elapsed_s: float
-    ) -> float:
+    def _batch_wait_limit_s(self, batch_size: int, max_batch_size: int) -> float:
         max_delay_s = self._batching_adaptive_delay_max_s
         if max_delay_s is None:
             return self._batching_delay_s
@@ -233,8 +231,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             * missing_slots
             * _BATCH_INTERARRIVAL_HEADROOM
         )
-        predicted_deadline_s = elapsed_s + predicted_additional_wait_s
-        return min(max(predicted_deadline_s, self._batching_delay_s), max_delay_s)
+        return min(
+            max(predicted_additional_wait_s, self._batching_delay_s),
+            max_delay_s,
+        )
 
     def get_disagg_metrics(self) -> dict | None:
         """Return disagg role metrics snapshot, or None if not in disagg mode."""
@@ -407,6 +407,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     reqs=reqs,
                     error_msg=output_batch.error,
                 )
+
+            if self.gpu_id != 0:
+                return [OutputBatch() for _ in reqs]
 
             split_outputs = self._split_batched_output(output_batch, reqs)
             if split_outputs is None:
@@ -974,7 +977,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             compatible_reqs[0]
         )
         batch_wait_s = self._batch_wait_limit_s(
-            batch_len, effective_max_batch_size, oldest_wait_s
+            batch_len, effective_max_batch_size
         )
         should_wait_for_more = (
             batch_len < effective_max_batch_size
