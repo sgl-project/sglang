@@ -15,7 +15,7 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_func,
 )
 
-from sglang.jit_kernel.flash_attention import (
+from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
@@ -126,11 +126,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        self.kv_cache_dtype_str = getattr(
-            model_runner,
-            "kv_cache_dtype_str",
-            model_runner.server_args.kv_cache_dtype,
-        )
+        self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
 
         assert self.num_heads % self.num_kv_heads == 0

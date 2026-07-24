@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -29,7 +29,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_clamp, silu_and_mul_contig_post_quant
+from sglang.kernels.ops.attention.dsv4 import (
+    silu_and_mul_clamp,
+    silu_and_mul_contig_post_quant,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -74,8 +77,11 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
+from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+from sglang.srt.layers.dcp.planner import (
+    prepare_decode_context_parallel_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -110,7 +116,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_utils import materialize_bpreshuffle_fp8_scale
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale,
+)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
@@ -176,14 +184,11 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
-    get_device,
-    get_exec,
     get_flags,
     get_forward,
     get_model,
     get_parallel,
     get_server_args,
-    get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -209,8 +214,8 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sglang.jit_kernel.dsv3_router_gemm import (
-        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import (
+        dsv3_router_gemm as dsv3_router_gemm,
     )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
@@ -377,7 +382,9 @@ class DeepseekV2MLP(nn.Module):
             return down_output
 
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
-            from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+                fused_clamp_act_mul,
+            )
 
             if not self._fused_clamp_fp8_checked:
                 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -455,14 +462,6 @@ class MoEGate(nn.Module):
                     "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
-                # NOTE(kpham-sgl): flashinfer trtllm routing requires a bf16
-                # routing_bias; an fp32 bias yields NaN routing on exact ties.
-                # Mirror the fp8 path's cast.
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
-                    correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
             )
@@ -488,7 +487,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if get_exec().deterministic.enable_deterministic_inference:
+        if get_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -500,7 +499,7 @@ class MoEGate(nn.Module):
             )
         ):
             if _is_cuda:
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
@@ -514,7 +513,7 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                logits = _jit_dsv3_router_gemm(
+                logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
 
@@ -524,7 +523,7 @@ class MoEGate(nn.Module):
                 logits = F.linear(hidden_states, self.weight, None)
             else:
                 # cuBLAS bf16 x bf16 -> fp32 GEMM (torch.mm's out_dtype kwarg is CUDA-only)
-                from sglang.jit_kernel.dsv4 import linear_bf16_fp32
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
@@ -554,7 +553,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = get_exec().moe.disable_shared_experts_fusion
+        _fusion_disabled = get_server_args().disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
@@ -624,7 +623,8 @@ class DeepseekV2MoE(nn.Module):
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
+            num_experts=num_experts_for_moe
+            + get_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -797,7 +797,7 @@ class DeepseekV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
+                config.n_routed_experts + get_server_args().ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -1711,7 +1711,7 @@ class DeepseekV2AttentionMLA(
                 base=rope_theta,
                 rope_scaling=rope_scaling,
                 is_neox_style=is_neox_style,
-                device=get_device().device,
+                device=get_server_args().device,
             )
 
             if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
@@ -1795,6 +1795,34 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        if self.q_lora_rank is None:
+            yield
+            return
+        tensor_attrs = [
+            (self, "w_kc", 0),
+            (self, "w_vc", 0),
+            (self, "w_scale_k", 0),
+            (self, "w_scale_v", 0),
+        ]
+        ctx = get_cp_decode_attn_tp_ctx()
+        with ctx.maybe_use_decode_attn_tp(
+            forward_batch,
+            [self.q_b_proj, self.o_proj],
+            tensor_attrs=tensor_attrs,
+            radix_attn=self.attn_mqa,
+        ):
+            if ctx.use_decode_attn_tp:
+                orig_num_local_heads = self.num_local_heads
+                self.num_local_heads = self.num_heads // ctx.decode_tp_size
+                try:
+                    yield
+                finally:
+                    self.num_local_heads = orig_num_local_heads
+            else:
+                yield
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -2062,7 +2090,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_spec().speculative_algorithm
+            get_server_args().speculative_algorithm
         )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -2213,15 +2241,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            llama_4_scaling=llama_4_scaling,
-            layer_scatter_modes=self.layer_scatter_modes,
-            prev_topk_indices=prev_topk_indices,
-        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+                layer_scatter_modes=self.layer_scatter_modes,
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -2719,7 +2748,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -2758,7 +2787,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.num_fused_shared_experts = 0
         server_args = get_server_args()
 
-        if get_exec().moe.disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None

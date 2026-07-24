@@ -14,7 +14,7 @@ from sglang.srt.compilation.compile_phase import (
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class PyMscclppCommunicator:
 
     def _is_symm_mem_enabled(self) -> bool:
         try:
-            return get_exec().comm.enable_symm_mem
+            return get_server_args().enable_symm_mem
         except ValueError:
             return False
 
