@@ -147,6 +147,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
         self._recording = False
         self._disable_all = False
+        # Resolved once: some device modules (e.g. `torch.cpu`) do not expose
+        # `is_current_stream_capturing`; treat "no graph support" as "never
+        # capturing" so the capture guards below work on every backend.
+        self._is_current_stream_capturing = getattr(
+            torch.get_device_module(), "is_current_stream_capturing", lambda: False
+        )
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
@@ -193,12 +199,31 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
         if not self._recording:
             return
+        if self._is_current_stream_capturing():
+            # Speculative-decoding draft CUDA-graph capture (e.g. EAGLE's
+            # multi-step `draft_forward` with speculative_num_steps >= 2) drives
+            # full `ModelRunner.forward` calls while a stream capture is active,
+            # so this pass boundary can land inside a capture. The pass-boundary
+            # bookkeeping is not capture-safe: with metrics enabled the
+            # accumulator performs a rank-0 GPU->CPU sync
+            # (`utilization_rate_gpu.item()` in `_append_utilization_rate`),
+            # which raises cudaErrorStreamCaptureUnsupported ("operation not
+            # permitted when stream is capturing") and invalidates the capture
+            # (cudaErrorStreamCaptureInvalidated -> startup crash loop); it also
+            # issues a `torch.distributed.reduce` plus buffer writes that would
+            # be baked into the draft graph and replayed on every draft step.
+            # Per-layer hooks intentionally stay active during capture (see
+            # `_on_hook`); only the pass-boundary work must be skipped.
+            return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
         if not self._recording:
+            return
+        if self._is_current_stream_capturing():
+            # See `_on_forward_pass_start`: not capture-safe.
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
@@ -235,9 +260,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if not (
-            self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
+        if not (self._recording or self._is_current_stream_capturing()):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
