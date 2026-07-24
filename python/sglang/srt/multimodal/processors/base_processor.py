@@ -489,6 +489,7 @@ class BaseMultimodalProcessor(ABC):
         videos=None,
         audios=None,
         processor=None,
+        processor_video_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> dict:
         """
@@ -502,8 +503,13 @@ class BaseMultimodalProcessor(ABC):
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
-            if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+            video_config = (
+                self.video_config
+                if processor_video_config is None
+                else processor_video_config
+            )
+            if video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
                 "Gemma3nProcessor",
