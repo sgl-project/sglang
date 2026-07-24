@@ -334,6 +334,7 @@ DSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "triton",  # SM120 (consumer Blackwell) torch fallback — no flashmla/fa3 kernel on this arch
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
@@ -2397,6 +2398,64 @@ class ServerArgs:
         "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
         NS("exec.moe"),
     ] = False
+
+    # -------------------------------------------------------------------------
+    # Paged Experts
+    # -------------------------------------------------------------------------
+    enable_paged_experts: A[
+        bool,
+        "Enable Paged Experts: keep K of E MoE experts resident on the GPU and page the rest from "
+        "pinned host RAM (serve an MoE model larger than VRAM).",
+    ] = False
+    paged_experts_num_resident: A[
+        str,
+        "Resident experts per layer (K) for --enable-paged-experts: an int to pin K, 'auto' to size from "
+        "free VRAM (safe margins, respects --mem-fraction-static), or 'max' to reclaim the concurrency-scaled "
+        "safety margins for the most resident experts (measured reserve; opt-in, spends headroom).",
+    ] = "auto"
+    paged_experts_store: A[
+        str,
+        Arg(
+            help="Host expert store kind for --enable-paged-experts. 'pinned' (default) page-locks the "
+            "store and pages with the fast transfer kernel. 'paged' uses a non-pinned store paged with a "
+            "plain indexed copy — correct but slower; use it only when the pinned store would exceed the "
+            "host's page-locked memory limit (e.g. an unquantized model on a small-RAM box).",
+            choices=["pinned", "paged"],
+        ),
+    ] = "pinned"
+    paged_experts_kv_reserve_gb: A[
+        float,
+        "KV-cache headroom (GB) to reserve when sizing K (--paged-experts-num-resident auto or max). "
+        "Default -1 reserves for the declared concurrency x context; the K-slot pool is fixed and sglang "
+        "sizes the real KV pool from the leftover. Raise this to guarantee a larger KV pool at the cost of "
+        "fewer resident experts (more paging).",
+    ] = -1.0
+    paged_experts_eviction: A[
+        str,
+        Arg(
+            help="Residency (eviction) policy for --enable-paged-experts. 'lru' (default) evicts the "
+            "least-recently-used non-needed expert. 'lfu' evicts the least-frequently-used (use count, "
+            "LRU tiebreak) — better for skewed expert routing, where a few experts are hot.",
+            choices=["lru", "lfu"],
+        ),
+    ] = "lru"
+    paged_experts_cold_backing: A[
+        str,
+        Arg(
+            help="Backing for the windowed cold tail. The pinned window is sized automatically: when the store "
+            "exceeds the host's page-lock ceiling only the hot window is page-locked and the E-W cold experts "
+            "live in this tier. 'ram' (default) keeps them in pageable host RAM — so the whole store must fit "
+            "RAM. 'disk' mmaps them to a file (page-cache-bounded), letting the store exceed RAM (a model "
+            "bigger than host memory still serves; cold misses read from disk). Pair with --paged-experts-cold-dir "
+            "on a real disk.",
+            choices=["ram", "disk"],
+        ),
+    ] = "ram"
+    paged_experts_cold_dir: A[
+        str,
+        "Directory for the --paged-experts-cold-backing disk cold tier. Must be a real disk with room for "
+        "the cold tail (NOT a tmpfs like /tmp). Empty (default) uses the system temp dir.",
+    ] = ""
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

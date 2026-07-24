@@ -44,6 +44,23 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+# Optional post-replay hook for the pinned-window paged-experts fallback (replay-twice). After a captured
+# replay, a registered hook may stage data the graph could not read in-graph — for paged experts, the
+# window-missing (cold) experts that decide_bounded deferred — directly into the GPU slots out-of-graph, then
+# return True to request another replay of the SAME graph (the residency maps it reads are fixed-address, so
+# the next replay sees the staged experts resident). Bounded by _POST_REPLAY_MAX_TRIES. A no-op with zero
+# overhead unless a hook is registered, so the default monolithic captured path is byte-for-byte unchanged.
+_post_replay_hook: Optional[Callable[[], bool]] = None
+_POST_REPLAY_MAX_TRIES = 8
+
+
+def set_post_replay_hook(fn: Optional[Callable[[], bool]]) -> None:
+    """Register (or clear, with ``None``) the post-replay hook. Idempotent; the paged-experts pager calls
+    this once when the first windowed layer sets up its captured residency state."""
+    global _post_replay_hook
+    _post_replay_hook = fn
+
+
 class FullCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
@@ -127,6 +144,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        if _post_replay_hook is not None:
+            tries = 0
+            while _post_replay_hook() and tries < _POST_REPLAY_MAX_TRIES:
+                self._graphs[shape_key].replay()
+                tries += 1
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
