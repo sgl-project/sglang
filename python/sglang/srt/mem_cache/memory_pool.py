@@ -704,18 +704,6 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
-                    # The sliding window is the (K-1)-wide axis; the other conv
-                    # axis is the independent channel axis. Different backends
-                    # order these two axes differently in their conv_state:
-                    #   GDN  -> (channel, K-1)  (channel-major)
-                    #   KDA  -> (K-1, channel)  (window-major, axes swapped in
-                    #           KimiLinearStateShape.create)
-                    # Detect the window axis by its length (conv_kernel - 1)
-                    # rather than assuming a fixed position, so the dedup view's
-                    # last two dims keep the SAME order as conv_state. That keeps
-                    # the shared sliding buffer built over the true K-1 window
-                    # axis (not the channel axis) for both layouts, and lets the
-                    # layout-agnostic scatter/commit read it through strides.
                     win_len = cache_params.shape.conv_kernel - 1
                     self.conv_window_axis = self._detect_conv_window_axis(
                         conv_state_shape, win_len
