@@ -293,7 +293,11 @@ add_mount_if_exists "libmnl" "libmnl.so*"
 echo "Mount args: $MOUNT_ARGS"
 
 echo "Launching container: ci_sglang"
-docker run -dt --user root \
+# --init runs tini as PID 1 so SIGTERM from `docker stop` reaches the sglang
+# process group and exited worker children are reaped, instead of leaving
+# zombie KFD contexts that leak VRAM on shutdown.
+docker run -dt --init --user root \
+  --label sglang-ci=1 \
   --device=/dev/kfd \
   --device=/dev/dri \
   ${DEVICE_FLAG} \

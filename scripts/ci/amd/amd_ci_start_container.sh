@@ -310,7 +310,14 @@ case "${ENABLE_CACHE_HOST,,}" in
 esac
 
 echo "Launching container: ci_sglang"
-docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
+# --init runs a minimal init (tini) as PID 1 so that:
+#   * SIGTERM from `docker stop` is forwarded to the sglang process group
+#     instead of being swallowed by a non-forwarding shell PID 1, and
+#   * exited sglang worker children (scheduler / TP / detokenizer procs) are
+#     reaped instead of lingering as zombies that keep KFD contexts (and thus
+#     VRAM) alive. This is central to freeing GPU memory cleanly on shutdown.
+docker run -dt --init --user root --device=/dev/kfd ${DEVICE_FLAG} \
+  --label sglang-ci=1 \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
