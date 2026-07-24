@@ -1817,7 +1817,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         elif rid in self.rid_to_state:
             state = self.rid_to_state[rid]
             state.abort_requested = True
-            if getattr(state.obj, "parallel_sample_num", 1) > 1:
+            parallel_sample_num = getattr(state.obj, "parallel_sample_num", None)
+            if parallel_sample_num is None:
+                sampling_params = getattr(state.obj, "sampling_params", None)
+                parallel_sample_num = (
+                    sampling_params.get("n", 1)
+                    if isinstance(sampling_params, dict)
+                    else 1
+                )
+            if parallel_sample_num > 1:
                 # Snapshot because scheduler abort echoes remove child ownership.
                 target_rids = tuple(sorted(self.logical_rid_to_child_rids.get(rid, ())))
             else:
