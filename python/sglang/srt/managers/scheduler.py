@@ -1708,7 +1708,15 @@ class Scheduler(
             ps=self.ps,
             dp_tp_cpu_group=self.dp_tp_cpu_group,
             get_forward_ct=lambda: self.forward_ct,
+            set_roofline_annotations=self._set_model_runner_roofline_annotations,
         )
+
+    def _set_model_runner_roofline_annotations(self, enabled: bool) -> None:
+        # Some backends (e.g. MLX) may not expose a model_runner; roofline
+        # step-span folding only applies to the standard runner path.
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is not None:
+            model_runner.roofline_annotations = enabled
 
     def init_weight_updater(self) -> None:
         self.weight_updater = SchedulerWeightUpdaterManager(
@@ -3319,6 +3327,17 @@ class Scheduler(
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
+
+        # Roofline aggregates are folded into the model_runner step span (gated
+        # on model_runner.roofline_annotations), so no wrapper is needed here.
+        return self._run_batch_inner(batch, pp_proxy_tensors)
+
+    def _run_batch_inner(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Inner implementation of run_batch, optionally wrapped by profiler annotations."""
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
