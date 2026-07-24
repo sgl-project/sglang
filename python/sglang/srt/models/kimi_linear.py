@@ -668,9 +668,7 @@ class KimiLinearForCausalLM(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
-            return not (
-                self.model.start_layer <= layer_id < self.model.end_layer
-            )
+            return not (self.model.start_layer <= layer_id < self.model.end_layer)
         if name.startswith("model.embed_tokens."):
             return not self.pp_group.is_first_rank
         if name.startswith(("model.norm.", "lm_head.")):

@@ -632,8 +632,7 @@ class MooncakeKVManager(CommonKVManager):
                     len(dst_data_ptrs),
                 )
                 layers_params = [
-                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
-                    for i, j in pairs
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
