@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
@@ -269,6 +270,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Cosmos3ForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -490,6 +492,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "cosmos3_omni",
         ):
             return None
 
@@ -625,6 +628,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_timestamps is not None
         ):
@@ -726,6 +730,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
             "intern_s2_preview",
+            "cosmos3_omni",
         ):
             mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
                 base_output,
