@@ -211,10 +211,6 @@ class WeightCacheDaemon:
         from sglang.srt.runtime_context import get_context
         from sglang.srt.server_args import ServerArgs
 
-        # Set up global server args (required by model __init__ and weight loading).
-        # Pass the real PP/DP dims (not the defaults) so any load-path code that
-        # reads get_server_args().pp_size / .dp_size sees the same values that
-        # initialize_model_parallel below is configured with.
         server_args = ServerArgs(
             model_path=self.model_path,
             dtype=self.dtype,
