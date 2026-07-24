@@ -119,7 +119,7 @@ impl ApiError {
                 (StatusCode::BAD_GATEWAY, "upstream_unreachable")
             }
             ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
-            ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
+            ApiError::UpstreamTimeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"),
             ApiError::NoHealthyWorkers { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "no_healthy_workers")
             }
@@ -355,7 +355,7 @@ mod tests {
             worker: worker.clone(),
         };
         let resp = err.into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             resp.headers()
                 .get("x-router-error-code")
