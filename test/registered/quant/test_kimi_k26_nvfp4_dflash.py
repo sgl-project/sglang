@@ -19,7 +19,6 @@ EXTRA_ARGS = [
     "--moe-runner-backend=flashinfer_trtllm",
     "--fp4-gemm-backend=flashinfer_cutlass",
     "--attention-backend=trtllm_mla",
-    "--kv-cache-dtype=fp8_e4m3",
     "--mem-fraction-static=0.85",
     "--max-running-requests=16",
     "--speculative-algorithm=DFLASH",
