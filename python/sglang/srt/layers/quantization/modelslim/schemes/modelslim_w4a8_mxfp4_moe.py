@@ -7,18 +7,18 @@ from typing import Any, Dict
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUMXFP4W4A8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
 from sglang.srt.utils import set_weight_attrs
 
-MXFP4_W4A8_BLOCK_SIZE = 32
-MXFP4_W4A8_PACK_FACTOR = 2
+W4A8_MXFP4_BLOCK_SIZE = 32
+W4A8_MXFP4_PACK_FACTOR = 2
 
-__all__ = ["ModelSlimMXFP4W4A8MoE"]
+__all__ = ["ModelSlimW4A8MXFP4MoE"]
 
 
-class ModelSlimMXFP4W4A8MoE(ModelSlimMoEScheme):
+class ModelSlimW4A8MXFP4MoE(ModelSlimMoEScheme):
     """Create one ModelSlim W4A8 MXFP expert-weight group (w13 or w2)."""
 
     def __init__(
@@ -32,7 +32,7 @@ class ModelSlimMXFP4W4A8MoE(ModelSlimMoEScheme):
             )
         self.quant_config = quant_config
         self.weight_prefix = weight_prefix
-        self.kernel = NPUMXFP4W4A8MoEMethod()
+        self.kernel = NPUW4A8MXFP4MoEMethod()
 
     def create_weights(
         self,
@@ -59,7 +59,7 @@ class ModelSlimMXFP4W4A8MoE(ModelSlimMoEScheme):
             torch.empty(
                 num_experts,
                 output_size,
-                input_size // MXFP4_W4A8_PACK_FACTOR,
+                input_size // W4A8_MXFP4_PACK_FACTOR,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
@@ -71,8 +71,8 @@ class ModelSlimMXFP4W4A8MoE(ModelSlimMoEScheme):
             torch.zeros(
                 num_experts,
                 output_size,
-                (input_size + MXFP4_W4A8_BLOCK_SIZE - 1)
-                // MXFP4_W4A8_BLOCK_SIZE,
+                (input_size + W4A8_MXFP4_BLOCK_SIZE - 1)
+                // W4A8_MXFP4_BLOCK_SIZE,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
