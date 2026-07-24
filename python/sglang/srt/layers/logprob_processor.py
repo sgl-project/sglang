@@ -296,6 +296,8 @@ def get_token_ids_logprobs_chunk(
         int: Number of remaining tokens to process in next chunk
     """
     # Empty chunks still walk the slice to emit placeholder entries.
+    if log_normalizer is not None:
+        row_max, row_log_sum = log_normalizer
     pt = 0
     next_split_pruned_len = 0
     for n, (token_ids, pruned_len) in enumerate(
@@ -328,7 +330,6 @@ def get_token_ids_logprobs_chunk(
             if token_ids is not None:
                 row = logprobs[pt + j, token_ids]
                 if log_normalizer is not None:
-                    row_max, row_log_sum = log_normalizer
                     row = (row.float() - row_max[pt + j]) - row_log_sum[pt + j]
                 val.append(row.tolist())
                 idx.append(token_ids)
@@ -495,6 +496,15 @@ class InputLogprobProcessor:
         split_len_topk = 0
         split_len_token_ids = 0
 
+        fused_kernel, fused_max_k = None, 0
+        if self.enable_fast_input_logprobs and pruned_states.is_cuda:
+            from sglang.srt.layers.logsumexp import (
+                FUSED_TOPK_MAX_K,
+                row_logsumexp_topk,
+            )
+
+            fused_kernel, fused_max_k = row_logsumexp_topk, FUSED_TOPK_MAX_K
+
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
@@ -565,16 +575,8 @@ class InputLogprobProcessor:
                     if logits_metadata.extend_return_top_logprob
                     else 0
                 )
-                use_fused = False
-                if chunk_logprobs.is_cuda and max_k > 0:
-                    from sglang.srt.layers.logsumexp import (
-                        FUSED_TOPK_MAX_K,
-                        row_logsumexp_topk,
-                    )
-
-                    use_fused = max_k <= FUSED_TOPK_MAX_K
-                if use_fused:
-                    row_max, row_log_sum, top_vals, top_idx = row_logsumexp_topk(
+                if 0 < max_k <= fused_max_k:
+                    row_max, row_log_sum, top_vals, top_idx = fused_kernel(
                         chunk_logprobs, max_k
                     )
                     chunk_log_normalizer = (row_max, row_log_sum)

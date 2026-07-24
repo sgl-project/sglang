@@ -16,11 +16,33 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.moe_runner.triton_utils.gate_topk import (
+    fpval_to_key,
+    key_to_fpval,
+)
+
 # Maximum k for the fused top-k kernel; larger k should fall back to
 # torch.topk. The per-block selection cost grows with k: measured on GB300
 # at vocab=151936 the fused kernel beats a separate logsumexp + top-k up to
 # k~6 and drops below plain torch.topk near k=32.
 FUSED_TOPK_MAX_K = 8
+
+
+@triton.jit
+def _accumulate_block_lse(x, m_i, l_i):
+    """Fold one block of fp32 values into the running (max, sum_exp).
+
+    Per-block max first: a single dominant logit stays exact instead of
+    being renormalized against a stale running max. A +/-inf block max
+    makes exp(x - m_blk) nan; the true normalized sum_exp there is 1.
+    Shared by both kernels so their (max, log_sum) outputs are bitwise
+    identical by construction.
+    """
+    m_blk = tl.max(x)
+    l_blk = tl.sum(tl.exp(x - m_blk))
+    l_blk = tl.where((m_blk == float("inf")) | (m_blk == float("-inf")), 1.0, l_blk)
+    m_i, l_i = _combine_lse(m_i, l_i, m_blk, l_blk)
+    return m_i, l_i, m_blk
 
 
 @triton.jit
@@ -59,14 +81,7 @@ def _row_logsumexp_kernel(
         x = tl.load(
             row_ptr + offs * col_stride, mask=offs < num_cols, other=float("-inf")
         ).to(tl.float32)
-        # Per-block max first: a single dominant logit stays exact instead of
-        # being renormalized against a stale running max.
-        m_blk = tl.max(x)
-        l_blk = tl.sum(tl.exp(x - m_blk))
-        # +/-inf block max: exp(x - m_blk) is nan there; the true sum_exp
-        # normalized by m_blk is 1.
-        l_blk = tl.where((m_blk == float("inf")) | (m_blk == float("-inf")), 1.0, l_blk)
-        m_i, l_i = _combine_lse(m_i, l_i, m_blk, l_blk)
+        m_i, l_i, _ = _accumulate_block_lse(x, m_i, l_i)
 
     tl.store(out_max_ptr + row, m_i)
     tl.store(out_log_sum_ptr + row, tl.log(l_i))
@@ -104,26 +119,22 @@ def _pack_key(vals, idxs):
     """Pack fp32 value + int32 index into one order-encoding int64 key.
 
     Key order == candidate order: higher value wins, value ties go to the
-    LOWER index. The fp32 bits are mapped through the standard
-    sign-flip transform so unsigned bit order matches float order, then
-    placed above the complemented index; all keys land in [0, 2**63), so
-    signed int64 comparison is the candidate comparison. The 2147483647
-    (int32 max) index sentinel yields the smallest key for a given value,
-    so "empty" (-inf, sentinel) candidates lose against everything,
-    including genuine -inf lanes.
+    LOWER index. The fp32 bits are mapped through gate_topk's sign-flip
+    transform so unsigned bit order matches float order, then placed above
+    the complemented index; all keys land in [0, 2**63), so signed int64
+    comparison is the candidate comparison. The 2147483647 (int32 max)
+    index sentinel yields the smallest key for a given value, so "empty"
+    (-inf, sentinel) candidates lose against everything, including genuine
+    -inf lanes.
     """
-    bits = vals.to(tl.int32, bitcast=True)
-    sortable = bits ^ ((bits >> 31) | -2147483648)
-    return ((sortable.to(tl.int64) & 0xFFFFFFFF) << 31) | (2147483647 - idxs).to(
-        tl.int64
-    )
+    sortable = fpval_to_key(vals.to(tl.uint32, bitcast=True))
+    return (sortable.to(tl.int64) << 31) | (2147483647 - idxs).to(tl.int64)
 
 
 @triton.jit
 def _unpack_val(keys):
-    sortable = ((keys >> 31) & 0xFFFFFFFF).to(tl.int32)
-    bits = sortable ^ ((~sortable >> 31) | -2147483648)
-    return bits.to(tl.float32, bitcast=True)
+    sortable = ((keys >> 31) & 0xFFFFFFFF).to(tl.uint32)
+    return key_to_fpval(sortable).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -169,14 +180,7 @@ def _row_logsumexp_topk_kernel(
             row_ptr + offs * col_stride, mask=offs < num_cols, other=float("-inf")
         ).to(tl.float32)
 
-        # Same op sequence as _row_logsumexp_kernel so the (max, log_sum)
-        # outputs stay bitwise identical to the non-fused kernel.
-        m_blk = tl.max(x)
-        l_blk = tl.sum(tl.exp(x - m_blk))
-        # +/-inf block max: exp(x - m_blk) is nan there; the true sum_exp
-        # normalized by m_blk is 1.
-        l_blk = tl.where((m_blk == float("inf")) | (m_blk == float("-inf")), 1.0, l_blk)
-        m_i, l_i = _combine_lse(m_i, l_i, m_blk, l_blk)
+        m_i, l_i, m_blk = _accumulate_block_lse(x, m_i, l_i)
 
         # Top-k maintenance. Blocks are visited in ascending column order and
         # the wrapper guarantees the first block holds >= K in-row lanes, so
