@@ -11,10 +11,6 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.layers.attention.dsa.utils import (
-    INDEXER_K_CACHE_PRESHUFFLE_TILE,
-    aiter_can_use_preshuffle_paged_mqa,
-)
 
 from .utils import make_name
 
@@ -35,16 +31,7 @@ def _jit_fused_store_module(
     index_dtype: torch.dtype,
     page_size: int,
 ):
-    template_args = [input_dtype, index_dtype, page_size, is_arch_support_pdl()]
-    if name == "indexer":
-        # Only the indexer kernel has the preshuffle tile-size template param;
-        # FusedStoreCacheFlashMLAKernel does not take it.
-        template_args.append(
-            INDEXER_K_CACHE_PRESHUFFLE_TILE
-            if aiter_can_use_preshuffle_paged_mqa()
-            else 0
-        )
-    args = make_cpp_args(*template_args)
+    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(

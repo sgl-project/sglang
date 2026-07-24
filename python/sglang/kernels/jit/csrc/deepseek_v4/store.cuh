@@ -75,7 +75,7 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL, int32_t kPreshuffleSize = 0>
+template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
@@ -114,20 +114,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   OutStorage result;
   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  if constexpr (kPreshuffleSize != 0) {
-    constexpr int32_t kTile = kPreshuffleSize;
-    constexpr int32_t kVecSize = 4;
-    const int32_t dim_base = lane_id * kVecSize;
-    const int32_t token_tile_id = offset / kTile;
-    const int32_t token_in_tile = offset % kTile;
-    const int32_t col_tile_id = dim_base / kTile;
-    const int32_t col_in_tile = dim_base % kTile;
-    const int32_t value_offset =
-        token_tile_id * (kTile * 128) + col_tile_id * (kTile * kTile) + token_in_tile * kTile + col_in_tile;
-    static_cast<OutStorage*>(pointer::offset(page_ptr, value_offset))[0] = result;
-  } else {
-    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  }
+  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
   static_cast<float*>(scale_ptr)[0] = scale;
 
   PDLTriggerSecondary<kUsePDL>();
@@ -174,11 +161,11 @@ struct FusedStoreCacheFlashMLAKernel {
   }
 };
 
-template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL, int32_t kPreshuffleSize = 0>
+template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
 struct FusedStoreCacheIndexerKernel {
   static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132 * kPageSize;
-  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, kLogSize, kUsePDL, kPreshuffleSize>;
+  static constexpr auto kernel = fused_store_indexer_cache<Float, IndicesT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
