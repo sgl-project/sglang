@@ -1341,6 +1341,18 @@ class DeepseekV4AttnBackend(
                 else None
             )
 
+    def _get_captured_draft_decode_metadata(
+        self,
+        bs: int,
+    ) -> Optional[DSV4RawDecodeMetadata]:
+        """Return raw metadata that already aliases the EAGLE graph inputs."""
+        if not self.is_draft_runner or self.needs_cpu_seq_lens or self.is_dspark_draft:
+            return None
+        metadata = self.cuda_graph_metadata_of_bucket_and_bs[
+            _GraphBucket.DECODE_OR_IDLE
+        ].get(bs)
+        return metadata if isinstance(metadata, DSV4RawDecodeMetadata) else None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
         if self.mtp_enabled and logical_forward_mode.is_idle():
@@ -2067,38 +2079,43 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        from types import SimpleNamespace
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        inner_fb = SimpleNamespace(
-            batch_size=forward_batch.batch_size,
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            # Propagate the real runtime mode so inner backends can detect IDLE
-            # and apply their idle substitution.
-            actual_forward_mode=getattr(
-                forward_batch, "actual_forward_mode", forward_batch.forward_mode
-            ),
-            input_ids=getattr(forward_batch, "input_ids", None),
-            positions=getattr(forward_batch, "positions", None),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-            spec_info=forward_batch.spec_info,
         )
+        active_backends = self.attn_backends[: self.speculative_num_steps - 1]
         if in_capture:
-            for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_metadata_out_graph(
-                    inner_fb, in_capture=True
-                )
+            for backend in active_backends:
+                backend.init_forward_metadata_out_graph(inner_fb, in_capture=True)
         else:
-            if self.speculative_num_steps == 1:
+            if not active_backends:
                 return
-            self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
-            temp_metadata = self.attn_backends[0].forward_metadata
-            for i in range(1, self.speculative_num_steps - 1):
-                self.attn_backends[i].replay_cuda_graph_metadata_from(
+            captured_metadata = []
+            if inner_fb.actual_forward_mode.is_decode():
+                for backend in active_backends:
+                    metadata = backend._get_captured_draft_decode_metadata(
+                        inner_fb.batch_size
+                    )
+                    if metadata is None:
+                        break
+                    captured_metadata.append(metadata)
+            if len(captured_metadata) == len(active_backends):
+                # Capture retained direct views of EAGLE's req/seq graph
+                # buffers, which the runner refreshes before this call. The
+                # raw out-cache tensor is only a capture-time dummy: live SWA
+                # write locations are regenerated inside the graph.
+                for backend, metadata in zip(
+                    active_backends, captured_metadata, strict=True
+                ):
+                    backend.forward_metadata = metadata
+                return
+            active_backends[0].init_forward_metadata_out_graph(inner_fb)
+            temp_metadata = active_backends[0].forward_metadata
+            for backend in active_backends[1:]:
+                backend.replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,
                     temp_metadata=temp_metadata,
                     bucket=_GraphBucket.DECODE_OR_IDLE,
