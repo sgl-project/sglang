@@ -7,7 +7,7 @@ use std::{
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::Api,
+    api::{Api, ListParams},
     runtime::{
         watcher::{watcher, Config},
         WatchStreamExt,
@@ -34,6 +34,11 @@ pub struct ServiceDiscoveryConfig {
     pub enabled: bool,
     pub selector: HashMap<String, String>,
     pub check_interval: Duration,
+    /// Period of the authoritative full-LIST reconcile that repairs the
+    /// worker set independently of watch health. Keep this comfortably below
+    /// the pod termination-drain budget so a draining pod stops receiving new
+    /// traffic early enough for its in-flight requests to complete.
+    pub resync_interval: Duration,
     pub port: u16,
     pub namespace: Option<String>,
     // PD mode specific configuration
@@ -55,6 +60,7 @@ impl Default for ServiceDiscoveryConfig {
             enabled: false,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8000,
             namespace: None,
             pd_mode: false,
@@ -328,10 +334,53 @@ pub async fn start_service_discovery(
             }
         }
 
+        // Authoritative periodic full-LIST reconcile. The watch alone cannot
+        // guarantee convergence: `.applied_objects()` drops the watcher's
+        // Delete events, and environments that frequently drop long-lived
+        // watch connections leave extended windows where nothing is observed.
+        // This task repairs both missed adds and missed removes on a fixed
+        // cadence, independent of watch health. `time::interval` fires
+        // immediately, so the first reconcile also seeds the worker set at
+        // startup.
+        {
+            let pods_resync = pods.clone();
+            let config_resync = Arc::clone(&config_arc);
+            let tracked_resync = Arc::clone(&tracked_pods);
+            let app_context_resync = Arc::clone(&app_context);
+            // Clamp to >= 1s: time::interval panics on a zero period.
+            let resync_period = config_arc.resync_interval.max(Duration::from_secs(1));
+            tokio::spawn(async move {
+                let mut ticker = time::interval(resync_period);
+                loop {
+                    ticker.tick().await;
+                    reconcile_from_list(
+                        &pods_resync,
+                        &config_resync,
+                        Arc::clone(&tracked_resync),
+                        Arc::clone(&app_context_resync),
+                        config_resync.port,
+                    )
+                    .await;
+                }
+            });
+        }
+
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
         loop {
+            // Reconcile against a fresh LIST before (re)starting the watch so
+            // a reconnect immediately repairs the adds/removes missed during
+            // the outage, rather than waiting for the next periodic tick.
+            reconcile_from_list(
+                &pods,
+                &config_arc,
+                Arc::clone(&tracked_pods),
+                Arc::clone(&app_context),
+                port,
+            )
+            .await;
+
             let watcher_config = Config::default();
             let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
 
@@ -408,11 +457,11 @@ pub async fn start_service_discovery(
                 }
             }
 
-            warn!(
-                "Kubernetes watcher exited, restarting in {} seconds",
-                config_arc.check_interval.as_secs()
-            );
-            time::sleep(config_arc.check_interval).await;
+            // No extra sleep here: the Err arm already applies exponential
+            // backoff (retry_delay), and on a clean stream end we want a
+            // prompt restart so the reconcile above re-lists without an
+            // additional stall. The periodic reconcile task guarantees
+            // convergence regardless of watch health.
         }
     });
 
@@ -617,6 +666,103 @@ async fn handle_pod_deletion(
             pod_info.name, pod_info.pod_type, worker_url
         );
     }
+}
+
+/// Full LIST + reconcile of the tracked worker set against the API server.
+///
+/// Adds any healthy, selector-matching pod not yet tracked, and removes any
+/// tracked pod that has disappeared from the API server or begun terminating
+/// (mirroring the watch path's deletion_timestamp handling). This is the
+/// authoritative resync that makes worker correctness independent of
+/// watch-stream reliability: `.applied_objects()` drops Delete events and
+/// unstable environments drop the long-lived watch, so the watch alone
+/// cannot converge.
+async fn reconcile_from_list(
+    pods: &Api<Pod>,
+    config: &ServiceDiscoveryConfig,
+    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    app_context: Arc<AppContext>,
+    port: u16,
+) {
+    // Same client-side filtering as the watch (Config::default() => no server
+    // label filter); we match via should_include below.
+    let list = match pods.list(&ListParams::default()).await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("SD resync LIST failed, keeping current worker set: {}", e);
+            return;
+        }
+    };
+
+    // Names currently present in the API for matching pods, and add-missing.
+    // A pod with a deletion_timestamp is deliberately NOT counted as present:
+    // the watch path deregisters a pod as soon as it starts terminating, and
+    // the reconcile must mirror that semantic watch-independently. If it
+    // waited for the pod to disappear from the API instead, a draining pod
+    // would keep receiving new traffic whenever the watch is down — which
+    // both fails those requests once the pod finishes shutting down and can
+    // prevent a graceful-drain hook from ever reaching zero in-flight.
+    // handle_pod_deletion is idempotent (removes only if tracked), so the
+    // watch and the reconcile processing the same termination never conflict.
+    let mut present: HashSet<String> = HashSet::new();
+    for pod in &list.items {
+        if !PodInfo::should_include(pod, config) {
+            continue;
+        }
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        if let Some(name) = pod.metadata.name.clone() {
+            present.insert(name);
+        }
+        if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
+            // handle_pod_event dedups via tracked_pods and gates on
+            // is_healthy(), so re-adds are cheap no-ops.
+            handle_pod_event(
+                &pod_info,
+                Arc::clone(&tracked_pods),
+                Arc::clone(&app_context),
+                port,
+                config.pd_mode,
+            )
+            .await;
+        }
+    }
+
+    // Remove-absent: any tracked pod whose name is no longer in the API.
+    // Iterate the STORED PodInfo values so handle_pod_deletion's exact-struct
+    // `tracked.remove(pod_info)` always matches.
+    let stale: Vec<PodInfo> = match tracked_pods.lock() {
+        Ok(tracker) => stale_tracked_pods(&tracker, &present),
+        Err(e) => {
+            error!("SD resync: failed to lock tracked_pods: {}", e);
+            return;
+        }
+    };
+    for pod_info in stale {
+        handle_pod_deletion(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            port,
+        )
+        .await;
+    }
+}
+
+/// Tracked pods whose name is absent from a fresh LIST of the API server.
+///
+/// Selection is by pod NAME (the stable key), never by full `PodInfo`
+/// equality: a tracked pod whose status/readiness has flipped since it was
+/// added must still be treated as present. The returned values are the
+/// stored `PodInfo` structs so the caller's `HashSet::remove` matches
+/// exactly.
+fn stale_tracked_pods(tracked: &HashSet<PodInfo>, present: &HashSet<String>) -> Vec<PodInfo> {
+    tracked
+        .iter()
+        .filter(|pod_info| !present.contains(&pod_info.name))
+        .cloned()
+        .collect()
 }
 
 /// Start router node discovery for mesh cluster
@@ -899,6 +1045,7 @@ mod tests {
             enabled: true,
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1538,6 +1685,7 @@ mod tests {
             enabled: true,
             selector: regular_selector,
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1573,6 +1721,7 @@ mod tests {
             enabled: true,
             selector: regular_selector,
             check_interval: Duration::from_secs(60),
+            resync_interval: Duration::from_secs(30),
             port: 8080,
             namespace: None,
             pd_mode: true,
@@ -1586,5 +1735,75 @@ mod tests {
 
         let regular_pod = create_regular_k8s_pod("regular-pod", "10.0.1.1");
         assert!(!PodInfo::should_include(&regular_pod, &config));
+    }
+
+    fn tracked_pod_info(name: &str, ip: &str, status: &str, is_ready: bool) -> PodInfo {
+        PodInfo {
+            name: name.to_string(),
+            ip: ip.to_string(),
+            status: status.to_string(),
+            is_ready,
+            pod_type: Some(PodType::Regular),
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        }
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_removes_only_absent_names() {
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Running", true));
+        tracked.insert(tracked_pod_info("pod-c", "10.0.0.3", "Running", true));
+
+        let mut present = HashSet::new();
+        present.insert("pod-a".to_string());
+        present.insert("pod-c".to_string());
+
+        let stale = stale_tracked_pods(&tracked, &present);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "pod-b");
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_keeps_pod_with_changed_status() {
+        // The stored PodInfo was captured while the pod was Ready/Running; the
+        // live pod has since flipped (e.g. is_ready=false). Presence is keyed
+        // by name, so the tracked entry must NOT be selected for removal —
+        // full-struct equality would wrongly treat it as gone.
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+
+        let mut present = HashSet::new();
+        present.insert("pod-a".to_string());
+
+        let stale = stale_tracked_pods(&tracked, &present);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_empty_list_removes_everything() {
+        // A fresh LIST that returns no matching pods must drain the whole
+        // tracked set (e.g. all workers were deleted while the watch was
+        // down).
+        let mut tracked = HashSet::new();
+        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Pending", false));
+
+        let stale = stale_tracked_pods(&tracked, &HashSet::new());
+        assert_eq!(stale.len(), 2);
+    }
+
+    #[test]
+    fn test_stale_tracked_pods_returns_stored_struct() {
+        // The returned PodInfo must be the STORED struct (not a re-parsed
+        // one) so the caller's exact-struct HashSet::remove always matches.
+        let stored = tracked_pod_info("pod-gone", "10.0.0.9", "Running", true);
+        let mut tracked = HashSet::new();
+        tracked.insert(stored.clone());
+
+        let stale = stale_tracked_pods(&tracked, &HashSet::new());
+        assert_eq!(stale, vec![stored]);
     }
 }
