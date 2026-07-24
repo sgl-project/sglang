@@ -5,6 +5,9 @@ metatags:
 tag: NEW
 ---
 
+
+> ⚠️ **Note:** Runtime support for DiffusionGemma is currently pending and is **not yet available** in the latest release (v0.5.14). This documentation is a preview for an upcoming release.
+
 ## 1. Model Introduction
 
 DiffusionGemma is a uniform-state (renoising) block-diffusion language model from Google. An encoder builds causal context, and a decoder denoises a fixed-length bidirectional canvas of `canvas_length` tokens. The `Gemma4Renoise` sampler runs `max_denoising_steps` reverse steps over the canvas, feeding the previous step's logits back as self-conditioning and emitting the greedy argmax of the processed logits.
