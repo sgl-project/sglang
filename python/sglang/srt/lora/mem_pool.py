@@ -726,6 +726,17 @@ class LoRAMemoryPool:
 
         return cached_weight
 
+    @staticmethod
+    def _get_layer_pipeline_flag(layer_modules):
+        """Get the shared pipeline flag for a layer's modules.
+
+        All modules in a layer share one flag, so just return the first one found.
+        """
+        for module in layer_modules.values():
+            if module._pipeline_flag is not None:
+                return module._pipeline_flag
+        return None
+
     def prepare_lora_batch(
         self,
         cur_uids: Set[Optional[str]],
@@ -734,7 +745,15 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        loading_stream: Optional[torch.cuda.Stream] = None,
     ):
+        """
+        Prepare LoRA batch for inference.
+
+        If loading_stream is provided, enables pipelined loading with per-module
+        synchronization signals, allowing the compute stream to begin before all
+        layers are loaded.
+        """
         # Python hash seeds differ by TP process; slot and LRU updates must not.
         ordered_uids = sorted(cur_uids, key=lambda uid: (uid is not None, uid or ""))
 
@@ -764,7 +783,8 @@ class LoRAMemoryPool:
 
             if not candidates:
                 raise ValueError(
-                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
+                    "No available buffer slots found. Please ensure the number of "
+                    "active (pinned) loras is less than max_loras_per_batch."
                 )
 
             # Prefer evicting LoRA adapters over the base model (None).
@@ -772,10 +792,8 @@ class LoRAMemoryPool:
             # and no other adapters can be evicted.
             non_none_candidates = candidates - {None}
             if non_none_candidates:
-                # Prioritize evicting actual LoRA adapters
                 candidates_to_use = non_none_candidates
             else:
-                # Only None is available for eviction (batch is all LoRA requests)
                 candidates_to_use = candidates
 
             # Select victim using eviction policy
@@ -806,6 +824,7 @@ class LoRAMemoryPool:
                     lora_modules,
                     lora_embed_tokens_module,
                     lora_lm_head_module,
+                    loading_stream=loading_stream,
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
@@ -845,7 +864,17 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        loading_stream: Optional[torch.cuda.Stream] = None,
     ):
+        """
+        Load LoRA weights into the buffer slot.
+
+        If loading_stream is provided, emits per-module pipeline signals
+        (mark_loading before DMA, mark_ready after) so the compute stream
+        can overlap with weight loading.
+        """
+        pipelined = loading_stream is not None
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
@@ -859,11 +888,28 @@ class LoRAMemoryPool:
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 copy_weight_into_buffer(buffer_view, weight)
 
+        def sliced_or_cached(slice_fn, temp_buffer, temp_cache_keys):
+            """Return (weight, tp_key) for the current target_module, reusing
+            the pinned cache to skip the (possibly concat-heavy) slice on a hit.
+            `target_module` and `pinned_layer_weights` are read from the loop scope.
+            """
+            key = append_cache_key_suffix(
+                temp_cache_keys[target_module], f"tp{self.tp_rank}"
+            )
+            cached = pinned_layer_weights.get(key)
+            weight = (
+                cached
+                if cached is not None
+                else slice_fn(temp_buffer[target_module], self.tp_rank)
+            )
+            return weight, key
+
         if uid is None:
             self._clear_buffer_slot_for_base(buffer_id)
             return
 
         assert lora_adapter is not None
+
         lora_rank = lora_adapter.config.r
 
         # Pre-validate weight names against target modules across all layers
@@ -903,6 +949,13 @@ class LoRAMemoryPool:
                 logger.warning(msg)
 
         for layer_id in range(self.num_layer):
+            # Signal this layer's shared flag as LOADING before DMA.
+            # All modules in a layer share one flag, so we only signal once.
+            if pipelined:
+                layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
+                if layer_flag is not None:
+                    layer_flag.mark_loading()
+
             layer = lora_adapter.layers[layer_id]
             layer_weights = layer.weights
             pinned_layer_weights = layer.pinned_weights
@@ -1064,25 +1117,20 @@ class LoRAMemoryPool:
                     # Skip weight slicing if the weight is not present in the adapter
                     continue
 
-                # Handle standard modules
-                temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                    temp_A_buffer[target_module], self.tp_rank
+                # Handle standard modules. slice_lora_*_weights can be
+                # expensive (fused QKV / gate_up_proj call torch.concat,
+                # The sliced result is deterministic per (weight, tp_rank) and
+                # pinned-weight cache already stores it under the tp-suffixed
+                # key, so on a hit we reuse it and skip the slice — otherwise
+                temp_A_buffer[target_module], temp_A_cache_keys[target_module] = (
+                    sliced_or_cached(
+                        module.slice_lora_a_weights, temp_A_buffer, temp_A_cache_keys
+                    )
                 )
-                cache_keys = temp_A_cache_keys[target_module]
-                assert cache_keys is not None
-                temp_A_cache_keys[target_module] = append_cache_key_suffix(
-                    cache_keys,
-                    f"tp{self.tp_rank}",
-                )
-
-                temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                    temp_B_buffer[target_module], self.tp_rank
-                )
-                cache_keys = temp_B_cache_keys[target_module]
-                assert cache_keys is not None
-                temp_B_cache_keys[target_module] = append_cache_key_suffix(
-                    cache_keys,
-                    f"tp{self.tp_rank}",
+                temp_B_buffer[target_module], temp_B_cache_keys[target_module] = (
+                    sliced_or_cached(
+                        module.slice_lora_b_weights, temp_B_buffer, temp_B_cache_keys
+                    )
                 )
 
             for name, weights in temp_A_buffer.items():
@@ -1325,6 +1373,25 @@ class LoRAMemoryPool:
                         # contracts over the full padded max_rank, so the tail must be clean.
                         target_buffer[buffer_id, :, lora_rank:].zero_()
 
+            # Signal this layer's shared flag as READY after DMA
+            if pipelined:
+                layer_flag = self._get_layer_pipeline_flag(lora_modules[layer_id])
+                if layer_flag is not None:
+                    layer_flag.mark_ready(loading_stream)
+
+        # Signal embed_tokens and lm_head as LOADING before embedding DMA
+        if pipelined:
+            if (
+                lora_embed_tokens_module is not None
+                and lora_embed_tokens_module._pipeline_flag is not None
+            ):
+                lora_embed_tokens_module._pipeline_flag.mark_loading()
+            if (
+                lora_lm_head_module is not None
+                and lora_lm_head_module._pipeline_flag is not None
+            ):
+                lora_lm_head_module._pipeline_flag.mark_loading()
+
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
@@ -1466,6 +1533,19 @@ class LoRAMemoryPool:
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
                 self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+
+        # Signal embed_tokens and lm_head as READY after embedding DMA
+        if pipelined:
+            if (
+                lora_embed_tokens_module is not None
+                and lora_embed_tokens_module._pipeline_flag is not None
+            ):
+                lora_embed_tokens_module._pipeline_flag.mark_ready(loading_stream)
+            if (
+                lora_lm_head_module is not None
+                and lora_lm_head_module._pipeline_flag is not None
+            ):
+                lora_lm_head_module._pipeline_flag.mark_ready(loading_stream)
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
