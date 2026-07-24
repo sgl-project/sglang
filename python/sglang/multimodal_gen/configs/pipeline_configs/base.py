@@ -459,6 +459,9 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
+    def get_vae_decode_batch_size(self, latents):
+        return latents.shape[0]
+
     @staticmethod
     def _gather_sp_tensor(tensor: torch.Tensor, *, dim: int) -> torch.Tensor:
         """All-gather an SP-sharded tensor along the specified logical dimension."""

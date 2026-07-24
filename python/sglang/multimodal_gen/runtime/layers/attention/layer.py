@@ -656,6 +656,38 @@ class USPAttention(nn.Module):
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
+        npu_varlen_meta = (
+            attn_mask_meta.get("npu_varlen")
+            if isinstance(attn_mask_meta, dict)
+            else None
+        )
+        if (
+            attn_mask is not None
+            and npu_varlen_meta is not None
+            and getattr(self.attn_impl, "supports_varlen", False)
+        ):
+            if get_ring_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "Ascend varlen replicated-prefix attention does not support ring parallelism."
+                )
+            sp_size = get_ulysses_parallel_world_size()
+            if sp_size > 1:
+                if num_replicated_prefix <= 0:
+                    raise ValueError(
+                        "Ascend varlen SP attention requires a replicated prefix."
+                    )
+                return self._forward_with_replicated_prefix_varlen(
+                    q,
+                    k,
+                    v,
+                    ctx_attn_metadata,
+                    num_replicated_prefix,
+                    npu_varlen_meta,
+                )
+            return self._forward_npu_varlen(
+                q, k, v, ctx_attn_metadata, npu_varlen_meta
+            )
+
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
         meta_pad_start = meta_pad_end = None
@@ -1053,6 +1085,95 @@ class USPAttention(nn.Module):
         out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
+
+    @staticmethod
+    def _gather_sequence(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        expanded = indices[:, :, None, None].expand(
+            -1, -1, tensor.shape[2], tensor.shape[3]
+        )
+        return torch.gather(tensor, 1, expanded).contiguous()
+
+    def _forward_npu_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        varlen_meta: dict,
+    ) -> torch.Tensor:
+        gather_indices = varlen_meta["gather_indices"]
+        restore_indices = varlen_meta["restore_indices"]
+        if gather_indices is None:
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        q = self._gather_sequence(q, gather_indices)
+        k = self._gather_sequence(k, gather_indices)
+        v = self._gather_sequence(v, gather_indices)
+        out = self.attn_impl.forward_varlen(
+            q,
+            k,
+            v,
+            varlen_meta["actual_seq_lengths"],
+            ctx_attn_metadata,
+        )
+        return self._gather_sequence(out, restore_indices)
+
+    def _forward_with_replicated_prefix_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        num_rep: int,
+        varlen_meta: dict,
+    ) -> torch.Tensor:
+        sp_size = get_ulysses_parallel_world_size()
+        sp_rank = get_sp_parallel_rank()
+
+        q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
+        k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
+        v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+        if q.shape[2:] != k.shape[2:] or q.shape[2:] != v.shape[2:]:
+            raise ValueError("Packed Ascend USP attention requires equal Q/K/V heads")
+
+        head_dim = q.shape[-1]
+        qkv_shard = torch.stack((q_shard, k_shard, v_shard), dim=3).flatten(3, 4)
+        qkv_shard = _usp_input_all_to_all(qkv_shard, head_dim=2)
+
+        h_local = qkv_shard.shape[2]
+        h_start = sp_rank * h_local
+        qkv_rep = torch.stack((q_rep, k_rep, v_rep), dim=3).flatten(3, 4)
+        qkv_rep = qkv_rep[:, :, h_start : h_start + h_local, :].contiguous()
+
+        qkv = torch.cat([qkv_rep, qkv_shard], dim=1)
+        gather_indices = varlen_meta["gather_indices"]
+        restore_indices = varlen_meta["restore_indices"]
+        if gather_indices is not None:
+            qkv = self._gather_sequence(qkv, gather_indices)
+        q, k, v = [
+            tensor.contiguous()
+            for tensor in qkv.unflatten(-1, (3, head_dim)).unbind(dim=3)
+        ]
+        if gather_indices is None:
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        else:
+            out = self.attn_impl.forward_varlen(
+                q,
+                k,
+                v,
+                varlen_meta["actual_seq_lengths"],
+                ctx_attn_metadata,
+            )
+            out = self._gather_sequence(out, restore_indices)
+
+        out_rep = out[:, :num_rep]
+        out_shard = _usp_output_all_to_all(out[:, num_rep:], head_dim=2)
+        gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
+        torch.distributed.all_gather(
+            gathered,
+            out_rep.contiguous(),
+            group=get_sp_group().ulysses_group,
+        )
+        return torch.cat([torch.cat(gathered, dim=2), out_shard], dim=1)
 
     def forward_with_replicated_kv_prefix(
         self,

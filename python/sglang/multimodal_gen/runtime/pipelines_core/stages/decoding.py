@@ -291,7 +291,28 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
+            decode_batch_size = server_args.pipeline_config.get_vae_decode_batch_size(
+                batch.latents
+            )
+            if decode_batch_size < batch.latents.shape[0]:
+                logger.info_once(
+                    f"VAE decode is using batch chunks of {decode_batch_size}"
+                )
+                frames = torch.cat(
+                    [
+                        self.decode(
+                            latents,
+                            server_args,
+                            vae_dtype=vae_dtype,
+                        )
+                        for latents in batch.latents.split(decode_batch_size)
+                    ],
+                    dim=0,
+                )
+            else:
+                frames = self.decode(
+                    batch.latents, server_args, vae_dtype=vae_dtype
+                )
 
             # decode trajectory latents if needed
             if batch.return_trajectory_decoded:
