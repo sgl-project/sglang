@@ -509,7 +509,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    # Number of tokens model layers treat as non-padding. This includes fabricated
+    # idle tokens to keep MoE collectives participating.
     num_token_non_padded_cpu: int = None
+    # Local token count used as unpad width in post_forward_mlp_sync_batch.
+    num_tokens_before_dp_padding: Optional[int] = None
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
     # For logits and logprobs post processing
@@ -1382,6 +1386,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
+        # Keep the first pre-pad length: split prefill re-enters this on the same
+        # ForwardBatch per layer chunk, and later calls see the already-padded shape.
+        if self.num_tokens_before_dp_padding is None:
+            self.num_tokens_before_dp_padding = self.input_ids.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.lora_ids is not None:
@@ -1468,9 +1476,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
-            spec_info.hidden_states = self._pad_tensor_to_size(
-                spec_info.hidden_states, num_tokens
-            )
+            if spec_info.hidden_states is not None:
+                spec_info.hidden_states = self._pad_tensor_to_size(
+                    spec_info.hidden_states, num_tokens
+                )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1494,7 +1503,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                num_tokens = self.hidden_states_backup.shape[0]
+                num_tokens = self.num_tokens_before_dp_padding
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
@@ -1504,27 +1513,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup
