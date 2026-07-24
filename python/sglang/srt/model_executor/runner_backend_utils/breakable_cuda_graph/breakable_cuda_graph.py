@@ -231,14 +231,10 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Segment teardown (capture_end + instantiate, worst case an
-            # allocator stall under memory pressure) is the slow, per-rank
-            # variable step of a capture. Re-sync ranks here — in a patient
-            # distributed barrier — before eager break fns that may contain
-            # rank-coupled collectives with short hard timeouts (DeepEP
-            # NORMAL dispatch spins at most LEGACY_NUM_CPU_TIMEOUT_SECS=100s,
-            # a compile-time constant). Capture-only by construction: replay
-            # bypasses this wrapper via replay_fn.
+            # Re-sync ranks after segment teardown (the slow, variable
+            # step) before break fns with rank-coupled collectives and hard
+            # timeouts (DeepEP NORMAL: 100s). Capture-only; replay bypasses
+            # this wrapper.
             if capture._barrier_fn is not None:
                 capture._barrier_fn()
 

@@ -604,17 +604,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         return True
 
-    def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
-        # DSV4 DP attention / DeepEP collectives need every DP rank to enter
-        # the same replay path. Sparse-DP batches (one or more ranks with
-        # zero local tokens) fall back to eager to avoid hanging ranks.
-        global_num_tokens = forward_batch.global_num_tokens_cpu
-        if global_num_tokens is None:
-            return False
-        return len(global_num_tokens) > 1 and any(
-            int(num_tokens) == 0 for num_tokens in global_num_tokens
-        )
-
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> None:
@@ -682,7 +671,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
-    def _replay_ineligible_locally(
+    def replay_ineligible_locally(
         self,
         *,
         batch_size: int,
@@ -741,27 +730,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if num_tokens > self.max_num_tokens:
             return True
+        # No exact-shape check: load_batch bucket-pads; only reject
+        # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return True
         return False
 
-    def schedule_batch_replay_eligible(self, batch) -> bool:
-        """ScheduleBatch adapter for ``_replay_ineligible_locally`` (dp
-        mlp-sync vote)."""
-        return not self._replay_ineligible_locally(
-            batch_size=batch.batch_size(),
-            num_tokens=batch.extend_num_tokens,
-            input_embeds=batch.input_embeds,
-            replace_embeds=None,
-            prefix_lens=batch.prefix_lens,
-            is_target_verify=batch.forward_mode.is_target_verify(),
-            capture_hidden_mode=None,
-            return_logprob=batch.return_logprob,
+    def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+        if global_num_tokens is None:
+            return False
+        return len(global_num_tokens) > 1 and any(
+            int(num_tokens) == 0 for num_tokens in global_num_tokens
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._replay_ineligible_locally(
+        # DP check: group verdict from the schedule-time all-gather
+        # (min-reduced votes; also requires every rank to hold tokens).
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and not forward_batch.can_run_dp_breakable_cuda_graph
+        ):
+            return False
+
+        # Every dp rank must hold tokens this forward (reads the synced
+        # table post dp-padding; idle ranks vote permissively upstream).
+        if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        # Non-DP local check (sole decision for tp-only).
+        if self.replay_ineligible_locally(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),
             input_embeds=forward_batch.input_embeds,
@@ -772,25 +771,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return_logprob=forward_batch.return_logprob,
         ):
             return False
-        # BCG-with-captured-metadata under DP attention: every rank must
-        # have local tokens, and the batch must declare itself replayable.
-        # These gates are no-ops for non-DP / non-opt-in paths because
-        # global_num_tokens_cpu stays None.
-        if self._has_inactive_dp_rank(forward_batch):
-            return False
-        if (
-            forward_batch.global_num_tokens_cpu is not None
-            and not forward_batch.can_run_dp_breakable_cuda_graph
-        ):
-            return False
-        # No exact-shape check here: load_batch bucket-pads to the nearest
-        # captured shape. The factor above only rejects replays whose padded
-        # model work is disproportionate to the useful token count.
-        #
-        # Multi-req replay is supported by body-capture backends via the
-        # layer_model.forward monkey-patch in replay(): the captured graph runs
-        # the transformer stack, then the outer model.forward runs
-        # logits_processor eagerly on top with live request metadata.
         return True
 
     def _build_capture_spec_info(self, num_tokens: int):

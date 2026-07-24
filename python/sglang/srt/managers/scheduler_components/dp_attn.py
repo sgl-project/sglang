@@ -375,9 +375,9 @@ def prepare_mlp_sync_batch_raw(
 def make_local_breakable_eligible_fn(
     tp_worker,
 ) -> Callable[[ScheduleBatch], bool]:
-    """Bind the rank-local breakable-replay eligibility check to the
-    worker's target-model prefill graph runner, for the mlp-sync
-    consensus (see PrefillCudaGraphRunner.schedule_batch_replay_eligible).
+    """Bind the rank-local breakable-replay eligibility check
+    (PrefillCudaGraphRunner.replay_ineligible_locally) to the worker's
+    target-model prefill graph runner, for the mlp-sync consensus.
     """
     if isinstance(tp_worker, BaseSpecWorker):
         tp_worker = tp_worker.target_worker
@@ -385,8 +385,15 @@ def make_local_breakable_eligible_fn(
     def local_breakable_eligible(batch: ScheduleBatch) -> bool:
         if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
             return True
-        return tp_worker.model_runner.prefill_cuda_graph_runner.schedule_batch_replay_eligible(
-            batch
+        return not tp_worker.model_runner.prefill_cuda_graph_runner.replay_ineligible_locally(
+            batch_size=batch.batch_size(),
+            num_tokens=batch.extend_num_tokens,
+            input_embeds=batch.input_embeds,
+            replace_embeds=None,
+            prefix_lens=batch.prefix_lens,
+            is_target_verify=batch.forward_mode.is_target_verify(),
+            capture_hidden_mode=None,
+            return_logprob=batch.return_logprob,
         )
 
     return local_breakable_eligible
