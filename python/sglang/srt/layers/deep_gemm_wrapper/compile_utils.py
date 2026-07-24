@@ -34,6 +34,7 @@ _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+_IGNORE_GET_BEST_DEEPGEMM_CONFIG_KEY = envs.SGLANG_IGNORE_GET_BEST_DEEPGEMM_CONFIG_KEY.get()
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -108,6 +109,63 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+
+# Maps SGLang warmup kernel types to DeepGEMM get_best_gemm_config_key args.
+_KERNEL_TYPE_TO_CONFIG_KEY_ARGS: Dict[DeepGemmKernelType, Tuple[str, str]] = {
+    DeepGemmKernelType.GEMM_NT_F8F8BF16: ("Normal", "fp8"),
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: (
+        "MGroupedContiguous",
+        "fp8",
+    ),
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: ("MGroupedMasked", "fp8"),
+    DeepGemmKernelType.GEMM_NT_BF16BF16F32: ("Normal", "bf16_fp32"),
+    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: ("MGroupedContiguous", "bf16"),
+    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: ("MGroupedMasked", "bf16"),
+}
+
+
+def _dedupe_m_list_by_config(
+    kernel_type: DeepGemmKernelType,
+    n: int,
+    k: int,
+    num_groups: int,
+    m_list: List[int],
+) -> List[int]:
+    """Keep one representative M per unique DeepGEMM JIT config (V1-style dedup)."""
+    get_key = getattr(deep_gemm, "get_best_gemm_config_key", None)
+    if get_key is None:
+        logger.warning(
+            "DeepGEMM get_best_gemm_config_key is not available, skipping DeepGEMM warmup dedup"
+        )
+        return m_list
+
+    key_args = _KERNEL_TYPE_TO_CONFIG_KEY_ARGS.get(kernel_type)
+    if key_args is None:
+        logger.warning(
+            "No config-key mapping for %s; skipping DeepGEMM warmup dedup",
+            kernel_type.name,
+        )
+        return m_list
+
+    gemm_type, mma = key_args
+    seen: Dict[Tuple, int] = {}
+    for m in m_list:
+        # tvm_ffi.Array hashes by identity; convert to tuple for value equality.
+        config_key = tuple(get_key(gemm_type, mma, m, n, k, num_groups))
+        if config_key not in seen:
+            seen[config_key] = m
+
+    deduped = sorted(seen.values())
+    logger.info(
+        "DeepGEMM warmup dedup: %d Ms -> %d unique configs for <%s> N=%d, K=%d, num_groups=%d",
+        len(m_list),
+        len(deduped),
+        kernel_type.name,
+        n,
+        k,
+        num_groups,
+    )
+    return deduped
 
 
 # TODO improve code
@@ -199,6 +257,9 @@ def _compile_deep_gemm_one_type_all(
                 f"Available memory {memory_budget}GB is less than required memory {required_memory}GB for warmup, reducing max_m to {max_m} to avoid out of memory"
             )
             m_list = [m for m in m_list if m <= max_m]
+
+        if not _IGNORE_GET_BEST_DEEPGEMM_CONFIG_KEY:
+            m_list = _dedupe_m_list_by_config(kernel_type, n, k, num_groups, m_list)
 
         # Need some methods to estimate needed memory for warmup
         executor = _BaseWarmupExecutor.create(
