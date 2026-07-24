@@ -302,6 +302,8 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+    # vLLM-compatible per-request multimodal processor kwargs (e.g. Gemma4 max_soft_tokens)
+    mm_processor_kwargs: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -717,6 +719,8 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            images_config=self.images_config,
+            mm_processor_kwargs=self.mm_processor_kwargs,
             sampling_params=self.sampling_params[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
