@@ -78,6 +78,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def is_backuped(self, node_id: NodeId) -> bool:
+        """Whether the node's KV is already backed up to host."""
+        ...
+
+    @abstractmethod
     def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         """Bump the reference count on a node's component locks."""
         ...

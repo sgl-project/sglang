@@ -21,6 +21,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    ComponentAction,
+    MambaEvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
 )
@@ -179,7 +181,7 @@ class MambaComponent(TreeComponent):
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
-            self._evict_excess_path_states(node)
+            self._emit_excess_path_states_eviction(node, result)
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -192,18 +194,32 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
-            self._evict_excess_path_states(node)
+            self._emit_excess_path_states_eviction(node, result)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
 
-    def _evict_excess_path_states(self, tail: UnifiedTreeNode) -> None:
+    def _emit_excess_path_states_eviction(
+        self, tail: UnifiedTreeNode, result: InsertResult
+    ) -> None:
+        """Defer the path-cap eviction so it runs after the insert's BackupKV."""
+        if self.mamba_max_states_per_path < 0:
+            return
+        result.cache_actions.append(MambaEvictExcessPathStates(tail.id))
+
+    def _evict_excess_path_states(
+        self,
+        tail: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
         """Evict shallow eligible device checkpoints beyond the path cap.
 
         Full KV and any existing host backup are retained. The tail, forks,
-        locked nodes, and device leaves are preserved, so the cap is a
-        best-effort soft limit.
+        locked nodes (including a pending backup chain's write-through locks),
+        and device leaves are preserved, so the cap is a best-effort soft
+        limit. Freed slots are collected into the caller's dicts.
         """
         cap = self.mamba_max_states_per_path
         if cap < 0:
@@ -222,30 +238,23 @@ class MambaComponent(TreeComponent):
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}
-        device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        try:
-            for node in reversed(holders):
-                if excess <= 0 or node is tail:
-                    break
-                if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
-                    continue
-                if node in self.tree_core.evictable_device_leaves:
-                    continue
-                self.tree_core._evict_component_and_detach_lru(
-                    node,
-                    self,
-                    device_frees,
-                    host_frees,
-                    target=EvictLayer.DEVICE,
-                    tracker=tracker,
-                )
-                self.tree_core._cascade_evict(
-                    node, self, tracker, device_frees, host_frees
-                )
-                excess -= 1
-        finally:
-            self.cache._drain_frees(device_frees, host_frees)
+        for node in reversed(holders):
+            if excess <= 0 or node is tail:
+                break
+            if node.component_data[ct].lock_ref > 0 or len(node.children) != 1:
+                continue
+            if node in self.tree_core.evictable_device_leaves:
+                continue
+            self.tree_core._evict_component_and_detach_lru(
+                node,
+                self,
+                device_frees,
+                host_frees,
+                target=EvictLayer.DEVICE,
+                tracker=tracker,
+            )
+            self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
+            excess -= 1
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -810,6 +819,16 @@ class MambaComponent(TreeComponent):
             self._mamba_pool_host.free(host_value)
 
     def apply_component_action(self, action: ComponentAction) -> None:
+        if isinstance(action, MambaEvictExcessPathStates):
+            device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
+            self._evict_excess_path_states(
+                self.tree_core.node_by_id(action.tail_node_id),
+                device_frees,
+                host_frees,
+            )
+            self.cache._drain_frees(device_frees, host_frees)
+            return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:
                 self._free_mamba_value(indices)

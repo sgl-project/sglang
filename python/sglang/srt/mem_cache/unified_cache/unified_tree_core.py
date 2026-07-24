@@ -368,6 +368,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    def is_backuped(self, node_id: NodeId) -> bool:
+        """Whether the node's KV is already backed up to host."""
+        return self._node_arena[node_id].backuped
+
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
         node = UnifiedTreeNode(self.component_types, priority=priority)
@@ -691,7 +695,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
         cache_actions: list[CacheAction | ComponentAction] = []
-        # Trigger backup from the deepest threshold-crossing node.
+        # Deepest threshold-crossing walked node; its chain covers shallower ones.
         backup_node: Optional[UnifiedTreeNode] = None
         # Collect unreferenced device KV values during the walk.
         device_kv_to_free: list[torch.Tensor] = []
@@ -765,6 +769,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = InsertResult(
             prefix_len=total_prefix_length, cache_actions=cache_actions
         )
+        # Defer the backup action for the walked nodes.
+        if backup_node is not None:
+            cache_actions.append(self._build_backup_kv_action(backup_node))
+
         for component in self.components:
             component.commit_insert_component_data(
                 node=target_node,
@@ -782,9 +790,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
 
         if is_new_leaf and self._inc_hit_count_and_check(target_node, params.chunked):
-            backup_node = target_node
-        if backup_node is not None:
-            cache_actions.append(self._build_backup_kv_action(backup_node))
+            cache_actions.append(self._build_backup_kv_action(target_node))
         return result
 
     def _split_node(
