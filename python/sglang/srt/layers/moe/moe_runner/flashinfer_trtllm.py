@@ -976,7 +976,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             global_scale_inv,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
-            backend="cute-dsl",
+            backend=(
+                "cuda" if torch.cuda.is_current_stream_capturing() else "cute-dsl"
+            ),
         )
 
         seq_len, hidden_size = hidden_states.shape

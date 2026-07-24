@@ -131,7 +131,6 @@ class KimiVLForConditionalGeneration(nn.Module):
             config.vision_config,
             prefix=add_prefix("vision_tower", prefix),
             use_data_parallel=self.use_data_parallel,
-            use_tensor_parallel=not self.use_data_parallel,
         )
 
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
@@ -263,6 +262,12 @@ class KimiVLForConditionalGeneration(nn.Module):
             use_default_weight_loading = False
             if "vision" in name:
                 if self.vision_tower is not None:
+                    # MoonViT's attention is wrapped in sglang's VisionAttention,
+                    # whose sub-modules are named qkv_proj/proj instead of the
+                    # checkpoint's wqkv/wo.
+                    name = name.replace("wqkv.", "attn.qkv_proj.").replace(
+                        "wo.", "attn.proj."
+                    )
                     use_default_weight_loading = True
             else:
                 for param_name, weight_name, shard_id in stacked_params_mapping:
