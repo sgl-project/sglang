@@ -230,6 +230,13 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # Force host hashlib.sha1 for presharded fingerprints (disables CUDA JIT
+    # and the pinned streaming path). Useful for A/B debug.
+    SGLANG_PRESHARDED_FORCE_CPU_SHA1 = EnvBool(False)
+    # Use the CUDA JIT SHA-1 kernel for on-device fingerprints. Digests match
+    # hashlib, but the sequential compress is slower than host SHA-1 for large
+    # tensors; prefer the default streaming D2H path unless debugging the JIT.
+    SGLANG_PRESHARDED_USE_CUDA_SHA1 = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.

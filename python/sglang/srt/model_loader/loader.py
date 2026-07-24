@@ -1954,18 +1954,99 @@ class PreshardedModelLoader(DefaultModelLoader):
         except (AssertionError, AttributeError):
             pass
 
+    # Chunk size for pinned D2H streaming SHA-1 of CUDA tensors (bytes).
+    _HASH_STREAM_CHUNK_BYTES = 8 << 20  # 8 MiB
+    # Below this size, optional CUDA JIT SHA-1 is competitive with host path.
+    _HASH_CUDA_JIT_MAX_BYTES = 4 << 20  # 4 MiB
+
     @staticmethod
     def _hash_tensor(tensor: torch.Tensor) -> str:
         """Full SHA1 over (shape, dtype, raw bytes); shared by content-dedup
         and verification — collisions would silently corrupt loaded weights,
-        so a probabilistic fingerprint is unsafe."""
-        cpu = tensor.detach().to(device="cpu", copy=False).contiguous()
+        so a probabilistic fingerprint is unsafe.
+
+        Digests always match
+        ``hashlib.sha1(shape_str + dtype_str + raw_le_bytes).hexdigest()``.
+
+        CUDA tensors default to **pinned streaming D2H + host SHA-1** (avoids
+        peak host allocation of the full tensor). Optional CUDA JIT SHA-1
+        (``SGLANG_PRESHARDED_USE_CUDA_SHA1``) hashes on-device with identical
+        digests; sequential SHA-1 on GPU is slower for multi-GB weights, so
+        it is off by default and auto-used only for small tensors when enabled.
+        """
+        t = tensor.detach()
+        prefix = str(tuple(t.shape)).encode() + str(t.dtype).encode()
+
+        if t.numel() == 0:
+            return hashlib.sha1(prefix).hexdigest()
+
+        cont = t.contiguous()
+        flat_u8 = cont.reshape(-1).view(torch.uint8)
+        nbytes = flat_u8.numel()
+        force_cpu = envs.SGLANG_PRESHARDED_FORCE_CPU_SHA1.get()
+        use_cuda_sha1 = envs.SGLANG_PRESHARDED_USE_CUDA_SHA1.get()
+
+        # CUDA JIT path: identical digests; sequential on-device compress is
+        # slower than host for multi-GB tensors, so only use when opted in.
+        if cont.is_cuda and not force_cpu and use_cuda_sha1:
+            try:
+                from sglang.kernels.jit.sha1 import sha1_prefix_data_cuda
+
+                return sha1_prefix_data_cuda(prefix, flat_u8).hex()
+            except Exception as e:
+                logger.warning(
+                    "CUDA SHA-1 JIT unavailable (%s); falling back to host SHA-1",
+                    e,
+                )
+
+        if cont.is_cuda and not force_cpu:
+            return PreshardedModelLoader._hash_tensor_cuda_streamed(prefix, flat_u8)
+
         h = hashlib.sha1()
-        h.update(str(tuple(cpu.shape)).encode())
-        h.update(str(cpu.dtype).encode())
-        if cpu.numel() > 0:
-            flat = cpu.reshape(-1).view(torch.uint8)
-            h.update(memoryview(flat.numpy()))
+        h.update(prefix)
+        cpu = flat_u8.to(device="cpu", copy=False).contiguous()
+        h.update(memoryview(cpu.numpy()))
+        return h.hexdigest()
+
+    @staticmethod
+    def _hash_tensor_cuda_streamed(prefix: bytes, flat_u8: torch.Tensor) -> str:
+        """SHA-1 via double-buffered pinned D2H + host hashlib (identical digest).
+
+        Overlaps the next chunk's device-to-host copy with hashing the current
+        chunk so multi-GB weights never need a single contiguous host allocation.
+        """
+        h = hashlib.sha1()
+        h.update(prefix)
+        nbytes = int(flat_u8.numel())
+        chunk = PreshardedModelLoader._HASH_STREAM_CHUNK_BYTES
+        pins = [
+            torch.empty(chunk, dtype=torch.uint8, pin_memory=True),
+            torch.empty(chunk, dtype=torch.uint8, pin_memory=True),
+        ]
+        copy_stream = torch.cuda.Stream()
+        prev_event = None
+        prev_n = 0
+        prev_idx = 0
+        off = 0
+        i = 0
+        while off < nbytes or prev_event is not None:
+            if off < nbytes:
+                n = min(chunk, nbytes - off)
+                idx = i & 1
+                with torch.cuda.stream(copy_stream):
+                    pins[idx][:n].copy_(flat_u8[off : off + n], non_blocking=True)
+                    ev = copy_stream.record_event()
+                # Hash previous chunk while this copy runs.
+                if prev_event is not None:
+                    prev_event.synchronize()
+                    h.update(memoryview(pins[prev_idx][:prev_n].numpy()))
+                prev_event, prev_n, prev_idx = ev, n, idx
+                off += n
+                i += 1
+            else:
+                prev_event.synchronize()
+                h.update(memoryview(pins[prev_idx][:prev_n].numpy()))
+                prev_event = None
         return h.hexdigest()
 
     def _verify_rank_checksum(
