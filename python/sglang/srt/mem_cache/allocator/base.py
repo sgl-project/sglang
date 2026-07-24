@@ -87,7 +87,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 

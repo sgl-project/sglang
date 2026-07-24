@@ -75,10 +75,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
 
+    @property
+    def support_partial_cpu_restore(self) -> bool:
+        return getattr(self._kvcache, "support_partial_cpu_restore", False)
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
         return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
+            kv_cache_cpu, indices, mamba_indices=mamba_indices, start=start
         )
