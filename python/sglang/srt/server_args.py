@@ -2075,7 +2075,7 @@ class ServerArgs:
     ] = "prefill"
     verify_attention_backend: A[
         Optional[str],
-        "Attention backend for speculative target verify. Must match the prefill or decode attention backend. Defaults to following the decode backend (the sync-free path on GPU-plan backends). Supersedes --speculative-attention-mode for verify.",
+        "Attention backend for speculative target verify, independent of prefill/decode. Defaults to following the decode backend (the sync-free path on GPU-plan backends). Supersedes --speculative-attention-mode for verify.",
         NS("spec"),
     ] = None
     speculative_draft_attention_backend: A[
