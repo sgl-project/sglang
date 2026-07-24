@@ -69,6 +69,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_audiodit import (
+    LongCatAudioDiTPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
@@ -134,6 +137,9 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_audiodit import (
+    LongCatAudioDiTSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
@@ -1142,6 +1148,17 @@ def _register_configs():
             lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
             lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
         ],
+    )
+
+    # LongCat-AudioDiT
+    register_configs(
+        sampling_param_cls=LongCatAudioDiTSamplingParams,
+        pipeline_config_cls=LongCatAudioDiTPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-AudioDiT-1B",
+            "meituan-longcat/LongCat-AudioDiT-3.5B",
+        ],
+        model_detectors=[lambda hf_id: "longcat-audiodit" in hf_id.lower()],
     )
 
 

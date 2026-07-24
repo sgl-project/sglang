@@ -77,6 +77,7 @@ class DataType(Enum):
     VIDEO = auto()
     MESH = auto()
     ACTION = auto()
+    AUDIO = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
@@ -85,6 +86,8 @@ class DataType(Enum):
             return "mp4"
         if self == DataType.ACTION:
             return "json"
+        if self == DataType.AUDIO:
+            return "wav"
         return "glb"
 
 
@@ -108,6 +111,11 @@ class SamplingParams:
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
+
+    # Audio inputs (voice cloning / TTS models, e.g. LongCat-AudioDiT)
+    prompt_audio_path: str | None = None
+    prompt_text: str | None = None
+    guidance_method: str = "cfg"
 
     # Text inputs
     prompt: str | list[str] | None = field(
@@ -249,7 +257,7 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json", ".wav")
         if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -1077,6 +1085,21 @@ class SamplingParams:
                 "Frame rate used for action token temporal mRoPE positions. "
                 "Defaults to the video fps when not set."
             ),
+        )
+        add_argument(
+            "--prompt-audio-path",
+            type=str,
+            help="Path to a reference audio file for voice cloning (e.g. LongCat-AudioDiT)",
+        )
+        add_argument(
+            "--prompt-text",
+            type=str,
+            help="Transcript of the reference audio for voice cloning (e.g. LongCat-AudioDiT)",
+        )
+        add_argument(
+            "--guidance-method",
+            type=str,
+            help="Guidance method for flow matching models: 'cfg' or 'apg' (e.g. LongCat-AudioDiT)",
         )
         add_argument(
             "--moba-config-path",

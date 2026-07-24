@@ -75,6 +75,7 @@ diffusion = [
   "cache-dit==1.3.5",
   "cloudpickle",
   "diffusers==0.37.0",
+  "librosa",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",

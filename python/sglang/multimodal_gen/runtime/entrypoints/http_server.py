@@ -6,7 +6,7 @@ import os
 import signal
 import uuid
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import torch
@@ -274,11 +274,20 @@ def make_serializable(obj):
     return obj
 
 
-def encode_video_to_base64(file_path: str):
+def encode_file_to_base64(file_path: str):
     if not os.path.exists(file_path):
         return None
     with open(file_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _scheduler_response_has_no_output(response: Any) -> bool:
+    """True when generation produced no tensor output, files, or audio."""
+    return (
+        response.output is None
+        and response.output_file_paths is None
+        and response.audio is None
+    )
 
 
 async def forward_to_scheduler(
@@ -288,15 +297,20 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None and response.output_file_paths is None:
+        if _scheduler_response_has_no_output(response):
             raise RuntimeError("Model generation returned no output.")
 
         if response.output_file_paths:
             output_file_path = response.output_file_paths[0]
         else:
             output_file_path = sp.output_file_path()
+            # For audio-only models output is None; pass the audio tensor instead.
+            if response.output is None and response.audio is not None:
+                outputs_to_save = [response.audio]
+            else:
+                outputs_to_save = [response.output[0]]
             save_outputs(
-                [response.output[0]],
+                outputs_to_save,
                 sp.data_type,
                 sp.fps,
                 True,
@@ -319,10 +333,10 @@ async def forward_to_scheduler(
 
         if output_file_path:
             logger.info("Processing output file: %s", output_file_path)
-            b64_video = encode_video_to_base64(output_file_path)
+            b64_content = encode_file_to_base64(output_file_path)
 
-            if b64_video:
-                data["output"] = b64_video
+            if b64_content:
+                data["output"] = b64_content
                 data.pop("video_data", None)
                 data.pop("video_tensor", None)
 
@@ -359,6 +373,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             height=params.get("height"),
             guidance_scale=params.get("guidance_scale"),
             save_output=params.get("save_output"),
+            prompt_audio_path=inst.get("prompt_audio_path")
+            or params.get("prompt_audio_path"),
+            prompt_text=inst.get("prompt_text") or params.get("prompt_text"),
+            guidance_method=params.get("guidance_method"),
         )
 
         backend_req = prepare_request(server_args, sampling_params=sp)
