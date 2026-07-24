@@ -1386,13 +1386,14 @@ class KimiK3DeltaAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        # Fused-decode handoff (attempt-and-verify): offer the output-norm
-        # gate to the KDA backend so decode can run conv1d + delta rule +
-        # gated RMSNorm as one kernel. If the backend leaves the stash
-        # unconsumed (env off, shape not covered, non-decode), apply o_norm
-        # here as before.
-        fused_onorm = (
-            self._kda_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        # Fused KDA handoff (attempt-and-verify): offer the output-norm gate
+        # so covered decode and target-verify kernels can fold gated RMSNorm
+        # into the recurrence kernel. If the backend leaves the stash
+        # unconsumed (env off or shape not covered), apply o_norm here as
+        # before.
+        fused_onorm = self._kda_fused_decode_ready and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states

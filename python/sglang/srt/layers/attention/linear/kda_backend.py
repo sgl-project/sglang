@@ -692,7 +692,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
-        replayssm_on = getattr(mamba_cache_params, "replayssm_rawv", None) is not None
+        replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
+        replayssm_on = replayssm_rawv is not None
         if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
                 "KDA target_verify requires a speculative mamba cache "
@@ -711,9 +712,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             draft_token_num=draft_token_num,
             ragged_layout=ragged_layout,
             conv_states=conv_states,
+            ssm_states=ssm_states,
             intermediate_state_cache=intermediate_state_cache,
             intermediate_conv_window_cache=intermediate_conv_window_cache,
             retrieve_parent_token=retrieve_parent_token,
+            replayssm_rawv=replayssm_rawv,
         ):
             return self._run_dspark_cutedsl_mtp(
                 layer=layer,
@@ -727,6 +730,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 intermediate_state_indices=intermediate_state_indices,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                replayssm_g=mamba_cache_params.replayssm_g,
+                replayssm_beta=mamba_cache_params.replayssm_beta,
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -797,7 +804,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # values the recurrent kernel already holds, replacing the eager torch
         # scatter. Dense verify only; ring_kwargs is empty otherwise (and for
         # non-triton verify kernels, which never see replayssm).
-        replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
         ring_kwargs = {}
         if replayssm_rawv is not None and ragged_layout is None:
             ring_kwargs = dict(
@@ -844,9 +850,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         draft_token_num: int,
         ragged_layout,
         conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
         intermediate_state_cache: torch.Tensor,
         intermediate_conv_window_cache: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_rawv: Optional[torch.Tensor],
     ) -> bool:
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
@@ -887,8 +895,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        if (
+            ssm_states.dtype != torch.float32
+            or tuple(ssm_states.shape[-3:])
+            != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
+            or tuple(ssm_states.stride()[-3:])
+            != (
+                layer.head_v_dim * layer.head_k_dim,
+                layer.head_k_dim,
+                1,
+            )
+            or ssm_states.stride(0) % 4 != 0
+            or ssm_states.storage_offset() % 4 != 0
+        ):
+            return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
             return False
+        if intermediate_state_cache is None:
+            # ReplaySSM: the ring replaces the per-step snapshots. The kernel
+            # wrapper validates ring layout/dtypes and raises loudly (there is
+            # no recurrent fallback without intermediate_ssm).
+            return replayssm_rawv is not None
         if intermediate_state_cache.shape[1] < draft_token_num:
             return False
         if tuple(intermediate_state_cache.shape[-3:]) != (
@@ -913,6 +940,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        replayssm_rawv: Optional[torch.Tensor] = None,
+        replayssm_rawk: Optional[torch.Tensor] = None,
+        replayssm_g: Optional[torch.Tensor] = None,
+        replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -939,7 +970,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ic_q, ic_k, ic_v = intermediate_conv_window_cache.split(
             [layer.q_dim, layer.k_dim, layer.v_dim], dim=-2
         )
-        return fused_kda_decode_mtp_dspark(
+        # The kernel owns all 128 output channels and can fold gated RMSNorm
+        # into the recurrence.
+        onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+        fused_static = getattr(layer, "_k3_fused_decode_args", None)
+        apply_onorm = onorm_gate is not None and fused_static is not None
+        if apply_onorm:
+            onorm_weight = fused_static[5]
+            onorm_eps = fused_static[6]
+            onorm_gate = onorm_gate.reshape(1, seq_len, h, layer.head_v_dim)
+        else:
+            onorm_weight = None
+            onorm_eps = None
+            onorm_gate = None
+
+        out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
             x_k=x_k,
             x_v=x_v,
@@ -963,4 +1008,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cu_seqlens=query_start_loc.to(torch.int32),
             lower_bound=float(layer.lower_bound),
             scale=layer.head_q_dim**-0.5,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
+            onorm_gate=onorm_gate,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
         )
+        if apply_onorm:
+            layer._k3_onorm_consumed = True
+        return out
