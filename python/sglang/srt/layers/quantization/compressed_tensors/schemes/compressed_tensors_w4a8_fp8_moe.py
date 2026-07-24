@@ -290,7 +290,7 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
 
         assert (
             self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        ), "Only SiLU / SwiGLU-OAI activations are supported."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -319,5 +319,7 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
             layer.a13_scale,
             layer.a2_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+            gemm1_clamp_limit=self.moe_runner_config.gemm1_clamp_limit,
         )
         return StandardCombineInput(hidden_states=output)
