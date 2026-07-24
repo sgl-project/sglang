@@ -222,14 +222,19 @@ def _check_case(
     base_reference = reference_local_moe(case, tensors, include_lora=False)
     if has_signal:
         full_reference = reference_local_moe(case, tensors, stages=stages)
+        # Subtract each side's OWN matched base so base-pipeline BF16 noise
+        # cancels and the gate sees only the LoRA contribution (§21.1). The
+        # rel-L2 gate uses BF16 computation precision even for an FP32
+        # destination: the pipeline computes in BF16 throughout.
+        base_torch = run_base_only_torch(case, tensors, device=device)
         gates = resolve_signal_gates(
             full_reference - base_reference,
-            destination_dtype=result.output.dtype,
+            destination_dtype=torch.bfloat16,
             base_reference=base_reference,
         )
         checks.append(
             check_delta(
-                result.output.cpu().float() - base_reference,
+                result.output.cpu().float() - base_torch.cpu().float(),
                 full_reference - base_reference,
                 gates,
                 label="complete local MoE",
