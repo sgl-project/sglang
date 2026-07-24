@@ -25,13 +25,9 @@ from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocat
     }
 )
 @triton.autotune(
-    # Configs that fail to compile on the target arch are skipped, so widening
-    # the num_warps x num_stages grid only adds candidates, never a bad kernel.
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in (2, 4, 8)
-        for ns in (2, 3, 4)
-    ],
+    # CDNA tuning: sparse prefill is faster when each selected 128-token KV
+    # block is processed as smaller MFMA-friendly sub-tiles.
+    configs=[triton.Config({}, num_warps=1, num_stages=1)],
     key=[
         "BLOCK_SIZE_Q",
         "BLOCK_SIZE_K",
@@ -97,6 +93,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    SUB_K: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # get batch id and head id
@@ -129,8 +126,9 @@ def _gqa_share_sparse_fwd_kernel(
         sink = tl.load(sink_ptrs, boundary_check=(0, 1), padding_option="zero").to(
             tl.float32
         )
+    tl.static_assert(BLOCK_SIZE_K % SUB_K == 0)
+    NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
     # offsets for paged K/V load
-    off_n = tl.arange(0, BLOCK_SIZE_K)
     off_kd = tl.arange(0, BLOCK_SIZE_KD)
     off_vd = tl.arange(0, BLOCK_SIZE_VD)
     kd_mask = off_kd < qk_head_dim
@@ -155,13 +153,6 @@ def _gqa_share_sparse_fwd_kernel(
         )
         # load q, shape: [BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D] -> [BLOCK_SIZE_QH, BLOCK_SIZE_D]
         q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
-        # init statistics
-        off_q_k = (
-            tl.arange(0, BLOCK_SIZE_Q)[:, None]
-            + pid_q_j * BLOCK_SIZE_Q
-            + prefix_len
-            - tl.arange(0, BLOCK_SIZE_K)[None, :]
-        )
         if HAS_SINK:
             m_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
             lse_i = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H), dtype=tl.float32)
@@ -182,63 +173,71 @@ def _gqa_share_sparse_fwd_kernel(
             # get current block start index (absolute K position)
             c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
             t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_ks
-                + pid_kh * stride_kh
-                + off_kd[:, None] * stride_kd,
-                mask=kd_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # fp8 main K cache is unit-scaled; widen to the Q compute dtype
-                # before the tl.dot (compiled out when the cache is bf16).
-                k = k.to(q.dtype)
-            # compute qk
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal mask
-            qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * sm_scale_log2e
-            # K boundary mask: positions beyond seq_len contribute -inf
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # compute m_ij and l_ij
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            # scale acc_o
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vs
-                + pid_kh * stride_vh
-                + off_vd[None, :] * stride_vd,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
-                # than to fp8 (which would wreck attention-weight precision).
-                v = v.to(q.dtype)
-            p = p.to(v.dtype)
-            acc_o += tl.dot(p, v)
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+            for sub_i in range(NUM_SUB):
+                off_n = tl.arange(0, SUB_K) + sub_i * SUB_K
+                # paged load K via req_to_token: pos -> slot -> k_cache
+                pos = c + off_n
+                pos_mask = pos < seq_len
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+                # k shape: [BLOCK_SIZE_KD, SUB_K] (transposed for tl.dot)
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_ks
+                    + pid_kh * stride_kh
+                    + off_kd[:, None] * stride_kd,
+                    mask=kd_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    # fp8 main K cache is unit-scaled; widen to the Q compute dtype
+                    # before the tl.dot (compiled out when the cache is bf16).
+                    k = k.to(q.dtype)
+                # compute qk
+                qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K), dtype=tl.float32)
+                off_q_k = (
+                    tl.arange(0, BLOCK_SIZE_Q)[:, None]
+                    + pid_q_j * BLOCK_SIZE_Q
+                    + prefix_len
+                    - off_n[None, :]
+                )
+                # causal mask
+                qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
+                qk = tl.reshape(qk, BLOCK_SIZE_QH, SUB_K)
+                # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, SUB_K]
+                #   -> [BLOCK_SIZE_QH, SUB_K]
+                qk += tl.dot(q, k) * sm_scale_log2e
+                # K boundary mask: positions beyond seq_len contribute -inf
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+                # compute m_ij and l_ij
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                # scale acc_o
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                # paged load V
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vs
+                    + pid_kh * stride_vh
+                    + off_vd[None, :] * stride_vd,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    # Widen V so `p.to(v.dtype)` casts P to the compute dtype rather
+                    # than to fp8 (which would wreck attention-weight precision).
+                    v = v.to(q.dtype)
+                p = p.to(v.dtype)
+                acc_o += tl.dot(p, v)
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output
@@ -304,6 +303,7 @@ def flash_prefill_with_gqa_share_sparse(
     )  # calculate multiple queries in one kernel if seqlence length is too long
     BLOCK_SIZE_Q = triton.next_power_of_2(block_size_q)
     BLOCK_SIZE_K = triton.next_power_of_2(block_size_k)
+    SUB_K = 64 if BLOCK_SIZE_K >= 64 else BLOCK_SIZE_K
     grid = (
         triton.cdiv(triton.cdiv(max_seqlen_q, block_size_q), num_q_loop),
         num_k_heads,
@@ -352,5 +352,8 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        SUB_K=SUB_K,
+        matrix_instr_nonkdim=16,
+        kpack=2,
     )
     return o
