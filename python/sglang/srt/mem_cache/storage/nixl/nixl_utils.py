@@ -169,17 +169,20 @@ class NixlBackendSelection:
             if self.backend_name == "DOCA_MEMOS":
                 from sglang.srt.mem_cache.mmap_allocator import (
                     HUGEPAGE_BYTES_2MB,
-                    hugepage_available_bytes,
+                    HUGEPAGE_MODE_REQUIRED,
+                    hugepage_mode,
                     hugepage_size_requested,
                 )
 
                 hugepage_size = hugepage_size_requested()
-                if (hugepage_size != HUGEPAGE_BYTES_2MB) or (
-                    hugepage_available_bytes(hugepage_size) == 0
+                if (
+                    hugepage_mode(hugepage_size) != HUGEPAGE_MODE_REQUIRED
+                    or hugepage_size != HUGEPAGE_BYTES_2MB
                 ):
                     logger.error(
-                        "NIXL DOCA_MEMOS requires SGLANG_HUGEPAGE_SIZE=2MB and "
-                        "vm.nr_hugepages reserved."
+                        "NIXL DOCA_MEMOS requires "
+                        "SGLANG_HUGEPAGE_MODE=required, "
+                        "SGLANG_HUGEPAGE_SIZE=2MB, and hugetlb-backed host pools."
                     )
                     return False
 

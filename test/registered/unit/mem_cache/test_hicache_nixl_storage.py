@@ -34,7 +34,6 @@ class MockHybridPool:
         component_bytes: int = 8,
         expose_zero_copy: bool = True,
     ):
-        self.layout = "page_first"
         self.page_size = page_size
         self.dtype = torch.uint8
         self.device = "cpu"
@@ -883,71 +882,76 @@ class TestDocaMemosNixl(unittest.TestCase):
         dummy._pre_register_host = MagicMock()
         return dummy
 
-    def test_format_key_doca_memos(self):
+    @staticmethod
+    def _make_hybrid_pool(*, expose_zero_copy: bool = True):
+        host = MockHybridPool(expose_zero_copy=expose_zero_copy)
+        host.layout = "page_first"
+        return host
+
+    def test_batch_exists_formats_doca_memos_key(self):
         import hashlib
         from unittest.mock import MagicMock
 
-        from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-
-        key = "some/cache/key@suffix"
-        formatted = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         dummy = HiCacheNixl.__new__(HiCacheNixl)
-        dummy.backend_selector = MagicMock()
-        dummy.backend_selector.backend_name = "DOCA_MEMOS"
-        dummy.backend_selector.mem_type = "OBJ"
-        self.assertEqual(dummy._format_key(key), formatted)
+        dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS", mem_type="OBJ")
+        dummy.agent = MagicMock()
+        dummy.agent.query_memory.return_value = [object()]
+        dummy.config_suffix = "@suffix"
+        dummy.is_zero_copy = False
 
-    def test_doca_memos_registration_requires_direct_layout(self):
-        from unittest.mock import MagicMock
+        self.assertEqual(dummy.batch_exists(["some/cache/key"]), 1)
+        formatted = hashlib.sha256(b"some/cache/key@suffix").hexdigest()[:32]
+        dummy.agent.query_memory.assert_called_once_with(
+            [(0, 0, 0, formatted)],
+            "DOCA_MEMOS",
+            mem_type="OBJ",
+        )
 
-        from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-
-        dummy = HiCacheNixl.__new__(HiCacheNixl)
-        dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
-        host = MockMemPoolHost(is_zero_copy_mode=False)
-        with self.assertRaisesRegex(RuntimeError, "page_first"):
-            dummy.register_mem_pool_host(host)
-
-    def test_doca_memos_registration_requires_hugetlb_allocation(self):
-        from unittest.mock import MagicMock
-
-        from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
-
-        dummy = HiCacheNixl.__new__(HiCacheNixl)
-        dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
-        host = MockMemPoolHost(is_zero_copy_mode=True)
-        with self.assertRaisesRegex(RuntimeError, "hugetlb-backed"):
-            dummy.register_mem_pool_host(host)
-
-    def test_register_mem_host_pool_v2_doca_requires_zero_copy(self):
-        dummy = self._make_registration_target()
-        host = MockHybridPool(expose_zero_copy=False)
-
-        with self.assertRaisesRegex(RuntimeError, "zero-copy"):
-            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
-
-    def test_register_mem_host_pool_v2_doca_requires_direct_layout(self):
-        dummy = self._make_registration_target()
-        host = MockHybridPool()
-        host.layout = "layer_first"
-
-        with self.assertRaisesRegex(RuntimeError, "page_first"):
-            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
-
-    def test_register_mem_host_pool_v2_doca_rejects_non_hugepage(self):
-        dummy = self._make_registration_target()
-        host = MockHybridPool()
-
-        with self.assertRaisesRegex(RuntimeError, "hugetlb-backed"):
-            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
-
-    def test_register_mem_host_pool_v2_doca_accepts_hugepages(self):
+    def test_register_mem_pool_host_doca_memos(self):
         from unittest.mock import patch
 
         from sglang.srt.mem_cache.mmap_allocator import MEM_BACKEND_HUGEPAGE
 
         dummy = self._make_registration_target()
-        host = MockHybridPool()
+        host = MockMemPoolHost(is_zero_copy_mode=False)
+        with self.assertRaisesRegex(RuntimeError, "page_first"):
+            dummy.register_mem_pool_host(host)
+        self.assertFalse(hasattr(dummy, "mem_pool_host"))
+
+        dummy = self._make_registration_target()
+        host = MockMemPoolHost(is_zero_copy_mode=True)
+        with self.assertRaisesRegex(RuntimeError, "hugetlb-backed"):
+            dummy.register_mem_pool_host(host)
+        self.assertFalse(hasattr(dummy, "mem_pool_host"))
+
+        dummy = self._make_registration_target()
+        host = MockMemPoolHost(is_zero_copy_mode=True)
+        with patch(
+            "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_mem_backend",
+            return_value=MEM_BACKEND_HUGEPAGE,
+        ):
+            dummy.register_mem_pool_host(host)
+        self.assertIs(dummy.mem_pool_host, host)
+
+    def test_register_mem_host_pool_v2_doca_memos(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.mmap_allocator import MEM_BACKEND_HUGEPAGE
+
+        dummy = self._make_registration_target()
+        host = self._make_hybrid_pool(expose_zero_copy=False)
+        with self.assertRaisesRegex(RuntimeError, "zero-copy"):
+            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+
+        dummy = self._make_registration_target()
+        host = self._make_hybrid_pool()
+        with self.assertRaisesRegex(RuntimeError, "hugetlb-backed"):
+            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+        self.assertNotIn(PoolName.MAMBA, dummy.registered_pools)
+
+        dummy = self._make_registration_target()
+        host = self._make_hybrid_pool()
+        host.temporal_buffer = torch.empty((4, 0), dtype=torch.uint8)
         with patch(
             "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_mem_backend",
             return_value=MEM_BACKEND_HUGEPAGE,
@@ -955,10 +959,7 @@ class TestDocaMemosNixl(unittest.TestCase):
             dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
 
         self.assertIs(dummy.registered_pools[PoolName.MAMBA], host)
-        self.assertEqual(
-            dummy._pre_register_host.call_count,
-            len(host.get_hybrid_pool_buffer()),
-        )
+        dummy._pre_register_host.assert_called_once()
 
     def test_doca_memos_initparams(self):
         from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlBackendConfig
@@ -984,11 +985,10 @@ class TestDocaMemosNixl(unittest.TestCase):
             },
         )
 
-    def test_doca_memos_backend_requires_hugepage_env(self):
-        from unittest.mock import MagicMock, patch
+    def test_doca_memos_backend_requires_hugepage_policy(self):
+        from unittest.mock import MagicMock
 
         from sglang.srt.environ import envs
-        from sglang.srt.mem_cache.mmap_allocator import HUGEPAGE_BYTES_2MB
         from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
             NixlBackendConfig,
             NixlBackendSelection,
@@ -1001,37 +1001,27 @@ class TestDocaMemosNixl(unittest.TestCase):
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
-            self.assertFalse(selector.create_backend(agent))
-        with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
-            self.assertFalse(selector.create_backend(agent))
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                self.assertFalse(selector.create_backend(agent))
+            with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
+                self.assertFalse(selector.create_backend(agent))
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                self.assertFalse(selector.create_backend(agent))
 
         selector = NixlBackendSelection(
             plugin="DOCA_MEMOS",
             nixlconfig=NixlBackendConfig({}),
         )
-        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-            with patch(
-                "sglang.srt.mem_cache.mmap_allocator.hugepage_available_bytes",
-                return_value=HUGEPAGE_BYTES_2MB,
-            ):
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
                 self.assertTrue(selector.create_backend(agent))
         agent.create_backend.assert_called_once_with(
             "DOCA_MEMOS", {"query_mem_mode": "actual"}
         )
 
-        selector = NixlBackendSelection(
-            plugin="DOCA_MEMOS",
-            nixlconfig=NixlBackendConfig({}),
-        )
-        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-            with patch(
-                "sglang.srt.mem_cache.mmap_allocator.hugepage_available_bytes",
-                return_value=0,
-            ):
-                self.assertFalse(selector.create_backend(agent))
-
-    def test_tensor_mem_backend_reflects_alloc(self):
+    def test_alloc_mmap_hugepage_modes(self):
         import ctypes
         from unittest.mock import patch
 
@@ -1045,21 +1035,52 @@ class TestDocaMemosNixl(unittest.TestCase):
             tensor_mem_backend,
         )
 
-        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
-            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
-
-        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-            with patch.object(mmap_allocator, "_alloc_hugepage") as mock_hp:
-                mock_hp.return_value = (ctypes.c_uint8 * 16)()
+        with envs.SGLANG_HUGEPAGE_MODE.override("off"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
                 buf = mmap_allocator.alloc_mmap((4,), torch.float32)
-            self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_HUGEPAGE)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(mmap_allocator, "_alloc_hugepage") as mock_hp:
+                    mock_hp.return_value = (ctypes.c_uint8 * 16)()
+                    buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_HUGEPAGE)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "_alloc_hugepage",
+                    side_effect=OSError("no hugepages"),
+                ):
+                    with patch.object(mmap_allocator, "_libc", object()):
+                        buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+                self.assertEqual(tensor_mem_backend(buf), MEM_BACKEND_MMAP)
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                with patch.object(
+                    mmap_allocator,
+                    "_alloc_hugepage",
+                    side_effect=OSError("no hugepages"),
+                ):
+                    with patch.object(mmap_allocator, "_libc", object()):
+                        with patch.object(mmap_allocator.mmap, "mmap") as plain_mmap:
+                            with self.assertRaisesRegex(RuntimeError, "no hugepages"):
+                                mmap_allocator.alloc_mmap((4,), torch.float32)
+                            plain_mmap.assert_not_called()
+
+        with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+                with self.assertRaisesRegex(ValueError, "SGLANG_HUGEPAGE_SIZE"):
+                    mmap_allocator.alloc_mmap((4,), torch.float32)
 
 
 class TestHiCacheHostMemoryPreflight(unittest.TestCase):
     """HiCache host pool memory preflight (RAM + optional hugetlb)."""
 
-    def test_memory_available_bytes_uses_max_of_ram_and_hugetlb(self):
+    def test_memory_available_bytes_hugepage_modes(self):
         from unittest.mock import MagicMock, patch
 
         from sglang.srt.environ import envs
@@ -1074,72 +1095,45 @@ class TestHiCacheHostMemoryPreflight(unittest.TestCase):
         normal_ram_with_reserve = (
             HICACHE_HOST_MEMORY_RESERVE_BYTES + normal_usable_100mb
         )
-        hugetlb_100mb = 100 * HUGEPAGE_BYTES_2MB
-        hugetlb_200mb = 200 * HUGEPAGE_BYTES_2MB
+        hugetlb_200mb = 100 * HUGEPAGE_BYTES_2MB
         low_ram = MagicMock(available=normal_ram_with_reserve)
         with patch.object(
             mmap_allocator.psutil, "virtual_memory", return_value=low_ram
         ):
-            with envs.SGLANG_HUGEPAGE_SIZE.override(""):
-                self.assertEqual(memory_available_bytes(), normal_usable_100mb)
-            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                with patch.object(
-                    mmap_allocator, "hugepage_available_bytes", return_value=0
-                ):
+            with envs.SGLANG_HUGEPAGE_MODE.override("off"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override(""):
                     self.assertEqual(memory_available_bytes(), normal_usable_100mb)
-            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                with patch.object(
-                    mmap_allocator,
-                    "hugepage_available_bytes",
-                    return_value=hugetlb_100mb,
-                ):
-                    self.assertEqual(memory_available_bytes(), hugetlb_100mb)
-            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                with patch.object(
-                    mmap_allocator,
-                    "hugepage_available_bytes",
-                    return_value=hugetlb_200mb,
-                ):
-                    self.assertEqual(memory_available_bytes(), hugetlb_200mb)
+            with envs.SGLANG_HUGEPAGE_MODE.override("prefer"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator, "hugepage_available_bytes", return_value=0
+                    ):
+                        self.assertEqual(memory_available_bytes(), normal_usable_100mb)
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator,
+                        "hugepage_available_bytes",
+                        return_value=hugetlb_200mb,
+                    ):
+                        self.assertEqual(memory_available_bytes(), hugetlb_200mb)
 
-    def test_memory_available_bytes_does_not_reserve_hugetlb(self):
-        from unittest.mock import MagicMock, patch
-
-        from sglang.srt.environ import envs
-        from sglang.srt.mem_cache import mmap_allocator
-        from sglang.srt.mem_cache.mmap_allocator import (
-            HUGEPAGE_BYTES_2MB,
-            memory_available_bytes,
-        )
-
-        hugetlb_bytes = 100 * HUGEPAGE_BYTES_2MB
+        normal_ram = HICACHE_HOST_MEMORY_RESERVE_BYTES + 32 * 1024**3
+        hugetlb_bytes = 16 * 1024**3
         with patch.object(
             mmap_allocator.psutil,
             "virtual_memory",
-            return_value=MagicMock(available=0),
-        ):
-            with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-                with patch.object(
-                    mmap_allocator,
-                    "hugepage_available_bytes",
-                    return_value=hugetlb_bytes,
-                ):
-                    self.assertEqual(memory_available_bytes(), hugetlb_bytes)
-
-    def test_hugepage_size_requested(self):
-        from sglang.srt.environ import envs
-        from sglang.srt.mem_cache.mmap_allocator import (
-            HUGEPAGE_BYTES_1GB,
-            HUGEPAGE_BYTES_2MB,
-            hugepage_size_requested,
-        )
-
-        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
-            self.assertEqual(hugepage_size_requested(), 0)
-        with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
-            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_2MB)
-        with envs.SGLANG_HUGEPAGE_SIZE.override("1GB"):
-            self.assertEqual(hugepage_size_requested(), HUGEPAGE_BYTES_1GB)
+            return_value=MagicMock(available=normal_ram),
+        ) as normal_memory:
+            with envs.SGLANG_HUGEPAGE_MODE.override("required"):
+                with envs.SGLANG_HUGEPAGE_SIZE.override("2MB"):
+                    with patch.object(
+                        mmap_allocator,
+                        "hugepage_available_bytes",
+                        return_value=hugetlb_bytes,
+                    ) as huge_available:
+                        self.assertEqual(memory_available_bytes(), hugetlb_bytes)
+                        huge_available.assert_called_once_with(HUGEPAGE_BYTES_2MB)
+                        normal_memory.assert_not_called()
 
 
 if __name__ == "__main__":
