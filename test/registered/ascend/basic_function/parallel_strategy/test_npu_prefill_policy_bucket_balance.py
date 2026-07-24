@@ -13,10 +13,12 @@ from sglang.test.ascend.test_ascend_utils import (
     popen_with_error_check,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
@@ -56,7 +58,7 @@ def send_request(url):
     )
 
 
-class PDDisaggregationVariableLengthScheduleFallbackTest(CustomTestCase):
+class PDDisaggregationVariableLengthScheduleFallbackTest(PDDisaggregationServerBase):
     """Verify PD disaggregation: bucket scheduling under balance, fallback to load-aware routing on prefill imbalance.
 
     [Test Category] Functional
