@@ -20,6 +20,8 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align
 
 
 class WhisperAttention(torch.nn.Module):
@@ -427,9 +429,20 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend
         # correctly allocates encoder KV cache locations in the KV pool.
         # These dummy tokens are stripped before the model forward receives input_ids.
+        #
+        # The encoder produces exactly ``max_source_positions`` KV vectors, but
+        # paged decode kernels require the decoder KV region to begin on a page
+        # boundary. Reserve a page-aligned number of encoder slots so the decoder
+        # starts page-aligned; the extra ``reserve - encoder_len`` slots are
+        # allocated but never written or read. ``num_image_tokens`` stays the
+        # *true* encoder length so cross-attention reads exactly the real encoder
+        # KV. ceil_align(x, 1) == x, so the reserve equals encoder_len for
+        # page_size == 1 (e.g. CUDA/flashinfer Whisper) — a no-op there.
         encoder_len = self.config.max_source_positions
+        page_size = get_global_server_args().page_size
+        encoder_reserve = ceil_align(encoder_len, page_size)
         mm_inputs.num_image_tokens = encoder_len
-        return array("q", [0]) * encoder_len + input_ids
+        return array("q", [0]) * encoder_reserve + input_ids
 
     def forward(
         self,
