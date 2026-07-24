@@ -6076,7 +6076,6 @@ class ServerArgs:
             assert (
                 self.tp_size % (self.dp_size * view.attn_cp_size) == 0
             ), "tp_size must be divisible by dp_size * attn_cp_size"
-
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
