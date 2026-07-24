@@ -12,28 +12,29 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.pad import (
+    pad_draft_extend_query as pad_draft_extend_query_triton,
+)
+from sglang.kernels.ops.attention.pad import (
+    unpad_draft_extend_output as unpad_draft_extend_output_triton,
+)
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+    mla_quantize_without_rope_for_fp8,
+)
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
-)
-from sglang.srt.layers.attention.triton_ops.pad import (
-    pad_draft_extend_query as pad_draft_extend_query_triton,
-)
-from sglang.srt.layers.attention.triton_ops.pad import (
-    unpad_draft_extend_output as unpad_draft_extend_output_triton,
-)
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
-)
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -60,6 +61,35 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 # (128 / block_size). We capture the 128 constant here so we can
 # compute the LCM with other padding constraints.
 TRTLLM_BLOCK_CONSTRAINT = 128
+
+TRTLLM_MLA_MAX_BATCH_SIZE = 8192
+
+
+def _multi_ctas_kv_counter_bytes(
+    device: torch.device, num_q_heads: int, batch_size: int
+) -> int:
+    sm_count = flashinfer.utils.get_device_sm_count(device)
+    return flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_q_heads, sm_count
+    )
+
+
+def make_persistent_multi_ctas_kv_counter_buffer(
+    device: torch.device, num_q_heads: int, max_batch_size: int
+) -> torch.Tensor:
+    num_bytes = _multi_ctas_kv_counter_bytes(
+        device, num_q_heads, max(TRTLLM_MLA_MAX_BATCH_SIZE, max_batch_size)
+    )
+    return torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+
+
+def grow_multi_ctas_kv_counter_buffer_if_needed(
+    buffer: torch.Tensor, device: torch.device, num_q_heads: int, batch_size: int
+) -> torch.Tensor:
+    required_bytes = _multi_ctas_kv_counter_bytes(device, num_q_heads, batch_size)
+    if buffer.numel() >= required_bytes:
+        return buffer
+    return torch.zeros(required_bytes, dtype=torch.uint8, device=device)
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
@@ -189,6 +219,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 ),
             )
 
+        self._multi_ctas_kv_counter_buffer = (
+            make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                self.num_q_heads,
+                max_batch_size=model_runner.max_running_requests,
+            )
+        )
+
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.decode_cuda_graph_kv_indices = None
@@ -203,6 +241,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        # Tree-mask scratch is fetched from the target backend only.
+        self.is_draft_runner = model_runner.is_draft_worker
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -283,13 +323,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
-        num_tokens_per_bs = max_num_tokens // max_bs
+        num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.store_dtype = torch.uint8
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs // 2, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req // 2, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.store_dtype,
                 device=self.device,
             )
@@ -303,7 +343,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.data_type,
                 device=self.device,
             )
@@ -315,7 +355,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill:
+        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
             # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
             # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(
@@ -343,18 +383,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
+                bs * num_tokens_per_req + 1,
+                num_tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
             metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=device
+                (bs,), num_tokens_per_req, dtype=torch.int32, device=device
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
@@ -382,12 +422,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
 
@@ -414,7 +455,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
@@ -512,11 +555,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 
@@ -635,6 +680,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
         extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
+        if self.backend == "trtllm-gen":
+            extra_kwargs["multi_ctas_kv_counter_buffer"] = (
+                self._multi_ctas_kv_counter_buffer
+            )
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -712,22 +761,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
         if self.data_type == torch.float8_e4m3fn:
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(
-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+            assert q_rope is not None and k_rope is not None
+            if cos_sin_cache is None:
+                q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                )
+            else:
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch.positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             merge_query = False
 
         # Save KV cache if requested
@@ -820,22 +870,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
-            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-            assert all(
-                x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
-                q,
-                q_rope,
-                k.squeeze(1),
-                k_rope.squeeze(1),
-                forward_batch.positions,
-                cos_sin_cache,
-                is_neox,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-            )
+            assert q_rope is not None and k_rope is not None
+            if cos_sin_cache is None:
+                q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                )
+            else:
+                q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                    q,
+                    q_rope,
+                    k.squeeze(1),
+                    k_rope.squeeze(1),
+                    forward_batch.positions,
+                    cos_sin_cache,
+                    is_neox,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
             merge_query = False
 
         # Save KV cache if requested

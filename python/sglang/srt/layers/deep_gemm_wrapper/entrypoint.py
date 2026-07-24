@@ -18,7 +18,29 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    from deep_gemm.utils.layout import (
+        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+    )
+
+    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+
+        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+        which frees the storage while the GEMM still reads through the alias
+        -- a use-after-free that surfaces as NaN logits or "pointer resides
+        on host memory" during CUDA graph capture once the allocator reuses
+        the block. Hand back ``sf`` itself in that case so ownership is
+        preserved.
+        """
+        out = _get_mn_major_tma_aligned_tensor(sf)
+        if out.data_ptr() == sf.data_ptr():
+            assert out.shape == sf.shape and out.stride() == sf.stride()
+            return sf
+        return out
+
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -171,6 +193,32 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_mxfp8_f8f8bf16(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+):
+    m, k = lhs[0].shape
+    n, _ = rhs[0].shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    disable_cast = lhs[1].dtype == torch.int and rhs[1].dtype == torch.int
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.fp8_fp4_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            recipe_a=(1, 32),
+            recipe_b=(1, 32),
+            disable_ue8m0_cast=disable_cast,
+        )
+
+
 def gemm_nt_bf16bf16f32(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
@@ -226,6 +274,8 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     x, x_scale = x_fp8
 
     if x_scale.dtype == torch.int:
+        return
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

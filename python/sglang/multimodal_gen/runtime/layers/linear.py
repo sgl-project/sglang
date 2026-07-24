@@ -33,20 +33,12 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
-
-# yapf: enable
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    use_intel_amx_backend,
-)
 
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
+# yapf: enable
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
@@ -61,7 +53,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "ComfyUIFp4LinearMethod",
@@ -160,26 +151,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu and _is_cpu_amx_available:
-            _amx_process_weight_after_loading(layer, ["weight"])
-
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if use_intel_amx_backend(layer):
-            x_shapes = x.shape
-            if len(x_shapes) == 3:
-                x = x.view(-1, x.shape[-1])
-            output = torch.ops.sgl_kernel.weight_packed_linear(
-                x.to(layer.weight.dtype),
-                layer.weight,
-                bias,
-                True,  # is_vnni
-            )
-            if len(x_shapes) == 3:
-                output = output.view(x_shapes[0], x_shapes[1], -1)
-            return output
         output = (
             F.linear(x, layer.weight, bias)
             if IS_AMP_SUPPORTED or bias is None
