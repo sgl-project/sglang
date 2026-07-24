@@ -344,8 +344,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.enable_staging and self.is_mla_backend:
+        self.enable_staging = bool(
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or envs.SGLANG_DISAGG_DSV4_STAGING_BUFFER.get()
+        )
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and not envs.SGLANG_DISAGG_DSV4_STAGING_BUFFER.get()
+            and self.is_mla_backend
+        ):
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -1725,7 +1732,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_staging = bool(
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or envs.SGLANG_DISAGG_DSV4_STAGING_BUFFER.get()
+        )
         self.staging_handler = None
 
     def add(self, decode_req: DecodeRequest) -> None:

@@ -100,6 +100,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if server_args.disaggregation_mode in ("prefill", "decode"):
         if (
+            envs.SGLANG_DISAGG_DSV4_STAGING_BUFFER.get()
+            and server_args.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError(
+                "SGLANG_DISAGG_DSV4_STAGING_BUFFER requires "
+                "disaggregation_transfer_backend='mooncake', "
+                f"got '{server_args.disaggregation_transfer_backend}'."
+            )
+        if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and server_args.disaggregation_transfer_backend not in ("mooncake", "nixl")
         ):

@@ -91,6 +91,8 @@ class DecodeStagingHandler:
 
     def num_writers_for(self, decode_req) -> int:
         """Compute num_writers for a specific request based on its prefill TP."""
+        if getattr(self.kv_manager, "enable_dsv4_staging", False):
+            return 1
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
             return prefill_tp // max(1, self.decode_tp)
@@ -106,18 +108,24 @@ class DecodeStagingHandler:
                 "Check that the transfer backend correctly initializes the staging allocator."
             )
         kv_buffer_info = kv_manager.kv_buffer_tensors
-        if kv_buffer_info is None:
+        if kv_buffer_info is None and not getattr(
+            kv_manager, "enable_dsv4_staging", False
+        ):
             raise RuntimeError(
                 "Staging is enabled but kv_manager.kv_buffer_tensors is None. "
                 "Check that set_kv_buffer_tensors() was called during kv_manager init."
             )
         decode_tp = kv_manager.attn_tp_size
 
-        from sglang.srt.disaggregation.common.staging_buffer import (
-            resolve_total_kv_heads,
-        )
+        if getattr(kv_manager, "enable_dsv4_staging", False):
+            total_kv_heads = 0
+            kv_buffer_info = {}
+        else:
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                resolve_total_kv_heads,
+            )
 
-        total_kv_heads = resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
+            total_kv_heads = resolve_total_kv_heads(kv_manager.kv_args, decode_tp)
         return cls(
             kv_manager=kv_manager,
             staging_allocator=staging_allocator,
@@ -143,7 +151,16 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def submit_chunk_scatter(
-        self, room: int, chunk_idx: int, page_start: int, num_pages: int
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        *,
+        layout: str = "",
+        num_fragments: int = 0,
+        is_last: bool = False,
+        writer_id: str = "",
     ) -> bool:
         """Submit scatter for an intermediate chunk whose writers all arrived.
 
@@ -160,21 +177,58 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
-        chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
-        if chunk_idx >= len(chunk_infos):
-            return False
-        alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
+        if layout == "dsv4_blocks":
+            chunk_infos = getattr(
+                decode_req.kv_receiver, "dsv4_chunk_staging_infos", {}
+            )
+            chunk_key = (chunk_idx, writer_id)
+            chunk_info = chunk_infos.get(chunk_key)
+            if chunk_info is None:
+                logger.warning(
+                    "DSV4 staging allocation missing room=%s chunk=%s writer=%s",
+                    room,
+                    chunk_idx,
+                    writer_id,
+                )
+                return False
+        else:
+            chunk_infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+            if chunk_idx >= len(chunk_infos):
+                return False
+            chunk_info = chunk_infos[chunk_idx]
+        alloc_id, staging_offset = chunk_info[0], chunk_info[1]
         if staging_offset < 0 or alloc_id < 0:
             return False
 
-        ok = self._scatter_region(staging_offset, page_start, num_pages, decode_req)
+        ok = self._scatter_region(
+            staging_offset,
+            page_start,
+            num_pages,
+            decode_req,
+            layout=layout,
+            num_fragments=num_fragments,
+        )
         if ok:
             event = torch.cuda.Event()
             event.record(self.staging_allocator._scatter_stream)
-            if not hasattr(decode_req, "_chunk_events"):
-                decode_req._chunk_events = []
-            decode_req._chunk_events.append((event, alloc_id))
-            chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+            if layout == "dsv4_blocks":
+                # Each PP stage owns a separate self-describing allocation.
+                # Completion is gated by all prefill status messages plus all
+                # per-writer CUDA events, rather than by one "last" writer.
+                if not hasattr(decode_req, "_chunk_events"):
+                    decode_req._chunk_events = []
+                decode_req._chunk_events.append((event, alloc_id))
+                del chunk_infos[chunk_key]
+            elif is_last:
+                decode_req._scatter_event = event
+                decode_req._scatter_alloc_id = alloc_id
+                decode_req._staging_last_scatter_submitted = True
+            else:
+                if not hasattr(decode_req, "_chunk_events"):
+                    decode_req._chunk_events = []
+                decode_req._chunk_events.append((event, alloc_id))
+            if layout != "dsv4_blocks":
+                chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
         else:
             logger.warning(
                 "submit_chunk_scatter failed room=%s chunk_idx=%s tp_rank=%s",
@@ -196,6 +250,9 @@ class DecodeStagingHandler:
         num_pages: int,
         writer_id: str,
         chunk_writer_counts: dict,
+        layout: str = "",
+        num_fragments: int = 0,
+        is_last: bool = False,
     ) -> bool:
         """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
 
@@ -203,7 +260,6 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -212,13 +268,43 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
+        if layout == "dsv4_blocks":
+            return self.submit_chunk_scatter(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                layout=layout,
+                num_fragments=num_fragments,
+                is_last=is_last,
+                writer_id=writer_id,
+            )
+
+        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         writers_arrived = len(chunk_writer_counts[room][chunk_idx])
         num_writers = self.num_writers_for(decode_req)
         if writers_arrived >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            self.submit_chunk_scatter(
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                layout=layout,
+                num_fragments=num_fragments,
+                is_last=is_last,
+            )
             del chunk_writer_counts[room][chunk_idx]
             return True
         return False
+
+    def mark_dsv4_transfer_complete(self, room: int) -> None:
+        """Record that every DSV4 prefill writer has reported transfer success."""
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return
+        decode_req._dsv4_all_writers_arrived = True
+        if not getattr(decode_req, "_chunk_events", None):
+            decode_req._staging_scatter_done = True
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Submit scatter for the last chunk when all ranks report Success.
@@ -273,6 +359,11 @@ class DecodeStagingHandler:
                     chunk_events.pop(i)
                     self._free_and_send_watermark(alloc_id, decode_req)
 
+        if getattr(decode_req, "_dsv4_all_writers_arrived", False):
+            if not getattr(decode_req, "_chunk_events", None):
+                decode_req._staging_scatter_done = True
+            return
+
         if not getattr(decode_req, "_staging_last_scatter_submitted", False):
             return
 
@@ -293,6 +384,9 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         decode_req: DecodeRequest,
+        *,
+        layout: str = "",
+        num_fragments: int = 0,
     ) -> bool:
         """Submit scatter kernels for a staging region to scatter_stream.
 
@@ -300,16 +394,14 @@ class DecodeStagingHandler:
         runs on scatter_stream so that the decode_thread never blocks on
         the default stream (which carries the main-thread forward pass).
         """
-        from sglang.srt.disaggregation.common.staging_buffer import (
-            scatter_staging_to_kv,
-        )
-
-        k_buffers = self.kv_buffer_info["k_buffers"]
-        v_buffers = self.kv_buffer_info["v_buffers"]
-        page_size = self.kv_buffer_info["page_size"]
-        dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
-
-        device = k_buffers[0].device
+        if layout == "dsv4_blocks":
+            device = torch.device(f"cuda:{self.kv_manager.kv_args.gpu_id}")
+        else:
+            k_buffers = self.kv_buffer_info["k_buffers"]
+            v_buffers = self.kv_buffer_info["v_buffers"]
+            page_size = self.kv_buffer_info["page_size"]
+            dst_tp_rank = self.kv_manager.kv_args.engine_rank % self.decode_tp
+            device = k_buffers[0].device
         torch.cuda.set_device(device)
 
         if not hasattr(self.staging_allocator, "_scatter_stream"):
@@ -318,6 +410,18 @@ class DecodeStagingHandler:
         scatter_stream = self.staging_allocator._scatter_stream
 
         staging_view = self.staging_allocator.buffer.buffer[staging_offset:]
+
+        if layout == "dsv4_blocks":
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                scatter_address_blocks_from_staging,
+            )
+
+            with torch.cuda.stream(scatter_stream):
+                scatter_address_blocks_from_staging(
+                    staging_view,
+                    num_fragments,
+                )
+            return True
 
         req_pool_idx = decode_req.req.req_pool_idx
         token_start = page_start * page_size
@@ -418,7 +522,9 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
         staging_ctx.watermark_cv.notify_all()
 
 
-def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
+def handle_staging_rsp(
+    msg_parts, transfer_infos: dict, expected_writer_id: str = ""
+) -> None:
     """Process a STAGING_RSP message and update transfer info with allocation."""
     stg_room = int(msg_parts[1].decode("ascii"))
     stg_chunk_idx = int(msg_parts[2].decode("ascii"))
@@ -426,6 +532,9 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_round = int(msg_parts[4].decode("ascii"))
     stg_end = int(msg_parts[5].decode("ascii"))
     stg_session = msg_parts[6].decode("ascii")
+    stg_writer = msg_parts[7].decode("ascii") if len(msg_parts) > 7 else ""
+    if stg_writer and expected_writer_id and stg_writer != expected_writer_id:
+        return
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
     if tinfo is not None:
@@ -499,7 +608,11 @@ class PrefillStagingStrategy:
     def __init__(self, kv_manager, staging_buffer):
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
-        page_size = kv_manager.kv_buffer_tensors["page_size"]
+        page_size = (
+            1
+            if getattr(kv_manager, "enable_dsv4_staging", False)
+            else kv_manager.kv_buffer_tensors["page_size"]
+        )
         cps = kv_manager.server_args.chunked_prefill_size or 8192
         self.full_chunk_pages = max(1, cps // page_size)
 
@@ -555,16 +668,19 @@ class PrefillStagingStrategy:
         self,
         session_id: str,
         prefill_kv_indices,
+        dst_kv_indices,
         dst_staging_ptr: int,
         dst_staging_size: int,
         target_info,
-    ) -> int:
+        token_position_offset: int = 0,
+    ) -> Tuple[object, int, int]:
         """Execute staged transfer (gather + RDMA).
 
-        Returns 0 on success, -1 to signal fallback to slice path.
+        Returns ``(result, num_fragments, staged_bytes)``. Generic MHA staging
+        reports zero for the latter two fields.
         """
         try:
-            return self.kv_manager.send_kvcache_staged(
+            result = self.kv_manager.send_kvcache_staged(
                 session_id,
                 prefill_kv_indices,
                 dst_staging_ptr,
@@ -573,7 +689,12 @@ class PrefillStagingStrategy:
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
                 staging_buffer=self.staging_buffer,
+                dst_kv_indices=dst_kv_indices,
+                token_position_offset=token_position_offset,
             )
+            if isinstance(result, tuple):
+                return result
+            return result, 0, 0
         except Exception as e:
             raise RuntimeError(
                 f"[Staging] KV transfer via staging buffer failed: {e}. "
@@ -666,8 +787,9 @@ def handle_staging_req(
 ):
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
-    Deduplicates: multiple prefill TP ranks requesting the same (room, chunk_idx)
-    only allocate once.  Sends ALLOC_OVERSIZED on permanent failure.
+    Generic staging deduplicates by ``(room, chunk_idx)``. DSV4 block staging
+    additionally keys by writer id because PP stages carry disjoint layers and
+    must not overwrite one another. Sends ALLOC_OVERSIZED on permanent failure.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
@@ -675,6 +797,8 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
+    required_override = int(msg[5].decode("ascii")) if len(msg) > 5 and msg[5] else None
+    writer_id = msg[6].decode("ascii") if len(msg) > 6 else ""
 
     if staging_allocator is None:
         logger.warning(
@@ -693,40 +817,53 @@ def handle_staging_req(
             session_id,
         )
         return
-    infos = getattr(receiver, "chunk_staging_infos", [])
+    if writer_id:
+        infos = getattr(receiver, "dsv4_chunk_staging_infos", None)
+        if infos is None:
+            infos = {}
+            receiver.dsv4_chunk_staging_infos = infos
+        info_key = (chunk_idx, writer_id)
+    else:
+        infos = getattr(receiver, "chunk_staging_infos", [])
+        info_key = chunk_idx
 
-    if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
-        _, offset, rnd, end, _ = infos[chunk_idx]
-    elif (
-        chunk_idx < len(infos)
-        and infos[chunk_idx][1] == StagingAllocator.ALLOC_OVERSIZED
-    ):
+    existing = (
+        infos.get(info_key)
+        if writer_id
+        else (infos[chunk_idx] if chunk_idx < len(infos) else None)
+    )
+    if existing is not None and existing[0] >= 0:
+        _, offset, rnd, end, _ = existing
+    elif existing is not None and existing[1] == StagingAllocator.ALLOC_OVERSIZED:
         offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
     else:
-        from sglang.srt.disaggregation.common.staging_buffer import (
-            compute_staging_layout,
-            resolve_total_kv_heads,
-        )
+        if required_override is not None:
+            required = required_override
+        else:
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                compute_staging_layout,
+                resolve_total_kv_heads,
+            )
 
-        page_size = kv_args.page_size
-        kv_item_lens = kv_args.kv_item_lens
-        num_kv_layers = len(kv_item_lens) // 2
-        decode_bytes_per_token = kv_item_lens[0] // page_size
-        total_kv_heads = resolve_total_kv_heads(kv_args, attn_tp_size)
-        dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
-        bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
-        dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
+            page_size = kv_args.page_size
+            kv_item_lens = kv_args.kv_item_lens
+            num_kv_layers = len(kv_item_lens) // 2
+            decode_bytes_per_token = kv_item_lens[0] // page_size
+            total_kv_heads = resolve_total_kv_heads(kv_args, attn_tp_size)
+            dst_heads_per_rank = max(1, total_kv_heads // max(1, attn_tp_size))
+            bytes_per_head_per_token = decode_bytes_per_token // dst_heads_per_rank
+            dst_tp_rank = kv_args.engine_rank % max(1, attn_tp_size)
 
-        chunk_tokens = chunk_num_pages * page_size
-        _, _, required = compute_staging_layout(
-            prefill_attn_tp_size,
-            attn_tp_size,
-            dst_tp_rank,
-            total_kv_heads,
-            chunk_tokens,
-            bytes_per_head_per_token,
-            num_kv_layers,
-        )
+            chunk_tokens = chunk_num_pages * page_size
+            _, _, required = compute_staging_layout(
+                prefill_attn_tp_size,
+                attn_tp_size,
+                dst_tp_rank,
+                total_kv_heads,
+                chunk_tokens,
+                bytes_per_head_per_token,
+                num_kv_layers,
+            )
         result = staging_allocator.assign(required)
         if result is None:
             logger.error(
@@ -738,21 +875,29 @@ def handle_staging_req(
                 staging_allocator.total_size,
             )
             offset, rnd, end = StagingAllocator.ALLOC_OVERSIZED, 0, -1
-            while len(infos) <= chunk_idx:
-                infos.append((-1, -1, 0, -1, 0))
-            infos[chunk_idx] = (
+            value = (
                 -1,
                 StagingAllocator.ALLOC_OVERSIZED,
                 0,
                 -1,
                 chunk_num_pages,
             )
+            if writer_id:
+                infos[info_key] = value
+            else:
+                while len(infos) <= chunk_idx:
+                    infos.append((-1, -1, 0, -1, 0))
+                infos[chunk_idx] = value
         else:
             alloc_id, offset, rnd = result
             end = offset + required
-            while len(infos) <= chunk_idx:
-                infos.append((-1, -1, 0, -1, 0))
-            infos[chunk_idx] = (alloc_id, offset, rnd, end, chunk_num_pages)
+            value = (alloc_id, offset, rnd, end, chunk_num_pages)
+            if writer_id:
+                infos[info_key] = value
+            else:
+                while len(infos) <= chunk_idx:
+                    infos.append((-1, -1, 0, -1, 0))
+                infos[chunk_idx] = value
 
     bootstrap_infos = room_bootstrap.get(room)
     if bootstrap_infos:
@@ -760,17 +905,18 @@ def handle_staging_req(
             try:
                 sock, lock = receiver._connect_to_bootstrap_server(bi)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            b"STAGING_RSP",
-                            str(room).encode("ascii"),
-                            str(chunk_idx).encode("ascii"),
-                            str(offset).encode("ascii"),
-                            str(rnd).encode("ascii"),
-                            str(end).encode("ascii"),
-                            session_id.encode("ascii"),
-                        ]
-                    )
+                    fields = [
+                        b"STAGING_RSP",
+                        str(room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(offset).encode("ascii"),
+                        str(rnd).encode("ascii"),
+                        str(end).encode("ascii"),
+                        session_id.encode("ascii"),
+                    ]
+                    if writer_id:
+                        fields.append(writer_id.encode("ascii"))
+                    sock.send_multipart(fields)
             except Exception:
                 pass
 
@@ -782,7 +928,9 @@ def prefetch_staging_reqs(
     chunked_prefill_size: int,
     staging_requested: set,
     prefetch_sockets: dict,
-) -> None:
+    required_bytes_fn=None,
+    writer_id: str = "",
+) -> bool:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
@@ -796,6 +944,7 @@ def prefetch_staging_reqs(
     cps = chunked_prefill_size or 8192
     full_chunk_pages = max(1, cps // page_size)
 
+    all_sent = True
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
         # as a method (it consults decode_prefix_len). Normalize via callable()
@@ -811,13 +960,18 @@ def prefetch_staging_reqs(
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
-            stg_key = (room, chunk_idx, session_id)
+            stg_key = (room, chunk_idx, session_id, writer_id)
             if stg_key in staging_requested:
                 continue
             staging_requested.add(stg_key)
 
             remaining = total_pages - chunk_idx * full_chunk_pages
             chunk_pages = min(full_chunk_pages, remaining)
+            required_bytes = (
+                required_bytes_fn(chunk_pages, tinfo, chunk_idx, num_chunks)
+                if required_bytes_fn is not None
+                else None
+            )
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
@@ -827,14 +981,21 @@ def prefetch_staging_reqs(
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
                     prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
+                fields = [
+                    b"STAGING_REQ",
+                    str(room).encode("ascii"),
+                    str(chunk_idx).encode("ascii"),
+                    str(chunk_pages).encode("ascii"),
+                    session_id.encode("ascii"),
+                ]
+                if required_bytes is not None:
+                    fields.append(str(required_bytes).encode("ascii"))
+                elif writer_id:
+                    fields.append(b"")
+                if writer_id:
+                    fields.append(writer_id.encode("ascii"))
+                prefetch_sockets[ep].send_multipart(fields)
             except Exception:
                 staging_requested.discard(stg_key)
+                all_sent = False
+    return all_sent

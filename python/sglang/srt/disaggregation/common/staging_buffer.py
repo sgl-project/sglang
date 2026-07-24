@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
+_BLOCK_STAGING_ALIGNMENT = 256
+_BLOCK_STAGING_FRAGMENT_BYTES = 1024
 
 
 @triton.jit
@@ -112,6 +114,196 @@ def _fused_scatter_from_staging_kernel(
         pool_token * stride_pool_token.to(tl.int64) + head_offset.to(tl.int64) + e_idx
     )
     tl.store(layer_ptr + dst_offsets, vals, mask=mask)
+
+
+@triton.jit
+def _gather_address_blocks_kernel(
+    src_ptrs,
+    payload_offsets,
+    lengths,
+    staging,
+    data_offset,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy one bounded address fragment per program into packed staging."""
+    fragment_id = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    length = tl.load(lengths + fragment_id)
+    mask = offsets < length
+    src = tl.load(src_ptrs + fragment_id).to(staging.dtype)
+    payload_offset = tl.load(payload_offsets + fragment_id)
+    values = tl.load(src + offsets, mask=mask)
+    tl.store(staging + data_offset + payload_offset + offsets, values, mask=mask)
+
+
+@triton.jit
+def _scatter_address_blocks_kernel(
+    dst_ptrs,
+    payload_offsets,
+    lengths,
+    staging,
+    data_offset,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Scatter one bounded staging fragment to its final GPU address."""
+    fragment_id = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    length = tl.load(lengths + fragment_id)
+    mask = offsets < length
+    dst = tl.load(dst_ptrs + fragment_id).to(staging.dtype)
+    payload_offset = tl.load(payload_offsets + fragment_id)
+    values = tl.load(staging + data_offset + payload_offset + offsets, mask=mask)
+    tl.store(dst + offsets, values, mask=mask)
+
+
+def _align_block_staging_size(size: int) -> int:
+    return (
+        (size + _BLOCK_STAGING_ALIGNMENT - 1) // _BLOCK_STAGING_ALIGNMENT
+    ) * _BLOCK_STAGING_ALIGNMENT
+
+
+def split_address_blocks(
+    transfer_blocks: List[Tuple[int, int, int]],
+    fragment_bytes: int = _BLOCK_STAGING_FRAGMENT_BYTES,
+) -> List[Tuple[int, int, int]]:
+    """Split arbitrary address copies into fixed-size kernel fragments."""
+    fragments = []
+    for src, dst, length in transfer_blocks:
+        if length < 0:
+            raise ValueError(
+                f"transfer block length must be non-negative, got {length}"
+            )
+        for offset in range(0, length, fragment_bytes):
+            fragment_len = min(fragment_bytes, length - offset)
+            fragments.append((src + offset, dst + offset, fragment_len))
+    return fragments
+
+
+def compute_address_block_staging_size(
+    transfer_blocks: List[Tuple[int, int, int]],
+) -> Tuple[int, int]:
+    """Return ``(required_bytes, num_fragments)`` for address-block staging."""
+    fragments = split_address_blocks(transfer_blocks)
+    header_bytes = _align_block_staging_size(len(fragments) * 3 * 8)
+    payload_bytes = sum(length for _, _, length in fragments)
+    return _align_block_staging_size(header_bytes + payload_bytes), len(fragments)
+
+
+def compute_dsv4_staging_upper_bound(
+    num_tokens: int,
+    c4_layers: int,
+    c128_layers: int,
+    dst_dcp_size: int,
+) -> int:
+    """Conservative bytes required by one staged DSV4 KV chunk.
+
+    The bound assumes every compressed token becomes a separate two-segment
+    address fragment. It therefore remains valid for fragmented source and
+    destination KV allocations, while normal contiguous runs use a smaller
+    header.
+    """
+    dcp = max(1, dst_dcp_size)
+    c4_tokens = (max(0, num_tokens) + 3) // 4
+    c128_tokens = (max(0, num_tokens) + 127) // 128
+    c4_local_tokens = (c4_tokens + dcp - 1) // dcp
+    c128_local_tokens = (c128_tokens + dcp - 1) // dcp
+
+    # DSV4 packed records are value+rope/scale: 576+8 bytes for attention
+    # KV, and 128+4 bytes for the replicated c4 indexer.
+    payload_bytes = (
+        c4_layers * (c4_local_tokens * 584 + c4_tokens * 132)
+        + c128_layers * c128_local_tokens * 584
+    )
+    max_fragments = 2 * (
+        c4_layers * (c4_local_tokens + c4_tokens) + c128_layers * c128_local_tokens
+    )
+    header_bytes = _align_block_staging_size(max_fragments * 3 * 8)
+    return _align_block_staging_size(header_bytes + payload_bytes)
+
+
+def gather_address_blocks_to_staging(
+    transfer_blocks: List[Tuple[int, int, int]],
+    staging_buffer: StagingBuffer,
+    gpu_id: int,
+) -> Tuple[int, int]:
+    """Pack arbitrary GPU address copies into a self-describing buffer.
+
+    The header contains destination addresses, payload offsets, and lengths.
+    Decode can therefore scatter without reconstructing DSV4 page ownership.
+    Returns ``(bytes_written, num_fragments)``.
+    """
+    fragments = split_address_blocks(transfer_blocks)
+    required_bytes, num_fragments = compute_address_block_staging_size(transfer_blocks)
+    if not staging_buffer.fits(required_bytes):
+        raise RuntimeError(
+            f"DSV4 staging buffer needs {required_bytes} bytes, "
+            f"but only {staging_buffer.get_size()} bytes are available"
+        )
+    if num_fragments == 0:
+        return 0, 0
+
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+    src_ptrs = torch.tensor(
+        [src for src, _, _ in fragments], dtype=torch.int64, device=device
+    )
+    dst_ptrs = torch.tensor(
+        [dst for _, dst, _ in fragments], dtype=torch.int64, device=device
+    )
+    lengths = torch.tensor(
+        [length for _, _, length in fragments], dtype=torch.int64, device=device
+    )
+    payload_offsets = torch.empty(num_fragments, dtype=torch.int64, device=device)
+    payload_offsets[0] = 0
+    if num_fragments > 1:
+        torch.cumsum(lengths[:-1], dim=0, out=payload_offsets[1:])
+
+    header_bytes = _align_block_staging_size(num_fragments * 3 * 8)
+    header = staging_buffer.buffer[:header_bytes].view(torch.int64)
+    header_dst_ptrs = header[:num_fragments]
+    header_payload_offsets = header[num_fragments : 2 * num_fragments]
+    header_lengths = header[2 * num_fragments : 3 * num_fragments]
+
+    if not hasattr(staging_buffer, "_gather_stream"):
+        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
+    gather_stream = staging_buffer._gather_stream
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+    with torch.cuda.stream(gather_stream):
+        header_dst_ptrs.copy_(dst_ptrs)
+        header_payload_offsets.copy_(payload_offsets)
+        header_lengths.copy_(lengths)
+        _gather_address_blocks_kernel[(num_fragments,)](
+            src_ptrs,
+            payload_offsets,
+            lengths,
+            staging_buffer.buffer,
+            header_bytes,
+            BLOCK_SIZE=_BLOCK_STAGING_FRAGMENT_BYTES,
+        )
+    gather_stream.synchronize()
+    return required_bytes, num_fragments
+
+
+def scatter_address_blocks_from_staging(
+    staging_buffer_view: torch.Tensor,
+    num_fragments: int,
+) -> None:
+    """Scatter a self-describing address-block staging payload."""
+    if num_fragments <= 0:
+        return
+    header_bytes = _align_block_staging_size(num_fragments * 3 * 8)
+    header = staging_buffer_view[:header_bytes].view(torch.int64)
+    dst_ptrs = header[:num_fragments]
+    payload_offsets = header[num_fragments : 2 * num_fragments]
+    lengths = header[2 * num_fragments : 3 * num_fragments]
+    _scatter_address_blocks_kernel[(num_fragments,)](
+        dst_ptrs,
+        payload_offsets,
+        lengths,
+        staging_buffer_view,
+        header_bytes,
+        BLOCK_SIZE=_BLOCK_STAGING_FRAGMENT_BYTES,
+    )
 
 
 class StagingBuffer:
@@ -203,6 +395,7 @@ class StagingAllocator:
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
         """Allocate a region. Returns (alloc_id, offset, round) or None."""
+        required_bytes = _align_block_staging_size(required_bytes)
         with self.lock:
             if required_bytes > self.total_size:
                 return None

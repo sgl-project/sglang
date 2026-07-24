@@ -108,6 +108,12 @@ class MooncakeTransferDebugStats:
         with self._lock:
             self._timings["status"].append(duration)
 
+    def record_staged_transfer(self, byte_count: int, block_count: int = 1) -> None:
+        with self._lock:
+            self._counters["staged_calls"] += 1
+            self._counters["staged_blocks"] += block_count
+            self._counters["staged_bytes"] += byte_count
+
     def record_engine_start(self) -> None:
         with self._lock:
             self._engine_active += 1
@@ -172,6 +178,7 @@ class MooncakeTransferDebugStats:
             logger.info(
                 "Mooncake transfer debug rank=%s interval=%.2fs "
                 "chunks=%d tokens=%d engine_calls=%d blocks=%d bytes=%d "
+                "staged=%d/%d/%d "
                 "payload=%.3fGB/s pending=%s active=%s "
                 "engine_active=%d/%d skipped=%d kv_skipped=%d errors=%d/%d "
                 "timing_ms(avg/p95/max) queue=%s chunk=%s kv=%s state=%s "
@@ -183,6 +190,9 @@ class MooncakeTransferDebugStats:
                 counters.get("engine_calls", 0),
                 counters.get("engine_blocks", 0),
                 counters.get("engine_bytes", 0),
+                counters.get("staged_calls", 0),
+                counters.get("staged_blocks", 0),
+                counters.get("staged_bytes", 0),
                 payload_gbps,
                 snapshot["pending"],
                 snapshot["active"],
