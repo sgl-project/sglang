@@ -434,23 +434,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(gpu_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(gpu_id)
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -557,6 +543,18 @@ def get_dispatch_device_backend():
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
+
+
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 def get_amdgpu_memory_capacity():
