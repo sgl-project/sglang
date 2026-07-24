@@ -857,8 +857,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        # The fallback belongs to genuine extend forwards only. Target-verify /
+        # draft-extend must never honor it: `forward_prefill_metadata` is a
+        # stale leftover from the last prefill there (eager init clears it,
+        # but decode-graph capture does not), and capturing verify through the
+        # flashinfer path binds the graph to prefill-planned wrapper buffers,
+        # which fault (illegal address) at replay.
         if (
-            self.forward_prefill_metadata is not None
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
         ):
             return super().forward_extend(
