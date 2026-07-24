@@ -302,6 +302,10 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclCommSuspend(ncclComm_t comm, int flags);
+        Function("ncclCommSuspend", ncclResult_t, [ncclComm_t, ctypes.c_int]),
+        # ncclResult_t ncclCommResume(ncclComm_t comm);
+        Function("ncclCommResume", ncclResult_t, [ncclComm_t]),
         # ncclResult_t ncclGroupStart();
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
@@ -358,16 +362,33 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            missing_comm_suspend = False
             for func in exported_functions:
-                f = getattr(self.lib, func.name)
+                try:
+                    f = getattr(self.lib, func.name)
+                except AttributeError:
+                    if func.name in ("ncclCommSuspend", "ncclCommResume"):
+                        missing_comm_suspend = True
+                        continue
+                    raise
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f
+            if missing_comm_suspend and torch.version.cuda is not None:
+                logger.warning(
+                    "NCCL communicator suspend/resume is unavailable in %s "
+                    "(requires NCCL >= 2.29.7); communicator memory offload "
+                    "is disabled.",
+                    so_file,
+                )
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+        self.supports_comm_suspend = all(
+            name in self._funcs for name in ("ncclCommSuspend", "ncclCommResume")
+        )
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
@@ -534,6 +555,12 @@ class NCCLLibrary:
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+
+    def ncclCommSuspend(self, comm: ncclComm_t, flags: int) -> None:
+        self.NCCL_CHECK(self._funcs["ncclCommSuspend"](comm, flags))
+
+    def ncclCommResume(self, comm: ncclComm_t) -> None:
+        self.NCCL_CHECK(self._funcs["ncclCommResume"](comm))
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int
