@@ -1,15 +1,21 @@
 """TTFT/ITL A/B/C: Python TM vs Rust TM (native MM) vs Rust TM (Python MM)
 on an image workload.
 
-Arms:
-  python      — Python tokenizer manager
-  rust        — Rust TM + native Qwen MM pipeline
-  rust_py_mm  — Rust TM, MM forced through Python mm_processor
-                (SGLANG_DISABLE_NATIVE_MM=1)
+Arms (aliases in parentheses):
+  python                — Python tokenizer manager
+  rust (native)         — Rust TM + native Qwen MM pipeline
+  rust_py_mm (py_mm)    — Rust TM, MM forced through Python mm_processor
+                          (SGLANG_DISABLE_NATIVE_MM=1)
 
 Sweeps either concurrency (default) or image-count (`--image-counts`),
-launching each arm once with identical server args. Outputs a table,
-raw.json, and sweep.png (TTFT and ITL panels; mean solid, p99 dashed).
+launching each selected arm once with identical server args. Outputs a
+table, raw.json, and sweep.png (TTFT and ITL panels; mean solid, p99
+dashed).
+
+Partial re-runs keep the same raw.json shape: pass `--arms native` (or
+`--arms rust`) and either reuse `--output-dir` (merges existing
+raw.json) or `--merge-from <prior raw.json|dir>` so baselines stay on
+the plot without re-running.
 
     # concurrency sweep (fixed image-count)
     python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
@@ -18,6 +24,11 @@ raw.json, and sweep.png (TTFT and ITL panels; mean solid, p99 dashed).
     # image-count sweep (fixed concurrency)
     python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
         --concurrencies 64 --num-prompts 1024 --image-counts 1 2 3 4 --output-len 256
+
+    # re-run native rust only; keep python / rust_py_mm from a prior dir
+    python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
+        --arms native --merge-from results/0723_205224_nolog_conc \
+        --output-dir results/0723_rerun_native
 """
 
 import argparse
@@ -28,6 +39,17 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Canonical arm name -> accepted CLI aliases (first alias is the canonical name).
+ARM_ALIASES = {
+    "python": "python",
+    "rust": "rust",
+    "native": "rust",
+    "rust_native": "rust",
+    "rust_py_mm": "rust_py_mm",
+    "py_mm": "rust_py_mm",
+}
+ARM_ORDER = ("python", "rust", "rust_py_mm")
 
 # Prefer the workspace checkout over any installed sglang, here and in the
 # launched server subprocesses (via PYTHONPATH).
@@ -167,6 +189,52 @@ def run_arm(arm, args, out_dir, levels):
     return results
 
 
+def normalize_arm(name):
+    key = name.lower().replace("-", "_")
+    if key not in ARM_ALIASES:
+        raise SystemExit(
+            f"unknown arm {name!r}; choose from {', '.join(sorted(ARM_ALIASES))}"
+        )
+    return ARM_ALIASES[key]
+
+
+def normalize_results(results):
+    """JSON object keys are strings; coerce level keys back to int."""
+    out = {}
+    for arm, arm_results in results.items():
+        if not isinstance(arm_results, dict):
+            continue
+        out[arm] = {
+            int(x): (None if v is None else v) for x, v in arm_results.items()
+        }
+    return out
+
+
+def load_raw_json(path):
+    """Load raw.json from a file or a results directory."""
+    p = Path(path)
+    if p.is_dir():
+        p = p / "raw.json"
+    if not p.is_file():
+        raise SystemExit(f"merge source not found: {p}")
+    return normalize_results(json.loads(p.read_text()))
+
+
+def merge_results(base, overlay):
+    """Keep prior arms; overlay arms overwrite on conflict."""
+    merged = {arm: dict(levels) for arm, levels in base.items()}
+    for arm, levels in overlay.items():
+        merged[arm] = dict(levels)
+    return {arm: merged[arm] for arm in sorted(merged, key=_arm_sort_key)}
+
+
+def _arm_sort_key(arm):
+    try:
+        return (0, ARM_ORDER.index(arm))
+    except ValueError:
+        return (1, arm)
+
+
 def plot(results, args, out_dir, levels):
     import matplotlib
 
@@ -183,13 +251,14 @@ def plot(results, args, out_dir, levels):
     }
     xpos = {x: i for i, x in enumerate(xs)}
     for ax, metric in zip(axes, ("ttft", "itl")):
-        for arm, arm_results in results.items():
+        for arm in sorted(results, key=_arm_sort_key):
+            arm_results = results[arm]
             color = colors.get(arm, "tab:gray")
             for stat, style in (("mean", "-o"), ("p99", "--s")):
                 pts = [
                     (xpos[x], r[f"{stat}_{metric}_ms"])
                     for x, r in sorted(arm_results.items())
-                    if r
+                    if r and x in xpos
                 ]
                 if pts:
                     ax.plot(*zip(*pts), style, color=color, label=f"{arm} {stat}")
@@ -227,9 +296,16 @@ def main():
         "--arms",
         nargs="+",
         default=["python", "rust", "rust_py_mm"],
-        choices=["python", "rust", "rust_py_mm"],
-        help="python=Python TM; rust=Rust TM+native MM; "
-        "rust_py_mm=Rust TM+Python MM (SGLANG_DISABLE_NATIVE_MM)",
+        metavar="ARM",
+        help="which arms to launch (default: all). Aliases: native/rust_native→rust, "
+        "py_mm→rust_py_mm. Prior arms can be kept via --merge-from / existing "
+        "output-dir raw.json so the plot still shows the full A/B/C set.",
+    )
+    parser.add_argument(
+        "--merge-from",
+        default=None,
+        help="prior raw.json (or results dir containing it) to merge before plot; "
+        "also auto-merges raw.json already in --output-dir",
     )
     parser.add_argument("--concurrencies", type=int, nargs="+",
                         default=[1, 4, 16, 64, 128, 256, 512, 1024])
@@ -258,6 +334,7 @@ def main():
                         help="extra args passed through to sglang serve")
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
+    args.arms = list(dict.fromkeys(normalize_arm(a) for a in args.arms))
 
     levels = sweep_levels(args)
     out_dir = Path(
@@ -266,14 +343,27 @@ def main():
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"output dir: {out_dir}")
+    print(f"arms to run: {', '.join(args.arms)}")
     _dataset["build_n"] = max(level_prompts(args, c) for _, c, _ in levels)
 
-    results = {arm: run_arm(arm, args, out_dir, levels) for arm in args.arms}
+    base = {}
+    if args.merge_from:
+        base = merge_results(base, load_raw_json(args.merge_from))
+        print(f"merged from: {args.merge_from} (arms: {', '.join(base) or 'none'})")
+    existing = out_dir / "raw.json"
+    if existing.is_file():
+        base = merge_results(base, load_raw_json(existing))
+        print(f"merged existing: {existing} (arms: {', '.join(base) or 'none'})")
+
+    ran = {arm: run_arm(arm, args, out_dir, levels) for arm in args.arms}
+    results = merge_results(base, ran)
     (out_dir / "raw.json").write_text(json.dumps(results, indent=2))
 
     xname = "imgs" if args.image_counts else "conc"
-    for arm, arm_results in results.items():
-        print(f"\n[{arm}]  {xname:>6}  mean_ttft   p99_ttft   mean_itl    p99_itl  req/s")
+    for arm in sorted(results, key=_arm_sort_key):
+        arm_results = results[arm]
+        tag = " (ran)" if arm in ran else " (merged)"
+        print(f"\n[{arm}]{tag}  {xname:>6}  mean_ttft   p99_ttft   mean_itl    p99_itl  req/s")
         for x, r in sorted(arm_results.items()):
             if r:
                 vals = "".join(f"{r[k]:>11.1f}" for k in METRICS)
@@ -282,6 +372,7 @@ def main():
                 print(f"  {x:>6}  FAILED")
     plot(results, args, out_dir, levels)
     print(f"\nsaved: {out_dir}/raw.json, {out_dir}/sweep.png")
+    print(f"arms in plot: {', '.join(sorted(results, key=_arm_sort_key))}")
 
 
 if __name__ == "__main__":

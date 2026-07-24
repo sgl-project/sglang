@@ -37,11 +37,19 @@ python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
 # image-count sweep (fixed concurrency; x-axis = image count)
 python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
     --concurrencies 64 --num-prompts 1024 --image-counts 1 2 3 4 --output-len 256
+
+# re-run native rust only; keep other arms from a prior raw.json on the plot
+python benchmark/rust_tokenizer_manager/bench_mm_ab.py --gpu 1 \
+    --arms native --merge-from results/<prior_dir> --output-dir results/<new_dir>
 ```
+
+Arms: `python`, `rust` (alias `native`), `rust_py_mm` (alias `py_mm`).
+`--arms` selects which servers to launch; `--merge-from` (or an existing
+`raw.json` in `--output-dir`) keeps prior arms in `raw.json` / `sweep.png`.
 
 Defaults: `Qwen/Qwen3.5-0.8B`, 1x720p image + 128 text tokens in / 64 out per
 request, concurrency 1 → 1024. Each level runs
-`min(num_prompts, max(128, 32*concurrency))` requests (2048 cap by default):
+`min(num_prompts, max(128, 16*concurrency))` requests (2048 cap by default):
 enough samples for steady state everywhere without serializing thousands of
 ~200 ms requests at low concurrency, which would take minutes per level.
 
@@ -52,4 +60,5 @@ Written to `--output-dir` (default `results/<timestamp>/`):
 - `sweep.png` — TTFT and ITL vs concurrency (log-log; mean solid, p99 dashed,
   one color per arm), plus a per-arm table on stdout
 - `raw.json` — per-arm `{concurrency: {mean/p99 ttft/itl, request_throughput}}`
+  (stable shape across partial re-runs; merged arms kept)
 - `{arm}.jsonl`, `server_{arm}.log` — bench_serving lines and server logs
