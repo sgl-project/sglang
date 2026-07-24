@@ -13,8 +13,8 @@ export const ZImageTurboDeployment = () => {
           { id: 'b200', label: 'B200', default: true },
           { id: 'h200', label: 'H200', default: false },
           { id: 'h100', label: 'H100', default: false },
-          { id: 'ascend2', label: 'A2', default: false },
-          { id: 'ascend3', label: 'A3', default: false }
+          { id: 'a2', label: 'A2', default: false },
+          { id: 'a3', label: 'A3', default: false }
         ]
       }
     },
@@ -22,15 +22,13 @@ export const ZImageTurboDeployment = () => {
     generateCommand: function(values) {
       const { hardware } = values;
 
-      if (hardware === 'ascend2') {
+      if (hardware === 'a2') {
         return `sglang serve \\
   --model-path Tongyi-MAI/Z-Image-Turbo \\
-  --tp-size 2 \\
-  --sp-degree 2 \\
-  --num-gpus 4`;
+  --num-gpus 1`;
       }
 
-      if (hardware === 'ascend3') {
+      if (hardware === 'a3') {
         return `#One A3 card has 2 npu chips
 sglang serve \\
   --model-path Tongyi-MAI/Z-Image-Turbo \\
@@ -114,7 +112,7 @@ sglang serve \\
   }, []);
 
   useEffect(() => {
-    const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+    const isAscend = values.hardware === 'a2' || values.hardware === 'a3';
     const targetTabName = isAscend ? 'Ascend A2 / A3' : 'AMD MI300X';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');

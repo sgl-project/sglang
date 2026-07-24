@@ -14,8 +14,8 @@ export const QwenImageDeployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false },
           { id: 'mi325x', label: 'MI325X', default: false },
           { id: 'mi355x', label: 'MI355X', default: false },
-          { id: 'ascend2', label: 'A2', default: false },
-          { id: 'ascend3', label: 'A3', default: false }
+          { id: 'a2', label: 'A2', default: false },
+          { id: 'a3', label: 'A3', default: false }
         ]
       },
       precision: {
@@ -35,13 +35,13 @@ export const QwenImageDeployment = () => {
     },
 
     generateCommand: function(values) {
-      if (values.hardware === 'ascend2') {
+      if (values.hardware === 'a2') {
         return `sglang serve \\
   --model-path Qwen/Qwen-Image \\
   --num-gpus 1`;
       }
 
-      if (values.hardware === 'ascend3') {
+      if (values.hardware === 'a3') {
         return `#One A3 card has 2 npu chips
 sglang serve \\
   --model-path Qwen/Qwen-Image \\
@@ -132,8 +132,8 @@ sglang serve \\
 
   useEffect(() => {
     let targetTabName = 'AMD MI300X';
-    if (values.hardware === 'ascend2') targetTabName = 'Ascend A2';
-    if (values.hardware === 'ascend3') targetTabName = 'Ascend A3';
+    if (values.hardware === 'a2') targetTabName = 'Ascend A2';
+    if (values.hardware === 'a3') targetTabName = 'Ascend A3';
 
     const allTabs = document.querySelectorAll('button, [role="tab"]');
 
