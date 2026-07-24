@@ -14,6 +14,90 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
+    def test_available_size_reports_logical_capacity(self):
+        """A small device working set must not look like logical KV usage."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.logical_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=5_445_376),
+            full_available_size=MagicMock(return_value=5_445_376),
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=272_268)
+        )
+
+        self.assertEqual(allocator.available_size(), 5_445_376)
+        self.assertEqual(allocator.full_available_size(), 5_445_376)
+        allocator.hisparse_attn_allocator.available_size.assert_not_called()
+
+    def test_empty_pool_does_not_report_eighty_percent_full_usage(self):
+        from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+            SchedulerPoolStatsObserver,
+        )
+
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.logical_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=5_445_376),
+            full_available_size=MagicMock(return_value=5_445_376),
+            swa_available_size=MagicMock(return_value=326_656),
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=272_268)
+        )
+
+        observer = SchedulerPoolStatsObserver(
+            tree_cache=SimpleNamespace(
+                full_evictable_size=MagicMock(return_value=0),
+                swa_evictable_size=MagicMock(return_value=0),
+            ),
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=None,
+            session_controller=None,
+            hisparse_coordinator=None,
+            is_hybrid_swa=True,
+            is_hybrid_ssm=False,
+            enable_hisparse=True,
+            full_tokens_per_layer=5_445_376,
+            swa_tokens_per_layer=326_656,
+            max_total_num_tokens=5_445_376,
+            get_last_batch=lambda: None,
+            get_running_batch=lambda: None,
+        )
+
+        stats = observer._get_swa_token_info()
+
+        self.assertEqual(stats.full_num_used, 0)
+        self.assertEqual(stats.full_token_usage, 0.0)
+        self.assertEqual(stats.swa_num_used, 0)
+        self.assertEqual(stats.swa_token_usage, 0.0)
+
+    def test_device_capacity_is_still_checked_by_alloc_extend(self):
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        allocator.compress_ratio = 4
+        allocator.page_size = 256
+        allocator.hisparse_page_size = 64
+        allocator.logical_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=1_000_000)
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=0)
+        )
+
+        prefix_lens = torch.tensor([0], dtype=torch.int64)
+        seq_lens = torch.tensor([256], dtype=torch.int64)
+
+        result = allocator.alloc_extend(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            last_loc=torch.tensor([-1], dtype=torch.int64),
+            extend_num_tokens=256,
+        )
+
+        self.assertIsNone(result)
+
     def test_forwards_swa_tail_allocation_to_logical_allocator(self):
         allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
         logical_allocator = MagicMock(spec=["alloc_extend_swa_tail"])
