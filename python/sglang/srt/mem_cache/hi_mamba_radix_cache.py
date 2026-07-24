@@ -1676,7 +1676,9 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.enable_storage:
             try:
                 if hasattr(self.cache_controller.storage_backend, "clear"):
-                    self.cache_controller.storage_backend.clear()
+                    result = self.cache_controller.storage_backend.clear()
+                    if result is False:
+                        return False
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
