@@ -77,6 +77,14 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
       <td><strong style={{color: 'red'}}>x</strong></td>
     </tr>
     <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/30319">MXFP4 W4A4 (ModelSlim)</a></td>
+      <td>MoE</td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+      <td><strong style={{color: 'green'}}>√</strong></td>
+      <td><strong style={{color: 'red'}}>x</strong></td>
+    </tr>
+    <tr>
       <td>W4A4 dynamic</td>
       <td>MoE</td>
       <td><strong style={{color: 'green'}}>√</strong></td>
@@ -407,6 +415,23 @@ python3 -m sglang.launch_server \
 > - **Offline** (`ModelSlimMXFP4Scheme` → `NPUSingleLevelMXFP4OfflineLinearMethod`) is **single-level**: msmodelslim's `W4A4_MXFP4` checkpoint ships single-level UE8M0 block scales (block_size = 32), so the matmul runs via `npu_quant_matmul(..., x1_dtype=x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[1, 1, 32])`. The online and offline paths therefore use different matmul kernels — they no longer share the matmul path.
 > - As with W4A8, the packed-FP4 dtype passed to the NPU ops (`dst_type` / `x2_dtype`) must be resolved from `torch_npu.float4_e2m1fn_x2` (an int enum), not the `torch.float4_e2m1fn_x2` dtype object, which recent op-plugin builds reject.
 > - Validated end-to-end on Ascend A5 hardware.
+
+**ModelSlim W4A4 MXFP4 for LLM MoE models:**
+
+SGLang auto-detects offline ModelSlim `W4A4_MXFP4` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend 950 products or newer.
+
+```bash Command
+MODEL_PATH=/path/to/w4a4-mxfp4-moe-model
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --tp-size 1
+```
+
+> **Implementation Notes:**
+> - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
+> - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP4 dispatch. SGLang dynamically quantizes each expert input to MXFP4 immediately before grouped matmul.
 
 ## Diffusion Model Quantization on Ascend NPU
 
