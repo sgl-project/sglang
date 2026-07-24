@@ -1495,9 +1495,13 @@ class HiRadixCache(RadixCache):
         if len(operation.hash_value) == 0:
             completed = False
         else:
+            # kv pool
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
+            # sidecar pool (only present when using HybridCacheController)
+            if completed and getattr(operation, "pool_transfers", None):
+                completed = getattr(operation, "pool_transfers_done", False)
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -1506,13 +1510,6 @@ class HiRadixCache(RadixCache):
         else:
             # unknown prefetch stop policy, just return True
             return True
-
-        if (
-            completed
-            and getattr(operation, "pool_transfers", None)
-            and not getattr(operation, "pool_transfers_done", True)
-        ):
-            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(

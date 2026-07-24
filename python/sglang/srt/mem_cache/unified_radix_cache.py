@@ -1994,9 +1994,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(operation.hash_value) == 0:
             completed = False
         else:
+            # kv pool
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
+            # sidecar pool
+            if completed and operation.pool_transfers:
+                completed = operation.pool_transfers_done
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -2006,12 +2010,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
-        if (
-            completed
-            and getattr(operation, "pool_transfers", None)
-            and not getattr(operation, "pool_transfers_done", True)
-        ):
-            can_terminate = False
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
@@ -2169,7 +2167,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # tail (host_indices[completed_tokens:])
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
-                extra_pools=pool_transfers,
+                extra_pools=pool_transfers if operation.pool_transfers_done else None,
             )
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
             del self.ongoing_prefetch[req_id]
@@ -2215,9 +2213,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._barrier_attn_groups()
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
+        pool_transfers = [x for xfers in comp_xfers.values() for x in xfers]
         self.cache_controller.append_host_mem_release(
             host_indices=host_indices[:completed_tokens],
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            extra_pools=pool_transfers if operation.pool_transfers_done else None,
         )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
