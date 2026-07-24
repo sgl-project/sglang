@@ -21,6 +21,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+from sglang.kernels.ops.attention.dsa.dcp_localize_index_kv import (
+    dcp_local_capacity,
+    dcp_localize_page_table,
+)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged,
     gather_dequant_requant_fp8_paged,
@@ -231,6 +235,17 @@ class DSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # DCP-sharded indexer (SGLANG_DSA_DCP_SHARD_INDEXER): this rank's local
+    # view of page_table_1, precomputed once per forward batch and reused
+    # across layers instead of recomputed per-layer inside the Indexer (see
+    # dcp_localize_index_kv.dcp_localize_page_table). None unless the flag is
+    # on and page_table_1 is available (it can be dropped by
+    # dsa_drop_wide_page_table; Indexer falls back to per-layer computation
+    # in that rare combination).
+    dcp_local_page_table: Optional[torch.Tensor] = None
+    dcp_local_to_global: Optional[torch.Tensor] = None
+    dcp_local_causal_count: Optional[torch.Tensor] = None
+
 
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
@@ -291,6 +306,23 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
+
+    def get_dcp_local_view(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """This rank's precomputed (once per forward step) local page-table
+        view for the DCP-sharded indexer -- see
+        DeepseekSparseAttnBackend._build_dcp_local_view. None if unavailable
+        (flag off, or page_table_1 was dropped); callers fall back to
+        computing it inline in that case.
+        """
+        if self.attn_metadata.dcp_local_page_table is None:
+            return None
+        return (
+            self.attn_metadata.dcp_local_page_table,
+            self.attn_metadata.dcp_local_to_global,
+            self.attn_metadata.dcp_local_causal_count,
+        )
 
     def topk_transform(
         self,
@@ -465,6 +497,15 @@ class DeepseekSparseAttnBackend(
         self.dcp_enabled = parallel.dcp_enabled
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        # Mirrors Indexer.dcp_shard_indexer (dsa_indexer.py): whether the
+        # sharded-indexer local view (page table / causal counts) should be
+        # built once per forward step here in metadata construction, instead
+        # of per-layer inside the Indexer. Kept as a separate flag (not read
+        # off the Indexer instance) since DSAMetadata construction predates
+        # any per-layer Indexer object for this forward step.
+        self.dcp_shard_indexer = (
+            self.dcp_enabled and envs.SGLANG_DSA_DCP_SHARD_INDEXER.get()
+        )
         if self.dcp_enabled:
             assert (
                 self.dsa_decode_impl == "trtllm" and self.dsa_prefill_impl == "trtllm"
@@ -766,6 +807,46 @@ class DeepseekSparseAttnBackend(
         from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
+
+    def _build_dcp_local_view(
+        self, page_table_1: Optional[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # Preprocess the DCP-sharded indexer's local page-table view once per
+        # forward (shared across layers), at metadata-build time, mirroring
+        # _build_topk_v2_plan. None when the flag is off, or when page_table_1
+        # itself was dropped (dsa_drop_wide_page_table) -- the Indexer falls
+        # back to computing it per-layer in that rare combination.
+        if not self.dcp_shard_indexer or page_table_1 is None:
+            return None, None, None
+        local_capacity = dcp_local_capacity(
+            page_table_1.shape[1], self.dcp_size, self.real_page_size
+        )
+        return dcp_localize_page_table(
+            page_table_1,
+            self.dcp_size,
+            self.dcp_rank,
+            local_capacity,
+            self.real_page_size,
+        )
+
+    def _refresh_dcp_local_view(self, metadata: DSAMetadata) -> None:
+        # Refresh in-place under CUDA graph replay, mirroring
+        # _refresh_topk_v2_plan: `copy_` preserves the buffers' data_ptrs the
+        # captured graph read from. None means it was not built (flag off /
+        # page_table_1 dropped), so there is nothing to refresh.
+        if metadata.dcp_local_page_table is None or metadata.page_table_1 is None:
+            return
+        local_capacity = metadata.dcp_local_page_table.shape[1]
+        fresh_page_table, fresh_to_global, fresh_causal_count = dcp_localize_page_table(
+            metadata.page_table_1,
+            self.dcp_size,
+            self.dcp_rank,
+            local_capacity,
+            self.real_page_size,
+        )
+        metadata.dcp_local_page_table.copy_(fresh_page_table)
+        metadata.dcp_local_to_global.copy_(fresh_to_global)
+        metadata.dcp_local_causal_count.copy_(fresh_causal_count)
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
@@ -1091,6 +1172,9 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        dcp_local_page_table, dcp_local_to_global, dcp_local_causal_count = (
+            self._build_dcp_local_view(page_table)
+        )
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1124,6 +1208,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            dcp_local_page_table=dcp_local_page_table,
+            dcp_local_to_global=dcp_local_to_global,
+            dcp_local_causal_count=dcp_local_causal_count,
         )
         self.forward_metadata = metadata
 
@@ -1429,6 +1516,9 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        dcp_local_page_table, dcp_local_to_global, dcp_local_causal_count = (
+            self._build_dcp_local_view(page_table_1)
+        )
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1447,6 +1537,9 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            dcp_local_page_table=dcp_local_page_table,
+            dcp_local_to_global=dcp_local_to_global,
+            dcp_local_causal_count=dcp_local_causal_count,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1715,6 +1808,7 @@ class DeepseekSparseAttnBackend(
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
+            self._refresh_dcp_local_view(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
             if not target_verify_ctx_lens_written:
                 if metadata.paged_mqa_ctx_lens_2d is None:
@@ -1912,6 +2006,7 @@ class DeepseekSparseAttnBackend(
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
+            self._refresh_dcp_local_view(metadata)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:

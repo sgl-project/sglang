@@ -8,12 +8,25 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 from einops import rearrange
 
+from sglang.kernels.ops.attention.dsa.dcp_localize_index_kv import (
+    dcp_compact_store_loc,
+    dcp_local_capacity,
+    dcp_localize_page_table,
+    dcp_pack_local_to_global,
+)
+from sglang.kernels.ops.attention.dsa.dcp_topk_merge_cutedsl import (
+    pack_dcp_topk_candidates_cutedsl,
+    stable_topk_from_gathered_candidates_cutedsl,
+)
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
@@ -317,6 +330,15 @@ class BaseIndexerMetadata(ABC):
         Return: batch idx for each token.
         """
 
+    def get_dcp_local_view(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Return: (local_page_table, local_to_global, local_causal_count)
+        precomputed once per forward step for the DCP-sharded indexer, or
+        None if unavailable (flag off, or not precomputed by this backend).
+        """
+
     @abstractmethod
     def topk_transform(
         self,
@@ -403,6 +425,13 @@ class Indexer(MultiPlatformOp):
         else:
             self.cp_size = None
             self.cp_rank = None
+        parallel = get_parallel()
+        self.dcp_enabled = parallel.dcp_enabled
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        self.dcp_shard_indexer = (
+            self.dcp_enabled and envs.SGLANG_DSA_DCP_SHARD_INDEXER.get()
+        )
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
@@ -672,6 +701,23 @@ class Indexer(MultiPlatformOp):
 
         return key
 
+    def _dcp_compact_index_store_loc(self, out_cache_loc: torch.Tensor) -> torch.Tensor:
+        """Compact the write address for the (now genuinely dcp_size-smaller)
+        index K-cache. Must use the same page-granular ownership as
+        dcp_localize_page_table (see dcp_localize_index_kv module docstring
+        for why: page-level, not per-token, ownership is required for the
+        compacted table to preserve physical page contiguity, which the
+        paged-MQA-logits kernel's block_tables addressing depends on).
+        """
+        pool = get_token_to_kv_pool()
+        return dcp_compact_store_loc(
+            out_cache_loc,
+            self.dcp_size,
+            self.dcp_rank,
+            pool.page_size,
+            pool.index_buf_size,
+        )
+
     def _fused_k_prepare_and_store(
         self,
         key_raw: torch.Tensor,
@@ -694,10 +740,15 @@ class Indexer(MultiPlatformOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
+            fused_loc = (
+                self._dcp_compact_index_store_loc(out_cache_loc)
+                if self.dcp_shard_indexer
+                else out_cache_loc
+            )
             fused_k_indexer_norm_rope_store(
                 key_raw,
                 pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
+                fused_loc,
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
@@ -707,7 +758,10 @@ class Indexer(MultiPlatformOp):
             )
             return
 
-        # Fallback: separate K kernel + store kernel.
+        # Fallback: separate K kernel + store kernel. Rope is a per-token
+        # pointwise transform, so computing it over the full (uncompacted)
+        # batch and letting _store_index_k_cache compact at the actual store
+        # gives the same per-token result as compacting first.
         key = fused_k_indexer_norm_rope(
             key_raw,
             self.k_norm.weight,
@@ -872,6 +926,53 @@ class Indexer(MultiPlatformOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _dcp_sharded_topk_from_local_logits(
+        self,
+        metadata: BaseIndexerMetadata,
+        local_logits: torch.Tensor,
+        local_seq_lens: torch.Tensor,
+        local_to_global: torch.Tensor,
+        row_starts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Local top-k -> pack -> all_gather -> merge, reconstructing the
+        exact global top-k (see dcp_topk_merge_cutedsl.py for why this is
+        exact, not approximate) from each rank's local-shard-only scoring.
+
+        Decode calls this with one row per request and ``local_to_global``
+        already ``[B, local_capacity]`` (row_starts=None). Extend/chunked-
+        prefill calls it with one row per query TOKEN sharing one flat,
+        request-packed ``local_to_global`` -- callers there pass a
+        ``[num_tokens, packed_width]`` broadcast view (stride 0 on dim 0, not
+        materialized) plus each token's own ``row_starts`` offset into it, so
+        this method does not force contiguity on ``local_to_global``.
+        """
+        local_topk = metadata.topk_transform(
+            local_logits, self.index_topk, ks=row_starts, ke_offset=local_seq_lens
+        ).to(torch.int32)
+
+        batch_size = local_logits.shape[0]
+        dcp_group = get_parallel().dcp_group
+        # Allocate the to-be-gathered buffer from the symmetric-memory pool
+        # (matching the convention in layers/dcp/comm.py, e.g.
+        # alloc_dcp_q_combine_buf): all_gather's own output allocation is
+        # already symmetric-memory-aware internally, but the NVLS/window fast
+        # path needs the input side registered too, not just the output.
+        with use_symmetric_memory(dcp_group):
+            packed = torch.empty(
+                (batch_size, self.index_topk, 2),
+                dtype=torch.float32,
+                device=local_logits.device,
+            )
+        pack_dcp_topk_candidates_cutedsl(
+            local_logits.contiguous(),
+            local_topk.contiguous(),
+            local_to_global,
+            packed,
+            row_starts=row_starts,
+        )
+        gathered = dcp_group.all_gather(packed, dim=1)
+        return stable_topk_from_gathered_candidates_cutedsl(gathered, self.index_topk)
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -896,8 +997,81 @@ class Indexer(MultiPlatformOp):
                 ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
-        # NOTE(dark): this support extend/decode/decode+graph
-        if _is_hip and not _use_aiter_preshuffle:
+
+        # Sharded-indexer path: score only this rank's local KV shard instead
+        # of the full (replicated) sequence, then reconstruct the exact
+        # global top-k via pack + all_gather + merge (see
+        # dcp_localize_index_kv.py / dcp_topk_merge_cutedsl.py). Covers decode
+        # and target-verify/draft-extend-v2, but only on the plain deepgemm
+        # paged-mqa-logits kernel: the cutedsl dsl_expand trick and the
+        # deepgemm "native" 2D-context variant (both multi-draft-token perf
+        # paths for next_n>=2) still take the existing full-replication path.
+        assert len(q_fp8.shape) == 3
+        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
+        # hidden states; q_offset is the real (unpadded) q length.
+        q_offset = sum(metadata.get_dsa_extend_len_cpu())
+        B = metadata.get_seqlens_int32().shape[0]
+        next_n = q_offset // B if B > 0 else 0
+        use_cute_dsl = (
+            self.paged_mqa_logits_backend.is_cutedsl()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        use_dg_native = (
+            not use_cute_dsl
+            and _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and next_n >= 2
+            and ctx_2d is not None
+            and ctx_2d.shape == (B, next_n)
+        )
+
+        use_dcp_shard = (
+            self.dcp_shard_indexer
+            and not _is_hip
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            and not use_cute_dsl
+            and not use_dg_native
+        )
+
+        local_to_global = None
+        if use_dcp_shard:
+            # Prefer the once-per-forward-step view precomputed at metadata
+            # construction (DeepseekSparseAttnBackend._build_dcp_local_view),
+            # shared across every layer instead of recomputed per-layer.
+            # Falls back to computing it inline here when unavailable (rare:
+            # page_table_1 dropped by dsa_drop_wide_page_table).
+            hoisted = metadata.get_dcp_local_view()
+            if hoisted is not None:
+                local_page_table_1, local_to_global, local_causal_count = hoisted
+                local_capacity = local_page_table_1.shape[1]
+            else:
+                global_page_table_1 = metadata.get_page_table_1()
+                local_capacity = dcp_local_capacity(
+                    global_page_table_1.shape[1], self.dcp_size, page_size
+                )
+                local_page_table_1, local_to_global, local_causal_count = (
+                    dcp_localize_page_table(
+                        global_page_table_1,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        local_capacity,
+                        page_size,
+                    )
+                )
+            strided_indices = torch.arange(
+                0,
+                local_capacity,
+                page_size,
+                device=local_page_table_1.device,
+                dtype=torch.int32,
+            )
+            block_tables = local_page_table_1[:, strided_indices] // page_size
+        elif _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
@@ -906,27 +1080,55 @@ class Indexer(MultiPlatformOp):
         kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        is_expanded_mode = forward_batch.forward_mode.is_target_verify() or (
+            forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        if use_dcp_shard and not is_expanded_mode:
+            global_seq_lens = metadata.get_seqlens_int32()
+            seqlens_32 = torch.gather(
+                local_causal_count,
+                1,
+                (global_seq_lens.long() - 1).clamp(min=0).unsqueeze(1),
+            ).squeeze(1)
+            seqlens_32 = torch.where(
+                global_seq_lens > 0, seqlens_32, torch.zeros_like(seqlens_32)
+            ).to(torch.int32)
+        elif use_dcp_shard and is_expanded_mode:
+            # One row per (request, draft-position); no token_to_batch_idx
+            # needed (unlike the ragged extend path) since every draft
+            # position of request b reads request b's own local_causal_count
+            # row directly -- just a multi-column gather per request.
+            global_seq_lens_expanded = metadata.get_seqlens_expanded()
+            seq_lens_2d = (
+                global_seq_lens_expanded
+                if global_seq_lens_expanded.dim() == 2
+                else global_seq_lens_expanded.view(B, next_n)
+            )
+            col_idx = (seq_lens_2d.long() - 1).clamp(min=0)
+            local_len_2d = torch.gather(local_causal_count, 1, col_idx)
+            local_len_2d = torch.where(
+                seq_lens_2d > 0, local_len_2d, torch.zeros_like(local_len_2d)
+            )
+            seqlens_32 = local_len_2d.reshape(-1).to(torch.int32)
+        elif is_expanded_mode:
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        assert len(q_fp8.shape) == 3
-        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
-        # hidden states; q_offset is the real (unpadded) q length.
-        q_offset = sum(metadata.get_dsa_extend_len_cpu())
-
-        B = metadata.get_seqlens_int32().shape[0]
-        next_n = q_offset // B if B > 0 else 0
-        use_cute_dsl = (
-            self.paged_mqa_logits_backend.is_cutedsl()
-            and not forward_batch.forward_mode.is_draft_extend_v2()
+        # otherwise fall back to computing it here. The cached metadata was built
+        # against the global (unsharded) seq_lens, so the sharded path always
+        # recomputes it against the local ones.
+        schedule_metadata = (
+            None
+            if use_dcp_shard
+            else getattr(metadata, "paged_mqa_schedule_metadata", None)
         )
+
+        # use_cute_dsl / use_dg_native were decided above (before use_dcp_shard
+        # was finalized, so the fallback check could run before touching
+        # block_tables). dsl_expand_factor needs max_seq_len, so it's computed
+        # here; use_cute_dsl is False whenever use_dcp_shard is True (the gate
+        # above already ruled that combination out).
         dsl_expand_factor, dsl_atom = 1, 1
         if (
             use_cute_dsl
@@ -942,15 +1144,6 @@ class Indexer(MultiPlatformOp):
                 kernel_atoms=(1, 2, 3, 4),
                 num_heads=self.n_heads,
             )
-        ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
-        use_dg_native = (
-            not use_cute_dsl
-            and _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
-            and next_n >= 2
-            and ctx_2d is not None
-            and ctx_2d.shape == (B, next_n)
-        )
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
@@ -1031,9 +1224,23 @@ class Indexer(MultiPlatformOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if use_dcp_shard:
+            # Decode: one row per request, matching local_to_global's own
+            # [B, local_capacity] shape 1:1. Target-verify/draft-extend-v2:
+            # logits has one row per (request, draft-position) -- repeat each
+            # request's local_to_global row next_n times (row = b*next_n+j).
+            local_to_global_rows = (
+                local_to_global.repeat_interleave(next_n, dim=0)
+                if is_expanded_mode
+                else local_to_global
+            )
+            topk_result = self._dcp_sharded_topk_from_local_logits(
+                metadata, logits, seqlens_32, local_to_global_rows
+            )
+        else:
+            # NOTE(dark): logits should be cleaned in topk_transform
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1134,6 +1341,64 @@ class Indexer(MultiPlatformOp):
         )
         weights = weights.squeeze(-1)
 
+        # Sharded-indexer path (see _get_topk_paged for the decode analog):
+        # pack only this rank's local KV shard into the ragged buffer instead
+        # of the full (replicated) one, then reconstruct the exact global
+        # top-k via pack + all_gather + merge. Falls back to the existing
+        # full-replication path when OOM-avoidance chunking is needed (rare,
+        # and less likely here since the local buffer is dcp_size x smaller).
+        use_dcp_shard = self.dcp_shard_indexer and not _is_hip
+        local_to_global_packed = None
+        local_ks = local_ke = None
+
+        if use_dcp_shard:
+            # Prefer the once-per-forward-step view (see _get_topk_paged);
+            # falls back to inline computation when unavailable.
+            hoisted = metadata.get_dcp_local_view()
+            if hoisted is not None:
+                local_page_table_1, _, local_causal_count = hoisted
+                local_capacity = local_page_table_1.shape[1]
+                global_page_table_1 = metadata.get_page_table_1()
+            else:
+                global_page_table_1 = metadata.get_page_table_1()
+                local_capacity = dcp_local_capacity(
+                    global_page_table_1.shape[1], self.dcp_size, page_size
+                )
+                local_page_table_1, _, local_causal_count = dcp_localize_page_table(
+                    global_page_table_1,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    local_capacity,
+                    page_size,
+                )
+            global_indexer_seq_len = metadata.get_indexer_seq_len()
+            local_row_totals = torch.gather(
+                local_causal_count,
+                1,
+                (global_indexer_seq_len.long() - 1).clamp(min=0).unsqueeze(1),
+            ).squeeze(1)
+            local_row_totals = torch.where(
+                global_indexer_seq_len > 0,
+                local_row_totals,
+                torch.zeros_like(local_row_totals),
+            ).to(torch.int32)
+            local_row_offsets = (
+                torch.cumsum(local_row_totals, dim=0) - local_row_totals
+            ).to(torch.int32)
+            local_seq_len_sum = int(local_row_totals.sum().item())
+            local_max_seq_len = (
+                int(local_row_totals.max().item()) if local_row_totals.numel() else 0
+            )
+
+            strided_indices = torch.arange(
+                0,
+                local_capacity,
+                page_size,
+                device=local_page_table_1.device,
+                dtype=torch.int32,
+            )
+            local_block_tables = local_page_table_1[:, strided_indices] // page_size
+
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
@@ -1158,17 +1423,65 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         ks, ke = metadata.get_indexer_kvcache_range()
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
-        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
-            layer_id,
-            metadata.get_indexer_seq_len(),
-            block_tables,
-            seq_len_sum,
-            max_seq_len,
-        )
+        if use_dcp_shard:
+            # Chunking eligibility is checked against the (much smaller) local
+            # packed width; if the local buffer still needs chunking, punt to
+            # the existing full-replication path rather than extending the
+            # OOM-avoidance loop to the sharded case.
+            q_offset_probe = ks.shape[0]
+            need_chunk_local, _ = self._should_chunk_mqa_logits(
+                q_offset_probe, local_seq_len_sum, device_index
+            )
+            if need_chunk_local:
+                use_dcp_shard = False
+
+        if use_dcp_shard:
+            local_ks = local_row_offsets[token_to_batch_idx]
+            # seq_lens_expanded is already per-query-token (one causal bound
+            # per row of `logits`); token_to_batch_idx selects each token's
+            # own REQUEST row out of local_causal_count before gathering at
+            # that token's own causal column.
+            per_token_causal_count = local_causal_count[token_to_batch_idx]
+            col_idx = (seq_lens_expanded.long() - 1).clamp(min=0).unsqueeze(1)
+            local_len_at_token = torch.gather(
+                per_token_causal_count, 1, col_idx
+            ).squeeze(1)
+            local_len_at_token = torch.where(
+                seq_lens_expanded > 0,
+                local_len_at_token,
+                torch.zeros_like(local_len_at_token),
+            )
+            local_ke = local_ks + local_len_at_token
+            local_to_global_packed = dcp_pack_local_to_global(
+                global_page_table_1,
+                self.dcp_size,
+                self.dcp_rank,
+                global_indexer_seq_len,
+                local_row_offsets,
+                local_seq_len_sum,
+                page_size,
+            )
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id,
+                local_row_totals,
+                local_block_tables,
+                local_seq_len_sum,
+                local_max_seq_len,
+            )
+        else:
+            indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+            seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+            max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                block_tables,
+                seq_len_sum,
+                max_seq_len,
+            )
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
@@ -1177,14 +1490,28 @@ class Indexer(MultiPlatformOp):
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
 
-        # Check if we need to chunk to avoid OOM
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        # Check if we need to chunk to avoid OOM (sharded path already ruled
+        # this out above against the local width; this covers the
+        # non-sharded path).
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+
+        if use_dcp_shard and local_seq_len_sum == 0:
+            # This rank owns nothing locally-relevant for this whole chunk
+            # (e.g. a short chunk under a large dcp_size) -- skip the
+            # zero-width MQA-logits kernel call entirely rather than launching
+            # it over an empty K dimension. Safe host-sync branch: extend
+            # never runs under CUDA graph capture, and local_seq_len_sum is
+            # already forced to host above for the buffer-sizing calls.
+            topk_result[:q_offset] = -1
+            return topk_result
+
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
             q_offset, k_offset, device_index
         )
+
+        if use_dcp_shard:
+            ks, ke = local_ks.to(torch.int32), local_ke.to(torch.int32)
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -1221,8 +1548,26 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            if use_dcp_shard:
+                # local_to_global_packed is one flat buffer shared by every
+                # query-token row (each row's own `ks` picks its offset into
+                # it); broadcast (stride 0, not materialized) to match
+                # logits' row count for the pack kernel's [row, col] addressing.
+                local_to_global_2d = local_to_global_packed.unsqueeze(0).expand(
+                    logits.shape[0], -1
+                )
+                raw_topk_result = self._dcp_sharded_topk_from_local_logits(
+                    metadata,
+                    logits,
+                    local_len_at_token,
+                    local_to_global_2d,
+                    row_starts=ks,
+                )
+            else:
+                self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+                raw_topk_result = metadata.topk_transform(
+                    logits, self.index_topk, ks=ks
+                )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -1649,6 +1994,11 @@ class Indexer(MultiPlatformOp):
 
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
+        if self.dcp_shard_indexer:
+            # aiter/HIP below re-reads forward_batch.out_cache_loc directly and
+            # is unreached here: DCP requires the CUDA-only trtllm backends
+            # (asserted in DeepseekSparseAttnBackend.__init__).
+            out_cache_loc = self._dcp_compact_index_store_loc(out_cache_loc)
 
         pool = get_token_to_kv_pool()
         if hasattr(pool, "invalidate_index_buffer_for_layer"):

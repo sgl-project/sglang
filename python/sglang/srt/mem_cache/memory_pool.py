@@ -4261,11 +4261,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
             parallel = get_parallel()
-            if parallel.dcp_enabled:
+            if parallel.dcp_enabled and not envs.SGLANG_DSA_DCP_SHARD_INDEXER.get():
                 # The indexer K cache is not sharded under DCP: every rank
                 # keeps index_k for every token (global-slot addressed) so
                 # all ranks compute identical top-k.
                 index_buf_size = size * parallel.attn_dcp_size
+            # Else (SGLANG_DSA_DCP_SHARD_INDEXER): the index buffer holds only
+            # this rank's owned 1/dcp_size share, written at the compacted
+            # local address `owned_slot // attn_dcp_size` (see the store-path
+            # compaction in dsa_indexer.py) -- an injective map from the owned
+            # subset of the global range onto exactly `[0, size)`, so `size`
+            # here is already the right (unmultiplied) capacity.
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128

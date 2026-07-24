@@ -712,6 +712,11 @@ class Envs:
     # Allow the fused top-k v2 transform under DCP (off by default: the v2
     # plan is decode-shaped and slower on large extend chunks).
     SGLANG_DSA_DCP_ENABLE_FUSED_TOPK = EnvBool(False)
+    # Shard the DSA indexer's K-cache and top-k scoring across DCP ranks
+    # (each rank scores only its own local KV shard, then a pack + all_gather
+    # + merge step reconstructs the exact global top-k) instead of replicating
+    # the full indexer K-cache and full-sequence scoring on every rank.
+    SGLANG_DSA_DCP_SHARD_INDEXER = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
