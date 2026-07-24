@@ -4,7 +4,7 @@
 // end-to-end on the corresponding hardware, then filled with sglang_version + speed/accuracy.
 export const benchmarks = [
   // ---- H200 + FP8 ----  (8-GPU single node; serve recipe in glm-5.2.jsx; real weights,
-  // --random-range-ratio 1.0, flush-cache every run; high-throughput pending re-measurement)
+  // --random-range-ratio 1.0, flush-cache every run)
   {
     // EAGLE MTP 5-1-6, mfs 0.8. env SGLANG_SIMULATE_ACC_LEN=3.5
     // (match-expected: 50% accept 3 / 50% accept 4) fixes the acceptance length.
@@ -29,7 +29,15 @@ export const benchmarks = [
         ttft_ms: 80562, tpot_ms: 28.08, tokens_per_sec_per_gpu: 2391 },
     ],
   },
-  { match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  {
+    // HT: DP8 + deepep + mfs 0.85 + max-running 256, no spec (so no SIMULATE_ACC_LEN).
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "v0.5.14 @ 49e384ce",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
+        ttft_ms: 553480, tpot_ms: 61.71, tokens_per_sec_per_gpu: 1656 },
+    ],
+  },
   // ---- B200 + FP8 ----  (8-GPU single node, TP8; real weights, --random-range-ratio 1.0, flush-cache every run)
   {
     // EAGLE MTP 5-1-6, mfs 0.8, no cuda-graph-max-bs. env SGLANG_SIMULATE_ACC_LEN=3.5
