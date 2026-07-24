@@ -39,10 +39,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
+                logger.warning(
+                    "EXPERIMENTAL: Decode radix cache together with speculative "
+                    f"decoding (--speculative-algorithm {server_args.speculative_algorithm}). "
+                    "The radix tree uses bigram (EAGLE) keys; prealloc prefix "
+                    "matching, prebuilt caching and finish/retract release all "
+                    "route through the eagle-aware radix paths."
                 )
             from sglang.srt.arg_groups.overrides import resolved_view
 
