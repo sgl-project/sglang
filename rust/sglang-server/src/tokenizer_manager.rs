@@ -41,6 +41,15 @@ pub enum TmEvent {
     /// the scheduler wire needs it and it can't be recovered from the hashed
     /// `RidHash` (which `on_abort` re-derives via `RidHash::from_rid`).
     Abort(String),
+    /// An MM worker finished a request parked in `Encoding`: `input_ids` are
+    /// the final (placeholder-expanded) prompt ids from the native pipeline.
+    /// The mm buffers ride the Rust sidecar (rid-keyed, popped by
+    /// `RustServer.drain` via `Server.take_native_mm`), not this event.
+    MmEncoded { rid: String, input_ids: Vec<i32> },
+    /// An MM worker rejected a request parked in `Encoding` (bad media URL,
+    /// unsupported modality, preprocess error, …) — reject it back to the
+    /// client as a 400.
+    MmFailed { rid: String, message: String },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.

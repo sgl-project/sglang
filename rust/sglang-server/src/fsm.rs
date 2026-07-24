@@ -37,8 +37,8 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding (an MM worker runs the model's Python
-    /// `mm_processor` and returns the final expanded `input_ids`).
+    /// Has multimodal inputs → Encoding (an MM worker runs the native Rust
+    /// pipeline and returns the final expanded `input_ids`).
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,

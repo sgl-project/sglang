@@ -33,6 +33,14 @@ axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
 dynamo-tokenizers = "1.5.3"
 flume = "0.12.0"
+# Same major as the workspace pyo3: the zero-copy native MM drain
+# (`take_native_mm`) moves Rust vectors into numpy arrays.
+numpy = "0.29.0"
 regex-syntax = "0.8"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+# The pure-Rust core of the native MM pipeline. `default-features = false`
+# drops the pyo3 bindings so the crate links as a plain rlib; the dependency
+# is renamed so `use sglang_mm::…` reads naturally while the crate keeps its
+# unique `sglang_mm_core` artifact name in the shared workspace target/.
+sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }

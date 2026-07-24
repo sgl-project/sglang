@@ -23,13 +23,14 @@ use bytes::Bytes;
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RidHash;
+use crate::message::DetokMsg;
+use crate::message::normalize_sampling_params;
 use crate::message::{
     EgressItem, IngressMsg, MmRequest, Request, RequestKind, abort_req_msgpack, control_req_msgpack,
 };
+use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
-use crate::runtime::channels::{DetokMsg, Senders, TmEvent, recv};
-use crate::runtime::ring::IngressProducer;
-use crate::tokenizer_manager::sampling::normalize_sampling_params;
+use crate::tokenizer_manager::{Senders, TmEvent, recv};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -61,6 +62,7 @@ pub struct Ingress {
 }
 
 impl Ingress {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: flume::Receiver<TmEvent>,
         senders: Senders,
@@ -479,7 +481,7 @@ mod tests {
     use super::*;
     use crate::fsm::RequestState;
     use crate::message::{EgressSink, GenerateRequest};
-    use crate::runtime::ring::{IngressConsumer, ingress_ring};
+    use crate::ring::{IngressConsumer, ingress_ring};
     use tokio::sync::mpsc;
 
     /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —
