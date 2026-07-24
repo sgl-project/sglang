@@ -4128,10 +4128,17 @@ class ServerArgs:
         # Breakable is the general CUDA default, but it is not compatible with
         # multimodal prefill. Models on this allowlist have had their decoder
         # prefill validated under tc_piecewise; the vision encoder remains
-        # eager outside the captured LM forward.
+        # eager outside the captured LM forward. Speculative decoding is
+        # excluded from the auto-upgrade: tc_piecewise prefill has not been
+        # perf-validated on spec targets, and the historical spec-verify
+        # corruption that this combination used to trigger (#28386) is fixed in
+        # trtllm_mla_backend (stale prefill-fallback metadata; see #31198), so
+        # explicit --cuda-graph-backend-prefill pins now work — spec configs
+        # simply keep their default prefill backend unless pinned.
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+            and self.speculative_algorithm is None
         ):
             logger.info(
                 "Using tc_piecewise CUDA graph for validated multimodal "
