@@ -454,6 +454,14 @@ class TestRegexMaxLength(CustomTestCase):
         """Test that character class '[a-z]' gives max length 1."""
         self.assertEqual(get_max_seq_length("[a-z]"), 1)
 
+    def test_negated_literal(self):
+        """Test that negated literal '[^a]' still consumes exactly one character."""
+        self.assertEqual(get_max_seq_length("[^a]"), 1)
+
+    def test_repeated_negated_literal(self):
+        """Test that repeated negated literal '[^a]{3}' uses the repeat upper bound."""
+        self.assertEqual(get_max_seq_length("[^a]{3}"), 3)
+
     def test_dot_any(self):
         """Test that dot wildcard '.' gives max length 1."""
         self.assertEqual(get_max_seq_length("."), 1)
