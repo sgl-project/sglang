@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -247,8 +248,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             source=self.buffers,
         )
-
-        from sglang.srt.configs.model_config import is_deepseek_dsa
 
         self.dsa_sparse_prefill_forced = is_deepseek_dsa(
             self.model_runner.model_config.hf_config
