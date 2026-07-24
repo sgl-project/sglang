@@ -14,15 +14,13 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale_tuple,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    _is_block_scale_fp8,
     _is_cuda,
     _is_hip,
     _is_musa,
@@ -51,6 +49,9 @@ if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+    from sglang.srt.layers.quantization.fp8_utils import (
+        materialize_bpreshuffle_fp8_scale_tuple,
+    )
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
 
@@ -222,7 +223,7 @@ class DeepseekMHAForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -253,7 +254,7 @@ class DeepseekMHAForwardMixin:
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
 
-        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+        if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -345,7 +346,7 @@ class DeepseekMHAForwardMixin:
                 )
             )[0]
         else:
-            if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            if _use_aiter_gfx95 and _is_block_scale_fp8(self.kv_b_proj):
                 kv = self.kv_b_proj(kv_a_quanted)[0]
             else:
                 kv = self.kv_b_proj(kv_a)[0]

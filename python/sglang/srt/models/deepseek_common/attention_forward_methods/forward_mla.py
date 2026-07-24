@@ -55,6 +55,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    _is_block_scale_fp8,
     _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
@@ -286,10 +287,7 @@ class DeepseekMLAForwardMixin:
                     )
                 else:
                     q_lora = None
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    ):
+                    if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                         if self.use_dsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                                 q,
@@ -305,9 +303,7 @@ class DeepseekMLAForwardMixin:
                                 transpose_scale=False,
                             )
                             if _use_aiter_bpreshuffle_gfx95:
-                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(
-                                    q_quanted
-                                )
+                                q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                             q = q_quanted
                         else:
                             q, _, k_nope, _ = fused_rms_fp8_group_quant(
@@ -709,10 +705,7 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
-                    forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
-                ):
+                elif forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -792,9 +785,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_parallel().attn_dcp_size,
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs_mla(
-                attn_output, lse, get_parallel().dcp_group
-            )
+            attn_output = cp_lse_ag_out_rs_mla(attn_output, lse, get_parallel().dcp_group)
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -876,7 +867,7 @@ class DeepseekMLAForwardMixin:
                 # _bmm_buf is already (batch, heads, dim) contiguous
                 if self.o_proj.weight.dtype == torch.uint8:
                     attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
-                elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                elif _is_block_scale_fp8(self.o_proj):
                     attn_bmm_output = fused_flatten_fp8_group_quant(
                         _bmm_buf,
                         group_size=128,
@@ -884,15 +875,13 @@ class DeepseekMLAForwardMixin:
                         transpose_scale=False,
                     )
                     if _use_aiter_bpreshuffle_gfx95:
-                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                            attn_bmm_output
-                        )
+                        attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
                 else:
                     attn_bmm_output = _bmm_buf.flatten(1, 2)
             elif self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+            elif _is_block_scale_fp8(self.o_proj):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output,
@@ -901,9 +890,7 @@ class DeepseekMLAForwardMixin:
                     transpose_scale=False,
                 )
                 if _use_aiter_bpreshuffle_gfx95:
-                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(
-                        attn_bmm_output
-                    )
+                    attn_bmm_output = materialize_bpreshuffle_fp8_scale_tuple(attn_bmm_output)
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
