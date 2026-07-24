@@ -123,6 +123,10 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+# NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
+# It is an internal dispatch format set automatically by ModelRunner when the
+# weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
+# choice let users create contradictory combos (see _handle_load_format).
 
 # TODO: this list should likely contain only methods that support online quantization, or that support using custom quantization classes compatible with a given `quant_method` in config.json.
 # Some of the choices here do NOT support online quantization.
@@ -3298,6 +3302,36 @@ class ServerArgs:
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
         NS("exec.features"),
     ] = False
+
+    weight_cache_mode: A[
+        str,
+        Arg(
+            help="Weight cache mode. 'off': normal disk loading. "
+            "'daemon': launch weight cache daemon (holds weights in GPU memory). "
+            "Engine-spawned daemons are co-terminal with the engine and do NOT "
+            "persist across restarts, so this alone does not speed up restart "
+            "(the first start is slower). For fast recovery, run the standalone "
+            "daemon (python -m sglang.srt.weight_cache.daemon) and connect with "
+            "'client'. 'client': connect to existing daemon and load via IPC.",
+            choices=["off", "daemon", "client"],
+        ),
+        NS("model"),
+    ] = "off"
+    weight_cache_socket: A[
+        Optional[str],
+        Arg(
+            help="Unix socket path for weight cache daemon (client mode)."
+            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+        ),
+        NS("model"),
+    ] = None
+    weight_cache_timeout: A[
+        int,
+        Arg(
+            help="Timeout in seconds for weight cache daemon readiness (default: 1800).",
+        ),
+        NS("model"),
+    ] = 1800
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -6934,6 +6968,31 @@ class ServerArgs:
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
                 self.validate_transfer_engine()
+            )
+
+        # "ipc_cache" is an internal-only load format: ModelRunner sets it
+        # automatically when the weight cache is enabled, and it is not a public
+        # --load-format choice. Setting it directly is always wrong (no daemon is
+        # launched, and fallback_load_format inherits a nonsensical format), so
+        # reject it and point at the knob (defense-in-depth; the CLI already
+        # rejects it via LOAD_FORMAT_CHOICES).
+        if self.load_format == "ipc_cache":
+            raise ValueError(
+                "load_format='ipc_cache' is an internal-only format and must not "
+                "be set directly. Enable the weight cache via --weight-cache-mode "
+                "client (connect to an existing daemon) or daemon (launch one); "
+                "that selects IPC loading automatically."
+            )
+
+        # Speculative decoding loads an extra draft model whose weights the
+        # daemon does not export, so refuse the combination up front instead of
+        # failing deep inside draft-worker load (draft-model daemon TBD).
+        if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
+            raise ValueError(
+                "--weight-cache-mode is not supported together with speculative "
+                "decoding (--speculative-algorithm): the weight cache daemon does "
+                "not export the draft model's weights. Disable one of them "
+                "(--weight-cache-mode off) for this configuration."
             )
 
     def _is_mistral_native_format(self) -> bool:

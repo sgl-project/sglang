@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_enable_ipc_weight_cache,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -987,6 +988,18 @@ class ModelRunner:
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,
+            weight_cache_mode=self.server_args.weight_cache_mode,
+            weight_cache_socket=self.server_args.weight_cache_socket,
+        )
+
+        # If the weight cache is enabled, override the load format to IPC_CACHE
+        # and derive the per-rank daemon socket. Idempotent across reloads.
+        maybe_enable_ipc_weight_cache(
+            load_config=self.load_config,
+            server_args=self.server_args,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
