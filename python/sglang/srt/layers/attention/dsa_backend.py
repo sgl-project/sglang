@@ -111,6 +111,20 @@ def _all_gather_dsa_trtllm_fp8_kv(
 
 _is_hip = is_hip()
 
+
+def _detect_gfx950() -> bool:
+    # gfx950 (MI355X) detection via gcnArchName; get_device_sm() is unreliable on ROCm.
+    if not _is_hip:
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+# gfx950 supports the dense-MHA prefill fallback via aiter flash_attn_varlen_func.
+_is_gfx950 = _detect_gfx950()
+
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
@@ -2589,8 +2603,9 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        if self.device_sm_major >= 10:
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # ROCm (gfx950) always uses the aiter flash_attn_varlen_func path below.
+        if self.device_sm_major >= 10 and not _is_hip:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
@@ -3022,11 +3037,13 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or _is_gfx950
+                )  # SM90/SM100 (NVIDIA) or gfx950 (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
