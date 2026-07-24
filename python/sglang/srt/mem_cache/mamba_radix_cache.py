@@ -19,6 +19,7 @@ limitations under the License.
 The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
+import os
 from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -60,6 +61,12 @@ import logging
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
+
+# Debug-only invariant checks in the Mamba slot-donation path call tensor.item(),
+# which forces a per-request cudaStreamSynchronize on the scheduler thread. Under
+# load this can serialize/stall the scheduler. Gate them off by default; set
+# SGLANG_MAMBA_DEBUG_ASSERTS=1 to re-enable for debugging.
+_MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 
 class TreeNode:
@@ -592,13 +599,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 src_active = req.mamba_ping_pong_track_buffer[
                     mamba_ping_pong_track_buffer_to_keep
                 ].unsqueeze(-1)
-                assert src_active.item() != -1, (
-                    f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
-                    f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
-                    f"next_track_idx={req.mamba_next_track_idx}, "
-                    f"last_track_seqlen={req.mamba_last_track_seqlen}, "
-                    f"rid={req.rid}"
-                )
+                if _MAMBA_DEBUG_ASSERTS:
+                    # .item() forces a cudaStreamSynchronize; only pay it when debugging.
+                    assert src_active.item() != -1, (
+                        f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
+                        f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                        f"next_track_idx={req.mamba_next_track_idx}, "
+                        f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                        f"rid={req.rid}"
+                    )
                 if self.int8_ckpt_pool is not None:
                     mamba_value = self._commit_int8_checkpoint(src_active)
                     # quantized -> no ping-pong slot needs keeping
