@@ -266,7 +266,7 @@ def prepare_mlp_sync_batch_raw(
     # min()-reduces this across DP ranks, so a prefill batch with idle ranks
     # still resolves to True (idle ranks become a padded dummy extend).
     # Vote transport only: the eligibility conditions themselves live in
-    # PrefillCudaGraphRunner._replay_ineligible_locally (reached through
+    # PrefillCudaGraphRunner.replay_ineligible_locally (reached through
     # local_breakable_eligible); idle/None ranks stay permissive.
     can_run_breakable_cuda_graph = (
         local_batch is None

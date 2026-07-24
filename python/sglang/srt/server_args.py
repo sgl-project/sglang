@@ -3983,12 +3983,9 @@ class ServerArgs:
             )
 
     def _align_prefill_buckets_for_deepep_bcg(self):
-        """Capture of a prefill bucket whose num_tokens is not a multiple of
-        8 deterministically hangs the DeepEP a2a under BCG (reproduced on
-        GLM-5.2 tp8: bucket 16 captures, bucket 12 wedges in dispatch with
-        ample free memory; every larger repro died at the first non-multiple
-        in the list). Root cause not yet isolated — align user-supplied
-        bucket lists up to multiples of 8 rather than hang."""
+        """Non-multiple-of-8 prefill buckets deterministically hang DeepEP
+        a2a capture under BCG (root cause not isolated); align user bucket
+        lists up to multiples of 8 instead."""
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
 
         if (
@@ -4203,11 +4200,9 @@ class ServerArgs:
         from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
         rules = [
-            # MLA prefill takes a different attn-forward path under BCG
-            # (forward_mha.py has no eager breaks). DSA models are exempt:
-            # under BCG the DSA dispatcher forces use_mha=False, so prefill
-            # runs the sparse path, whose indexer already splits eagerly
-            # (bcg_dsa_indexer_prefill_split).
+            # MLA prefill under BCG takes forward_mha, which has no eager
+            # breaks. DSA is exempt: BCG forces the sparse path, whose
+            # indexer already splits eagerly.
             (
                 "MLA attention (non-DSA)",
                 lambda: self.use_mla_backend()
@@ -4239,12 +4234,10 @@ class ServerArgs:
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
             ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
-            # DeepEP is exempt: its MoE runs as an eager split node with
-            # NORMAL-mode a2a between captured segments (see
-            # bcg_deepep_moe_experts); the prefill bucket list is clamped in
-            # _align_prefill_buckets_for_deepep_bcg so in-capture rendezvous
-            # and bridge-buffer memory stay bounded. Other a2a backends
-            # (mooncake/nixl/moriep/flashinfer) are unvalidated under BCG.
+            # DeepEP is exempt: its MoE is an eager split node with NORMAL
+            # a2a between segments (DeepEPMoE.a2a_forward_with_output);
+            # buckets are 8-aligned below. Other a2a backends are
+            # unvalidated under BCG.
             (
                 "MoE A2A backend (non-DeepEP)",
                 lambda: _resolved_view(self).moe_a2a_backend not in ("none", "deepep"),

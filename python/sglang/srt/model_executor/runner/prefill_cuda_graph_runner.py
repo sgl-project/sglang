@@ -163,11 +163,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     buffer population, attention metadata init, and output slicing.
     """
 
-    # DSA forces use_mha=False inside BCG capture/replay (see
-    # DeepseekSparseAttnBackend.set_dsa_prefill_impl), so the captured graph
-    # runs the sparse path for any prefix and the MHA-prefix replay ban does
-    # not apply. Class-level default keeps partially-constructed instances
-    # (unit tests via __new__) on the conservative ban.
+    # DSA forces use_mha=False in BCG capture/replay, so the sparse path
+    # serves any prefix and the MHA-prefix ban does not apply. Class
+    # default keeps __new__-built test instances on the ban.
     dsa_sparse_prefill_forced: bool = False
 
     def __init__(self, model_runner: ModelRunner):
@@ -683,21 +681,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_hidden_mode,
         return_logprob: bool,
     ) -> bool:
-        """Single source of truth for the rank-local prefill replay
-        eligibility conditions. Two adapters call it: ``can_run_graph``
-        (ForwardBatch fields, at forward time) and
-        ``schedule_batch_replay_eligible`` (ScheduleBatch fields, before
-        the dp mlp-sync, so the verdict joins the min()-reduced
-        can_run_dp_breakable_cuda_graph consensus). Under DP attention
-        every rank must reach the same replay-vs-eager decision: a lone
-        eager rank re-derives its own attention path (e.g. MHA on DSA
-        models) and its collectives mismatch the replaying ranks'
-        captured ones, deadlocking the batch.
-
-        Pass ``capture_hidden_mode=None`` when the value is not known at
-        the call site; it is rank-uniform (derived from the spec-decoding
-        configuration), so checking it at forward time only cannot split
-        the dp group.
+        """Rank-local replay eligibility: the single source of truth for
+        ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
+        vote (ScheduleBatch, schedule time) — all dp ranks must reach the
+        same replay-vs-eager decision or their collectives mismatch. Pass
+        ``capture_hidden_mode=None`` when unknown at the call site (it is
+        rank-uniform; forward-time-only checking cannot split the group).
         """
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return True

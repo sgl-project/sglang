@@ -238,14 +238,10 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             if capture._barrier_fn is not None:
                 capture._barrier_fn()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them. A break may declare a capture stub
-            # (the capture_stub argument): the capture pass only needs the output
-            # buffer's address recorded — its contents are never consumed
-            # (real values flow at warmup and at every replay via replay_fn,
-            # which always calls the real inner). Stubbing lets breaks whose
-            # bodies are expensive or rank-coupled (e.g. DeepEP NORMAL a2a)
-            # skip that work during capture entirely.
+            # Run the break once so its outputs are allocated and their
+            # addresses recorded. A capture_stub replaces the body during
+            # capture (contents are never consumed; warmup and replay run
+            # the real inner), letting rank-coupled bodies skip the work.
             if capture_stub is not None:
                 output = capture_stub(*args, **kwargs)
             else:
