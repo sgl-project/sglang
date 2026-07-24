@@ -57,162 +57,7 @@ def _get_splitk_bufs(
 
 
 # ---------------------------------------------------------------------------
-# Variant 1: Base single-pass kernel (adapted from aiter sparse MLA)
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _sparse_mla_decode_base_kernel(
-    q_ptr,  # [N, H, Q_DIM] fp8
-    kv_ptr,  # [num_pages, 1, KV_DIM] fp8
-    idx_ptr,  # [N, topk] int32
-    out_ptr,  # [N, H, D_V] bf16
-    sm_scale,
-    topk: tl.constexpr,
-    H: tl.constexpr,
-    Q_DIM: tl.constexpr,
-    KV_DIM: tl.constexpr,
-    D_V: tl.constexpr,
-    D_TAIL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    TILE_SIZE: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    head_block = tl.program_id(1)
-
-    offs_m = tl.arange(0, BLOCK_M) + head_block * BLOCK_M
-    h_mask = offs_m < H
-
-    offs_nope = tl.arange(0, D_V)
-    offs_rope = tl.arange(0, D_TAIL)
-
-    # Load Q nope part [BLOCK_M, D_V]
-    q_nope = tl.load(
-        q_ptr + token_idx * H * Q_DIM + offs_m[:, None] * Q_DIM + offs_nope[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(tl.bfloat16)
-
-    # Load Q rope part [BLOCK_M, D_TAIL]
-    q_rope = tl.load(
-        q_ptr
-        + token_idx * H * Q_DIM
-        + offs_m[:, None] * Q_DIM
-        + (D_V + offs_rope)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    ).to(tl.bfloat16)
-
-    M_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-    L_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, D_V], dtype=tl.float32)
-
-    offs_t = tl.arange(0, TILE_SIZE)
-    num_tiles = (topk + TILE_SIZE - 1) // TILE_SIZE
-
-    for t in range(num_tiles):
-        tile_start = t * TILE_SIZE
-        valid = (tile_start + offs_t) < topk
-
-        idx = tl.load(
-            idx_ptr + token_idx * topk + tile_start + offs_t,
-            mask=valid,
-            other=0,
-        )
-        valid = valid & (idx >= 0)
-        page = tl.where(valid, idx, 0).to(tl.int64)
-
-        # Load KV — addressed with KV_DIM stride (may differ from Q_DIM)
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv_nope = tl.load(
-            kv_base + offs_nope[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(tl.bfloat16)
-
-        # Load KV rope [TILE_SIZE, D_TAIL]
-        kv_rope = tl.load(
-            kv_base + (D_V + offs_rope)[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        ).to(tl.bfloat16)
-
-        # QK = q_nope @ kv_nope.T + q_rope @ kv_rope.T  [BLOCK_M, TILE_SIZE]
-        S = tl.dot(q_nope, tl.trans(kv_nope)).to(tl.float32)
-        S += tl.dot(q_rope, tl.trans(kv_rope)).to(tl.float32)
-        S = S * sm_scale
-        S = tl.where(valid[None, :], S, float("-inf"))
-
-        # Online softmax
-        m_new = tl.maximum(M_i, tl.max(S, axis=1))
-        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp(M_i - m_safe)
-        p = tl.exp(S - m_safe[:, None])
-        L_i = L_i * alpha + tl.sum(p, axis=1)
-
-        # PV = P @ V_nope  [BLOCK_M, D_V]
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv_nope).to(tl.float32)
-        M_i = m_new
-
-    # Normalize
-    l_safe = tl.where(L_i == 0.0, 1.0, L_i)
-    acc = acc / l_safe[:, None]
-
-    tl.store(
-        out_ptr + token_idx * H * D_V + offs_m[:, None] * D_V + offs_nope[None, :],
-        acc.to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-
-
-def triton_sparse_mla_decode_base(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int = 512,
-) -> torch.Tensor:
-    """Base single-pass Triton sparse MLA decode.
-
-    q:       [bs, H, DIM] fp8
-    kv:      [num_pages, 1, DIM] fp8
-    indices: [bs, 1, topk] int32
-    returns: [1, bs, H, d_v] bf16
-    """
-    bs, H, q_dim = q.shape
-    kv_dim = kv.shape[-1]
-    d_tail = q_dim - d_v
-    topk = indices.shape[-1]
-    idx_flat = indices.squeeze(1).contiguous()  # [bs, topk]
-
-    out = torch.empty(bs, H, d_v, device=q.device, dtype=torch.bfloat16)
-
-    BLOCK_M = 16
-    n_head_blocks = (H + BLOCK_M - 1) // BLOCK_M
-    TILE_SIZE = 64
-
-    _sparse_mla_decode_base_kernel[(bs, n_head_blocks)](
-        q,
-        kv,
-        idx_flat,
-        out,
-        sm_scale,
-        topk=topk,
-        H=H,
-        Q_DIM=q_dim,
-        KV_DIM=kv_dim,
-        D_V=d_v,
-        D_TAIL=d_tail,
-        BLOCK_M=BLOCK_M,
-        TILE_SIZE=TILE_SIZE,
-        num_warps=4,
-        num_stages=1,
-    )
-    return out.unsqueeze(0)
-
-
-# ---------------------------------------------------------------------------
-# Variant 2: Split-K kernel (adapted from DSv4 paged_decode.py)
+# Split-K kernel (adapted from DSv4 paged_decode.py)
 # ---------------------------------------------------------------------------
 
 LOG2E = 1.4426950408889634
@@ -638,6 +483,7 @@ def _sparse_mla_decode_reduce_kernel(
     H: tl.constexpr,
     D_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
+    ACTIVE_SPLITS: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -646,7 +492,7 @@ def _sparse_mla_decode_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, KV_SPLITS)
+    k_offs = tl.arange(0, ACTIVE_SPLITS)
     d_mask = d_offs < D_V
 
     H_padded = tl.cdiv(H, 16) * 16
@@ -748,6 +594,12 @@ def triton_sparse_mla_decode_splitk(
         )
         return out.unsqueeze(0)
 
+    tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
+    active_splits = (topk + tiles_per_split * BLOCK_K - 1) // (
+        tiles_per_split * BLOCK_K
+    )
+    active_splits = min(active_splits, kv_splits)
+
     lse_partial, acc_partial = _get_splitk_bufs(
         bs, kv_splits, h_padded, d_v, q_nope.device
     )
@@ -785,6 +637,7 @@ def triton_sparse_mla_decode_splitk(
         H=H,
         D_V=d_v,
         KV_SPLITS=kv_splits,
+        ACTIVE_SPLITS=active_splits,
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
         num_warps=4,
@@ -805,5 +658,4 @@ def triton_sparse_mla_decode(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    """Auto-select between base and split-K based on batch size."""
     return triton_sparse_mla_decode_splitk(q_nope, q_rope, kv, indices, sm_scale, d_v)
