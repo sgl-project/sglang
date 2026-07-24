@@ -998,6 +998,7 @@ class Envs:
     # model-specific CPU-to-GPU weight copy pool for load-time experiments.
     SGLANG_DSV4_WEIGHT_LOAD_THREADS = EnvInt(0)
     SGLANG_MOE_WEIGHT_LOAD_AGGREGATE_PROFILE = EnvBool(False)
+    SGLANG_MOE_COMPACT_EDGE_SHARDS = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

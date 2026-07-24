@@ -111,6 +111,10 @@ _weight_load_profile = {
     "durations": [],
     "categories": {},
     "top_slow": [],
+    "clone_tasks": 0,
+    "clone_bytes": 0,
+    "clone_durations": [],
+    "clone_categories": {},
 }
 
 
@@ -204,6 +208,44 @@ def _profiled_moe_weight_copy(
             heapq.heapreplace(top_slow, item)
 
 
+def _maybe_compact_edge_shard(
+    src: torch.Tensor,
+    *,
+    kind: str,
+    shard_id: str,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    if not envs.SGLANG_MOE_COMPACT_EDGE_SHARDS.get() or tp_rank not in (
+        0,
+        tp_size - 1,
+    ):
+        return src
+
+    src_bytes = src.numel() * src.element_size()
+    category_key = (
+        f"{kind}|{shard_id}|{src.dtype}|{tuple(src.shape)}|"
+        f"offset={int(src.storage_offset() != 0)}|"
+        f"view={int(src.untyped_storage().nbytes() > src_bytes)}"
+    )
+    start = time.perf_counter()
+    compact = src.clone(memory_format=torch.contiguous_format)
+    elapsed = time.perf_counter() - start
+    with _weight_load_profile_lock:
+        profile = _weight_load_profile
+        profile["clone_tasks"] += 1
+        profile["clone_bytes"] += src_bytes
+        profile["clone_durations"].append(elapsed)
+        bucket = profile["clone_categories"].setdefault(
+            category_key, _new_weight_load_bucket()
+        )
+        bucket["tasks"] += 1
+        bucket["src_bytes"] += src_bytes
+        bucket["dst_bytes"] += src_bytes
+        bucket["durations"].append(elapsed)
+    return compact
+
+
 def _weight_load_quantile(sorted_values: list[float], quantile: float) -> float:
     if not sorted_values:
         return 0.0
@@ -234,6 +276,23 @@ def emit_moe_weight_load_profile(tp_rank: int) -> None:
                 }
             )
         categories.sort(key=lambda item: item["sum_elapsed_s"], reverse=True)
+        clone_durations = sorted(profile["clone_durations"])
+        clone_categories = []
+        for key, bucket in profile["clone_categories"].items():
+            bucket_durations = sorted(bucket["durations"])
+            clone_categories.append(
+                {
+                    "key": key,
+                    "tasks": bucket["tasks"],
+                    "bytes": bucket["src_bytes"],
+                    "sum_elapsed_s": sum(bucket_durations),
+                    "p50_s": _weight_load_quantile(bucket_durations, 0.50),
+                    "p95_s": _weight_load_quantile(bucket_durations, 0.95),
+                    "p99_s": _weight_load_quantile(bucket_durations, 0.99),
+                    "max_s": max(bucket_durations, default=0.0),
+                }
+            )
+        clone_categories.sort(key=lambda item: item["sum_elapsed_s"], reverse=True)
         payload = {
             "tp_rank": tp_rank,
             "tasks": profile["tasks"],
@@ -256,6 +315,16 @@ def emit_moe_weight_load_profile(tp_rank: int) -> None:
             "over_100ms": sum(value >= 0.100 for value in durations),
             "over_1s": sum(value >= 1.0 for value in durations),
             "categories": categories,
+            "clone_tasks": profile["clone_tasks"],
+            "clone_bytes": profile["clone_bytes"],
+            "clone_sum_elapsed_s": sum(clone_durations),
+            "clone_p50_s": (
+                statistics.median(clone_durations) if clone_durations else 0.0
+            ),
+            "clone_p95_s": _weight_load_quantile(clone_durations, 0.95),
+            "clone_p99_s": _weight_load_quantile(clone_durations, 0.99),
+            "clone_max_s": max(clone_durations, default=0.0),
+            "clone_categories": clone_categories,
             "top_slow": [
                 event
                 for _, _, event in sorted(
@@ -716,6 +785,13 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            loaded_weight = _maybe_compact_edge_shard(
+                loaded_weight,
+                kind="scale",
+                shard_id=shard_id,
+                tp_rank=tp_rank,
+                tp_size=self.moe_tp_size,
+            )
             _profiled_moe_weight_copy(
                 expert_data,
                 loaded_weight,
@@ -795,6 +871,13 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        loaded_weight = _maybe_compact_edge_shard(
+            loaded_weight,
+            kind="w13",
+            shard_id=shard_id,
+            tp_rank=tp_rank,
+            tp_size=self.moe_tp_size,
+        )
         _profiled_moe_weight_copy(
             expert_data,
             loaded_weight,
@@ -872,6 +955,13 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+        loaded_weight = _maybe_compact_edge_shard(
+            loaded_weight,
+            kind="w2",
+            shard_id=shard_id,
+            tp_rank=tp_rank,
+            tp_size=self.moe_tp_size,
+        )
         _profiled_moe_weight_copy(
             expert_data,
             loaded_weight,
