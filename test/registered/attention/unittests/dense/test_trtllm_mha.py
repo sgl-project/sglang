@@ -144,8 +144,7 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    # Frozen-KV MTP draft CG runner (chain, topk=1) — records the fused
-    # in-graph metadata rebuild inside FrozenKVMTPCudaGraphRunner's capture.
+    # Frozen-KV MTP draft CG runner (chain, topk=1).
     FROZEN_KV_MTP_RUNNER_CASES = (
         DenseAttentionCase(
             name="runner_frozen_kv_mtp_decode_trtllm_mha_cuda_graph",
