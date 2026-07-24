@@ -12,6 +12,7 @@ from sglang.kernels.spec import KernelBackend, KernelSpec
 _TRITON_KERNELS = [
     ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
+    ("draft_extend", "fused_draft_extend_prolog"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),

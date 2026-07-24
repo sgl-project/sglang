@@ -7,6 +7,7 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
+from sglang.kernels.ops.speculative.draft_extend import fused_draft_extend_prolog
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult, _async_d2h
@@ -22,6 +23,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
     eagle_sample,
 )
+from sglang.srt.speculative.spec_info import PrecomputedExtendLayout
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     generate_token_bitmask,
@@ -29,7 +31,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -38,6 +40,7 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_cpu:
@@ -126,6 +129,7 @@ def prepare_for_draft_extend(
     gpu_only = batch.seq_lens_cpu is None
 
     batch.spec_info = draft_extend_input
+    draft_extend_input.precomputed_extend_layout = None
     # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
     # may run this under a plan stream; casting inside the plan stream creates a
     # cross-stream dependency that can lead to data races and break MTP acceptance.
@@ -151,9 +155,24 @@ def prepare_for_draft_extend(
         batch.model_config.vocab_size,
         "v2 prepare_for_draft_extend input_ids",
     )
-    # init_new requires both list or both Tensor;
-    # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    # init_new requires both list or both Tensor. Fuse the uniform-width GPU
+    # metadata construction so draft-extend pays one launch instead of six.
+    prolog_output = None
+    if gpu_only and _is_cuda and batch.seq_lens.is_cuda:
+        prolog_output = fused_draft_extend_prolog(
+            batch.seq_lens,
+            num_draft_tokens,
+            front_offset=front_offset,
+            positions=draft_extend_input.positions,
+        )
+        batch.prefix_lens = prolog_output.prefix_lens
+        batch.extend_lens = prolog_output.extend_seq_lens
+        draft_extend_input.positions = prolog_output.positions
+        draft_extend_input.precomputed_extend_layout = PrecomputedExtendLayout(
+            positions=prolog_output.positions,
+            extend_start_loc=prolog_output.extend_start_loc,
+        )
+    elif gpu_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -182,7 +201,11 @@ def prepare_for_draft_extend(
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+    forward_batch.seq_lens = (
+        prolog_output.post_extend_seq_lens
+        if prolog_output is not None
+        else forward_batch.seq_lens + num_draft_tokens
+    )
     if not gpu_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
