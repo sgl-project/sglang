@@ -15,6 +15,9 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -81,7 +85,6 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
-
 if is_cuda():
     import deep_gemm
 
@@ -456,6 +459,42 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # DCP: latent KV interleaved across ranks (slot % dcp); indexer K
+        # cache replicated so all ranks compute identical top-k.
+        parallel = get_parallel()
+        self.dcp_enabled = parallel.dcp_enabled
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        if self.dcp_enabled:
+            assert (
+                self.dsa_decode_impl == "trtllm" and self.dsa_prefill_impl == "trtllm"
+            ), (
+                "DCP requires the trtllm DSA backends (the sm100 defaults); "
+                f"got decode={self.dsa_decode_impl}, "
+                f"prefill={self.dsa_prefill_impl}."
+            )
+            assert not model_runner.server_args.enable_prefill_cp, (
+                "DCP does not compose with prefill CP yet: the DCP extend "
+                "recipe assumes every rank in a DCP group holds the same "
+                "extend rows, and prefill CP splits rows across ranks."
+            )
+            assert self.hisparse_coordinator is None, "DCP does not support hisparse."
+            if self.use_fused_topk:
+                # Fused top-k v2 under DCP is measured incorrect on the
+                # current tree (gsm8k 0.000 vs 0.920 with fusion off, single
+                # commit delta); disable until the v2 transform composes with
+                # the owner filter again. Costs decode perf, tracked in the
+                # PR's F-list.
+                print_warning_once("Disabling fused DSA top-k under DCP.")
+                self.use_fused_topk = False
+            if model_runner.server_args.enable_dp_attention:
+                # Keep each DCP group inside one attention-DP shard so the
+                # replicated indexer sees identical requests group-wide.
+                assert parallel.attn_tp_size % self.dcp_size == 0, (
+                    f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
+                    f"({parallel.attn_tp_size}) under dp-attention."
+                )
+
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
         # construction: an unsupported config must fail at launch rather than
@@ -495,7 +534,8 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+                    * self._dcp_workspace_multiplier(model_runner),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -503,13 +543,25 @@ class DeepseekSparseAttnBackend(
             self._multi_ctas_kv_counter_buffer = (
                 make_persistent_multi_ctas_kv_counter_buffer(
                     torch.device(self.device),
-                    self.num_q_heads,
+                    self.num_q_heads * self.dcp_size,
                     max_batch_size=model_runner.max_running_requests,
                 )
             )
         else:
             self.workspace_buffer = None
             self._multi_ctas_kv_counter_buffer = None
+
+    def _dcp_workspace_multiplier(self, model_runner) -> int:
+        # The trtllm LSE request under DCP adds softmax-stats workspace that
+        # scales with the dcp-widened head count.
+        if not get_parallel().dcp_enabled:
+            return 1
+        widened_heads = (
+            model_runner.model_config.num_attention_heads
+            // get_parallel().attn_tp_size
+            * get_parallel().attn_dcp_size
+        )
+        return 1 + (widened_heads + 15) // 16
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -720,10 +772,22 @@ class DeepseekSparseAttnBackend(
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
         ):
+            if self.dcp_enabled:
+                return self._dcp_global_slots_to_local_rows(topk_indices)
             return topk_indices
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def _dcp_global_slots_to_local_rows(
+        self, page_table_1: torch.Tensor
+    ) -> torch.Tensor:
+        """Global KV slots -> this rank's local rows (unowned become -1).
+
+        Returns a new tensor: the input is shared across layers (IndexShare).
+        """
+        owned = (page_table_1 >= 0) & (page_table_1 % self.dcp_size == self.dcp_rank)
+        return torch.where(owned, page_table_1 // self.dcp_size, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -1953,7 +2017,10 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if self.use_fused_topk and not self.dcp_enabled:
+            # Under DCP, extend stays on the unfused transform (see
+            # get_indexer_metadata): the fused v2 transform is decode-shaped
+            # and ~2x slower on large extend chunks.
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -1986,6 +2053,8 @@ class DeepseekSparseAttnBackend(
                         or forward_batch.forward_mode.is_draft_extend_v2()
                     ),
                     cu_seqlens_q=metadata.cu_seqlens_q,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
                 )
 
         # todo hisparse: to cover more backends
@@ -2221,6 +2290,8 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -2908,6 +2979,8 @@ class DeepseekSparseAttnBackend(
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             if topk_indices is not None:
@@ -2916,7 +2989,19 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
+
+        if self.dcp_enabled:
+            # The trtllm-gen sparse kernel consumes valid-first index rows
+            # bounded by per-row counts, while the DCP owner filter leaves -1
+            # holes mid-row. Attention is permutation-invariant over the
+            # selected set, so compact by descending sort and pass the local
+            # valid counts as seq_lens.
+            page_table_1, _ = page_table_1.sort(dim=-1, descending=True)
+            dcp_local_counts = (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            seq_lens = dcp_local_counts
 
         q_scale = 1.0
         k_scale = (
@@ -2933,7 +3018,7 @@ class DeepseekSparseAttnBackend(
             grow_multi_ctas_kv_counter_buffer_if_needed(
                 self._multi_ctas_kv_counter_buffer,
                 torch.device(self.device),
-                self.num_q_heads,
+                num_heads,
                 batch_size,
             )
         )
@@ -2952,6 +3037,16 @@ class DeepseekSparseAttnBackend(
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
+        lse_buf = None
+        if self.dcp_enabled:
+            # Pre-register the LSE buffer in the symmetric-memory pool so the
+            # kernel writes it directly there — cp_lse_ag_out_rs_mla's
+            # all-gather then needs no separate cast/copy of its own.
+            with use_symmetric_memory(get_parallel().dcp_group):
+                lse_buf = torch.empty(
+                    (batch_size, num_heads), dtype=torch.float32, device=q.device
+                )
+
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
@@ -2966,9 +3061,34 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            # Under DCP each rank attends its filtered top-k shard; the
+            # base-2 LSE (ComputeLSEFromMD) feeds the cross-rank combine.
+            return_lse=self.dcp_enabled,
+            lse=lse_buf,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
+        if self.dcp_enabled:
+            out, lse = out
+            out = out.view(batch_size, num_heads, -1)
+            # lse is lse_buf (flashinfer returns the caller-supplied buffer
+            # unchanged) — already fp32 and pool-registered, so this view is
+            # just a shape check, not a cast.
+            lse = lse.view(batch_size, num_heads)
+            # Rows where this rank owns none of the selected tokens must
+            # contribute exp2(-inf)=0 to the cross-rank combine (the kernel's
+            # raw output for count-0 rows is NaN, not 0). One token per row
+            # here, so cum_seq_lens is just 0..batch_size.
+            fixup_zero_kv_rows(
+                out,
+                lse,
+                dcp_local_counts,
+                self.get_device_int32_arange(batch_size + 1),
+                max_seq_len=1,
+            )
+            # q rows are tokens for both decode (bs) and the decode-ized
+            # extend; the combine wants out [T, H, D] and lse [T, H] fp32.
+            return (out, lse)
         return out
 
     def _pad_topk_indices(
@@ -3033,6 +3153,7 @@ class DeepseekSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
+                and (not self.dcp_enabled)  # DCP extend uses the sparse MLA path
                 and (self.hisparse_coordinator is None)
             )
         else:
@@ -3082,9 +3203,17 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+        force_unfused = (
+            not self.use_fused_topk
+            or (
+                self.hisparse_coordinator is not None
+                and forward_batch.forward_mode.is_decode_or_idle()
+            )
+            # Under DCP, fuse decode only: the v2 fused transform is
+            # decode/MTP-shaped and measured ~2x slower on 32k-row extend
+            # chunks; extend uses the unfused transform (positions), which
+            # carries the DCP owner filter itself.
+            or (self.dcp_enabled and not forward_batch.forward_mode.is_decode_or_idle())
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

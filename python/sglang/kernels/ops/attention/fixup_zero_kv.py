@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -12,7 +17,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_fixup_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+    args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "fixup_zero_kv",
         *args,

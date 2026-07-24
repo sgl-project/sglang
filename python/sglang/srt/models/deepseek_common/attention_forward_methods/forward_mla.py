@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    alloc_dcp_q_combine_buf,
     cp_lse_ag_out_rs_mla,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -255,6 +256,13 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        # Set when the plain-bf16 bmm below writes q_nope_out directly into
+        # the DCP Q-gather's combine buffer (see use_fused_dcp_q_buf); passed
+        # to all_gather_q_for_mla_decode so it can skip its torch.cat.
+        combined_q_buf: Optional[torch.Tensor] = None
+        # Set when the DSA indexer was forked onto the side stream under DCP;
+        # the main stream syncs with it after the q all-gather is issued.
+        dsa_dcp_indexer_sync_pending = False
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -353,24 +361,35 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
-                if self.should_run_indexer(prev_topk_indices):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
-                else:
+
+                def _indexer_topk():
+                    if self.should_run_indexer(prev_topk_indices):
+                        return self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
                     # skip_topk reuses prev layer's indices; mirror into this
                     # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
-                current_stream.wait_stream(self.alt_stream)
+                    return maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
+
+                if get_parallel().dcp_enabled and self.use_dsa:
+                    # The indexer goes on the side stream so it also overlaps
+                    # the q all-gather; its sync is deferred to the dcp gather
+                    # block below.
+                    k_nope = k_nope.unsqueeze(1)
+                    q = self.q_b_proj_forward(q)
+                    with torch.cuda.stream(self.alt_stream):
+                        topk_indices = _indexer_topk()
+                    dsa_dcp_indexer_sync_pending = True
+                else:
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = k_nope.unsqueeze(1)
+                        q = self.q_b_proj_forward(q)
+                    topk_indices = _indexer_topk()
+                    current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj_forward(q)
@@ -411,6 +430,34 @@ class DeepseekMLAForwardMixin:
             # this transposed alias directly.
             q_nope_out = fusion_plan.q_nope_out_view
         else:
+            # bmm naturally produces q_nope_out as [H, B, D]; on the DCP
+            # decode/DSA-extend path (no LoRA correction in between) that's
+            # exactly the layout all_gather_q_for_mla_decode wants, so skip
+            # transposing to [B, H, D] here only to transpose back there —
+            # and, for the plain bf16 bmm, write straight into the DCP
+            # gather's combine buffer via out= so the gather doesn't need a
+            # separate torch.cat at all (see combined_q_buf below).
+            defer_q_nope_transpose = (
+                get_parallel().dcp_enabled
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not is_kv_b_lora_active(self)
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
+                )
+            )
+            use_fused_dcp_q_buf = (
+                defer_q_nope_transpose
+                and not self.use_deep_gemm_bmm
+                and not _is_hip
+                and self.w_kc.dtype != torch.float8_e4m3fn
+            )
+
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
                 from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
@@ -507,18 +554,28 @@ class DeepseekMLAForwardMixin:
                         self.w_scale,
                         torch.bfloat16,
                     )
+            elif use_fused_dcp_q_buf:
+                combined_q_buf = alloc_dcp_q_combine_buf(
+                    q_nope,
+                    self.num_local_heads,
+                    self.qk_rope_head_dim,
+                    self.kv_lora_rank,
+                )
+                q_nope_out = combined_q_buf[..., self.qk_rope_head_dim :]
+                torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out)
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-            q_nope_out = q_nope_out.transpose(0, 1)
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                    kv_b_lora_q_apply,
-                )
+            if not defer_q_nope_transpose:
+                q_nope_out = q_nope_out.transpose(0, 1)
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                    from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                        kv_b_lora_q_apply,
+                    )
 
-                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-            elif is_kv_b_lora_active(self):
-                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                    q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+                elif is_kv_b_lora_active(self):
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
@@ -561,24 +618,47 @@ class DeepseekMLAForwardMixin:
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
                     q_nope_out=q_nope_out,
                     q_pe=q_pe,
+                    combined_buf=combined_q_buf,
                 )
-            elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if dsa_dcp_indexer_sync_pending:
+                    # The DSA indexer ran on the side stream, overlapped with
+                    # the q pipeline and the all-gather above; join before the
+                    # attention core consumes topk_indices.
+                    torch.cuda.current_stream().wait_stream(self.alt_stream)
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                if self.use_dsa:
+                    # DSA extend mirrors the decode recipe: gather q across
+                    # the DCP group, attend the local KV shard with all
+                    # gathered heads, LSE-combine in forward_absorb_core.
+                    # Draft-extend and target-verify rows take the same path.
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                        combined_buf=combined_q_buf,
+                    )
+                elif forward_batch.forward_mode.is_extend():
+                    # Dense MLA gathers KV instead; its draft-extend path is
+                    # not implemented.
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
                 )
+
+        if dsa_dcp_indexer_sync_pending and not forward_batch.forward_mode.is_decode():
+            # Idle/fallback modes skip the decode gather block above; still
+            # join the side-stream indexer before returning.
+            torch.cuda.current_stream().wait_stream(self.alt_stream)
 
         return (
             q_pe,
@@ -607,6 +687,9 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        # Set only by the DCP attention branches; the combine below asserts on
+        # it so a fusion path silently skipping the LSE fails loudly.
+        lse = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -709,11 +792,18 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
-                elif (
+                elif get_parallel().dcp_enabled and (
                     forward_batch.forward_mode.is_decode()
-                    and get_parallel().dcp_enabled
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
                 ):
-                    # set return_lse=True to correct attn_output
+                    # set return_lse=True to correct attn_output. DSA extend
+                    # takes this path too: q was head-widened in prepare and
+                    # each rank runs the sparse kernels over its KV shard.
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
                         k_nope,
@@ -786,7 +876,17 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_parallel().dcp_enabled:
+        if get_parallel().dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or (
+                self.use_dsa
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            )
+        ):
+            assert lse is not None, (
+                "DCP LSE combine reached without an LSE — the attention call "
+                "above must go through the attn_mqa_for_dcp_decode branch."
+            )
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

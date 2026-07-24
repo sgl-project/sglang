@@ -4260,6 +4260,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+            parallel = get_parallel()
+            if parallel.dcp_enabled:
+                # The indexer K cache is not sharded under DCP: every rank
+                # keeps index_k for every token (global-slot addressed) so
+                # all ranks compute identical top-k.
+                index_buf_size = size * parallel.attn_dcp_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
