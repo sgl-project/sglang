@@ -40,7 +40,7 @@ class SchedulerLoadInquirer:
     tp_worker: BaseTpWorker
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     spec_algorithm: SpeculativeAlgorithm
-    get_running_batch: Callable
+    get_num_running_reqs: Callable
     get_waiting_queue: Callable
     get_stats: Callable
     get_chunked_req: Callable
@@ -87,7 +87,7 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        num_running_reqs = self.get_num_running_reqs()
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
