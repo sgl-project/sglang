@@ -317,6 +317,8 @@ class Envs:
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    SGLANG_TRACE_ASYNC = EnvBool(False)
+    SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable lazy compaction in the unified memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
