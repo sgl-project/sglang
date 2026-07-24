@@ -40,7 +40,7 @@ class Llama32Detector(BaseFormatDetector):
             parsed = ast.literal_eval(text.strip())
             if isinstance(parsed, dict):
                 return json.dumps(parsed, ensure_ascii=False)
-        except:
+        except (ValueError, SyntaxError, json.JSONDecodeError):
             pass
         return text
 
@@ -94,7 +94,7 @@ class Llama32Detector(BaseFormatDetector):
                             idx = dict_end + len(self.tool_call_separator)
                             safe_idx = idx
                             continue
-                except:
+                except (json.JSONDecodeError, ValueError, KeyError):
                     pass
 
                 next_obj_start = action_text.find('{"name":', idx + 1)
@@ -131,7 +131,7 @@ class Llama32Detector(BaseFormatDetector):
         try:
             result = super().parse_streaming_increment("", tools)
             return result
-        except:
+        except (json.JSONDecodeError, ValueError, KeyError):
             # Fall back to original buffer
             self._buffer = original_buffer
             return super().parse_streaming_increment(new_text, tools)
