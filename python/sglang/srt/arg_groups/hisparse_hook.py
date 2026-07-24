@@ -103,6 +103,12 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
     if is_hip and is_v4_hisparse:
+        if server_args.disaggregation_mode == "prefill":
+            raise ValueError(
+                "DeepSeek-V4 HiSparse is decode-only under PD disaggregation. "
+                "The prefill server must keep the dense C4 source layout so KV "
+                "transfer reads logical pages rather than remapped hot slots."
+            )
         # DSv4 HiSparse manages its own dtype/backend pairing for both the
         # separate packed-KV and the unified-KV layouts on ROCm (the unified-KV
         # path now wires its own HiSparse C4 device/host pool), so skip the

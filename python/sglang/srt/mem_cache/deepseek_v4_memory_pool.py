@@ -307,8 +307,14 @@ class HiSparseUnifiedC4DevicePool(HiSparseC4DevicePool):
             unified_kv_pool.kv_buffer[local_id][self.swa_pages :]
             for local_id in c4_local_layer_ids
         ]
-        # Device-resident compressed rows available for the C4 hot region.
-        self.size = self.kv_buffer[0].shape[0] if self.kv_buffer else 0
+        # The unified allocation includes one logical C4 page of padding for
+        # the reserved null slot. Exclude that padding from allocator capacity;
+        # page-size-1 allocation then returns indices 1..size, all backed by the
+        # padded view without exposing the remaining guard rows.
+        c4_padding_rows = unified_kv_pool.page_size // self.compress_ratio
+        self.size = (
+            self.kv_buffer[0].shape[0] - c4_padding_rows if self.kv_buffer else 0
+        )
 
         # Host-mirror item geometry: one bf16 head_dim row per token, with
         # ``page_size`` rows per page. store_dtype == dtype (bf16) so no view

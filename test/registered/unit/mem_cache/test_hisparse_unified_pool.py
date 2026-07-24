@@ -104,7 +104,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         self.assertEqual(c4_ids, [0, 2])
         self.assertEqual(pool.layer_num, 2)
         self.assertEqual(len(pool.kv_buffer), 2)
-        self.assertEqual(pool.size, C4_ROWS + C4_PAD_ROWS)
+        self.assertEqual(pool.size, C4_ROWS)
         for buf in pool.kv_buffer:
             self.assertEqual(tuple(buf.shape), (C4_ROWS + C4_PAD_ROWS, HEAD_DIM))
             self.assertEqual(buf.dtype, torch.bfloat16)
@@ -147,7 +147,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
 
         # The HiSparse hot pool aliases the shrunk region -> its size follows.
         pool, _ = self._build_hisparse_pool(unified, stage_ratios)
-        self.assertEqual(pool.size, c4_device_rows + C4_PAD_ROWS)
+        self.assertEqual(pool.size, c4_device_rows)
 
     # ------------------------------------------------------------------
     # View aliasing onto rows[swa_pages:]
@@ -215,7 +215,7 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         mapping = torch.cat(
             [
                 torch.zeros(
-                    logical_size + pool.page_size, dtype=torch.int64, device="cuda"
+                    logical_size + C4_PAD_ROWS, dtype=torch.int64, device="cuda"
                 ),
                 torch.tensor([-1], dtype=torch.int64, device="cuda"),
             ]
@@ -259,6 +259,29 @@ class TestHiSparseUnifiedPool(unittest.TestCase):
         self.assertTrue(
             torch.all(pool.full_to_hisparse_device_index_mapping[logical_indices] == 0)
         )
+
+    def test_mapping_covers_final_partial_logical_page(self):
+        stage_ratios = [4]
+        unified = self._build_unified_pool(stage_ratios)
+        pool, _ = self._build_hisparse_pool(unified, stage_ratios)
+        logical_size = C4_ROWS
+        mapping = torch.cat(
+            [
+                torch.zeros(
+                    logical_size + C4_PAD_ROWS, dtype=torch.int64, device="cuda"
+                ),
+                torch.tensor([-1], dtype=torch.int64, device="cuda"),
+            ]
+        )
+        pool.register_mapping(mapping)
+        final_compressed_index = logical_size + C4_PAD_ROWS - 1
+        mapping[final_compressed_index] = 7
+
+        translated = pool.translate_loc_to_hisparse_device(
+            torch.tensor([final_compressed_index], dtype=torch.int64, device="cuda")
+        )
+
+        self.assertEqual(translated.item(), 7)
 
     def test_alloc_oversubscribe_returns_none(self):
         if not is_hip():
