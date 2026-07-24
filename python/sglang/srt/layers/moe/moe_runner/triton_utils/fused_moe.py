@@ -637,7 +637,34 @@ def _fused_moe_kernel_sequence(
                     swiglu_limit=swiglu_limit_for_triton,
                 )
         elif _is_cuda or _is_hip or _is_xpu:
-            if filter_expert and _is_cuda:
+            _use_fused_act_quant = (
+                envs.SGLANG_OPT_FUSED_ACT_QUANT.get()
+                and _is_cuda
+                and use_fp8_w8a8
+                and block_shape is not None
+                and len(block_shape) >= 2
+                and block_shape[1] == 128
+            )
+            if _use_fused_act_quant:
+                from sglang.kernels.ops.activation.activation import (
+                    run_activation_quant,
+                )
+
+                _expert_ids_arg = None
+                _expert_step_arg = 1
+                if filter_expert:
+                    _expert_ids_arg = (
+                        expert_ids if down_moe_use_tma else topk_ids.view(-1)
+                    )
+                    _expert_step_arg = config["BLOCK_SIZE_M"] if down_moe_use_tma else 1
+                intermediate_cache2, a2_scale = run_activation_quant(
+                    "silu",
+                    intermediate_cache1.view(-1, N),
+                    expert_ids=_expert_ids_arg,
+                    expert_step=_expert_step_arg,
+                    group_size=128,
+                )
+            elif filter_expert and _is_cuda:
                 # HIP/XPU fall through to the unfiltered path: the down kernel
                 # zeros filtered rows without reading their input.
                 silu_and_mul(
@@ -664,7 +691,34 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if filter_expert and _is_cuda:
+            _use_fused_act_quant = (
+                envs.SGLANG_OPT_FUSED_ACT_QUANT.get()
+                and _is_cuda
+                and use_fp8_w8a8
+                and block_shape is not None
+                and len(block_shape) >= 2
+                and block_shape[1] == 128
+            )
+            if _use_fused_act_quant:
+                from sglang.kernels.ops.activation.activation import (
+                    run_activation_quant,
+                )
+
+                _expert_ids_arg = None
+                _expert_step_arg = 1
+                if filter_expert:
+                    _expert_ids_arg = (
+                        expert_ids if down_moe_use_tma else topk_ids.view(-1)
+                    )
+                    _expert_step_arg = config["BLOCK_SIZE_M"] if down_moe_use_tma else 1
+                intermediate_cache2, a2_scale = run_activation_quant(
+                    "gelu",
+                    intermediate_cache1.view(-1, N),
+                    expert_ids=_expert_ids_arg,
+                    expert_step=_expert_step_arg,
+                    group_size=128,
+                )
+            elif filter_expert and _is_cuda:
                 gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
@@ -877,7 +931,7 @@ def fused_experts_impl(
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
