@@ -288,6 +288,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        self._low_priority_values_first = params.schedule_low_priority_values_first
 
         self.kv_event_queue = []
 
@@ -303,7 +304,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy,
+            low_values_first=params.schedule_low_priority_values_first,
+        )
 
         self.evictable_leaves = set()
         self.reset()
@@ -329,8 +333,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
-        # Initialize root with minimum priority so any real priority overrides it
-        self.root_node = TreeNode(priority=-sys.maxsize)
+        # Root priority: use the extreme that is *least* important so any real
+        # priority overrides it.  In normal mode that is -sys.maxsize (minimum);
+        # in low-values-first mode it is sys.maxsize (maximum).
+        self.root_node = TreeNode(
+            priority=sys.maxsize if self._low_priority_values_first else -sys.maxsize
+        )
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
@@ -703,6 +711,17 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             return
         node.hit_count += 1
 
+    def _aggregate_priority(self, node: TreeNode, priority: int) -> None:
+        """Aggregate priority on a shared prefix node.
+
+        Normal mode: higher priority = more important → use max.
+        Low-values-first mode: lower priority = more important → use min.
+        """
+        if self._low_priority_values_first:
+            node.priority = min(node.priority, priority)
+        else:
+            node.priority = max(node.priority, priority)
+
     def _insert_helper(
         self,
         node: TreeNode,
@@ -716,8 +735,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             priority = 0
         access_time = time.monotonic()
         node.last_access_time = access_time
-        # Update priority along the path (take max to propagate higher priority)
-        node.priority = max(node.priority, priority)
+        # Update priority along the path (aggregate based on direction)
+        self._aggregate_priority(node, priority)
         if len(key) == 0:
             return 0, node
 
@@ -734,11 +753,11 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                new_node.priority = max(new_node.priority, priority)
+                self._aggregate_priority(new_node, priority)
                 self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
-                node.priority = max(node.priority, priority)
+                self._aggregate_priority(node, priority)
                 self._inc_hit_count(node, chunked)
             if len(key):
                 child_key = key.child_key(self.page_size)
