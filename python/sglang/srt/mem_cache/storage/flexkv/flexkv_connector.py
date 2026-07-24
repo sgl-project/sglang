@@ -25,12 +25,13 @@ Modes:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
 import struct
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -61,6 +62,28 @@ except ImportError as exc:  # pragma: no cover - runtime check
     ) from exc
 
 logger = logging.getLogger(__name__)
+
+_SGLANG_REQ_ID_UNSET = object()
+_INFO_STATUSES = {"hit", "miss", "skipped", "success"}
+_WARNING_STATUSES = {"cancelled", "failed", "missing", "not_found", "timeout"}
+
+
+@dataclass
+class _CacheOpContext:
+    operation: str
+    sglang_req_id: Optional[str]
+    start_ns: int
+    task_id: int = -1
+
+
+def _status_value(response: Any) -> str:
+    status = getattr(response, "status", None)
+    value = getattr(status, "value", status)
+    return str(value).lower() if value is not None else "missing"
+
+
+def _is_terminal_status(status: str) -> bool:
+    return status in {"success", "failed", "cancelled", "not_found"}
 
 
 class FlexKVConnector:
@@ -224,13 +247,17 @@ class FlexKVConnector:
         # 10. Per-rank in-flight tracking.
         # Loads
         self._pending_lookups: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._pending_lookup_contexts: Dict[str, _CacheOpContext] = {}
         self._inflight_loads: Dict[int, int] = {}  # producer_id -> rid hashlike
         self._completed_layerwise: List[int] = []
         self._launched_load_tids: List[int] = []  # leader-only, for periodic drain
+        self._launched_load_contexts: Dict[int, _CacheOpContext] = {}
         # Stores
         self._inflight_stores: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._inflight_store_contexts: Dict[str, _CacheOpContext] = {}
         # Prefetches
         self._ongoing_prefetches: Dict[str, int] = {}  # rid -> fkv_task_id
+        self._prefetch_contexts: Dict[str, _CacheOpContext] = {}
         self._prefetch_enabled = bool(
             self.cache_config.enable_ssd
             or self.cache_config.enable_remote
@@ -244,6 +271,120 @@ class FlexKVConnector:
             self._prefetch_enabled,
         )
 
+    def _new_op_context(
+        self,
+        operation: str,
+        tracking_key: Optional[str],
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+        task_id: int = -1,
+    ) -> _CacheOpContext:
+        if sglang_req_id is _SGLANG_REQ_ID_UNSET:
+            sglang_req_id = tracking_key
+        return _CacheOpContext(
+            operation=operation,
+            sglang_req_id=sglang_req_id,
+            start_ns=time.perf_counter_ns(),
+            task_id=task_id,
+        )
+
+    def _pop_context(
+        self,
+        attr: str,
+        key: Any,
+        operation: str,
+        task_id: int,
+    ) -> _CacheOpContext:
+        context = getattr(self, attr, {}).pop(key, None)
+        if context is None:
+            context = self._new_op_context(operation, str(key), task_id=task_id)
+        context.operation = operation
+        context.task_id = task_id
+        return context
+
+    def _log_cache_op(
+        self,
+        context: _CacheOpContext,
+        action: str,
+        status: str,
+        *,
+        task_id: Optional[int] = None,
+        start_ns: Optional[int] = None,
+        **fields: Any,
+    ) -> None:
+        if not self._sync_ctx.is_sync_leader:
+            return
+        if status in _WARNING_STATUSES:
+            level = logging.WARNING
+        elif action == "launch" or status in _INFO_STATUSES:
+            level = logging.INFO
+        else:
+            level = logging.DEBUG
+        if not logger.isEnabledFor(level):
+            return
+
+        if start_ns is None and action == "complete":
+            start_ns = context.start_ns
+        elapsed_s = (
+            (time.perf_counter_ns() - start_ns) / 1e9 if start_ns is not None else None
+        )
+
+        values = [
+            ("operation", context.operation),
+            ("action", action),
+            ("status", status),
+        ]
+        for name in ("direction", "blocks", "op_id", "graph_id"):
+            if name in fields:
+                values.append((name, fields.pop(name)))
+        values.extend(
+            [
+                ("sglang_req_id", context.sglang_req_id),
+                (
+                    "flexkv_task_id",
+                    context.task_id if task_id is None else task_id,
+                ),
+            ]
+        )
+        for name in (
+            "child_task_ids",
+            "flexkv_batch_task_id",
+            "flexkv_batch_task_ids",
+            "flexkv_task_ids",
+        ):
+            if name in fields:
+                values.append((name, fields.pop(name)))
+        if "transfer_mode" in fields:
+            values.append(("transfer_mode", fields.pop("transfer_mode")))
+        error = fields.pop("error", None)
+        values.extend((name, value) for name, value in fields.items())
+        if elapsed_s is not None:
+            values.append((f"{context.operation}_time", elapsed_s))
+        if error is not None:
+            values.append(("error", error))
+
+        formatted = []
+        for name, value in values:
+            if value is None:
+                continue
+            if name in {"sglang_req_id", "error"}:
+                value = json.dumps(str(value), ensure_ascii=True)
+            elif isinstance(value, bool):
+                value = str(value).lower()
+            elif name.endswith("_time"):
+                value = f"{value:.4f}s"
+            elif isinstance(value, float):
+                value = f"{value:.3f}"
+            elif isinstance(value, (list, tuple)):
+                value = ",".join(str(item) for item in value) or "-"
+            formatted.append(f"{name}={value}")
+
+        logger.log(
+            level,
+            "[%s][FlexKV-SGLang] %s",
+            logging.getLevelName(level),
+            " ".join(formatted),
+        )
+
     # ------------------------------------------------------------------
     # Public API — lookup / load
     # ------------------------------------------------------------------
@@ -253,6 +394,7 @@ class FlexKVConnector:
         token_ids: List[int],
         token_mask: torch.Tensor,
         rid: Optional[str] = None,
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
     ) -> Tuple[int, int]:
         """Page-aligned prefix lookup against FlexKV.
 
@@ -264,14 +406,18 @@ class FlexKVConnector:
             under this key so a later ``retrieve_kv(rid, slots)`` call
             can resolve it. If not set, the held task is cancelled when
             hit > 0 and the caller didn't ask to track it.
+          sglang_req_id: business request ID used only for logs. This can be
+            ``None`` when ``rid`` is an internal tracking key.
 
         Returns:
           ``(fkv_task_id, hit_count)``. ``hit_count`` is page-aligned
           and may be smaller than the raw FlexKV match if the page
           floor truncated it.
         """
+        context = self._new_op_context("lookup", rid, sglang_req_id)
         fkv_task_id = -1
         hit_length = 0
+        lookup_error: Optional[Exception] = None
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             tids_np = np.asarray(token_ids, dtype=np.int64)
@@ -285,7 +431,7 @@ class FlexKVConnector:
                     swa_aware=self._swa_kv_pool is not None,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[FlexKV] get_match raised: %s", exc)
+                lookup_error = exc
                 res = None
             if res is None:
                 fkv_task_id = -1
@@ -296,7 +442,10 @@ class FlexKVConnector:
 
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter(
-                {"task_id": fkv_task_id, "hit": hit_length}
+                {
+                    "task_id": fkv_task_id,
+                    "hit": hit_length,
+                }
             )
             fkv_task_id = payload["task_id"]
             hit_length = payload["hit"]
@@ -313,6 +462,22 @@ class FlexKVConnector:
                 )
             hit_length = aligned
 
+        context.task_id = fkv_task_id
+        lookup_status = (
+            "failed"
+            if lookup_error is not None
+            else ("hit" if hit_length > 0 else "miss")
+        )
+        self._log_cache_op(
+            context,
+            "complete",
+            lookup_status,
+            tokens=len(token_ids),
+            hit_tokens=hit_length,
+            hit_blocks=hit_length // self.page_size,
+            error=str(lookup_error) if lookup_error is not None else None,
+        )
+
         # Decide what to do with the held task. Three cases:
         #   1. hit_length > 0 and rid given → stash for retrieve_kv later.
         #   2. hit_length > 0 and rid is None → cancel; caller can't use it.
@@ -320,6 +485,7 @@ class FlexKVConnector:
         #      empty graph COMPLETED inside get_match, cancel would warn.
         if hit_length > 0 and rid is not None and fkv_task_id >= 0:
             self._pending_lookups[rid] = fkv_task_id
+            self._pending_lookup_contexts[rid] = context
         elif hit_length > 0 and fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
@@ -330,9 +496,18 @@ class FlexKVConnector:
         """Cancel the task held by an earlier ``lookup_kv(rid=...)`` that
         won't be followed by a ``retrieve_kv`` (e.g. allocation failed)."""
         fkv_task_id = self._pending_lookups.pop(rid, -1)
+        context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
         if fkv_task_id >= 0 and self._sync_ctx.is_sync_leader:
             assert self.kv_manager is not None
             self.kv_manager.cancel([fkv_task_id])
+        if context is not None:
+            context.operation = "load"
+            self._log_cache_op(
+                context,
+                "complete",
+                "cancelled",
+                reason="lookup_released",
+            )
 
     def retrieve_kv(
         self,
@@ -348,6 +523,10 @@ class FlexKVConnector:
         fkv_task_id = self._pending_lookups.pop(rid, -1)
         if fkv_task_id < 0:
             return 0
+        context = self._pop_context(
+            "_pending_lookup_contexts", rid, "load", fkv_task_id
+        )
+        load_start_ns = time.perf_counter_ns()
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
@@ -361,30 +540,61 @@ class FlexKVConnector:
 
         n = slot_mapping_cpu.numel()
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            self.kv_manager.launch(
-                task_ids=[fkv_task_id],
-                slot_mappings=[slot_mapping_cpu],
-                swa_slot_mappings=[swa_slot_mapping],
-                as_batch=True,
-                layerwise_transfer=False,
-            )
-            logger.info(
-                "[FlexKV-IO] direction=H2D path=bulk phase=launch "
-                "task_id=%d slots=%d swa_slots=%d rid=%s",
-                fkv_task_id,
-                n,
-                swa_slots,
-                rid,
-            )
-            resp = self.kv_manager.wait([fkv_task_id], timeout=30.0)
-            if not (
-                fkv_task_id in resp
-                and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
-            ):
-                logger.warning(
-                    "[FlexKV] retrieve_kv: task %d failed/timed out",
-                    fkv_task_id,
+            try:
+                self.kv_manager.launch(
+                    task_ids=[fkv_task_id],
+                    slot_mappings=[slot_mapping_cpu],
+                    swa_slot_mappings=[swa_slot_mapping],
+                    as_batch=True,
+                    layerwise_transfer=False,
                 )
+            except Exception as exc:  # noqa: BLE001
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "failed",
+                    start_ns=load_start_ns,
+                    direction="H2D",
+                    transfer_mode="no-layerwise",
+                    stage="launch",
+                    error=str(exc),
+                )
+                raise
+            self._log_cache_op(
+                context,
+                "launch",
+                "running",
+                direction="H2D",
+                transfer_mode="no-layerwise",
+                slots=n,
+                swa_slots=swa_slots,
+            )
+            try:
+                resp = self.kv_manager.wait([fkv_task_id], timeout=30.0) or {}
+            except Exception as exc:  # noqa: BLE001
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "failed",
+                    start_ns=load_start_ns,
+                    direction="H2D",
+                    transfer_mode="no-layerwise",
+                    error=str(exc),
+                )
+                raise
+            status = _status_value(resp.get(fkv_task_id))
+            success = status == KVResponseStatus.SUCCESS.value
+            self._log_cache_op(
+                context,
+                "complete",
+                status,
+                start_ns=load_start_ns,
+                direction="H2D",
+                transfer_mode="no-layerwise",
+                slots=n,
+                swa_slots=swa_slots,
+            )
+            if not success:
                 n = 0
         if self._sync_ctx.needs_sync:
             self._sync_ctx.barrier()
@@ -403,6 +613,10 @@ class FlexKVConnector:
             "disabled. Set FLEXKV_ENABLE_LAYERWISE_TRANSFER=1."
         )
         fkv_task_id = self._pending_lookups.pop(rid, -1)
+        context = self._pop_context(
+            "_pending_lookup_contexts", rid, "load", fkv_task_id
+        )
+        load_start_ns = time.perf_counter_ns()
 
         slot_mapping_cpu = self._to_cpu_int64(slot_mapping)
         swa_slot_mapping = self._build_swa_slot_mapping(slot_mapping)
@@ -555,61 +769,90 @@ class FlexKVConnector:
                     if fkv_task_id >= 0:
                         self.kv_manager.cancel([fkv_task_id])
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[FlexKV-Layerwise] pre-launch cancel failed for task %d: %s",
-                        fkv_task_id,
-                        exc,
+                    self._log_cache_op(
+                        context,
+                        "cleanup",
+                        "failed",
+                        start_ns=load_start_ns,
+                        direction="H2D",
+                        transfer_mode="layerwise",
+                        stage="prelaunch_cancel",
+                        error=str(exc),
                     )
             if all_cleanup_ok == 0:
                 raise RuntimeError(
                     "FlexKV layerwise counter rollback failed on at least one rank: "
                     f"{cleanup_error or 'remote rank failure'}"
                 )
-            logger.warning(
-                "[FlexKV-Layerwise] phase=preflight_reject rank=%d "
-                "generation=%d task_id=%d producer_id=%d reason=%s",
-                self._sync_ctx.world_rank,
-                generation,
-                fkv_task_id,
-                producer_id,
-                local_error or "another rank rejected the pre-launch state",
+            self._log_cache_op(
+                context,
+                "complete",
+                "failed",
+                start_ns=load_start_ns,
+                direction="H2D",
+                transfer_mode="layerwise",
+                stage="preflight",
+                rank=self._sync_ctx.world_rank,
+                generation=generation,
+                producer_id=producer_id,
+                error=local_error or "another rank rejected the pre-launch state",
             )
             return 0, -1
 
-        logger.info(
-            "[FlexKV-Layerwise] phase=registered rank=%d generation=%d "
-            "task_id=%d producer_id=%d expected_signal_count=%d rid=%s",
-            self._sync_ctx.world_rank,
-            generation,
-            fkv_task_id,
-            producer_id,
-            expected_signal_count,
-            rid,
+        self._log_cache_op(
+            context,
+            "register",
+            "ready",
+            direction="H2D",
+            transfer_mode="layerwise",
+            rank=self._sync_ctx.world_rank,
+            generation=generation,
+            producer_id=producer_id,
+            expected_signal_count=expected_signal_count,
         )
 
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            launched_task_ids = self.kv_manager.launch(
-                task_ids=[fkv_task_id],
-                slot_mappings=[slot_mapping_cpu],
-                swa_slot_mappings=[swa_slot_mapping],
-                as_batch=True,
-                layerwise_transfer=True,
-                counter_id=producer_id,
-            )
+            try:
+                launched_task_ids = self.kv_manager.launch(
+                    task_ids=[fkv_task_id],
+                    slot_mappings=[slot_mapping_cpu],
+                    swa_slot_mappings=[swa_slot_mapping],
+                    as_batch=True,
+                    layerwise_transfer=True,
+                    counter_id=producer_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "failed",
+                    start_ns=load_start_ns,
+                    direction="H2D",
+                    transfer_mode="layerwise",
+                    stage="launch",
+                    error=str(exc),
+                )
+                raise
             # A layerwise launch is always merged into a batch task. Track the
             # IDs returned by launch(), not the lookup task ID that the merge
             # removes from FlexKV's task table.
             self._launched_load_tids.extend(launched_task_ids)
-            logger.info(
-                "[FlexKV-IO] direction=H2D path=layerwise phase=launch "
-                "task_id=%d batch_task_ids=%s slots=%d swa_slots=%d "
-                "producer_id=%d rid=%s",
-                fkv_task_id,
-                launched_task_ids,
-                n,
-                swa_slots,
-                producer_id,
-                rid,
+            for launched_task_id in launched_task_ids:
+                self._launched_load_contexts[launched_task_id] = replace(
+                    context,
+                    task_id=launched_task_id,
+                    start_ns=load_start_ns,
+                )
+            self._log_cache_op(
+                context,
+                "launch",
+                "running",
+                direction="H2D",
+                flexkv_batch_task_ids=launched_task_ids,
+                transfer_mode="layerwise",
+                slots=n,
+                swa_slots=swa_slots,
+                producer_id=producer_id,
             )
 
         return n, producer_id
@@ -622,18 +865,47 @@ class FlexKVConnector:
         if len(self._launched_load_tids) < threshold:
             return
         task_ids = list(dict.fromkeys(self._launched_load_tids))
+        contexts = getattr(self, "_launched_load_contexts", {})
         try:
             responses = (
                 self.kv_manager.wait(task_ids, timeout=0.0, completely=True) or {}
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[FlexKV] drain_launched_loads wait: %s", exc)
+            context = next(
+                (contexts[task_id] for task_id in task_ids if task_id in contexts),
+                None,
+            )
+            context = context or self._new_op_context("load", "-")
+            self._log_cache_op(
+                context,
+                "poll",
+                "failed",
+                task_id=-1,
+                direction="H2D",
+                flexkv_batch_task_ids=task_ids,
+                transfer_mode="layerwise",
+                error=str(exc),
+            )
             return
+        for task_id, response in responses.items():
+            status = _status_value(response)
+            if not _is_terminal_status(status):
+                continue
+            context = self._pop_context(
+                "_launched_load_contexts", task_id, "load", task_id
+            )
+            self._log_cache_op(
+                context,
+                "complete",
+                status,
+                direction="H2D",
+                transfer_mode="layerwise",
+            )
         self._launched_load_tids = [
             task_id
             for task_id in task_ids
             if task_id not in responses
-            or responses[task_id].status != KVResponseStatus.SUCCESS
+            or not _is_terminal_status(_status_value(responses[task_id]))
         ]
 
     # ------------------------------------------------------------------
@@ -645,6 +917,7 @@ class FlexKVConnector:
         rid: str,
         token_ids: List[int],
         kv_indices: torch.Tensor,
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
     ) -> int:
         """Schedule a write back from GPU into FlexKV.
 
@@ -657,6 +930,7 @@ class FlexKVConnector:
         Returns the FlexKV task id of the in-flight store, or -1 if
         nothing needed to be written.
         """
+        context = self._new_op_context("store", rid, sglang_req_id)
         token_ids_np = np.asarray(token_ids, dtype=np.int64)
         n = len(token_ids_np)
         if n != len(kv_indices):
@@ -671,6 +945,14 @@ class FlexKVConnector:
             aligned_len = (n // self.page_size) * self.page_size
             if aligned_len == 0:
                 self._send_pp_put_meta(-1, [])
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "skipped",
+                    direction="D2H",
+                    reason="partial_block",
+                    tokens=0,
+                )
                 return -1
             if aligned_len < n:
                 token_ids_np = token_ids_np[:aligned_len]
@@ -678,44 +960,77 @@ class FlexKVConnector:
 
         fkv_task_id = -1
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            match_error: Optional[Exception] = None
             try:
                 res = self.kv_manager.put_match(token_ids=token_ids_np, token_mask=None)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[FlexKV] put_match raised: %s", exc)
+                match_error = exc
                 res = None
             if res is None:
                 self._send_pp_put_meta(-1, [])
+                self._log_cache_op(
+                    context,
+                    "complete",
+                    "failed",
+                    direction="D2H",
+                    stage="put_match",
+                    reason="no_response" if match_error is None else None,
+                    error=str(match_error) if match_error is not None else None,
+                )
                 return -1
             fkv_task_id, unmatched_mask = res
+            context.task_id = fkv_task_id
 
             self._send_pp_put_meta(fkv_task_id, unmatched_mask)
 
-            if int(unmatched_mask.sum()) > 0:
+            unmatched_count = int(unmatched_mask.sum())
+            if unmatched_count > 0:
                 filtered = kv_indices[unmatched_mask]
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 swa_slot_mapping = self._build_swa_slot_mapping(filtered)
                 swa_slots = (
                     0 if swa_slot_mapping is None else int(swa_slot_mapping.numel())
                 )
-                self.kv_manager.launch(
-                    task_ids=[fkv_task_id],
-                    slot_mappings=[slot_mapping_cpu],
-                    swa_slot_mappings=[swa_slot_mapping],
-                    as_batch=False,
-                    layerwise_transfer=False,
-                )
-                logger.info(
-                    "[FlexKV-IO] direction=D2H path=bulk phase=launch "
-                    "operation=store task_id=%d tokens=%d slots=%d "
-                    "swa_slots=%d rid=%s",
-                    fkv_task_id,
-                    int(unmatched_mask.sum()),
-                    int(slot_mapping_cpu.numel()),
-                    swa_slots,
-                    rid,
+                try:
+                    self.kv_manager.launch(
+                        task_ids=[fkv_task_id],
+                        slot_mappings=[slot_mapping_cpu],
+                        swa_slot_mappings=[swa_slot_mapping],
+                        as_batch=False,
+                        layerwise_transfer=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log_cache_op(
+                        context,
+                        "complete",
+                        "failed",
+                        direction="D2H",
+                        transfer_mode="no-layerwise",
+                        stage="launch",
+                        error=str(exc),
+                    )
+                    raise
+                self._log_cache_op(
+                    context,
+                    "launch",
+                    "running",
+                    direction="D2H",
+                    transfer_mode="no-layerwise",
+                    tokens=unmatched_count,
+                    slots=int(slot_mapping_cpu.numel()),
+                    swa_slots=swa_slots,
                 )
                 self._inflight_stores[rid] = fkv_task_id
+                self._inflight_store_contexts[rid] = context
                 return fkv_task_id
+            self._log_cache_op(
+                context,
+                "complete",
+                "skipped",
+                direction="D2H",
+                reason="already_cached",
+                tokens=0,
+            )
             return -1
 
         # Non-leader path: receive the unmatched mask + maybe forward
@@ -738,6 +1053,8 @@ class FlexKVConnector:
                 slot_mapping_cpu = self._to_cpu_int64(filtered)
                 self._send_slot_mapping_to_remote(fkv_task_id, slot_mapping_cpu)
                 self._inflight_stores[rid] = fkv_task_id
+                context.task_id = fkv_task_id
+                self._inflight_store_contexts[rid] = context
         return fkv_task_id
 
     def check_completed_stores(self) -> List[str]:
@@ -749,16 +1066,39 @@ class FlexKVConnector:
             if self._inflight_stores:
                 fk_to_rid = {v: k for k, v in self._inflight_stores.items()}
                 try:
-                    completed_dict = self.kv_manager.try_wait(
-                        task_ids=list(fk_to_rid.keys())
+                    completed_dict = (
+                        self.kv_manager.try_wait(task_ids=list(fk_to_rid.keys())) or {}
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("[FlexKV] check_completed_stores: %s", exc)
+                    rid = next(iter(self._inflight_stores))
+                    context = getattr(self, "_inflight_store_contexts", {}).get(rid)
+                    context = context or self._new_op_context(
+                        "store", rid, task_id=self._inflight_stores[rid]
+                    )
+                    self._log_cache_op(
+                        context,
+                        "poll",
+                        "failed",
+                        task_id=-1,
+                        flexkv_task_ids=list(fk_to_rid),
+                        error=str(exc),
+                    )
                     completed_dict = {}
-                for fk_tid in completed_dict:
+                for fk_tid, response in completed_dict.items():
                     rid = fk_to_rid[fk_tid]
                     completed_rids.append(rid)
                     self._inflight_stores.pop(rid, None)
+                    context = self._pop_context(
+                        "_inflight_store_contexts", rid, "store", fk_tid
+                    )
+                    status = _status_value(response)
+                    self._log_cache_op(
+                        context,
+                        "complete",
+                        status,
+                        direction="D2H",
+                        transfer_mode="no-layerwise",
+                    )
 
         if self._sync_ctx.is_pp_sender:
             self._sync_ctx.scatter_pp(
@@ -782,6 +1122,7 @@ class FlexKVConnector:
                         rid = fk_to_rid[fk_tid]
                         completed_rids.append(rid)
                         self._inflight_stores.pop(rid, None)
+                        getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
 
         if self._sync_ctx.needs_sync:
             completed_rids = self._sync_ctx.scatter(completed_rids)
@@ -792,38 +1133,78 @@ class FlexKVConnector:
         fkv_task_id = self._inflight_stores.pop(rid, -1)
         if fkv_task_id < 0:
             return True
+        context = self._pop_context(
+            "_inflight_store_contexts", rid, "store", fkv_task_id
+        )
         if not self._sync_ctx.is_sync_leader or self.kv_manager is None:
             return True
         try:
-            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout)
+            resp = self.kv_manager.wait([fkv_task_id], timeout=timeout) or {}
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[FlexKV] wait_store: %s", exc)
+            self._log_cache_op(
+                context,
+                "complete",
+                "failed",
+                direction="D2H",
+                transfer_mode="no-layerwise",
+                error=str(exc),
+            )
             return False
-        return (
-            fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
+        status = _status_value(resp.get(fkv_task_id))
+        success = status == KVResponseStatus.SUCCESS.value
+        self._log_cache_op(
+            context,
+            "complete",
+            status,
+            direction="D2H",
+            transfer_mode="no-layerwise",
         )
+        return success
 
     # ------------------------------------------------------------------
     # Public API — prefetch
     # ------------------------------------------------------------------
 
-    def prefetch_async(self, rid: str, token_ids: List[int]) -> int:
+    def prefetch_async(
+        self,
+        rid: str,
+        token_ids: List[int],
+        sglang_req_id: Any = _SGLANG_REQ_ID_UNSET,
+    ) -> int:
         if not self._prefetch_enabled or not rid:
             return -1
+        context = self._new_op_context("prefetch", rid, sglang_req_id)
         task_id = -1
+        prefetch_error: Optional[Exception] = None
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
                 task_id = self.kv_manager.prefetch_async(
                     token_ids=np.asarray(token_ids, dtype=np.int64)
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("[FlexKV] prefetch_async: %s", exc)
+                prefetch_error = exc
                 task_id = -1
         if self._sync_ctx.needs_sync:
             payload = self._sync_ctx.scatter({"task_id": task_id})
             task_id = payload["task_id"]
         if task_id >= 0:
+            context.task_id = task_id
             self._ongoing_prefetches[rid] = task_id
+            self._prefetch_contexts[rid] = context
+            self._log_cache_op(
+                context,
+                "launch",
+                "running",
+                tokens=len(token_ids),
+            )
+        elif self._sync_ctx.is_sync_leader:
+            self._log_cache_op(
+                context,
+                "complete",
+                "failed",
+                reason="task_not_created" if prefetch_error is None else None,
+                error=str(prefetch_error) if prefetch_error is not None else None,
+            )
         return task_id
 
     def check_prefetch_progress(self, rid: str) -> bool:
@@ -833,25 +1214,62 @@ class FlexKVConnector:
         if task_id < 0:
             return True
         done = False
+        status = "running"
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
             try:
-                completed = self.kv_manager.try_wait(task_ids=[task_id])
-            except Exception:  # noqa: BLE001
+                completed = self.kv_manager.try_wait(task_ids=[task_id]) or {}
+            except Exception as exc:  # noqa: BLE001
+                context = getattr(self, "_prefetch_contexts", {}).get(rid)
+                context = context or self._new_op_context(
+                    "prefetch", rid, task_id=task_id
+                )
+                self._log_cache_op(
+                    context,
+                    "poll",
+                    "failed",
+                    error=str(exc),
+                )
                 completed = {}
             if task_id in completed:
-                done = True
+                status = _status_value(completed[task_id])
+                done = _is_terminal_status(status)
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"done": done})
+            payload = self._sync_ctx.scatter({"done": done, "status": status})
             done = payload["done"]
+            status = payload["status"]
         if done:
             self._ongoing_prefetches.pop(rid, None)
+            context = self._pop_context("_prefetch_contexts", rid, "prefetch", task_id)
+            self._log_cache_op(
+                context,
+                "complete",
+                status,
+            )
         return done
 
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_lookups.pop(rid, None)
+        lookup_context = getattr(self, "_pending_lookup_contexts", {}).pop(rid, None)
+        if lookup_context is not None:
+            lookup_context.operation = "load"
+            self._log_cache_op(
+                lookup_context,
+                "complete",
+                "cancelled",
+                reason="caller_cancelled",
+            )
         # FlexKV doesn't currently support prefetch cancellation, but
         # we still drop our tracking entry.
-        self._ongoing_prefetches.pop(rid, None)
+        task_id = self._ongoing_prefetches.pop(rid, -1)
+        context = getattr(self, "_prefetch_contexts", {}).pop(rid, None)
+        if context is not None:
+            self._log_cache_op(
+                context,
+                "complete",
+                "cancelled",
+                task_id=task_id,
+                reason="caller_cancelled_tracking",
+            )
 
     # ------------------------------------------------------------------
     # Layerwise transfer hooks
@@ -888,6 +1306,19 @@ class FlexKVConnector:
                         launched, timeout=30.0, completely=True
                     )
                     responses = responses or {}
+                    for task_id, response in responses.items():
+                        status = _status_value(response)
+                        context = self._pop_context(
+                            "_launched_load_contexts", task_id, "load", task_id
+                        )
+                        self._log_cache_op(
+                            context,
+                            "complete",
+                            status,
+                            direction="H2D",
+                            transfer_mode="layerwise",
+                            source="reset",
+                        )
                     failed = [
                         task_id
                         for task_id in launched
@@ -920,19 +1351,47 @@ class FlexKVConnector:
                     self.kv_manager.cancel(pending)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[FlexKV] reset cancel: %s", exc)
+        for context in self._pending_lookup_contexts.values():
+            context.operation = "load"
+            self._log_cache_op(
+                context, "complete", "cancelled", reason="connector_reset"
+            )
+        self._pending_lookup_contexts.clear()
         self._pending_lookups.clear()
+        for context in self._prefetch_contexts.values():
+            self._log_cache_op(
+                context, "complete", "cancelled", reason="connector_reset"
+            )
+        self._prefetch_contexts.clear()
         self._ongoing_prefetches.clear()
         self._inflight_loads.clear()
         self._completed_layerwise.clear()
         self._launched_load_tids.clear()
+        getattr(self, "_launched_load_contexts", {}).clear()
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
-            for fk_tid in list(self._inflight_stores.values()):
+            for rid, fk_tid in list(self._inflight_stores.items()):
                 if fk_tid >= 0:
+                    context = self._pop_context(
+                        "_inflight_store_contexts", rid, "store", fk_tid
+                    )
+                    error = None
                     try:
-                        self.kv_manager.wait([fk_tid], timeout=20.0)
-                    except Exception:  # noqa: BLE001
-                        pass
+                        responses = self.kv_manager.wait([fk_tid], timeout=20.0) or {}
+                        status = _status_value(responses.get(fk_tid))
+                    except Exception as exc:  # noqa: BLE001
+                        status = "failed"
+                        error = str(exc)
+                    self._log_cache_op(
+                        context,
+                        "complete",
+                        status,
+                        direction="D2H",
+                        transfer_mode="no-layerwise",
+                        source="reset",
+                        error=error,
+                    )
         self._inflight_stores.clear()
+        getattr(self, "_inflight_store_contexts", {}).clear()
         if self.layer_done_counter is not None:
             self.layer_done_counter.reset()
 

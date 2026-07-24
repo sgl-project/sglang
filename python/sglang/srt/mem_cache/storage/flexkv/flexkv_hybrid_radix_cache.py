@@ -129,7 +129,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
         token_mask[device_length:] = True
         _, hit_length = self.flexkv_connector.lookup_kv(
-            token_ids, token_mask, rid=params.req.rid
+            token_ids,
+            token_mask,
+            rid=params.req.rid,
+            sglang_req_id=params.req.rid,
         )
         if hit_length <= 0:
             return result
@@ -338,7 +341,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             store_key = f"{req.rid}:flexkv-store:{self._store_generation}"
             self._store_generation += 1
         try:
-            task_id = self.flexkv_connector.store_kv(store_key, token_ids, indices)
+            task_id = self.flexkv_connector.store_kv(
+                store_key,
+                token_ids,
+                indices,
+                sglang_req_id=req.rid,
+            )
         except Exception:
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
             raise
@@ -385,7 +393,9 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def prefetch_from_storage(self, rid: str, last_host_node: Any, token_ids) -> None:
         del last_host_node
-        self.flexkv_connector.prefetch_async(rid, list(token_ids))
+        self.flexkv_connector.prefetch_async(
+            rid, list(token_ids), sglang_req_id=rid
+        )
 
     def check_prefetch_progress(self, rid: str) -> bool:
         return self.flexkv_connector.check_prefetch_progress(rid)
