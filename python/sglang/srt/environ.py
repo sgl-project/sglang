@@ -1220,6 +1220,11 @@ class Envs:
     # nondeterministic (bf16 unordered sum) -- keep off for bit-reproducibility.
     # No effect on the DeepGEMM (block-FP8) mega path, which lacks the knob.
     SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE = EnvBool(False)
+    # Cross-rank combine wire format for the FlashInfer NVFP4 cutedsl MegaMOE
+    # kernel. "bf16" is exact/default; "mxfp8" and "nvfp4" reduce combine
+    # traffic with a small accuracy tradeoff and require FC2 reduce outside the
+    # kernel.
+    SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

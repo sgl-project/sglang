@@ -6722,6 +6722,25 @@ class ServerArgs:
 
         self.flashinfer_a2a_dispatch_type = dispatch_type
 
+    def _validate_flashinfer_megamoe_envs(self):
+        combine_dtype = (
+            envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+        )
+        if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+            raise ValueError(
+                "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
+                f"'bf16', 'mxfp8', or 'nvfp4', got {combine_dtype!r}."
+            )
+        if (
+            combine_dtype != "bf16"
+            and envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+        ):
+            raise ValueError(
+                "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE="
+                f"{combine_dtype!r} is incompatible with "
+                "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
+            )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -6760,6 +6779,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
 
         if a2a_backend == "flashinfer_megamoe":
+            self._validate_flashinfer_megamoe_envs()
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size
             ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"

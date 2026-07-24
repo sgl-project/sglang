@@ -860,6 +860,66 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             server_args._handle_a2a_moe()
 
 
+class TestFlashinferMegaMoeEnvKnobs(CustomTestCase):
+    def setUp(self):
+        self._combine_dtype_backup = os.environ.get(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
+        )
+        self._ikr_backup = os.environ.get(
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE"
+        )
+        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.clear()
+        envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.clear()
+
+    def tearDown(self):
+        if self._combine_dtype_backup is None:
+            envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.clear()
+        else:
+            os.environ["SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"] = (
+                self._combine_dtype_backup
+            )
+        if self._ikr_backup is None:
+            envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.clear()
+        else:
+            os.environ["SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE"] = (
+                self._ikr_backup
+            )
+
+    def _make_args(self):
+        return ServerArgs(
+            model_path="dummy",
+            quantization="modelopt_fp4",
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            enable_dp_attention=True,
+            dp_size=4,
+            tp_size=4,
+        )
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
+            self._make_args()._handle_a2a_moe()
+
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("mxfp8"):
+            self._make_args()._handle_a2a_moe()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_rejects_invalid_value(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("fp8"):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
+            ):
+                self._make_args()._handle_a2a_moe()
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_megamoe_combine_dtype_conflicts_with_ikr(self, _):
+        with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
+            with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    self._make_args()._handle_a2a_moe()
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):

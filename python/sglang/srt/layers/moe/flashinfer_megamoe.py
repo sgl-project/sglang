@@ -147,6 +147,27 @@ def _resolve_max_tokens_per_rank() -> int:
     return derived if derived > 0 else 1024
 
 
+def resolve_flashinfer_megamoe_combine_dtype() -> str:
+    combine_dtype = (
+        envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.get().strip().lower()
+    )
+    if combine_dtype not in ("bf16", "mxfp8", "nvfp4"):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE must be one of "
+            f"'bf16', 'mxfp8', or 'nvfp4', got {combine_dtype!r}."
+        )
+    if (
+        combine_dtype != "bf16"
+        and envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get()
+    ):
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE="
+            f"{combine_dtype!r} is incompatible with "
+            "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
+        )
+    return combine_dtype
+
+
 def _layer_ep_world_rank(layer: FusedMoE) -> tuple[int, int]:
     world_size = int(layer.moe_ep_size)
     rank = int(layer.moe_ep_rank)
@@ -297,6 +318,7 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
             apply_topk_in_fc1=True,
             in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
+            combine_dtype=resolve_flashinfer_megamoe_combine_dtype(),
             input_norm_const=_scalar_float(layer.w13_input_scale_quant),
             fc1_alpha=layer.g1_alphas,
             fc2_alpha=layer.g2_alphas,
