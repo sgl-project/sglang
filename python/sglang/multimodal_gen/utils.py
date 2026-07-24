@@ -533,11 +533,17 @@ def kill_itself_when_parent_died() -> None:
 
     # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
     PR_SET_PDEATHSIG = 1
+    # Capture parent before arming PDEATHSIG: if the parent already died in the
+    # fork->prctl window, PDEATHSIG won't fire, so detect the reparent explicitly.
+    parent_pid = os.getppid()
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))
-    if os.getppid() == 1:
+    # getppid() changing means we were reparented (parent gone). Comparing to the
+    # captured pid instead of "== 1" avoids self-killing when PID 1 is the real
+    # parent (e.g. running as a container's init process).
+    if os.getppid() != parent_pid:
         os.kill(os.getpid(), signal.SIGKILL)
 
 
