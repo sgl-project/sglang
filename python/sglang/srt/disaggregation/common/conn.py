@@ -53,11 +53,13 @@ class KVTransferError(Exception):
         bootstrap_room: int,
         failure_reason: str,
         is_from_another_rank: bool = False,
+        status_code: Optional[int] = None,
     ):
         super().__init__(failure_reason)
         self.bootstrap_room = bootstrap_room
         self.failure_reason = failure_reason
         self.is_from_another_rank = is_from_another_rank
+        self.status_code = status_code
 
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
@@ -180,6 +182,7 @@ class CommonKVManager(BaseKVManager):
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
+        self.failure_status_codes: Dict[int, int] = {}
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -200,6 +203,7 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            self.required_dst_info_num_table: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -259,14 +263,23 @@ class CommonKVManager(BaseKVManager):
         else:
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
+            elif self.request_status[bootstrap_room] == KVPoll.Failed:
+                return
             else:
                 self.request_status[bootstrap_room] = max(
                     self.request_status[bootstrap_room], status
                 )
 
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
+    def record_failure(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        status_code: Optional[int] = None,
+    ):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+            if status_code is not None:
+                self.failure_status_codes[bootstrap_room] = int(status_code)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1147,12 +1160,21 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "required_dst_info_num_table"):
+            self.kv_mgr.required_dst_info_num_table.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "failure_status_codes"):
+            self.kv_mgr.failure_status_codes.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "failure_timestamps"):
+            self.kv_mgr.failure_timestamps.pop(self.bootstrap_room, None)
 
     def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
+        with self.kv_mgr.failure_lock:
+            has_failure_reason = self.bootstrap_room in self.kv_mgr.failure_records
+        if not has_failure_reason:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Aborted by AbortReq.",
+            )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
@@ -1392,12 +1414,18 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        self.kv_mgr.failure_status_codes.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "failure_timestamps"):
+            self.kv_mgr.failure_timestamps.pop(self.bootstrap_room, None)
 
     def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
+        with self.kv_mgr.failure_lock:
+            has_failure_reason = self.bootstrap_room in self.kv_mgr.failure_records
+        if not has_failure_reason:
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Aborted by AbortReq.",
+            )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         if (
