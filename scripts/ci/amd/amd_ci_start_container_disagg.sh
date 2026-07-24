@@ -228,13 +228,35 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
-    CACHE_VOLUME=""
+CACHE_HOST=/home/runner/sglang-data
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *350* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
 fi
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ ! -d "$CACHE_HOST" ]]; then
+      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
+      exit 1
+    fi
+    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    ;;
+  0|false|no|off|"")
+    CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""
@@ -324,6 +346,12 @@ docker run -dt --user root \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache \
+  /sgl-data/aiter-kernels
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

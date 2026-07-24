@@ -246,7 +246,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -266,7 +266,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
@@ -292,7 +292,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -312,7 +312,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite sgl-kernel-unit-test-2-gpu-amd
 
@@ -333,7 +333,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -353,7 +353,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -371,7 +371,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -391,7 +391,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run JIT kernel unit tests
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite jit-kernel-unit-test-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
@@ -409,7 +409,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -448,7 +448,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{matrix.runner}}
     steps:
@@ -468,7 +468,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -487,7 +487,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -506,7 +506,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 75
+        timeout-minutes: 150
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -583,7 +583,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -602,7 +602,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -622,7 +622,7 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -641,7 +641,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-mi300-1gpu-sglang]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
@@ -673,7 +673,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           # This directory persists across container restarts on the self-hosted runner
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
@@ -703,7 +703,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -725,7 +725,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -781,7 +781,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-mi300-2gpu-sglang]
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
@@ -813,7 +813,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Clear pre-built AITER kernels from Docker image to avoid segfaults
@@ -842,7 +842,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -864,7 +864,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 150
+        timeout-minutes: 300
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -920,7 +920,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: linux-mi325-1gpu-sglang
+    runs-on: linux-mi300-1gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -976,7 +976,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-4gpu-sglang]
+        runner: [linux-mi300-4gpu-sglang]
         part: [0]
     runs-on: ${{matrix.runner}}
     steps:
@@ -997,7 +997,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e NCCL_CUMEM_ENABLE=0 \
@@ -1030,11 +1030,11 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi325-8gpu-sglang
+      RUNNER_LABELS: linux-mi300-8gpu-sglang
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-8gpu-sglang]
+        runner: [linux-mi300-8gpu-sglang]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
@@ -1054,13 +1054,13 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Test RCCL multi-GPU communication
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           echo "Testing RCCL multi-GPU communication with debug info..."
           docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/amd/test_rccl_multi_gpu.py"
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 240
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
 
