@@ -299,43 +299,72 @@ fi
 if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
-    # uninstall existing aiter
-    docker exec ci_sglang pip uninstall -y amd-aiter || true
-
-    # delete old aiter directory
-    docker exec ci_sglang rm -rf /sgl-workspace/aiter
-
-    # clone a fresh copy to /sgl-workspace/aiter
-    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
-
-    # checkout correct version and install requirements
-    # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
-    # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does
-    # not block switching to commits that predate that rule. The working tree
-    # was just produced by `rm -rf` + fresh `git clone` above, so there are no
-    # real user changes to preserve.
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        git fetch --all && \
-        git checkout -f ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive && \
-        pip install -r requirements.txt
-    "
-
-    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-        GPU_ARCH_LIST="gfx950"
-    else
-        GPU_ARCH_LIST="gfx942"
+    # Clone + verify the target commit is reachable BEFORE touching the AITER
+    # that shipped in the image. This block used to uninstall aiter and
+    # `rm -rf` its checkout first, then `git checkout -f <commit>`. A commit
+    # that is not reachable in ROCm/aiter (a stale `aiter_ref` dispatch
+    # override, or a fork-only SHA) makes that checkout die with
+    # `fatal: reference is not a tree` (git exit 128) under `set -e`, which
+    # leaves the container with NO aiter at all -- so every aiter-dependent
+    # test then fails with a confusing `ModuleNotFoundError: No module named
+    # 'aiter'`. Verifying first keeps the working image aiter intact when the
+    # requested commit is bad.
+    docker exec ci_sglang rm -rf /sgl-workspace/aiter.new
+    AITER_COMMIT_OK=1
+    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter.new || AITER_COMMIT_OK=0
+    if [[ "${AITER_COMMIT_OK}" == "1" ]]; then
+        # `git fetch --all --tags` so commits on any branch/tag are present,
+        # then confirm the target resolves to a real commit object.
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter.new && \
+            git fetch --all --tags --quiet && \
+            git cat-file -e '${REPO_AITER_COMMIT}^{commit}'
+        " || AITER_COMMIT_OK=0
     fi
-    echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # build AITER
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
-    "
+    if [[ "${AITER_COMMIT_OK}" != "1" ]]; then
+        docker exec ci_sglang rm -rf /sgl-workspace/aiter.new || true
+        if [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]]; then
+            echo "[CI-AITER-CHECK] ERROR: AITER commit '${REPO_AITER_COMMIT}' is not reachable in https://github.com/ROCm/aiter.git and the image ships no AITER to fall back to."
+            echo "[CI-AITER-CHECK] Fix the aiter_ref override or the AITER_COMMIT_DEFAULT in docker/rocm.Dockerfile."
+            exit 1
+        fi
+        echo "[CI-AITER-CHECK] WARNING: AITER commit '${REPO_AITER_COMMIT}' is not reachable in https://github.com/ROCm/aiter.git."
+        echo "[CI-AITER-CHECK] Keeping the AITER already installed in the image (${IMAGE_AITER_VERSION}) so aiter-dependent tests still run. Fix the aiter_ref override or the AITER_COMMIT_DEFAULT in docker/rocm.Dockerfile."
+    else
+        # Target commit verified reachable -> safe to replace the working AITER.
+        docker exec ci_sglang pip uninstall -y amd-aiter || true
+        docker exec ci_sglang rm -rf /sgl-workspace/aiter
+        docker exec ci_sglang mv /sgl-workspace/aiter.new /sgl-workspace/aiter
 
-    echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
+        # checkout correct version and install requirements
+        # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
+        # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does
+        # not block switching to commits that predate that rule. The working tree
+        # was just produced by a fresh `git clone` above, so there are no real
+        # user changes to preserve.
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            git checkout -f ${REPO_AITER_COMMIT} && \
+            git submodule update --init --recursive && \
+            pip install -r requirements.txt
+        "
+
+        if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+            GPU_ARCH_LIST="gfx950"
+        else
+            GPU_ARCH_LIST="gfx942"
+        fi
+        echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
+
+        # build AITER
+        docker exec ci_sglang bash -c "
+            cd /sgl-workspace/aiter && \
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        "
+
+        echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
+    fi
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
