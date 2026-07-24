@@ -1408,22 +1408,34 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # Qwen3.5 ModelOpt checkpoints keep the embedded MTP model in BF16.
+            preserve_online_draft_quantization = (
+                self.quantization == "nvfp4_online"
+                and self.is_draft_model
+                and "Qwen3_5ForCausalLMMTP"
+                in (getattr(self.hf_config, "architectures", None) or [])
+                and getattr(self.hf_text_config, "model_type", None)
+                == "qwen3_5_moe_text"
+                and quant_method == "modelopt_fp4"
+            )
+
             # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            if not preserve_online_draft_quantization:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]
