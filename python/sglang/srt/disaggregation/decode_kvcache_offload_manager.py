@@ -54,6 +54,11 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        # Only UMBP ("mori") needs its hugepage-backed allocator (for
+        # RegisterRdmaMemoryRegion); other backends use the default mmap one.
+        allocator_type = (
+            "mori" if server_args.hicache_storage_backend == "mori" else "default"
+        )
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
                 kv_cache,
@@ -61,6 +66,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
@@ -69,6 +75,7 @@ class DecodeKVCacheOffloadManager:
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                allocator_type=allocator_type,
             )
         else:
             raise ValueError("Unsupported KV cache type for decode offload")
