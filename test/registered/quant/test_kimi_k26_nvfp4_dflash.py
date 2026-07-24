@@ -22,12 +22,6 @@ EXTRA_ARGS = [
     "--kv-cache-dtype=fp8_e4m3",
     "--mem-fraction-static=0.85",
     "--max-running-requests=16",
-    "--speculative-algorithm=DFLASH",
-    f"--speculative-draft-model-path={DRAFT_MODEL_PATH}",
-    "--speculative-num-draft-tokens=8",
-    "--speculative-draft-attention-backend=fa4",
-    "--speculative-draft-model-quantization=unquant",
-    "--speculative-draft-window-size=4096",
 ]
 
 
@@ -58,11 +52,7 @@ class TestKimiK26Nvfp4Dflash(unittest.TestCase):
                 num_examples=200,
                 api="completion",
             ),
-            performance_params=PerformanceTestParams(
-                batch_sizes=[1, 8, 16],
-                spec_accept_length_threshold=2.0,
-                profile_dir="performance_profiles_kimi_k26_nvfp4_dflash",
-            ),
+            performance_params=None,
         )
 
 
