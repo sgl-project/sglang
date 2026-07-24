@@ -19,12 +19,29 @@ from sglang.srt.disaggregation.mori.conn import (
     TransferInfo,
     _select_rank_local_ib_device,
 )
+from sglang.srt.managers.hisparse_coordinator import (
+    _align_host_pages_for_hugepage,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMoriHiSparseTransfer(unittest.TestCase):
+    def test_host_pages_align_to_hugetlb_registration(self):
+        original_pages = 3_098_880
+        aligned_pages = _align_host_pages_for_hugepage(
+            original_pages, item_bytes=1024, hugepage_size="2MB"
+        )
+        self.assertGreaterEqual(aligned_pages, original_pages)
+        self.assertEqual(aligned_pages % 2048, 0)
+        self.assertEqual(
+            _align_host_pages_for_hugepage(
+                original_pages, item_bytes=1024, hugepage_size=""
+            ),
+            original_pages,
+        )
+
     def test_rank_local_rdma_device_selection(self):
         devices = ",".join(f"ionic_{i}" for i in range(8))
         self.assertEqual(

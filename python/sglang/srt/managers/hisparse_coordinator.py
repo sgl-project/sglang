@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import math
 from typing import List, NamedTuple, Union
 
 import torch
@@ -29,6 +30,20 @@ device_module = get_device_module()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _align_host_pages_for_hugepage(
+    num_host_pages: int, item_bytes: int, hugepage_size: str
+) -> int:
+    if (hugepage_size or "").strip().upper() != "2MB":
+        return num_host_pages
+    hugepage_bytes = 2 * 1024 * 1024
+    rows_per_alignment = hugepage_bytes // math.gcd(hugepage_bytes, item_bytes)
+    return (
+        (num_host_pages + rows_per_alignment - 1)
+        // rows_per_alignment
+        * rows_per_alignment
+    )
 
 
 class HiSparseAct(NamedTuple):
@@ -86,6 +101,8 @@ class HiSparseCoordinator:
         if self.is_dsv4_hisparse:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
+            item_bytes = self.mem_pool_device.bytes_per_page_padded
+            server_args = get_server_args()
             # Host cold-pool sizing (unified-KV / dsv4 path): the host pool is
             # bound to size_full/compress_ratio -- a mirror of the GPU full-token
             # c4 budget, not an independent expansion into host RAM.
@@ -101,7 +118,20 @@ class HiSparseCoordinator:
                 + page_size
                 - 1
             ) // page_size
-            server_args = get_server_args()
+            if server_args.disaggregation_transfer_backend == "mori":
+                aligned_num_host_pages = _align_host_pages_for_hugepage(
+                    num_host_pages,
+                    item_bytes,
+                    envs.SGLANG_HUGEPAGE_SIZE.get(),
+                )
+                if aligned_num_host_pages != num_host_pages:
+                    logger.info(
+                        "Aligned DSV4 HiSparse host pages %d -> %d for 2MiB "
+                        "MoRI registrations",
+                        num_host_pages,
+                        aligned_num_host_pages,
+                    )
+                    num_host_pages = aligned_num_host_pages
             host_register_chunk_bytes = (
                 envs.SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES.get()
                 if server_args.disaggregation_transfer_backend == "mori"
@@ -110,7 +140,7 @@ class HiSparseCoordinator:
             self.mem_pool_host = DeepSeekV4PagedHostPool(
                 pool_name="dsv4_hisparse_c4",
                 device_buffers=self.mem_pool_device.kv_buffer,
-                item_bytes=self.mem_pool_device.bytes_per_page_padded,
+                item_bytes=item_bytes,
                 num_host_pages=num_host_pages,
                 slot_page_size=page_size,
                 layout="layer_first",
