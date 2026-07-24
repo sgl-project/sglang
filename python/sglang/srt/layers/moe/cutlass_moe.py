@@ -18,7 +18,7 @@ if _is_cuda:
         shuffle_rows,
     )
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import silu_and_mul
 
 
 def cutlass_fused_experts_fp8(

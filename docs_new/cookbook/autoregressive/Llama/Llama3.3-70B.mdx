@@ -24,9 +24,11 @@ For more details, please refer to the [official Llama models repository](https:/
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
-This section provides deployment configurations optimized for AMD GPUs (MI300X, MI325X, MI355X).
+This section provides deployment configurations optimized for AMD GPUs (MI300X, MI325X, MI355X) and Intel Xeon CPUs.
 
 ### 3.1 Interactive Configuration
 
@@ -44,6 +46,10 @@ import { Llama33Deployment } from "/src/snippets/autoregressive/llama33-70b-depl
 - **FP8 Model Variant**: Use AMD's optimized `amd/Llama-3.3-70B-Instruct-FP8-KV`
 - **Tool Calling**: Enable with `--tool-call-parser llama3` for function calling support
 - **Higher Throughput**: Optional TP=2 or TP=4 can be used for increased throughput
+
+**Xeon CPU Deployment:**
+
+Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

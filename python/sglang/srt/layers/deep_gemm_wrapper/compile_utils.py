@@ -436,7 +436,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # in-seq-split). _dummy_run does not pad q/hidden like the real flow, so
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
     from sglang.srt.utils.common import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count

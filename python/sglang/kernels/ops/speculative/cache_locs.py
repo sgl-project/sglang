@@ -259,6 +259,74 @@ def filter_finished_cache_loc_kernel(
 
 
 @triton.jit
+def rebuild_compact_draft_req_to_token(
+    draft_req_to_token,
+    target_req_to_token,
+    req_pool_indices,
+    suffix_start,
+    draft_prefix_lens,
+    verify_out_cache_loc,
+    verify_loc_stride,
+    draft_pool_len: tl.constexpr,
+    target_pool_len: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Rebuild one request's draft-local compact req->token row in a single pass.
+
+    Row layout written: [0, prefix_len) = the committed target suffix window
+    (target_req_to_token[req, suffix_start : suffix_start + prefix_len]) and
+    [prefix_len, prefix_len + block_size) = the verify block slots. Fixed grid,
+    per-row data-dependent loop bound; no host reads, so the caller never syncs.
+    """
+    BLOCK: tl.constexpr = 256
+    pid = tl.program_id(axis=0)
+    req = tl.load(req_pool_indices + pid).to(tl.int64)
+    start = tl.load(suffix_start + pid).to(tl.int64)
+    prefix_len = tl.load(draft_prefix_lens + pid).to(tl.int64)
+    total = prefix_len + block_size
+
+    src_row = target_req_to_token + req * target_pool_len
+    dst_row = draft_req_to_token + req * draft_pool_len
+    verify_row = verify_out_cache_loc + pid * verify_loc_stride
+
+    offs = tl.arange(0, BLOCK).to(tl.int64)
+    num_loop = tl.cdiv(total, BLOCK)
+    for i in range(num_loop):
+        col = offs + i * BLOCK
+        in_prefix = col < prefix_len
+        in_block = (col >= prefix_len) & (col < total)
+        src = tl.load(src_row + start + col, mask=in_prefix, other=0)
+        blk = tl.load(verify_row + (col - prefix_len), mask=in_block, other=0)
+        val = tl.where(in_prefix, src, blk)
+        tl.store(dst_row + col, val, mask=in_prefix | in_block)
+
+
+def rebuild_compact_draft_req_to_token_func(
+    *,
+    draft_req_to_token: torch.Tensor,
+    target_req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    suffix_start: torch.Tensor,
+    draft_prefix_lens: torch.Tensor,
+    verify_out_cache_loc_2d: torch.Tensor,
+    batch_size: int,
+    block_size: int,
+) -> None:
+    rebuild_compact_draft_req_to_token[(batch_size,)](
+        draft_req_to_token,
+        target_req_to_token,
+        req_pool_indices,
+        suffix_start,
+        draft_prefix_lens,
+        verify_out_cache_loc_2d,
+        verify_out_cache_loc_2d.stride(0),
+        draft_req_to_token.shape[1],
+        target_req_to_token.shape[1],
+        block_size,
+    )
+
+
+@triton.jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,

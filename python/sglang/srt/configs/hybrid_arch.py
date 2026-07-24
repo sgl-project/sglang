@@ -6,6 +6,8 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InklingMMConfig,
+    InklingModelConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -76,6 +78,11 @@ def mamba2_config(model_config: ModelConfig):
         | ZayaConfig,
     ):
         return config
+    if isinstance(config, InklingModelConfig):
+        return config if config.mamba2_cache_params is not None else None
+    if isinstance(config, InklingMMConfig):
+        text_config = config.text_config
+        return text_config if text_config.mamba2_cache_params is not None else None
     if isinstance(config, NemotronH_Nano_VL_V2_Config):
         return config.llm_config
 

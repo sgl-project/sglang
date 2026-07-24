@@ -9,7 +9,12 @@ import zmq
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import BackupDramReq, sock_recv, sock_send
+from sglang.srt.managers.io_struct import (
+    BackupDramReq,
+    ExpertWeightPointer,
+    sock_recv,
+    sock_send,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.server_args import (
@@ -128,15 +133,10 @@ class ExpertBackupManager:
                 end_byte = current_byte_offset + byte_size
                 weight_ptr = buffer_base_ptr + current_byte_offset
                 self.continuous_buffer[start_byte:end_byte].copy_(weight_bytes)
-                self.weight_pointer_map[name] = {
-                    "name": name,
-                    "weight_ptr": weight_ptr,
-                    "shape": weight_info["shape"],
-                    "numel": weight_info["numel"],
-                    "dtype": weight_info["dtype"],
-                    "element_size": weight_info["element_size"],
-                    "byte_size": byte_size,
-                }
+                self.weight_pointer_map[name] = ExpertWeightPointer(
+                    weight_ptr=weight_ptr,
+                    byte_size=byte_size,
+                )
 
                 current_byte_offset = end_byte
 

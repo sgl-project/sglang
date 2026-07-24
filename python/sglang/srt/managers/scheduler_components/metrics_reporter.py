@@ -304,6 +304,8 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
                 prefill_q.add(len(req.origin_input_ids))
+            for req in self.scheduler.waiting_queue:
+                prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
                 decode_q.add(req.seqlen)
@@ -635,7 +637,17 @@ class SchedulerMetricsReporter:
             )
 
             # Basics
-            self.stats.num_running_reqs = prefill_stats.num_running_reqs
+            if (
+                self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+                and batch is not None
+            ):
+                # running_batch is never populated in PD prefill, so count the
+                # current forward batch instead.
+                self.stats.num_running_reqs = QueueCount.from_reqs(
+                    batch.reqs, priority_enabled
+                )
+            else:
+                self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
@@ -1090,9 +1102,18 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
+        if not self.current_scheduler_metrics_enabled:
+            return
+        # The running-reqs gauge holds the last batch report until the next
+        # one (on PD prefill that is the last forward-batch snapshot, which
+        # no later report zeroes). If it disagrees with running_batch -- the
+        # true idle value -- publish now instead of waiting out the window.
+        gauge_stale = self.stats.num_running_reqs.total != len(
+            self.scheduler.running_batch.reqs
+        )
         if (
-            not self.current_scheduler_metrics_enabled
-            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not gauge_stale
+            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 
