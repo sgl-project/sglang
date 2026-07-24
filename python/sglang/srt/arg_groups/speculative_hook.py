@@ -649,9 +649,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:
-    if server_args.device not in ("cuda", "cpu"):
+    if server_args.device not in ("cuda", "cpu", "xpu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA or CPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
