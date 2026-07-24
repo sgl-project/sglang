@@ -19,8 +19,10 @@ from __future__ import annotations
 import logging
 import sys
 from array import array
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
@@ -47,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    InsertStepResult,
     NodeId,
     UnifiedTreeCoreInterface,
 )
@@ -277,6 +280,30 @@ class UnifiedLRUList:
         return self.get_prev_no_host_lock(self.tail, check_id=False)
 
 
+# WALK (one node per step) -> COMMIT (leaf + commit hooks) -> TAIL (refresh + backup).
+class _InsertPhase(Enum):
+    WALK = auto()
+    COMMIT = auto()
+    TAIL = auto()
+
+
+class _InsertWalkState(msgspec.Struct):
+    """In-flight resumable-insert state persisted across step barriers."""
+
+    phase: _InsertPhase
+    node: UnifiedTreeNode
+    key: RadixKey
+    value: torch.Tensor
+    params: InsertParams
+    priority: int
+    total_prefix_length: int = 0
+    is_new_leaf: bool = False
+    target_node: Optional[UnifiedTreeNode] = None
+    result: Optional[InsertResult] = None
+    # Emitted actions awaiting the next barrier flush (or the final step).
+    pending_actions: list[CacheAction | ComponentAction] = []
+
+
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
     """The radix tree mechanism: owns the tree structure, per-node values, the
     per-component LRUs, the size/leaf bookkeeping, and the component drivers,
@@ -330,6 +357,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         match result."""
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+
+        # The single in-flight resumable insert, if suspended at a barrier.
+        self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -669,7 +699,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and node.hit_count >= self.write_through_threshold
         )
 
-    def insert(self, params: InsertParams) -> InsertResult:
+    def begin_insert(self, params: InsertParams) -> InsertStepResult:
+        """Start the insert, running to its first barrier or completion."""
+        # Insert walks are single-flight; a live walk means re-entrancy.
+        assert self._ongoing_insert_walk_state is None, "concurrent insert walks"
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -678,123 +711,175 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             value = value[: len(key)]
         else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
-        return self._insert_helper(self.root_node, key, value, params)
 
-    def _insert_helper(
-        self,
-        node: UnifiedTreeNode,
-        key: RadixKey,
-        value: torch.Tensor,
-        params: InsertParams,
-    ) -> InsertResult:
         priority = params.priority
         if priority is None:
             priority = 0
-        self._touch_node(node)
-        node.priority = max(node.priority, priority)
+        self._touch_node(self.root_node)
+        self.root_node.priority = max(self.root_node.priority, priority)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            return InsertStepResult(
+                actions=[], result=InsertResult(prefix_len=0, mamba_exist=True)
+            )
 
-        child_key = key.child_key(self.page_size)
-        total_prefix_length = 0
-        cache_actions: list[CacheAction | ComponentAction] = []
-        # Deepest threshold-crossing walked node; its chain covers shallower ones.
-        backup_node: Optional[UnifiedTreeNode] = None
-        # Collect unreferenced device KV values during the walk.
-        device_kv_to_free: list[torch.Tensor] = []
-        while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
-            self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
-            if prefix_len < len(node.key):
-                node, action = self._split_node(node.key, node, prefix_len)
-                if action is not None:
-                    cache_actions.append(action)
-            node.priority = max(node.priority, priority)
+        self._ongoing_insert_walk_state = _InsertWalkState(
+            phase=_InsertPhase.WALK,
+            node=self.root_node,
+            key=key,
+            value=value,
+            params=params,
+            priority=priority,
+        )
+        return self._advance_insert()
 
-            if node.evicted:
-                self._unevict_node_on_insert(node, value[:prefix_len])
-                # FULL was restored from the request's fresh KV. Aux
-                # components (e.g. SWA) may still hold tombstones and need
-                # to rebuild their value from the same slice.
-                for component in self.components:
-                    if component.component_type == BASE_COMPONENT_TYPE:
-                        continue
-                    component.recover_after_unevict(
-                        node=node,
-                        prefix_len=prefix_len,
-                        total_prefix_len=total_prefix_length,
-                        params=params,
-                        cache_actions=cache_actions,
-                    )
+    def resume_insert(self) -> InsertStepResult:
+        """Continue the suspended insert after its step actions were executed."""
+        assert self._ongoing_insert_walk_state is not None, "no in-flight insert"
+        return self._advance_insert()
+
+    def has_ongoing_insert(self) -> bool:
+        """Whether an insert walk is suspended at a barrier."""
+        return self._ongoing_insert_walk_state is not None
+
+    def end_insert(self) -> list[CacheAction | ComponentAction]:
+        """Finish the insert (idempotent); returns still-pending actions to drain."""
+        state = self._ongoing_insert_walk_state
+        self._ongoing_insert_walk_state = None
+        return state.pending_actions if state is not None else []
+
+    def _advance_insert(self) -> InsertStepResult:
+        """Run the in-flight insert to its next barrier or to completion."""
+        state = self._ongoing_insert_walk_state
+        while True:
+            flushed_len = len(state.pending_actions)
+            if state.phase is _InsertPhase.WALK:
+                self._insert_walk_step(state)
+            elif state.phase is _InsertPhase.COMMIT:
+                self._insert_commit_step(state)
+            elif state.phase is _InsertPhase.TAIL:
+                self._insert_tail_step(state)
+                self._ongoing_insert_walk_state = None
+                return InsertStepResult(
+                    actions=state.pending_actions, result=state.result
+                )
             else:
-                value_slice = value[:prefix_len]
-                consumed_from = prefix_len
-                # Let each component claim ownership of overlapping KV slots
-                for component in self.components:
-                    comp_consumed_from = component.update_component_on_insert_overlap(
-                        node=node,
-                        prefix_len=prefix_len,
-                        total_prefix_len=total_prefix_length,
-                        value_slice=value_slice,
-                        params=params,
-                        cache_actions=cache_actions,
-                    )
-                    consumed_from = min(consumed_from, comp_consumed_from)
+                raise AssertionError(f"unsupported insert phase: {state.phase}")
+            new_actions = state.pending_actions[flushed_len:]
+            # Suspend only at true barriers: any action whose execution the
+            # remaining walk depends on; fire-and-forget actions keep batching.
+            if new_actions and not all(map(self._is_deferrable_action, new_actions)):
+                flushed = state.pending_actions
+                state.pending_actions = []
+                return InsertStepResult(actions=flushed)
 
-                dup_start = max(0, params.prev_prefix_len - total_prefix_length)
-                if dup_start < consumed_from:
-                    device_kv_to_free.append(value_slice[dup_start:consumed_from])
+    @staticmethod
+    def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
+        """Fire-and-forget actions safe to batch until the next barrier."""
+        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
 
-            if self._inc_hit_count_and_check(node, params.chunked):
-                backup_node = node
-            total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+    def _insert_walk_step(self, state: _InsertWalkState) -> None:
+        """Process one walked node, appending its barrier actions to the state."""
+        key = state.key
+        child_key = key.child_key(self.page_size) if len(key) else None
+        if child_key not in state.node.children:
+            state.phase = _InsertPhase.COMMIT
+            return
+        step_actions = state.pending_actions
+        node = state.node.children[child_key]
+        self._touch_node(node)
+        prefix_len = node.key.match(key, page_size=self.page_size)
+        if prefix_len < len(node.key):
+            node, action = self._split_node(node.key, node, prefix_len)
+            if action is not None:
+                step_actions.append(action)
+        node.priority = max(node.priority, state.priority)
 
-        is_new_leaf = False
+        if node.evicted:
+            self._unevict_node_on_insert(node, state.value[:prefix_len])
+            # FULL was restored from the request's fresh KV. Aux
+            # components (e.g. SWA) may still hold tombstones and need
+            # to rebuild their value from the same slice.
+            for component in self.components:
+                if component.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                component.recover_after_unevict(
+                    node=node,
+                    prefix_len=prefix_len,
+                    total_prefix_len=state.total_prefix_length,
+                    params=state.params,
+                    cache_actions=step_actions,
+                )
+        else:
+            value_slice = state.value[:prefix_len]
+            consumed_from = prefix_len
+            # Let each component claim ownership of overlapping KV slots
+            for component in self.components:
+                comp_consumed_from = component.update_component_on_insert_overlap(
+                    node=node,
+                    prefix_len=prefix_len,
+                    total_prefix_len=state.total_prefix_length,
+                    value_slice=value_slice,
+                    params=state.params,
+                    cache_actions=step_actions,
+                )
+                consumed_from = min(consumed_from, comp_consumed_from)
+
+            dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
+            if dup_start < consumed_from:
+                step_actions.append(
+                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                )
+
+        if self._inc_hit_count_and_check(node, state.params.chunked):
+            step_actions.append(self._build_backup_kv_action(node))
+        state.node = node
+        state.total_prefix_length += prefix_len
+        state.key = key[prefix_len:]
+        state.value = state.value[prefix_len:]
+
+    def _insert_commit_step(self, state: _InsertWalkState) -> None:
+        """Create the tail leaf and run the component commit hooks."""
         # Create new leaf for remaining suffix. A leaf survives on its Full
         # value alone; auxiliary components (SWA, Mamba) may legitimately hold
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
-        if len(key):
-            target_node = self._add_new_node(node, key, value, priority=priority)
-            is_new_leaf = True
+        if len(state.key):
+            state.target_node = self._add_new_node(
+                state.node, state.key, state.value, priority=state.priority
+            )
+            state.is_new_leaf = True
         else:
-            target_node = node
+            state.target_node = state.node
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        if device_kv_to_free:
-            cache_actions.append(FreeDeviceKV(device_kv_to_free))
-        result = InsertResult(
-            prefix_len=total_prefix_length, cache_actions=cache_actions
-        )
-        # Defer the backup action for the walked nodes.
-        if backup_node is not None:
-            cache_actions.append(self._build_backup_kv_action(backup_node))
-
+        state.result = InsertResult(prefix_len=state.total_prefix_length)
         for component in self.components:
             component.commit_insert_component_data(
-                node=target_node,
-                is_new_leaf=is_new_leaf,
-                params=params,
-                result=result,
+                node=state.target_node,
+                is_new_leaf=state.is_new_leaf,
+                params=state.params,
+                result=state.result,
+                cache_actions=state.pending_actions,
             )
+        state.phase = _InsertPhase.TAIL
 
-        if target_node is not self.root_node:
+    def _insert_tail_step(self, state: _InsertWalkState) -> None:
+        """Refresh the LRUs and append the terminal new-leaf backup."""
+        if state.target_node is not self.root_node:
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
                     continue
                 component.refresh_lru(
-                    LRURefreshPhase.INSERT_END, target_node, self.root_node
+                    LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if is_new_leaf and self._inc_hit_count_and_check(target_node, params.chunked):
-            cache_actions.append(self._build_backup_kv_action(target_node))
-        return result
+        if state.is_new_leaf and self._inc_hit_count_and_check(
+            state.target_node, state.params.chunked
+        ):
+            state.pending_actions.append(
+                self._build_backup_kv_action(state.target_node)
+            )
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int

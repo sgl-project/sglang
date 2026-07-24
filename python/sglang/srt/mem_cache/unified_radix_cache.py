@@ -385,9 +385,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
-        result = self.tree_core.insert(params)
-        self._apply_cache_actions(result.cache_actions)
-        return result
+        # Fail fast on re-entrancy without touching the in-flight walk.
+        assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
+        # Pump the resumable insert: execute each barrier's actions at the
+        # tree's pause point so I/O lands where the pre-split code ran inline.
+        try:
+            step = self.tree_core.begin_insert(params)
+            while True:
+                self._apply_cache_actions(step.actions)
+                if step.result is not None:
+                    # Walk actions flow through the steps; the result is action-free.
+                    assert not step.result.cache_actions
+                    return step.result
+                step = self.tree_core.resume_insert()
+        finally:
+            # Drain still-pending actions so frees reach the allocator on abort.
+            self._apply_cache_actions(self.tree_core.end_insert())
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -764,8 +777,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup; a
-        failure is a deterministic host-space shortfall, so no intra-drain retry."""
+        """Run a backup action top-down, stopping at the first failed backup."""
         written = 0
         for node_id in action.node_ids:
             # Overlapping chain actions: skip already-backed nodes.

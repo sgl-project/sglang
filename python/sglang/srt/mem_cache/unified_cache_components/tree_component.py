@@ -226,6 +226,7 @@ class TreeComponent(ABC):
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Finalize component data on the target (leaf) node after the insert
         walk completes. Called once per insert.

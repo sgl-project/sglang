@@ -65,9 +65,9 @@ class BackupKV(msgspec.Struct, frozen=True):
 
 
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):
-    """Deferred per-path Mamba state-cap eviction from the tail's root path;
-    ordered after the insert's BackupKVs so in-flight write-through locks
-    shield the pending backup chain."""
+    """Per-path Mamba state-cap eviction from the tail's root path; applied at
+    the insert's commit barrier, after the walk-time backups whose
+    write-through locks shield the backed-up chain."""
 
     tail_node_id: NodeId
     component_type: ComponentType = ComponentType.MAMBA

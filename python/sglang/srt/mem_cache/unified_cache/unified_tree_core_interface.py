@@ -9,11 +9,22 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, Sequence
 
+import msgspec
+
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
+
+
+class InsertStepResult(msgspec.Struct, frozen=True):
+    """One step of a resumable insert: the Controller executes ``actions``, then
+    resumes while ``result`` is None; ``result`` is set on the final step."""
+
+    actions: list[CacheAction | ComponentAction]
+    result: Optional[InsertResult] = None
+
 
 if TYPE_CHECKING:
     import torch
@@ -234,8 +245,23 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def insert(self, params: InsertParams) -> InsertResult:
-        """Insert device values to the tree per the provided key."""
+    def begin_insert(self, params: InsertParams) -> InsertStepResult:
+        """Start the (single-flight) insert, running to its first barrier or completion."""
+        ...
+
+    @abstractmethod
+    def resume_insert(self) -> InsertStepResult:
+        """Continue the suspended insert after its step actions were executed."""
+        ...
+
+    @abstractmethod
+    def has_ongoing_insert(self) -> bool:
+        """Whether an insert walk is suspended at a barrier."""
+        ...
+
+    @abstractmethod
+    def end_insert(self) -> list[CacheAction | ComponentAction]:
+        """Finish the insert (idempotent); returns still-pending actions to drain."""
         ...
 
     @abstractmethod

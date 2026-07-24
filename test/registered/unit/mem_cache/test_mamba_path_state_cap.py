@@ -288,6 +288,32 @@ class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
         self.assertIsNotNone(leaf.component_data[ComponentType.MAMBA].host_value)
         cache.sanity_check()
 
+    def test_walk_backup_excludes_same_insert_restamped_mamba(self):
+        """The walked target's backup executes before commit hooks, so a mamba
+        value re-stamped by the same insert stays out of the host backup."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        mamba_comp = cache.components[ComponentType.MAMBA]
+
+        self._insert(cache, allocator, req_to_token_pool, [1, 2])
+        ancestor = next(iter(cache.root_node.children.values()))
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+
+        # The cap walk tombstones the ancestor's mamba state.
+        mamba_comp.mamba_max_states_per_path = 1
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
+        self.assertIsNone(ancestor.component_data[ComponentType.MAMBA].value)
+
+        # Re-inserting [1, 2] crosses the threshold and re-stamps the tombstone
+        # in the same insert; the backup must not carry the fresh mamba state.
+        cache.write_through_threshold = ancestor.hit_count + 1
+        self._insert(cache, allocator, req_to_token_pool, [1, 2])
+        cache.writing_check(write_back=True)
+
+        self.assertTrue(ancestor.backuped)
+        ancestor_cd = ancestor.component_data[ComponentType.MAMBA]
+        self.assertIsNotNone(ancestor_cd.value)
+        self.assertIsNone(ancestor_cd.host_value)
+
     def test_cap_walk_failure_still_drains_collected_frees(self):
         """A cap walk that raises mid-eviction must still free the tombstoned
         slots it already collected (the pre-split inline frees could not leak)."""

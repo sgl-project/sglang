@@ -173,6 +173,7 @@ class MambaComponent(TreeComponent):
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
         if is_new_leaf:
@@ -181,7 +182,7 @@ class MambaComponent(TreeComponent):
             self.tree_core.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
-            self._emit_excess_path_states_eviction(node, result)
+            self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -194,19 +195,21 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
-            self._emit_excess_path_states_eviction(node, result)
+            self._emit_excess_path_states_eviction(node, cache_actions)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
 
     def _emit_excess_path_states_eviction(
-        self, tail: UnifiedTreeNode, result: InsertResult
+        self,
+        tail: UnifiedTreeNode,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Defer the path-cap eviction so it runs after the insert's BackupKV."""
         if self.mamba_max_states_per_path < 0:
             return
-        result.cache_actions.append(MambaEvictExcessPathStates(tail.id))
+        cache_actions.append(MambaEvictExcessPathStates(tail.id))
 
     def _evict_excess_path_states(
         self,

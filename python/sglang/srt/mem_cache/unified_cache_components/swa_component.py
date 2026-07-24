@@ -269,6 +269,7 @@ class SWAComponent(TreeComponent):
         is_new_leaf: bool,
         params: InsertParams,
         result: InsertResult,
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         if not is_new_leaf:
             return
@@ -288,13 +289,13 @@ class SWAComponent(TreeComponent):
         # the in-window tail lands more-MRU.
         capped_parent = self._maybe_split_leaf_for_swa_lock(node)
         if capped_parent is not None:
-            result.cache_actions.append(
+            cache_actions.append(
                 SWARebuild(
                     capped_parent.id,
                     capped_parent.component_data[BASE_COMPONENT_TYPE].value,
                 )
             )
-        result.cache_actions.append(
+        cache_actions.append(
             SWARebuild(
                 node.id,
                 node.component_data[BASE_COMPONENT_TYPE].value,

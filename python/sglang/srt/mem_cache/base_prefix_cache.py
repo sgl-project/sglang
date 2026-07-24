@@ -83,7 +83,7 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
-    # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
+    # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
     )
