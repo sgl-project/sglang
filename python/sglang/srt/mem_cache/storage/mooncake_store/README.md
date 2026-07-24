@@ -305,6 +305,18 @@ python -m sglang.launch_server \
     --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_group_semantics": true}'
 ```
 
+**Failed-get negative cache:**
+
+Mooncake metadata can briefly outlive a failed or terminated data segment. To avoid repeatedly issuing a remote get that has just failed, the backend suppresses `batch_exists` hits for the failed physical key for one second. A successful put immediately clears the entry.
+
+Configure the TTL and memory bound through `--hicache-storage-backend-extra-config`:
+
+```bash
+--hicache-storage-backend-extra-config '{"failed_get_ttl_seconds": 1.0, "failed_get_cache_max_entries": 65536}'
+```
+
+Set `failed_get_ttl_seconds` to `0` to disable the cache. The cache is process-local, bounded, and affects performance only: a suppressed remote hit falls back to recomputation, so it cannot expose incomplete KV data.
+
 **HiCache Related Parameters for SGLang Server**
 
 For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.io/advanced_features/hicache_design.html#related-parameters).
