@@ -58,5 +58,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         with self.assertRaises(AttributeError):
             resolve_language_model(SimpleNamespace())
 
+
 if __name__ == "__main__":
     unittest.main()
