@@ -24,98 +24,23 @@ replay) → overlap and CUDA-graph safe. Copies are uint8 byte moves
 import triton
 import triton.language as tl
 
-EVICTED_SENTINEL: int = -1  # sentinel in req_to_token for evicted attention KV
-
-
-@triton.jit
-def dual_source_swap_in_kernel(
-    device_locs,        # [max_reqs, max_seq] GPU int32 — req_to_token, persistent
-    req_pool_indices,   # [padded_bs] GPU int64 — persistent
-    topk_indices,       # [padded_bs, TOPK] GPU int32 — from DSA indexer
-    host_locs,          # [max_reqs, max_seq] GPU int64 — token-level host indices
-    host_ptrs,          # [num_layers] GPU int64 — per-layer host base pointers
-    host_stride_t,      # [1] GPU int64 — bytes between consecutive host tokens
-    device_kv,          # GPU uint8 view — per-layer KV buffer
-    result,             # [padded_bs, TOPK] GPU int32 — output
-    temp_slots,         # [max_reqs, TOPK] GPU int64 — persistent
-    num_real_reqs,      # [1] GPU int32
-    layer_id,            # int (runtime scalar, fixed per captured launch)
-    device_locs_stride: tl.constexpr,
-    host_locs_stride: tl.constexpr,
-    device_kv_stride: tl.constexpr,   # bytes per device token row
-    TOPK: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
-):
-    """Cache-less reference kernel: every evicted top-k position DMAs
-    from host each call. Superseded in production by
-    swap_in_plan_kernel + swap_in_serve_kernel (stable-slot hit cache);
-    kept as the no-cache baseline for scripts/bench_swapin_kernels.py."""
-    rid = tl.program_id(0)
-    tid = tl.program_id(1)
-
-    real_bs = tl.load(num_real_reqs)
-    if rid >= real_bs:
-        tl.store(result + rid * TOPK + tid, -1)
-        return
-
-    req_idx = tl.load(req_pool_indices + rid)
-
-    topk_pos = tl.load(topk_indices + rid * TOPK + tid)
-    if topk_pos < 0:
-        tl.store(result + rid * TOPK + tid, -1)
-        return
-
-    gpu_idx = tl.load(device_locs + req_idx * device_locs_stride + topk_pos)
-
-    if gpu_idx >= 0:
-        # GPU hit: attention KV still on device
-        tl.store(result + rid * TOPK + tid, gpu_idx)
-        return
-
-    # Evicted: DMA from host to temp GPU slot
-    h_idx = tl.load(host_locs + req_idx * host_locs_stride + topk_pos)
-    if h_idx < 0:
-        tl.store(result + rid * TOPK + tid, -1)
-        return
-
-    t_idx = tl.load(temp_slots + req_idx * TOPK + tid)
-    if t_idx < 0:
-        tl.store(result + rid * TOPK + tid, -1)
-        return
-
-    host_base = tl.load(host_ptrs + layer_id)
-    if host_base == 0:
-        # Host pool not attached (e.g. during graph capture) — mask out.
-        tl.store(result + rid * TOPK + tid, -1)
-        return
-    host_kv = host_base.to(tl.pointer_type(tl.uint8))
-    host_kv_stride = tl.load(host_stride_t)
-
-    # Bit-exact byte copy: host pinned row -> device temp row
-    kv_offs = tl.arange(0, BLOCK_KV)
-    mask = kv_offs < device_kv_stride
-    src = tl.load(host_kv + h_idx * host_kv_stride + kv_offs, mask=mask, other=0)
-    tl.store(device_kv + t_idx * device_kv_stride + kv_offs, src, mask=mask)
-
-    tl.store(result + rid * TOPK + tid, t_idx.to(tl.int32))
-
 
 @triton.jit
 def swap_in_plan_kernel(
-    req_pool_indices,   # [padded_bs] GPU int64 — persistent
-    topk_indices,       # [padded_bs, TOPK] GPU int32 — from DSA indexer
-    device_locs,        # [max_reqs, max_seq] GPU int32 — req_to_token
-    host_locs,          # [max_reqs, max_seq] GPU int64 — token-level host indices
-    slot_pos,           # [max_reqs, LAYERS, NSLOT] int32 — resident position per
-                        #   device-buffer slot (-1 = empty), persistent, in-place
-    pos2slot,           # [max_reqs, max_seq] int32 — transient position→slot
-                        #   scratch, all -1 between calls (self-cleaning)
-    scratch,            # [max_reqs, 2*NSLOT + TOPK] int32 — transient scratch
-    plan,               # [max_reqs, TOPK] int32 — out: hit → slot,
-                        #   miss → slot + NSLOT, non-buffer → -1
-    num_real_reqs,      # [1] GPU int32
-    layer_id,           # int (runtime scalar, fixed per captured launch)
-    num_layers,         # int (runtime scalar)
+    req_pool_indices,  # [padded_bs] GPU int64 — persistent
+    topk_indices,  # [padded_bs, TOPK] GPU int32 — from DSA indexer
+    device_locs,  # [max_reqs, max_seq] GPU int32 — req_to_token
+    host_locs,  # [max_reqs, max_seq] GPU int64 — token-level host indices
+    slot_pos,  # [max_reqs, LAYERS, NSLOT] int32 — resident position per
+    #   device-buffer slot (-1 = empty), persistent, in-place
+    pos2slot,  # [max_reqs, max_seq] int32 — transient position→slot
+    #   scratch, all -1 between calls (self-cleaning)
+    scratch,  # [max_reqs, 2*NSLOT + TOPK] int32 — transient scratch
+    plan,  # [max_reqs, TOPK] int32 — out: hit → slot,
+    #   miss → slot + NSLOT, non-buffer → -1
+    num_real_reqs,  # [1] GPU int32
+    layer_id,  # int (runtime scalar, fixed per captured launch)
+    num_layers,  # int (runtime scalar)
     device_locs_stride: tl.constexpr,
     host_locs_stride: tl.constexpr,
     pos2slot_stride: tl.constexpr,
@@ -152,10 +77,10 @@ def swap_in_plan_kernel(
     rec = slot_pos + req_idx * num_layers * NSLOT + layer_id * NSLOT
     p2s = pos2slot + req_idx * pos2slot_stride
     flag_buf = scratch + req_idx * (2 * NSLOT + TOPK)  # retained flags
-    free_buf = flag_buf + NSLOT                        # compacted free slots
-    miss_buf = free_buf + NSLOT                        # compacted miss positions
+    free_buf = flag_buf + NSLOT  # compacted free slots
+    miss_buf = free_buf + NSLOT  # compacted miss positions
 
-    k = tl.arange(0, TOPK)   # lanes
+    k = tl.arange(0, TOPK)  # lanes
     s = tl.arange(0, NSLOT)  # slots
 
     pos = tl.load(topk_indices + rid * TOPK + k)
@@ -223,18 +148,18 @@ def swap_in_plan_kernel(
 
 @triton.jit
 def swap_in_serve_kernel(
-    device_locs,        # [max_reqs, max_seq] GPU int32 — req_to_token
-    req_pool_indices,   # [padded_bs] GPU int64
-    topk_indices,       # [padded_bs, TOPK] GPU int32
-    host_locs,          # [max_reqs, max_seq] GPU int64
-    host_ptrs,          # [num_layers] GPU int64
-    host_stride_t,      # [1] GPU int64
-    device_kv,          # GPU uint8 view — per-layer KV buffer
-    result,             # [padded_bs, TOPK] GPU int32 — output
-    temp_slots,         # [max_reqs, NSLOT] GPU int64 — SINGLE device buffer
-    plan,               # [max_reqs, TOPK] int32 — from swap_in_plan_kernel
-    num_real_reqs,      # [1] GPU int32
-    layer_id,           # int (runtime scalar)
+    device_locs,  # [max_reqs, max_seq] GPU int32 — req_to_token
+    req_pool_indices,  # [padded_bs] GPU int64
+    topk_indices,  # [padded_bs, TOPK] GPU int32
+    host_locs,  # [max_reqs, max_seq] GPU int64
+    host_ptrs,  # [num_layers] GPU int64
+    host_stride_t,  # [1] GPU int64
+    device_kv,  # GPU uint8 view — per-layer KV buffer
+    result,  # [padded_bs, TOPK] GPU int32 — output
+    temp_slots,  # [max_reqs, NSLOT] GPU int64 — SINGLE device buffer
+    plan,  # [max_reqs, TOPK] int32 — from swap_in_plan_kernel
+    num_real_reqs,  # [1] GPU int32
+    layer_id,  # int (runtime scalar)
     device_locs_stride: tl.constexpr,
     host_locs_stride: tl.constexpr,
     device_kv_stride: tl.constexpr,
@@ -297,5 +222,3 @@ def swap_in_serve_kernel(
     tl.store(device_kv + t_idx * device_kv_stride + kv_offs, src, mask=mask)
 
     tl.store(result + rid * TOPK + tid, t_idx.to(tl.int32))
-
-

@@ -237,22 +237,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     # Correct the base KV term to the real storage layout:
                     # the fp8 DSA pool row is calculate_mla_kv_cache_dim
-                    # wide (payload + scales + bf16 rope bytes), which the
-                    # generic (kv_lora_rank + qk_rope) term underestimates
-                    # (~656 vs 576 B/token/layer) — enough to overrun the
-                    # budget by ~7% at pool init.
-                    #
-                    # TODO(upstream): this underestimation is a pre-existing
-                    # upstream inaccuracy, NOT V2-specific — every
-                    # fp8_e4m3 DSA deployment (non-TRTLLM/HIP backends)
-                    # allocates 656 B/token/layer while budgeting 576, and
-                    # the overrun silently eats the (1 - mem_fraction)
-                    # activation headroom. The fix is gated on V2 here only
-                    # because correcting it globally shrinks existing
-                    # deployments' pools by ~7% (a behavior change for
-                    # configs tuned around the old bias). Upstream fix:
-                    # make _compute_cell_size use calculate_mla_kv_cache_dim
-                    # unconditionally for the MLA/DSA branch.
+                    # wide (payload + scales + bf16 rope), which the generic
+                    # (kv_lora_rank + qk_rope) term underestimates (~656 vs
+                    # 576 B/token/layer, a ~7% pool-budget overrun).
+                    # TODO(upstream): pre-existing inaccuracy for every fp8
+                    # DSA deployment; gated on V2 only because fixing it
+                    # globally shrinks existing pools (a behavior change).
                     real_kv_dim = calculate_mla_kv_cache_dim(
                         model_config=model_config,
                         kv_cache_dtype=kv_cache_dtype,
@@ -263,9 +253,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                     if real_kv_dim > base_kv_dim:
                         cell_size += (
-                            (real_kv_dim - base_kv_dim)
-                            * kv_size
-                            * effective_num_layers
+                            (real_kv_dim - base_kv_dim) * kv_size * effective_num_layers
                         )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool

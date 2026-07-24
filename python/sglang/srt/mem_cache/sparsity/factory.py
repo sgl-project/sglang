@@ -117,17 +117,14 @@ def parse_hisparse_config(server_args) -> SparseConfig:
 
 
 def hisparse_v2_expansion_ratio(server_args) -> float:
-    """Expanded indexer region size as a multiple of the attention pool
-    (in tokens): expanded_tokens = ratio * max_total_num_tokens.
+    """Expanded indexer region size as a multiple of the attention pool:
+    expanded_tokens = ratio * max_total_num_tokens.
 
-    Explicit override: hisparse_config {"expansion_ratio": R}. Default is
-    1 + hicache_ratio — admitted prefixes can span at most the device
-    pool (1x) plus what the host pool can hold of displaced attention KV
-    (hicache_ratio x), so a larger region is unreachable and a smaller
-    one makes the expanded region the binding constraint before host
-    capacity. Both DefaultPoolConfigurator (budget cell) and
-    KVCacheConfigurator (index_buf_size) MUST derive from this single
-    helper, or the capacity accounting splits (P1-2 class bug).
+    Override via hisparse_config {"expansion_ratio": R}; default
+    1 + hicache_ratio (admitted prefixes can span at most device + host
+    capacity). DefaultPoolConfigurator (budget cell) and
+    KVCacheConfigurator (index_buf_size) MUST both derive from this
+    helper, or the capacity accounting splits.
     """
     cfg = _parse_sparse_config(server_args)
     ratio = cfg.sparse_extra_config.get("expansion_ratio")
@@ -149,12 +146,9 @@ def hisparse_v2_expansion_ratio(server_args) -> float:
 
 def hisparse_v2_top_k(server_args, model_config) -> int:
     """The operative V2 decode top-k: the model's ``index_topk`` when
-    present (the coordinator sizes per-request temp slots with it and the
-    DSA backend selects that many positions), else hisparse_config.top_k.
-
-    Capacity sizing (coordinator overhead, max_running_requests clamp)
-    MUST use this same value — sizing from a diverging config top_k
-    underestimates coordinator memory and inflates the request clamp.
+    present, else hisparse_config.top_k. A config top_k that diverges
+    from the model's is rejected — the DSA indexer always selects
+    index_topk positions, which governs all capacity sizing.
     """
     cfg = _parse_sparse_config(server_args)
     model_top_k = getattr(model_config.hf_text_config, "index_topk", None)
@@ -173,28 +167,18 @@ def hisparse_v2_top_k(server_args, model_config) -> int:
 
 def hisparse_v2_device_buffer_tokens(server_args, model_config) -> int:
     """Per-request temp device-buffer size in tokens — V1's
-    ``device_buffer_size`` knob (hisparse_config field), but with a V2
-    default of ``top_k`` (1x): on hardware with ample host-DMA bandwidth
-    the 2x buffer showed no end-to-end gain and a regression on
-    near-pool-capacity workloads (see the doc's device_buffer_size A/B),
-    so V2 only grows the buffer when the field is set explicitly. V1
-    keeps its own 2*top_k parser default.
+    ``device_buffer_size`` knob, but defaulting to ``top_k`` (1x) for V2:
+    a larger buffer trades hit rate for per-request device footprint and
+    only pays off when host-DMA bandwidth is the bottleneck, so V2 grows
+    it only when set explicitly (V1 keeps its 2*top_k parser default).
 
-    This is the V2 request's lifetime device floor: admission allocates
-    this many regular-pool tokens and the swap-in hit cache retains
-    residents across steps in them. Capacity sizing (coordinator
-    overhead, max_running_requests clamp, scheduler reservation via
-    ``coordinator.temp_slot_tokens``) MUST derive from this same value.
-    The coordinator additionally validates page alignment and
-    power-of-2 (tl.arange slot vectors).
+    This is the request's lifetime device floor; all capacity sizing
+    MUST derive from this helper. The coordinator additionally validates
+    page alignment and power-of-2.
     """
     _parse_sparse_config(server_args)  # config validation (clear errors)
     top_k = hisparse_v2_top_k(server_args, model_config)
-    raw = (
-        json.loads(server_args.hisparse_config)
-        if server_args.hisparse_config
-        else {}
-    )
+    raw = json.loads(server_args.hisparse_config) if server_args.hisparse_config else {}
     explicit = raw.get("device_buffer_size")
     if explicit is None:
         return top_k

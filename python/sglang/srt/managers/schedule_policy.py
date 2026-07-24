@@ -671,12 +671,9 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # HiSparse V2: the admitted prefix is evictable (already counted
-        # in evictable_size()) and temp slots are already allocated (not
-        # in available_size) — but the REMAINING decode tail is
-        # request-owned and non-evictable, so it must stay reserved
-        # across rounds exactly like a standard request, or new prefills
-        # consume it and long generations retract/OOM.
+        # HiSparse V2 note: even though an admitted prefix is evictable, the
+        # remaining decode tail is request-owned and non-evictable — it must
+        # stay reserved here like any standard request (else retract/OOM).
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -841,9 +838,6 @@ class PrefillAdder:
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
-        # Callers pass the future-token reservation computed by
-        # self._future_token_policy (standard max_new, or the HiSparse V2
-        # admission-predicted amount — see _HiSparseV2FutureTokenPolicy).
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
@@ -1177,17 +1171,11 @@ class PrefillAdder:
         # retried) — unless the system is otherwise idle, where letting it
         # run standard is the progress guarantee (e.g. a request larger
         # than the whole expanded pool).
-        if (
-            self._future_token_policy.admission_exhausted(
-                len(req.full_untruncated_fill_ids), max_new
-            )
-            and (
-                len(self.can_run_list) > 0
-                or (
-                    self.running_batch is not None
-                    and self.running_batch.batch_size() > 0
-                )
-            )
+        if self._future_token_policy.admission_exhausted(
+            len(req.full_untruncated_fill_ids), max_new
+        ) and (
+            len(self.can_run_list) > 0
+            or (self.running_batch is not None and self.running_batch.batch_size() > 0)
         ):
             return AddReqResult.OTHER
         total_tokens = cand_extend_input_len + cand_future + self.page_size

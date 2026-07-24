@@ -155,32 +155,44 @@ class HiSparseV2Coordinator:
         # Temp GPU slots for attention KV DMA (per-request device buffer)
         self.temp_slots = torch.full(
             (max_num_req_slots, self.temp_slot_tokens),
-            -1, dtype=torch.int64, device=device,
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
         # Resident position per buffer slot (-1 = empty), per layer
         # (each layer's indexer selects its own top-k).
         self._slot_pos = torch.full(
             (max_num_req_slots, self.num_layers, self.temp_slot_tokens),
-            -1, dtype=torch.int32, device=device,
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         # Per-lane serve plan produced by swap_in_plan_kernel.
         self._plan = torch.full(
             (max_num_req_slots, self.top_k),
-            -1, dtype=torch.int32, device=device,
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         # Transient position→slot mapping (shared across layers; the
         # plan kernel self-cleans it back to -1) + small per-call
         # compaction scratch.
         self._pos2slot = torch.full(
             (max_num_req_slots, max_context_len),
-            -1, dtype=torch.int32, device=device,
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         self._plan_scratch = torch.zeros(
             (max_num_req_slots, 2 * self.temp_slot_tokens + self.top_k),
-            dtype=torch.int32, device=device,
+            dtype=torch.int32,
+            device=device,
         )
         self.top_k_device_locs_buffer = torch.full(
-            (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device,
+            (max_num_req_slots, self.top_k),
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -189,7 +201,9 @@ class HiSparseV2Coordinator:
         # falls back to this tensor for the host index.
         self._host_locs = torch.full(
             (max_num_req_slots, max_context_len),
-            -1, dtype=torch.int64, device=device,
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
 
         # Eviction queue — callback enqueues precomputed masks,
@@ -203,8 +217,11 @@ class HiSparseV2Coordinator:
         expanded_count = total_indexer_pages - expanded_start
         logger.info(
             "HiSparse V2: indexer buffer %d total pages, %d expanded (%.1f MB/layer)",
-            total_indexer_pages, expanded_count,
-            expanded_count * token_to_kv_pool.index_k_with_scale_buffer[0].shape[1] / 1e6,
+            total_indexer_pages,
+            expanded_count,
+            expanded_count
+            * token_to_kv_pool.index_k_with_scale_buffer[0].shape[1]
+            / 1e6,
         )
         self._indexer_page_allocator = _SimplePageAllocator(expanded_count, device)
         self._indexer_page_offset = expanded_start
@@ -212,7 +229,9 @@ class HiSparseV2Coordinator:
         # Per-request expanded indexer page table (-1 = use original page)
         self.req_to_indexer_page = torch.full(
             (max_num_req_slots, max_pages_per_req),
-            -1, dtype=torch.int32, device=device,
+            -1,
+            dtype=torch.int32,
+            device=device,
         )
 
         self.tp_group = tp_group
@@ -244,9 +263,7 @@ class HiSparseV2Coordinator:
                 self._host_kv_cache = host_pool
             tree_cache._hisparse_v2_on_evict = self._on_node_evicted
             tree_cache._hisparse_v2_node_active = self._node_backs_active_request
-            self._host_capacity_tokens = int(
-                getattr(cc.mem_pool_host, "size", 0)
-            )
+            self._host_capacity_tokens = int(getattr(cc.mem_pool_host, "size", 0))
 
             # Publish host base pointers + row stride for the swap-in kernel.
             refs = self._host_kv_cache.data_refs
@@ -259,7 +276,8 @@ class HiSparseV2Coordinator:
             self._host_stride_t.fill_(u8[0].stride(0))
             logger.info(
                 "HiSparse V2: host pool attached, %d layers, row stride %d bytes",
-                len(u8), u8[0].stride(0),
+                len(u8),
+                u8[0].stride(0),
             )
 
     def set_decode_producer_stream(self, stream) -> None:
@@ -312,12 +330,15 @@ class HiSparseV2Coordinator:
             logger.warning(
                 "admit_request: indexer page alloc failed for req_pool_idx=%d "
                 "(need %d pages, %d available)",
-                req_pool_idx, num_pages, self._indexer_page_allocator.available(),
+                req_pool_idx,
+                num_pages,
+                self._indexer_page_allocator.available(),
             )
             return False
 
         # Temp device buffer for attention KV swap-in (whole pages)
         from sglang.srt.mem_cache.common import evict_from_tree_cache
+
         evict_from_tree_cache(self.tree_cache, self.temp_slot_tokens)
         temp = self.token_to_kv_pool_allocator.alloc(self.temp_slot_tokens)
         if temp is None:
@@ -331,12 +352,12 @@ class HiSparseV2Coordinator:
         actual_pages = new_pages + self._indexer_page_offset
 
         token_indices = self.req_to_token_pool.req_to_token[req_pool_idx, :tree_len]
-        orig_pages = (token_indices[::self.page_size] // self.page_size).long()
+        orig_pages = (token_indices[:: self.page_size] // self.page_size).long()
         for layer_buf in self.token_to_kv_pool.index_k_with_scale_buffer:
             layer_buf[actual_pages.long()] = layer_buf[orig_pages]
 
         self.req_to_indexer_page[req_pool_idx, :num_pages] = actual_pages
-        self.temp_slots[req_pool_idx, :self.temp_slot_tokens] = temp.to(torch.int64)
+        self.temp_slots[req_pool_idx, : self.temp_slot_tokens] = temp.to(torch.int64)
         self._slot_pos[req_pool_idx] = -1
         self._host_locs[req_pool_idx] = -1
         self._active_reqs[req_pool_idx] = tree_len
@@ -379,9 +400,7 @@ class HiSparseV2Coordinator:
 
         idx = req_pool_indices.long()
         num_tokens = num_pages * self.page_size
-        firsts = self.req_to_token_pool.req_to_token[
-            idx, :num_tokens:self.page_size
-        ]
+        firsts = self.req_to_token_pool.req_to_token[idx, : num_tokens : self.page_size]
         orig_pages = firsts // self.page_size
         exp_pages = self.req_to_indexer_page[idx, :num_pages]
         table = torch.where((firsts < 0) & (exp_pages >= 0), exp_pages, orig_pages)
@@ -507,7 +526,7 @@ class HiSparseV2Coordinator:
         # clone() is required: allocator.free() may defer the free into a
         # free-group that holds a reference, and we overwrite the buffer
         # with -1 right below — freeing a view would free page -1.
-        temp = self.temp_slots[req_pool_idx, :self.temp_slot_tokens].clone()
+        temp = self.temp_slots[req_pool_idx, : self.temp_slot_tokens].clone()
         self.token_to_kv_pool_allocator.free(temp)
         self.temp_slots[req_pool_idx] = -1
         # (_slot_pos is left stale: only V2-active rows are consumed by the
@@ -516,9 +535,7 @@ class HiSparseV2Coordinator:
         pages = self.req_to_indexer_page[req_pool_idx]
         valid_pages = pages[pages >= 0]
         if len(valid_pages) > 0:
-            self._indexer_page_allocator.free(
-                valid_pages - self._indexer_page_offset
-            )
+            self._indexer_page_allocator.free(valid_pages - self._indexer_page_offset)
         self.req_to_indexer_page[req_pool_idx] = -1
         self._host_locs[req_pool_idx] = -1
 
