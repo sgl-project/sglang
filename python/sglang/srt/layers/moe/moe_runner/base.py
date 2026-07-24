@@ -161,7 +161,10 @@ class PermuteMethodPool:
         :param runner_backend_name: The MoeRunnerBackend name.
         :param permute_func: The permute function to register.
         """
-        # TODO: check if registration is valid
+        # Validate the runner name eagerly. The format name can't be checked
+        # here without a circular import through token_dispatcher.
+        MoeRunnerBackend(runner_backend_name)  # raises if not a valid runner
+
         key = (dispatch_output_name, runner_backend_name)
         if key in cls._pre_permute_methods:
             raise ValueError(
@@ -183,7 +186,10 @@ class PermuteMethodPool:
         :param combine_input_name: The CombineInputFormat name.
         :param permute_func: The permute function to register.
         """
-        # TODO: check if registration is valid
+        # Validate the runner name eagerly. The format name can't be checked
+        # here without a circular import through token_dispatcher.
+        MoeRunnerBackend(runner_backend_name)  # raises if not a valid runner
+
         key = (runner_backend_name, combine_input_name)
         if key in cls._post_permute_methods:
             raise ValueError(
