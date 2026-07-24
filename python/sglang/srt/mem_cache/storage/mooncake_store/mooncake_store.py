@@ -98,6 +98,25 @@ class MooncakeStoreConfig:
     ssd_offload_path: Optional[str] = None
 
     @staticmethod
+    def _resolve_local_hostname(overrides: Optional[dict] = None) -> str:
+        """Resolve local_hostname for the current process.
+
+        Process environment takes precedence over config overrides so multi-node
+        runtime attach can broadcast shared extra_config while each node uses its
+        own MOONCAKE_LOCAL_HOSTNAME / LOCAL_HOSTNAME.
+        """
+        if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
+            return envs.MOONCAKE_LOCAL_HOSTNAME.get()
+        local_hostname = os.getenv("LOCAL_HOSTNAME")
+        if local_hostname:
+            return local_hostname
+        if overrides is not None:
+            value = overrides.get("local_hostname")
+            if value:
+                return value
+        return envs.MOONCAKE_LOCAL_HOSTNAME.default
+
+    @staticmethod
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
         if not envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
@@ -120,9 +139,7 @@ class MooncakeStoreConfig:
             )
 
         return MooncakeStoreConfig(
-            local_hostname=config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
+            local_hostname=MooncakeStoreConfig._resolve_local_hostname(config),
             metadata_server=config.get(
                 "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
             ),
@@ -168,18 +185,8 @@ class MooncakeStoreConfig:
                 "Either the environment variable 'MOONCAKE_MASTER' or 'MOONCAKE_CLIENT' is not set."
             )
 
-        # Special handling for local_hostname: try MOONCAKE_LOCAL_HOSTNAME first,
-        # then fall back to LOCAL_HOSTNAME if not set.
-        # This is for forward compatibility with the legacy LOCAL_HOSTNAME environment variable.
-        if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
-            local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.get()
-        else:
-            local_hostname = os.getenv(
-                "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            )
-
         return MooncakeStoreConfig(
-            local_hostname=local_hostname,
+            local_hostname=MooncakeStoreConfig._resolve_local_hostname(),
             metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.get(),
             global_segment_size=_parse_global_segment_size(
                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
@@ -207,9 +214,7 @@ class MooncakeStoreConfig:
             )
 
         return MooncakeStoreConfig(
-            local_hostname=extra_config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
+            local_hostname=MooncakeStoreConfig._resolve_local_hostname(extra_config),
             metadata_server=extra_config.get(
                 "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
             ),
