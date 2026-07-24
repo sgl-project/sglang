@@ -59,9 +59,22 @@ class TestNativeMmDrainAdapter(CustomTestCase):
         self.assertEqual(output.mm_items[0].feature[0, 0].item(), 99)
 
     def test_optional_pad_values_use_precomputed_hashes(self):
-        with patch.dict(os.environ, {"SGLANG_MM_PRECOMPUTE_HASH": "1"}):
+        from sglang.srt.managers.schedule_batch import _compute_pad_value
+
+        # The whole point of worker-precomputed hashes is that the scheduler
+        # loop never runs hash_feature — make any call a hard failure.
+        with (
+            patch.dict(os.environ, {"SGLANG_MM_PRECOMPUTE_HASH": "1"}),
+            patch(
+                "sglang.srt.managers.mm_utils.hash_feature",
+                side_effect=AssertionError("scheduler loop must not hash features"),
+            ),
+        ):
             output, _ = self.build()
-            self.assertTrue(all(item.pad_value is not None for item in output.mm_items))
+        self.assertEqual(
+            [item.pad_value for item in output.mm_items],
+            [_compute_pad_value(101), _compute_pad_value(202)],
+        )
 
 
 if __name__ == "__main__":

@@ -10,16 +10,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _utils import PROCESSOR_CONFIGS, image_bytes, make_image, spec_json  # noqa: E402
+from _utils import (  # noqa: E402
+    PROCESSOR_CONFIGS,
+    image_bytes,
+    load_core,
+    make_image,
+    spec_json,
+)
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-try:
-    from sglang.srt.multimodal import _core
-
-    QWEN_CORE = _core.qwen_vl
-except (AttributeError, ImportError):
-    QWEN_CORE = None
+QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 
 
 @unittest.skipUnless(QWEN_CORE, "sglang-mm Qwen binding not built")
@@ -31,7 +32,8 @@ class TestQwenImagePreprocess(CustomTestCase):
 
         for family, config in PROCESSOR_CONFIGS.items():
             processor = Qwen2VLImageProcessor(**config)
-            for index, size in enumerate(((640, 480), (1024, 683), (50, 40))):
+            sizes = ((640, 480), (1024, 683), (50, 40), (300, 301))
+            for index, size in enumerate(sizes):
                 with self.subTest(family=family, size=size):
                     image = make_image(*size, seed=index)
                     actual, grid = QWEN_CORE.preprocess(

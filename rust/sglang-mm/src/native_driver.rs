@@ -42,8 +42,11 @@ pub fn process(
                     }
                     ImageSource::Bytes(bytes) => bytes.clone(),
                 };
+                // Decode failure falls back rather than failing: the Python
+                // path decodes more formats (GIF/WebP/BMP, 16-bit PNG) via
+                // PIL, and it returns the 400 itself for truly corrupt bytes.
                 let (rgb, height, width) =
-                    common::decode_rgb(&bytes).map_err(NativeError::Failed)?;
+                    common::decode_rgb(&bytes).map_err(NativeError::Fallback)?;
                 let image = pipeline
                     .processor
                     .process_image(&rgb, height, width)

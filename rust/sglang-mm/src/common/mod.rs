@@ -28,7 +28,17 @@ pub fn sha256_u64(data: &[u8]) -> u64 {
 }
 
 pub fn decode_rgb(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+    use image::ColorType;
+
     let img = image::load_from_memory(data).map_err(|e| format!("image decode: {e}"))?;
+    // >8-bit samples: PIL clips to 255 where `to_rgb8` would rescale. Refuse
+    // rather than silently diverge from the Python (PIL) pipeline.
+    if !matches!(
+        img.color(),
+        ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
+    ) {
+        return Err(format!("image decode: unsupported color {:?}", img.color()));
+    }
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
     Ok((rgb.into_raw(), h as usize, w as usize))

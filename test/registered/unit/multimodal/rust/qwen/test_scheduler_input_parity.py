@@ -21,21 +21,12 @@ from sglang.srt.managers.rust_server import MmProcessorHost  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
-from _utils import (
-    PROCESSOR_CONFIGS,
-    image_bytes,
-    request_payload,
-    spec_json,
-)  # noqa: E402
+from _utils import PROCESSOR_CONFIGS, image_bytes, load_core, request_payload  # noqa: E402
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-try:
-    from sglang.srt.multimodal import _core
-
-    DRIVER = _core.qwen_vl.process_native_mm_payload
-except (AttributeError, ImportError):
-    DRIVER = None
+CORE = load_core()
+DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm_payload", None)
 
 
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
@@ -48,27 +39,27 @@ class TestQwenSchedulerInputParity(CustomTestCase):
         self.processor.io_executor.shutdown()
         self.processor.cpu_executor.shutdown()
 
+    def make_host(self):
+        """A drain-adapter host whose spec comes from ``native_spec()`` — the
+        production extraction path — rather than a hand-built dict."""
+        host = MmProcessorHost.__new__(MmProcessorHost)
+        host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
+        host.mm_processor = self.processor
+        host._processor = self.processor._processor
+        host.server_args = self.processor.server_args
+        host._native = None
+        return host, host.native_spec()
+
     def compare(self, sources):
+        host, spec = self.make_host()
+        self.assertIsNotNone(spec, "native_spec() rejected the fixture processor")
+
         input_ids = []
         for _ in sources:
             input_ids.extend((1, 2, 3, 4))
-        raw = DRIVER(
-            request_payload(input_ids, sources),
-            spec_json(self.config, image_token_id=2),
-        )
+        raw = DRIVER(request_payload(input_ids, sources), spec)
         ids, features, grids, hashes, offsets, mrope, delta = raw
 
-        host = MmProcessorHost.__new__(MmProcessorHost)
-        host._native = {
-            **self.config,
-            "feature_dim": 3
-            * self.config["temporal_patch_size"]
-            * self.config["patch_size"] ** 2,
-            "image_token_id": 2,
-            "vision_start_token_id": 1,
-            "vision_end_token_id": 3,
-            "video_token_id": 5,
-        }
         rust_output = host.build_native_mm(
             (features, grids, hashes, offsets, mrope, delta)
         )
@@ -101,7 +92,7 @@ class TestQwenSchedulerInputParity(CustomTestCase):
             native_bytes = np.ascontiguousarray(
                 rust["features"][row : row + rows]
             ).tobytes()
-            self.assertEqual(expected_hash, _core.common.data_hash(native_bytes))
+            self.assertEqual(expected_hash, CORE.common.data_hash(native_bytes))
             row += rows
             expected_python_hash = hash_feature(python_item.feature)
             python_item.set_pad_value()

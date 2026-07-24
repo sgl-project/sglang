@@ -17,18 +17,14 @@ from _utils import (  # noqa: E402
     VIDEO_TOKEN_ID,
     VISION_START_ID,
     image_bytes,
+    load_core,
     request_payload,
     spec_json,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-try:
-    from sglang.srt.multimodal import _core
-
-    QWEN_CORE = _core.qwen_vl
-except (AttributeError, ImportError):
-    QWEN_CORE = None
+QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 
 
 @unittest.skipUnless(
@@ -65,14 +61,9 @@ class TestQwenPromptGeometry(CustomTestCase):
                     ),
                 )
 
-    def test_placeholder_mismatch_falls_back(self):
-        with self.assertRaisesRegex(ValueError, "fallback.*placeholder"):
-            QWEN_CORE.process_native_mm_payload(
-                request_payload([7, 8], [image_bytes(80, 80)]),
-                spec_json(PROCESSOR_CONFIGS["qwen2_5_vl"]),
-            )
-
     def test_mrope_matches_model_reference(self):
+        """The single Rust image-only M-RoPE must match ``get_rope_index``
+        for every native Qwen family (image-only makes them coincide)."""
         from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 
         grids = [(1, 4, 6), (1, 6, 4)]
@@ -85,21 +76,22 @@ class TestQwenPromptGeometry(CustomTestCase):
             ids.extend((902, 11))
 
         actual, delta = QWEN_CORE.mrope_image_only_py(len(ids), items, 2)
-        expected, expected_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=2,
-            image_token_id=IMAGE_TOKEN_ID,
-            video_token_id=VIDEO_TOKEN_ID,
-            vision_start_token_id=VISION_START_ID,
-            model_type="qwen3_vl",
-            tokens_per_second=None,
-            input_ids=torch.tensor(ids).unsqueeze(0),
-            image_grid_thw=torch.tensor(grids),
-            video_grid_thw=None,
-        )
-        np.testing.assert_array_equal(
-            np.asarray(actual).reshape(3, -1), expected.squeeze(1).numpy()
-        )
-        self.assertEqual(delta, int(expected_delta.item()))
+        actual = np.asarray(actual).reshape(3, -1)
+        for model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+            with self.subTest(model_type=model_type):
+                expected, expected_delta = MRotaryEmbedding.get_rope_index(
+                    spatial_merge_size=2,
+                    image_token_id=IMAGE_TOKEN_ID,
+                    video_token_id=VIDEO_TOKEN_ID,
+                    vision_start_token_id=VISION_START_ID,
+                    model_type=model_type,
+                    tokens_per_second=2 if model_type == "qwen2_5_vl" else None,
+                    input_ids=torch.tensor(ids).unsqueeze(0),
+                    image_grid_thw=torch.tensor(grids),
+                    video_grid_thw=None,
+                )
+                np.testing.assert_array_equal(actual, expected.squeeze(1).numpy())
+                self.assertEqual(delta, int(expected_delta.item()))
 
 
 if __name__ == "__main__":

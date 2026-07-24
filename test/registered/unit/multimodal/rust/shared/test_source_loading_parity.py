@@ -2,6 +2,7 @@
 
 import base64
 import http.server
+import sys
 import tempfile
 import threading
 import unittest
@@ -11,14 +12,13 @@ from sglang.srt.utils.common import get_image_bytes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _utils import load_core  # noqa: E402
+
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-try:
-    from sglang.srt.multimodal import _core
-
-    FETCH = _core.common.fetch_bytes
-except (AttributeError, ImportError):
-    FETCH = None
+CORE = load_core()
+FETCH = CORE and CORE.common.fetch_bytes
 
 
 @unittest.skipUnless(FETCH, "sglang-mm fetch binding not built")
@@ -58,6 +58,7 @@ class TestRustMediaSourceLoading(CustomTestCase):
             self.assertEqual(bytes(FETCH(url)), get_image_bytes(url))
         finally:
             server.shutdown()
+            server.server_close()
             thread.join()
 
     def test_invalid_sources_fail(self):

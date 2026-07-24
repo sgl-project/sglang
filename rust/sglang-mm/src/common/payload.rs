@@ -166,6 +166,35 @@ mod tests {
     }
 
     #[test]
+    fn malformed_payloads_fail() {
+        // Truncated msgpack (array header, no elements) and wrong arity.
+        assert!(matches!(parse(b"\x91"), Err(NativeError::Failed(_))));
+        let three = encode(vec![Value::Nil, Value::Nil, Value::from("a")]);
+        assert!(matches!(parse(&three), Err(NativeError::Failed(_))));
+    }
+
+    #[test]
+    fn empty_video_audio_lists_do_not_fall_back() {
+        // Mirrors Python `has_valid_data`: nil / empty lists don't count.
+        let payload = encode(vec![
+            Value::Nil,
+            Value::Array(vec![Value::from(1)]),
+            Value::from("a"),
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Array(vec![])]),
+        ]);
+        assert_eq!(parse(&payload).unwrap().images.len(), 1);
+    }
+
+    #[test]
+    fn image_free_payload_falls_back() {
+        assert!(matches!(
+            parse(&image_payload(Value::Nil)),
+            Err(NativeError::Fallback(_))
+        ));
+    }
+
+    #[test]
     fn rejects_non_integer_input_ids() {
         let payload = encode(vec![
             Value::Nil,

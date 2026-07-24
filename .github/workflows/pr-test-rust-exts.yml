@@ -1,0 +1,48 @@
+name: PR Test (Rust extensions)
+
+# In-crate unit tests for the Rust extensions bundled with the `sglang` wheel
+# (rust/). The pyo3 bindings themselves are exercised by the Python unit suite
+# (base-a-test-cpu), which builds the extensions from source; this job covers
+# the pure-Rust cores, exactly as sglang-server links them.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "rust/**"
+      - ".github/workflows/pr-test-rust-exts.yml"
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "rust/**"
+      - ".github/workflows/pr-test-rust-exts.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-exts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sglang-mm-unit:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-mm
+
+      # --no-default-features drops the pyo3 `python` feature: extension-module
+      # crates cannot link test binaries, and this is the exact feature set
+      # sglang-server consumes.
+      - name: cargo test (pure-Rust core)
+        working-directory: rust/sglang-mm
+        run: cargo test --no-default-features
