@@ -14,6 +14,7 @@ implemented today.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 
 import torch
@@ -28,6 +29,13 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
+
+# MXFP4 group (block) size — fixed at 32 by the FP4 npu_quant_matmul kernel.
+# Same value as linear_method_npu.py:MXFP4_BLOCK_SIZE; duplicated here as a plain
+# int so this device-agnostic config never imports the NPU-only linear module.
+MXFP4_W4A8_GROUP_SIZE = 32
 
 
 class Mxfp4W4A8Config(QuantizationConfig):
@@ -95,6 +103,21 @@ class Mxfp4W4A8Config(QuantizationConfig):
                 self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
+                return UnquantizedLinearMethod()
+            # FP4 (A8W4) npu_quant_matmul requires the reduction dim K to be a
+            # multiple of the MXFP4 group size (32) — it has no partial-last-block
+            # support (unlike MXFP8's A8W8 kernel, which pads ceil(K/32) scales).
+            # Layers whose input dim isn't 32-aligned (e.g. Qwen3.5 vision MLP
+            # linear_fc2 with K=4304) fall back to BF16, mirroring how
+            # msmodelslim / vllm-ascend leave such layers unquantized offline.
+            if layer.input_size % MXFP4_W4A8_GROUP_SIZE != 0:
+                logger.warning(
+                    "mxfp_w4a8: skipping %s (input_size=%d not a multiple of %d); "
+                    "falling back to unquantized BF16.",
+                    prefix,
+                    layer.input_size,
+                    MXFP4_W4A8_GROUP_SIZE,
+                )
                 return UnquantizedLinearMethod()
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
