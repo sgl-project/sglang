@@ -1879,6 +1879,13 @@ class ServerArgs:
         "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
         NS("exec.comm"),
     ] = False
+    enable_flashinfer_allreduce_only: A[
+        bool,
+        Arg(
+            help="Route allreduce-only tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
+            resolvable=True,
+        ),
+    ] = False
     pre_warm_nccl: A[
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
