@@ -150,9 +150,8 @@ class PrefillDelayer:
             and (token_usage < x)
         )
 
-        # The queue-delay timeout must ride the all-gather like every other
-        # input: a rank-local wall-clock read can flip on one rank and not
-        # another at the max_delay_ms boundary and split the batch decision.
+        # Gathering the timeout keeps rank-skewed clocks from splitting the
+        # batch decision at the max_delay_ms boundary.
         local_queue_timeout_expired = (
             prev_state is not None
             and (time.perf_counter() - prev_state.start_time) * 1000.0

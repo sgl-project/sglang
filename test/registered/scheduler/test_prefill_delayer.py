@@ -52,9 +52,7 @@ class NegotiateCall:
     # Inter-call sleep (seconds). Used to exercise the queue-trigger
     # wall-clock timeout.
     sleep_before_s: float = 0.0
-    # Per-rank age (ms) of an injected delay state. Simulates rank-skewed
-    # wall clocks around the max_delay_ms boundary; the negotiation must
-    # still release (or hold) on every rank in lockstep.
+    # Rank-skewed state ages verify that timeout release stays collective.
     inject_state_age_ms: Optional[List[float]] = None
 
 
@@ -389,7 +387,6 @@ _NEGOTIATE_TEST_CASES = [
         queue_min_ratio=0.5,
         max_delay_ms=50,
         calls=[
-            # First queue-delay attempt only consumes skip_first_delayer.
             NegotiateCall(
                 prefillable=[True, True, True, True],
                 token_usage=[0.9, 0.9, 0.9, 0.9],
@@ -405,8 +402,6 @@ _NEGOTIATE_TEST_CASES = [
                 max_prefill_bs=[80, 80, 80, 80],
                 waiting_queue_len=[10, 10, 10, 10],
                 max_running_requests=1024,
-                # Only rank 0 is past the 50ms cap. Local wall-clock reads
-                # would release rank 0 and keep delaying the others.
                 inject_state_age_ms=[60.0, 10.0, 10.0, 10.0],
             ),
         ],
