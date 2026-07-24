@@ -469,7 +469,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.11.post1"
+    MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
@@ -499,7 +499,7 @@ install_extra_deps() {
     MOONCAKE_WHEEL_ZIP_URL=""
     case "$(uname -m)" in
         aarch64)
-            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8496806286.zip"
+            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8601134467.zip"
             ;;
         x86_64)
             if [ "$CU_MAJOR" = "13" ]; then
@@ -507,12 +507,12 @@ install_extra_deps() {
                 # rejected ("incompatible with the current platform"). Pick the
                 # ABI-matching artifact by SYS_PYTHON_VER.
                 if [ "$SYS_PYTHON_VER" = "3.10" ]; then
-                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497008026.zip"
+                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8601619448.zip"
                 else
-                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497021972.zip"
+                    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8601613825.zip"
                 fi
             else
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8497492280.zip"
+                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/8601840082.zip"
             fi
             ;;
     esac
