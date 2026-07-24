@@ -24,20 +24,37 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.spec_attn_is_decode = (
-            model_runner.server_args.speculative_attention_mode == "decode"
-        )
-        self.spec_attn_is_prefill = (
-            model_runner.server_args.speculative_attention_mode == "prefill"
-        )
+        server_args = model_runner.server_args
+        self.spec_attn_is_decode = server_args.speculative_attention_mode == "decode"
+        self.spec_attn_is_prefill = server_args.speculative_attention_mode == "prefill"
+        # Backend that serves target_verify. --verify-attention-backend names it
+        # directly (must match one of the two composed slots); when unset it
+        # follows the deprecated --speculative-attention-mode routing.
+        self.verify_backend = self._resolve_verify_backend(server_args)
         # decide_needs_cpu_seq_lens ORs this flag across the backends the spec
-        # decode loop actually touches. The decode backend always runs (decode,
-        # and target_verify when speculative_attention_mode=decode); the prefill
-        # backend serves the loop only when mode=prefill routes target_verify to
-        # it. Counting a cpu-seq-lens prefill backend on decode-mode steps it
-        # never serves forces a needless per-step seq_lens D2H + host sync.
-        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
-            self.spec_attn_is_prefill and prefill_backend.needs_cpu_seq_lens
+        # decode loop actually touches: the decode backend (decode steps) and the
+        # verify backend (target_verify steps). A cpu-seq-lens prefill backend
+        # that never serves the loop must not force a per-step seq_lens D2H sync.
+        self.needs_cpu_seq_lens = (
+            decode_backend.needs_cpu_seq_lens or self.verify_backend.needs_cpu_seq_lens
+        )
+
+    def _resolve_verify_backend(self, server_args) -> AttentionBackend:
+        verify_str = server_args.verify_attention_backend
+        if verify_str is None:
+            return (
+                self.decode_backend
+                if self.spec_attn_is_decode
+                else self.prefill_backend
+            )
+        prefill_str, decode_str = server_args.get_attention_backends()
+        if verify_str == decode_str:
+            return self.decode_backend
+        if verify_str == prefill_str:
+            return self.prefill_backend
+        raise ValueError(
+            f"--verify-attention-backend={verify_str!r} must match the decode "
+            f"({decode_str!r}) or prefill ({prefill_str!r}) attention backend"
         )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
@@ -52,17 +69,14 @@ class HybridAttnBackend(AttentionBackend):
 
         Note:
             - decode_or_idle: Always uses decode backend
-            - target_verify: Uses decode backend if speculative_attention_mode is "decode", otherwise prefill backend
+            - target_verify: Uses the verify backend (--verify-attention-backend,
+              or the --speculative-attention-mode routing when unset)
             - prefill: Always uses prefill backend
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
         elif forward_mode.is_target_verify():
-            return (
-                self.decode_backend
-                if self.spec_attn_is_decode
-                else self.prefill_backend
-            )
+            return self.verify_backend
         else:
             return self.prefill_backend
 

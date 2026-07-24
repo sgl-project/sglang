@@ -2068,11 +2068,16 @@ class ServerArgs:
     speculative_attention_mode: A[
         str,
         Arg(
-            help="Attention backend for speculative decoding operations (both target verify and draft extend). Can be one of 'prefill' (default) or 'decode'.",
+            help="Deprecated for target verify: use --verify-attention-backend. Routes speculative operations (target verify and draft extend) to the 'prefill' (default) or 'decode' attention backend.",
             choices=["prefill", "decode"],
         ),
         NS("spec"),
     ] = "prefill"
+    verify_attention_backend: A[
+        Optional[str],
+        "Attention backend for speculative target verify. Must match the prefill or decode attention backend. Defaults to following the decode backend (the sync-free path on GPU-plan backends). Supersedes --speculative-attention-mode for verify.",
+        NS("spec"),
+    ] = None
     speculative_draft_attention_backend: A[
         Optional[str],
         "Attention backend for speculative decoding drafting.",
@@ -3791,24 +3796,24 @@ class ServerArgs:
             )
             self.smg_grpc_mode = True
 
-        # --speculative-attention-mode is a legacy routing knob: its
-        # 'prefill'/'decode' values select which existing attention backend
-        # serves target-verify rather than naming one directly. Its default
+        # --speculative-attention-mode routes target-verify by naming a phase
+        # ('prefill'/'decode') rather than the backend, and its default
         # 'prefill' combined with an explicit attention backend silently routes
-        # verify to the prefill backend, which can disable the sync-free decode
-        # path (a cpu-seq-lens prefill backend forces a per-step host sync).
+        # verify to the prefill backend, disabling the sync-free decode path (a
+        # cpu-seq-lens prefill backend forces a per-step host sync). Only warn
+        # when the user has not already moved to --verify-attention-backend.
         if (
             self.speculative_algorithm is not None
+            and self.verify_attention_backend is None
             and self.speculative_attention_mode == "prefill"
             and not self.is_attention_backend_not_set()
         ):
             logger.warning(
                 "--speculative-attention-mode is 'prefill' (default) while an "
                 "explicit attention backend is set: speculative target-verify "
-                "will run on the prefill backend. This legacy routing is "
-                "deprecated; pass --speculative-attention-mode decode to run "
-                "verify on the decode backend (the sync-free path on GPU-plan "
-                "backends such as trtllm_mla)."
+                "will run on the prefill backend. Set --verify-attention-backend "
+                "to the decode backend to run verify on the sync-free path on "
+                "GPU-plan backends such as trtllm_mla."
             )
 
         # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
