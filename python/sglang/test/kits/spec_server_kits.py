@@ -161,6 +161,11 @@ class SpecParityKit:
                 "--dtype",
                 cls.dtype,
                 *(["--trust-remote-code"] if cls.trust_remote_code else []),
+                *(
+                    ["--enable-deterministic-inference"]
+                    if cls.enable_deterministic_inference
+                    else []
+                ),
             ],
         )
         try:

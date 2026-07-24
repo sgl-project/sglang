@@ -60,7 +60,7 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -473,6 +473,12 @@ def _fused_moe_kernel_sequence(
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
+    # LoRA hooks consume and update route-major intermediate buffers. The TMA
+    # down path keeps those buffers in expert-sorted, block-padded order, which
+    # is incompatible with the hook contract.
+    if hooks and (hooks.after_gate_up is not None or hooks.after_down is not None):
+        down_moe_use_tma = False
+
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
         if down_moe_use_tma
@@ -610,7 +616,7 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
+                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
 
                     silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),

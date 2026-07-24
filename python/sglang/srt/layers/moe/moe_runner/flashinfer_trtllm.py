@@ -74,8 +74,8 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-    from sglang.jit_kernel.utils import is_arch_support_pdl
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
@@ -965,9 +965,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         ):
             e4m3_max = 256.0
 
+        global_scale_inv = torch.full(
+            (1,),
+            1.0 / (e4m3_max * 6.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (e4m3_max * 6.0),
+            global_scale_inv,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",
