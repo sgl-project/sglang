@@ -563,6 +563,19 @@ class RuntimeHandle:
                 )
             else:
                 self._send_native_error(chunk_callback, str(error))
+        except asyncio.CancelledError:
+            if not typed_generation:
+                raise
+            error = RuntimeError(f"Request aborted: {obj.rid}")
+            error.status_code = 499
+            await self._send_typed_generation_errors(
+                chunk_callback,
+                ready_event,
+                error=error,
+                expected_choices=expected_choices,
+                terminal_choices=terminal_choices,
+                timeout_abort_rid=obj.rid,
+            )
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             if typed_generation:

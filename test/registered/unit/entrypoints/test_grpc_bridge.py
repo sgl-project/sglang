@@ -247,6 +247,40 @@ async def test_typed_non_streaming_error_terminates_every_choice():
 
 
 @pytest.mark.asyncio
+async def test_typed_cancellation_terminates_every_unfinished_choice():
+    started = asyncio.Event()
+
+    class _BlockingTokenizerManager(_TokenizerManager):
+        async def generate_request(
+            self, _obj, request=None, yield_scheduler_errors=False
+        ):
+            del request
+            self.yield_scheduler_errors = yield_scheduler_errors
+            started.set()
+            await asyncio.Event().wait()
+            yield
+
+    runtime = _runtime([])
+    runtime.tokenizer_manager = _BlockingTokenizerManager([])
+    callback = _Callback()
+    obj = SimpleNamespace(sampling_params={"n": 2}, rid="request")
+    task = asyncio.create_task(
+        runtime._run_generate(obj, callback, True, None, typed_generation=True)
+    )
+    await started.wait()
+
+    task.cancel()
+    await task
+
+    assert [call[0]["index"] for call in callback.calls] == [0, 1]
+    assert [call[1]["finished"] for call in callback.calls] == [False, True]
+    assert all(
+        call[0]["meta_info"]["finish_reason"]["status_code"] == 499
+        for call in callback.calls
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outputs", "message"),
     [
