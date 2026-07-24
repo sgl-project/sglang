@@ -245,6 +245,14 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        # Ensure w_kc and w_vc are on the same device as hidden_states.
+        # These are plain tensor attributes, not nn.Parameter, so they need
+        # special handling (For OffloaderV1).
+        if self.w_kc is not None and self.w_kc.device != hidden_states.device:
+            self.w_kc = self.w_kc.to(hidden_states.device, non_blocking=True)
+        if self.w_vc is not None and self.w_vc.device != hidden_states.device:
+            self.w_vc = self.w_vc.to(hidden_states.device, non_blocking=True)
+
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
