@@ -41,11 +41,15 @@ import copy
 import inspect
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
 import tqdm
 
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -118,6 +122,33 @@ logger = logging.getLogger(__name__)
 # lists can otherwise turn the lower launch overhead into substantially more
 # model work than an exact-shape eager forward.
 _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
+# Prefix attention adds one loop body per chunk to the captured topology, so
+# capture a small geometric set and round each replay up to the nearest one.
+_CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+
+
+def _chunked_prefix_variant(num_chunks: int) -> str:
+    return f"chunked_prefix:{num_chunks}"
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+@dataclass(frozen=True)
+class _ChunkedPrefixCaptureBuffers:
+    """Runner-owned tensors shared by every prefix and token-bucket variant.
+
+    ``starts`` / ``starts_cpu`` are constant (chunk ``c`` always starts at
+    ``c * prefix_chunk_len``) and filled once at allocation.
+    """
+
+    starts: torch.Tensor  # (max_chunks, req_slots)
+    seq_lens: torch.Tensor  # (max_chunks, req_slots)
+    cu_seq_lens: torch.Tensor  # (max_chunks, req_slots + 1)
+    starts_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -286,23 +317,62 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Auto: scale request slots with the chunked prefill size.
                 max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
             self._capture_req_slots = min(max_req, self.max_bs)
-            self._full_cg_seq_lens_cpu = torch.zeros(
-                (self._capture_req_slots,), dtype=torch.int64, device="cpu"
+        self._full_cg_seq_lens_cpu = (
+            torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
+            if self._is_full_backend
+            else None
+        )
+        # This flag controls whether the model dispatches through the distinct
+        # chunked-prefix topology; backend capability is validated separately.
+        self._capture_chunked_prefix = (
+            self._is_full_backend
+            and not model_runner.server_args.disable_chunked_prefix_cache
+        )
+        self._prefix_chunk_len = 0
+        self._prefix_chunk_capacity = 0
+        self._prefix_max_len = 0
+        self._prefix_capture_variants: tuple[int, ...] = ()
+        self._prefix_capture_batches: Dict[ShapeKey, ForwardBatch] = {}
+        self._prefix_capture_buffers: Optional[_ChunkedPrefixCaptureBuffers] = None
+        if self._capture_chunked_prefix:
+            attn_backend = model_runner.attn_backend
+            assert attn_backend.supports_full_cuda_graph_chunked_prefix, (
+                f"{type(attn_backend).__name__} does not support chunked-prefix "
+                "Full prefill CUDA graphs"
             )
+            prefix_config = model_runner.server_args.cuda_graph_config.prefill
+            (
+                self._prefix_chunk_len,
+                self._prefix_chunk_capacity,
+            ) = self._resolve_prefix_chunk_shape(model_runner, self._capture_req_slots)
+            self._prefix_max_len = self._max_addressable_prefix_len(model_runner)
+            max_real_chunks = _ceil_div(self._prefix_max_len, self._prefix_chunk_len)
+            # Variants are geometric, so n // 2 is the next-smaller variant; keep
+            # n only if the smaller variant does not already cover the max prefix.
+            self._prefix_capture_variants = tuple(
+                n for n in _CHUNKED_PREFIX_VARIANTS if n // 2 < max_real_chunks
+            )
+            self._prefix_capture_buffers = self._create_chunked_prefix_buffers()
+            logger.info(
+                "Full prefill CUDA graph cached-prefix chunks: "
+                "%d aggregate tokens/chunk (%d/request x %d slots), "
+                "variants=%s (%s)",
+                self._prefix_chunk_capacity,
+                self._prefix_chunk_len,
+                self._capture_req_slots,
+                self._prefix_capture_variants,
+                (
+                    "configured"
+                    if prefix_config.full_prefill_prefix_chunk_tokens is not None
+                    else "auto from chunked_prefill_size"
+                ),
+            )
+        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
-        elif isinstance(self.backend, BreakableCudaGraphBackend):
-            self._full_cg_seq_lens_cpu = None
-            with torch.device(self.device):
-                self._prefill_static_buffers = {
-                    name: torch.zeros((self.max_bs,), dtype=torch.int64)
-                    for name in _PREFILL_STATIC_FIELDS
-                }
-        else:
-            self._full_cg_seq_lens_cpu = None
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -603,6 +673,197 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             int(num_tokens) == 0 for num_tokens in global_num_tokens
         )
 
+    @staticmethod
+    def _has_prefix_hit(forward_batch: ForwardBatch) -> bool:
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        return prefix_lens is not None and any(
+            int(length) > 0 for length in prefix_lens
+        )
+
+    @staticmethod
+    def _max_addressable_prefix_len(model_runner) -> int:
+        table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
+        configured_context = model_runner.server_args.context_length
+        return (
+            min(table_width, configured_context)
+            if configured_context is not None and configured_context > 0
+            else table_width
+        )
+
+    @staticmethod
+    def _resolve_prefix_chunk_shape(
+        model_runner, capture_req_slots: int
+    ) -> tuple[int, int]:
+        """Resolve per-request length and aggregate capacity of one chunk."""
+        prefix_config = model_runner.server_args.cuda_graph_config.prefill
+        requested_capacity = prefix_config.full_prefill_prefix_chunk_tokens
+        if requested_capacity is None:
+            requested_capacity = model_runner.server_args.chunked_prefill_size
+            if requested_capacity is None or requested_capacity <= 0:
+                requested_capacity = prefix_config.max_bs
+        if requested_capacity is None or requested_capacity <= 0:
+            raise ValueError("full_prefill_prefix_chunk_tokens must be positive")
+        max_addressable_prefix_tokens = (
+            PrefillCudaGraphRunner._max_addressable_prefix_len(model_runner)
+            * capture_req_slots
+        )
+        requested_capacity = min(requested_capacity, max_addressable_prefix_tokens)
+        # Divide before allocating so increasing the number of request slots
+        # does not multiply the aggregate workspace represented by one chunk.
+        prefix_chunk_len = max(requested_capacity // capture_req_slots, 1)
+        return prefix_chunk_len, prefix_chunk_len * capture_req_slots
+
+    def _select_prefix_capture_chunks(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        """Smallest captured variant covering the batch's max prefix, or None."""
+        max_prefix_len = max(
+            int(length) for length in forward_batch.extend_prefix_lens_cpu
+        )
+        real_n = _ceil_div(max_prefix_len, self._prefix_chunk_len)
+        return next((n for n in self._prefix_capture_variants if n >= real_n), None)
+
+    def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
+        variant = None
+        if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
+            captured_n = self._select_prefix_capture_chunks(forward_batch)
+            assert captured_n is not None, "prefix batch has no captured FullCG variant"
+            variant = _chunked_prefix_variant(captured_n)
+        return ShapeKey(size=num_tokens, variant_label=variant)
+
+    def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
+        """Allocate the stable chunk-metadata tensors shared by all variants."""
+        max_chunks = max(self._prefix_capture_variants)
+        bs = self._capture_req_slots
+        starts_cpu = (
+            (torch.arange(max_chunks, dtype=torch.int32) * self._prefix_chunk_len)
+            .unsqueeze(1)
+            .repeat(1, bs)
+        )
+        return _ChunkedPrefixCaptureBuffers(
+            starts=starts_cpu.to(self.device, copy=True),
+            seq_lens=torch.zeros(
+                (max_chunks, bs), dtype=torch.int32, device=self.device
+            ),
+            cu_seq_lens=torch.zeros(
+                (max_chunks, bs + 1), dtype=torch.int32, device=self.device
+            ),
+            starts_cpu=starts_cpu,
+            seq_lens_cpu=torch.zeros((max_chunks, bs), dtype=torch.int32),
+            kv_indices=torch.zeros(
+                (max_chunks, self._prefix_chunk_capacity),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+
+    def _prepare_chunked_prefix_capture(
+        self,
+        forward_batch: ForwardBatch,
+        shape_key: ShapeKey,
+        captured_n: int,
+    ) -> None:
+        """Attach fixed-capacity, runner-owned prefix buffers for capture."""
+        assert self._prefill_static_buffers is not None
+        buffers = self._prefix_capture_buffers
+        assert buffers is not None
+        bs = self._capture_req_slots
+        prefix_len = min(self._prefix_chunk_len * captured_n, self._prefix_max_len)
+        prefix_lens_cpu = [prefix_len] * bs
+        self._prefill_static_buffers["extend_prefix_lens"][:bs].fill_(prefix_len)
+
+        self._populate_chunked_prefix_buffers(
+            captured_n=captured_n, prefix_lens_cpu=prefix_lens_cpu
+        )
+
+        forward_batch.extend_prefix_lens_cpu = prefix_lens_cpu
+        forward_batch.prefix_chunk_len = self._prefix_chunk_len
+        forward_batch.num_prefix_chunks = captured_n
+        forward_batch.prefix_chunk_idx = -1
+        forward_batch.prefix_chunk_starts = buffers.starts
+        forward_batch.prefix_chunk_starts_cpu = buffers.starts_cpu
+        forward_batch.prefix_chunk_seq_lens = buffers.seq_lens
+        forward_batch.prefix_chunk_seq_lens_cpu = buffers.seq_lens_cpu
+        forward_batch.prefix_chunk_cu_seq_lens = buffers.cu_seq_lens
+        forward_batch.prefix_chunk_max_seq_lens = [self._prefix_chunk_len] * captured_n
+        # Replay may pad request slots with zero-length prefixes. Capture the
+        # conservative branch needed by backends that fix up zero-KV rows.
+        forward_batch.prefix_chunk_has_zero_kv = [True] * captured_n
+        forward_batch.prefix_chunk_num_tokens = [
+            self._prefix_chunk_capacity
+        ] * captured_n
+        forward_batch.prefix_chunk_kv_indices = list(
+            buffers.kv_indices[:captured_n].unbind(0)
+        )
+        self._prefix_capture_batches[shape_key] = forward_batch
+        self.model_runner.attn_backend.prepare_full_cuda_graph_chunked_prefix(
+            forward_batch, in_capture=True
+        )
+
+    def _populate_chunked_prefix_buffers(
+        self,
+        *,
+        captured_n: int,
+        prefix_lens_cpu: list[int],
+    ) -> None:
+        """Refresh shared metadata/KV indices and zero rounded-up chunks."""
+        assert self._prefill_static_buffers is not None
+        buffers = self._prefix_capture_buffers
+        assert buffers is not None
+        bs = self._capture_req_slots
+        assert len(prefix_lens_cpu) == bs
+        real_n = _ceil_div(max(prefix_lens_cpu), self._prefix_chunk_len)
+        assert real_n <= captured_n
+
+        # Chunk starts are constant; only the lengths change. Compute once on
+        # CPU and copy into the stable CPU/GPU buffers the graph reads.
+        prefix_lens = torch.tensor(prefix_lens_cpu, dtype=torch.int32)
+        seq_lens = (prefix_lens - buffers.starts_cpu[:captured_n]).clamp(
+            min=0, max=self._prefix_chunk_len
+        )
+        cu_seq_lens = torch.zeros((captured_n, bs + 1), dtype=torch.int32)
+        cu_seq_lens[:, 1:] = seq_lens.cumsum(dim=1)
+        buffers.seq_lens_cpu[:captured_n].copy_(seq_lens)
+        buffers.seq_lens[:captured_n].copy_(seq_lens)
+        buffers.cu_seq_lens[:captured_n].copy_(cu_seq_lens)
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        # The kernel reads all request slots, so use the slot-padded static
+        # buffer (arange at capture, live indices + zeroed tail at replay).
+        req_pool_indices = self._prefill_static_buffers["req_pool_indices"][:bs]
+        buffers.kv_indices[:captured_n].zero_()
+        for chunk_idx in range(real_n):
+            create_chunked_prefix_cache_kv_indices[(bs,)](
+                req_to_token,
+                req_pool_indices,
+                buffers.starts[chunk_idx],
+                buffers.seq_lens[chunk_idx],
+                buffers.cu_seq_lens[chunk_idx],
+                buffers.kv_indices[chunk_idx],
+                req_to_token.shape[1],
+            )
+
+    def _prepare_chunked_prefix_replay(
+        self, shape_key: ShapeKey, forward_batch: ForwardBatch
+    ) -> None:
+        """Refresh stable buffers for the selected rounded-up chunk variant."""
+        capture_batch = self._prefix_capture_batches[shape_key]
+        raw_bs = forward_batch.batch_size
+        prefix_lens_cpu = [
+            int(length) for length in forward_batch.extend_prefix_lens_cpu[:raw_bs]
+        ] + [0] * (self._capture_req_slots - raw_bs)
+
+        self._populate_chunked_prefix_buffers(
+            captured_n=capture_batch.num_prefix_chunks,
+            prefix_lens_cpu=prefix_lens_cpu,
+        )
+        # Kept in sync for backend diagnostics; replay kernels read the stable
+        # GPU/CPU chunk tensors above, not this Python list.
+        capture_batch.extend_prefix_lens_cpu = prefix_lens_cpu
+        self.model_runner.attn_backend.prepare_full_cuda_graph_chunked_prefix(
+            capture_batch, in_capture=False
+        )
+
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> None:
@@ -711,9 +972,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
-        # No exact-shape check here: load_batch bucket-pads to the nearest
-        # captured shape. The factor above only rejects replays whose padded
-        # model work is disproportionate to the useful token count.
+        # Other backends and non-MLA FullCG keep using their normal graph with
+        # replay-refreshed metadata; only this extra topology has a prefix cap.
+        if (
+            self._capture_chunked_prefix
+            and self._has_prefix_hit(forward_batch)
+            and self._select_prefix_capture_chunks(forward_batch) is None
+        ):
+            return False
+        # load_batch bucket-pads to the nearest captured shape. The factor
+        # above rejects replays whose padded model work is disproportionate
+        # to the useful token count.
         #
         # Multi-req replay is supported by body-capture backends via the
         # layer_model.forward monkey-patch in replay(): the captured graph runs
@@ -888,15 +1157,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
             self.capture_one_shape(num_tokens)
+            if self._capture_chunked_prefix:
+                for captured_n in self._prefix_capture_variants:
+                    self.capture_one_shape(num_tokens, prefix_num_chunks=captured_n)
 
-    def capture_one_shape(self, size: int) -> None:
+    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        shape_key = ShapeKey(
+            size=num_tokens,
+            variant_label=(
+                _chunked_prefix_variant(prefix_num_chunks)
+                if prefix_num_chunks
+                else None
+            ),
+        )
+        if prefix_num_chunks:
+            self._prepare_chunked_prefix_capture(
+                forward_batch, shape_key, prefix_num_chunks
+            )
         if self._is_full_backend:
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            if not prefix_num_chunks:
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
+            # The prefix variant intentionally reuses the capture-stable
+            # metadata object initialized by the suffix-only variant above.
+            # Reaching into a backend-specific metadata cache here would make
+            # this path incompatible with the OSS FlashAttention backend.
         else:
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
@@ -918,7 +1209,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
-            ShapeKey(size=num_tokens),
+            shape_key,
             run_once,
             # DP padding can install capture-only tensors on this dummy batch;
             # BCG retains it so their recorded addresses remain valid.
@@ -1106,7 +1397,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch, static_forward_batch, static_num_tokens
         )
 
-        self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
     def _execute_body_capture(
@@ -1115,13 +1405,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_forward_batch: ForwardBatch,
         static_num_tokens: int,
         raw_num_tokens: int,
+        shape_key: ShapeKey,
         **kwargs,
     ):
         # BCG / Full: replay the captured body, run the LM head +
         # logits_processor eagerly.
-        shape_key = ShapeKey(size=self._static_num_tokens)
         full_path = self._is_full_backend
-        static_n = self._static_num_tokens
         ie_idx = self._input_embeds_arg_idx
 
         def replay_layer_forward(*args, **layer_kwargs):
@@ -1139,7 +1428,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     ie = args[ie_idx]
                 if ie is not None:
                     self.buffer_registry.get_slot("input_embeds").slice_for(
-                        1, static_n
+                        1, static_num_tokens
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             return hs[:raw_num_tokens] if full_path else hs
@@ -1178,7 +1467,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=raw_num_tokens,
         ):
             return self.backend.replay(
-                ShapeKey(size=self._static_num_tokens),
+                ShapeKey(size=static_num_tokens),
                 static_forward_batch,
                 **kwargs,
             )
@@ -1232,6 +1521,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
+            shape_key = self._shape_key(static_num_tokens, forward_batch)
+            # The only variants this runner records are chunked-prefix ones.
+            if shape_key.variant_label is not None:
+                self._prepare_chunked_prefix_replay(shape_key, forward_batch)
 
             if self._uses_eager_prefill_tail():
                 output = self._execute_body_capture(
@@ -1239,6 +1532,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     static_forward_batch,
                     static_num_tokens,
                     raw_num_tokens,
+                    shape_key,
                     **kwargs,
                 )
             else:
