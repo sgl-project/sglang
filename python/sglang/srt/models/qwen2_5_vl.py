@@ -63,6 +63,7 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
+    build_local_pixel_values_for_dp_encoder,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -669,9 +670,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        # in qwen-vl, last dim is the same. Non-local items' feature may have
+        # been dropped to None by the DP-encoder pre-H2D sharding; concat only
+        # the locally-owned shard.
+        fallback_device = next(self.visual.parameters()).device
+        pixel_values, dp_encoder_owner_ranks = build_local_pixel_values_for_dp_encoder(
+            items, dtype=self.visual.dtype, fallback_device=fallback_device
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
 
@@ -685,7 +689,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         raw_patch_dim = 1176
 
-        if pixel_values.dim() == 2:
+        # Precomputed embeddings bypass the vision encoder. Inputs using
+        # --mm-dp-encoder-shard-by-owner must continue through the DP encoder path.
+        if dp_encoder_owner_ranks is None and pixel_values.dim() == 2:
             current_dim = pixel_values.shape[-1]
             if current_dim == expected_dim:
                 return pixel_values
@@ -697,7 +703,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+                owner_ranks=dp_encoder_owner_ranks,
             )
         else:
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)

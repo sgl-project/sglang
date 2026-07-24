@@ -2005,9 +2005,20 @@ class Scheduler(
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
         if self.server_args.enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            image_inputs = self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            image_inputs = MultimodalInputs.from_processor_output(mm_inputs_dict)
+
+        # Decide DP-encoder ownership once, over the request's full image set,
+        # and store it as a persistent per-item tag. This is deterministic on
+        # every rank, survives retraction, and is the single source of truth for
+        # both the encode-path feature drop and the vision-model runner.
+        if image_inputs is not None:
+            from sglang.srt.managers.mm_utils import assign_dp_encoder_owners
+
+            assign_dp_encoder_owners(image_inputs.mm_items)
+
+        return image_inputs
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
