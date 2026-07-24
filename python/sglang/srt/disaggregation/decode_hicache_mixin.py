@@ -140,13 +140,25 @@ class DecodeHiCachePreallocMixin:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
         if not self.scheduler.enable_decode_hicache:
             return 0
-        return sum(
-            dr.prefix_match.restore_token_count
-            for dr in self.transfer_queue.queue
-            if dr.prefix_match is not None
-            and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
-            and dr.hicache_restored_node is None
-        )
+        total = 0
+        for dr in self.transfer_queue.queue:
+            if (dr.prefix_match is not None
+                and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+                and dr.hicache_restored_node is None
+            ):
+                if dr.awaiting_hicache_finalize:
+                    fill_len = len(dr.req.origin_input_ids) + max(
+                        len(dr.req.output_ids) -1 ,0
+                    )
+                    total += self._required_alloc_tokens(
+                        fill_len=fill_len,
+                        prefix_len=dr.prefx_match.l1_prefix_len,
+                    )
+                else:
+                    total += dr.prefx_match.restore_token_count
+        
+        return total
+        
 
 
 class HiCacheRestoreGatedKVReceiver:
@@ -177,7 +189,22 @@ class DecodeHiCacheTransferMixin:
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
             decode_req.hicache_restored_node = None
+        if (
+            decode_req.awaiting_hicache_finalize
+            and decode_req.prefix_match is not None
+        ):
+            self.tree_cache.dec_lock_ref(decode_req.prefix_match.last_device_node)
 
+    def _finalize_awaiting_hicache_reqs(self) -> None:
+        if self.prealloc_queue is None:
+            return
+        for decode_req in self.queue:
+            if (
+                decode_req.awaiting_hicache_finalize
+                and decode_req.hicache_restore_status == HiCacheRestoreResult.READY
+            ):
+                self.prealloc_queue._finalize_hicache_admission(decode_req)
+    
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
 
@@ -210,31 +237,34 @@ class DecodeHiCacheTransferMixin:
             )
         )
         # Failback: total coverage < required prefix means device alloc likely failed.
-        if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
-            logger.warning(
-                "HiCache load_back failed for rid=%s: device_indices=%d, "
-                "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
-                dr.req.rid,
-                len(rematch.device_indices),
-                len(new_indices),
-                pm.decode_prefix_len,
-                pm.l1_prefix_len,
-                pm.l2_host_hit_length,
-                pm.l3_storage_hit_length,
-            )
-            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
-            return False
-
-        dr.hicache_restored_kv_indices = torch.cat(
-            [rematch.device_indices[pm.l1_prefix_len :], new_indices]
-        )
-        dr.hicache_restored_node = restored_node
-        self.tree_cache.inc_lock_ref(restored_node)
+        # if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+        #     logger.warning(
+        #         "HiCache load_back failed for rid=%s: device_indices=%d, "
+        #         "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
+        #         dr.req.rid,
+        #         len(rematch.device_indices),
+        #         len(new_indices),
+        #         pm.decode_prefix_len,
+        #         pm.l1_prefix_len,
+        #         pm.l2_host_hit_length,
+        #         pm.l3_storage_hit_length,
+        #     )
+        #     dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+        #     return False
+        pm.prefix_indices = rematch.device_indices
+        pm.l2_host_hit_length = len(new_indices)
+        pm.l3_storage_hit_length = 0
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
+        
+        # Only the load_back tokens need to fill the gap; the device indices
+        # are written by _pre_alloc as the prefix
+        dr.hicache_restored_kv_indices = new_indices
+        dr.hicache_restored_node = restored_node
+        self.tree_cache.inc_lock_ref(restored_node)
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
