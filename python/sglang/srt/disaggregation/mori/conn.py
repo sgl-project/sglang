@@ -48,6 +48,30 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
+KV_MEM_KINDS = {"VRAM", "DRAM"}
+
+
+def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
+    if kinds is None:
+        return ["VRAM"] * expected_len
+    normalized = [str(kind).upper() for kind in kinds]
+    if len(normalized) != expected_len:
+        raise ValueError(
+            f"kv_data_mem_kinds length mismatch: got {len(normalized)}, "
+            f"expected {expected_len}"
+        )
+    invalid = sorted(set(normalized) - KV_MEM_KINDS)
+    if invalid:
+        raise ValueError(f"Unsupported KV memory kinds for MoRI: {invalid}")
+    return normalized
+
+
+def _pack_list(values: List) -> bytes:
+    return msgspec.msgpack.encode(values) if values else b""
+
+
+def _unpack_list(blob: bytes) -> List:
+    return list(msgspec.msgpack.decode(blob)) if blob else []
 
 
 def _normalize_state_indices_per_component(
@@ -124,6 +148,11 @@ class TransferInfo:
     # populate this field (older receiver or radix-cache feature off) -> treat
     # as 0 (no prefix hit, full send) for backward compatibility.
     decode_prefix_len: Optional[int] = None
+    # DSV4 HiSparse can allocate C4 host rows independently from the logical
+    # device pages used by the indexer/C128 buffers. The primary
+    # dst_kv_indices remain source-aligned logical pages; this optional array
+    # carries the finer-grained host row destinations.
+    dst_host_kv_indices: Optional[npt.NDArray[np.int32]] = None
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -155,6 +184,9 @@ class TransferInfo:
             decode_prefix_len: Optional[int] = int(payload[8].decode("ascii"))
         else:
             decode_prefix_len = None
+        dst_host_kv_indices = (
+            np.frombuffer(payload[9], dtype=np.int32) if len(payload) > 9 else None
+        )
 
         # A transfer is "dummy" only when the receiver does not need any
         # kv/aux/state delivered. When decode_prefix_len > 0 and the delta is
@@ -174,6 +206,7 @@ class TransferInfo:
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
             decode_prefix_len=decode_prefix_len,
+            dst_host_kv_indices=dst_host_kv_indices,
         )
 
 
@@ -183,6 +216,8 @@ class KVArgsRegisterInfo:
     dst_port: int
     engine_desc: EngineDesc
     dst_kv_mem_descs: List[MemoryDesc]
+    dst_kv_mem_kinds: List[str]
+    dst_kv_item_lens: List[int]
     dst_aux_mem_descs: List[MemoryDesc]
     dst_state_mem_descs: List[List[MemoryDesc]]
     gpu_id: int
@@ -218,11 +253,31 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
+        raw_kv_mem_kinds = (
+            [str(kind) for kind in _unpack_list(payload[13])]
+            if len(payload) > 13 and payload[13]
+            else None
+        )
+        dst_kv_mem_kinds = _normalize_kv_mem_kinds(
+            raw_kv_mem_kinds, len(dst_kv_mem_descs)
+        )
+        dst_kv_item_lens = (
+            [int(item_len) for item_len in _unpack_list(payload[14])]
+            if len(payload) > 14 and payload[14]
+            else []
+        )
+        if dst_kv_item_lens and len(dst_kv_item_lens) != len(dst_kv_mem_descs):
+            raise ValueError(
+                "Destination KV item-length metadata does not match descriptors: "
+                f"{len(dst_kv_item_lens)} != {len(dst_kv_mem_descs)}"
+            )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
             engine_desc=engine_desc,
             dst_kv_mem_descs=dst_kv_mem_descs,
+            dst_kv_mem_kinds=dst_kv_mem_kinds,
+            dst_kv_item_lens=dst_kv_item_lens,
             dst_aux_mem_descs=dst_aux_mem_descs,
             dst_state_mem_descs=dst_state_mem_descs,
             gpu_id=gpu_id,
@@ -385,12 +440,21 @@ class MoriKVManager(CommonKVManager):
         return engine
 
     def _register_local_buffers(self) -> None:
-        for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
+        self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
+            getattr(self.kv_args, "kv_data_mem_kinds", None),
+            len(self.kv_args.kv_data_ptrs),
+        )
+        for ptr, length, mem_kind in zip(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.kv_data_lens,
+            self.kv_args.kv_data_mem_kinds,
+        ):
+            is_host = mem_kind == "DRAM"
             mem_desc = self.engine.register_memory(
                 ptr,
                 length,
-                self.kv_args.gpu_id,
-                MemoryLocationType.GPU,
+                -1 if is_host else self.kv_args.gpu_id,
+                MemoryLocationType.CPU if is_host else MemoryLocationType.GPU,
             )
             self.kv_mem_descs.append(mem_desc)
         for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
@@ -714,19 +778,84 @@ class MoriKVManager(CommonKVManager):
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
-    def _get_mla_mem_desc_slices(
-        self, dst_mem_descs: List[MemoryDesc]
-    ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
+    def _get_mla_mem_desc_slices(self, peer_info: KVArgsRegisterInfo) -> tuple[
+        List[MemoryDesc],
+        List[MemoryDesc],
+        List[str],
+        List[int],
+    ]:
         src_descs = self.kv_mem_descs
-        num_local_layers = len(src_descs)
+        dst_mem_descs = peer_info.dst_kv_mem_descs
+        dst_mem_kinds = _normalize_kv_mem_kinds(
+            peer_info.dst_kv_mem_kinds, len(dst_mem_descs)
+        )
+        dst_item_lens = peer_info.dst_kv_item_lens
+        if dst_item_lens and len(dst_item_lens) != len(dst_mem_descs):
+            raise ValueError(
+                "Destination MLA item lengths do not match memory descriptors"
+            )
+
+        # Most deployments register only the decode rank's local PP stage.
+        # In that case the descriptor order already matches the prefill side.
+        if len(dst_mem_descs) == len(src_descs):
+            return (
+                src_descs,
+                dst_mem_descs,
+                dst_mem_kinds,
+                dst_item_lens or list(self.kv_args.kv_item_lens),
+            )
+
         start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + num_local_layers
-        if end_layer > len(dst_mem_descs):
+        end_layer = self.kv_args.prefill_end_layer
+        compression_ratios = self.kv_args.mla_compression_ratios
+        if compression_ratios is None:
+            end_layer = (
+                end_layer if end_layer is not None else start_layer + len(src_descs)
+            )
+            dst_indices = list(range(start_layer, end_layer))
+        else:
+            if end_layer is None:
+                raise ValueError("DSV4 MLA PP slicing requires prefill_end_layer")
+            local_ratios = compression_ratios[start_layer:end_layer]
+            c4_before = sum(ratio == 4 for ratio in compression_ratios[:start_layer])
+            c4_local = sum(ratio == 4 for ratio in local_ratios)
+            c4_total = sum(ratio == 4 for ratio in compression_ratios)
+            c128_before = sum(
+                ratio == 128 for ratio in compression_ratios[:start_layer]
+            )
+            c128_local = sum(ratio == 128 for ratio in local_ratios)
+            dst_indices = (
+                list(range(c4_before, c4_before + c4_local))
+                + list(
+                    range(
+                        c4_total + c4_before,
+                        c4_total + c4_before + c4_local,
+                    )
+                )
+                + list(
+                    range(
+                        2 * c4_total + c128_before,
+                        2 * c4_total + c128_before + c128_local,
+                    )
+                )
+            )
+
+        if len(dst_indices) != len(src_descs) or (
+            dst_indices and max(dst_indices) >= len(dst_mem_descs)
+        ):
             raise ValueError(
                 "Destination MLA KV descriptors do not match prefill pp configuration"
             )
-        dst_slice = dst_mem_descs[start_layer:end_layer]
-        return src_descs, dst_slice, num_local_layers
+        return (
+            src_descs,
+            [dst_mem_descs[i] for i in dst_indices],
+            [dst_mem_kinds[i] for i in dst_indices],
+            (
+                [dst_item_lens[i] for i in dst_indices]
+                if dst_item_lens
+                else list(self.kv_args.kv_item_lens)
+            ),
+        )
 
     def _submit_batch_transfer_plan(
         self,
@@ -754,6 +883,86 @@ class MoriKVManager(CommonKVManager):
     ) -> BatchTransferPlan:
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
+
+    def _build_mixed_item_transfer_plan(
+        self,
+        src_indices: npt.NDArray[np.int32],
+        dst_indices: npt.NDArray[np.int32],
+        src_item_len: int,
+        dst_item_len: int,
+    ) -> BatchTransferPlan:
+        """Build a plan when one source page maps to multiple host rows.
+
+        Unified-KV DSV4 stores one logical C4 page as 64 contiguous bf16 rows,
+        while the HiSparse host allocator addresses each row independently.
+        Expanding source pages into row offsets preserves fragmented host
+        allocations and still lets contiguous runs collapse into larger writes.
+        """
+        if src_indices.size == 0 or dst_indices.size == 0:
+            return BatchTransferPlan([], [], [])
+        if src_item_len == dst_item_len:
+            if src_indices.size != dst_indices.size:
+                raise ValueError(
+                    "Equal-size KV items require matching source/destination indices"
+                )
+            grouped_plan = GroupedIndexPlan.from_groups(
+                *group_concurrent_contiguous(src_indices, dst_indices)
+            )
+            return self._build_contiguous_transfer_plan(grouped_plan, src_item_len)
+        if src_item_len < dst_item_len or src_item_len % dst_item_len != 0:
+            raise ValueError(
+                "Unsupported mixed KV item geometry: "
+                f"source={src_item_len}, destination={dst_item_len}"
+            )
+
+        rows_per_source_page = src_item_len // dst_item_len
+        max_dst_rows = src_indices.size * rows_per_source_page
+        if dst_indices.size > max_dst_rows:
+            raise ValueError(
+                "Host destination rows exceed source page capacity: "
+                f"{dst_indices.size} > {max_dst_rows}"
+            )
+
+        expanded_src_rows = np.concatenate(
+            [
+                np.arange(
+                    int(src_page) * rows_per_source_page,
+                    int(src_page) * rows_per_source_page + rows_per_source_page,
+                    dtype=np.int64,
+                )
+                for src_page in src_indices
+            ]
+        )[: dst_indices.size]
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(expanded_src_rows, dst_indices)
+        )
+        return self._build_contiguous_transfer_plan(grouped_plan, dst_item_len)
+
+    def _host_rows_per_source_page(
+        self, peer_info: KVArgsRegisterInfo
+    ) -> Optional[int]:
+        _, _, dst_mem_kinds, dst_item_lens = self._get_mla_mem_desc_slices(peer_info)
+        rows_per_page = set()
+        for src_item_len, dst_item_len, mem_kind in zip(
+            self.kv_args.kv_item_lens, dst_item_lens, dst_mem_kinds
+        ):
+            if mem_kind != "DRAM":
+                continue
+            if src_item_len < dst_item_len or src_item_len % dst_item_len != 0:
+                raise ValueError(
+                    "Invalid DSV4 HiSparse host item geometry: "
+                    f"source={src_item_len}, destination={dst_item_len}"
+                )
+            rows_per_page.add(src_item_len // dst_item_len)
+        if not rows_per_page:
+            # A heterogeneous PP target can own only indexer/C128 layers. It
+            # receives the request-level host metadata but has no C4 transfer.
+            return None
+        if len(rows_per_page) != 1:
+            raise ValueError(
+                f"Inconsistent HiSparse host rows per source page: {rows_per_page}"
+            )
+        return rows_per_page.pop()
 
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
@@ -872,33 +1081,55 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
+        dst_host_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> List[TransferStatus]:
+        statuses: List[TransferStatus] = []
+
+        if self.is_mla_backend:
+            src_descs, dst_descs, dst_mem_kinds, dst_item_lens = (
+                self._get_mla_mem_desc_slices(peer_info)
+            )
+            plan_cache: Dict[Tuple[str, int, int], BatchTransferPlan] = {}
+            for layer_id, (
+                src_desc,
+                dst_desc,
+                dst_mem_kind,
+                dst_item_len,
+            ) in enumerate(zip(src_descs, dst_descs, dst_mem_kinds, dst_item_lens)):
+                target_indices = dst_kv_indices
+                if dst_mem_kind == "DRAM":
+                    if dst_host_kv_indices is None:
+                        raise ValueError(
+                            "DRAM KV destination requires HiSparse host indices"
+                        )
+                    target_indices = dst_host_kv_indices
+                src_item_len = self.kv_args.kv_item_lens[layer_id]
+                plan_key = (dst_mem_kind, src_item_len, dst_item_len)
+                layer_plan = plan_cache.get(plan_key)
+                if layer_plan is None:
+                    layer_plan = self._build_mixed_item_transfer_plan(
+                        prefill_kv_indices,
+                        target_indices,
+                        src_item_len,
+                        dst_item_len,
+                    )
+                    plan_cache[plan_key] = layer_plan
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_desc,
+                        dst_desc,
+                        layer_plan,
+                    )
+                )
+            return statuses
+
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
                 prefill_kv_indices,
                 dst_kv_indices,
             )
         )
-        statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
-
-        if self.is_mla_backend:
-            src_descs, dst_descs, layers_current_pp_stage = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
-            )
-            for layer_id in range(layers_current_pp_stage):
-                layer_plan = self._build_contiguous_transfer_plan(
-                    grouped_plan, self.kv_args.kv_item_lens[layer_id]
-                )
-                statuses.extend(
-                    self._submit_batch_transfer_plan(
-                        src_descs[layer_id],
-                        dst_descs[layer_id],
-                        layer_plan,
-                    )
-                )
-            return statuses
-
         (
             src_k_descs,
             src_v_descs,
@@ -1345,8 +1576,27 @@ class MoriKVManager(CommonKVManager):
 
                 if not info.is_dummy:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
+                    dst_host_indices_chunk = None
+                    if info.dst_host_kv_indices is not None:
+                        rows_per_page = self._host_rows_per_source_page(peer_info)
+                        if rows_per_page is not None:
+                            page_start = index_slice.start or 0
+                            page_stop = index_slice.stop or len(info.dst_kv_indices)
+                            host_start = page_start * rows_per_page
+                            host_stop = min(
+                                page_stop * rows_per_page,
+                                len(info.dst_host_kv_indices),
+                            )
+                            dst_host_indices_chunk = info.dst_host_kv_indices[
+                                host_start:host_stop
+                            ]
                     result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                        self.send_kvcache(
+                            peer_info,
+                            kv_indices,
+                            dst_indices_chunk,
+                            dst_host_kv_indices=dst_host_indices_chunk,
+                        )
                     )
 
                 if (
@@ -1681,29 +1931,32 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
+        packed_kv_mem_kinds = _pack_list(self.kv_mgr.kv_args.kv_data_mem_kinds)
+        packed_kv_item_lens = _pack_list(self.kv_mgr.kv_args.kv_item_lens)
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            payload = [
+                MORI_GUARD,
+                "None".encode("ascii"),
+                self.kv_mgr.local_ip.encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                engine_desc_blob,
+                packed_kv_descs,
+                packed_aux_descs,
+                packed_state_descs,
+                gpu_id,
+                decode_tp_size,
+                decode_tp_rank,
+                kv_item_len,
+                packed_state_item_lens,
+                packed_state_dim_per_tensor,
+                packed_kv_mem_kinds,
+                packed_kv_item_lens,
+            ]
             try:
                 with lock:
-                    sock.send_multipart(
-                        [
-                            MORI_GUARD,
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            engine_desc_blob,
-                            packed_kv_descs,
-                            packed_aux_descs,
-                            packed_state_descs,
-                            gpu_id,
-                            decode_tp_size,
-                            decode_tp_rank,
-                            kv_item_len,
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                        ]
-                    )
+                    sock.send_multipart(payload)
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -1720,6 +1973,7 @@ class MoriKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        host_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1735,6 +1989,11 @@ class MoriKVReceiver(CommonKVReceiver):
             if decode_prefix_len is not None and decode_prefix_len > 0
             else b""
         )
+        host_kv_indices_bytes = (
+            np.asarray(host_kv_indices, dtype=np.int32).tobytes()
+            if host_kv_indices is not None and host_kv_indices.size
+            else b""
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1743,22 +2002,23 @@ class MoriKVReceiver(CommonKVReceiver):
                 state_bytes = _pack_state_indices(normalized_state)
             else:
                 state_bytes = b""
+            payload = [
+                MORI_GUARD,
+                str(self.bootstrap_room).encode("ascii"),
+                self.kv_mgr.local_ip.encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                self.kv_mgr.engine_desc.key.encode("ascii"),
+                kv_indices_bytes if not is_dummy else b"",
+                aux_bytes if not is_dummy else b"",
+                state_bytes,
+                str(self.required_dst_info_num).encode("ascii"),
+                decode_prefix_bytes,
+            ]
+            if host_kv_indices is not None:
+                payload.append(host_kv_indices_bytes if not is_dummy else b"")
             try:
                 with lock:
-                    sock.send_multipart(
-                        [
-                            MORI_GUARD,
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.kv_mgr.engine_desc.key.encode("ascii"),
-                            kv_indices_bytes if not is_dummy else b"",
-                            aux_bytes if not is_dummy else b"",
-                            state_bytes,
-                            str(self.required_dst_info_num).encode("ascii"),
-                            decode_prefix_bytes,
-                        ]
-                    )
+                    sock.send_multipart(payload)
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,

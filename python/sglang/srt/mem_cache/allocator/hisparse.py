@@ -316,7 +316,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
-                    self._kvcache.c4_logical_size + self.hisparse_page_size,
+                    self._kvcache.c4_logical_size
+                    + self.page_size // self.compress_ratio,
                     dtype=torch.int64,
                     device=self.device,
                 ),

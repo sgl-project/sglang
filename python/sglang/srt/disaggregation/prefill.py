@@ -243,6 +243,7 @@ class PrefillBootstrapQueue:
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
+        kv_args.kv_data_mem_kinds = ["VRAM"] * len(kv_data_ptrs)
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
