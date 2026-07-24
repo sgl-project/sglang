@@ -337,7 +337,10 @@ class QWenLMHeadModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                temp_name = name.replace(weight_name, param_name)
+                if temp_name not in params_dict:
+                    continue
+                name = temp_name
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -348,6 +351,9 @@ class QWenLMHeadModel(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip visual encoder weights (e.g. Qwen-VL-Chat transformer.visual.*)
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
