@@ -2,7 +2,6 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -37,11 +36,18 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.model_executor.runner import compile_in_capture_mode
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    hc_head_torch,
+)
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cuda
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
 
 COMPRESS_RATIO_NEXTN_LAYER = 0
 
@@ -122,13 +128,16 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
-        return y.to(dtype)
+        kwargs = {
+            "norm_eps": self.rms_norm_eps,
+            "hc_eps": self.hc_eps,
+        }
+
+        if x.shape[0] == 0 or not _is_cuda:
+            return hc_head_torch(x, hc_fn, hc_scale, hc_base, **kwargs)
+
+        hc_head_impl = compile_in_capture_mode(hc_head_torch)
+        return hc_head_impl(x, hc_fn, hc_scale, hc_base, **kwargs)
 
     def forward(
         self,
