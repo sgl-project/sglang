@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaTagsResponse,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.sanitize_content import safe_apply_chat_template
 
 
 class OllamaServing:
@@ -77,7 +78,8 @@ class OllamaServing:
         ]
 
         # Apply chat template using tokenizer
-        prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+        prompt_ids = safe_apply_chat_template(
+            self.tokenizer_manager.tokenizer,
             messages,
             tokenize=True,
             add_generation_prompt=True,
