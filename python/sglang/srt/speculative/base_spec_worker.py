@@ -132,6 +132,15 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    def requires_dp_attention_eager_forward(self, batch) -> bool:
+        """Whether this rank needs the current DP-attention step to run eagerly.
+
+        The scheduler folds this into the existing DP MLP-sync all-gather so a
+        rank-local speculative fallback is applied consistently to every rank
+        participating in the MoE forward.
+        """
+        return False
+
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Activate the optimal adaptive step for the current batch size.
 

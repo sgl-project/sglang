@@ -146,6 +146,57 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _trim_trtllm_decode_dp_padding(
+    q_all: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    real_batch_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    """Keep pre-planned DSA decode metadata aligned with its real request rows.
+
+    Eager DP-attention pads model activations to the largest token count across
+    ranks, but an MTP draft batch can carry DSA metadata that was deliberately
+    planned before that padding.  The metadata page table therefore has
+    ``real_batch_size`` rows while q/top-k have the larger physical row count.
+    Attention has no DP collective, so it should run only on the real prefix;
+    the output is padded back before the following MLP collectives.
+    """
+    physical_batch_size = q_all.shape[0]
+    assert real_batch_size <= physical_batch_size, (
+        f"DSA metadata batch size ({real_batch_size}) exceeds q batch size "
+        f"({physical_batch_size})"
+    )
+
+    if topk_indices is not None:
+        assert real_batch_size <= topk_indices.shape[0], (
+            f"DSA metadata batch size ({real_batch_size}) exceeds topk batch size "
+            f"({topk_indices.shape[0]})"
+        )
+
+    num_padding_rows = physical_batch_size - real_batch_size
+    if num_padding_rows == 0:
+        return q_all, topk_indices, 0
+
+    return (
+        q_all[:real_batch_size],
+        (topk_indices[:real_batch_size] if topk_indices is not None else topk_indices),
+        num_padding_rows,
+    )
+
+
+def _restore_trtllm_decode_dp_padding(
+    output: torch.Tensor, num_padding_rows: int
+) -> torch.Tensor:
+    if num_padding_rows == 0:
+        return output
+    return torch.cat(
+        [
+            output,
+            output.new_zeros((num_padding_rows, *output.shape[1:])),
+        ],
+        dim=0,
+    )
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -2892,9 +2943,22 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        # Fused top-k always consumes a dense q-aligned tensor. Decode does too
+        # before we trim any eager DP padding to the pre-planned metadata rows.
+        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        num_decode_padding_rows = 0
+        if not is_prefill:
+            q_all, topk_indices, num_decode_padding_rows = (
+                _trim_trtllm_decode_dp_padding(
+                    q_all,
+                    topk_indices,
+                    metadata.cache_seqlens_int32.shape[0],
+                )
+            )
+
         if self.use_fused_topk:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2910,8 +2974,6 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
@@ -2969,7 +3031,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
-        return out
+        return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
