@@ -42,7 +42,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    compute_mamba_state_slice_blocks,
+    compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -948,7 +948,8 @@ class MooncakeKVManager(CommonKVManager):
             )
             if sub_rank != 0:
                 skip_kv = True
-                skip_state = True
+                # Hybrid-MLA KV is replicated across these source ranks, but
+                # TP-sharded state needs every rank for the aggregation path.
 
         if (
             self.attn_cp_size > 1
@@ -984,6 +985,12 @@ class MooncakeKVManager(CommonKVManager):
             src_conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
             src_conv_shard_groups = (
                 src_conv_shard_groups[i] if i < len(src_conv_shard_groups) else []
+            )
+            src_slice_outer_counts = getattr(
+                self.kv_args, "state_slice_outer_counts", []
+            )
+            src_slice_outer_counts = (
+                src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
             )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
@@ -1027,6 +1034,7 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
                             src_conv_shard_groups,
+                            src_slice_outer_counts,
                         )
                         or rc
                     )
@@ -1166,6 +1174,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         src_state_conv_shard_groups: list = None,
+        src_state_slice_outer_counts: list[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1207,45 +1216,41 @@ class MooncakeKVManager(CommonKVManager):
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[i]
 
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
-            src_bytes_per_dim = src_item_len // src_dim
-            dst_bytes_per_dim = dst_item_len // dst_dim
-
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
                 if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
                 else None
             )
-            # One block for single-axis states; three (q/k/v) for GDN conv_state
-            # on the scatter path.
+            outer_count = (
+                src_state_slice_outer_counts[i]
+                if src_state_slice_outer_counts
+                and i < len(src_state_slice_outer_counts)
+                else 1
+            )
             for (
-                src_dim_start,
-                dst_dim_start,
-                num_dims_to_send,
-            ) in compute_mamba_state_slice_blocks(
+                src_offset,
+                dst_offset,
+                bytes_to_send,
+            ) in compute_mamba_state_slice_byte_blocks(
+                src_item_len=src_item_len,
+                dst_item_len=dst_item_len,
                 src_dim=src_dim,
                 dst_dim=dst_dim,
+                outer_count=outer_count,
                 src_attn_tp_size=self.attn_tp_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
             ):
-                src_dim_offset = src_dim_start * src_bytes_per_dim
-                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
                 src_addr = (
                     src_state_data_ptrs[i]
                     + src_item_len * int(prefill_mamba_index[0])
-                    + src_dim_offset
+                    + src_offset
                 )
                 dst_addr = (
-                    dst_state_ptr
-                    + dst_item_len * int(dst_mamba_index[0])
-                    + dst_dim_offset
+                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
                 )
-
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
