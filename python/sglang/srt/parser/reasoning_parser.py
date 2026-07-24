@@ -58,6 +58,7 @@ class BaseReasoningFormatDetector:
         self._buffer = ""
         self.stripped_think_start = False
         self.think_start_self_label = ""
+        self.structured_content_start_token = None
 
         self._force_nonempty_content = force_nonempty_content
         self._accumulated_reasoning = ""
@@ -461,6 +462,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
+        # Defer grammar enforcement until that final-channel header completes,
+        # so the header is not masked away.
+        self.structured_content_start_token = "<|channel|>final<|message|>"
         self.parser = HarmonyParser()
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
