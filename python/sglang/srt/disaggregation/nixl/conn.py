@@ -362,6 +362,10 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.transfer_source_rank = (
+            self.kv_args.pp_rank * self.server_args.tp_size
+            + self.kv_args.engine_rank
+        )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
@@ -1078,7 +1082,7 @@ class NixlKVManager(CommonKVManager):
 
                         notif = (
                             f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
+                            f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
                         )
 
                         # Decide which kv send path to use:
@@ -1168,7 +1172,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                f"{req.room}_state_{self.transfer_source_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1181,13 +1185,9 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        # When no KV pages were sent (decode-side cache hit),
-                        # encode pp_rank in aux notif so receiver can mark
-                        # expected_kvs_per_pp[pp_rank] = 0.
+                        # A no-KV notification still identifies its PP source.
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
-                            )
+                            aux_notif = f"{req.room}_aux_nokv_{self.transfer_source_rank}"
                         else:
                             aux_notif = f"{req.room}_aux"
                         aux_xfer_handle = self.send_aux(
