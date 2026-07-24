@@ -1188,7 +1188,9 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
