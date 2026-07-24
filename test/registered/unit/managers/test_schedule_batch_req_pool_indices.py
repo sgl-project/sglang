@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -23,6 +24,7 @@ def _make_req(req_pool_idx, origin_input_ids, output_ids):
         return_logprob=False,
         grammar=None,
         return_hidden_states=False,
+        return_hidden_states_mode=CaptureHiddenMode.NULL,
         is_prefill_only=False,
     )
 
