@@ -3791,6 +3791,26 @@ class ServerArgs:
             )
             self.smg_grpc_mode = True
 
+        # --speculative-attention-mode is a legacy routing knob: its
+        # 'prefill'/'decode' values select which existing attention backend
+        # serves target-verify rather than naming one directly. Its default
+        # 'prefill' combined with an explicit attention backend silently routes
+        # verify to the prefill backend, which can disable the sync-free decode
+        # path (a cpu-seq-lens prefill backend forces a per-step host sync).
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_attention_mode == "prefill"
+            and not self.is_attention_backend_not_set()
+        ):
+            logger.warning(
+                "--speculative-attention-mode is 'prefill' (default) while an "
+                "explicit attention backend is set: speculative target-verify "
+                "will run on the prefill backend. This legacy routing is "
+                "deprecated; pass --speculative-attention-mode decode to run "
+                "verify on the decode backend (the sync-free path on GPU-plan "
+                "backends such as trtllm_mla)."
+            )
+
         # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
         # native server, falling back to SGLANG_GRPC_PORT.
         self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
