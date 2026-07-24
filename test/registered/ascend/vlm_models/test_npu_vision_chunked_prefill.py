@@ -124,7 +124,7 @@ class TestVisionChunkedPrefill(CustomTestCase):
         # prepare the video input about Steven introducing ipod nano
         file_path = VIDEO_JOBS_PATH
         if not os.path.exists(file_path):
-            logger.error(f"本地视频文件未找到: {file_path}")
+            logger.error(f"Local video file not found: {file_path}")
             raise FileNotFoundError(f"Video file not found at {file_path}")
 
         if not batch:

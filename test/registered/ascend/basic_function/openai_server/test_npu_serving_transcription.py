@@ -14,8 +14,8 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
+    AUDIO_TRUMP_WEF_PATH,
     QWEN3_ASR_0_6B_WEIGHTS_PATH,
-    VIDEO_TRUMP_WEF_PATH,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -28,10 +28,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 QWEN_ASR_MODEL = QWEN3_ASR_0_6B_WEIGHTS_PATH
-AUDIO_URL = VIDEO_TRUMP_WEF_PATH
+AUDIO_URL = AUDIO_TRUMP_WEF_PATH
 
 
-def download_audio_bytes(url=VIDEO_TRUMP_WEF_PATH):
+def download_audio_bytes(url=AUDIO_TRUMP_WEF_PATH):
     """Read audio file from local path and return raw bytes."""
     with open(url, "rb") as f:
         return f.read()
