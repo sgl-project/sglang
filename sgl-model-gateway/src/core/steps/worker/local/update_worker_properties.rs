@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::core::{
-    steps::workflow_data::WorkerUpdateWorkflowData, BasicWorkerBuilder, HealthConfig, Worker,
+    is_pd_input_limit_metadata_label, steps::workflow_data::WorkerUpdateWorkflowData,
+    BasicWorkerBuilder, HealthConfig, Worker,
 };
 
 /// Step to update worker properties.
@@ -48,6 +49,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             let mut updated_labels = worker.metadata().labels.clone();
             if let Some(ref new_labels) = request.labels {
                 for (key, value) in new_labels {
+                    if is_pd_input_limit_metadata_label(key) {
+                        warn!(
+                            worker_url = %worker.url(),
+                            label = %key,
+                            "Ignoring update override for router-managed worker metadata"
+                        );
+                        continue;
+                    }
                     updated_labels.insert(key.clone(), value.clone());
                 }
             }

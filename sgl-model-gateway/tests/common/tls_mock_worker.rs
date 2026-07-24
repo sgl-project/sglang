@@ -285,6 +285,8 @@ async fn server_info_handler(State(config): State<Arc<RwLock<TlsMockWorkerConfig
         "port": config.port,
         "host": "127.0.0.1",
         "tls_enabled": true,
+        "max_req_input_len": 32767,
+        "supports_disagg_max_req_input_len": true,
         "version": "0.3.0"
     }))
     .into_response()

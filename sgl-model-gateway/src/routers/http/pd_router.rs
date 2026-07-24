@@ -234,6 +234,62 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
+    const DISAGG_MAX_REQ_INPUT_LEN_KEY: &'static str = "disagg_max_req_input_len";
+
+    fn route_uses_shared_input_limit(route: &str) -> bool {
+        matches!(
+            route,
+            "/generate" | "/v1/completions" | "/v1/chat/completions"
+        )
+    }
+
+    fn get_shared_input_limit(
+        prefill_worker: &dyn Worker,
+        decode_worker: &dyn Worker,
+    ) -> Result<usize, String> {
+        for (role, worker) in [("prefill", prefill_worker), ("decode", decode_worker)] {
+            if !worker.supports_disagg_max_req_input_len() {
+                return Err(format!(
+                    "{} worker {} does not support the PD shared input limit",
+                    role,
+                    worker.url()
+                ));
+            }
+        }
+
+        let prefill_limit = prefill_worker.max_req_input_len().ok_or_else(|| {
+            format!(
+                "prefill worker {} has no valid max_req_input_len",
+                prefill_worker.url()
+            )
+        })?;
+        let decode_limit = decode_worker.max_req_input_len().ok_or_else(|| {
+            format!(
+                "decode worker {} has no valid max_req_input_len",
+                decode_worker.url()
+            )
+        })?;
+
+        if prefill_limit == 0 || decode_limit == 0 {
+            return Err(format!(
+                "PD worker input limits must be positive: prefill={}, decode={}",
+                prefill_limit, decode_limit
+            ));
+        }
+
+        Ok(prefill_limit.min(decode_limit))
+    }
+
+    fn inject_shared_input_limit(mut original: Value, limit: usize) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        obj.insert(
+            Self::DISAGG_MAX_REQ_INPUT_LEN_KEY.to_string(),
+            Value::from(limit as u64),
+        );
+        Ok(original)
+    }
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -415,6 +471,26 @@ impl PDRouter {
                             decode.url()
                         );
 
+                        let shared_input_limit = if Self::route_uses_shared_input_limit(route) {
+                            let limit = match Self::get_shared_input_limit(
+                                prefill.as_ref(),
+                                decode.as_ref(),
+                            ) {
+                                Ok(limit) => limit,
+                                Err(e) => return Self::handle_server_selection_error(e),
+                            };
+
+                            debug!(
+                                prefill_max_req_input_len = ?prefill.max_req_input_len(),
+                                decode_max_req_input_len = ?decode.max_req_input_len(),
+                                shared_input_limit = limit,
+                                "Selected PD shared input limit"
+                            );
+                            Some(limit)
+                        } else {
+                            None
+                        };
+
                         let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
@@ -428,6 +504,16 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+
+                        if let Some(shared_input_limit) = shared_input_limit {
+                            json_request = match Self::inject_shared_input_limit(
+                                json_request,
+                                shared_input_limit,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                        }
 
                         let ctx_is_stream = context.is_stream;
                         let response = self
@@ -1715,8 +1801,10 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorker, BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1739,6 +1827,79 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    fn create_capable_test_worker(
+        url: &str,
+        worker_type: WorkerType,
+        max_req_input_len: usize,
+    ) -> BasicWorker {
+        let labels = HashMap::from([
+            (
+                "max_req_input_len".to_string(),
+                max_req_input_len.to_string(),
+            ),
+            (
+                "supports_disagg_max_req_input_len".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .labels(labels)
+            .build()
+    }
+
+    #[test]
+    fn test_shared_input_limit_uses_smaller_worker_capacity() {
+        let prefill = create_capable_test_worker(
+            "http://prefill",
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            184_949,
+        );
+        let decode = create_capable_test_worker("http://decode", WorkerType::Decode, 372_277);
+
+        assert_eq!(
+            PDRouter::get_shared_input_limit(&prefill, &decode).unwrap(),
+            184_949
+        );
+    }
+
+    #[test]
+    fn test_shared_input_limit_requires_worker_capability() {
+        let prefill = BasicWorkerBuilder::new("http://prefill")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = create_capable_test_worker("http://decode", WorkerType::Decode, 372_277);
+
+        let error = PDRouter::get_shared_input_limit(&prefill, &decode).unwrap_err();
+        assert!(error.contains("does not support"));
+    }
+
+    #[test]
+    fn test_inject_shared_input_limit_overwrites_client_value() {
+        let request = json!({
+            "prompt": "hello",
+            "disagg_max_req_input_len": 999_999,
+        });
+
+        let request = PDRouter::inject_shared_input_limit(request, 184_949).unwrap();
+        assert_eq!(request["disagg_max_req_input_len"], 184_949);
+    }
+
+    #[test]
+    fn test_shared_input_limit_is_only_used_by_generation_routes() {
+        assert!(PDRouter::route_uses_shared_input_limit("/generate"));
+        assert!(PDRouter::route_uses_shared_input_limit("/v1/completions"));
+        assert!(PDRouter::route_uses_shared_input_limit(
+            "/v1/chat/completions"
+        ));
+        assert!(!PDRouter::route_uses_shared_input_limit("/rerank"));
+        assert!(!PDRouter::route_uses_shared_input_limit("/v1/rerank"));
     }
 
     #[test]
@@ -1868,6 +2029,7 @@ mod tests {
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 1234,
+            "disagg_max_req_input_len": 184_949,
         });
 
         let (prefill_request, decode_request) =
@@ -1880,6 +2042,7 @@ mod tests {
             "http://prefill:30000/v1/completions"
         );
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert_eq!(prefill_request.body["disagg_max_req_input_len"], 184_949);
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
         assert_eq!(
@@ -1889,25 +2052,32 @@ mod tests {
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
+        assert_eq!(decode_request.body["disagg_max_req_input_len"], 184_949);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Owned(_)));
     }
 
     #[tokio::test]
     async fn test_prepare_pd_worker_requests_preserves_non_dp_workers() {
-        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
-            .worker_type(WorkerType::Prefill {
+        let prefill = create_capable_test_worker(
+            "http://prefill:30000",
+            WorkerType::Prefill {
                 bootstrap_port: Some(8998),
-            })
-            .build();
-        let decode = BasicWorkerBuilder::new("http://decode:30001")
-            .worker_type(WorkerType::Decode)
-            .build();
-        let request = json!({
-            "prompt": "shared prefix",
-            "max_tokens": 8,
-            "bootstrap_room": 1234,
-        });
+            },
+            184_949,
+        );
+        let decode = create_capable_test_worker("http://decode:30001", WorkerType::Decode, 372_277);
+        let shared_input_limit = PDRouter::get_shared_input_limit(&prefill, &decode).unwrap();
+        let request = PDRouter::inject_shared_input_limit(
+            json!({
+                "prompt": "shared prefix",
+                "max_tokens": 8,
+                "bootstrap_room": 1234,
+                "disagg_max_req_input_len": 999_999,
+            }),
+            shared_input_limit,
+        )
+        .unwrap();
 
         let (prefill_request, decode_request) =
             PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
@@ -1925,6 +2095,8 @@ mod tests {
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
         assert!(decode_request.body.get("data_parallel_rank").is_none());
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
+        assert_eq!(prefill_request.body["disagg_max_req_input_len"], 184_949);
+        assert_eq!(decode_request.body["disagg_max_req_input_len"], 184_949);
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
     }

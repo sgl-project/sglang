@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
@@ -12,8 +12,9 @@ use crate::{
         circuit_breaker::CircuitBreakerConfig,
         model_card::ModelCard,
         steps::workflow_data::LocalWorkerWorkflowData,
-        worker::{HealthConfig, RuntimeType, WorkerType},
-        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
+        worker::{is_pd_input_limit_metadata_label, HealthConfig, RuntimeType, WorkerType},
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, MAX_REQ_INPUT_LEN_LABEL,
+        SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -46,6 +47,16 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
             })?;
         let discovered_labels = &context.data.discovered_labels;
 
+        validate_http_pd_input_limit_metadata(
+            connection_mode,
+            config.worker_type.as_deref(),
+            discovered_labels,
+        )
+        .map_err(|message| WorkflowError::StepFailed {
+            step_id: StepId::new("create_worker"),
+            message,
+        })?;
+
         // Check if worker already exists
         if app_context
             .worker_registry
@@ -67,11 +78,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
             config_labels.insert("cost".to_string(), cost.to_string());
         }
 
-        // Merge: discovered labels first, then config labels (config takes precedence)
-        let mut final_labels = discovered_labels.clone();
-        for (key, value) in &config_labels {
-            final_labels.insert(key.clone(), value.clone());
-        }
+        // Merge discovered and config labels. Registration values take precedence
+        // except for capability metadata owned by backend discovery.
+        let final_labels = merge_worker_labels(discovered_labels, &config_labels, &config.url);
 
         // Determine model_id: config > served_model_name > model_path > UNKNOWN_MODEL_ID
         let model_id = config
@@ -155,6 +164,67 @@ impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
+}
+
+fn validate_http_pd_input_limit_metadata(
+    connection_mode: &ConnectionMode,
+    worker_type: Option<&str>,
+    discovered_labels: &HashMap<String, String>,
+) -> Result<(), String> {
+    let is_http_pd_worker = matches!(connection_mode, ConnectionMode::Http)
+        && matches!(worker_type, Some("prefill" | "decode"));
+    if !is_http_pd_worker {
+        return Ok(());
+    }
+
+    let supports_shared_limit = discovered_labels
+        .get(SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL)
+        .is_some_and(|value| value == "true");
+    if !supports_shared_limit {
+        return Err(format!(
+            "HTTP {} worker does not advertise {}=true from /server_info",
+            worker_type.unwrap_or("PD"),
+            SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL
+        ));
+    }
+
+    let max_req_input_len = discovered_labels
+        .get(MAX_REQ_INPUT_LEN_LABEL)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            format!(
+                "HTTP {} worker has no valid positive {} from /server_info",
+                worker_type.unwrap_or("PD"),
+                MAX_REQ_INPUT_LEN_LABEL
+            )
+        })?;
+
+    debug!(
+        worker_type = worker_type.unwrap_or("PD"),
+        max_req_input_len, "Validated HTTP PD shared input limit metadata"
+    );
+    Ok(())
+}
+
+fn merge_worker_labels(
+    discovered_labels: &HashMap<String, String>,
+    config_labels: &HashMap<String, String>,
+    worker_url: &str,
+) -> HashMap<String, String> {
+    let mut final_labels = discovered_labels.clone();
+    for (key, value) in config_labels {
+        if is_pd_input_limit_metadata_label(key) {
+            warn!(
+                worker_url,
+                label = %key,
+                "Ignoring registration override for router-managed worker metadata"
+            );
+            continue;
+        }
+        final_labels.insert(key.clone(), value.clone());
+    }
+    final_labels
 }
 
 fn build_model_card(
@@ -395,4 +465,70 @@ fn create_single_worker(
     );
 
     vec![worker]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_pd_metadata(max_req_input_len: usize) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                MAX_REQ_INPUT_LEN_LABEL.to_string(),
+                max_req_input_len.to_string(),
+            ),
+            (
+                SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL.to_string(),
+                "true".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn http_pd_worker_requires_discovered_shared_limit_metadata() {
+        let error = validate_http_pd_input_limit_metadata(
+            &ConnectionMode::Http,
+            Some("prefill"),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains(SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL));
+
+        let metadata = HashMap::from([(
+            SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL.to_string(),
+            "true".to_string(),
+        )]);
+        let error =
+            validate_http_pd_input_limit_metadata(&ConnectionMode::Http, Some("decode"), &metadata)
+                .unwrap_err();
+        assert!(error.contains(MAX_REQ_INPUT_LEN_LABEL));
+    }
+
+    #[test]
+    fn http_pd_worker_accepts_valid_discovered_shared_limit_metadata() {
+        assert!(validate_http_pd_input_limit_metadata(
+            &ConnectionMode::Http,
+            Some("decode"),
+            &valid_pd_metadata(372_277),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn registration_labels_cannot_override_discovered_shared_limit_metadata() {
+        let discovered = valid_pd_metadata(184_949);
+        let config = HashMap::from([
+            (MAX_REQ_INPUT_LEN_LABEL.to_string(), "999999".to_string()),
+            (
+                SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL.to_string(),
+                "false".to_string(),
+            ),
+            ("zone".to_string(), "test".to_string()),
+        ]);
+
+        let merged = merge_worker_labels(&discovered, &config, "http://worker");
+        assert_eq!(merged[MAX_REQ_INPUT_LEN_LABEL], "184949");
+        assert_eq!(merged[SUPPORTS_DISAGG_MAX_REQ_INPUT_LEN_LABEL], "true");
+        assert_eq!(merged["zone"], "test");
+    }
 }
