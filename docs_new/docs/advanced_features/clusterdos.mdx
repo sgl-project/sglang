@@ -6,7 +6,7 @@ metatags:
 
 [clusterdOS](https://gitlab.com/aranya-tech/public/clusterdos) is a Kubernetes distribution that bootstraps and maintains a cluster via ArgoCD, treating each capability as an opt-in **gitapp** (Helm chart wrapped as an ArgoCD `Application`). It ships gitapps for Cilium, Rook Ceph, WekaFS, Grafana LGTM, Tailscale, kubevirt, Slurm — and today, for LLM inference, `vllm` + `clusterdos-inference` (vLLM + llm-d).
 
-This page describes a **proposed SGLang integration** into clusterdOS as a peer to that vLLM + llm-d stack: two new gitapps, `sglang` (raw engine) and `clusterdos-sglang-inference` (SGLang + sgl-router with optional PD-disaggregation), coexisting with the existing `inference` gitapp so operators pick the runtime per model.
+This page describes a **proposed SGLang integration** into clusterdOS as a peer to that vLLM + llm-d stack: a new **`clusterdos-sglang-inference`** gitapp (SGLang + sgl-router with optional PD-disaggregation), matching the composite shape of the existing `clusterdos-inference` chart. The two gitapps coexist so operators pick the runtime per model.
 
 ## Status
 
@@ -35,14 +35,14 @@ Enough hardware to answer "does SGLang boot and serve on our cluster?" — see t
 | --- | --- |
 | Kubernetes | v1.28+ (MicroK8s, kind, k3s, DOKS, EKS, bare-metal — any distro clusterdOS supports today) |
 | Nodes | 1 GPU-capable node |
-| GPU | 1× NVIDIA GPU with ≥ 24 GB VRAM (RTX 4090, L40S, A6000, A100-40GB) |
-| GPU operator | NVIDIA GPU Operator (already in clusterdOS as `nvidiagpuoperator` gitapp) — provides the `nvidia.com/gpu.present=true` node label + device plugin |
-| Storage | emptyDir works for the smoke test (≥ 30 GB free on node) |
+| GPU | 1× NVIDIA GPU with ≥ 24 GB VRAM (RTX 4090 24GB, L40 48GB, A6000 48GB, A100 40/80GB, H100). Comfortable for the ~8 GB Qwen3-4B smoke model; for 7-8B models bump to ≥ 40 GB or use `--mem-fraction-static` tuning. |
+| GPU operator | NVIDIA GPU Operator (clusterdOS `nvidiagpuoperator` gitapp) **plus** Node Feature Discovery (clusterdOS `nfd` gitapp) — required together for the `nvidia.com/gpu.present=true` node label. Verify with `kubectl get nodes -o jsonpath='{.items[*].metadata.labels}' \| grep -o "nvidia[^\"]*"`. If the label is absent, substitute what your cluster actually sets (e.g. `feature.node.kubernetes.io/pci-10de.present: "true"`). |
+| Storage | emptyDir works for the smoke test (≥ 15 GB free on node for the 4B model) |
 | Egress | HuggingFace Hub reachable from pod network (or a pre-populated HF cache) |
-| Node RAM | ≥ 32 GB (8B model + tokenizer + overhead) |
+| Node RAM | ≥ 16 GB (4B model + tokenizer + overhead) |
 | Client tooling | `kubectl` ≥ v1.28, `curl`, `jq` |
 
-Model target: **Qwen3-8B** or **Mistral-7B-Instruct-v0.3** — small enough for a single 24 GB GPU with no tensor parallelism.
+Model target: **Qwen3-4B** — ~8 GB in FP16, fits comfortably on any 24 GB GPU with plenty of KV headroom. Swap to `mistralai/Mistral-7B-Instruct-v0.3` (matches the clusterdos-inference default) if you have ≥ 40 GB VRAM and want to match the vLLM stack's smoke model.
 
 ### Tier 2 — Full-feature validation (the actual gitapp + router + PD, ~1-2 days)
 
@@ -123,7 +123,7 @@ spec:
           image: lmsysorg/sglang:latest
           command: ["python", "-m", "sglang.launch_server"]
           args:
-            - --model-path=Qwen/Qwen3-8B
+            - --model-path=Qwen/Qwen3-4B
             - --host=0.0.0.0
             - --port=30000
           ports:
@@ -141,8 +141,8 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: 1
-              memory: 32Gi
-              cpu: "8"
+              memory: 16Gi
+              cpu: "4"
           readinessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 300
@@ -153,7 +153,7 @@ spec:
       volumes:
         - name: hf-cache
           emptyDir:
-            sizeLimit: 30Gi
+            sizeLimit: 15Gi
 ---
 apiVersion: v1
 kind: Service
@@ -189,15 +189,16 @@ kubectl -n sglang-probe logs -f -l app=sglang-probe
 
 Expected log milestones:
 
-1. `Downloading Qwen3-8B` — HuggingFace download (~15 GB, 2-5 min on gigabit)
-2. `Loading model` — model init on GPU (~30 sec)
-3. `Capture CUDA graph` — CUDA-graph capture (~2 min)
+1. `Downloading Qwen3-4B` — HuggingFace download (~8 GB, 1-3 min on gigabit)
+2. `Loading model` — model init on GPU (~15-30 sec)
+3. `Capture CUDA graph` — CUDA-graph capture (~30 sec on H100, up to ~2 min on L40/A100)
 4. `The server is fired up and ready to roll!` — server up
 
 Common failures:
 
-- Pod stuck in `ContainerCreating` > 3 min → `kubectl describe pod` for image-pull issues.
-- Pod runs but never Ready → check logs for OOM, HF download failure, or CUDA-graph capture failure. Fallback: add `--disable-cuda-graph` to args.
+- Pod stuck in `Pending` → node label mismatch. `kubectl describe pod` will show `didn't match Pod's node affinity/selector`. Verify with `kubectl get nodes -o jsonpath='{.items[*].metadata.labels}' \| grep -o "nvidia[^\"]*"`; replace the nodeSelector with what your cluster sets.
+- Pod stuck in `ContainerCreating` > 3 min → image-pull or GPU device-plugin issue. `kubectl describe pod` and `kubectl -n kube-system logs -l app=nvidia-device-plugin`.
+- Pod runs but never Ready → OOM (bump memory limit or use smaller model), HF download failure (check egress), or CUDA-graph capture failure (add `--disable-cuda-graph` to args).
 
 ### Step 3 — Smoke-test the API (~2 min)
 
@@ -212,7 +213,7 @@ curl -s http://localhost:30000/v1/models | jq
 curl -s http://localhost:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-        "model": "Qwen/Qwen3-8B",
+        "model": "Qwen/Qwen3-4B",
         "messages": [{"role": "user", "content": "In one sentence: what is a radix cache?"}],
         "max_tokens": 100
       }' | jq
@@ -221,7 +222,7 @@ curl -s http://localhost:30000/v1/chat/completions \
 curl -N -s http://localhost:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-        "model": "Qwen/Qwen3-8B",
+        "model": "Qwen/Qwen3-4B",
         "messages": [{"role": "user", "content": "Count to 5."}],
         "stream": true,
         "max_tokens": 30
@@ -263,7 +264,7 @@ Purpose: give clusterdOS maintainers a working artifact to review before we comm
 
 All four must hold:
 
-1. `sglang: enabled: true` in `install.yaml` deploys SGLang + sgl-router via ArgoCD (not raw `kubectl`).
+1. `sglangInference: enabled: true` in `install.yaml` deploys SGLang + sgl-router via ArgoCD (not raw `kubectl`).
 2. Both pods reach `Ready`; ArgoCD reports **Synced / Healthy**.
 3. Chat completion works through the router (not directly against the engine).
 4. Setting `enabled: false` cleanly removes everything — no leaked resources.
@@ -272,80 +273,119 @@ All four must hold:
 
 Deferred to the full plan:
 
-- PD-disaggregation (single Deployment only)
+- PD-disaggregation (single engine Deployment only, `pdMode` values-toggle not implemented)
 - AMD / ROCm support (NVIDIA only)
+- Multi-vendor `_helpers.tpl` (hardcode NVIDIA node selector + toleration)
 - HPA, NetworkPolicy, ServiceMonitor
-- Full `values.yaml` surface (hardcode reasonable defaults)
-- PVC for HuggingFace cache (`emptyDir` is fine for a PoC)
+- Full `values.yaml` surface (hardcode reasonable defaults; no per-cluster override plumbing)
+- PVC for HuggingFace cache (`emptyDir` is fine for a PoC; production wants a shared PVC)
 - HF token secret plumbing (no gated models)
+- Autoscaling on custom metrics
 
 ### PoC file layout
 
-Minimal chart, ~180 lines total across 7 files. Mirrors the `gitapps/vllm/` shape plus the router-side pieces:
+One composite gitapp (SGLang engine + sgl-router in a single chart), matching how `clusterdos-inference` bundles vLLM + llm-d. Minimal chart, ~200 lines total across 8 files:
 
 ```
-gitapps/sglang/
+gitapps/clusterdos-sglang-inference/
 ├── Chart.yaml                     # ~10 lines
 ├── values.yaml                    # ~30 lines, hardcoded defaults
 └── templates/
-    ├── deployment.yaml            # SGLang engine (~60 lines)
-    ├── service.yaml               # engine ClusterIP (~10 lines)
+    ├── namespace.yaml             # matches clusterdos-inference pattern
+    ├── engine-deployment.yaml     # SGLang worker (~60 lines)
+    ├── engine-service.yaml        # headless service (~10 lines)
     ├── router-deployment.yaml     # sgl-router (~40 lines)
     ├── router-service.yaml        # router ClusterIP (~10 lines)
     └── router-rbac.yaml           # SA + Role + RoleBinding on endpointslices (~25 lines)
 ```
 
-Plus one line in `install.yaml`: `sglang: enabled: false` under `gitapps:`.
+Plus **two** other file edits (this is the piece the earlier draft of this doc missed — `install.yaml` alone is not enough):
+
+**`metadeployment/values.yaml`** — declare the gitapp (~10 lines, mirrors the shape of the existing `inference` entry):
+
+```yaml
+gitapps:
+  # ... existing entries ...
+  sglangInference:
+    # SGLang + sgl-router prefix-cache-aware routing
+    # ArgoCD app name: clusterdos-sglang-inference (template prepends "clusterdos-")
+    enabled: false
+    namespace: clusterdos-sglang-inference
+    internal: true
+    path: gitapps/clusterdos-sglang-inference
+    automated: true
+    syncWave: 2
+    values: {}
+```
+
+**`install.yaml`** — expose the toggle (1 line under `spec.source.helm.valuesObject.gitapps:`):
+
+```yaml
+sglangInference:
+  enabled: false
+```
+
+Users flip `enabled: true` in their `install.yaml` override to deploy — same pattern as every other clusterdOS gitapp. The `metadeployment/templates/gitapps.yaml` template picks up the map and generates a `clusterdos-sglang-inference` ArgoCD Application at sync-wave 2.
 
 ### PoC vs the smoke probe vs the full plan
 
 | Aspect | Smoke probe | **PoC** | Full plan |
 |---|---|---|---|
-| Effort | 30 min | **~4 days** | ~1 week |
-| Deploy path | `kubectl apply -f probe.yaml` | **ArgoCD + `install.yaml` toggle** | Same as PoC |
+| Effort | 30 min | **~4-5 days** (incl. debug margin) | ~1-1.5 weeks |
+| Chart | none (raw manifests) | **`gitapps/clusterdos-sglang-inference/`** | Same path, expanded templates |
+| Deploy path | `kubectl apply -f probe.yaml` | **ArgoCD + `sglangInference: enabled: true`** | Same as PoC |
 | Engine | 1× SGLang pod | **1× SGLang pod** | Multi-replica configurable |
 | Router | None | **`sgl-router` + K8s discovery** | Same as PoC, plus PD toggle |
-| PD-disagg | No | **No** | Yes (values.yaml toggle) |
-| Values surface | N/A | **Hardcoded** | Full |
+| PD-disagg | No | **No** | Yes (`pdMode.enabled` values toggle) |
+| Values surface | N/A | **Hardcoded defaults** | Full (`gpu.vendor`, `model`, `replicas`, `router.policy`, etc.) |
 | GPU vendor | NVIDIA | **NVIDIA** | NVIDIA + AMD |
+| Model | Qwen3-4B | Qwen3-4B | Configurable (Mistral-7B default) |
+| Observability | No | Optional | ServiceMonitor + Grafana Alloy annotations |
 | Purpose | "Does SGLang boot?" | **"Does the gitapp plumbing work?"** | Production integration |
 
 ### Demo playbook (~4 days)
 
-**Day 1 — Author the chart** (~4 hours)
+Estimate assumes some debug time — first-time RBAC / service-discovery / image-pull issues typically cost half a day beyond the happy path.
+
+**Day 1 — Author the chart + wire the toggle** (~4 hours)
 
 1. Fork `gitlab.com/aranya-tech/public/clusterdos`, branch off `develop` as `poc/sglang-inference`.
-2. Author the 7-file `gitapps/sglang/` skeleton — mirror the `gitapps/vllm/` layout for engine templates, use the sgl-router k8s discovery pattern (`--service-discovery --selector=app=sglang`) for the router side.
-3. Add `sglang: enabled: false` to `install.yaml`.
-4. Local dry-run: `helm template gitapps/sglang | kubectl apply --dry-run=client -f -`.
+2. Author `gitapps/clusterdos-sglang-inference/` (8 files above). Copy `gitapps/clusterdos-inference/templates/_helpers.tpl` naming convention and `Chart.yaml` shape as your reference.
+3. Add the `sglangInference` gitapp entry to `metadeployment/values.yaml` (10 lines shown above).
+4. Add `sglangInference: enabled: false` to `install.yaml` under `spec.source.helm.valuesObject.gitapps`.
+5. Local dry-run of the chart: `helm template gitapps/clusterdos-sglang-inference \| kubectl apply --dry-run=client -f -`. Should produce all resources without schema errors.
+6. GPG-signed commit per `AGENTS.md` (`SSH_AUTH_SOCK=/tmp/authenticated-agent.sock git commit -S ...`).
 
-**Day 2 — Deploy on a real cluster** (~4 hours)
+**Day 2 — Deploy on a real cluster** (~4-6 hours)
 
-5. Point a test cluster's `install.yaml` at the PoC branch (`targetRevision: poc/sglang-inference`).
-6. Enable the gitapp: `sglang: enabled: true`.
-7. Watch ArgoCD sync — capture the `Synced / Healthy` state.
-8. Watch pods come up (~10-20 min for weights download + CUDA graph capture).
-9. Port-forward the router service and curl a chat completion:
+7. Push branch to your fork. On a test cluster, replace the `install.yaml` `source.repoURL` with your fork URL and `targetRevision` with `poc/sglang-inference`.
+8. Add `clustername` to `install.yaml` if it isn't already set (REQUIRED field per the metadeployment values). Enable the gitapp: `sglangInference: enabled: true`.
+9. Apply: `kubectl apply -f install.yaml`. Watch ArgoCD create the `clusterdos-sglang-inference` Application.
+10. Watch pods (`kubectl -n clusterdos-sglang-inference get pods -w`). Engine ~5-10 min for Qwen3-4B download + CUDA-graph capture; router ~30 sec.
+11. Verify service discovery: `kubectl -n clusterdos-sglang-inference logs deploy/sgl-router \| grep -i "worker registered"` — should show the engine pod's IP getting added.
+
+**Day 3 — End-to-end verify + capture evidence** (~4 hours)
+
+12. Port-forward the router: `kubectl -n clusterdos-sglang-inference port-forward svc/sgl-router 30000:30000 &`
+13. Curl through the router (verifies routing works, not just direct engine):
 
     ```bash
-    kubectl -n sglang port-forward svc/sgl-router 30000:30000 &
+    curl -s http://localhost:30000/v1/models | jq
     curl -s http://localhost:30000/v1/chat/completions \
       -H 'Content-Type: application/json' \
-      -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"hi"}],"max_tokens":20}' | jq
+      -d '{"model":"Qwen/Qwen3-4B","messages":[{"role":"user","content":"hi"}],"max_tokens":20}' | jq
     ```
 
-**Day 3 — Iterate + capture evidence** (~4 hours)
+14. Test teardown: flip `sglangInference: enabled: false` in `install.yaml`, re-apply. ArgoCD should prune the Application → all pods/services gone. Verify: `kubectl get all -n clusterdos-sglang-inference` returns empty.
+15. Screenshots: ArgoCD UI (Synced/Healthy → pruned), successful `curl` output, engine + router pod-ready logs.
 
-10. Iterate on any startup / RBAC / networking issues.
-11. Test teardown: `sglang: enabled: false` → ArgoCD prunes → `kubectl get all -n sglang` returns empty.
-12. Screenshot the ArgoCD UI (Synced/Healthy state, and the successful prune).
-13. Capture the successful `curl` output and pod-ready logs.
+**Day 4-5 — PoC MR + writeup + debug margin** (~4-8 hours)
 
-**Day 4 — PoC MR + writeup** (~4 hours)
-
-14. Open a draft MR on the clusterdOS repo, title `PoC: SGLang inference gitapp (not for merge)`.
-15. MR body: success-criteria checklist + evidence bundle + explicit gap list vs the full plan below.
-16. Ping maintainers for greenlight on the design.
+16. Open a draft MR on the clusterdOS repo, title `PoC: clusterdos-sglang-inference gitapp (not for merge)`.
+17. MR body: success-criteria checklist + evidence bundle + explicit gap list vs the full plan below.
+18. Wait for the GitLab CI pipeline (mandatory per `AGENTS.md`). Fix any linting / template-render errors.
+19. Trigger CodeRabbit: comment `@aranya-robo review` on the MR.
+20. Ping maintainers for greenlight on the four "Decisions needed" items.
 
 ### PoC image caveat
 
@@ -355,38 +395,49 @@ Plus one line in `install.yaml`: `sglang: enabled: false` under `gitapps:`.
 
 ### Proposed file layout
 
-Mirrors the existing vLLM + llm-d pattern in the clusterdOS repo (`gitapps/vllm/` + `gitapps/clusterdos-inference/`):
+One composite gitapp mirroring the shape of `gitapps/clusterdos-inference/` (which packages vLLM + llm-d together):
 
 ```
-gitapps/sglang/
-├── Chart.yaml
-├── values.yaml               # vendor toggle (nvidia|amd), model, GPU count
-└── templates/
-    ├── deployment.yaml       # SGLang engine
-    ├── service.yaml          # ClusterIP :30000
-    └── priorityclass.yaml
-
 gitapps/clusterdos-sglang-inference/
 ├── Chart.yaml
-├── values.yaml               # SGLang + sgl-router; PD-mode toggle
+├── values.yaml               # gpu vendor toggle, model, replicas, TP, PD-mode
 └── templates/
-    ├── sglang-deployment.yaml    # workers labeled role: plain|prefill|decode
-    ├── sglang-service.yaml
-    ├── router-deployment.yaml    # sgl-router with k8s discovery backend
-    ├── router-service.yaml
-    ├── router-rbac.yaml          # get,list,watch on endpointslices
-    ├── servicemonitor.yaml       # Grafana Alloy autodiscover
-    └── networkpolicy.yaml
+    ├── namespace.yaml
+    ├── _helpers.tpl                # gpu selector / tolerations / naming helpers
+    ├── engine-deployment.yaml      # OR engine-statefulset.yaml if StatefulSet chosen
+    ├── engine-service.yaml         # headless
+    ├── router-deployment.yaml      # sgl-router with k8s discovery
+    ├── router-service.yaml         # ClusterIP entry point
+    ├── router-rbac.yaml            # SA + Role + RoleBinding on endpointslices
+    ├── servicemonitor.yaml         # optional; behind `monitoring.enabled` toggle
+    ├── networkpolicy.yaml          # optional
+    └── priorityclass.yaml
 ```
 
-### install.yaml additions
+Under PD mode (`pdMode.enabled=true`), the template emits **two** engine workloads (prefill + decode) with distinct `role` labels; under plain mode, one workload.
+
+### metadeployment/values.yaml — gitapp declaration
+
+Add to the `gitapps` map:
 
 ```yaml
-sglang:
-  enabled: false
 sglangInference:
   # SGLang + sgl-router prefix-cache-aware routing
-  # Alternative to `inference` (vLLM + llm-d); PD-disaggregation supported
+  # Components: SGLang engine (plain OR prefill/decode) + sgl-router with k8s discovery
+  # Alternative to `inference` (vLLM + llm-d); PD-disaggregation via values.pdMode.enabled
+  enabled: false
+  namespace: clusterdos-sglang-inference
+  internal: true
+  path: gitapps/clusterdos-sglang-inference
+  automated: true
+  syncWave: 2
+  values: {}
+```
+
+### install.yaml — toggle
+
+```yaml
+sglangInference:
   enabled: false
 ```
 
@@ -396,9 +447,10 @@ Single-GPU dev cluster convention, matching how `clusterdos-inference` ships:
 
 - `gpu.vendor: nvidia`, `gpu.count: 1`
 - `model: mistralai/Mistral-7B-Instruct-v0.3` (matches `clusterdos-inference` default)
-- Single replica, TP=1
+- Single engine replica, TP=1
 - `router.policy: cache_aware_zmq` (alternatives: `power_of_two`, `sticky`, `round_robin`, `random`, `load_based`)
 - `pdMode.enabled: false` (plain by default; opt-in for prefill/decode split)
+- `monitoring.enabled: true` — emits Grafana Alloy scrape annotations (matches `clusterdos-inference` shape)
 
 ### How PD-disaggregation works with sgl-router
 
@@ -428,11 +480,11 @@ The proposal ships both plain and PD-mode as a single gitapp with a values.yaml 
 
 Four decisions on the clusterdOS maintainer side unblock chart implementation:
 
-1. **Naming / scope** — separate `gitapps/clusterdos-sglang-inference/`, OR extend the existing `gitapps/clusterdos-inference/` with a `runtime: vllm|sglang` switch?
-   *Recommendation*: separate gitapp. The existing `clusterdos-inference/values.yaml` has ~40 llm-d-specific fields (scheduler, envoy sidecar, tokenizer sidecar, KV events port) that don't apply to sgl-router; abstracting them would balloon MR scope.
+1. **Naming / scope** — new `gitapps/clusterdos-sglang-inference/`, OR extend the existing `gitapps/clusterdos-inference/` with a `runtime: vllm|sglang` switch?
+   *Recommendation*: separate gitapp. The existing `clusterdos-inference/values.yaml` has ~40 llm-d-specific fields (Gateway API Inference Extension CRDs, scheduler EPP, envoy sidecar, UDS tokenizer sidecar, KV events port) that don't apply to sgl-router; abstracting them would balloon MR scope.
 2. **Router container image source** — sgl-router currently publishes only a nightly staging image at `lmsysorg/sglang-staging:experimental-router-dev` (see [`.github/workflows/nightly-experimental-sgl-router-docker.yml`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/nightly-experimental-sgl-router-docker.yml)). Options: (a) consume the nightly, (b) publish a stable release image upstream first, (c) publish a fork-hosted image (`ghcr.io/<org>/sgl-router:...`). Recommendation: (b) — best long-term contract for downstream distributions.
-3. **Naming convention** — the existing gitapps mix `gitapps/vllm/` (third-party name, no prefix) with `gitapps/clusterdos-inference/` (clusterdOS-authored, prefixed). Proposed: `gitapps/sglang/` + `gitapps/clusterdos-sglang-inference/` to match.
-4. **PD-disagg scope in v1** — ship plain mode only in the first MR and add PD in a follow-up, OR both together? Recommendation: both, because the PD toggle is a values.yaml boolean and the two-Deployment pattern is small.
+3. **StatefulSet vs Deployment for the engine** — `clusterdos-inference` uses a `StatefulSet` for the vLLM modelserver (stable pod names + parallel podManagementPolicy). For SGLang without PVCs and without cross-pod coordination, `Deployment` is simpler. Match `clusterdos-inference` (StatefulSet) or pick `Deployment` for the SGLang chart?
+4. **PD-disagg scope in v1** — ship plain mode only in the first MR and add PD in a follow-up, OR both together? Recommendation: both, because the PD toggle is a values.yaml boolean and the two-workload pattern is small.
 
 ## References
 
