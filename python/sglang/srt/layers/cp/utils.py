@@ -178,7 +178,6 @@ def prepare_cp_forward(forward_batch) -> None:
     if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
-        # TODO: Check why this is needed
         set_local_dp_buffer_len(
             sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
         )
@@ -203,7 +202,6 @@ def cp_split_before_forward(
 
 
 def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
-    """Shard a CP-v2 token-major hidden-state tensor without changing positions."""
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
@@ -213,7 +211,6 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
 
 
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
-    """Shard CP-v2 position ids without changing hidden states."""
     assert is_cp_v2_active(forward_batch)
     strategy = get_cp_strategy()
     assert strategy is not None
@@ -247,13 +244,8 @@ def cp_shard_model_inputs(
     complete_position_ids: Any,
     forward_batch,
 ):
-    """Shard all model inputs for CP-v2 at the runner boundary.
-
-    Yields ``(sharded_hidden_states, sharded_positions)``. ``spec_info.hidden_states``
-    is sharded in-place (the model reads it via ``forward_batch``, not as an
-    argument) and restored on exit, so the model stays CP-agnostic. This mirrors
-    the backup/restore pattern already used by the EAGLE cuda-graph runners.
-    """
+    """Temporarily shard speculative hidden states with the model inputs.
+    Restoring the shared batch keeps logits processing on full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
     sharded_hidden_states = cp_shard_hidden_states(
         complete_hidden_states, forward_batch

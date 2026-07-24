@@ -5972,9 +5972,7 @@ class ServerArgs:
             model_arch = hf_config.architectures[0]
             if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
                 is_dsa_default_model = is_deepseek_dsa(hf_config)
-                # TODO: CP-v2 for DSA models currently only supports the
-                # interleave strategy; other strategies (e.g. zigzag) will be
-                # supported later.
+                # DSA CP-v2 currently supports only the interleave strategy.
                 enable_default_cp_v2 = not is_dsa_default_model or (
                     self.enable_prefill_cp and self.cp_strategy == "interleave"
                 )

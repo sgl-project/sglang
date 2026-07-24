@@ -119,7 +119,6 @@ def materialize_full_kv_cp(
     k_pe: torch.Tensor,
     kv_lora_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Switch CP-v1/v2 for the MLA latent-KV all-gather."""
     if is_cp_v2_active(forward_batch):
         return get_cp_strategy().materialize_full_kv(
             forward_batch,

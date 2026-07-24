@@ -705,7 +705,6 @@ class TestCPInterleaveStrategy(CustomTestCase):
         set_buffer_len.assert_called_once_with(16)
 
     def test_interleave_can_apply_uses_legacy_round_robin_predicate(self):
-        # seq_len (8) >= cp_size (4) under a context-parallel extend → applicable.
         active_batch = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
@@ -717,7 +716,6 @@ class TestCPInterleaveStrategy(CustomTestCase):
         ):
             self.assertTrue(is_cp_v2_active(active_batch))
 
-        # seq_len (2) < cp_size (4) → not applicable.
         small_batch = SimpleNamespace(
             input_ids=torch.arange(2),
             forward_mode=_ExtendMode(),

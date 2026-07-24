@@ -351,9 +351,6 @@ class EagerRunner(BaseRunner):
         input_embeds = kwargs.get("input_embeds")
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
-        # Keep speculative hidden states aligned with the interleaved token
-        # slice for the duration of the model body, then restore the shared
-        # ForwardBatch object before logits processing.
         with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
         ) as (sharded_input_embeds, sharded_positions):

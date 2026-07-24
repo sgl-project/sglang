@@ -121,11 +121,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
             return input_[indices]
 
-        # for torch device tensor
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
     def shard_local_tokens(self, input_: Any) -> Any:
-        """Round-robin split a per-token tensor/list to this CP rank's local tokens."""
         return self._interleave_shard(input_)
 
     def shard_per_request(
@@ -133,15 +131,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         extend_seqs_cpu: List[int],
         extend_seqs: Any,
     ):
-        """Round-robin per-request Q-length split across CP ranks.
-
-        Distributes each request's tokens by ``token_idx % cp_size`` and returns
-        this rank's per-request lengths (zeros dropped) plus the indices of the
-        requests that keep at least one token:
-        ``(q_lens_cpu, q_lens, bs_idx_cpu, bs_idx)``. The ``_cpu`` lists are built
-        on host; ``q_lens`` / ``bs_idx`` are produced on-device by the shared
-        ``dsa_cp_round_robin_split_q_seqs_kernel`` so the split stays graph-safe.
-        """
+        """Return nonempty per-request lengths and indices for this CP rank.
+        The shared kernel builds device outputs to keep the split graph-safe."""
         from sglang.kernels.ops.attention.dsa.cp_split import (
             dsa_cp_round_robin_split_q_seqs_kernel,
         )
@@ -226,7 +217,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return [CPAttentionBackendKind.DSA]
 
     def materialize_full_indexer_k_cache(self, key: Any, forward_batch) -> Any:
-        """CP-v2 DSA indexer hook: all-gather the rank-local indexer key."""
         return self.gather_kv_cache(
             key.contiguous(), forward_batch, torch.cuda.current_stream()
         )
@@ -245,11 +235,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         return None
 
     def all_gather_dsa_trtllm_fp8_kv(self, forward_batch, k: Any, k_rope: Any) -> Any:
-        """All-gather FP8 KV for the TRT-LLM MLA backend under CP-v2.
-
-        Concatenates k and k_rope along the last dim, gathers across CP ranks
-        in full interleave order, then splits back into (k, k_rope).
-        """
         kv_lora_rank = k.shape[-1]
         qk_rope_head_dim = k_rope.shape[-1]
         kv_dtype = k.dtype
@@ -269,7 +254,6 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         swa_loc: Optional[Any] = None,
         **kwargs,
     ) -> Any:
-        """CP-v2 DSA MLA: rebuild the full-sequence latent KV from rank-local shards."""
         latent_cache = kwargs["latent_cache"]
         k_nope = kwargs["k_nope"]
         k_pe = kwargs["k_pe"]

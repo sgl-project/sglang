@@ -157,7 +157,6 @@ class ContextParallelStrategy(ABC):
         )
 
     def shard_local_tokens(self, input_: Any) -> Any:
-        """Shard an arbitrary per-token tensor/list to this CP rank's local tokens."""
         raise NotImplementedError(
             f"{self.name} strategy does not support local-token sharding"
         )
@@ -165,10 +164,6 @@ class ContextParallelStrategy(ABC):
     def materialize_full_indexer_k_cache(
         self, key: Any, forward_batch: ForwardBatch
     ) -> Any:
-        """Gather the rank-local DSA indexer key back to full token order.
-
-        Only DSA-capable strategies (interleave) override this; others reject it.
-        """
         raise NotImplementedError(
             f"{self.name} strategy does not support DSA indexer key gather"
         )
@@ -176,10 +171,6 @@ class ContextParallelStrategy(ABC):
     def all_gather_dsa_trtllm_fp8_kv(
         self, forward_batch: ForwardBatch, k: Any, k_rope: Any
     ) -> Any:
-        """All-gather FP8 KV for the TRT-LLM MLA backend back to full token order.
-
-        Only DSA-capable strategies (interleave) override this; others reject it.
-        """
         raise NotImplementedError(
             f"{self.name} strategy does not support DSA trtllm FP8 KV gather"
         )
