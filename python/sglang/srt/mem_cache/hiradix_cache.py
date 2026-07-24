@@ -1566,7 +1566,7 @@ class HiRadixCache(RadixCache):
 
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = operation.host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
+        matched_length, inserted_length = self._insert_helper_host(
             last_host_node,
             fetched_key,
             written_indices,
@@ -1584,7 +1584,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
+        loaded_from_storage = inserted_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:
@@ -1716,10 +1716,16 @@ class HiRadixCache(RadixCache):
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
-    ):
+    ) -> Tuple[int, int]:
+        # Returns (matched_length, inserted_length):
+        #   matched_length  -- prefix tokens that overlapped existing backed-up
+        #                       nodes (redundant); the caller frees
+        #                       `host_indices[:matched_length]`.
+        #   inserted_length -- tokens actually materialized into the host tree
+        #                       (new suffix only; used for L3-hit metrics).
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, 0
 
         child_key = key.child_key(self.page_size)
 
@@ -1728,10 +1734,11 @@ class HiRadixCache(RadixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = node.key.match(key, page_size=self.page_size)
+            matched_length += prefix_len
+
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
-            matched_length += prefix_len
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -1741,6 +1748,15 @@ class HiRadixCache(RadixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
+            # Guard: do not attach a host-only child under a device node that
+            # is not backed up. Doing so would break the backup invariant
+            # (backed-up nodes must form a contiguous prefix from root) and
+            # later trips the `_evict_regular` non-leaf assertion. Free the
+            # remaining host pages to prevent memory leaks and bail out.
+            if node is not self.root_node and not node.backuped:
+                self.cache_controller.mem_pool_host.free(host_value)
+                return matched_length, 0
+
             new_node = TreeNode(priority=node.priority)
             new_node.parent = node
             new_node.key = key
@@ -1755,7 +1771,7 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length
+        return matched_length, len(key)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
