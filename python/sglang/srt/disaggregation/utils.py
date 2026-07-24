@@ -855,6 +855,39 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
+def build_state_entry_pairs(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+) -> List[Tuple[int, int]]:
+    """Map prefill-local state entries to decode-global entries. Under PP the
+    prefill stage holds a subset of the mamba layers, so positional indexing
+    into the dst lists is wrong; pair entries by global layer id instead."""
+    if src_layer_ids and dst_layer_ids:
+        # Layer ids repeat once per state tensor (tensor-major x layer flatten),
+        # so pair the k-th occurrence on each side rather than a plain id lookup.
+        dst_pos = {}
+        for j, lid in enumerate(dst_layer_ids):
+            dst_pos.setdefault(lid, deque()).append(j)
+        pairs = []
+        for i, lid in enumerate(src_layer_ids):
+            if not dst_pos.get(lid):
+                raise RuntimeError(
+                    f"Decode peer is missing mamba state for model layer {lid}"
+                )
+            pairs.append((i, dst_pos[lid].popleft()))
+        return pairs
+    if n_src != n_dst:
+        # Without layer ids a positional pairing would silently transfer the
+        # wrong layers (e.g. PP prefill peered with a stale decode server).
+        raise RuntimeError(
+            "PP-heterogeneous mamba state transfer requires state_layer_ids on "
+            f"both peers; got src={n_src} dst={n_dst} entries"
+        )
+    return [(i, i) for i in range(n_src)]
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -864,6 +897,7 @@ def append_state_component(
     dim_per_tensor: Optional[List[int]] = None,
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
+    layer_ids: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -874,6 +908,7 @@ def append_state_component(
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
+    kv_args.state_layer_ids.append(layer_ids or [])
 
 
 def setup_state_kv_args(
@@ -903,6 +938,7 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
+    kv_args.state_layer_ids = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
@@ -971,6 +1007,13 @@ def setup_state_kv_args(
                 if hasattr(token_to_kv_pool, "get_state_slice_outer_counts")
                 else None
             )
+            # Global layer ids let the sender pair src/dst entries when the
+            # prefill PP stage registers only its own subset of mamba layers.
+            layer_ids = (
+                token_to_kv_pool.get_state_layer_ids()
+                if hasattr(token_to_kv_pool, "get_state_layer_ids")
+                else None
+            )
             append_state_component(
                 kv_args,
                 StateType.MAMBA,
@@ -980,6 +1023,7 @@ def setup_state_kv_args(
                 dim,
                 conv_shard_groups,
                 slice_outer_counts,
+                layer_ids,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
