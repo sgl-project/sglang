@@ -168,6 +168,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
+            and server_args.disaggregation_mode != "prefill"
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
@@ -196,6 +197,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
+            and server_args.disaggregation_mode != "prefill"
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
@@ -256,6 +258,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
+        if server_args.disaggregation_mode == "prefill" and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -305,7 +310,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = (
+            not self.server_args.disable_cuda_graph
+            and self.server_args.disaggregation_mode != "prefill"
+        )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:

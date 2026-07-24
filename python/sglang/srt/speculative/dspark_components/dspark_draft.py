@@ -305,8 +305,6 @@ class DraftBlockProposer:
         embed_module = target_model.get_input_embeddings()
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
-        if draft_sampler is not None:
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -314,6 +312,8 @@ class DraftBlockProposer:
             bs=bs,
             device=device,
             embed_module=embed_module,
+            draft_sampler=draft_sampler,
+            sampling_info=sampling_info,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -393,6 +393,8 @@ class DraftBlockProposer:
         bs: int,
         device: str,
         embed_module,
+        draft_sampler=None,
+        sampling_info=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
         prefix_lens = batch.seq_lens
@@ -437,6 +439,13 @@ class DraftBlockProposer:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if (
+            draft_sampler is not None
+            and graph_runner is not None
+            and graph_runner.can_run_graph(draft_forward_batch)
+        ):
+            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output

@@ -691,6 +691,15 @@ class KVCacheConfigurator:
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             mamba_size=self.server_args.max_mamba_cache_size,
             start_layer=self.layer_info.start_layer,
+            linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
+            mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            enable_linear_replayssm_spec=(
+                self.server_args.enable_linear_replayssm_spec
+                and (
+                    self.hybrid_gdn_config is not None
+                    or kimi_linear_config(self.model_config) is not None
+                )
+            ),
         )
         return req_to_token_pool
 

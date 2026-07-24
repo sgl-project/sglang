@@ -5510,11 +5510,11 @@ class ServerArgs:
                     "ragged-mode commit would fold a stale ring into the SSM state. "
                     "Use SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-            if self.disaggregation_mode != "null":
+            if self.disaggregation_mode == "prefill":
                 raise ValueError(
-                    "--enable-linear-replayssm-spec is not supported under PD "
-                    "disaggregation yet (follow-up). Got "
-                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                    "--enable-linear-replayssm-spec is not supported on a PD "
+                    "prefill server: the ring is spec-verify-only scratch and "
+                    "the prefill server never runs spec verify."
                 )
             if self.linear_replayssm_cache_len < 1:
                 raise ValueError(
