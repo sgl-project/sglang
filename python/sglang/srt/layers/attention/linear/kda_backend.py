@@ -252,6 +252,11 @@ class KDAKernelDispatcher:
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
+    # GPU-only decode/verify metadata (graph replay passes seq_lens_cpu=None);
+    # extend reads extend_seq_lens_cpu and mamba indices rebuild from req objects.
+    # Matches the other MambaAttnBackendBase subclasses (Mamba2/GDN/ShortConv).
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         # mamba_cache.conv is [..., kernel-1, dim] while conv_states_shape expects the window length (kernel-1) at shape[-1], hence the transpose.
