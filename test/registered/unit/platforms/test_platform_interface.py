@@ -264,11 +264,22 @@ class TestXpuDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_device(2), torch.device("xpu", 2))
 
     # TODO: @patch("torch.xpu.get_device_capability", return_value=(9, 0))
-    @patch("torch.ops.sgl_kernel.query_device.default", return_value=(9, 0))
-    def test_default_get_device_capability_uses_xpu(self, mock_get_device_capability):
+    def test_default_get_device_capability_uses_xpu(self):
+        # torch.ops.sgl_kernel.query_device is only registered by XPU builds
+        # of sgl-kernel, so patch the op namespace attribute with create=True
+        # (a dotted @patch target would fail to import on CPU/CUDA machines).
+        # torch.xpu.current_device() likewise needs an XPU device; mock it.
         base = XpuSRTPlatform()
-        self.assertEqual(base.get_device_capability(0), DeviceCapability(9, 0))
-        mock_get_device_capability.assert_called_once_with(0)
+        fake_query_device = MagicMock()
+        fake_query_device.default.return_value = (9, 0)
+        with (
+            patch("torch.xpu.current_device", return_value=0),
+            patch.object(
+                torch.ops.sgl_kernel, "query_device", fake_query_device, create=True
+            ),
+        ):
+            self.assertEqual(base.get_device_capability(0), DeviceCapability(9, 0))
+        fake_query_device.default.assert_called_once_with(0)
 
     def test_pin_memory_available_for_xpu_targets(self):
         base = XpuSRTPlatform()
