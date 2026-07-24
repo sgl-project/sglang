@@ -4210,6 +4210,19 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # TcPiecewise makes the trtllm_mla prefill fall back to the
+            # flashinfer-MLA implementation, which faults (illegal address)
+            # on an FP8 KV cache.
+            (
+                "MLA attention with FP8 KV cache",
+                lambda: self.kv_cache_dtype.startswith("fp8")
+                and (
+                    _resolved_view(self).attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                    or _resolved_view(self).prefill_attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                ),
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
@@ -6380,6 +6393,22 @@ class ServerArgs:
             )
 
         if a2a_backend == "deepep":
+            if self.moe_runner_backend == "flashinfer_cutedsl":
+                if self.deepep_mode == "auto":
+                    self.deepep_mode = "low_latency"
+                    logger.warning(
+                        "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
+                        "FP4 MoE has no DeepEP normal-dispatch handler, so "
+                        "deepep auto mode would crash during prefill. "
+                        "low_latency covers both prefill and decode."
+                    )
+                elif self.deepep_mode == "normal":
+                    raise ValueError(
+                        "flashinfer_cutedsl FP4 MoE only supports DeepEP "
+                        "low_latency dispatch (masked layout). DeepEP normal "
+                        "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
+                        "--deepep-mode low_latency or auto."
+                    )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
