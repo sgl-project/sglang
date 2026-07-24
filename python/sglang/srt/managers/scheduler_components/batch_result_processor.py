@@ -848,9 +848,7 @@ class SchedulerBatchResultProcessor:
         # PP speculative decode: advance seq_lens to post-iter (accept_lens added
         # per req). KV release above must finish first since it reads pre-iter
         # seq_lens; accept_lens covers both topk == 1 (bonus only) and topk > 1.
-        if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
-        ):
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             batch.seq_lens = batch.seq_lens + accept_lens
             if batch.seq_lens_cpu is not None:
                 batch.seq_lens_cpu = batch.seq_lens_cpu + accept_lens_cpu

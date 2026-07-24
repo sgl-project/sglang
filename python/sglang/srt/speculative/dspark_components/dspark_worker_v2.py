@@ -54,7 +54,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DSparkPPVerifyInputRaw,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    TargetVerifyResult,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
@@ -428,12 +427,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self.server_args.enable_dp_attention:
                 batch.capture_hidden_mode = CaptureHiddenMode.FULL
                 self.target_worker.forward_batch_generation(
-                    batch, pp_proxy_tensors=pp_proxy_tensors,capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, pp_proxy_tensors=pp_proxy_tensors,capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         # Non-last PP rank: only relay the target prefill forward; draft KV
         # injection happens exclusively on the last rank (which holds the draft pool).
@@ -572,9 +575,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark spec-v2 expected DFlashDraftInputV2 / DSparkPPVerifyInputRaw "
                 "state on the running batch."
             )
-        pp_raw = (
-            spec_info if isinstance(spec_info, DSparkPPVerifyInputRaw) else None
-        )
+        pp_raw = spec_info if isinstance(spec_info, DSparkPPVerifyInputRaw) else None
         draft_input = spec_info
 
         if batch.forward_mode.is_idle():
@@ -711,9 +712,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         # scheduler, which forwards it to the next PP stage.
         if self._pp_enabled and not self._pp_is_last_rank:
             pp_proxy_out = target_verify.pp_hidden_states_proxy_tensors
-            assert pp_proxy_out is not None, (
-                "non-last PP rank must relay proxy hidden downstream"
-            )
+            assert (
+                pp_proxy_out is not None
+            ), "non-last PP rank must relay proxy hidden downstream"
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_out,
                 next_token_ids=torch.empty((0,), dtype=torch.int64, device=device),

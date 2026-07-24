@@ -1187,9 +1187,7 @@ class SchedulerPPMixin:
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
 
-        if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
-        ):
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             output_result.accept_lens = torch.tensor(
                 batch.spec_info.accept_lens, dtype=torch.int64
             )

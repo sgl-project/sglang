@@ -15,7 +15,6 @@ from sglang.srt.speculative.dflash_info_v2 import (
     DFlashDraftInputV2,
 )
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -42,6 +41,7 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_verify_window impor
     scatter_compact_to_strided_into,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -119,7 +119,7 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         return cls(**pp_outputs["pp_spec_output"])
 
     @classmethod
-    def build_dummy_for_decode(cls, batch, num_draft: int) -> "DSparkPPVerifyInputRaw":
+    def build_dummy_for_decode(cls, batch, num_draft: int) -> DSparkPPVerifyInputRaw:
         # First decode step: the last PP rank has not proposed real drafts yet.
         bs = len(batch.reqs)
         gamma = max(num_draft - 1, 0)
@@ -135,10 +135,10 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
             accept_index=None,
         )
 
-    def filter_batch(
-        self, new_indices, new_indices_cpu: Optional[List[int]] = None
-    ):
-        idx = new_indices.tolist() if torch.is_tensor(new_indices) else list(new_indices)
+    def filter_batch(self, new_indices, new_indices_cpu: Optional[List[int]] = None):
+        idx = (
+            new_indices.tolist() if torch.is_tensor(new_indices) else list(new_indices)
+        )
 
         def pick(lst):
             return [lst[i] for i in idx]
@@ -159,7 +159,7 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         if self.accept_index is not None:
             self.accept_index = [self.accept_index[i] for i in idx]
 
-    def merge_batch(self, other: "DSparkPPVerifyInputRaw"):
+    def merge_batch(self, other: DSparkPPVerifyInputRaw):
         if not other.bonus_tokens:
             return
         if not self.bonus_tokens:
