@@ -3326,9 +3326,12 @@ class DeepseekSparseAttnMultiStepBackend:
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
 
 
-# Backward-compat aliases (deprecated: use DSA class names)
-DeepseekSparseAttnBackend = DeepseekSparseAttnBackend
-DeepseekSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
-DSAMetadata = DSAMetadata
-DSAFlashMLAMetadata = DSAFlashMLAMetadata
-DSAIndexerMetadata = DSAIndexerMetadata
+# Backward-compat aliases (deprecated: use DSA class names).
+# NSA (Native Sparse Attention) is the pre-rename public API re-exported by
+# nsa_backend.py; map those names to the current DSA classes so that importing
+# the deprecation shim keeps working.
+NativeSparseAttnBackend = DeepseekSparseAttnBackend
+NativeSparseAttnMultiStepBackend = DeepseekSparseAttnMultiStepBackend
+NSAMetadata = DSAMetadata
+NSAFlashMLAMetadata = DSAFlashMLAMetadata
+NSAIndexerMetadata = DSAIndexerMetadata
