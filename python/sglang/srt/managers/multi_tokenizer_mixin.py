@@ -672,6 +672,10 @@ class TokenizerWorker(TokenizerManager):
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if obj.mode == "in_place":
+            raise RuntimeError(
+                "In-place pause is not supported with multiple tokenizer workers."
+            )
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
