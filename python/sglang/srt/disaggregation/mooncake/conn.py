@@ -1888,7 +1888,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
-    def _register_kv_args(self):
+    def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -1948,8 +1948,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                     f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return
+                return False
+        return True
 
     def send_metadata(
         self,
@@ -2002,6 +2004,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()

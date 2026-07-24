@@ -1658,9 +1658,9 @@ class MoriKVReceiver(CommonKVReceiver):
             return
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
 
-    def _register_kv_args(self):
+    def _register_kv_args(self) -> bool:
         if self.bootstrap_infos is None:
-            return
+            return False
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
@@ -1703,8 +1703,10 @@ class MoriKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                     f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return
+                return False
+        return True
 
     def send_metadata(
         self,
@@ -1756,6 +1758,7 @@ class MoriKVReceiver(CommonKVReceiver):
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
