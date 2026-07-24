@@ -124,6 +124,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def init_tokenizer(self, server_args: ServerArgs):
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
+            self.vocab_size = None
         else:
             self.tokenizer = get_tokenizer(
                 server_args.tokenizer_path,
@@ -132,6 +133,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
             )
+            try:
+                self.vocab_size = len(self.tokenizer)
+            except TypeError:
+                self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
@@ -204,6 +209,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # If it is embedding model, no detokenization is needed.
         return recv_obj
 
+    @staticmethod
+    def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
+        """Map out-of-range token ids to 0 so the tokenizer can decode them.
+
+        Multimodal placeholder ids (e.g. Inkling's negative -101/-102, or radix-cache
+        pad-value hashes) are not real vocab tokens; tiktoken-style backends raise
+        OverflowError on negative / out-of-range ids. These only appear in the
+        surrogate-context prefix (before read_offset) and carry no text, and the clamp
+        is applied identically to surr_ids and read_ids, so the incremental
+        (read-minus-surr) output text is unchanged.
+        """
+        hi = vocab_size if vocab_size else None
+        return [t if (0 <= t and (hi is None or t < hi)) else 0 for t in ids]
+
     def _grouped_batch_decode(
         self,
         ids_list: List[List[int]],
@@ -270,6 +289,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
+        vocab_size = self.vocab_size
 
         # Initialize decode status
         read_ids, surr_ids = [], []
@@ -278,14 +298,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if rid not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=list(recv_obj.decode_ids[i]),
+                    decode_ids=self._clamp_decode_ids(
+                        recv_obj.decode_ids[i], vocab_size
+                    ),
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids.extend(recv_obj.decode_ids[i])
+                s.decode_ids.extend(
+                    self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
+                )
 
             read_ids.append(
                 self.trim_matched_stop(

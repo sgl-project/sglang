@@ -293,6 +293,7 @@ def get_stacked_multiply(
         "in_proj_qkvz": 4,  # GDN packed input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "gate_up_proj_shared_moe": 2,
         "in_proj": 2,
         "fused_qkv_a_proj_with_mqa": 2,
     }
@@ -322,7 +323,14 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "o_proj",
+    "out_proj",
+    "down_proj",
+    "down_proj_moe",
+    "down_proj_shared_moe",
+    "wo_ud",
+]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
@@ -338,7 +346,9 @@ REPLICATED_LINEAR_LORA_NAMES = [
 _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
         "qkv_proj",
+        "qkvr",
         "o_proj",
+        "wo_ud",
         "out_proj",
         "in_proj",
         "in_proj_qkvz",

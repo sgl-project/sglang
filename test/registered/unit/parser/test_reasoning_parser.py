@@ -9,6 +9,7 @@ from sglang.srt.parser.reasoning_parser import (
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
+    InklingDetector,
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
@@ -164,6 +165,107 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestInklingDetector(CustomTestCase):
+    def test_streaming_routes_blocks_across_all_string_boundaries(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_thinking|>think<|end_message|>"
+            "<|message_model|><|content_text|>answer<|end_message|>"
+            "<|content_model_end_sampling|>"
+        )
+        reasoning = ""
+        content = ""
+        for char in source:
+            result = detector.parse_streaming_increment(char)
+            reasoning += result.reasoning_text
+            content += result.normal_text
+        self.assertEqual(reasoning, "think")
+        self.assertEqual(content, "answer")
+
+    def test_tool_header_is_preserved_for_the_tool_parser(self):
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        content = ""
+        for char in source:
+            content += detector.parse_streaming_increment(char).normal_text
+        self.assertEqual(content, source)
+
+    def test_quoted_message_model_token_inside_content_is_preserved(self):
+        """Bug regression: the header branch flipped to header state on ANY
+        <|message_model|> occurrence, so a literal token the model wrote
+        inside a content block (e.g. quoting the protocol) silently swallowed
+        all payload text up to the next control token."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|><|content_text|>Header token: <|message_model|>"
+            " then more text<|end_message|>"
+        )
+        result = detector.detect_and_parse(source)
+        self.assertEqual(
+            result.normal_text, "Header token: <|message_model|> then more text"
+        )
+
+    def test_control_token_inside_tool_header_shares_the_full_alphabet(self):
+        """Bug regression: the tool-call detector validated headers against
+        INKLING_SPECIAL_TOKENS while the reasoning parser keyed on the larger
+        control alphabet (+ <|model_trigger_generation|>), so a control token
+        smuggled inside a header passed one machine and not the other."""
+        from sglang.srt.function_call.inkling_detector import (
+            InklingDetector as ToolDetector,
+        )
+
+        detector = ToolDetector()
+        prefix, name = detector._split_trailing_tool_header(
+            "<|message_model|>weather<|model_trigger_generation|>"
+        )
+        self.assertIsNone(name)
+
+    def test_continuation_stream_text_survives_chunk_boundaries(self):
+        """Bug regression: text arriving with no open block (a
+        continue_final_message stream resumes MID text block) was routed to
+        content only when a chunk held no control token; a chunk like
+        'ld<|end_message|>' silently dropped the 'ld'. All out-of-block text
+        must reach content regardless of chunking."""
+        source = (
+            " world<|end_message|><|message_model|><|content_text|>next<|end_message|>"
+        )
+        for chunks in (
+            [source],
+            [
+                " wor",
+                "ld<|end_message|>",
+                "<|message_model|><|content_text|>next<|end_message|>",
+            ],
+            list(source),
+        ):
+            detector = InklingDetector()
+            content = ""
+            for chunk in chunks:
+                content += detector.parse_streaming_increment(chunk).normal_text
+            self.assertEqual(content, " worldnext", msg=f"chunks={chunks!r}")
+
+    def test_finish_flushes_reasoning_truncated_before_end_token(self):
+        """Bug regression: with stream_reasoning=False the detector buffers the
+        thinking block and only flushes it on a control/end token. When
+        generation is cut mid-block (e.g. max_tokens) the stream ends with no
+        end token, so the buffered trace was dropped entirely; finish() must
+        emit it, matching the non-streaming detect_and_parse path."""
+        detector = InklingDetector(stream_reasoning=False)
+        source = "<|message_model|><|content_thinking|>truncated thinking"
+        streamed_reasoning = ""
+        for char in source:
+            streamed_reasoning += detector.parse_streaming_increment(
+                char
+            ).reasoning_text
+        # The block never closed, so nothing surfaces mid-stream.
+        self.assertEqual(streamed_reasoning, "")
+        # finish() flushes the buffered trace instead of dropping it.
+        self.assertEqual(detector.finish().reasoning_text, "truncated thinking")
 
 
 class TestKimiDetector(CustomTestCase):
