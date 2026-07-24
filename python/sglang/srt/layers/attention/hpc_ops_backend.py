@@ -67,13 +67,23 @@ _REQUIRED_PAGE_SIZE = 64
 FP8_ROPE_SUPPORTED_HEAD_CONFIGS = ((8, 1), (64, 8))
 # Minimum tokens each SM processes per task in the dynamic-scheduled decode
 # path (matches the HPC-Ops default).
-_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN = 512
+_DYNAMIC_SCHED_MIN_PROCESS_LEN = 512
 
 
 @functools.cache
 def has_hpc_ops() -> bool:
     """Return True if the ``hpc`` package (HPC-Ops) is installed."""
     return importlib.util.find_spec("hpc") is not None
+
+
+@functools.cache
+def _bf16_decode_supports_task_map() -> bool:
+    """hpc >= 6e2eced (PR #73) extends dynamic scheduling to bf16 decode."""
+    import inspect
+
+    import hpc
+
+    return "task_map" in inspect.signature(hpc.attention_decode_bf16).parameters
 
 
 class HPCOpsMetadata(msgspec.Struct):
@@ -101,7 +111,7 @@ class HPCOpsMetadata(msgspec.Struct):
     hpc_q_scale: Optional[torch.Tensor] = None
     # Split-K flag tensor for FP8 decode. shape: [bs, num_kv_heads], int32
     hpc_split_k_flag: Optional[torch.Tensor] = None
-    # Pre-scheduled decode task map (dynamic-scheduled FP8 decode); None falls
+    # Pre-scheduled decode task map (dynamic-scheduled decode); None falls
     # back to the kernel's static split-K scheduling.
     hpc_task_map: Optional[torch.Tensor] = None
 
@@ -191,13 +201,15 @@ class HPCOpsAttnBackend(AttentionBackend):
         # Fallback per-tensor KV scale for checkpoints without kv scales.
         self._ones_scale = torch.ones(1, dtype=torch.float32, device=self.device)
 
-        # Dynamic-scheduled FP8 decode: the task workspace is sized by the
-        # decode CUDA-graph max batch size in init_cuda_graph_state (sizing it
-        # by the full request-pool capacity would cost hundreds of MB); eager
-        # decode batches beyond that fall back to static split-K.
+        # Dynamic-scheduled decode (fp8 always; bf16 when the installed hpc
+        # supports it): the task workspace is sized by the decode CUDA-graph
+        # max batch size in init_cuda_graph_state (sizing it by the full
+        # request-pool capacity would cost hundreds of MB); eager decode
+        # batches beyond that fall back to static split-K.
         self.num_kv_heads = num_kv_heads
-        self._fp8_task_map: Optional[torch.Tensor] = None
-        self._fp8_task_map_max_bs = 0
+        self._dynamic_sched = self.use_fp8 or _bf16_decode_supports_task_map()
+        self._decode_task_map: Optional[torch.Tensor] = None
+        self._decode_task_map_max_bs = 0
 
         # CUDA graph state (allocated in init_cuda_graph_state).
         self.decode_cuda_graph_metadata = {}
@@ -239,27 +251,26 @@ class HPCOpsAttnBackend(AttentionBackend):
             page_size=self.page_size,
         )
         if (
-            self.use_fp8
-            and self._fp8_task_map is not None
+            self._decode_task_map is not None
             and forward_batch.forward_mode.is_decode()
-            and batch_size <= self._fp8_task_map_max_bs
+            and batch_size <= self._decode_task_map_max_bs
         ):
-            metadata.hpc_task_map = self._assign_fp8_decode_tasks(
+            metadata.hpc_task_map = self._assign_decode_tasks(
                 metadata.cache_seqlens_int32
             )
         self.forward_metadata = metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        if self.use_fp8:
+        if self._dynamic_sched:
             import hpc
 
-            self._fp8_task_map = hpc.get_attention_decode_task_workspace(
+            self._decode_task_map = hpc.get_attention_decode_task_workspace(
                 max_bs,
                 self.max_context_len,
                 self.num_kv_heads,
-                min_process_len=_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN,
+                min_process_len=_DYNAMIC_SCHED_MIN_PROCESS_LEN,
             )
-            self._fp8_task_map_max_bs = max_bs
+            self._decode_task_map_max_bs = max_bs
 
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -309,10 +320,10 @@ class HPCOpsAttnBackend(AttentionBackend):
             max_seq_pages=self.max_num_pages,
             page_size=self.page_size,
         )
-        if self.use_fp8 and self._fp8_task_map is not None:
+        if self._decode_task_map is not None:
             # Recorded into the decode graph, so the task map is re-populated
             # from the live seq_lens at every replay.
-            metadata.hpc_task_map = self._assign_fp8_decode_tasks(
+            metadata.hpc_task_map = self._assign_decode_tasks(
                 metadata.cache_seqlens_int32
             )
         self.forward_metadata = metadata
@@ -479,7 +490,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         metadata.hpc_q_scale = q_scale
         metadata.hpc_split_k_flag = split_k_flag
 
-    def _assign_fp8_decode_tasks(self, cache_seqlens: torch.Tensor) -> torch.Tensor:
+    def _assign_decode_tasks(self, cache_seqlens: torch.Tensor) -> torch.Tensor:
         """Populate the dynamic-scheduled decode task map from live KV lengths.
 
         The scheduler pass bins every (request, kv_head, KV-tile) chunk into
@@ -494,13 +505,13 @@ class HPCOpsAttnBackend(AttentionBackend):
         # kernel launch with an invalid configuration.
         hpc.assign_attention_decode_task(
             cache_seqlens,
-            self._fp8_task_map,
+            self._decode_task_map,
             self.num_kv_heads,
             mtp=1,
             new_kv_included=True,
-            min_process_len=_FP8_DYNAMIC_SCHED_MIN_PROCESS_LEN,
+            min_process_len=_DYNAMIC_SCHED_MIN_PROCESS_LEN,
         )
-        return self._fp8_task_map
+        return self._decode_task_map
 
     def _take_fp8_scales(self, metadata: HPCOpsMetadata):
         """Pop the per-layer FP8 scales written by the fused RoPE op."""
@@ -619,6 +630,13 @@ class HPCOpsAttnBackend(AttentionBackend):
                 split_flag=split_k_flag,
             )
         else:
+            # Older hpc's bf16 decode has no task_map kwarg; the map is only
+            # ever assigned when the installed hpc supports it.
+            task_map_kwargs = (
+                {"task_map": metadata.hpc_task_map}
+                if metadata.hpc_task_map is not None
+                else {}
+            )
             o = hpc.attention_decode_bf16(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -628,6 +646,7 @@ class HPCOpsAttnBackend(AttentionBackend):
                 mtp=0,
                 new_kv_included=True,
                 splitk=True,
+                **task_map_kwargs,
             )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
