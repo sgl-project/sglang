@@ -44,6 +44,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "fal--ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
     "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "ideogram-ai/ideogram-4-nf4": "Ideogram4Pipeline",
+    "ideogram-ai--ideogram-4-nf4": "Ideogram4Pipeline",
 }
 
 
