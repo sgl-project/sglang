@@ -39,6 +39,15 @@ def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
     return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
 
+def QuickGELU(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(1.702 * x)
+
+
+def NewGELU(x: torch.Tensor) -> torch.Tensor:
+    c = math.sqrt(2.0 / math.pi)
+    return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
+
+
 def per_token_quant_int8(x):
     x = x.float()
     absmax = x.abs().max(dim=-1).values
