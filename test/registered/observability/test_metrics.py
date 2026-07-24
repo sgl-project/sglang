@@ -126,6 +126,24 @@ class TestEnableMetrics(CustomTestCase):
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/generate",
                 json={
+                    "text": "A unique cold-cache metrics request. " * 64,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+            # A cold request must expose a zero cached-token counter so PromQL
+            # vector arithmetic retains the prompt-token series before a hit.
+            metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
+            self.assertEqual(metrics_response.status_code, 200)
+            cold_metrics = _parse_prometheus_metrics(metrics_response.text)
+            cached_samples = cold_metrics.get("sglang:cached_tokens_total", [])
+            self.assertTrue(cached_samples)
+            self.assertEqual(sum(sample.value for sample in cached_samples), 0)
+
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={
                     "text": ["The capital of France is"] * 20,
                     "sampling_params": {
                         "temperature": 0,
