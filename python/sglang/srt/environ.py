@@ -746,6 +746,11 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
+    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
+    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
+    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
