@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+    PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -69,9 +70,6 @@ from sglang.srt.session.streaming_session import StreamingSession
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-        PrefetchOperation,
-    )
     from sglang.srt.server_args import ServerArgs
 
 
@@ -854,10 +852,51 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
+        # Match prefix.
+        #
+        # match_prefix() gates the returned device indices on ALL components. For
+        # a hybrid-SWA tree the SWA validator stops at the first out-of-window
+        # tombstone, so device_indices collapses to length 0 for a long prefix
+        # even though the FULL-attention KV for the whole prefix is still
+        # device-resident. That makes the len(new_indices) assert below fatal on
+        # decode radix (new_prefix_len is the full-attention prefix length). Walk
+        # the just-inserted path read-only to collect the ungated FULL-component
+        # indices and re-point the request onto them, protecting the deepest full
+        # node from eviction. SWA reuse stays correctly window-gated elsewhere.
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        full_values = []
+        full_last_node = self.root_node
+        remaining_key = radix_key
+        walk_node = self.root_node
+        if len(remaining_key) > 0:
+            child_key = remaining_key.child_key(self.page_size)
+            while len(remaining_key) > 0 and child_key in walk_node.children:
+                child = walk_node.children[child_key]
+                full_data = child.component_data[BASE_COMPONENT_TYPE]
+                if full_data.value is None:
+                    break
+                matched = child.key.match(remaining_key, page_size=self.page_size)
+                if matched < len(child.key):
+                    # Partial match: the divergence is inside this node, so we
+                    # cannot descend into its children (they extend past this
+                    # node's full key). Take the matched span and stop, mirroring
+                    # _match_prefix_helper.
+                    full_values.append(full_data.value[:matched])
+                    full_last_node = child
+                    break
+                full_values.append(full_data.value)
+                full_last_node = child
+                walk_node = child
+                remaining_key = remaining_key[matched:]
+                if len(remaining_key) == 0:
+                    break
+                child_key = remaining_key.child_key(self.page_size)
+        if full_values:
+            new_indices = torch.cat(full_values)
+            new_last_node = full_last_node
+        else:
+            new_indices = match_result.device_indices
+            new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
@@ -1907,6 +1946,56 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
         )
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        """Return how many suffix tokens are resident in the L3 storage backend.
+
+        Mirrors ``HiRadixCache.query_storage_hit_length`` so ``UnifiedRadixCache``
+        is a drop-in for the decode-side HiCache prefix-match path
+        (``disaggregation/decode_hicache_mixin._build_decode_prefix_match``),
+        which calls this unconditionally on the tree cache. When no L3 storage
+        backend is configured (L2-only: GPU + host DRAM) this returns 0 exactly
+        like ``HiRadixCache``, so decode-side hierarchical cache works without an
+        external store and transparently gains storage-hit prefetch when one is
+        configured.
+        """
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        return storage_hit_count
 
     def prefetch_from_storage(
         self,
