@@ -29,7 +29,7 @@ def _fast_math_flags() -> list[str]:
 
 
 @cache_once
-def _jit_activation_module(dtype: torch.dtype) -> Module:
+def activation_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "activation",
@@ -59,7 +59,7 @@ def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = _jit_activation_module(input.dtype)
+    module = activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation(input_2d, out_2d, op_name)
@@ -74,7 +74,7 @@ def _run_activation_filtered_inplace(
     expert_step: int,
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = _jit_activation_module(input.dtype)
+    module = activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
@@ -110,7 +110,7 @@ def _run_unary_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     last = input.shape[-1]
-    module = _jit_activation_module(input.dtype)
+    module = activation_module(input.dtype)
     module.run_unary_activation(input.view(-1, last), out.view(-1, last), op_name)
 
 

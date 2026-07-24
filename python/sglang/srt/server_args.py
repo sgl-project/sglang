@@ -1063,6 +1063,11 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = False
     prefill_cp_mode: A[str, Arg(no_cli=True), NS("parallel")] = "in-seq-split"
+    enable_cp_decode_attn_tp: A[
+        bool,
+        "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
+        NS("parallel"),
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -2383,6 +2388,14 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    mamba_max_states_per_path: A[
+        int,
+        "Maximum number of cached Mamba states retained per root-to-tail path "
+        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
+        "interior states beyond the cap are removed while their full KV remains. "
+        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
+        NS("exec.mamba"),
+    ] = -1
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -3310,6 +3323,8 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._validate_mamba_max_states_per_path()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3486,6 +3501,14 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+
+    def _validate_mamba_max_states_per_path(self):
+        value = self.mamba_max_states_per_path
+        if value == 0 or value < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {value}."
+            )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -4730,6 +4753,19 @@ class ServerArgs:
                 "(DeepSeek Sparse Attention) models."
             )
 
+        if self.enable_cp_decode_attn_tp:
+            from sglang.srt.layers.cp.cp_decode_attn_tp import (
+                CP_DECODE_ATTN_TP_SUPPORTED_ARCHS,
+            )
+
+            if model_arch not in CP_DECODE_ATTN_TP_SUPPORTED_ARCHS:
+                raise ValueError(
+                    "--enable-cp-decode-attn-tp is only supported for models "
+                    "whose attention linears are replicated across CP ranks "
+                    f"(attn_tp_size=1). Got {model_arch}; supported: "
+                    f"{sorted(CP_DECODE_ATTN_TP_SUPPORTED_ARCHS)}."
+                )
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
             self._handle_mamba_radix_cache(model_arch=model_arch)
@@ -4934,9 +4970,13 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                validate_deepseek_v4_cp,
+                validate_deepseek_v4_mega_moe_token_budget,
+            )
 
             validate_deepseek_v4_cp(self)
+            validate_deepseek_v4_mega_moe_token_budget(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
             # (arg_groups/overrides.py: _deepseek_v4_sm120_moe), invoked here
@@ -8829,13 +8869,21 @@ class PortArgs:
                 scheduler_input_port = worker_ports[dp_rank]
 
             is_joiner = server_args.is_ep_joiner
+            # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
+            # dist_init_port / nccl_port (rendezvous uses the externally-managed
+            # store; see distributed/bootstrap.py:_resolve_dist_init_method), so
+            # their prechecks could only false-positive and are skipped.
+            dist_init_overridden = bool(
+                envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+            )
             try:
                 if dp_rank is None:
-                    if not is_joiner:
+                    if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
-                    wait_port_available(nccl_port, "nccl_port")
+                    if not dist_init_overridden:
+                        wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
