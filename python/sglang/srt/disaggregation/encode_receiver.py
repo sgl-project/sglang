@@ -65,9 +65,10 @@ class EncoderBootstrapServer:
     accessible through :meth:`list_urls`.
 
     Health-check tuning is controlled by env vars
-    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables)
-    and ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds).  Explicit
-    constructor args take precedence over the env vars.
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_INTERVAL`` (seconds; 0 disables),
+    ``SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT`` (seconds), and
+    ``SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL`` (seconds; 0 keeps probing
+    forever). Explicit constructor args take precedence over the env vars.
     """
 
     def __init__(
@@ -77,6 +78,7 @@ class EncoderBootstrapServer:
         urls: Optional[List[str]] = None,
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
+        evicted_ttl: Optional[float] = None,
     ):
 
         self.host = host
@@ -94,8 +96,19 @@ class EncoderBootstrapServer:
             if health_check_timeout is not None
             else envs.SGLANG_ENCODER_BOOTSTRAP_HEALTH_CHECK_TIMEOUT.get()
         )
-        self._consecutive_failures: Dict[str, int] = {}
-        self._max_consecutive_failures = 3
+        self._evicted_ttl = (
+            evicted_ttl
+            if evicted_ttl is not None
+            else envs.SGLANG_ENCODER_BOOTSTRAP_EVICTED_TTL.get()
+        )
+        # Evict only after this many consecutive probe failures (a busy
+        # encoder can miss a single 2s probe under load), and keep probing
+        # evicted URLs so they re-register automatically once healthy.
+        # Values are eviction timestamps; URLs older than ``_evicted_ttl``
+        # (when > 0) are permanently dropped.
+        self._health_fail_threshold = 3
+        self._health_fail_counts: Dict[str, int] = {}
+        self._evicted_urls: Dict[str, float] = {}
 
         @asynccontextmanager
         async def lifespan(fast_api_app: FastAPI):
@@ -153,7 +166,8 @@ class EncoderBootstrapServer:
     def register(self, url: str) -> bool:
         """Add *url* if not already present.  Returns True if added."""
         with self._lock:
-            self._consecutive_failures.pop(url, None)
+            self._health_fail_counts.pop(url, None)
+            self._evicted_urls.pop(url, None)
             if url not in self._urls:
                 self._urls.append(url)
                 logger.info(f"Registered encoder URL: {url}")
@@ -162,14 +176,20 @@ class EncoderBootstrapServer:
             return False
 
     def unregister(self, url: str) -> bool:
-        """Remove *url* if present.  Returns True if removed."""
+        """Remove *url* if present.  Returns True if removed.
+
+        An explicit unregister also drops the URL from the health-check
+        revival set so it does not come back automatically.
+        """
         with self._lock:
+            removed = url in self._urls or url in self._evicted_urls
             if url in self._urls:
                 self._urls.remove(url)
-                self._consecutive_failures.pop(url, None)
+            self._evicted_urls.pop(url, None)
+            self._health_fail_counts.pop(url, None)
+            if removed:
                 logger.info(f"Unregistered encoder URL: {url}")
-                return True
-            return False
+            return removed
 
     def list_urls(self) -> List[str]:
         """Return a snapshot of all registered encoder URLs."""
@@ -187,42 +207,78 @@ class EncoderBootstrapServer:
             return False
 
     async def _health_check_loop(self):
-        """Probe each registered encoder periodically and evict dead ones."""
+        """Probe registered (and previously evicted) encoders periodically.
+
+        A URL is evicted only after ``_health_fail_threshold`` consecutive
+        probe failures — a busy encoder may miss a single short-timeout probe
+        under load. Evicted URLs keep being probed and re-register
+        automatically once they respond again. After ``_evicted_ttl`` seconds
+        without a successful probe (when > 0), they are permanently dropped
+        so a dead encoder does not get probed forever.
+        """
 
         timeout = ClientTimeout(total=self._health_check_timeout)
         while True:
             try:
                 await asyncio.sleep(self._health_check_interval)
-                snapshot = self.list_urls()
-                if not snapshot:
+                now = time.time()
+                with self._lock:
+                    expired = []
+                    if self._evicted_ttl > 0:
+                        expired = [
+                            url
+                            for url, ts in self._evicted_urls.items()
+                            if now - ts >= self._evicted_ttl
+                        ]
+                        for url in expired:
+                            self._evicted_urls.pop(url, None)
+                            self._health_fail_counts.pop(url, None)
+                    candidates = list(
+                        dict.fromkeys(self._urls + list(self._evicted_urls))
+                    )
+                if expired:
+                    logger.warning(
+                        f"Health check permanently dropped {len(expired)} "
+                        f"encoder(s) after {self._evicted_ttl}s unhealthy: "
+                        f"{expired}"
+                    )
+                if not candidates:
                     continue
                 async with ClientSession(timeout=timeout) as session:
                     results = await asyncio.gather(
-                        *(self._probe(session, url) for url in snapshot),
+                        *(self._probe(session, url) for url in candidates),
                         return_exceptions=True,
                     )
-                evicted = []
+                evicted, revived = [], []
                 with self._lock:
-                    for url, ok in zip(snapshot, results):
+                    for url, ok in zip(candidates, results):
                         if ok is True:
-                            self._consecutive_failures.pop(url, None)
+                            self._health_fail_counts.pop(url, None)
+                            if url in self._evicted_urls:
+                                self._evicted_urls.pop(url, None)
+                                if url not in self._urls:
+                                    self._urls.append(url)
+                                revived.append(url)
                         else:
-                            self._consecutive_failures[url] = (
-                                self._consecutive_failures.get(url, 0) + 1
-                            )
-                            if (
-                                self._consecutive_failures[url]
-                                >= self._max_consecutive_failures
-                            ):
+                            if url in self._evicted_urls:
+                                continue
+                            count = self._health_fail_counts.get(url, 0) + 1
+                            self._health_fail_counts[url] = count
+                            if count >= self._health_fail_threshold:
                                 if url in self._urls:
                                     self._urls.remove(url)
-                                self._consecutive_failures.pop(url, None)
+                                self._evicted_urls[url] = now
+                                self._health_fail_counts.pop(url, None)
                                 evicted.append(url)
+                if revived:
+                    logger.info(
+                        f"Health check revived {len(revived)} encoder(s): {revived}"
+                    )
                 if evicted:
                     logger.warning(
-                        f"Health check evicted {len(evicted)} encoder(s) "
-                        f"after {self._max_consecutive_failures} consecutive "
-                        f"failures: {evicted}"
+                        f"Health check evicted {len(evicted)} encoder(s) after "
+                        f"{self._health_fail_threshold} consecutive failures "
+                        f"(will re-add when healthy): {evicted}"
                     )
             except asyncio.CancelledError:
                 raise
@@ -375,7 +431,9 @@ class EmbeddingData:
             self.shape = list(embedding.shape) if embedding is not None else None
         self.cached_embedding = None
         self.error_msg = error_msg
-        self.error_code = error_code
+        # Coerce to plain int: this object crosses process boundaries via
+        # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
+        self.error_code = int(error_code) if error_code is not None else None
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -783,51 +841,78 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
-                logger.warning(
-                    f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+            try:
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+                if getattr(recv_obj, "error_msg", None) is not None:
+                    logger.warning(
+                        f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
+                    )
+                    self.error_msg = recv_obj.error_msg
+                    self.error_code = recv_obj.error_code
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.recv_socket.close()
+                    return
+
+                # Extract original req_id from part_req_id and drop stale payloads
+                # that may arrive on a reused ZMQ port after a prior request aborted.
+                original_req_id = extract_original_req_id(recv_obj.req_id)
+                if original_req_id != self.recv_req.rid:
+                    logger.warning(
+                        f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                        f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                    )
+                    continue
+                recv_obj.req_id = original_req_id
+
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = (
+                    torch.frombuffer(buffer, dtype=recv_obj.dtype)
+                    .reshape(recv_obj.shape)
+                    .clone()
                 )
-                self.error_msg = recv_obj.error_msg
-                self.error_code = recv_obj.error_code
+
+                if self.recv_embedding_data is None:
+                    self.recv_embedding_data = (
+                        MultiModalEmbeddingData.from_embedding_data(
+                            recv_obj, model_type=self.model_type
+                        )
+                    )
+                else:
+                    self.recv_embedding_data.add(recv_obj)
+            except Exception as e:
+                # A message the scheduler cannot decode (blocked unpickle,
+                # bad shape/dtype, ...) must fail this request, not crash the
+                # scheduler event loop; FAIL still reaches the TP-wide status
+                # all-reduce in _process_waiting_requests.
+                logger.exception(
+                    "Failed to decode embedding message for rid=%s", self.rid
+                )
+                self.error_msg = f"Failed to decode embedding message: {e}"
                 self.status = WaitingImageRequestStatus.FAIL
+                self._cleanup_gpu_buffer()
                 self.recv_socket.close()
                 return
 
-            # Extract original req_id from part_req_id and drop stale payloads
-            # that may arrive on a reused ZMQ port after a prior request aborted.
-            original_req_id = extract_original_req_id(recv_obj.req_id)
-            if original_req_id != self.recv_req.rid:
-                logger.warning(
-                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-                )
-                continue
-            recv_obj.req_id = original_req_id
-
-            buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            recv_obj.embedding = (
-                torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                .reshape(recv_obj.shape)
-                .clone()
+        # Assemble mm_inputs. Wrapped so an assembly failure still reaches the
+        # TP-wide status all-reduce in _process_waiting_requests instead of
+        # raising past it.
+        try:
+            recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+            mm_inputs = self.mm_processor.get_mm_data(
+                self.recv_req.input_text,
+                recv_embedding,
+                **self.recv_embedding_data.get_mm_extra_meta(),
             )
-
-            if self.recv_embedding_data is None:
-                self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj, model_type=self.model_type
-                )
-            else:
-                self.recv_embedding_data.add(recv_obj)
-
-        recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
-        mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text,
-            recv_embedding,
-            **self.recv_embedding_data.get_mm_extra_meta(),
-        )
-        self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
-        self.status = WaitingImageRequestStatus.SUCCESS
+            self.recv_req.mm_inputs = mm_inputs
+            self.recv_req.input_ids = array("q", mm_inputs.input_ids)
+            self.status = WaitingImageRequestStatus.SUCCESS
+        except Exception as e:
+            logger.exception(
+                "Failed to assemble multimodal inputs for rid=%s", self.rid
+            )
+            self.status = WaitingImageRequestStatus.FAIL
+            self.error_msg = f"Failed to assemble multimodal inputs: {e}"
+            self._cleanup_gpu_buffer()
         self.recv_socket.close()
 
     def _cleanup_gpu_buffer(self):
@@ -1120,6 +1205,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             try:
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
+                return
+            except zmq.ZMQError:
+                # The RDMA pipeline thread closed the socket after an encoder
+                # error (e.g. OOM).  It already set status=FAIL; just bail.
                 return
 
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
@@ -1747,6 +1836,31 @@ class MMReceiverBase(ABC):
                 )
             obj.need_wait_for_mm_inputs = False
 
+    def _sync_fail_info_across_tp(self, waiting_req: WaitingImageRequest) -> None:
+        """Share encoder error fields across TP ranks before abort.
+
+        The encoder sends ZMQ error signals to each TP rank's receive socket,
+        but they can arrive at different times. ``all_reduce`` on status makes
+        every rank enter FAIL together while only some ranks have populated
+        ``error_msg`` / ``error_code``. attn_tp_rank 0 streams the abort to the
+        client, so merge the best-known payload from all ranks first.
+        """
+        if self.tp_size <= 1 or self.tp_group is None:
+            return
+
+        gathered = self.tp_group.all_gather_object(
+            (waiting_req.error_msg, waiting_req.error_code)
+        )
+        best_msg = waiting_req.error_msg
+        best_code = waiting_req.error_code
+        for msg, code in gathered:
+            if msg is not None:
+                best_msg = msg
+            if code is not None:
+                best_code = code
+        waiting_req.error_msg = best_msg
+        waiting_req.error_code = best_code
+
     # For zmq_to_scheduler
     def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
@@ -1805,6 +1919,7 @@ class MMReceiverBase(ABC):
             if status_value == WaitingImageRequestStatus.SUCCESS:
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingImageRequestStatus.FAIL:
+                self._sync_fail_info_across_tp(waiting_req)
                 logger.error(
                     f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
                 )

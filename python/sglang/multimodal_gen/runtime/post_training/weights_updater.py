@@ -169,23 +169,38 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
 
     For offloaded modules, updates CPU buffers directly via
     update_cpu_weights(); non-offloaded parameters use in-place copy.
+
+    The in-place copies below (param.data.copy_, DTensor _local_tensor.copy_,
+    and the offload manager's CPU-buffer copies) mutate tensors that were
+    created while the pipeline ran under ``torch.inference_mode()`` and are
+    therefore "inference tensors".  PyTorch forbids in-place mutation of an
+    inference tensor outside an inference-mode context, so wrap the whole
+    update in ``torch.inference_mode()`` (matching the offload manager's own
+    restore path).  Without this the weight-update API raises
+    "Inplace update to inference tensor outside InferenceMode is not allowed"
+    and returns an HTTP error.
     """
-    model_params = dict(module.named_parameters())
-    weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
+    with torch.inference_mode():
+        model_params = dict(module.named_parameters())
+        weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
-    offload_managers: list = []
-    if is_layerwise_offloaded_module(module):
-        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+        offload_managers: list = []
+        if is_layerwise_offloaded_module(module):
+            offload_managers = [
+                m for m in module.layerwise_offload_managers if m.enabled
+            ]
 
-    if offload_managers:
-        weight_dict = dict(weights_iter)
-        offloaded_names: set[str] = set()
-        for manager in offload_managers:
-            offloaded_names.update(manager.update_cpu_weights(weight_dict))
-        remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(remaining, model_params)
-    else:
-        load_weights_into_model(weights_iter, model_params)
+        if offload_managers:
+            weight_dict = dict(weights_iter)
+            offloaded_names: set[str] = set()
+            for manager in offload_managers:
+                offloaded_names.update(manager.update_cpu_weights(weight_dict))
+            remaining = (
+                (n, w) for n, w in weight_dict.items() if n not in offloaded_names
+            )
+            load_weights_into_model(remaining, model_params)
+        else:
+            load_weights_into_model(weights_iter, model_params)
 
 
 def _build_module_weight_name_mapper(module: torch.nn.Module):
