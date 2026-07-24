@@ -18,7 +18,7 @@ use crate::error::Error;
 use crate::fsm::Event;
 use crate::message::{Request, RequestKind};
 use crate::runtime::Runnable;
-use crate::runtime::channels::TmEvent;
+use crate::tokenizer_manager::TmEvent;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.

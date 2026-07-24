@@ -14,12 +14,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::ids::RidHash;
+use crate::message::DetokMsg;
 use crate::message::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
 };
+use crate::ring::EgressConsumer;
 use crate::runtime::Runnable;
-use crate::runtime::channels::{DetokMsg, Senders, recv};
-use crate::runtime::ring::EgressConsumer;
+use crate::tokenizer_manager::{Senders, recv};
 
 /// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
 /// It's the rust-native equivalent of the Python `TokenizerManager`'s
@@ -161,8 +162,8 @@ fn decode_error(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::DetokMsg;
     use crate::message::frame_egress_error;
-    use crate::runtime::channels::DetokMsg;
 
     /// A framed error round-trips: `frame_egress_error` → tag stripped →
     /// `decode_error` yields the rid + a `Fail` carrying the message.
