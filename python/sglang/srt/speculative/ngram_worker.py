@@ -230,6 +230,11 @@ class NGRAMWorker(BaseSpecWorker):
         # spliced in from spec_info. Sync mode and grammar batches process
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
+        #
+        # Grammar batches are synchronous by design, not by omission: this draft
+        # runs on the host, so the scheduler keeps NGRAM on need_grammar_sync
+        # (supports_grammar_overlap is False) and the corpus lookup below already
+        # sees the previous batch's committed tokens.
         use_prev_tokens = self.enable_overlap and not batch.has_grammar
         i = 0
         for req in batch.reqs:
@@ -342,8 +347,9 @@ class NGRAMWorker(BaseSpecWorker):
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Same splice condition as _prepare_draft_tokens: only overlap mode
-        # has accepted tokens missing from req.output_ids.
+        # Same splice condition as _prepare_draft_tokens (see there for why
+        # grammar batches are synchronous by design): only overlap mode has
+        # accepted tokens missing from req.output_ids.
         use_prev_tokens = self.enable_overlap and not batch.has_grammar
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
