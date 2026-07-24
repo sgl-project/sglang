@@ -1719,15 +1719,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         live attention positions); (b) a descendant holds a host lock
         (its host slots are referenced by a live request's host_locs).
         """
-        # Fold this drop decision into the rolling cross-rank signature
-        # (checked in writing_check): node id + token count, order-sensitive.
-        self._wb_fallback_sig = (
-            self._wb_fallback_sig * 1000003
-            + node.id * 31
-            + len(node.component_data[BASE_COMPONENT_TYPE].value)
-        ) % (1 << 31)
+
+        # Fold this drop decision AND its outcome into the rolling
+        # cross-rank signature (checked in writing_check): a rank that
+        # vetoes while another drops forks the tree immediately, so the
+        # branch taken must be part of the signature.
+        def _fold(outcome: int) -> None:
+            self._wb_fallback_sig = (
+                self._wb_fallback_sig * 1000003
+                + (node.id * 31 + len(node.component_data[BASE_COMPONENT_TYPE].value))
+                * 4
+                + outcome
+            ) % (1 << 31)
+
         guard = getattr(self, "_hisparse_v2_node_active", None)
         if guard is not None and guard(node):
+            _fold(1)
             logger.warning(
                 "wb-drop vetoed: node %d (%d tokens) backs an "
                 "active HiSparse V2 request; skipped",
@@ -1739,6 +1746,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while stack:
             d = stack.pop()
             if any(cd.host_lock_ref > 0 for cd in d.component_data):
+                _fold(2)
                 logger.warning(
                     "wb-drop vetoed: node %d has host-locked " "descendant %d; skipped",
                     node.id,
@@ -1746,6 +1754,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 return False
             stack.extend(d.children.values())
+        _fold(0)
         logger.info(
             "wb-drop: node=%d tokens=%d children=%d host_avail=%d",
             node.id,
