@@ -737,6 +737,10 @@ class GptOssModel(nn.Module):
                 }
             )
         else:
+            if self.end_layer in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
@@ -1325,9 +1329,9 @@ class GptOssForCausalLM(nn.Module):
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # EAGLE3 configs index hidden-state boundaries: layer N is the
+            # output after N transformer blocks, including the final boundary.
+            self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:
