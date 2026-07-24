@@ -1,0 +1,73 @@
+# sgl-router in PD mode.
+#
+# `--prefill-selector` and `--decode-selector` are BOTH required for PD
+# routing; each takes label-selector terms that partition the workers
+# into two pools. The router's PdPoolResolver picks a prefill worker
+# via the configured `--policy`, then picks a decode peer via
+# host-affinity fallback logic (same-host preferred, min-load otherwise).
+#
+# The plain `--selector` flag MUST be omitted in PD mode — it's mutually
+# exclusive with the prefill/decode pair.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router
+  namespace: sglang-pd
+  labels:
+    app.kubernetes.io/name: sgl-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgl-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sgl-router
+    spec:
+      serviceAccountName: sgl-router
+      containers:
+        - name: router
+          image: lmsysorg/sglang-router:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --host=0.0.0.0
+            - --port=30000
+            - --model-id=deepseek-ai/DeepSeek-V3-Instruct
+            - --policy=cache_aware_zmq
+            - --service-discovery
+            - --service-discovery-namespace=sglang-pd
+            - --prefill-selector
+            - app=engines-deepseek-v3,role=prefill
+            - --decode-selector
+            - app=engines-deepseek-v3,role=decode
+            - --cb-threshold=5
+            - --cb-cool-down-secs=30
+            # PD KV transfers can take tens of seconds on large models;
+            # give the request budget headroom over the plain-mode default.
+            - --request-timeout-secs=1200
+            - --stale-request-timeout-secs=3600
+            - --log-format=json
+          ports:
+            - name: http
+              containerPort: 30000
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30

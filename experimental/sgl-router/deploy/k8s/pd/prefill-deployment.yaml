@@ -1,0 +1,88 @@
+# Prefill-role SGLang workers.
+#
+# The `role: prefill` pod label is matched by the router's
+# `--prefill-selector role=prefill` flag; `app: engines-deepseek-v3`
+# is the shared model tag matched at the Service/EndpointSlice level.
+#
+# `--disaggregation-mode prefill` puts the engine into prefill role and
+# activates its bootstrap server on `--disaggregation-bootstrap-port`.
+# The decode worker connects to that port (host from the router's
+# injected `bootstrap_host`) to pull the KV cache via NIXL/Mooncake.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-prefill
+  namespace: sglang-pd
+  labels:
+    app.kubernetes.io/name: sglang-prefill
+    app: engines-deepseek-v3
+    role: prefill
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: engines-deepseek-v3
+      role: prefill
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sglang-prefill
+        app: engines-deepseek-v3
+        role: prefill
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: engine
+          image: lmsysorg/sglang:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=deepseek-ai/DeepSeek-V3-Instruct
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp-size=8
+            - --trust-remote-code
+            - --disaggregation-mode=prefill
+            - --disaggregation-bootstrap-port=8998
+            - --disaggregation-transfer-backend=mooncake
+          ports:
+            - name: http
+              containerPort: 30000
+            - name: bootstrap
+              containerPort: 8998
+          env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              memory: 1536Gi
+              cpu: "64"
+            requests:
+              nvidia.com/gpu: 8
+              memory: 1024Gi
+              cpu: "32"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 600
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 900
+            periodSeconds: 60
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 1500Gi

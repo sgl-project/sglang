@@ -1,0 +1,31 @@
+# The router watches EndpointSlices only — not Pods, not Services.
+# Grant the minimum verbs it needs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sgl-router
+  namespace: sglang
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sgl-router
+  namespace: sglang
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sgl-router
+  namespace: sglang
+subjects:
+  - kind: ServiceAccount
+    name: sgl-router
+    namespace: sglang
+roleRef:
+  kind: Role
+  name: sgl-router
+  apiGroup: rbac.authorization.k8s.io

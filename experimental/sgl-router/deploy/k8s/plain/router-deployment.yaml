@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router
+  namespace: sglang
+  labels:
+    app.kubernetes.io/name: sgl-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sgl-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sgl-router
+    spec:
+      serviceAccountName: sgl-router
+      containers:
+        - name: router
+          image: lmsysorg/sglang-router:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --host=0.0.0.0
+            - --port=30000
+            - --model-id=Qwen/Qwen3-32B
+            # `--tokenizer-path` omitted → router downloads it from HuggingFace
+            # for `--model-id`. Set HF_TOKEN below for gated models.
+            - --policy=cache_aware_zmq
+            - --service-discovery
+            - --service-discovery-namespace=sglang
+            - --selector
+            - app=engines-qwen3
+            - --cb-threshold=5
+            - --cb-cool-down-secs=30
+            - --request-timeout-secs=600
+            - --stale-request-timeout-secs=1800
+            - --log-format=json
+          ports:
+            - name: http
+              containerPort: 30000
+          env:
+            # Uncomment for gated tokenizer downloads:
+            # - name: HF_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: hf-token
+            #       key: token
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30

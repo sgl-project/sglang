@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - router-rbac.yaml
+  - engine-deployment.yaml
+  - engine-service.yaml
+  - router-deployment.yaml
+  - router-service.yaml

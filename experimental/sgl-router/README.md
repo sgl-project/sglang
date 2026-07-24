@@ -50,6 +50,17 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+## Kubernetes deployment
+
+Ready-to-apply manifest sets for both routing shapes live under
+[`deploy/k8s/`](./deploy/k8s/):
+
+- `deploy/k8s/plain/` — one-pool routing (reference: Qwen3-32B, TP=2)
+- `deploy/k8s/pd/`    — prefill/decode disaggregation (reference: DeepSeek-V3, TP=8)
+
+Full walkthrough with prerequisites, RBAC, policies, and troubleshooting:
+[Router Kubernetes Deployment](../../docs_new/docs/advanced_features/router_k8s_deployment.mdx).
+
 ## License
 
 Apache-2.0.

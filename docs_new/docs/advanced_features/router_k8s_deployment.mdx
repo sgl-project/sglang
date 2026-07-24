@@ -1,0 +1,208 @@
+---
+title: "Router Kubernetes Deployment"
+metatags:
+    description: "Deploy sgl-router with SGLang engines on Kubernetes — plain mode and prefill/decode disaggregation. Reference manifests, RBAC, service discovery, and PD bootstrap-room wiring."
+---
+
+Deployment recipes for running [sgl-router](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router) with SGLang engines on Kubernetes, for both plain routing and prefill/decode (PD) disaggregation. Reference manifests live in [`experimental/sgl-router/deploy/k8s/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/deploy/k8s).
+
+Related pages:
+
+- [SGLang Model Gateway](./sgl_model_gateway) — the Python multi-model gateway (SMG). This page is about the single-model Rust `sgl-router` under `experimental/`.
+- [PD Disaggregation](./pd_disaggregation) — engine-side design and transfer-engine (Mooncake / NIXL) setup.
+
+## Overview
+
+The router runs as a single Deployment in front of SGLang worker pods. It watches Kubernetes `EndpointSlice` resources for its worker pool and dispatches requests via a configurable policy (`cache_aware_zmq`, `power_of_two`, `sticky`, `round_robin`, `random`, `load_based`).
+
+Two shapes:
+
+- **Plain mode** — one pool of workers. Router picks one worker per request. Simplest and covers most single-model deployments.
+- **PD mode** — two pools (prefill and decode) with distinct pod labels. Router picks a prefill worker, resolves a decode peer (same-host preferred), injects `bootstrap_{host,port,room}` into the request body, and fans the same body to both. The decode response is what the client sees.
+
+```
+┌────────┐
+│ Client │──── POST /v1/chat/completions ─────┐
+└────────┘                                    ▼
+                                       ┌────────────┐
+                                       │ sgl-router │──watch EndpointSlices──┐
+                                       └────────────┘                        │
+                                          │                                  ▼
+                                          │              ┌──────────────────────────┐
+        Plain:  pick a worker, forward    │              │ EndpointSlice / K8s API  │
+        PD:     dual-send to prefill+decode              └──────────────────────────┘
+                                          │
+                                          ├───► worker (plain)      OR
+                                          │
+                                          ├───► prefill worker  ────┐  (bootstrap_room shared
+                                          │                         ▼   in request body;
+                                          └───► decode worker  ◄── KV via NIXL/Mooncake)
+                                                                    ▲
+                                                                    └── prefill.bootstrap_host:port
+```
+
+## Prerequisites
+
+- Kubernetes ≥ v1.28 (EndpointSlice API stable)
+- A GPU operator that produces node labels the manifests target — the reference manifests use `nvidia.com/gpu.present=true` (NVIDIA GPU Operator). For AMD, swap the nodeSelector to `feature.node.kubernetes.io/amd-gpu=true` and use a ROCm SGLang image.
+- Cluster egress to HuggingFace Hub (or a pre-populated model cache PVC)
+- For PD mode: pod-to-pod networking allowing the decode worker to reach the prefill's `--disaggregation-bootstrap-port` (default `8998`). No cross-node restrictions in the reference manifests; add a NetworkPolicy for prod.
+
+## Plain-mode deployment
+
+Reference manifests: [`deploy/k8s/plain/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/deploy/k8s/plain).
+
+Apply:
+
+```bash
+kubectl apply -k experimental/sgl-router/deploy/k8s/plain
+```
+
+What gets created (namespace `sglang`):
+
+| Resource | Purpose |
+| --- | --- |
+| `Deployment/sglang-engine` | 2 SGLang worker pods (Qwen3-32B, TP=2). Pod label `app: engines-qwen3` is what the router matches. |
+| `Service/sglang-engine` (headless) | Emits EndpointSlices per pod. Headless (`clusterIP: None`) makes per-pod dispatch the obvious intent. |
+| `Deployment/sgl-router` | 1 router pod, image `lmsysorg/sglang-router`, `--service-discovery` enabled. |
+| `Service/sgl-router` | Client entrypoint, port `30000`. Change type to `LoadBalancer` for a cloud external IP. |
+| `ServiceAccount` + `Role` + `RoleBinding` | `get,list,watch` on `endpointslices.discovery.k8s.io` — the minimum the router needs. |
+
+### Router flags used
+
+```
+--host=0.0.0.0
+--port=30000
+--model-id=Qwen/Qwen3-32B
+--policy=cache_aware_zmq          # or power_of_two, sticky, round_robin, random, load_based
+--service-discovery
+--service-discovery-namespace=sglang
+--selector app=engines-qwen3      # matches the engine Deployment's pod label
+--cb-threshold=5                  # circuit breaker opens after 5 consecutive failures
+--cb-cool-down-secs=30
+--request-timeout-secs=600        # per-request upstream budget
+--stale-request-timeout-secs=1800 # janitor reaps orphaned load entries
+--log-format=json                 # aggregator-friendly
+```
+
+`--tokenizer-path` is omitted, so the router downloads the tokenizer for `--model-id` from HuggingFace at startup (honors `HF_TOKEN`).
+
+### Verify
+
+```bash
+# Router is ready
+kubectl -n sglang wait --for=condition=Ready pod -l app.kubernetes.io/name=sgl-router --timeout=180s
+
+# Engines are ready (long delay for model download + CUDA graph capture)
+kubectl -n sglang wait --for=condition=Ready pod -l app=engines-qwen3 --timeout=1800s
+
+# Router sees both engines as EndpointSlice members
+kubectl -n sglang get endpointslices -l app=engines-qwen3
+
+# Try a request
+kubectl -n sglang port-forward svc/sgl-router 8080:30000 &
+curl -s http://localhost:8080/v1/models | jq
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-32B","messages":[{"role":"user","content":"hi"}]}' | jq
+```
+
+## PD-mode deployment
+
+Reference manifests: [`deploy/k8s/pd/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/deploy/k8s/pd).
+
+Apply:
+
+```bash
+kubectl apply -k experimental/sgl-router/deploy/k8s/pd
+```
+
+What changes vs plain mode:
+
+1. **Two worker Deployments**, labeled `role: prefill` and `role: decode`. The `app: engines-deepseek-v3` label is shared; `role` is the discriminator.
+2. **Two headless Services**, one per role. The prefill Service exposes the bootstrap port (`8998`) in addition to HTTP.
+3. **Prefill engine args** include `--disaggregation-mode=prefill` and `--disaggregation-bootstrap-port=8998`; decode args include `--disaggregation-mode=decode`. Both use `--disaggregation-transfer-backend=mooncake` (swap for `nixl` per your cluster's transport).
+4. **Router args** replace `--selector` with `--prefill-selector` and `--decode-selector`:
+
+    ```
+    --prefill-selector app=engines-deepseek-v3,role=prefill
+    --decode-selector  app=engines-deepseek-v3,role=decode
+    ```
+
+### How a PD request flows
+
+1. Client sends `POST /v1/chat/completions` to the router.
+2. Router parses the model, picks a **prefill worker** from the prefill pool via `--policy` (e.g. `cache_aware_zmq`).
+3. Router picks a **decode peer** via host-affinity (same-node preferred, else min-load).
+4. Router generates a 63-bit `bootstrap_room` ID and injects three top-level fields into the request body:
+    ```json
+    {
+      "bootstrap_host": "<prefill-pod-ip>",
+      "bootstrap_port": 8998,
+      "bootstrap_room": <u64>,
+      ...original body
+    }
+    ```
+5. Router **spawns** the prefill request (detached — outlives the client HTTP connection to avoid cancel-race with NIXL RPC teardown) and **awaits** the decode request. Decode's response is what the client sees.
+6. Engine side: the decode worker's admission path reads the bootstrap fields, opens a NIXL/Mooncake connection to `bootstrap_host:bootstrap_port`, and pulls the KV cache keyed by `bootstrap_room`. Prefill's bootstrap server matches the room and streams KV back.
+
+If prefill fails: decode times out on `bootstrap_room` after ~30–60 s (engine-side default). The router does not fail fast; this matches the shipping shape of peer HTTP-PD routers (llm-d, aibrix). See [PD Disaggregation](./pd_disaggregation) for the engine-side setup.
+
+### Router timing knobs for PD
+
+PD KV transfers on large models take tens of seconds. The reference manifest bumps the router's per-request budget:
+
+```
+--request-timeout-secs=1200          # 20 min per upstream request
+--stale-request-timeout-secs=3600    # 1 h before janitor reaps in-flight entries
+```
+
+Adjust based on model size × concurrency.
+
+## Policy selection
+
+The router's `--policy` picks one of six worker-selection strategies:
+
+| Policy | Best for | Notes |
+| --- | --- | --- |
+| `cache_aware_zmq` | Any multi-request workload with prefix reuse | Router builds a distributed block-hash prefix trie from KV-events published by workers; picks the worker with the longest matching prefix. Falls back to load-based when match rate is low. Default for the reference manifests. |
+| `power_of_two` | Randomized load balancing with theoretical guarantees | Samples two random workers, picks less-loaded. O(log log n) max load (Mitzenmacher 2001). |
+| `sticky` | Session-scoped conversations (chat multi-turn) | Rendezvous hashing (HRW) on a client-provided `x-sgl-routing-key` header. Zero rebuild cost on worker membership change. |
+| `round_robin` | Uniform workloads, no prefix reuse | Atomic counter dispatch. |
+| `random` | Baseline | Uniform random. |
+| `load_based` | When workers publish load via KV-events / heartbeat | Router picks min-load using worker-reported metrics rather than router-tracked in-flight counts. |
+
+## Observability
+
+- **Prometheus**: router exposes `/metrics` on the HTTP port. Scrape via a ServiceMonitor (not included in the reference manifests to keep them CRD-independent — add one if you run kube-prometheus).
+- **Structured logs**: `--log-format=json` produces one JSON record per line for aggregators (Loki, Grafana Alloy, Fluent Bit).
+- **Log level**: `--log-level=info` default; override with `RUST_LOG=debug` env var for verbose traces.
+- **Health endpoints**: `/healthz` (liveness) and `/readyz` (readiness). Router reports `ready` once at least one healthy worker is registered.
+
+## Autoscaling notes
+
+The router itself is nearly stateless (in-memory sticky map + prefix trie, both reproducible from EndpointSlice state) — you can scale router replicas horizontally. Multiple router replicas will independently rebuild their in-memory state from the EndpointSlice watch; for sticky-session routing across multiple routers, use `sticky_fallback_policy=power_of_two` so the two routers converge on similar assignments even without shared state.
+
+Engine autoscaling should use a custom metric (e.g. `sgl_router_active_requests` divided by replica count, or `token_usage` from engine metrics), not the default CPU-based HPA — GPU inference load isn't reflected in CPU usage.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Router logs `no healthy workers for model X` | RBAC missing, wrong selector, or engines not ready | `kubectl auth can-i list endpointslices --as=system:serviceaccount:sglang:sgl-router`; verify `--selector` matches pod labels |
+| Client 504 `stale_request_expired` | `--stale-request-timeout-secs` too short for the workload | Bump the flag; check for engine pod OOM |
+| PD requests hang, no decode reply | Prefill can't reach decode's NIXL socket, or decode can't reach prefill's `bootstrap_port` | Check NetworkPolicies; verify `bootstrap_port` matches on router + prefill args |
+| Engine pod stuck `NotReady` for >20 min | Model download or CUDA graph capture still running | Extend `readinessProbe.initialDelaySeconds`; check `kubectl logs` for progress |
+
+## Downstream distributions
+
+Platforms that package SGLang as an opt-in application:
+
+- **clusterdOS** — see the [SGLang gitapp](https://gitlab.com/aranya-tech/public/clusterdos) (proposed) — same manifest shape, wrapped as a Helm chart consumable via ArgoCD.
+
+## Reference
+
+- Router source: [`experimental/sgl-router/src/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/src)
+- K8s discovery backend: [`experimental/sgl-router/src/discovery/k8s.rs`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/src/discovery/k8s.rs)
+- PD dispatch handler: [`experimental/sgl-router/src/server/routes/chat.rs`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/src/server/routes/chat.rs)
+- CLI reference: run `sgl-router --help`

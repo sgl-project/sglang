@@ -1,0 +1,21 @@
+# Headless Service. `clusterIP: None` makes Kubernetes emit an
+# EndpointSlice per matching pod carrying per-pod IPs, which is what
+# `sgl-router --service-discovery` watches. A ClusterIP Service would
+# also produce EndpointSlices, but the headless form makes it obvious
+# that direct per-pod dispatch is the intent.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-engine
+  namespace: sglang
+  labels:
+    app: engines-qwen3
+spec:
+  clusterIP: None
+  selector:
+    app: engines-qwen3
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+      protocol: TCP

@@ -1,0 +1,17 @@
+# Client-facing entrypoint. Change `type: LoadBalancer` for a
+# cloud-provisioned external IP, or add an Ingress in front of the
+# ClusterIP for TLS termination.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router
+  namespace: sglang
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sgl-router
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+      protocol: TCP

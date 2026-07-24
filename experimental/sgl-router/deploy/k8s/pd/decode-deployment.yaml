@@ -1,0 +1,75 @@
+# Decode-role SGLang workers.
+#
+# Matches the router's `--decode-selector role=decode`. Decode workers
+# open NIXL / Mooncake connections OUTBOUND to the prefill worker's
+# bootstrap port to fetch KV, so they need no exposed bootstrap port
+# themselves.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-decode
+  namespace: sglang-pd
+  labels:
+    app.kubernetes.io/name: sglang-decode
+    app: engines-deepseek-v3
+    role: decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: engines-deepseek-v3
+      role: decode
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sglang-decode
+        app: engines-deepseek-v3
+        role: decode
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: engine
+          image: lmsysorg/sglang:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=deepseek-ai/DeepSeek-V3-Instruct
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp-size=8
+            - --trust-remote-code
+            - --disaggregation-mode=decode
+            - --disaggregation-transfer-backend=mooncake
+          ports:
+            - name: http
+              containerPort: 30000
+          env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              memory: 1536Gi
+              cpu: "64"
+            requests:
+              nvidia.com/gpu: 8
+              memory: 1024Gi
+              cpu: "32"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 600
+            periodSeconds: 15
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 1500Gi

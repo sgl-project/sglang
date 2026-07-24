@@ -1,0 +1,86 @@
+# SGLang worker Deployment for plain-mode (non-PD) routing.
+#
+# Replicas are the horizontal-scale unit; increase to add capacity behind
+# the router. The pod labels `app: engines-qwen3` are what the router's
+# `--selector app=engines-qwen3` matches; keep them in sync.
+#
+# TP size (--tp-size=2) matches the requested GPU count.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-engine
+  namespace: sglang
+  labels:
+    app.kubernetes.io/name: sglang-engine
+    app: engines-qwen3
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: engines-qwen3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sglang-engine
+        app: engines-qwen3
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: engine
+          image: lmsysorg/sglang:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=Qwen/Qwen3-32B
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp-size=2
+          ports:
+            - name: http
+              containerPort: 30000
+          env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            # Uncomment for gated models:
+            # - name: HF_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: hf-token
+            #       key: token
+          resources:
+            limits:
+              nvidia.com/gpu: 2
+              memory: 96Gi
+              cpu: "16"
+            requests:
+              nvidia.com/gpu: 2
+              memory: 64Gi
+              cpu: "8"
+          # Long initial delay to cover model download + CUDA graph capture.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        # Prefer a shared PVC across pods in production so weights download once.
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 200Gi

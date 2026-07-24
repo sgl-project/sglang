@@ -1,0 +1,41 @@
+# Two headless Services — one per role — so the router sees EndpointSlices
+# with the role label attached (prefill vs decode), which its
+# `--prefill-selector` and `--decode-selector` flags match against.
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-prefill
+  namespace: sglang-pd
+  labels:
+    app: engines-deepseek-v3
+    role: prefill
+spec:
+  clusterIP: None
+  selector:
+    app: engines-deepseek-v3
+    role: prefill
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-decode
+  namespace: sglang-pd
+  labels:
+    app: engines-deepseek-v3
+    role: decode
+spec:
+  clusterIP: None
+  selector:
+    app: engines-deepseek-v3
+    role: decode
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
