@@ -84,6 +84,13 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
         )
+    if server_args.pp_size > 1:
+        return (
+            "pipeline_parallel_size>1 is not supported "
+            "(adaptive state switching only happens on the last PP rank; "
+            "an extra synchronization mechanism would be needed to keep all "
+            "PP ranks in sync)"
+        )
     return None
 
 

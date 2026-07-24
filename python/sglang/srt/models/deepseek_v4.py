@@ -2337,6 +2337,15 @@ class DeepseekV4Model(nn.Module):
                 "of them: DSpark static-verify is CP-off for v1."
             )
         dspark_aux_hidden_states: List[torch.Tensor] = []
+        # Relay accumulated aux hidden states from upstream PP ranks. Each rank
+        # captures layers only in its own [start_layer, end_layer) range; the
+        # full aux list is rebuilt by concatenating upstream-relayed aux with
+        # local aux in PP-rank order, which matches the global layer order.
+        # PPProxyTensors only carries tensors, so aux is stacked as
+        # [L, num_tokens, hidden] and relayed under the "dspark_aux" key.
+        upstream_dspark_aux = None
+        if capture_dspark and pp_proxy_tensors is not None:
+            upstream_dspark_aux = pp_proxy_tensors.tensors.get("dspark_aux")
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
@@ -2395,7 +2404,18 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                # Relay aux: stack local captures and concat with upstream's
+                # [L_up, N, H] along the layer dim (upstream first, then local).
+                parts = []
+                if upstream_dspark_aux is not None:
+                    parts.append(upstream_dspark_aux)
+                if dspark_aux_hidden_states:
+                    parts.append(torch.stack(dspark_aux_hidden_states, dim=0))
+                if parts:
+                    proxy["dspark_aux"] = torch.cat(parts, dim=0)
+            return PPProxyTensors(proxy)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2405,7 +2425,14 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            # Rebuild the full aux list in global layer order: upstream-relayed
+            # layers first, then this rank's own captures.
+            full_aux = list(dspark_aux_hidden_states)
+            if upstream_dspark_aux is not None:
+                full_aux = [
+                    upstream_dspark_aux[i] for i in range(upstream_dspark_aux.shape[0])
+                ] + full_aux
+            return (hidden_states, pre_hc_head), full_aux
 
         return hidden_states, pre_hc_head
 
@@ -2484,8 +2511,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
@@ -2877,10 +2902,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name.startswith("mtp"):
                                 continue
                     else:
-                        if "shared_head.head" in name or "embed_tokens" in name:
+                        if "shared_head.head" in name:
+                            continue
+                        is_embed = "embed_tokens" in name
+                        # Under PP the draft model loads its own embed_tokens on
+                        # the last rank; otherwise embed is shared from target.
+                        if is_embed and (
+                            self.pp_group.world_size == 1
+                            or not self.pp_group.is_last_rank
+                        ):
                             continue
 
-                        if not name.startswith(nextn_layer_prefix):
+                        if not name.startswith(nextn_layer_prefix) and not is_embed:
                             continue
 
                         in_decoder = True
@@ -2956,6 +2989,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             if (
                                 ".embed_tokens." in name
+                                and not is_nextn
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
@@ -3081,7 +3115,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             skipped_checking_patterns.append("model.norm.")
             skipped_checking_patterns.extend(["lm_head", "hc_head_"])
         if is_nextn:
-            skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+            skipped_checking_patterns.extend(["lm_head"])
+            # Under PP the draft loads embed_tokens itself, so do not skip it here;
+            # under non-PP it is still shared from target by eagle_worker, so skip it.
+            if self.pp_group.world_size == 1:
+                skipped_checking_patterns.extend(["embed_tokens"])
         unloaded_params = {
             p
             for p in unloaded_params
@@ -3103,6 +3141,9 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def get_head(self):
+        return self.lm_head.weight
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
@@ -3110,6 +3151,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.lm_head.weight = head
         # Hot weight reload (RL workflows). Use the device-agnostic module
         # accessor so this works on both CUDA/HIP and NPU.
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
+
+    def set_head(self, head):
+        del self.lm_head.weight
+        self.lm_head.weight = head
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
 
