@@ -235,12 +235,6 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
-torch::Tensor fp8_blockwise_scaled_mm(
-    const torch::Tensor& mat_a,
-    const torch::Tensor& mat_b,
-    const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b,
-    const torch::Dtype& out_dtype);
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
@@ -262,15 +256,6 @@ void sgl_per_token_group_quant_8bit_v2(
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
-void bmm_fp8(
-    at::Tensor A,
-    at::Tensor B,
-    at::Tensor D,
-    at::Tensor A_scale,
-    at::Tensor B_scale,
-    at::Tensor workspace_buffer,
-    int64_t cublas_handle);
-void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 torch::Tensor gptq_gemm(
     torch::Tensor a,
@@ -294,7 +279,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
-    bool pad_sorted_token_ids);
+    bool pad_sorted_token_ids,
+    bool ignore_invalid_expert);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
@@ -730,27 +716,6 @@ void convert_vertical_slash_indexes_mergehead(
  * From csrc/grammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
-
-/*
- * From csrc/gemm (QServe)
- */
-void qserve_w4a8_per_chn_gemm(
-    const torch::Tensor& _in_feats,
-    const torch::Tensor& _kernel,
-    const torch::Tensor& _wscales,
-    const torch::Tensor& _ascales,
-    const torch::Tensor& _w_szs,
-    const torch::Tensor& _a_ssums,
-    torch::Tensor& _out_feats);
-
-void qserve_w4a8_per_group_gemm(
-    const torch::Tensor& _in_feats,
-    const torch::Tensor& _kernel,
-    const torch::Tensor& _zeros,
-    const torch::Tensor& _scales_i8,
-    const torch::Tensor& _wscales,
-    const torch::Tensor& _ascales,
-    torch::Tensor& _out_feats);
 
 /*
  * From csrc/quantization/gguf

@@ -7,6 +7,9 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    SampleStepTokens,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -18,10 +21,10 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    SampleStepTokens,
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    spec_scale_global_num_tokens,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 
 logger = logging.getLogger(__name__)
@@ -406,8 +409,10 @@ class DraftBlockProposer:
     ) -> None:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
-        gnt, gnt_logprob = (
-            self._draft_block_spec_info.get_spec_adjusted_global_num_tokens(batch)
+        gnt, gnt_logprob = spec_scale_global_num_tokens(
+            self._draft_block_spec_info,
+            batch.global_num_tokens,
+            batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
         forward_batch.global_num_tokens_cpu = gnt

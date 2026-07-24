@@ -21,7 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher import (
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
     TorchDistributedCommBackend,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -115,7 +119,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # The workspace must fit both:
         #  (a) the fattest prefill batch (bounded by chunked_prefill_size), and
         #  (b) the largest decode batch (bounded by max_running_requests, which
-        #      _resolve_max_num_reqs caps at 4096 per DP worker).
+        #      resolve_max_num_reqs caps at 4096 per DP worker).
         # max_running_requests is not yet resolved at model-construction time,
         # so we use 4096 as a floor to cover decode batches and _dummy_run
         # (which warms up at batch_size = req_to_token_pool.size).
@@ -176,7 +180,12 @@ class FlashinferDispatcher(BaseDispatcher):
         output_dtype = hidden_states.dtype
         x = hidden_states
         x_sf = None
-        topk_ids = topk_output.topk_ids
+        # FlashInfer dispatch requires materialized top-k IDs and weights.
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = topk_output.to_standard()
+        # FlashInfer MoeAlltoAll's expert-ID ABI is int32. This dispatcher is
+        # only selected for moe_a2a_backend="flashinfer".
+        topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)

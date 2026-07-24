@@ -21,7 +21,7 @@ from .cuda_graph_decode_runner import (
 # "prod_fill": mirrors `eagle_draft_extend_cuda_graph_runner.py:466-474`
 # (and similar in `multi_layer_eagle_draft_extend_cuda_graph_runner.py`):
 # padded rows are pure scratch — `seq_lens[padded] = seq_len_fill_value`,
-# `extend_seq_lens[padded] = num_tokens_per_bs`, `req_pool_indices[padded] = 0`,
+# `extend_seq_lens[padded] = num_tokens_per_req`, `req_pool_indices[padded] = 0`,
 # `out_cache_loc[padded] = 0`, `positions[padded] = 0`. seq_lens and
 # extend_seq_lens are intentionally inconsistent for padded rows (their
 # subtraction goes negative), so backends must defend against that — the
@@ -55,7 +55,7 @@ class SpeculativeCudaGraphAdapter:
     pad_style: PadStyle = "small_real"
     # Required when pad_style == "prod_fill": draft tokens per request,
     # used to fill the padded slots of extend_seq_lens / spec_info.
-    pad_num_tokens_per_bs: Optional[int] = None
+    pad_num_tokens_per_req: Optional[int] = None
 
 
 def _apply_prod_fill_padding(
@@ -64,7 +64,7 @@ def _apply_prod_fill_padding(
     real_bs: int,
     capture_bs: int,
     seq_len_fill_value: int,
-    num_tokens_per_bs: int,
+    num_tokens_per_req: int,
 ) -> None:
     """Overwrite padded slots of `batch` to match the production CG runner.
 
@@ -85,20 +85,20 @@ def _apply_prod_fill_padding(
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     if getattr(batch, "extend_seq_lens", None) is not None:
-        batch.extend_seq_lens[pad_lo:pad_hi] = num_tokens_per_bs
+        batch.extend_seq_lens[pad_lo:pad_hi] = num_tokens_per_req
     if getattr(batch, "extend_seq_lens_cpu", None) is not None:
         ext = list(batch.extend_seq_lens_cpu)
         for i in range(pad_lo, min(pad_hi, len(ext))):
-            ext[i] = num_tokens_per_bs
+            ext[i] = num_tokens_per_req
         batch.extend_seq_lens_cpu = ext
 
     # Per-request slot tensors.
     batch.req_pool_indices[pad_lo:pad_hi] = 0
 
     # Per-token tensors: padded rows occupy slots
-    # [real_bs * num_tokens_per_bs, capture_bs * num_tokens_per_bs).
-    tok_lo = pad_lo * num_tokens_per_bs
-    tok_hi = pad_hi * num_tokens_per_bs
+    # [real_bs * num_tokens_per_req, capture_bs * num_tokens_per_req).
+    tok_lo = pad_lo * num_tokens_per_req
+    tok_hi = pad_hi * num_tokens_per_req
     for field in ("out_cache_loc", "positions", "input_ids"):
         t = getattr(batch, field, None)
         if t is not None and t.numel() >= tok_hi:
@@ -111,11 +111,11 @@ def _apply_prod_fill_padding(
     if spec_info is not None:
         eslt = getattr(spec_info, "extend_seq_lens_tensor", None)
         if isinstance(eslt, torch.Tensor) and eslt.numel() >= pad_hi:
-            eslt[pad_lo:pad_hi] = num_tokens_per_bs
+            eslt[pad_lo:pad_hi] = num_tokens_per_req
         eslc = getattr(spec_info, "extend_seq_lens_cpu", None)
         if isinstance(eslc, list):
             for i in range(pad_lo, min(pad_hi, len(eslc))):
-                eslc[i] = num_tokens_per_bs
+                eslc[i] = num_tokens_per_req
 
 
 def _check_speculative_cuda_graph_case(
@@ -296,9 +296,9 @@ def run_speculative_cuda_graph_case(
         and adapter.allow_padding
         and real_bs < capture_batch_size
     ):
-        if adapter.pad_num_tokens_per_bs is None:
+        if adapter.pad_num_tokens_per_req is None:
             raise ValueError(
-                "SpeculativeCudaGraphAdapter.pad_num_tokens_per_bs must be set "
+                "SpeculativeCudaGraphAdapter.pad_num_tokens_per_req must be set "
                 "when pad_style='prod_fill'."
             )
         _apply_prod_fill_padding(
@@ -306,7 +306,7 @@ def run_speculative_cuda_graph_case(
             real_bs=real_bs,
             capture_bs=capture_batch_size,
             seq_len_fill_value=capture_prefix_len,
-            num_tokens_per_bs=adapter.pad_num_tokens_per_bs,
+            num_tokens_per_req=adapter.pad_num_tokens_per_req,
         )
 
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):

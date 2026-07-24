@@ -39,7 +39,7 @@ except ImportError:
         allow_module_level=True,
     )
 
-from sglang.srt.layers.attention.fla.kda import chunk_kda  # noqa: E402
+from sglang.kernels.ops.attention.fla.kda import chunk_kda  # noqa: E402
 from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (  # noqa: E402
     FlashKDAKernel,
 )
