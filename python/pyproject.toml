@@ -144,6 +144,7 @@ test = [
   "accelerate",
   "addict",
   "auto-round>=0.13.1",
+  "av==16.1.0",
   "bitsandbytes",
   "pymupdf",
   "diff-cover",
