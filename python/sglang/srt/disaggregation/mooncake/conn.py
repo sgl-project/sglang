@@ -1997,7 +1997,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
-        elif status == KVPoll.WaitingForInput:
+        elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            # Apply the timeout to both WaitingForInput (transfer not yet
+            # started) and Transferring (transfer started but never signalled
+            # done). A request that stalls mid-transfer otherwise stays pinned
+            # forever, holding its req_to_token_pool slot on the decode side and
+            # eventually starving admission. This mirrors the NIXL receiver,
+            # which already checks the timeout unconditionally once the transfer
+            # has been initiated.
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result
