@@ -15,6 +15,18 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
+        // A key that cannot form a valid HTTP header value would otherwise
+        // silently produce an unauthenticated client at runtime.
+        if let Some(key) = &self.proxy.worker_api_key {
+            if key.is_empty() {
+                return Err(anyhow!("--worker-api-key must be non-empty when set"));
+            }
+            if reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+                return Err(anyhow!(
+                    "--worker-api-key contains characters that are not valid in an HTTP header value"
+                ));
+            }
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
