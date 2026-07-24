@@ -12,12 +12,25 @@ export const ZImageTurboDeployment = () => {
           { id: 'mi355x', label: 'MI355X', default: false },
           { id: 'b200', label: 'B200', default: true },
           { id: 'h200', label: 'H200', default: false },
-          { id: 'h100', label: 'H100', default: false }
+          { id: 'h100', label: 'H100', default: false },
+          { id: 'ascend2', label: 'A2', default: false },
+          { id: 'ascend3', label: 'A3', default: false }
         ]
       }
     },
 
     generateCommand: function(values) {
+      const { hardware } = values;
+
+      if (hardware === 'ascend2' || hardware === 'ascend3') {
+        return `sglang serve \\
+  --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --num-gpus 2 \\
+  --port 30069`;
+      }
+
       return `sglang serve \\
   --model-path Tongyi-MAI/Z-Image-Turbo \\
   --ulysses-degree=1 \\
@@ -90,6 +103,19 @@ export const ZImageTurboDeployment = () => {
 
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+    const targetTabName = isAscend ? 'Ascend A2 / A3' : 'AMD MI300X';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => ({ ...prev, [optionName]: value }));

@@ -11,6 +11,8 @@
             { id: 'mi300x', label: 'MI300X', default: false },
             { id: 'mi325x', label: 'MI325X', default: false },
             { id: 'mi355x', label: 'MI355X', default: false },
+            { id: 'ascend2', label: 'A2', default: false },
+            { id: 'ascend3', label: 'A3', default: false }
           ],
         },
         task: {
@@ -32,10 +34,10 @@
         },
         bestPractice: {
           name: 'bestPractice',
-          title: 'Sequence Parallelism',
+          title: 'Optimization',
           items: [
             { id: 'off', label: 'Standard', default: true },
-            { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+            { id: 'on', label: 'Best Practice', default: false },
           ],
         },
       };
@@ -85,6 +87,22 @@
         return modelConfigs[configKey]?.supportedLoras || [];
       })();
 
+      useEffect(() => {
+        const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+
+        const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+
+        const allTabs = document.querySelectorAll('button, [role="tab"]');
+
+        allTabs.forEach((tab) => {
+          const text = tab.textContent.trim();
+
+          if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+            tab.click();
+          }
+        });
+      }, [values.hardware]);
+
       const handleRadioChange = (optionName, itemId) => {
         setValues((prev) => {
           const next = { ...prev, [optionName]: itemId };
@@ -117,6 +135,40 @@
           return '# Error: Invalid configuration';
         }
 
+
+        if (hardware === 'ascend2' || hardware === 'ascend3') {
+          const numGpus = bestPractice === 'on' ? 4 : 2;
+
+          if (task === 't2v') {
+            const hardConfig = bestPractice === 'on'
+              ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
+              : '';
+
+            return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15 sglang serve \\
+  --model-path /models/Wan-AI/Wan2.2-T2V-A14B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 4 \\
+  --num-gpus 8 \\
+  --port 30006 \\
+  --attention-backend laser_attn`;
+          }
+
+          if (task === 'i2v') {
+            return `sglang serve \\
+  --model-path /home/weights/Wan2.2-I2V-A14B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus ${numGpus}`;
+          }
+
+          if (task === 'ti2v') {
+            return `sglang serve \\
+  --model-path /home/weights/Wan2.2-TI2V-5B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus ${numGpus}`;
+          }
+        }
         let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
           if (hardware === 'b300') {
@@ -131,14 +183,14 @@
         return command;
       };
 
-const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };
-const cardStyle = { padding: '8px 12px', border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`, borderLeft: `3px solid ${isDark ? '#E85D4D' : '#D45D44'}`, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', background: isDark ? '#1f2937' : '#fff' };
-const titleStyle = { fontSize: '13px', fontWeight: '600', minWidth: '140px', flexShrink: 0, color: isDark ? '#e5e7eb' : 'inherit' };
-const itemsStyle = { display: 'flex', rowGap: '2px', columnGap: '6px', flexWrap: 'wrap', alignItems: 'center', flex: 1 };
-const labelBaseStyle = { padding: '4px 10px', border: `1px solid ${isDark ? '#9ca3af' : '#d1d5db'}`, borderRadius: '3px', cursor: 'pointer', display: 'inline-flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontWeight: '500', fontSize: '13px', transition: 'all 0.2s', userSelect: 'none', minWidth: '45px', textAlign: 'center', flex: 1, background: isDark ? '#374151' : '#fff', color: isDark ? '#e5e7eb' : 'inherit' };
-const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
-const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
-const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark ? '#111827' : '#f5f5f5', borderRadius: '6px', fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: '12px', lineHeight: '1.5', color: isDark ? '#e5e7eb' : '#374151', whiteSpace: 'pre-wrap', overflowX: 'auto', margin: 0, border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}` };
+      const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };
+      const cardStyle = { padding: '8px 12px', border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`, borderLeft: `3px solid ${isDark ? '#E85D4D' : '#D45D44'}`, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', background: isDark ? '#1f2937' : '#fff' };
+      const titleStyle = { fontSize: '13px', fontWeight: '600', minWidth: '140px', flexShrink: 0, color: isDark ? '#e5e7eb' : 'inherit' };
+      const itemsStyle = { display: 'flex', rowGap: '2px', columnGap: '6px', flexWrap: 'wrap', alignItems: 'center', flex: 1 };
+      const labelBaseStyle = { padding: '4px 10px', border: `1px solid ${isDark ? '#9ca3af' : '#d1d5db'}`, borderRadius: '3px', cursor: 'pointer', display: 'inline-flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontWeight: '500', fontSize: '13px', transition: 'all 0.2s', userSelect: 'none', minWidth: '45px', textAlign: 'center', flex: 1, background: isDark ? '#374151' : '#fff', color: isDark ? '#e5e7eb' : 'inherit' };
+      const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
+      const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
+      const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark ? '#111827' : '#f5f5f5', borderRadius: '6px', fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: '12px', lineHeight: '1.5', color: isDark ? '#e5e7eb' : '#374151', whiteSpace: 'pre-wrap', overflowX: 'auto', margin: 0, border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}` };
 
       return (
         <div style={containerStyle} className="not-prose">

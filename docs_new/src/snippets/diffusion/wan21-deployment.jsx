@@ -47,6 +47,8 @@ export const Wan21Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'ascend2', label: 'A2', default: false },
+        { id: 'ascend3', label: 'A3', default: false }
       ],
     },
     task: {
@@ -64,10 +66,10 @@ export const Wan21Deployment = () => {
     },
     bestPractice: {
       name: 'bestPractice',
-      title: 'Sequence Parallelism',
+      title: 'Optimization',
       items: [
         { id: 'off', label: 'Standard', default: true },
-        { id: 'on', label: 'Best Practice (4 GPUs)', default: false },
+        { id: 'on', label: 'Best Practice', default: false },
       ],
     },
   };
@@ -114,6 +116,22 @@ export const Wan21Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    const isAscend = values.hardware === 'ascend2' || values.hardware === 'ascend3';
+
+    const targetTabName = isAscend ? 'Ascend A3' : 'NVIDIA B200';
+
+    const allTabs = document.querySelectorAll('button, [role="tab"]');
+
+    allTabs.forEach((tab) => {
+      const text = tab.textContent.trim();
+
+      if (text === targetTabName && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+      }
+    });
+  }, [values.hardware]);
+
   const handleRadioChange = (optionName, itemId) => {
     setValues((prev) => {
       let next = { ...prev, [optionName]: itemId };
@@ -154,12 +172,39 @@ export const Wan21Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { task, modelsize, selectedLoraPath, bestPractice } = values;
+    const { hardware, task, modelsize, selectedLoraPath, bestPractice } = values;
     const configKey = `${task}-${modelsize}`;
     const config = modelConfigs[configKey];
 
     if (!config) {
       return '# Error: Invalid configuration';
+    }
+
+    if (hardware === 'ascend2' || hardware === 'ascend3') {
+      if (task === 't2v' && modelsize === '14b') {
+        const hardConfig = bestPractice === 'on'
+          ? `SGLANG_CACHE_DIT_FN=2 SGLANG_CACHE_DIT_BN=1 SGLANG_CACHE_DIT_WARMUP=4 SGLANG_CACHE_DIT_RDT=0.4 SGLANG_CACHE_DIT_MC=4 SGLANG_CACHE_DIT_TAYLORSEER=true SGLANG_CACHE_DIT_TS_ORDER=2 SGLANG_CACHE_DIT_ENABLED=true `
+          : '';
+
+        return `${hardConfig}ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 sglang serve \\
+  --model-path /models/Wan-AI/Wan2.1-T2V-14B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 2 \\
+  --num-gpus 4 \\
+  --port 20006 \\
+  --attention-backend laser_attn`;
+      }
+
+      if (task === 't2v' && modelsize === '1_3b') {
+        return `sglang serve \\
+  --model-path /models/Wan-AI/Wan2.1-T2V-1.3B-Diffusers/ \\
+  --tp-size 2 \\
+  --sp-degree 1 \\
+  --num-gpus 2 \\
+  --port 8764`;
+      }
+
+      return `ЗАГЛУШКА: Ascend supports Wan2.1, but this launch command is not ready for the selected model variant.`;
     }
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;

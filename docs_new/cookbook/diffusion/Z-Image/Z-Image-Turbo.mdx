@@ -209,73 +209,159 @@ Test Environment:
 
 #### 5.1.1 Generate an image
 
-**Server Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Server Command**:
 
-```shell Command
-sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
-    --ulysses-degree=1 --ring-degree=1 --port 30000
-```
+    ```shell Command
+    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
+        --ulysses-degree=1 --ring-degree=1 --port 30000
+    ```
 
-**Benchmark Command**:
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Tongyi-MAI/Z-Image-Turbo
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  1.84
-Request rate:                            inf
-Max request concurrency:                 1
-Successful requests:                     1/1
---------------------------------------------------
-Request throughput (req/s):              0.54
-Latency Mean (s):                        1.8435
-Latency Median (s):                      1.8435
-Latency P99 (s):                         1.8435
---------------------------------------------------
-Peak Memory Max (MB):                    30689.20
-Peak Memory Mean (MB):                   30689.20
-Peak Memory Median (MB):                 30689.20
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Tongyi-MAI/Z-Image-Turbo
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  1.84
+    Request rate:                            inf
+    Max request concurrency:                 1
+    Successful requests:                     1/1
+    --------------------------------------------------
+    Request throughput (req/s):              0.54
+    Latency Mean (s):                        1.8435
+    Latency Median (s):                      1.8435
+    Latency P99 (s):                         1.8435
+    --------------------------------------------------
+    Peak Memory Max (MB):                    30689.20
+    Peak Memory Mean (MB):                   30689.20
+    Peak Memory Median (MB):                 30689.20
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Server Command**:
+
+    ```shell Command
+    sglang serve --model-path /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
+    ```
+
+    **Benchmark Command**:
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       2.43
+    Request rate:                                 inf
+    Max request concurrency:                      1
+    Successful requests:                          1/1
+    Completed outputs:                            1
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             2.43
+    Latency Median (s):                           2.43
+    Latency P90 (s):                              2.43
+    Latency P95 (s):                              2.43
+    Latency P99 (s):                              2.43
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11052.00
+    Peak Memory Mean (MB):                        11052.00
+    Peak Memory Median (MB):                      11052.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>
 
 #### 5.1.2 Generate images with high concurrency
 
-**Benchmark Command**:
+<Tabs>
+  <Tab title="AMD MI300X">
+    **Benchmark Command**:
 
-```shell Command
-python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
-```
+    ```shell Command
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
 
-**Result**:
+    **Result**:
 
-```text Output
-================= Serving Benchmark Result =================
-Task:                                    text-to-image
-Model:                                   Tongyi-MAI/Z-Image-Turbo
-Dataset:                                 vbench
---------------------------------------------------
-Benchmark duration (s):                  35.32
-Request rate:                            inf
-Max request concurrency:                 20
-Successful requests:                     20/20
---------------------------------------------------
-Request throughput (req/s):              0.57
-Latency Mean (s):                        18.5672
-Latency Median (s):                      18.5573
-Latency P99 (s):                         34.9880
---------------------------------------------------
-Peak Memory Max (MB):                    30689.26
-Peak Memory Mean (MB):                   30689.21
-Peak Memory Median (MB):                 30689.21
-============================================================
-```
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                    text-to-image
+    Model:                                   Tongyi-MAI/Z-Image-Turbo
+    Dataset:                                 vbench
+    --------------------------------------------------
+    Benchmark duration (s):                  35.32
+    Request rate:                            inf
+    Max request concurrency:                 20
+    Successful requests:                     20/20
+    --------------------------------------------------
+    Request throughput (req/s):              0.57
+    Latency Mean (s):                        18.5672
+    Latency Median (s):                      18.5573
+    Latency P99 (s):                         34.9880
+    --------------------------------------------------
+    Peak Memory Max (MB):                    30689.26
+    Peak Memory Mean (MB):                   30689.21
+    Peak Memory Median (MB):                 30689.21
+    ============================================================
+    ```
+  </Tab>
+  <Tab title="Ascend A3">
+    **Benchmark Command**:
+
+    ```shell Command
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    ```
+
+    **Result**:
+
+    ```text Output
+    ================= Serving Benchmark Result =================
+    Task:                                         text-to-image
+    Model:                                        /models/Tongyi-MAI/Z-Image-Turbo/Z-Image-Turbo
+    Dataset:                                      vbench
+    --------------------------------------------------
+    Benchmark duration (s):                       49.08
+    Request rate:                                 inf
+    Max request concurrency:                      20
+    Successful requests:                          20/20
+    Completed outputs:                            20
+    Outputs per prompt:                           1
+    --------------------------------------------------
+    Request throughput (req/s):                   0.41
+    Output throughput (outputs/s):                0.41
+    Latency Mean (s):                             25.78
+    Latency Median (s):                           25.77
+    Latency P90 (s):                              44.42
+    Latency P95 (s):                              46.75
+    Latency P99 (s):                              48.61
+    --------------------------------------------------
+    Peak Memory Max (MB):                         11054.00
+    Peak Memory Mean (MB):                        11054.00
+    Peak Memory Median (MB):                      11054.00
+    ------------------------------------------------------------
+    ```
+  </Tab>
+</Tabs>
