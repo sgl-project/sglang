@@ -10,6 +10,11 @@ on:
         options:
           - 'all'
           - publish
+          - push_local_registry
+      source_run_id:
+        description: 'Source run ID for local registry artifacts'
+        required: false
+        type: string
   schedule:
     - cron: '0 12 * * *'
 
@@ -134,7 +139,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ false }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish' || inputs.job_select == 'push_local_registry') }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -143,10 +148,19 @@ jobs:
       matrix:
         gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
     steps:
-      - name: Download image tag artifact
+      - name: Download image tag artifact from current run
+        if: inputs.source_run_id == ''
         uses: actions/download-artifact@v4
         with:
           name: image-tag-${{ matrix.gpu_arch }}
+
+      - name: Download image tag artifact from source run
+        if: inputs.source_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.source_run_id }}
 
       - name: Read image tag
         run: |
