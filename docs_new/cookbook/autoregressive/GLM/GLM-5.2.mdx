@@ -57,7 +57,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 </Warning>
 
 <Note>
-  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 2-1-3 = 2); high-throughput has no spec.
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc` (H200 FP8 cells: `v0.5.14 @ 49e384ce`). Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5; FP8 balanced 1-1-2 = 2; NVFP4 balanced 2-1-3 = 2); high-throughput has no spec.
 </Note>
 
 ## Playground
