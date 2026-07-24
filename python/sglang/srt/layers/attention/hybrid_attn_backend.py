@@ -29,10 +29,10 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
-        # The FutureMap seq_lens mirror exists for the spec loop's variable
-        # accept_len, and target_verify is the only forward this backend serves
-        # there (plain decode advances seq_lens by 1 on the host).
-        self.needs_cpu_seq_lens = (
+        # Backends the spec decode loop can route to: verify (target_verify) and
+        # decode (idle batches keep ForwardMode.IDLE). A prefill backend serves
+        # neither, so a host-plan prefill backend must not force the D2H.
+        self.needs_cpu_seq_lens = decode_backend.needs_cpu_seq_lens or (
             model_runner.server_args.speculative_algorithm is not None
             and self.verify_backend.needs_cpu_seq_lens
         )
