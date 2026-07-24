@@ -92,6 +92,7 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+        self.lora_execution_engine: str = server_args.lora_execution_engine
         self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
@@ -139,7 +140,12 @@ class LoRAManager:
         # ===== END TO BE REFACTORED ====
 
     def init_cuda_graph_moe_buffers(
-        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype,
+        moe_layer,
+        include_legacy_kernel_buffers: bool = True,
     ):
         """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
 
@@ -151,6 +157,7 @@ class LoRAManager:
             max_loras=max_loras,
             compute_dtype=compute_dtype,
             moe_layer=moe_layer,
+            include_legacy_kernel_buffers=include_legacy_kernel_buffers,
         )
 
     def create_lora_update_result(
@@ -799,6 +806,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_execution_engine=self.lora_execution_engine,
         )
 
         # Initializing memory pool with base model
@@ -806,7 +814,11 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(
+            module,
+            self.lora_backend,
+            lora_execution_engine=self.lora_execution_engine,
+        )
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
@@ -961,9 +973,19 @@ def init_lora_cuda_graph_moe_buffers(
     max_loras = server_args.max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
-            lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)
+            # Every engine needs the graph-stable batch metadata; only the
+            # legacy fused Triton path needs the kernel scratch alongside it.
+            include_legacy = module.lora_execution_engine != "sgl_lora"
+            lora_manager.init_cuda_graph_moe_buffers(
+                max_bs,
+                max_loras,
+                dtype,
+                module,
+                include_legacy_kernel_buffers=include_legacy,
+            )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_bs={max_bs}, max_loras={max_loras})"
+                f"(max_bs={max_bs}, max_loras={max_loras}, "
+                f"legacy_kernel_buffers={include_legacy})"
             )
             break

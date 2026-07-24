@@ -2718,6 +2718,18 @@ class ServerArgs:
         ),
         NS("lora"),
     ] = "csgmv"
+    lora_execution_engine: A[
+        Literal["auto", "legacy", "sgl_lora"],
+        Arg(
+            help=(
+                "Choose the LoRA execution engine. 'legacy' preserves the "
+                "existing layer execution, while 'sgl_lora' selects the new "
+                "MoE LoRA execution path. 'auto' currently resolves to 'legacy'."
+            ),
+            choices=["auto", "legacy", "sgl_lora"],
+        ),
+        NS("lora"),
+    ] = "auto"
     max_lora_chunk_size: A[
         Optional[int],
         Arg(
@@ -8260,6 +8272,39 @@ class ServerArgs:
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+
+        # Keep execution-engine selection orthogonal to the dense LoRA kernel
+        # backend. The new engine is MoE-only and requires virtual experts.
+        if self.lora_execution_engine == "auto":
+            self.override(
+                "check_lora_server_args",
+                lora_execution_engine="legacy",
+            )
+        elif (
+            self.lora_execution_engine == "sgl_lora"
+            and not self.lora_use_virtual_experts
+        ):
+            self.override(
+                "check_lora_server_args",
+                lora_use_virtual_experts=True,
+            )
+
+        if self.lora_execution_engine == "sgl_lora":
+            if getattr(self, "ep_join_mode", None) is not None:
+                raise ValueError("sgl_lora does not yet support elastic EP")
+            if self.enable_dp_attention and self.dp_size > 1:
+                raise ValueError(
+                    "sgl_lora does not yet support DP-attention with dp_size > 1"
+                )
+            if (
+                self.enable_eplb
+                or self.init_expert_location != "trivial"
+                or self.ep_num_redundant_experts > 0
+            ):
+                raise ValueError(
+                    "sgl_lora currently requires trivial expert placement "
+                    "without EPLB or redundant experts"
+                )
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:

@@ -144,6 +144,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_execution_engine: str = "legacy",
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -159,18 +160,22 @@ class LoRAMemoryPool:
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
         self.pin_memory_available: bool = is_pin_memory_available()
 
-        # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
-        # global `topk_ids` -> local expert IDs before the MoE kernel, so
-        # per-expert LoRA buffers must be sized and keyed by the local slice.
-        # FlashInfer CUTLASS/CuteDSL/TRTLLM/MXFP4 keep global IDs, and an
-        # uneven expert split (`num_experts % moe_ep_size != 0`, shouldn't
-        # happen in practice) is also treated as globally-keyed so we don't
-        # silently truncate experts.
+        # Legacy providers that keep global expert IDs also keep globally keyed
+        # factors. SGL LoRA decouples the two domains: its route map translates
+        # global provider IDs to EP-local factor slots, so its resident factors
+        # stay sharded even when the provider consumes global IDs.
+        #
+        # An uneven expert split (`num_experts % moe_ep_size != 0`, shouldn't
+        # happen in practice) remains globally keyed so we don't silently
+        # truncate experts.
         self.moe_ep_size, self.moe_ep_rank = _get_moe_ep_context()
         num_experts_global = self._get_num_experts(base_model)
         self.moe_use_local_expert_ids = (
             self.moe_ep_size > 1
-            and not _moe_runner_keeps_global_expert_ids()
+            and (
+                lora_execution_engine == "sgl_lora"
+                or not _moe_runner_keeps_global_expert_ids()
+            )
             and num_experts_global % self.moe_ep_size == 0
         )
 
@@ -296,9 +301,12 @@ class LoRAMemoryPool:
         return any(isinstance(m, FusedMoE) for m in base_model.modules())
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
-        """Experts owned by this rank. Equals the global count when EP is
-        off, the runner keeps global IDs, or the split isn't even (all
-        three cases fold into `moe_use_local_expert_ids == False`)."""
+        """Experts represented in each resident factor tensor.
+
+        SGL LoRA uses an EP-local factor domain even when its base provider
+        routes with global IDs; legacy global-ID providers retain their
+        historical global factor domain.
+        """
         total = self._get_num_experts(base_model)
         if not self.moe_use_local_expert_ids:
             return total
