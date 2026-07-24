@@ -687,7 +687,8 @@ def pre_permute_standard_to_deep_gemm(
         )
     )
 
-    dispose_tensor(hidden_states_ref)
+    if runner_config.inplace:
+        dispose_tensor(hidden_states_ref)
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
