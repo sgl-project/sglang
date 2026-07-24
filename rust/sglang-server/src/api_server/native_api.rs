@@ -360,7 +360,7 @@ fn generation_event_stream(
 mod tests {
     use super::*;
     use crate::message::ChunkEvent;
-    use crate::runtime::channels::Senders;
+    use crate::tokenizer_manager::Senders;
     use futures::StreamExt;
     fn senders() -> Senders {
         Senders {

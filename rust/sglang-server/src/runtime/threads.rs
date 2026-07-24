@@ -1,5 +1,5 @@
-//! Thread-group machinery: the [`Runnable`] stage trait, CPU-core partitioning,
-//! and the pinned-thread spawners used by `runtime::start`.
+//! Thread-group machinery: CPU-core partitioning and the pinned-thread
+//! spawners (for [`Runnable`] stages) used by `runtime::start`.
 //!
 //! Adding a new thread group (encoder, weight loader, KV-cache offloader, …) is
 //! three small steps and no spawn boilerplate:
@@ -11,15 +11,7 @@ use std::thread::JoinHandle;
 
 use core_affinity::CoreId;
 
-use super::RuntimeConfig;
-
-/// A pipeline stage that owns its channel handles + config and runs a blocking
-/// loop until its inbox closes. Lets the runtime spawn stages uniformly via
-/// [`spawn_stage`] / [`spawn_pool`] instead of free `run_*` functions with
-/// positional handles. Implemented by every CPU-bound worker and TM router.
-pub trait Runnable: Send + 'static {
-    fn run(self);
-}
+use super::{Runnable, RuntimeConfig};
 
 /// Cores reserved for the two TokenizerManager router threads (`tm-ingress`,
 /// `tm-egress`) — light, latency-sensitive channel routers, so one core each.

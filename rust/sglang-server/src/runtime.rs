@@ -15,22 +15,22 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-pub mod channels;
 mod config;
-pub mod ring;
-pub mod threads;
+mod runnable;
+mod threads;
 
 pub use config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
 
-use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
-use crate::runtime::ring::{
+use crate::message::DetokMsg;
+use crate::ring::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
 };
 use crate::runtime::threads::{plan_cores, spawn_pool};
+use crate::tokenizer_manager::{Senders, TmEvent};
 use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
 
 // Re-export so stages keep importing `crate::runtime::Runnable`.
-pub use threads::Runnable;
+pub use runnable::Runnable;
 
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
 /// and `egress`. `request_shutdown` (also run on `Drop`) stops every stage.
