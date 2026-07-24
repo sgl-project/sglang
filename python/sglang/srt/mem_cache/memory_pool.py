@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    ceil_align,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
@@ -2032,14 +2033,31 @@ class MHATokenToKVPool(KVCache):
                     ]
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
-                    self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
-                    self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
-                    ]
+
+                    def _zeros(shape):
+                        return torch.zeros(
+                            shape, dtype=self.store_dtype, device=self.device
+                        )
+
+                    if k_shape == v_shape:
+                        # Store K and V as block-aligned halves of one allocation
+                        # so paged kernels with a single pool base can reach V
+                        # via block offsets. Each half keeps its standalone
+                        # shape/strides. NHD rows are token slots and get
+                        # padded to whole pages; HND rows already are pages.
+                        rows = k_shape[0]
+                        padded = (
+                            rows if self.use_hnd else ceil_align(rows, self.page_size)
+                        )
+                        fused = [
+                            _zeros((2, padded, *k_shape[1:]))
+                            for _ in range(self.layer_num)
+                        ]
+                        self.k_buffer = [buf[0, :rows] for buf in fused]
+                        self.v_buffer = [buf[1, :rows] for buf in fused]
+                    else:
+                        self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
+                        self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 

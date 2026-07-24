@@ -2,7 +2,14 @@ from __future__ import annotations
 
 """
 Support attention backend for TRTLLM MHA kernels from flashinfer.
-The kernel supports sm100 only, with sliding window and attention sink features.
+
+Prefill dispatch:
+  - SM90 / SM120: trtllm_fmha_v2_prefill (Q_PAGED_KV_NHD layout)
+  - SM100:        trtllm_batch_context_with_kv_cache (HND layout)
+
+Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
+
+Sliding window and attention sink features are supported.
 """
 
 import logging
@@ -38,7 +45,7 @@ from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, print_warning_once
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
@@ -77,6 +84,8 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
+    # Per-forward memoization of pre-expanded [B, 2, M] fmha_v2 block tables
+    fmha_v2_block_tables: Optional[dict] = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -192,6 +201,43 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # fmha_v2 prefill kernel supports SM90 and SM120
+        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
+
+    def _fmha_v2_paged_inputs(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+    ):
+        """Build (qkv, block_tables) for trtllm_fmha_v2_prefill.
+
+        The kernel addresses K and V blocks from k_cache's base pointer via
+        int32 block offsets. When V sits at a block-aligned offset from K
+        (the fused pool halves), pass the views with pre-expanded [B, 2, M]
+        offsets, avoiding an expensive copy of KV caches.
+        """
+        block_bytes = k_cache.stride(0) * k_cache.element_size()
+        delta, rem = divmod(v_cache.data_ptr() - k_cache.data_ptr(), block_bytes)
+        if rem != 0 or not 0 < delta < torch.iinfo(torch.int32).max // 2:
+            print_warning_once(
+                "fmha_v2 prefill: KV pool is not fused block-aligned, so the forward "
+                "copies the full per-layer KV pool on every prefill call (slow)."
+            )
+            return (q, torch.stack([k_cache, v_cache], dim=1)), page_table
+
+        tables = self.forward_metadata.fmha_v2_block_tables
+        if tables is None:
+            tables = self.forward_metadata.fmha_v2_block_tables = {}
+        key = (page_table.data_ptr(), tuple(page_table.shape), delta)
+        expanded = tables.get(key)
+        if expanded is None:
+            expanded = tables[key] = torch.stack(
+                [page_table, page_table + delta], dim=1
+            )
+        return (q, (k_cache, v_cache)), expanded
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1085,33 +1131,41 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             and not use_fused_qkv
         ):
             q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
+        if self.use_fmha_v2:
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # NHD layout (native pool format): [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        is_decode_mode = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+
+        if not self.use_fmha_v2 or is_decode_mode:
+            # Decode and SM100 batch_context kernels require HND layout.
+            k_cache, v_cache = self._reshape_paged_kv_cache(
+                k_cache_raw, v_cache_raw, layer, layer.head_dim
+            )
+        else:
+            k_cache = k_cache_raw.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            v_cache = v_cache_raw.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            )
 
         kv_cache = (k_cache, v_cache)
-
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        if is_decode_mode:
             if self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
@@ -1146,6 +1200,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out_dtype=self.q_data_type,
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                 )
+        elif self.use_fmha_v2 and not cp_v2_active:
+            # CP-v2 must go through cp_strategy.run_attention (per-shard
+            # masking); the plain-causal fmha_v2 call below would be wrong.
+            qkv, fmha_v2_block_tables = self._fmha_v2_paged_inputs(
+                q=q, k_cache=k_cache, v_cache=v_cache, page_table=page_table
+            )
+            o = flashinfer.prefill.trtllm_fmha_v2_prefill(
+                qkv,
+                input_layout="Q_PAGED_KV_NHD",
+                workspace_buffer=self.workspace_buffer,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_q_len=self.forward_metadata.max_seq_len_q,
+                max_kv_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                block_tables=fmha_v2_block_tables,
+                out_dtype=self.q_data_type,
+                mask_mode="causal",
+                window_left=layer.sliding_window_size,
+                sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                or 0.0,
+            )
         else:
 
             def _trtllm_context_attn(
