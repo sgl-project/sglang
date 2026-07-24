@@ -32,7 +32,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -185,7 +185,7 @@ class KimiDeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.v_head_dim
+        self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % self.tp_size == 0
@@ -662,6 +662,19 @@ class KimiLinearForCausalLM(nn.Module):
         else:
             return hidden_states
 
+    def _is_non_local_pp_weight(self, name: str) -> bool:
+        if self.pp_group.world_size == 1:
+            return False
+
+        layer_id = get_layer_id(name)
+        if layer_id is not None:
+            return not (self.model.start_layer <= layer_id < self.model.end_layer)
+        if name.startswith("model.embed_tokens."):
+            return not self.pp_group.is_first_rank
+        if name.startswith(("model.norm.", "lm_head.")):
+            return not self.pp_group.is_last_rank
+        return False
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -701,6 +714,8 @@ class KimiLinearForCausalLM(nn.Module):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+            if self._is_non_local_pp_weight(name):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -736,8 +751,6 @@ class KimiLinearForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -749,8 +762,6 @@ class KimiLinearForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -773,9 +784,6 @@ class KimiLinearForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
-
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -784,6 +792,8 @@ class KimiLinearForCausalLM(nn.Module):
             loaded_params.add(name)
 
         for layer_id in self.config.full_attention_layer_ids:
+            if not self.model.start_layer <= layer_id < self.model.end_layer:
+                continue
             self_attn = self.model.layers[layer_id].self_attn
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)

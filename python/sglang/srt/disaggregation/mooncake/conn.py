@@ -41,7 +41,8 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    compute_mamba_state_slice_blocks,
+    build_state_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -126,6 +127,8 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_kv_layer_ids: List[int]
+    dst_state_layer_ids: List[List[int]]
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -147,6 +150,16 @@ class KVArgsRegisterInfo:
             ),
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
+            ),
+            dst_kv_layer_ids=(
+                list(struct.unpack(f"{len(msg[14]) // 4}I", msg[14]))
+                if len(msg) > 14 and msg[14] != b""
+                else []
+            ),
+            dst_state_layer_ids=(
+                unpack_int_lists(msg[15], "I")
+                if len(msg) > 15 and msg[15] != b""
+                else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
@@ -591,6 +604,8 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         state_type: Optional[StateType] = None,
         force_flat: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -609,17 +624,30 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if src_layer_ids and dst_layer_ids:
+                pairs = build_state_entry_pairs(
+                    src_layer_ids,
+                    dst_layer_ids,
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -701,6 +729,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
@@ -710,6 +739,8 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            src_layer_ids=getattr(self.kv_args, "kv_layer_ids", []),
+            dst_layer_ids=dst_layer_ids,
         )
 
     def send_kvcache_slice(
@@ -946,7 +977,8 @@ class MooncakeKVManager(CommonKVManager):
             )
             if sub_rank != 0:
                 skip_kv = True
-                skip_state = True
+                # Hybrid-MLA KV is replicated across these source ranks, but
+                # TP-sharded state needs every rank for the aggregation path.
 
         if (
             self.attn_cp_size > 1
@@ -983,6 +1015,16 @@ class MooncakeKVManager(CommonKVManager):
             src_conv_shard_groups = (
                 src_conv_shard_groups[i] if i < len(src_conv_shard_groups) else []
             )
+            src_slice_outer_counts = getattr(
+                self.kv_args, "state_slice_outer_counts", []
+            )
+            src_slice_outer_counts = (
+                src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
+            )
+            src_state_layer_ids = getattr(self.kv_args, "state_layer_ids", [])
+            src_state_layer_ids = (
+                src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
+            )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
                     target_rank_registration_info.dst_state_data_ptrs[i]
@@ -999,8 +1041,14 @@ class MooncakeKVManager(CommonKVManager):
                     if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
+                dst_state_layer_ids = (
+                    target_rank_registration_info.dst_state_layer_ids[i]
+                    if i < len(target_rank_registration_info.dst_state_layer_ids)
+                    else []
+                )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
+                dst_state_layer_ids = []
             dst_indices = (
                 req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
             )
@@ -1025,6 +1073,9 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
                             src_conv_shard_groups,
+                            src_slice_outer_counts,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
                         )
                         or rc
                     )
@@ -1037,6 +1088,8 @@ class MooncakeKVManager(CommonKVManager):
                             src_item_lens,
                             dst_data_ptrs,
                             dst_indices,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
                         )
                         or rc
                     )
@@ -1138,11 +1191,20 @@ class MooncakeKVManager(CommonKVManager):
         src_state_item_lens: list[int],
         dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        pairs = build_state_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
             length = src_state_item_lens[i]
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
@@ -1164,6 +1226,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         src_state_conv_shard_groups: list = None,
+        src_state_slice_outer_counts: list[int] = None,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1193,57 +1258,62 @@ class MooncakeKVManager(CommonKVManager):
                 src_state_item_lens,
                 dst_state_data_ptrs,
                 dst_mamba_index,
+                src_layer_ids,
+                dst_layer_ids,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        pairs = build_state_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
             src_item_len = src_state_item_lens[i]
-            dst_item_len = dst_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[j]
             src_dim = src_state_dim_per_tensor[i]
-            dst_dim = dst_state_dim_per_tensor[i]
-
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
-            src_bytes_per_dim = src_item_len // src_dim
-            dst_bytes_per_dim = dst_item_len // dst_dim
+            dst_dim = dst_state_dim_per_tensor[j]
 
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
                 if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
                 else None
             )
-            # One block for single-axis states; three (q/k/v) for GDN conv_state
-            # on the scatter path.
+            outer_count = (
+                src_state_slice_outer_counts[i]
+                if src_state_slice_outer_counts
+                and i < len(src_state_slice_outer_counts)
+                else 1
+            )
             for (
-                src_dim_start,
-                dst_dim_start,
-                num_dims_to_send,
-            ) in compute_mamba_state_slice_blocks(
+                src_offset,
+                dst_offset,
+                bytes_to_send,
+            ) in compute_mamba_state_slice_byte_blocks(
+                src_item_len=src_item_len,
+                dst_item_len=dst_item_len,
                 src_dim=src_dim,
                 dst_dim=dst_dim,
+                outer_count=outer_count,
                 src_attn_tp_size=self.attn_tp_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
             ):
-                src_dim_offset = src_dim_start * src_bytes_per_dim
-                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
                 src_addr = (
                     src_state_data_ptrs[i]
                     + src_item_len * int(prefill_mamba_index[0])
-                    + src_dim_offset
+                    + src_offset
                 )
                 dst_addr = (
-                    dst_state_ptr
-                    + dst_item_len * int(dst_mamba_index[0])
-                    + dst_dim_offset
+                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
                 )
-
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1376,6 +1446,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
+                                target_rank_registration_info.dst_kv_layer_ids,
                             )
                         elif (
                             self.enable_staging
@@ -1904,6 +1975,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_layer_ids = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_layer_ids", []) or [], "I"
+            )
+            packed_kv_layer_ids = b"".join(
+                struct.pack("I", layer_id)
+                for layer_id in getattr(self.kv_mgr.kv_args, "kv_layer_ids", [])
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1939,6 +2017,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_kv_layer_ids,
+                        packed_state_layer_ids,
                     ]
                 )
 

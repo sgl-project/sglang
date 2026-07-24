@@ -224,6 +224,9 @@ class KimiLinearStateShape:
     # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
     # along the dim axis, so the dedup conv-intermediate layout must stay off.
     disable_conv_window_dedup: bool = True
+    # Per-slot conv tensors are [K-1, sharded_channels], unlike the usual
+    # [sharded_channels, K-1] layout.
+    conv_slice_axis: int = 1
 
     num_heads: int
     head_dim: int
@@ -231,6 +234,8 @@ class KimiLinearStateShape:
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Full q/k/v dimensions. Each block is TP-sharded independently.
+    conv_shard_groups: Optional[List[int]] = None
     # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
     # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
     # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
@@ -278,6 +283,7 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            conv_shard_groups=[proj_size, proj_k_size, proj_k_size],
             num_k_heads_per_tp=num_k_heads_per_tp,
         )
 
