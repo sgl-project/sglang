@@ -554,8 +554,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -572,6 +570,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1038,6 +1037,15 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        # Early-send issues the KV read before this step's forward is enqueued,
+        # but under overlap scheduling the PRIOR step's prefill forward may still
+        # be writing these prefix pages on forward_stream. Record a completion
+        # event now so the transfer worker can wait on those writes before the
+        # RDMA read, instead of racing them.
+        if self.enable_overlap:
+            ev = torch.cuda.Event()
+            ev.record(self.forward_stream)
+            req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(

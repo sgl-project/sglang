@@ -2041,6 +2041,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
     load_format: Optional[str] = None
+    expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(

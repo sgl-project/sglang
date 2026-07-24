@@ -241,7 +241,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -361,6 +361,7 @@ class Scheduler(
             and self.enable_hierarchical_cache
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_dp_attention = server_args.enable_dp_attention
         self.enable_unified_memory = server_args.enable_unified_memory
@@ -785,6 +786,11 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
+            # Write the draft load_format onto server_args (not just the bag):
+            # the draft worker is built from a copy of self.server_args and
+            # build_load_config reads server_args.load_format, so a bag-only
+            # override would be ignored and the draft would load in the target's
+            # format.
             self.server_args.override(
                 "scheduler.draft_load_format",
                 load_format=self.server_args.speculative_draft_load_format,
@@ -889,8 +895,8 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_server_args().pp_max_micro_batch_size:
-            get_server_args().override(
+        if not get_parallel().pp_max_micro_batch_size:
+            get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
                     self.max_running_requests // self.ps.pp_size, 1
@@ -1459,6 +1465,9 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        self.tree_cache.release_host_resources()
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.release_host_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1475,6 +1484,18 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        elif is_cuda() or _is_hip:
+            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
+            # stream aliases forward_stream, which would eliminate scheduler
+            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            _redraws = 0
+            while (
+                self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream
+                and _redraws < 64
+            ):
+                self.schedule_stream = self.device_module.Stream(priority=0)
+                _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
@@ -1482,18 +1503,19 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Wait for the prev forward to finish reading the shared buffers this
-        # iter's schedule will overwrite. Fast path: wait on the read-done event
-        # the forward published after its snapshot (non-spec: decode graph;
-        # spec: draft_extend), then clear it. Else fall back to whole-forward
-        # wait_stream.
+        # Called right after each launch: order later schedule_stream work
+        # (result processing, next iteration's writes) behind the forward's
+        # shared-buffer reads. Fast path: wait on the read-done event the
+        # forward published after its snapshot (non-spec: decode graph; spec:
+        # draft_extend), then clear it. Else whole-forward wait_stream
+        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
-        if ev is not None:
+        runner.war_fastpath_read_done_event = None
+        if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
-            runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
@@ -1553,8 +1575,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1582,6 +1602,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Fence result processing behind this forward's shared reads.
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1627,18 +1649,33 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # Spec algorithms that don't advance the grammar FSM inside verify() (see
+        # supports_grammar_overlap) still need overlap forced off for grammar decode
+        # batches, so the FSM is advanced before the next batch's bitmask.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
+            and not batch.spec_algorithm.supports_grammar_overlap()
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
 
+        # Algorithms that support grammar overlap advance the FSM inside verify()
+        # via the grammar barrier (overlapping the target forward), which resolves
+        # whatever result is still pending in the queue — including the
+        # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _advance_pending_grammar(self):
+        """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
+        -processed decode result still in the queue, so a following verify()'s
+        bitmask sees the previous batch's committed tokens. Invoked mid-worker
+        (before generate_token_bitmask) so the CPU advance overlaps the target
+        verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        """
+        for prev_batch, prev_result in self.result_queue:
+            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -1865,6 +1902,20 @@ class Scheduler(
 
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
+        max_new_tokens = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if self.max_new_tokens_limit is not None and self.max_new_tokens_limit > 0:
+            if max_new_tokens > self.max_new_tokens_limit:
+                logger.warning(
+                    f"Capping max_new_tokens of request {req.rid} to "
+                    f"SGLANG_MAX_NEW_TOKENS_LIMIT={self.max_new_tokens_limit} "
+                    f"(requested: {req.sampling_params.max_new_tokens})."
+                )
+            max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
@@ -1874,15 +1925,15 @@ class Scheduler(
         req.sampling_params.max_new_tokens = max(
             0,
             min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
+                max_new_tokens,
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
+        # Clipping above can push max_new_tokens below min_new_tokens, which
+        # would suppress EOS for the whole generation. Restore the invariant.
+        if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
+            req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -2672,7 +2723,8 @@ class Scheduler(
                 if self.dllm_config.first_done_first_out_mode:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
-                    self.req_to_token_pool.free(req)
+                        self.req_to_token_pool.free(req)
+                    # Otherwise, keep req slot/KV for reuse.
                 else:
                     self.stash_chunked_request(req)
 
@@ -2788,7 +2840,7 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
+        res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3303,15 +3355,19 @@ class Scheduler(
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = (
-                            {
-                                "on_publish": partial(
-                                    self.future_map.publish, future_indices
+                        fwd_kwargs = {}
+                        if not batch.spec_algorithm.is_none():
+                            fwd_kwargs["on_publish"] = partial(
+                                self.future_map.publish, future_indices
+                            )
+                            # Grammar-overlap-capable workers advance the grammar FSM
+                            # inside verify() before building the bitmask; hand them the
+                            # barrier that resolves the previous batch's committed
+                            # tokens (overlapping the target forward).
+                            if batch.spec_algorithm.supports_grammar_overlap():
+                                fwd_kwargs["grammar_barrier"] = (
+                                    self._advance_pending_grammar
                                 )
-                            }
-                            if not batch.spec_algorithm.is_none()
-                            else {}
-                        )
 
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
@@ -3840,7 +3896,9 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
+        # Resolved config (pristine server_args + post-publish overrides) so a
+        # readback reflects values changed via /set_internal_state, not startup.
+        ret = get_context().resolved_server_args_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3960,8 +4018,8 @@ class Scheduler(
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
-                get_server_args().override(source="update_server_args", **remaining)
-            logger.info(f"Global server args updated! {get_server_args()=}")
+                get_context().override(source="update_server_args", **remaining)
+            logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
 
@@ -3990,7 +4048,7 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
+        barrier(group=self.tp_group.cpu_group)
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
@@ -4039,6 +4097,22 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if self.dllm_config is not None:
+            for req in self.dllm_manager.pop_aborted_reqs(
+                recv_req.abort_all, recv_req.rid
+            ):
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    AbortReq(rid=req.rid), req
+                )
+                if (
+                    req.req_pool_idx is not None
+                    or getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`

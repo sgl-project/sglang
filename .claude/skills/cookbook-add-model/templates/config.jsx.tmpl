@@ -97,7 +97,8 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
     // One entry per accuracy field. A value is a string, OR a {[variant]: string}
     // object when the command differs per variant. Keys must match ACCURACY_LABELS
     // in _deployment.jsx + the per-cell/defaultAccuracy keys.
