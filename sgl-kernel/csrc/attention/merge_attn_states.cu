@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 
 #include "pytorch_extension_utils.h"
@@ -43,28 +44,30 @@ __global__ void merge_attn_states_kernel(
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
 
-  const uint global_idx = blockIdx.x * NUM_THREADS + threadIdx.x;
-  const uint token_head_threads = num_tokens * num_heads * threads_per_head;
+  const int64_t global_idx = static_cast<int64_t>(blockIdx.x) * NUM_THREADS + threadIdx.x;
+  const int64_t token_head_threads = static_cast<int64_t>(num_tokens) * num_heads * threads_per_head;
 
   if (global_idx >= token_head_threads) return;
 
   // global_idx -> token_idx + head_idx + pack_idx
-  const uint token_head_idx = global_idx / threads_per_head;
-  const uint pack_idx = global_idx % threads_per_head;
+  const int64_t token_head_idx = global_idx / threads_per_head;
+  const uint pack_idx = static_cast<uint>(global_idx % threads_per_head);
 
-  const uint token_idx = token_head_idx / num_heads;
-  const uint head_idx = token_head_idx % num_heads;
+  const int64_t token_idx = token_head_idx / num_heads;
+  const uint head_idx = static_cast<uint>(token_head_idx % num_heads);
 
   const uint pack_offset = pack_idx * pack_size;  // (0~15)*8, etc.
-  const uint head_offset = token_idx * num_heads * head_size + head_idx * head_size;
+  const int64_t head_offset =
+      (token_idx * static_cast<int64_t>(num_heads) + head_idx) * static_cast<int64_t>(head_size);
+  const int64_t lse_offset = token_idx * static_cast<int64_t>(num_heads) + head_idx;
   const scalar_t* prefix_head_ptr = prefix_output + head_offset;
   const scalar_t* suffix_head_ptr = suffix_output + head_offset;
   scalar_t* output_head_ptr = output + head_offset;
 
   // float p_lse = prefix_lse[head_idx * num_tokens + token_idx];
   // float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
-  float p_lse = prefix_lse[token_idx * num_heads + head_idx];
-  float s_lse = suffix_lse[token_idx * num_heads + head_idx];
+  float p_lse = prefix_lse[lse_offset];
+  float s_lse = suffix_lse[lse_offset];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
@@ -101,7 +104,7 @@ __global__ void merge_attn_states_kernel(
   // We only need to write to output_lse once per head.
   if (output_lse != nullptr && pack_idx == 0) {
     float out_lse = logf(out_se) + max_lse;
-    output_lse[token_idx * num_heads + head_idx] = out_lse;
+    output_lse[lse_offset] = out_lse;
   }
 }
 
@@ -165,12 +168,15 @@ void merge_attn_states_launcher(
   // Process one pack elements per thread. for float, the
   // pack_size is 4 for half/bf16, the pack_size is 8.
   const uint threads_per_head = head_size / pack_size;
-  const uint total_threads = num_tokens * num_heads * threads_per_head;
+  const int64_t total_threads = static_cast<int64_t>(num_tokens) * num_heads * threads_per_head;
 
   dim3 block(NUM_THREADS);
-  dim3 grid((total_threads + NUM_THREADS - 1) / NUM_THREADS);
-
   const c10::cuda::OptionalCUDAGuard device_guard(prefix_output.device());
+  const int64_t grid_x = (total_threads + NUM_THREADS - 1) / NUM_THREADS;
+  const int64_t max_grid_x = at::cuda::getCurrentDeviceProperties()->maxGridSize[0];
+  TORCH_CHECK(grid_x <= max_grid_x, "merge_attn_states grid.x exceeds device limit: ", grid_x, " > ", max_grid_x);
+  dim3 grid(static_cast<uint>(grid_x));
+
   auto stream = at::cuda::getCurrentCUDAStream();
 
   LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS);
