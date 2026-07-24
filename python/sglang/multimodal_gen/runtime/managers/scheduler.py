@@ -70,9 +70,6 @@ logger = init_logger(__name__)
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
-_BATCH_INTERARRIVAL_EWMA_ALPHA = 0.25
-_BATCH_INTERARRIVAL_HEADROOM = 1.25
-_BATCH_ADAPTIVE_BOOTSTRAP_MULTIPLIER = 4.0
 
 
 class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisaggMixin):
@@ -152,16 +149,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
-        adaptive_delay_max_ms = getattr(
-            server_args, "batching_adaptive_delay_max_ms", None
-        )
-        self._batching_adaptive_delay_max_s = (
-            adaptive_delay_max_ms / 1000.0
-            if adaptive_delay_max_ms is not None
-            else None
-        )
-        self._batching_interarrival_ewma_s: float | None = None
-        self._batching_last_arrival_s: float | None = None
         self._next_batch_wait_s = self._batching_delay_s
         self._last_batch_wait_s = self._batching_delay_s
         self._batch_metrics_enabled = server_args.enable_batching_metrics
@@ -189,52 +176,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 "Dynamic batch metrics enabled; logging summary every %d dispatches.",
                 _BATCH_METRICS_LOG_INTERVAL,
             )
-        if self._batching_adaptive_delay_max_s is not None:
-            logger.info(
-                "Adaptive batch delay enabled: min=%.2fms, max=%.2fms.",
-                self._batching_delay_s * 1000.0,
-                self._batching_adaptive_delay_max_s * 1000.0,
-            )
-
-    def _record_batch_arrival(self, now: float) -> None:
-        if self._batching_adaptive_delay_max_s is None:
-            return
-
-        if self._batching_last_arrival_s is not None:
-            interval_s = now - self._batching_last_arrival_s
-            if interval_s > self._batching_adaptive_delay_max_s:
-                self._batching_interarrival_ewma_s = None
-            elif self._batching_interarrival_ewma_s is None:
-                self._batching_interarrival_ewma_s = interval_s
-            else:
-                alpha = _BATCH_INTERARRIVAL_EWMA_ALPHA
-                self._batching_interarrival_ewma_s = (
-                    alpha * interval_s
-                    + (1.0 - alpha) * self._batching_interarrival_ewma_s
-                )
-        self._batching_last_arrival_s = now
-
-    def _batch_wait_limit_s(self, batch_size: int, max_batch_size: int) -> float:
-        max_delay_s = self._batching_adaptive_delay_max_s
-        if max_delay_s is None:
-            return self._batching_delay_s
-
-        if self._batching_interarrival_ewma_s is None:
-            return min(
-                self._batching_delay_s * _BATCH_ADAPTIVE_BOOTSTRAP_MULTIPLIER,
-                max_delay_s,
-            )
-
-        missing_slots = max(0, max_batch_size - batch_size)
-        predicted_additional_wait_s = (
-            self._batching_interarrival_ewma_s
-            * missing_slots
-            * _BATCH_INTERARRIVAL_HEADROOM
-        )
-        return min(
-            max(predicted_additional_wait_s, self._batching_delay_s),
-            max_delay_s,
-        )
 
     def get_disagg_metrics(self) -> dict | None:
         """Return disagg role metrics snapshot, or None if not in disagg mode."""
@@ -976,9 +917,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         effective_max_batch_size = self._batch_admission.max_admissible_batch_size(
             compatible_reqs[0]
         )
-        batch_wait_s = self._batch_wait_limit_s(
-            batch_len, effective_max_batch_size
-        )
+        batch_wait_s = self._batching_delay_s
         should_wait_for_more = (
             batch_len < effective_max_batch_size
             and not self._batch_admission.batch_is_full(compatible_reqs)
@@ -1002,11 +941,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             elif reject_reasons:
                 stop_reason = reject_reasons[0]
             elif oldest_wait_s >= batch_wait_s:
-                stop_reason = (
-                    "adaptive_delay"
-                    if self._batching_adaptive_delay_max_s is not None
-                    else "delay"
-                )
+                stop_reason = "delay"
             else:
                 stop_reason = "ready"
         self._record_batch_dispatch_metrics(
@@ -1121,8 +1056,6 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
                 now = time.monotonic()
-                if any(isinstance(req, Req) for _, req in new_reqs):
-                    self._record_batch_arrival(now)
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
