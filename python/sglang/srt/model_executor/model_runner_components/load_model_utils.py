@@ -44,6 +44,7 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
     remote_instance_weight_info: Optional[Any]
+    startup_weight_load: Optional[Any] = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(
@@ -219,6 +220,7 @@ def load_model_with_memory_saver(
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
     remote_instance_weight_info = None
+    startup_weight_load = None
     with memory_saver_adapter.region(
         GPU_MEMORY_TYPE_WEIGHTS,
         enable_cpu_backup=enable_cpu_backup,
@@ -227,10 +229,29 @@ def load_model_with_memory_saver(
             load_config=load_config,
             model_config=model_config,
         )
-        model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(device, gpu_id),
-        )
+        device_config = DeviceConfig(device, gpu_id)
+        if server_args.startup_weight_load_mode == "overlap":
+            from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+                StartupWeightLoadManager,
+                StartupWeightLoadOptions,
+            )
+
+            startup_weight_load = StartupWeightLoadManager.create(
+                loader=loader,
+                model_config=model_config,
+                load_config=load_config,
+                device_config=device_config,
+                options=StartupWeightLoadOptions.from_server_args(
+                    server_args=server_args,
+                    is_draft_worker=is_draft_worker,
+                ),
+            )
+            model = startup_weight_load.prepare()
+        else:
+            model = loader.load_model(
+                model_config=model_config,
+                device_config=device_config,
+            )
         if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
@@ -245,6 +266,7 @@ def load_model_with_memory_saver(
         loader=loader,
         model=model,
         remote_instance_weight_info=remote_instance_weight_info,
+        startup_weight_load=startup_weight_load,
     )
 
 

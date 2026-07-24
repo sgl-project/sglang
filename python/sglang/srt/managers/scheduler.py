@@ -850,6 +850,8 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
+        if self.server_args.startup_weight_load_mode == "overlap":
+            self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
@@ -861,6 +863,9 @@ class Scheduler(
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
+
+        if self.server_args.startup_weight_load_mode == "overlap":
+            self.tp_worker.finalize_startup_weight_load()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

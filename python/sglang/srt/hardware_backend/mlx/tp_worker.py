@@ -46,10 +46,13 @@ class MlxTpModelWorker(TpModelWorker):
 
     def _init_model_runner(self):
         """Create MLX runner first (auto-sizes pool), then stub with matching size."""
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
             MlxModelRunnerStub,
         )
+
+        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
         init_kwargs = dict(

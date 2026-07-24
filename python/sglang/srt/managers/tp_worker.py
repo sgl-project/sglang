@@ -399,6 +399,18 @@ class TpModelWorker(BaseTpWorker):
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
 
+    def start_startup_weight_load(self) -> None:
+        """Start deferred checkpoint prefetching for all model runners."""
+        self.model_runner.start_startup_weight_load()
+        for mr in self.model_runner_list[1:]:
+            mr.start_startup_weight_load()
+
+    def finalize_startup_weight_load(self) -> None:
+        """Commit deferred startup weights for all model runners."""
+        self.model_runner.finalize_startup_weight_load()
+        for mr in self.model_runner_list[1:]:
+            mr.finalize_startup_weight_load()
+
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
 
