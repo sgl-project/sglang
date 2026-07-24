@@ -205,6 +205,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "flashinfer-cascade",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
@@ -1605,6 +1606,19 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    cascade_min_prefix_tokens: A[
+        int,
+        "Minimum shared-prefix length (in tokens) required for the flashinfer-cascade "
+        "backend to fire its MultiLevelCascadeAttentionWrapper decode path. Below this, "
+        "the per-request flashinfer path runs instead. Only used when "
+        "--attention-backend flashinfer-cascade is set.",
+    ] = 128
+    cascade_min_batch_size: A[
+        int,
+        "Minimum running batch size required for the flashinfer-cascade backend to "
+        "fire. Below this, the per-request flashinfer path runs instead. Only used "
+        "when --attention-backend flashinfer-cascade is set.",
+    ] = 4
     sampling_backend: A[
         Optional[str],
         Arg(
