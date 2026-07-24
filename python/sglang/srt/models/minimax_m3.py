@@ -104,6 +104,52 @@ _FP8_KV_DTYPES = (
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
 
+def _sparse_attention_layer_ids_for_topk(config: PretrainedConfig) -> set[int]:
+    sparse_cfg = getattr(config, "sparse_attention_config", None)
+    if not sparse_cfg:
+        return set()
+    freq = sparse_cfg.get("sparse_attention_freq")
+    if freq is None:
+        return set()
+    return {i for i, enabled in enumerate(freq) if enabled != 0}
+
+
+def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]:
+    return {
+        layer_id: ordinal
+        for ordinal, layer_id in enumerate(
+            sorted(_sparse_attention_layer_ids_for_topk(config))
+        )
+    }
+
+
+def _should_share_minimax_m3_sparse_index(
+    config: PretrainedConfig, layer_id: int
+) -> tuple[bool, int]:
+    sparse_ordinal = _sparse_attention_layer_ordinals(config).get(layer_id, -1)
+    if sparse_ordinal < 0:
+        return False, sparse_ordinal
+    if not _is_hip:
+        return False, sparse_ordinal
+    refresh_interval = int(
+        getattr(config, "sparse_index_refresh_interval", 1) or 1
+    )
+    share_pattern = getattr(config, "sparse_index_share_pattern", None)
+    if share_pattern is not None:
+        if 0 <= sparse_ordinal < len(share_pattern):
+            return share_pattern[sparse_ordinal] == "S", sparse_ordinal
+        return False, sparse_ordinal
+
+    if refresh_interval <= 0:
+        raise ValueError("sparse_index_refresh_interval must be a positive integer")
+    if refresh_interval == 1:
+        return False, sparse_ordinal
+
+    # MiniMax-M3 schedules sharing by sparse-layer ordinal, not absolute layer id.
+    offset = int(getattr(config, "sparse_index_refresh_offset", 0))
+    return max(sparse_ordinal - offset, 0) % refresh_interval != 0, sparse_ordinal
+
+
 _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
@@ -466,6 +512,8 @@ class MiniMaxM3Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
+        self.share_sparse_index = False
+        self.sparse_layer_ordinal = -1
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -519,6 +567,14 @@ class MiniMaxM3Attention(nn.Module):
             self.idx_replica_size = attn_tp_size // self.idx_head_tp_size
             self.idx_head_rank = attn_tp_rank // self.idx_replica_size
             self.num_idx_heads = self.total_idx_heads // self.idx_head_tp_size
+            self.share_sparse_index, self.sparse_layer_ordinal = (
+                _should_share_minimax_m3_sparse_index(config, layer_id)
+            )
+            if self.share_sparse_index and not self.disable_index_value:
+                raise ValueError(
+                    "MiniMax-M3 sparse index sharing requires the index-value "
+                    "path to be disabled"
+                )
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -643,6 +699,10 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        # The shared sparse backend receives RadixAttention rather than this model
+        # module, so carry the per-layer sharing schedule on the layer handle.
+        self.attn.share_sparse_index = self.share_sparse_index
+        self.attn.sparse_layer_ordinal = self.sparse_layer_ordinal
 
         self._use_fused_qknorm_rope = (
             _is_cuda
@@ -1002,7 +1062,7 @@ class MiniMaxM3Attention(nn.Module):
             fused_out = self.fused_qkv_index_proj(hidden_states)
             qkv = fused_out[:, : self._fused_main_size]
 
-            if self._combined_qknorm_ok:
+            if self._combined_qknorm_ok and not self.share_sparse_index:
                 from sglang.kernels.ops.attention.minimax_qknorm_rope import (
                     minimax_qknorm_rope_grouped,
                 )
@@ -1050,7 +1110,13 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_qkv, _ = self.index_qkv_proj(hidden_states)
 
-            if main_qk_already_normed:
+            if self.share_sparse_index:
+                if not main_qk_already_normed:
+                    q, k = self._qk_norm_rope(positions, q, k)
+                # Keep the packed projection columns for ABI and weight-layout
+                # compatibility, but skip index norm/RoPE/cache insertion and top-k.
+                idx_q = idx_k = idx_v = None
+            elif main_qk_already_normed:
                 use_fused_index_norm_rope = (
                     self._use_fused_qknorm_rope
                     and self.idx_head_dim == 128
@@ -1097,10 +1163,14 @@ class MiniMaxM3Attention(nn.Module):
             q = q.view(q.shape[0], self.num_heads, self.head_dim)
             k = k.view(k.shape[0], self.num_kv_heads, self.head_dim)
             v = v.view(v.shape[0], self.num_kv_heads, self.head_dim)
-            idx_q = idx_q.reshape(idx_q.shape[0], self.num_idx_heads, self.idx_head_dim)
-            idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
-            if idx_v is not None:
-                idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
+            if not self.share_sparse_index:
+                assert idx_q is not None and idx_k is not None
+                idx_q = idx_q.reshape(
+                    idx_q.shape[0], self.num_idx_heads, self.idx_head_dim
+                )
+                idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
+                if idx_v is not None:
+                    idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
             idx_o, attn_output = self.attn(
                 q, k, v, forward_batch, idx_q=idx_q, idx_k=idx_k, idx_v=idx_v
             )

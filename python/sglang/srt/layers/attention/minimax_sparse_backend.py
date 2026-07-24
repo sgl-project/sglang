@@ -18,11 +18,13 @@ from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+_is_hip = is_hip()
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
@@ -42,6 +44,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        refresh_interval = int(
+            getattr(
+                text_config,
+                "sparse_index_refresh_interval",
+                getattr(hf_config, "sparse_index_refresh_interval", 1),
+            )
+            or 1
+        )
+        share_pattern = getattr(
+            text_config,
+            "sparse_index_share_pattern",
+            getattr(hf_config, "sparse_index_share_pattern", None),
+        )
+        self.sparse_index_sharing_enabled = _is_hip and (
+            refresh_interval > 1 or share_pattern is not None
+        )
 
         # Plain Python int so it is safe inside CUDA graphs (no .item() at graph time).
         self._max_seqlen_q: int = 1
@@ -158,6 +177,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"sparse_index_sharing={self.sparse_index_sharing_enabled}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
 
@@ -237,6 +257,63 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    @staticmethod
+    def _shares_sparse_index(layer) -> bool:
+        return bool(getattr(layer, "share_sparse_index", False))
+
+    def _sparse_index_share_key(
+        self, mode: str, q: torch.Tensor, forward_batch: ForwardBatch
+    ) -> tuple:
+        return (
+            mode,
+            tuple(q.shape),
+            q.dtype,
+            q.device,
+            tuple(forward_batch.req_pool_indices.shape),
+            tuple(forward_batch.seq_lens.shape),
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            self._max_seqlen_q,
+            self._max_seqlen_k,
+        )
+
+    def _sparse_index_share_state(self, forward_batch: ForwardBatch):
+        if not self.sparse_index_sharing_enabled:
+            return None
+        state = getattr(forward_batch, "_minimax_sparse_index_share_state", None)
+        if state is None:
+            state = {}
+            setattr(forward_batch, "_minimax_sparse_index_share_state", state)
+        return state
+
+    def _load_shared_sparse_index(
+        self, layer, forward_batch: ForwardBatch, key: tuple
+    ):
+        if not self._shares_sparse_index(layer):
+            return None
+        state = self._sparse_index_share_state(forward_batch)
+        if state is None:
+            return None
+        entry = state.get("selection")
+        if entry is None or entry.get("key") != key:
+            return None
+        return entry["value"]
+
+    def _store_shared_sparse_index(
+        self, layer, forward_batch: ForwardBatch, key: tuple, value
+    ) -> None:
+        state = self._sparse_index_share_state(forward_batch)
+        if state is not None:
+            state["selection"] = {
+                "key": key,
+                "value": value,
+                "layer_id": layer.layer_id,
+                "sparse_layer_ordinal": getattr(
+                    layer, "sparse_layer_ordinal", -1
+                ),
+            }
+
     def forward(
         self,
         q,
@@ -249,13 +326,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         if forward_batch.forward_mode.is_idle():
             idx_q = kwargs.get("idx_q")
-            num_idx_heads = idx_q.shape[1]
             disable_value = layer.layer_id in self.disable_value_layer_ids
-            idx_out: Optional[torch.Tensor] = (
-                None
-                if disable_value
-                else q.new_zeros(q.shape[0], num_idx_heads * self.idx_head_dim)
-            )
+            if self._shares_sparse_index(layer):
+                idx_out = None
+            else:
+                num_idx_heads = idx_q.shape[1]
+                idx_out = (
+                    None
+                    if disable_value
+                    else q.new_zeros(q.shape[0], num_idx_heads * self.idx_head_dim)
+                )
             out = q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
             return idx_out, out
         else:
@@ -272,25 +352,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         *,
-        idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        share_sparse_index = self._shares_sparse_index(layer)
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k,
-                v,
-                idx_k,
-                None if disable_value else idx_v,
-            )
+            if share_sparse_index:
+                self.kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            else:
+                assert idx_k is not None
+                self.kv_pool.set_fused_kv_index_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    idx_k,
+                    None if disable_value else idx_v,
+                )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
-        if disable_value:
+        if share_sparse_index:
+            idx_k_cache = idx_v_cache = None
+        elif disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
@@ -319,9 +408,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         original_num_tokens = q.shape[0]
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
-            idx_q = idx_q[:actual_num_tokens]
+            if idx_q is not None:
+                idx_q = idx_q[:actual_num_tokens]
 
-        idx_o, o = minimax_sparse_prefill(
+        share_key = None
+        shared_topk_idx = None
+        if self.sparse_index_sharing_enabled:
+            share_key = self._sparse_index_share_key("prefill", q, forward_batch)
+            shared_topk_idx = self._load_shared_sparse_index(
+                layer, forward_batch, share_key
+            )
+            if share_sparse_index and shared_topk_idx is None:
+                raise RuntimeError(
+                    "MiniMax-M3 sparse index selection missing on a sharing layer"
+                )
+        idx_o, o, topk_idx = minimax_sparse_prefill(
             q,
             k_cache,
             v_cache,
@@ -346,7 +447,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_value,
             use_msa=self.use_msa,
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            shared_topk_idx=shared_topk_idx,
         )
+        if self.sparse_index_sharing_enabled and not share_sparse_index:
+            assert share_key is not None
+            self._store_shared_sparse_index(
+                layer, forward_batch, share_key, topk_idx
+            )
 
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
@@ -410,23 +517,36 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
         *,
-        idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
         idx_v: Optional[torch.Tensor],
         **kwargs,
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        self.kv_pool.set_fused_kv_index_buffer(
-            layer,
-            forward_batch.out_cache_loc,
-            k,
-            v,
-            idx_k,
-            None if disable_value else idx_v,
+        share_sparse_index = self._shares_sparse_index(layer)
+        kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
+            forward_batch, layer.layer_id
         )
+        if not kv_cached_by_fusion:
+            if share_sparse_index:
+                self.kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            else:
+                assert idx_k is not None
+                self.kv_pool.set_fused_kv_index_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    idx_k,
+                    None if disable_value else idx_v,
+                )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
-        if disable_value:
+        if share_sparse_index:
+            idx_k_cache = idx_v_cache = None
+        elif disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
@@ -458,7 +578,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
-        idx_o, o = minimax_sparse_decode(
+        share_key = None
+        shared_indexer_output = None
+        if self.sparse_index_sharing_enabled:
+            share_key = self._sparse_index_share_key("decode", q, forward_batch)
+            shared_indexer_output = self._load_shared_sparse_index(
+                layer, forward_batch, share_key
+            )
+            if share_sparse_index and shared_indexer_output is None:
+                raise RuntimeError(
+                    "MiniMax-M3 sparse index selection missing on a sharing layer"
+                )
+        idx_o, o, indexer_output = minimax_sparse_decode(
             q,
             None,
             k_cache,
@@ -483,7 +614,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
+            shared_indexer_output=shared_indexer_output,
         )
+        if self.sparse_index_sharing_enabled and not share_sparse_index:
+            assert share_key is not None
+            self._store_shared_sparse_index(
+                layer, forward_batch, share_key, indexer_output
+            )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
