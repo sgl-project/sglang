@@ -479,6 +479,14 @@ class DeepseekSparseAttnBackend(
                 "extend rows, and prefill CP splits rows across ranks."
             )
             assert self.hisparse_coordinator is None, "DCP does not support hisparse."
+            if self.use_fused_topk:
+                # Fused top-k v2 under DCP is measured incorrect on the
+                # current tree (gsm8k 0.000 vs 0.920 with fusion off, single
+                # commit delta); disable until the v2 transform composes with
+                # the owner filter again. Costs decode perf, tracked in the
+                # PR's F-list.
+                print_warning_once("Disabling fused DSA top-k under DCP.")
+                self.use_fused_topk = False
             if model_runner.server_args.enable_dp_attention:
                 # Keep each DCP group inside one attention-DP shard so the
                 # replicated indexer sees identical requests group-wide.
