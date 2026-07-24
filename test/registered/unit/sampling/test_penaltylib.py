@@ -2,8 +2,10 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+
 
 import unittest
 from unittest.mock import MagicMock
@@ -22,6 +24,10 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+    apply_scaling_penalties,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -29,11 +35,12 @@ DEVICE = "cpu"
 
 
 # Helpers: mock Req and ScheduleBatch
-def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
+def _make_req(freq=0.0, presence=0.0, rep=1.0, min_tokens=0, stop_ids=None, eos_id=2):
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.sampling_params.frequency_penalty = freq
     req.sampling_params.presence_penalty = presence
+    req.sampling_params.repetition_penalty = rep
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.tokenizer.additional_stop_token_ids = None
@@ -270,6 +277,177 @@ class TestBatchedPresencePenalizer(CustomTestCase):
         _, pen = self._setup([1.0])
         pen.teardown()
         self.assertFalse(hasattr(pen, "presence_penalties"))
+
+
+# BatchedRepetitionPenalizer
+class TestBatchedRepetitionPenalizer(CustomTestCase):
+
+    def _setup(self, rep_values):
+        reqs = [_make_req(rep=r) for r in rep_values]
+        batch = _make_batch(reqs)
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedRepetitionPenalizer}
+        )
+        pen = orch.penalizers[BatchedRepetitionPenalizer]
+        return orch, pen
+
+    def test_is_required_with_above_unit_penalty(self):
+        _, pen = self._setup([1.2])
+        self.assertTrue(pen.is_required())
+
+    def test_is_required_with_sub_unit_penalty(self):
+        _, pen = self._setup([0.5])
+        self.assertTrue(pen.is_required())
+
+    def test_is_not_required_with_unit_penalty(self):
+        _, pen = self._setup([1.0])
+        self.assertFalse(pen.is_required())
+
+    def test_is_multiplicative_flag(self):
+        self.assertTrue(BatchedRepetitionPenalizer.is_multiplicative)
+
+    def test_prepare_initializes_cumulated_to_ones(self):
+        _, pen = self._setup([2.0])
+        self.assertEqual(pen.cumulated_repetition_penalties.shape, (1, VOCAB_SIZE))
+        self.assertTrue(
+            torch.equal(
+                pen.cumulated_repetition_penalties,
+                torch.ones(1, VOCAB_SIZE),
+            )
+        )
+
+    def test_apply_positive_logit_divides(self):
+        _, pen = self._setup([2.0])
+        pen.cumulate_output_tokens(torch.tensor([5]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        pen.apply(logits)
+        self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
+
+    def test_apply_negative_logit_multiplies(self):
+        _, pen = self._setup([2.0])
+        pen.cumulate_output_tokens(torch.tensor([5]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 5] = -4.0
+        pen.apply(logits)
+        self.assertAlmostEqual(logits[0, 5].item(), -8.0, places=5)
+
+    def test_apply_untouched_token_unchanged(self):
+        _, pen = self._setup([2.0])
+        pen.cumulate_output_tokens(torch.tensor([5]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 7] = 3.0
+        pen.apply(logits)
+        self.assertAlmostEqual(logits[0, 7].item(), 3.0, places=5)
+
+    def test_cumulate_twice_does_not_compound(self):
+        # repetition_penalty uses scatter_ (overwrite), unlike frequency_penalty's
+        # scatter_add_ — so repeated emissions of the same token do not compound.
+        _, pen = self._setup([2.0])
+        pen.cumulate_output_tokens(torch.tensor([5]))
+        pen.cumulate_output_tokens(torch.tensor([5]))
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, 5] = 4.0
+        pen.apply(logits)
+        self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
+
+    def test_get_scaling_penalties_returns_cumulated(self):
+        _, pen = self._setup([2.0])
+        self.assertIs(pen.get_scaling_penalties(), pen.cumulated_repetition_penalties)
+
+    def test_filter_keeps_subset(self):
+        _, pen = self._setup([1.5, 2.0])
+        keep = torch.tensor([1])
+        pen.filter(keep)
+        self.assertEqual(pen.repetition_penalties.shape[0], 1)
+        self.assertEqual(pen.cumulated_repetition_penalties.shape[0], 1)
+        self.assertAlmostEqual(pen.repetition_penalties[0, 0].item(), 2.0, places=5)
+
+    def test_merge_concatenates(self):
+        _, pen1 = self._setup([1.5])
+        _, pen2 = self._setup([2.0])
+        pen1.merge(pen2)
+        self.assertEqual(pen1.repetition_penalties.shape[0], 2)
+        self.assertEqual(pen1.cumulated_repetition_penalties.shape[0], 2)
+
+    def test_teardown_cleans_attributes(self):
+        _, pen = self._setup([2.0])
+        pen.teardown()
+        self.assertFalse(hasattr(pen, "repetition_penalties"))
+        self.assertFalse(hasattr(pen, "cumulated_repetition_penalties"))
+        self.assertFalse(pen.is_prepared())
+
+    def test_cumulate_when_not_prepared_is_noop(self):
+        _, pen = self._setup([1.0])
+        pen.cumulate_output_tokens(torch.tensor([1]))
+
+    def test_apply_when_not_prepared_is_noop(self):
+        _, pen = self._setup([1.0])
+        logits = torch.zeros(1, VOCAB_SIZE)
+        original = logits.clone()
+        pen.apply(logits)
+        self.assertTrue(torch.equal(logits, original))
+
+
+# apply_scaling_penalties (module-level function)
+class TestApplyScalingPenalties(CustomTestCase):
+
+    def test_positive_logit_divides(self):
+        logits = torch.tensor([[4.0, 2.0]])
+        penalties = torch.tensor([[2.0, 1.0]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertAlmostEqual(logits[0, 0].item(), 2.0, places=5)
+        self.assertAlmostEqual(logits[0, 1].item(), 2.0, places=5)
+
+    def test_negative_logit_multiplies(self):
+        logits = torch.tensor([[-4.0, -2.0]])
+        penalties = torch.tensor([[2.0, 1.0]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertAlmostEqual(logits[0, 0].item(), -8.0, places=5)
+        self.assertAlmostEqual(logits[0, 1].item(), -2.0, places=5)
+
+    def test_penalty_one_is_identity(self):
+        logits = torch.tensor([[3.0, -3.0, 0.0]])
+        penalties = torch.ones(1, 3)
+        apply_scaling_penalties(logits, penalties)
+        self.assertTrue(torch.allclose(logits, torch.tensor([[3.0, -3.0, 0.0]])))
+
+    def test_zero_logit_stays_zero(self):
+        logits = torch.tensor([[0.0]])
+        penalties = torch.tensor([[2.0]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_sub_unit_penalty_amplifies_positive(self):
+        logits = torch.tensor([[4.0]])
+        penalties = torch.tensor([[0.5]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertAlmostEqual(logits[0, 0].item(), 8.0, places=5)
+
+    def test_sub_unit_penalty_shrinks_negative(self):
+        logits = torch.tensor([[-4.0]])
+        penalties = torch.tensor([[0.5]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertAlmostEqual(logits[0, 0].item(), -2.0, places=5)
+
+    def test_in_place_mutation(self):
+        logits = torch.tensor([[4.0]])
+        original_data_ptr = logits.data_ptr()
+        apply_scaling_penalties(logits, torch.tensor([[2.0]]))
+        self.assertEqual(logits.data_ptr(), original_data_ptr)
+        self.assertAlmostEqual(logits[0, 0].item(), 2.0, places=5)
+
+    def test_batched_shapes_broadcast(self):
+        logits = torch.tensor([[4.0, -4.0], [2.0, -2.0]])
+        penalties = torch.tensor([[2.0, 2.0], [1.0, 1.0]])
+        apply_scaling_penalties(logits, penalties)
+        self.assertTrue(
+            torch.allclose(logits, torch.tensor([[2.0, -8.0], [2.0, -2.0]]))
+        )
 
 
 # BatchedMinNewTokensPenalizer
