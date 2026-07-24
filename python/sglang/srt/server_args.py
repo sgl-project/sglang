@@ -1038,6 +1038,29 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    dcp_comm_backend: A[
+        str,
+        Arg(
+            help="Communication backend for the decode context-parallel (DCP) "
+            "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
+            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
+            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
+            choices=["ag_rs", "a2a", "fi_a2a"],
+        ),
+        NS("parallel"),
+    ] = "ag_rs"
+    dcp_replicate_q_proj: A[
+        bool,
+        Arg(
+            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            "backend: replicate the Q projection so each DCP rank computes the "
+            "full-head query locally (redundant projection compute), eliminating "
+            "the per-layer head-dim all-gather of Q. Trades a small amount of "
+            "extra GEMM for one fewer collective per layer.",
+        ),
+        NS("parallel"),
+    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -3587,6 +3610,30 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
+        if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
+            raise ValueError(
+                f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
+                "decode context-parallel attention reduction and therefore "
+                "requires --dcp-size / --decode-context-parallel-size > 1, but "
+                f"got dcp_size={self.dcp_size}."
+            )
+        if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
+            raise ValueError(
+                "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
+                "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
+                "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
+                "authoritative fabric probe runs at model-runner init; use 'a2a' "
+                "or 'ag_rs' on clusters without MNNVL."
+            )
+        if self.dcp_replicate_q_proj:
+            if self.dcp_size <= 1:
+                raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
+            if self.dcp_comm_backend not in ("a2a", "fi_a2a"):
+                raise ValueError(
+                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
+                    "communication backend (it removes the head-dim Q all-gather); "
+                    f"got --dcp-comm-backend={self.dcp_comm_backend}."
+                )
         if not self.dcp_size > 1:
             return
         if is_hip():
@@ -4175,6 +4222,19 @@ class ServerArgs:
             (
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
+            ),
+            # TcPiecewise makes the trtllm_mla prefill fall back to the
+            # flashinfer-MLA implementation, which faults (illegal address)
+            # on an FP8 KV cache.
+            (
+                "MLA attention with FP8 KV cache",
+                lambda: self.kv_cache_dtype.startswith("fp8")
+                and (
+                    _resolved_view(self).attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                    or _resolved_view(self).prefill_attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                ),
             ),
         ]
         for _name, predicate in rules:
@@ -6346,6 +6406,22 @@ class ServerArgs:
             )
 
         if a2a_backend == "deepep":
+            if self.moe_runner_backend == "flashinfer_cutedsl":
+                if self.deepep_mode == "auto":
+                    self.deepep_mode = "low_latency"
+                    logger.warning(
+                        "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
+                        "FP4 MoE has no DeepEP normal-dispatch handler, so "
+                        "deepep auto mode would crash during prefill. "
+                        "low_latency covers both prefill and decode."
+                    )
+                elif self.deepep_mode == "normal":
+                    raise ValueError(
+                        "flashinfer_cutedsl FP4 MoE only supports DeepEP "
+                        "low_latency dispatch (masked layout). DeepEP normal "
+                        "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
+                        "--deepep-mode low_latency or auto."
+                    )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
