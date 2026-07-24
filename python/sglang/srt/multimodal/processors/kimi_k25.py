@@ -271,6 +271,57 @@ def _gpu_preprocess_images(
     return pixel_values, grid_thws
 
 
+def _compute_resize_configs(images, media_proc_cfg):
+    """Per-image navit resize configs derived from the HF media_proc_cfg."""
+    return [
+        navit_resize_config(
+            *_get_image_dimensions(image),
+            media_proc_cfg["patch_size"],
+            media_proc_cfg["merge_kernel_size"],
+            media_proc_cfg["in_patch_limit"],
+            media_proc_cfg["patch_limit_on_one_side"],
+            media_proc_cfg.get("fixed_output_tokens"),
+        )
+        for image in images
+    ]
+
+
+def kimi_gpu_preprocess(images, media_proc_cfg, resize_configs=None):
+    """GPU image preprocessing for Kimi, independent of text/tokenizer.
+
+    Shared by KimiGPUProcessorWrapper._gpu_call and the EPD encoder server
+    (which has no tokenizer and therefore cannot use the wrapper).
+
+    Args:
+        images: list of PIL Images, CUDA tensors, or media dicts with an
+            "image" key (as produced by the EPD encoder normalization).
+        media_proc_cfg: dict from the HF media processor.
+        resize_configs: optional precomputed configs, one per image.
+
+    Returns:
+        dict with "pixel_values" and "image_grid_thw" (CUDA tensors).
+    """
+    images = [
+        item["image"] if isinstance(item, dict) and "image" in item else item
+        for item in images
+    ]
+    if resize_configs is None:
+        resize_configs = _compute_resize_configs(images, media_proc_cfg)
+
+    image_mean = torch.tensor(
+        media_proc_cfg["image_mean"], device="cuda", dtype=torch.float32
+    ).view(1, 3, 1, 1)
+    image_std_inv = (
+        1.0
+        / torch.tensor(media_proc_cfg["image_std"], device="cuda", dtype=torch.float32)
+    ).view(1, 3, 1, 1)
+
+    pixel_values, grid_thws = _gpu_preprocess_images(
+        images, resize_configs, image_mean, image_std_inv, media_proc_cfg["patch_size"]
+    )
+    return {"pixel_values": pixel_values, "image_grid_thw": grid_thws}
+
+
 # ---------------------------------------------------------------------------
 # Kimi K2.5 GPU processor wrapper
 # ---------------------------------------------------------------------------
@@ -286,28 +337,9 @@ class KimiGPUProcessorWrapper:
     like a normal HF processor from the outside.
     """
 
-    def __init__(
-        self,
-        hf_processor,
-        image_token,
-        patch_size,
-        merge_kernel_size,
-        in_patch_limit,
-        patch_limit_on_one_side,
-        fixed_output_tokens,
-        image_mean,
-        image_std,
-    ):
+    def __init__(self, hf_processor, image_token):
         self._hf_processor = hf_processor
         self._image_token = image_token
-        self._patch_size = patch_size
-        self._merge_kernel_size = merge_kernel_size
-        self._in_patch_limit = in_patch_limit
-        self._patch_limit_on_one_side = patch_limit_on_one_side
-        self._fixed_output_tokens = fixed_output_tokens
-        self._image_mean = image_mean
-        self._image_std = image_std
-        self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
         # - image_processor: checked via isinstance(..., BaseImageProcessor)
@@ -328,22 +360,10 @@ class KimiGPUProcessorWrapper:
     def _gpu_call(self, text, images):
         """Bypass HF KimiK25VisionProcessor.preprocess entirely -- use GPU ops."""
         input_text = text[0] if isinstance(text, list) else text
+        media_proc_cfg = self.media_processor.media_proc_cfg
 
         # 1. Compute resize configs (CPU math)
-        resize_configs = []
-        for image in images:
-            w, h = _get_image_dimensions(image)
-            resize_configs.append(
-                navit_resize_config(
-                    w,
-                    h,
-                    self._patch_size,
-                    self._merge_kernel_size,
-                    self._in_patch_limit,
-                    self._patch_limit_on_one_side,
-                    self._fixed_output_tokens,
-                )
-            )
+        resize_configs = _compute_resize_configs(images, media_proc_cfg)
 
         # 2. Expand image tokens
         parts = input_text.split(self._image_token)
@@ -355,20 +375,15 @@ class KimiGPUProcessorWrapper:
         # 3. Tokenize
         text_inputs = self._hf_processor.tokenizer(input_text, return_tensors="pt")
 
-        # 4. GPU image preprocessing
-        image_mean, image_std_inv = self._get_gpu_norm_tensors()
-        pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_mean, image_std_inv, self._patch_size
-        )
-
-        grid_thws = grid_thws.cpu()
+        # 4. GPU image preprocessing (shared with the EPD encoder server path)
+        image_inputs = kimi_gpu_preprocess(images, media_proc_cfg, resize_configs)
 
         return {
             "input_ids": text_inputs["input_ids"],
-            "pixel_values": pixel_values,
+            "pixel_values": image_inputs["pixel_values"],
             # Use SGL-standard key so get_new_expanded_mm_items() can split
             # per-image for cache granularity (it looks up 'image_grid_thw').
-            "image_grid_thw": grid_thws,
+            "image_grid_thw": image_inputs["image_grid_thw"].cpu(),
         }
 
     def _cpu_call(self, text, images, **kwargs):
@@ -395,17 +410,6 @@ class KimiGPUProcessorWrapper:
             out["image_grid_thw"] = grid_thws
         return out
 
-    def _get_gpu_norm_tensors(self, device="cuda"):
-        if self._gpu_norm_tensors is None:
-            image_mean = torch.tensor(
-                self._image_mean, device=device, dtype=torch.float32
-            ).view(1, 3, 1, 1)
-            image_std_inv = (
-                1.0 / torch.tensor(self._image_std, device=device, dtype=torch.float32)
-            ).view(1, 3, 1, 1)
-            self._gpu_norm_tensors = (image_mean, image_std_inv)
-        return self._gpu_norm_tensors
-
 
 # ---------------------------------------------------------------------------
 # Kimi K2.5 SGLang multimodal processor
@@ -426,20 +430,9 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
 
-        # Extract media processing config from HF processor
-        media_proc_cfg = _processor.media_processor.media_proc_cfg
-
         # Replace with GPU-capable wrapper
         self._processor = KimiGPUProcessorWrapper(
-            _processor,
-            image_token=self.mm_tokens.image_token,
-            patch_size=media_proc_cfg["patch_size"],
-            merge_kernel_size=media_proc_cfg["merge_kernel_size"],
-            in_patch_limit=media_proc_cfg["in_patch_limit"],
-            patch_limit_on_one_side=media_proc_cfg["patch_limit_on_one_side"],
-            fixed_output_tokens=media_proc_cfg.get("fixed_output_tokens"),
-            image_mean=media_proc_cfg["image_mean"],
-            image_std=media_proc_cfg["image_std"],
+            _processor, image_token=self.mm_tokens.image_token
         )
 
     async def process_mm_data_async(
