@@ -40,7 +40,9 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
         f"/{test_utils.SGL_TEST_FILES_CI_DATA_REPO}/"
         f"{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
     )
-    assert pinned_revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    assert (
+        pinned_revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    )
     assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
