@@ -45,7 +45,7 @@ _INJECTION_COVERAGE = {
 }
 
 
-class TestKernelCheck(CustomTestCase):
+class TestInvariants(CustomTestCase):
     def _strict(self):
         return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
 
