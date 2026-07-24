@@ -105,6 +105,9 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Optional custom-mask override for sliding-attention layers.
+    sliding_custom_mask: torch.Tensor | None = None
+    sliding_mask_indptr: torch.Tensor | None = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -1317,6 +1320,8 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        custom_mask, mask_indptr = self._get_custom_mask_for_layer(layer)
+
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
@@ -1372,9 +1377,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            custom_mask,
             causal,
-            self.forward_metadata.mask_indptr,
+            mask_indptr,
             self.forward_metadata.max_extend_len,
             k_descale,
             v_descale,
@@ -1523,6 +1528,22 @@ class TritonAttnBackend(AttentionBackend):
         out = prefix_out * prefix_scale + current_out * current_scale
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+    def _get_custom_mask_for_layer(
+        self, layer: RadixAttention
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if (
+            layer.sliding_window_size >= 0
+            and self.forward_metadata.sliding_custom_mask is not None
+        ):
+            return (
+                self.forward_metadata.sliding_custom_mask,
+                self.forward_metadata.sliding_mask_indptr,
+            )
+        return (
+            self.forward_metadata.custom_mask,
+            self.forward_metadata.mask_indptr,
+        )
+
     def _forward_extend_unified(
         self,
         q: torch.Tensor,
@@ -1637,6 +1658,7 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         # Call unified kernel
+        custom_mask, mask_indptr = self._get_custom_mask_for_layer(layer)
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
@@ -1649,8 +1671,8 @@ class TritonAttnBackend(AttentionBackend):
             unified_kv_indices,
             prefix_lens,
             self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            custom_mask=custom_mask,
+            mask_indptr=mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,
