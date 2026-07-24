@@ -97,7 +97,7 @@ srt_hip = [
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
   # ancient setuptools sdist; an exact pin keeps the resolver converging.
-  "compressed-tensors==0.15.0",
+  "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch",
