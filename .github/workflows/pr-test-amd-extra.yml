@@ -61,6 +61,11 @@ on:
         required: false
         type: string
         default: ''
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: string
+        default: mi325
       rocm_version:
         description: 'ROCm container variant (empty = Dockerfile default; rocm720 = ROCm 7.2.0)'
         required: false

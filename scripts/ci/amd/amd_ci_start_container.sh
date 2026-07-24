@@ -57,7 +57,8 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
+      echo "      Mount /home/runner/sglang-data to /sgl-data."
+      echo "      Defaults to 1 for MI300 and MI35x runners, otherwise 0."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -288,7 +289,19 @@ else
 fi
 
 CACHE_HOST=/home/runner/sglang-data
-ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  CACHE_RUNNER_NAME="${RUNNER_NAME:-${HOSTNAME_VALUE}}"
+  CACHE_RUNNER_NAME_LOWER="${CACHE_RUNNER_NAME,,}"
+  case "${CACHE_RUNNER_NAME_LOWER}" in
+    *mi300*|*mi35x*)
+      ENABLE_CACHE_HOST="1"
+      echo "Enabling persistent CI data by default for runner: ${CACHE_RUNNER_NAME}"
+      ;;
+    *)
+      ENABLE_CACHE_HOST="0"
+      ;;
+  esac
+fi
 case "${ENABLE_CACHE_HOST,,}" in
   1|true|yes|on|pvc|persistent)
     if [[ ! -d "$CACHE_HOST" ]]; then
