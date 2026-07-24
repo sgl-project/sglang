@@ -51,7 +51,9 @@ template <
                                          // fetch pipeline
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
-    const bool is_zp_float               // is zero point of float16 type?
+    const bool is_zp_float,              // is zero point of float16 type?
+    const bool kIsEP,                    // expert parallelism
+    const bool kHasBias                  // has per-expert bias
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -292,7 +294,9 @@ template <
                                          // fetch pipeline
     const int group_blocks,              // number of consecutive 16x16 blocks
                                          // with a separate quantization scale
-    const bool is_zp_float               // is zero point of float16 type?
+    const bool is_zp_float,              // is zero point of float16 type?
+    const bool kIsEP,                    // expert parallelism
+    const bool kHasBias                  // has per-expert bias
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -378,8 +382,10 @@ __global__ void Marlin(
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
   int num_valid_blocks = parallel;
-  for (int i = 0; i < parallel; i++) {
-    if (expert_ids_ptr[i] == -1) num_valid_blocks--;
+  if constexpr (kIsEP) {
+    for (int i = 0; i < parallel; i++) {
+      if (expert_ids_ptr[i] == -1) num_valid_blocks--;
+    }
   }
   int num_invalid_blocks = parallel - num_valid_blocks;
   parallel = num_valid_blocks;
@@ -510,18 +516,23 @@ __global__ void Marlin(
     if (par_id >= parallel) return;
 
     old_expert_id = expert_id;
-    if (num_invalid_blocks > 0) {
-      int skip_count = block_id == -1 ? par_id : 0;
-      block_id++;
-      for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
-        expert_id = expert_ids_ptr[i];
-        if (expert_id != -1) {
-          if (skip_count == 0) {
-            block_id = i;
-            break;
+    if constexpr (kIsEP) {
+      if (num_invalid_blocks > 0) {
+        int skip_count = block_id == -1 ? par_id : 0;
+        block_id++;
+        for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
+          expert_id = expert_ids_ptr[i];
+          if (expert_id != -1) {
+            if (skip_count == 0) {
+              block_id = i;
+              break;
+            };
+            skip_count--;
           };
-          skip_count--;
-        };
+        }
+      } else {
+        block_id = par_id;
+        expert_id = expert_ids_ptr[block_id];
       }
     } else {
       block_id = par_id;
@@ -541,7 +552,7 @@ __global__ void Marlin(
     if constexpr (has_act_order) {
       g_idx += (expert_id - old_expert_id) * prob_k;
     }
-    if (has_bias) {
+    if constexpr (kHasBias) {
       b_bias_ptr += (expert_id - old_expert_id) * b_bias_expert_stride;
     }
 
@@ -1536,12 +1547,14 @@ __global__ void Marlin(
           res = __hmul2(res, global_scale);
         }
       }
-      if (has_bias && last) {
-        scalar_t2 tmp_bias = b_bias[0];
-        if constexpr (m_block_size_8) {
-          tmp_bias = Dtype::num2num2(reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
+      if constexpr (kHasBias) {
+        if (last) {
+          scalar_t2 tmp_bias = b_bias[0];
+          if constexpr (m_block_size_8) {
+            tmp_bias = Dtype::num2num2(reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
+          }
+          res = __hadd2(res, tmp_bias);
         }
-        res = __hadd2(res, tmp_bias);
       }
 
       if constexpr (m_block_size_8) {
@@ -1754,10 +1767,12 @@ __global__ void Marlin(
 
       thread_block_reduce();
 
-      if (has_bias && last) {
-        __syncthreads();
-        cp_async4_pred(&sh_bias[bias_sh_wr], &b_bias_ptr[bias_gl_rd], threadIdx.x < 16 * thread_n_blocks / 8);
-        cp_async_fence();
+      if constexpr (kHasBias) {
+        if (last) {
+          __syncthreads();
+          cp_async4_pred(&sh_bias[bias_sh_wr], &b_bias_ptr[bias_gl_rd], threadIdx.x < 16 * thread_n_blocks / 8);
+          cp_async_fence();
+        }
       }
 
       if constexpr (!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp)) {
@@ -1813,12 +1828,14 @@ __global__ void Marlin(
         barrier_release(&locks[locks_off], last);
       }
 
-      if (has_bias && last) {
-        cp_async_wait<0>();
-        __syncthreads();
-        reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
-        reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
-        __syncthreads();
+      if constexpr (kHasBias) {
+        if (last) {
+          cp_async_wait<0>();
+          __syncthreads();
+          reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
+          reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
+          __syncthreads();
+        }
       }
 
       if (use_atomic_add && slice_count > 1 && slice_idx != 0) wait_negative_and_add(&locks[locks_off]);
