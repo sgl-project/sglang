@@ -293,15 +293,26 @@ class WeightUpdater:
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
+        model = self.get_model()
         if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
+            _model_load_weights_direct(model, named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
+            custom_loader(model, named_tensors)
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+            model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        # All three load paths above bypass the loader's post-load step (the
+        # direct/custom loaders write params in place, and load_weights is
+        # called here without the loader wrapper that normally follows it with
+        # post_load_weights). Models that rebuild derived weight caches
+        # (fp32-transposed router gates, repacked quant operands, ...) in
+        # post_load_weights would otherwise serve stale derived weights after
+        # an in-place (e.g. RL-style) weight update. Idempotent for loaders
+        # that already ran the hook.
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
