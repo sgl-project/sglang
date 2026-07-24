@@ -173,23 +173,9 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
-        self.enable_dsv4_staging = bool(
-            envs.SGLANG_DISAGG_DSV4_STAGING_BUFFER.get()
-            and getattr(self.kv_args, "mla_compression_ratios", None)
-        )
-        self.enable_pcp_dcp_rank_affinity = bool(
+        self.enable_pcp_dcp_rank_affinity = (
             server_args.disaggregation_pcp_dcp_rank_affinity
-            and not self.enable_dsv4_staging
         )
-        if (
-            self.enable_dsv4_staging
-            and server_args.disaggregation_pcp_dcp_rank_affinity
-        ):
-            logger.warning(
-                "SGLANG_DISAGG_DSV4_STAGING_BUFFER disables PCP-DCP rank "
-                "affinity: prefill CP rank 0 will fan out staged KV to all "
-                "decode DCP ranks."
-            )
         self._check_pcp_dcp_rank_affinity_local_topology()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
@@ -199,21 +185,12 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
-        self.enable_all_cp_ranks_for_transfer = not self.enable_dsv4_staging and (
+        self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
             or self.enable_pcp_dcp_rank_affinity
         )
-        if (
-            self.enable_dsv4_staging
-            and envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
-        ):
-            logger.warning(
-                "SGLANG_DISAGG_DSV4_STAGING_BUFFER ignores "
-                "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER; only prefill "
-                "CP rank 0 sends staged KV."
-            )
         self._check_dcp_compat()
 
         # bind zmq socket
@@ -793,9 +770,7 @@ class CommonKVManager(BaseKVManager):
                 self.server_args, "enable_dsa_cache_layer_split", False
             ),
             "cp_strategy": self.server_args.cp_strategy,
-            "disaggregation_pcp_dcp_rank_affinity": getattr(
-                self, "enable_pcp_dcp_rank_affinity", False
-            ),
+            "disaggregation_pcp_dcp_rank_affinity": (self.enable_pcp_dcp_rank_affinity),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1415,7 +1390,7 @@ class CommonKVReceiver(BaseKVReceiver):
         )
 
         if self.kv_mgr.enable_staging:
-            self.require_staging = self.kv_mgr.enable_dsv4_staging or (
+            self.require_staging = (
                 self.prefill_info.attn_tp_size != 0
                 and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
             )
