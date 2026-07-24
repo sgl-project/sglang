@@ -71,6 +71,20 @@ def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> Li
     return normalized
 
 
+def _select_rank_local_ib_device(
+    ib_devices: str,
+    *,
+    attn_dp_size: int,
+    attn_dp_rank: int,
+    attn_tp_rank: int,
+) -> str:
+    devices = [device.strip() for device in ib_devices.split(",") if device.strip()]
+    if not devices:
+        return ib_devices
+    rank = attn_dp_rank if attn_dp_size > 1 else attn_tp_rank
+    return devices[rank % len(devices)]
+
+
 def _pack_list(values: List) -> bytes:
     return msgspec.msgpack.encode(values) if values else b""
 
@@ -426,7 +440,23 @@ class MoriKVManager(CommonKVManager):
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
-            os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+            ib_devices = self.kv_args.ib_device
+            if envs.SGLANG_MORI_RANK_LOCAL_IB_DEVICE.get():
+                ib_devices = _select_rank_local_ib_device(
+                    ib_devices,
+                    attn_dp_size=self.attn_dp_size,
+                    attn_dp_rank=self.attn_dp_rank,
+                    attn_tp_rank=self.attn_tp_rank,
+                )
+                os.environ["MORI_IO_RAIL_AFFINITY"] = "1"
+                logger.info(
+                    "MoRI rank-local RDMA device: %s "
+                    "(attn_dp_rank=%d, attn_tp_rank=%d)",
+                    ib_devices,
+                    self.attn_dp_rank,
+                    self.attn_tp_rank,
+                )
+            os.environ["MORI_RDMA_DEVICES"] = ib_devices
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)
