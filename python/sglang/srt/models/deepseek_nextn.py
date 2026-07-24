@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -261,14 +262,7 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
-            seed_buf = (
-                forward_batch.spec_info.dsa_seed_topk_capture
-                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                else None
-            )
-            should_update_dsa_topk_indices = (
-                forward_batch.reuse_dsa_topk_indices or seed_buf is not None
-            )
+            index_topk_share = IndexTopKShareState(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -276,11 +270,7 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     residual,
                     zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.spec_info.dsa_topk_indices
-                        if forward_batch.reuse_dsa_topk_indices
-                        else None
-                    ),
+                    prev_topk_indices=index_topk_share.prev_topk_indices(),
                 )
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -296,7 +286,7 @@ class DeepseekModelNextN(nn.Module):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-                    if should_update_dsa_topk_indices and topk_indices is not None:
+                    if index_topk_share.should_update and topk_indices is not None:
                         topk_indices = _gather_dsa_topk_indices_for_cp(
                             topk_indices,
                             local_num_tokens,
@@ -304,17 +294,7 @@ class DeepseekModelNextN(nn.Module):
                             forward_batch,
                             torch.cuda.current_stream(),
                         )
-            if should_update_dsa_topk_indices and topk_indices is not None:
-                if forward_batch.reuse_dsa_topk_indices:
-                    forward_batch.spec_info.dsa_topk_indices = topk_indices
-                if seed_buf is not None:
-                    sel = forward_batch.spec_info.dsa_seed_topk_select
-                    src = (
-                        topk_indices[: seed_buf.shape[0]]
-                        if sel is None
-                        else topk_indices[sel]
-                    )
-                    seed_buf[: src.shape[0]].copy_(src)
+            index_topk_share.store_topk_indices(topk_indices)
         finally:
             exit_stack.close()
 
