@@ -1,6 +1,7 @@
 import logging
 import math
 from dataclasses import replace
+from types import SimpleNamespace as _SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -47,7 +48,15 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    generate_token_bitmask,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.speculative.triton_ops.dflash import (
+    _compute_dflash_accept_bonus_triton_unchecked,
+    _prepare_dflash_draft_block_unchecked,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -1684,6 +1693,41 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
+
+        # Grammar-constrained decoding for DFLASH.
+        # DFLASH verify is a *linear chain*: draft_tokens[bs, block_size] where
+        # column 0 is the current (already-committed) token and columns 1: are the
+        # draft proposals. To constrain output to the grammar we mask the target
+        # logits at each chain position to the grammar-allowed vocabulary *before*
+        # the accept/argmax step -- exactly what EAGLE does over its draft tree.
+        # A chain is a degenerate tree (each node's only child is the next
+        # position; no siblings), so we reuse the EAGLE helper generate_token_bitmask().
+        # Grammar FSM advancement over committed tokens is handled downstream in
+        # SchedulerOutputProcessorMixin._resolve_spec_v2_tokens.
+        if getattr(batch, "has_grammar", False):
+            _block = int(self.block_size)
+            _bs = draft_tokens.shape[0]
+            _rnt = torch.full((_bs, _block), -1, dtype=torch.int64)
+            if _block > 1:
+                _rnt[:, :-1] = torch.arange(1, _block, dtype=torch.int64)
+            _rns = torch.full((_bs, _block), -1, dtype=torch.int64)
+            _draft_cpu = draft_tokens.reshape(_bs, _block).to(
+                device="cpu", dtype=torch.int64
+            )
+            _shim = _SimpleNamespace(grammar=None)
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                _shim,
+                _rnt,
+                _rns,
+                _draft_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None and _shim.grammar is not None:
+                vocab_mask = vocab_mask.to(logits_output.next_token_logits.device)
+                _shim.grammar.apply_vocab_mask(
+                    logits_output.next_token_logits, vocab_mask
+                )
 
         candidates = draft_tokens
         new_seq_lens = None
