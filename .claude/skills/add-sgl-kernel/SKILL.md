@@ -18,7 +18,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 
 ## Two rules of thumb (must follow)
 
-1. **Prefer `python/sglang/jit_kernel` first** when the kernel does **not** depend on CUTLASS or another large C++ project. This is the default path for lightweight kernels that benefit from rapid iteration.
+1. **Prefer `python/sglang/kernels/jit` first** when the kernel does **not** depend on CUTLASS or another large C++ project. This is the default path for lightweight kernels that benefit from rapid iteration.
 2. **Prefer `sgl-kernel`** when the kernel **does** depend on CUTLASS or another large C++ project, or when it should be part of the AOT wheel / torch op registration flow.
 3. **Exception**: if the dependency is `flashinfer`, or CUTLASS that is already provided through `flashinfer`, the kernel can still be implemented as `jit_kernel`.
 

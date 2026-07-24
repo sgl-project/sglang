@@ -44,7 +44,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 
 ScalarType, scalar_types = get_scalar_types()
