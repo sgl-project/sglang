@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=13.0.1
+ARG CUDA_VERSION=13.0.3
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -12,7 +12,7 @@ ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.4.5
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.4.post1
+ARG SGL_DEEP_GEMM_VERSION=0.1.5rc1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -194,19 +194,18 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+    && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
-    elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    elif [ "$CUDA_VERSION" = "12.9.2" ]; then \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
-    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
         python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
@@ -229,10 +228,9 @@ COPY proto                 /tmp/sglang_deps/proto
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && cd /tmp/sglang_deps/python \
@@ -315,13 +313,10 @@ RUN set -eux; \
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /build/DeepEP && \
     case "$CUDA_VERSION" in \
-        12.6.1) \
+        12.6.3) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
             ;; \
-        12.8.1) \
-            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-            ;; \
-        12.9.1|13.0.1) \
+        12.9.2|13.0.3) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
             ;; \
         *) \
@@ -370,10 +365,9 @@ ARG FLASHINFER_VERSION
 # Stage jit-cache/cubin artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
-        12.6.1) CUINDEX=126 ;; \
-        12.8.1) CUINDEX=128 ;; \
-        12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        12.6.3) CUINDEX=126 ;; \
+        12.9.2) CUINDEX=129 ;; \
+        13.0.3) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
@@ -616,10 +610,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
+    python3 -m pip install "cuda-python>=12,<13" ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
+    python3 -m pip install "cuda-python>=13,<14" ; \
 fi
 
 # Add yank script

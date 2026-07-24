@@ -29,7 +29,7 @@ concurrency:
 env:
   # Must match TORCH_VER in docker/sgl-deep-gemm.Dockerfile — the wheel's
   # pre-compiled _C.so links against this torch ABI.
-  TORCH_VER: "2.11.0"
+  TORCH_VER: "2.13.0"
 
 jobs:
   build-cu129-matrix:

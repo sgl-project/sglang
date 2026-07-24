@@ -22,6 +22,7 @@ PYTHON_VERSION="$1"
 CUDA_VERSION="$2"
 DEEPGEMM_SRC="$(cd "$3" && pwd)"
 ARCH="${4:-$(uname -i)}"
+TORCH_VER="${TORCH_VER:-2.13.0}"
 
 case "${CUDA_VERSION}" in
   13.0) CU_TAG=cu130 ;;
@@ -51,6 +52,7 @@ echo "----------------------------------------"
 echo "PYTHON_VERSION: ${PYTHON_VERSION}"
 echo "CUDA_VERSION:   ${CUDA_VERSION}"
 echo "CU_TAG:         ${CU_TAG}"
+echo "TORCH_VER:      ${TORCH_VER}"
 echo "ARCH:           ${ARCH}"
 echo "BASE_IMG:       ${BASE_IMG}"
 echo "DEEPGEMM_SRC:   ${DEEPGEMM_SRC}"
@@ -64,6 +66,7 @@ docker build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg TORCH_VER="${TORCH_VER}" \
   -t "${DEPS_TAG}" \
   --network=host
 

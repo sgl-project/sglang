@@ -101,7 +101,10 @@ jobs:
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
           cd sgl-kernel
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+          if ! ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"; then
+            echo "sgl-kernel build failed; retrying after resetting buildx builder/cache"
+            RESET_BUILDER=1 ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+          fi
         env:
           USE_CCACHE: 1
 

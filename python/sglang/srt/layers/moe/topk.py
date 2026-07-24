@@ -32,10 +32,12 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+if TYPE_CHECKING:
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+
 from sglang.srt.runtime_context import get_parallel
 
 try:
-    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import make_ragged_tensor_metadata
     from triton_kernels.topk import topk as triton_kernels_topk
 
@@ -49,7 +51,7 @@ try:
     ):
         if simulated_ep != 1:
             raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels 3.6.0"
+                "simulated_ep routing is not supported with triton_kernels 3.7.1"
             )
 
         if sm_first:
@@ -64,20 +66,13 @@ try:
         )
         dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
         combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+        gather_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
+        scatter_indx = combine_indx
         ragged_metadata = make_ragged_tensor_metadata(
             sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
         )
         gate_scal = sparse_logits.vals.flatten()[combine_indx]
-        routing_data = RoutingData(
-            gate_scal,
-            ragged_metadata.slice_sizes,
-            logits.shape[-1],
-            n_expts_act,
-            ragged_metadata,
-        )
-        gather_indx = GatherIndx(combine_indx, dispatch_indx)
-        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
-        return routing_data, gather_indx, scatter_indx
+        return ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act
 
 except ImportError:
     pass
@@ -308,9 +303,11 @@ class StandardTopKOutputPacked(NamedTuple):
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""
 
-    routing_data: RoutingData
-    gather_indx: GatherIndx
-    scatter_indx: ScatterIndx
+    a_ragged_metadata: RaggedTensorMetadata
+    gather_indx: torch.Tensor
+    scatter_indx: torch.Tensor
+    gate_scal: torch.Tensor
+    n_expts_act: int
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -516,12 +513,24 @@ class TopK(MultiPlatformOp):
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
+            (
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            ) = routing(
                 router_logits,
                 self.topk_config.top_k,
                 sm_first=not self.topk_config.renormalize,
             )
-            return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+            return TritonKernelTopKOutput(
+                a_ragged_metadata,
+                gather_idx,
+                scatter_idx,
+                gate_scal,
+                n_expts_act,
+            )
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,

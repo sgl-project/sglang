@@ -32,6 +32,7 @@ on:
 # The github context (including github.event_name) IS inherited from the caller.
 env:
   SGLANG_IS_IN_CI: true
+  NCCL_NVLS_ENABLE: "0"
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}

@@ -346,10 +346,10 @@ class DeepseekMLAForwardMixin:
 
             # overlap q_b_proj and indexer during decode
             if (
-                self.alt_stream is not None
+                q_lora is not None
+                and self.alt_stream is not None
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
-                and q_lora is not None
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)

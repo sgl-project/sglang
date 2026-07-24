@@ -277,17 +277,11 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        overlap = _is_cuda and not torch.compiler.is_compiling()
-        if (
-            overlap
-            and get_moe_a2a_backend().is_flashinfer()
-            and not get_is_capture_mode()
+        if _is_cuda and (
+            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            overlap = False
-        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
-        else:
-            return self._forward_core_normal(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
