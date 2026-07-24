@@ -26,6 +26,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,13 @@ def sample_draft_block(
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             return torch.argmax(step_logits, dim=-1)
 
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
@@ -199,6 +202,11 @@ def sample_draft_block(
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
+                # All-NaN rows make multinomial raise; clamp to one-hot token 0.
+                degenerate_rows = torch.isnan(probs[:, :1])
+                one_hot_token0 = torch.zeros_like(probs)
+                one_hot_token0[:, 0] = 1.0
+                probs = torch.where(degenerate_rows, one_hot_token0, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
