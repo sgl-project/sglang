@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -48,16 +49,38 @@ class FakeKVSender(BaseKVSender):
         self.kv_mgr = mgr
         self.has_sent = False
         self.conclude_state: Optional[KVPoll] = None
+        self.poll_count = 0  # Track number of times polled before send()
+        # Threshold for auto-aborting leaked requests (health checks, connection validation)
+        # while avoiding premature abortion during multi-GPU bootstrap sync.
+        self._auto_abort_threshold = (
+            envs.SGLANG_DISAGGREGATION_FAKE_AUTO_ABORT_THRESHOLD.get()
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
+
         if not self.has_sent:
-            # Assume handshake completed instantly
+            self.poll_count += 1
+
+            # During normal operation, a request transitions from bootstrap to prefill
+            # within a few polls. If poll_count exceeds threshold, it's a leaked
+            # request (health check, aborted) that will never call send().
+            # Auto-abort to Failed to prevent queue accumulation.
+            if self.poll_count >= self._auto_abort_threshold:
+                logger.warning(
+                    f"FakeKVSender auto-aborting after {self.poll_count} polls without send() - "
+                    "likely a leaked request (health check or aborted)"
+                )
+                self.conclude_state = KVPoll.Failed
+                return KVPoll.Failed
+
+            # First poll and subsequent polls (< threshold): return WaitingForInput
+            # to allow multi-GPU bootstrap synchronization without premature abortion
             return KVPoll.WaitingForInput
 
-        # Assume transfer completed instantly
-        logger.debug("FakeKVSender poll success")
+        # Assume transfer completed instantly after send()
+        logger.debug("FakeKVSender poll success after send()")
         self.conclude_state = KVPoll.Success
         return KVPoll.Success
 
@@ -79,7 +102,10 @@ class FakeKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
+        # Note: send() after auto-abort (poll_count >= threshold) is a no-op
+        # since conclude_state=Failed takes precedence in poll()
         self.has_sent = True
+        self.poll_count = 0  # Reset counter after send
         logger.debug(
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
