@@ -47,6 +47,30 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+# Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
+# so we don't open a fresh TCP connection per query (that churns short-lived
+# sockets and can exhaust ephemeral ports under high concurrency). Thread-local
+# because requests.Session is not safe for concurrent cross-thread use.
+_bootstrap_sessions = threading.local()
+
+
+def _get_bootstrap_session(bootstrap_addr: str) -> requests.Session:
+    sessions = getattr(_bootstrap_sessions, "by_addr", None)
+    if sessions is None:
+        sessions = {}
+        _bootstrap_sessions.by_addr = sessions
+    session = sessions.get(bootstrap_addr)
+    if session is None:
+        # Not evicted: the number of bootstrap_addr is bounded (one per prefill
+        # server). Bootstrap is http-only, so only http:// is mounted.
+        session = requests.Session()
+        session.mount(
+            "http://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1)
+        )
+        sessions[bootstrap_addr] = session
+    return session
+
+
 class KVTransferError(Exception):
     def __init__(
         self,
@@ -1278,7 +1302,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
+            response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -1298,7 +1322,7 @@ class CommonKVReceiver(BaseKVReceiver):
         """Batch query prefill dp_ranks for given bootstrap_rooms."""
         try:
             url = f"http://{bootstrap_addr}/query_dp_ranks"
-            response = requests.post(
+            response = _get_bootstrap_session(bootstrap_addr).post(
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
                 timeout=5,
