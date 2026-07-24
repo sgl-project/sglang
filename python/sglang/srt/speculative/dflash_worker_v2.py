@@ -39,6 +39,10 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.domino_utils import (
+    domino_greedy_rollout,
+    validate_domino_runtime,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -147,6 +151,55 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
+class _DominoDraftSampler:
+    """Capture-safe TP=1 Domino rollout over a fixed-size draft block."""
+
+    def __init__(
+        self,
+        *,
+        target_embedding,
+        lm_head_weight,
+        prefix_gru,
+        embed_proj,
+        vocab_size,
+        block_size,
+        shift_label,
+        max_bs,
+        candidate_pool_size=2048,
+    ):
+        self.target_embedding = target_embedding
+        self.lm_head_weight = lm_head_weight
+        self.prefix_gru = prefix_gru
+        self.embed_proj = embed_proj
+        self.vocab_size = int(vocab_size)
+        self.block_size = int(block_size)
+        self.shift_label = bool(shift_label)
+        self.candidate_pool_size = int(candidate_pool_size)
+        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.out = torch.empty(
+            (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
+        )
+
+    def __call__(self, hidden_states, input_ids=None):
+        if input_ids is None:
+            raise RuntimeError("Domino draft sampler requires block input_ids.")
+        bs = hidden_states.shape[0] // self.block_size
+        draft_hidden = hidden_states.view(bs, self.block_size, -1)
+        verified_ids = input_ids.view(bs, self.block_size)[:, 0]
+        proposals = domino_greedy_rollout(
+            draft_hidden=draft_hidden,
+            verified_ids=verified_ids,
+            target_embedding=self.target_embedding,
+            lm_head_weight=self.lm_head_weight,
+            prefix_gru=self.prefix_gru,
+            embed_proj=self.embed_proj,
+            vocab_size=self.vocab_size,
+            shift_label=self.shift_label,
+            candidate_pool_size=self.candidate_pool_size,
+        )
+        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -195,6 +248,36 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+        self._is_domino = draft_config.is_domino
+        self.domino_candidate_pool_size = int(
+            server_args.speculative_domino_candidate_pool_size
+        )
+        if self._is_domino:
+            if self.domino_candidate_pool_size < 0:
+                raise ValueError(
+                    "--speculative-domino-candidate-pool-size must be non-negative, "
+                    f"got {self.domino_candidate_pool_size}."
+                )
+            target_model = self.target_worker.model_runner.model
+            target_embedding = target_model.get_input_embeddings()
+            lm_head = getattr(target_model, "lm_head", None)
+            prefix_gru = getattr(self.draft_model, "prefix_gru", None)
+            embed_proj = getattr(self.draft_model, "embed_proj", None)
+            if lm_head is None or prefix_gru is None or embed_proj is None:
+                raise ValueError(
+                    "DFLASH Domino requires target lm_head and loaded Domino projector modules."
+                )
+            validate_domino_runtime(
+                device=torch.device(self.device),
+                tp_size=int(get_tp_group().world_size),
+                target_vocab_size=int(self.model_runner.model_config.vocab_size),
+                draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
+                hidden_size=int(self.draft_model.config.hidden_size),
+                target_embedding=target_embedding,
+                lm_head=lm_head,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+            )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
@@ -212,6 +295,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self._is_domino and self.block_size <= 1:
+            raise ValueError(
+                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
+                f"got {self.block_size}."
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -228,6 +316,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
+            if self._is_domino:
+                logger.info(
+                    "DFLASH Domino rollout enabled (eager BF16, TP=1, block-shared candidate pool size=%s).",
+                    self.domino_candidate_pool_size,
+                )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
@@ -369,6 +462,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
         tp_group = get_tp_group()
+        if self._is_domino:
+            if tp_group.world_size != 1:
+                return _eager("Domino cuda graph currently requires tp=1")
+            prefix_gru = self.draft_model.prefix_gru
+            embed_proj = self.draft_model.embed_proj
+            if prefix_gru is None or embed_proj is None:
+                return _eager("Domino projector modules are unavailable")
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH Domino rollout folded into the draft cuda graph (tp=1)."
+                )
+            return _DominoDraftSampler(
+                target_embedding=target_model.get_input_embeddings(),
+                lm_head_weight=lm_head.weight,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                block_size=self.block_size,
+                shift_label=self.draft_model.shift_label,
+                max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+                candidate_pool_size=self.domino_candidate_pool_size,
+            )
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
                 # No shard metadata to recover per-rank vocab offsets from.
@@ -1613,7 +1728,35 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if (
+            self._is_domino
+            and self._draft_sampler is not None
+            and draft_out.can_run_graph
+        ):
+            draft_next = self._draft_sampler.out[
+                : bs * (int(self.block_size) - 1)
+            ].view(bs, int(self.block_size) - 1)
+        elif self._is_domino:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            prefix_gru = self.draft_model.prefix_gru
+            embed_proj = self.draft_model.embed_proj
+            if prefix_gru is None or embed_proj is None:
+                raise RuntimeError("DFLASH Domino projector modules are unavailable.")
+            draft_next = domino_greedy_rollout(
+                draft_hidden=draft_hidden,
+                verified_ids=block_ids[:, 0],
+                target_embedding=embed_module,
+                lm_head_weight=lm_head.weight,
+                prefix_gru=prefix_gru,
+                embed_proj=embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                shift_label=bool(self.draft_model.shift_label),
+                candidate_pool_size=self.domino_candidate_pool_size,
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
