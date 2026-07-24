@@ -48,8 +48,7 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
     if not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()):
         raise ValueError(
-            "FlashInfer allreduce fusion requires SM90, SM10X, or SM120 "
-            "NVIDIA GPUs."
+            "FlashInfer allreduce fusion requires SM90, SM10X, or SM120 NVIDIA GPUs."
         )
 
     if backend == "auto":
@@ -277,22 +276,6 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
 
         allocation_size = ceil_align(buffer_size + signal_pad_size, alloc_granularity)
 
-        mc_prop = cuda_driver.CUmulticastObjectProp()
-        mc_prop.numDevices = world_size
-        mc_prop.size = allocation_size
-        mc_prop.handleTypes = prop.requestedHandleTypes
-
-        err, mc_granularity = cuda_driver.cuMulticastGetGranularity(
-            mc_prop,
-            cuda_driver.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
-        )
-        if err != cuda_driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(
-                "cuMulticastGetGranularity failed for FlashInfer "
-                f"workspace preflight: {err}"
-            )
-
-        allocation_size = ceil_align(allocation_size, mc_granularity)
         allocation_sizes.append(allocation_size)
     return allocation_sizes
 

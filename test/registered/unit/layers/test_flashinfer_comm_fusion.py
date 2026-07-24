@@ -72,6 +72,31 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_trtllm_workspace_preflight_does_not_require_multicast(self):
+        class _FakeCudaDriver:
+            CUresult = types.SimpleNamespace(CUDA_SUCCESS=0)
+            CUmemAllocationGranularity_flags = types.SimpleNamespace(
+                CU_MEM_ALLOC_GRANULARITY_RECOMMENDED=0
+            )
+
+            @staticmethod
+            def cuMemGetAllocationGranularity(_prop, _flag):
+                return 0, 65536
+
+            @staticmethod
+            def cuMulticastGetGranularity(*_args):
+                raise AssertionError("TRT-LLM symmetric memory has multicast disabled")
+
+        sizes = fusion._flashinfer_trtllm_workspace_allocation_sizes(
+            _FakeCudaDriver(),
+            object(),
+            world_size=2,
+            max_token_num=32,
+            hidden_dim=16,
+            dtype=torch.bfloat16,
+        )
+        self.assertEqual(sizes, [2162688, 2162688, 2162688])
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
@@ -181,9 +206,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             patch.object(fusion, "is_sm120_supported", return_value=True),
         ):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(
-                    single_node_trtllm
-                ),
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_trtllm),
                 "trtllm",
             )
             with self.assertRaises(ValueError):
