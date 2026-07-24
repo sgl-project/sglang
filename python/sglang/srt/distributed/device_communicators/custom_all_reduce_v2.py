@@ -31,6 +31,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     custom_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -39,6 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from .configs.custom_all_reduce_v2 import get_all_reduce_config
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
+    is_one_nvlink_clique,
     is_weak_contiguous,
 )
 from .vmm_utils import (
@@ -139,7 +141,7 @@ class CustomAllReduceV2:
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
         # device-side pointer table: one row of world_size pointers per
-        # graph-captured all-reduce input (at most 8 MB at world_size = 8)
+        # graph-captured all-reduce input
         self.graph_params = torch.zeros(
             (_MAX_GRAPH_INPUTS, self.world_size),
             dtype=torch.uint64,
@@ -411,10 +413,18 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    supported = list(range(2, 17))
+    if dist.get_world_size(group=group) not in supported:
+        return False
+    # Multi-node is safe only when the whole TP group is a single NVLink clique
+    # (one NVL72 / MNNVL domain); v2's symm-mem storage then spans nodes over fabric
+    # peer VAs. Otherwise fall back to the intra-node nvlink/p2p check.
+    if not all(in_the_same_node_as(group, source_rank=0)):
+        return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
-        supported_world_size=list(range(2, 9)),
+        supported_world_size=supported,
         cls_name="CustomAllReduceV2",
     )
     return full_nvlink is True
