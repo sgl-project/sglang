@@ -51,6 +51,21 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(text_config.swa_head_dim, 128)
         self.assertEqual(text_config.swa_v_head_dim, 128)
 
+    def test_zero_v_head_dim_falls_back_to_head_dim(self):
+        """MLA-disabled checkpoints (e.g. deepseek-vl2-tiny) declare
+        v_head_dim=0 instead of omitting it; 0 must not size the KV pool."""
+        text_config = _make_text_config(
+            head_dim=None,
+            v_head_dim=0,
+            swa_head_dim=None,
+            swa_v_head_dim=None,
+        )
+
+        model_config = self._derive_shapes(text_config)
+
+        self.assertEqual(model_config.v_head_dim, 128)
+        self.assertEqual(text_config.v_head_dim, 128)
+
     def test_explicit_head_dims_are_preserved(self):
         text_config = _make_text_config(
             head_dim=128,
