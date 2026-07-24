@@ -1279,6 +1279,50 @@ def ep_scatter(
     return
 
 
+@torch.no_grad()
+def ep_scatter_mxfp8_quant(
+    recv_x: torch.Tensor,
+    recv_topk: torch.Tensor,
+    num_recv_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    quant_block_size: int,
+):
+    """Fused BF16-to-MXFP8 quantization and contiguous expert scatter."""
+    from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
+        per_token_quant_fp8_ue8m0_contig_scatter,
+    )
+
+    block_e = 128
+    assert recv_x.dtype == torch.bfloat16
+    assert output_tensor.dtype == torch.float8_e4m3fn
+    assert output_tensor_scale.dtype == torch.int32
+    assert m_indices.shape[0] % block_e == 0
+
+    num_experts = num_recv_tokens_per_expert.shape[0]
+    _fwd_kernel_ep_scatter_1[(num_experts,)](
+        num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_experts=num_experts,
+        num_warps=8,
+        BLOCK_E=block_e,
+        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+    )
+    per_token_quant_fp8_ue8m0_contig_scatter(
+        recv_x,
+        output_tensor,
+        output_tensor_scale,
+        recv_topk,
+        expert_start_loc,
+        output_index,
+        group_size=quant_block_size,
+    )
+
+
 @triton.jit
 def _fwd_kernel_ep_gather(
     total_token_num,

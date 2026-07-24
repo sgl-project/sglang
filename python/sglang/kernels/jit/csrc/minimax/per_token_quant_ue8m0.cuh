@@ -107,6 +107,19 @@ struct PerTokenQuantUe8m0ScatterParams {
   uint32_t m_max;
 };
 
+struct PerTokenQuantUe8m0ContigScatterParams {
+  const bf16_t* __restrict__ x;            // [num_tokens, hidden]
+  fp8_e4m3_t* __restrict__ output;         // [all_tokens, hidden]
+  int32_t* __restrict__ output_scale;      // [num_groups/4, all_tokens]
+  const int32_t* __restrict__ topk_ids;    // [num_tokens, topk]; <0 = skip
+  int32_t* __restrict__ expert_start_loc;  // [num_experts]; atomically advanced
+  int32_t* __restrict__ output_index;      // [num_tokens, topk]
+  uint32_t num_tokens;
+  uint32_t hidden;
+  uint32_t num_groups;
+  uint32_t all_tokens;
+};
+
 template <uint32_t kGroupSize, uint32_t kTopK, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  //
     per_token_quant_ue8m0_scatter_kernel(const PerTokenQuantUe8m0ScatterParams __grid_constant__ params) {
@@ -193,6 +206,77 @@ __global__ __launch_bounds__(1024, 2) void  //
   PDLTriggerSecondary<kUsePDL>();
 }
 
+template <uint32_t kGroupSize, uint32_t kTopK, bool kUsePDL>
+__global__ __launch_bounds__(1024, 2) void  //
+    per_token_quant_ue8m0_contig_scatter_kernel(const PerTokenQuantUe8m0ContigScatterParams __grid_constant__ params) {
+  using namespace device;
+  constexpr uint32_t kVecElems = 8;
+  static_assert(kGroupSize % kVecElems == 0, "group_size must be a multiple of 8");
+  constexpr uint32_t kThreadsPerGroup = kGroupSize / kVecElems;
+  using InputVec = AlignedVector<bf16x2_t, kVecElems / 2>;
+  using OutputVec = AlignedVector<fp8x2_e4m3_t, kVecElems / 2>;
+
+  const uint32_t token_id = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  __shared__ int32_t dst_rows[kTopK];
+  PDLWaitPrimary<kUsePDL>();
+
+  if (tid < kTopK) {
+    const auto index = static_cast<uint64_t>(token_id) * kTopK + tid;
+    const int32_t expert_id = params.topk_ids[index];
+    const int32_t dst = expert_id >= 0 ? atomicAdd(params.expert_start_loc + expert_id, 1) : -1;
+    dst_rows[tid] = dst;
+    params.output_index[index] = dst;
+  }
+
+  const auto token_in = params.x + static_cast<uint64_t>(token_id) * params.hidden;
+  InputVec in_vec;
+  in_vec.load(token_in, tid);
+  float local_max = 0.0f;
+  float vals[kVecElems];
+#pragma unroll
+  for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+    const auto [v0, v1] = cast<fp32x2_t>(in_vec[i]);
+    vals[2 * i + 0] = v0;
+    vals[2 * i + 1] = v1;
+    local_max = fmaxf(local_max, fmaxf(fabsf(v0), fabsf(v1)));
+  }
+  local_max = warp::reduce_max<kThreadsPerGroup>(local_max);
+  const float absmax = fmaxf(local_max, 1e-10f);
+  const uint32_t ue8m0_exp = cast_to_ue8m0(absmax / math::FP8_E4M3_MAX);
+  const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+
+  OutputVec out_vec;
+#pragma unroll
+  for (uint32_t i = 0; i < kVecElems / 2; ++i) {
+    out_vec[i] = pack_fp8(vals[2 * i + 0] * inv_scale, vals[2 * i + 1] * inv_scale);
+  }
+
+  __syncthreads();
+#pragma unroll
+  for (uint32_t i = 0; i < kTopK; ++i) {
+    const int32_t dst = dst_rows[i];
+    if (dst >= 0) {
+      out_vec.store(params.output + static_cast<uint64_t>(dst) * params.hidden, tid);
+    }
+  }
+
+  const uint32_t group_id = tid / kThreadsPerGroup;
+  const uint32_t within_group = tid % kThreadsPerGroup;
+  const uint32_t c = group_id / 4u;
+  const uint32_t b = group_id % 4u;
+  auto* scale_bytes = reinterpret_cast<uint8_t*>(params.output_scale);
+#pragma unroll
+  for (uint32_t i = within_group; i < kTopK; i += kThreadsPerGroup) {
+    const int32_t dst = dst_rows[i];
+    if (dst < 0) continue;
+    const uint64_t int32_index = static_cast<uint64_t>(c) * params.all_tokens + dst;
+    scale_bytes[int32_index * 4u + b] = static_cast<uint8_t>(ue8m0_exp);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <int64_t kGroupSize, int64_t kTopK, bool kUsePDL>
 void per_token_quant_ue8m0_scatter(
     tvm::ffi::TensorView x,
@@ -239,6 +323,57 @@ void per_token_quant_ue8m0_scatter(
   };
   if (num_tokens == 0) return;
   constexpr auto kernel = per_token_quant_ue8m0_scatter_kernel<kGroupSize, kTopK, kUsePDL>;
+  LaunchKernel(num_tokens, threads, device.unwrap())  //
+      .enable_pdl(kUsePDL)(kernel, params);
+}
+
+template <int64_t kGroupSize, int64_t kTopK, bool kUsePDL>
+void per_token_quant_ue8m0_contig_scatter(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView output,
+    tvm::ffi::TensorView output_scale,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView expert_start_loc,
+    tvm::ffi::TensorView output_index) {
+  using namespace host;
+  auto device = SymbolicDevice{};
+  auto M = SymbolicSize{"num_tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto P = SymbolicSize{"all_tokens"};
+  auto G4 = SymbolicSize{"num_groups_div_4"};
+  auto E = SymbolicSize{"num_experts"};
+  device.set_options<kDLCUDA>();
+  TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device).verify(x);
+  TensorMatcher({P, H}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output);
+  TensorMatcher({G4, P}).with_dtype<int32_t>().with_device(device).verify(output_scale);
+  TensorMatcher({M, kTopK}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<int32_t>().with_device(device).verify(expert_start_loc);
+  TensorMatcher({M, kTopK}).with_dtype<int32_t>().with_device(device).verify(output_index);
+
+  const uint32_t num_tokens = static_cast<uint32_t>(M.unwrap());
+  const uint32_t hidden = static_cast<uint32_t>(H.unwrap());
+  RuntimeCheck(hidden % kGroupSize == 0, "hidden ", hidden, " not divisible by group_size ", kGroupSize);
+  const uint32_t num_groups = hidden / static_cast<uint32_t>(kGroupSize);
+  RuntimeCheck(num_groups % 4 == 0, "num_groups must be a multiple of 4 for int32 packing");
+  RuntimeCheck(static_cast<uint32_t>(G4.unwrap()) * 4 == num_groups, "scale G/4 mismatch");
+  const uint32_t threads = hidden / 8;
+  RuntimeCheck(threads <= 1024, "hidden/8 must be <= 1024, got ", threads);
+  RuntimeCheck(threads >= kTopK, "hidden/8 must cover topk destination setup");
+
+  const auto params = PerTokenQuantUe8m0ContigScatterParams{
+      .x = static_cast<const bf16_t*>(x.data_ptr()),
+      .output = static_cast<fp8_e4m3_t*>(output.data_ptr()),
+      .output_scale = static_cast<int32_t*>(output_scale.data_ptr()),
+      .topk_ids = static_cast<const int32_t*>(topk_ids.data_ptr()),
+      .expert_start_loc = static_cast<int32_t*>(expert_start_loc.data_ptr()),
+      .output_index = static_cast<int32_t*>(output_index.data_ptr()),
+      .num_tokens = num_tokens,
+      .hidden = hidden,
+      .num_groups = num_groups,
+      .all_tokens = static_cast<uint32_t>(P.unwrap()),
+  };
+  if (num_tokens == 0) return;
+  constexpr auto kernel = per_token_quant_ue8m0_contig_scatter_kernel<kGroupSize, kTopK, kUsePDL>;
   LaunchKernel(num_tokens, threads, device.unwrap())  //
       .enable_pdl(kUsePDL)(kernel, params);
 }

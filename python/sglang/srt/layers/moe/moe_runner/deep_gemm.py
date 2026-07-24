@@ -85,23 +85,6 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     return new_x.transpose(1, 2).contiguous().transpose(1, 2)
 
 
-def _quantize_bf16_standard_input_for_fp8(
-    hidden_states: torch.Tensor,
-    group_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    return sglang_per_token_group_quant_fp8(
-        hidden_states.contiguous(),
-        group_size=group_size,
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
-
-
 def copy_list_to_gpu_no_ce(arr: List[int]):
     from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
@@ -797,6 +780,7 @@ def _pre_permute_standard_to_deep_gemm_contig(
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
         ep_scatter,
+        ep_scatter_mxfp8_quant,
         fused_local_bincount_pad_sum,
         standard_contig_all_tokens_upper_bound,
     )
@@ -817,6 +801,7 @@ def _pre_permute_standard_to_deep_gemm_contig(
     if quant_info.w13_weight.dtype == torch.bfloat16:
         hidden_states_for_scatter = hidden_states.contiguous()
         hidden_states_scale = None
+        fuse_mxfp8_quant_scatter = False
         input_dtype = torch.bfloat16
         quant_block_size = 128
     else:
@@ -826,12 +811,10 @@ def _pre_permute_standard_to_deep_gemm_contig(
         )
         assert quant_info.block_shape is not None
         quant_block_size = quant_info.block_shape[1]
-        hidden_states_for_scatter, hidden_states_scale = (
-            _quantize_bf16_standard_input_for_fp8(
-                hidden_states,
-                quant_block_size,
-            )
-        )
+        assert deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        hidden_states_for_scatter = hidden_states.contiguous()
+        hidden_states_scale = None
+        fuse_mxfp8_quant_scatter = True
         input_dtype = torch.float8_e4m3fn
 
     # Routed top-k IDs are unique within each token. Conservatively allow fused
@@ -862,20 +845,12 @@ def _pre_permute_standard_to_deep_gemm_contig(
         device=hidden_states_device,
         dtype=input_dtype,
     )
-    if hidden_states_scale is not None:
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            scale_size = hidden_states_scale.shape[-1]
-            input_tensor_scale = torch.empty(
-                (scale_size, all_tokens),
-                device=hidden_states_device,
-                dtype=hidden_states_scale.dtype,
-            ).transpose(0, 1)
-        else:
-            input_tensor_scale = torch.empty(
-                (all_tokens, K // quant_block_size),
-                device=hidden_states_device,
-                dtype=hidden_states_scale.dtype,
-            )
+    if fuse_mxfp8_quant_scatter:
+        input_tensor_scale = torch.empty(
+            (K // quant_block_size // 4, all_tokens),
+            device=hidden_states_device,
+            dtype=torch.int32,
+        ).transpose(0, 1)
     else:
         input_tensor_scale = torch.empty(
             (1,),
@@ -889,22 +864,33 @@ def _pre_permute_standard_to_deep_gemm_contig(
     output_index = torch.empty_like(topk_ids, dtype=torch.int32)
     expert_start_loc = torch.empty_like(padded_counts)
 
-    ep_scatter(
-        hidden_states_for_scatter,
-        hidden_states_scale,
-        topk_ids,
-        padded_counts,
-        expert_start_loc,
-        input_tensor,
-        input_tensor_scale,
-        m_indices,
-        output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        quant_block_size=quant_block_size,
-    )
+    if fuse_mxfp8_quant_scatter:
+        ep_scatter_mxfp8_quant(
+            hidden_states_for_scatter,
+            topk_ids,
+            padded_counts,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            quant_block_size=quant_block_size,
+        )
+    else:
+        ep_scatter(
+            hidden_states_for_scatter,
+            hidden_states_scale,
+            topk_ids,
+            padded_counts,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            quant_block_size=quant_block_size,
+        )
     dispose_tensor(hidden_states_for_scatter)
-    if hidden_states_scale is not None:
-        dispose_tensor(hidden_states_scale)
     if hidden_states_for_scatter is not hidden_states:
         dispose_tensor(hidden_states)
 
