@@ -67,20 +67,11 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
-    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     print_warning_once,
 )
-
-# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
-# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
-# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
-# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
-_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
-_IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
     import deep_gemm
@@ -331,7 +322,13 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_sparse_q8", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+    "flashmla_kv",
+    "fa3",
+    "tilelang",
+    "triton",
+    "trtllm",
 ]
 
 
@@ -1997,32 +1994,6 @@ class DeepseekSparseAttnBackend(
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
-                # Triton prefill kernel reads q_nope/q_rope directly, skipping
-                # the concat (it splits q into main/tail internally anyway).
-                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
-                # tail=64, topk=2048); everything else uses TileLang.
-                if (
-                    _DSA_TRITON_PREFILL
-                    and _IS_GFX95
-                    and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-                    and layer.tp_q_head_num == 16
-                    and layer.v_head_dim == 512
-                    and (layer.head_dim - layer.v_head_dim) == 64
-                    and page_table_1.shape[-1] == 2048
-                    and q_nope.shape[0] >= 512
-                ):
-                    from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
-                        triton_sparse_mla_fwd,
-                    )
-
-                    return triton_sparse_mla_fwd(
-                        q_nope=q_nope,
-                        q_rope=q_rope,
-                        kv=kv_cache,
-                        indices=page_table_1.unsqueeze(1),
-                        sm_scale=layer.scaling,
-                        d_v=layer.v_head_dim,
-                    )
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -2030,6 +2001,19 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "triton":
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            return triton_sparse_mla_fwd(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2259,6 +2243,15 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "triton":
+            return self._forward_triton_decode(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
             )
         elif self.dsa_decode_impl == "fa3":
             return self._forward_fa3(
@@ -2640,6 +2633,28 @@ class DeepseekSparseAttnBackend(
 
         return tilelang_sparse_fwd(
             q=q_all,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+        )
+
+    def _forward_triton_decode(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        return triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,

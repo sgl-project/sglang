@@ -1842,8 +1842,8 @@ def calculate_mla_kv_cache_dim(
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        server_args.dsa_prefill_backend in ("tilelang", "aiter")
-        or server_args.dsa_decode_backend in ("tilelang", "aiter")
+        server_args.dsa_prefill_backend in ("tilelang", "triton", "aiter")
+        or server_args.dsa_decode_backend in ("tilelang", "triton", "aiter")
     ):
         return kv_cache_dim
 
