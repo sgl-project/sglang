@@ -385,6 +385,16 @@ class HiCacheFile(HiCacheStorage):
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
+        # Strict unified-kv SWA HiCache: the SWA window and its coupled c4/indexer
+        # overlap state persist as INDEPENDENT L3 pools coupled by key (sidecar
+        # C4_STATE->SWA + TRAILING_PAGES). The SWA blob is a pure window again (no
+        # A-gather tail packing), so its byte layout differs from the older
+        # ``_swapk1`` packed blobs -- namespace the whole cache by layout version so
+        # a stale packed blob cannot be read under the new independent layout. Bump
+        # the tag on any future SWA/state L3 layout change.
+        if envs.SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE.get():
+            self.config_suffix += "_swaind1"
+
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

@@ -823,6 +823,12 @@ class Envs:
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
 
+    # Strict bit-exact SWA HiCache for unified_kv (DeepSeek-V4): offload the SWA
+    # ring to host and restore it on reuse instead of reprefilling a 128-token
+    # tail. Sizing: --hicache-swa-offload-page-stride. OFF == #29417 best-effort (tail
+    # reprefill, no SWA host pool) -- cheaper for short-prefix workloads.
+    SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE = EnvBool(False)
+
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
