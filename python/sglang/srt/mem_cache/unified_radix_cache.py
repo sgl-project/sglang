@@ -475,9 +475,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         elif self.tree_core.drop_subtree_no_host(
                             node_id, tracker, device_frees, host_frees
                         ):
-                            # Free the dropped slots now so later backups in
-                            # this round can reuse the reclaimed host space.
-                            self._drain_frees(device_frees, host_frees)
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
                                 "due to host memory pressure, root node %d",
@@ -491,6 +488,9 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
+                    # Drain per victim, matching the pre-split inline frees
+                    # (keeps host space current for later backups this round).
+                    self._drain_frees(device_frees, host_frees)
             finally:
                 self.tree_core.evict_device_end(ct)
 
