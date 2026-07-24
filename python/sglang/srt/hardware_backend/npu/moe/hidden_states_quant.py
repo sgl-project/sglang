@@ -27,15 +27,26 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     """
     Dynamic per‑token quantisation of hidden states.
 
+    Set ``use_mx_quant`` for block-scaled dynamic quantisation. Otherwise, the
+    standard dynamic quantisation op is used.
+
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
+
+    def __init__(
+        self, quant_dtype: torch.dtype, use_mx_quant: bool = False
+    ) -> None:
+        super().__init__(quant_dtype)
+        self._op = (
+            torch.ops.npu.npu_dynamic_mx_quant
+            if use_mx_quant
+            else torch.ops.npu.npu_dynamic_quant
+        )
 
     def __call__(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        quantized, scale = torch.ops.npu.npu_dynamic_quant(
-            hidden_states, dst_type=self.quant_dtype
-        )
+        quantized, scale = self._op(hidden_states, dst_type=self.quant_dtype)
         return quantized, scale
 
 

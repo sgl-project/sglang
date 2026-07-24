@@ -164,14 +164,17 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUMXFP4W4A8MoEMethod
+#  NPUW4A8MXFP4MoEMethod
 # ---------------------------------------------------------------------------
-class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
+class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
     def __init__(self):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn, use_mx_quant=True
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -226,13 +229,8 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
             )
 
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
-                hidden_states,
-                axis=1,
-                round_mode="rint",
-                dst_type=torch.float8_e4m3fn,
-                block_size=32,
-                scale_alg=None,
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(
+                hidden_states
             )
         elif pertoken_scale is not None:
             pertoken_scale = pertoken_scale.reshape(
