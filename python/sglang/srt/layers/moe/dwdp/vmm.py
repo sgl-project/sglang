@@ -8,7 +8,11 @@ import logging
 from typing import Tuple
 
 import torch
-from cuda.bindings import driver as cuda
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    # For non-cuda platform.
+    cuda = None
 
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     check_drv,

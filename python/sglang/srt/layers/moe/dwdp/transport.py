@@ -9,7 +9,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from cuda.bindings import driver as cuda
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    # For non-cuda platform.
+    cuda = None
 
 from sglang.srt.distributed.device_communicators.vmm_utils import (
     check_drv,
