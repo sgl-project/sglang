@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.dllm.attention import build_dllm_prefill_blockwise_mask
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -169,6 +170,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -486,6 +488,13 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
+        # FlashInfer 0.6.12 resolves backend="auto" only on the first plan and
+        # then keeps that backend. On SM90, an unmasked first plan selects FA3,
+        # which does not support a later custom mask. Keep a dedicated FA2
+        # wrapper so masked and unmasked plans cannot poison each other's state.
+        self.prefill_wrapper_ragged_custom_mask = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend="fa2"
+        )
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -698,6 +707,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 ],
                 dim=0,
             ),
+        )
+
+    def _select_prefill_ragged_wrapper(
+        self, custom_mask: Optional[torch.Tensor]
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        return (
+            self.prefill_wrapper_ragged_custom_mask
+            if custom_mask is not None
+            else self.prefill_wrapper_ragged
         )
 
     def init_forward_metadata_out_graph(
@@ -975,6 +993,48 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
+            self_attention_custom_mask = None
+            if forward_batch.is_dllm_prefill:
+                assert forward_batch.dllm_config is not None
+                prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+                extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if prefix_lens_cpu is None:
+                    prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
+                if extend_lens_cpu is None:
+                    extend_lens_cpu = (
+                        forward_batch.extend_seq_lens.detach().cpu().tolist()
+                    )
+                self_attention_custom_mask = build_dllm_prefill_blockwise_mask(
+                    prefix_lens_cpu,
+                    extend_lens_cpu,
+                    forward_batch.dllm_config.block_size,
+                    forward_batch.input_ids.device,
+                    include_prefix=not use_ragged,
+                )
+                if self_attention_custom_mask is not None:
+                    expected_mask_numel = sum(
+                        extend_len
+                        * (extend_len if use_ragged else prefix_len + extend_len)
+                        for prefix_len, extend_len in zip(
+                            prefix_lens_cpu, extend_lens_cpu
+                        )
+                    )
+                    assert self_attention_custom_mask.numel() == expected_mask_numel, (
+                        "Unexpected dLLM prefill custom-mask size: "
+                        f"{self_attention_custom_mask.numel()} != "
+                        f"{expected_mask_numel}"
+                    )
+                    if self.dispatch_reason is not None:
+                        raise NotImplementedError(
+                            "Multi-block dLLM prefill custom masks currently "
+                            "require FlashInfer's single-wrapper full-attention path"
+                        )
+                    if self.enable_mis:
+                        raise NotImplementedError(
+                            "Multi-block dLLM prefill custom masks cannot be "
+                            "combined with multi-item scoring"
+                        )
+
             # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()
             if self.enable_mis:
@@ -998,8 +1058,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                self_attention_custom_mask=self_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 custom_kv_indices=self.dq_page_table,
+            )
+            ragged_wrapper = self._select_prefill_ragged_wrapper(
+                self_attention_custom_mask if use_ragged else None
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1007,6 +1071,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
                 swa_out_cache_loc=swa_out_cache_loc,
+                ragged_wrapper=ragged_wrapper,
             )
 
     def init_cuda_graph_state(
@@ -1353,11 +1418,15 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            ragged_wrapper = (
+                self.forward_metadata.ragged_wrapper or self.prefill_wrapper_ragged
+            )
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = ragged_wrapper.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1375,7 +1444,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = ragged_wrapper.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1766,6 +1835,9 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrapper_ragged_custom_mask = (
+            attn_backend.prefill_wrapper_ragged_custom_mask
+        )
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1790,6 +1862,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1810,6 +1883,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1840,6 +1914,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            self_attention_custom_mask=self_attention_custom_mask,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
         )
@@ -1858,6 +1933,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -1928,6 +2004,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                self_attention_custom_mask=self_attention_custom_mask,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -1992,6 +2069,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
     ):
@@ -2029,6 +2107,9 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                self_attention_custom_mask=(
+                    self_attention_custom_mask if wrapper_id == 0 else None
+                ),
             )
 
     def call_begin_forward(
@@ -2049,11 +2130,14 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        self_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
     ):
         bs = len(seq_lens)
+        if use_ragged and self_attention_custom_mask is not None:
+            wrapper_ragged = self.prefill_wrapper_ragged_custom_mask
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2091,7 +2175,11 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
-            custom_mask = cross_attention_custom_mask
+            custom_mask = (
+                self_attention_custom_mask
+                if not use_ragged and self_attention_custom_mask is not None
+                else cross_attention_custom_mask
+            )
         else:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
@@ -2123,6 +2211,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                custom_mask=self_attention_custom_mask,
             )
 
         if use_sliding_window_kv_pool:
