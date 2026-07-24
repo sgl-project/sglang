@@ -710,6 +710,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it (accepts <code>max</code>, <code>high</code>; empty means unset).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
