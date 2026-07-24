@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -155,7 +156,7 @@ class _FakeDeviceModule:
         yield
 
 
-class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
+class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
         if src_registry is not None:
@@ -454,6 +455,83 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+
+    def test_mamba_kernel_ascend_backup_then_load_roundtrip(self):
+        num_layers = 2
+        host_indices = torch.tensor([1, 3], dtype=torch.int64)
+        device_indices = torch.tensor([2, 5], dtype=torch.int64)
+        temporal = torch.arange(num_layers * 8 * 3, dtype=torch.float32).reshape(
+            num_layers, 8, 3
+        )
+        conv = (
+            torch.arange(num_layers * 8 * 2, dtype=torch.float32).reshape(
+                num_layers, 8, 2
+            )
+            / 8
+        ).to(torch.bfloat16)
+        device_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=temporal.clone(), conv=[conv.clone()])
+        )
+        expected_temporal = device_pool.mamba_cache.temporal[:, device_indices].clone()
+        expected_conv = device_pool.mamba_cache.conv[0][:, device_indices].clone()
+
+        host = MambaPoolHost.__new__(MambaPoolHost)
+        host.layout = "page_first_direct"
+        host.num_mamba_layers = num_layers
+        host.temporal_state_elem_size = 3
+        host.temporal_buffer = torch.zeros(
+            8, num_layers, 1, 3, dtype=torch.float32
+        )
+        host.conv_state_shapes = [(2,)]
+        host.conv_buffer = [
+            torch.zeros(8, num_layers, 1, 2, dtype=torch.bfloat16)
+        ]
+        host.temporal_staging_buffer = None
+        host.conv_staging_buffers = [None]
+        host._temporal_can_use_jit = False
+        host._conv_can_use_jit = [False]
+        host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
+        host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
+
+        host.backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend="kernel_ascend",
+        )
+        device_pool.mamba_cache.temporal.zero_()
+        device_pool.mamba_cache.conv[0].zero_()
+        for layer_id in range(num_layers):
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.temporal[:, device_indices], expected_temporal
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                device_pool.mamba_cache.conv[0][:, device_indices], expected_conv
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.temporal_buffer[host_indices].squeeze(2).transpose(0, 1),
+                expected_temporal,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                host.conv_buffer[0][host_indices].squeeze(2).transpose(0, 1),
+                expected_conv,
             )
         )
 
