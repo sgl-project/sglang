@@ -938,10 +938,21 @@ class KimiK3DeltaAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
         all_reduce_fusion: bool = False,
+        bfa_alt_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> None:
         super().__init__()
         self.all_reduce_fusion = all_reduce_fusion
+        # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
+        # hidden_states, so they can run concurrently with the wide fused
+        # [q,k,v,g] GEMM on the main stream (graphed decode/verify only).
+        # Same SM bound rationale as the MLA gate stream.
+        self._bfa_alt_stream = bfa_alt_stream
+        self._bfa_bs_limit = (
+            (128 if is_blackwell_supported() else 64)
+            if bfa_alt_stream is not None
+            else 0
+        )
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: all head-sharded params must follow the
         # attention-TP group (= tp under plain TP, = 1 under DP attention),
@@ -1308,17 +1319,46 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
-            fused_states, _ = self.fused_qkvg_proj(hidden_states)
-            qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
 
+                if (
+                    self._bfa_alt_stream is not None
+                    and get_is_capture_mode()
+                    and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
+                ):
+                    # Issue the tiny [f_a|b] + f_b GEMVs on the side stream,
+                    # then the wide [q,k,v,g] GEMM on the main stream; both
+                    # read only hidden_states. Join before the split's
+                    # consumers touch beta/forget_gate.
+                    alt = self._bfa_alt_stream
+                    cur = torch.cuda.current_stream()
+                    alt.wait_stream(cur)
+                    with torch.cuda.stream(alt):
+                        bfa = gemm(hidden_states, w)
+                        forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
+                        beta = bfa[..., n_fa : n_fa + n_b]
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    qkv, g_proj_states = torch.split(
+                        fused_states, self.split_sizes, dim=-1
+                    )
+                    cur.wait_stream(alt)
+                    return qkv, beta, forget_gate, g_proj_states
+
+                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                qkv, g_proj_states = torch.split(
+                    fused_states, self.split_sizes, dim=-1
+                )
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
+                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                qkv, g_proj_states = torch.split(
+                    fused_states, self.split_sizes, dim=-1
+                )
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -1630,6 +1670,11 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
                 all_reduce_fusion=self.all_reduce_fusion,
+                # Shared with the MLA gate stream: KDA and MLA layers never
+                # run concurrently within one forward, so the stream is free.
+                bfa_alt_stream=(
+                    alt_streams[2] if alt_streams is not None else None
+                ),
             )
         else:
             self.self_attn = KimiK3MLAAttention(
