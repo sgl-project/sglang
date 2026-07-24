@@ -302,7 +302,11 @@ class FutureMap:
 
         # Spec extras are gated by spec_algo, not by the payload's shape, so a
         # non-spec stash allocates no extra bufs (only output_tokens_buf).
-        self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
+        self.need_topk = (
+            self.spec_algo.is_some()
+            and self.spec_algo.need_topk()
+            and payload.topk_p is not None
+        )
         self.need_hidden_states = (
             self.spec_algo.is_some()
             and spec_need_hidden_states()
