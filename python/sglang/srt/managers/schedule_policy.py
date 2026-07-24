@@ -85,6 +85,15 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
     os.environ.get("IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD", "32")
 )
 
+# Opt-in experiment: run the waiting-queue radix pass even when the primary
+# scheduler policy is cache-agnostic, such as fcfs.
+ENABLE_CACHE_AGNOSTIC_IN_BATCH_PREFIX_CACHING = get_bool_env_var(
+    "SGLANG_ENABLE_CACHE_AGNOSTIC_IN_BATCH_PREFIX_CACHING"
+)
+IN_BATCH_PREFIX_CACHING_CACHE_AGNOSTIC_MAX_QUEUE_SCAN = int(
+    os.environ.get("IN_BATCH_PREFIX_CACHING_CACHE_AGNOSTIC_MAX_QUEUE_SCAN", "128")
+)
+
 
 IGNORE_EOS_RESERVE_TOKENS = 1
 
@@ -203,6 +212,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+            self._maybe_apply_cache_agnostic_in_batch_prefix_caching(waiting_queue)
             return
 
         if isinstance(policy, CacheAwarePolicy):
@@ -233,6 +243,7 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+            self._maybe_apply_cache_agnostic_in_batch_prefix_caching(waiting_queue)
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
@@ -265,48 +276,92 @@ class SchedulePolicy:
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
         """
-        temporary_deprioritized: Set[int] = set()
-        self.waiting_queue_radix_tree.reset()
-
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
-            extra_key = r.extra_key
-            match_result = match_prefix_for_req(
-                self.tree_cache, r, prefix_ids, include_req=True
-            )
+            match_prefix_for_req(self.tree_cache, r, prefix_ids, include_req=True)
 
-            # NOTE(sang): This logic is for in-batch prefix caching;
-            # If there are more than 1 request that have small matching prefix from
-            # existing cache, but all those requests share the same prefix, we prefer
-            # to schedule only one of them so that we can increase the cache hit rate.
-            # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
-            # threshold means we cannot use in-batch prefix caching for short prefixes.
-            # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+        return self._compute_in_batch_prefix_matches(waiting_queue)
+
+    def _compute_in_batch_prefix_matches(
+        self, waiting_queue: List[Req], max_queue_scan: Optional[int] = None
+    ) -> Set[int]:
+        # NOTE(sang): This logic is for in-batch prefix caching;
+        # If there are more than 1 request that have small matching prefix from
+        # existing cache, but all those requests share the same prefix, we prefer
+        # to schedule only one of them so that we can increase the cache hit rate.
+        # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
+        # threshold means we cannot use in-batch prefix caching for short prefixes.
+        # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
+        if IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD < 0:
+            return set()
+
+        temporary_deprioritized: Set[int] = set()
+        self.waiting_queue_radix_tree.reset()
+        scanned_queue = waiting_queue
+        if max_queue_scan is not None and max_queue_scan > 0:
+            scanned_queue = waiting_queue[:max_queue_scan]
+
+        for r in scanned_queue:
+            if len(r.prefix_indices) > IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                continue
+
+            prefix_ids = r.origin_input_ids + r.output_ids
+            extra_key = r.extra_key
+            match_result = self.waiting_queue_radix_tree.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                )
+            )
+            if envs.SGLANG_RADIX_FORCE_MISS.get():
+                match_result = zero_match_result(
+                    self.waiting_queue_radix_tree, match_result
+                )
+            in_batch_matching_prefixes = match_result.device_indices
+            if (
+                len(in_batch_matching_prefixes)
+                >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
+            ):
+                temporary_deprioritized.add(r.rid)
+            else:
+                self.waiting_queue_radix_tree.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        value=torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
                 )
-                if envs.SGLANG_RADIX_FORCE_MISS.get():
-                    match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result
-                    )
-                in_batch_matching_prefixes = match_result.device_indices
-                if (
-                    len(in_batch_matching_prefixes)
-                    >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-                ):
-                    temporary_deprioritized.add(r.rid)
-                else:
-                    # Insert with a dummy key
-                    self.waiting_queue_radix_tree.insert(
-                        InsertParams(
-                            key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
-                        )
-                    )
+
         return temporary_deprioritized
+
+    def _maybe_apply_cache_agnostic_in_batch_prefix_caching(
+        self, waiting_queue: List[Req]
+    ) -> None:
+        for req in waiting_queue:
+            req.defer_for_in_batch_prefix_cache = False
+
+        if (
+            not ENABLE_CACHE_AGNOSTIC_IN_BATCH_PREFIX_CACHING
+            or getattr(self.tree_cache, "disable", True)
+            or not self.tree_cache.supports_fast_match_prefix()
+            or get_server_args().disaggregation_mode == "decode"
+        ):
+            return
+
+        temporary_deprioritized = self._compute_in_batch_prefix_matches(
+            waiting_queue,
+            max_queue_scan=IN_BATCH_PREFIX_CACHING_CACHE_AGNOSTIC_MAX_QUEUE_SCAN,
+        )
+        if temporary_deprioritized:
+            for req in waiting_queue:
+                req.defer_for_in_batch_prefix_cache = (
+                    req.rid in temporary_deprioritized
+                )
+            SchedulePolicy._stable_deprioritize(waiting_queue, temporary_deprioritized)
+
+    @staticmethod
+    def _stable_deprioritize(
+        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        waiting_queue.sort(key=lambda r: r.rid in temporary_deprioritized)
 
     @staticmethod
     def _sort_by_longest_prefix(
