@@ -448,6 +448,8 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
  * @param write_plan        `[num_q_tokens,  8]` uint8 (output)
  * @param compress_ratio 4 for c4, 128 for c128
+ * @param verify_width Number of verifier rows that must be rewritten; 0 keeps
+ *                     the default prefill behavior
  * @param use_cuda_graph Whether the plans will be used with cuda graph (affects padding)
  * @return (compress plan tensor, write plan tensor)
  */
@@ -462,6 +464,7 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t compress_ratio,
     const int32_t swa_page_size,
     const int32_t ring_size,
+    const int32_t verify_width,
     const bool use_cuda_graph) {
   auto B = SymbolicSize{"batch_size"};
   auto N = SymbolicSize{"num_q_tokens"};
@@ -507,12 +510,13 @@ inline PrefillPlan plan_compress_prefill(
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
+  RuntimeCheck(0 <= verify_width && verify_width <= ring_size - compress_ratio);
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
 
   constexpr int32_t kMaxMTPDraftTokens = 4;
-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
+  const auto mtp_pad = verify_width > 0 ? verify_width : std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
 
   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
@@ -573,7 +577,9 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    const int32_t default_first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    const int32_t first_w_pos =
+        verify_width > 0 ? std::min(default_first_w_pos, seq_len - verify_width) : default_first_w_pos;
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
