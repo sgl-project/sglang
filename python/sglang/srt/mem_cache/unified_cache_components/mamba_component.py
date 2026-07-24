@@ -22,9 +22,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
-    MambaEvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
+    MambaEvictExcessPathStates,
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
@@ -822,12 +822,15 @@ class MambaComponent(TreeComponent):
         if isinstance(action, MambaEvictExcessPathStates):
             device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
             host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-            self._evict_excess_path_states(
-                self.tree_core.node_by_id(action.tail_node_id),
-                device_frees,
-                host_frees,
-            )
-            self.cache._drain_frees(device_frees, host_frees)
+            # Drain even if the walk raises so tombstoned slots are not leaked.
+            try:
+                self._evict_excess_path_states(
+                    self.tree_core.node_by_id(action.tail_node_id),
+                    device_frees,
+                    host_frees,
+                )
+            finally:
+                self.cache._drain_frees(device_frees, host_frees)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

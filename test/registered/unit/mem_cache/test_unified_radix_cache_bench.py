@@ -566,7 +566,7 @@ def bench_lock_unlock(
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
         r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        if r.last_device_node != env.tree.root_node:
+        if r.last_device_node != env.tree.root_node.id:
             nodes.append(r.last_device_node)
     if not nodes:
         return BenchResult("lock_unlock", 0, 0, 0, [])
