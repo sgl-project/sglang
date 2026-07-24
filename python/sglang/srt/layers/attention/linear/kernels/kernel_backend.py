@@ -42,6 +42,16 @@ class LinearAttnKernelBase(ABC):
         **kwargs,
     ) -> tuple: ...
 
+    def build_extend_prep(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_pool_size: int,
+    ) -> object | None:
+        """Build backend-specific metadata that can be reused across layers."""
+        return None
+
     def target_verify(
         self,
         A_log: torch.Tensor,
