@@ -55,6 +55,10 @@ def _make_batch_str_output() -> BatchStrOutput:
             {"device": 3, "host": 0},
             {"device": 1, "host": 3},
         ],
+        cached_tokens_by_component=[
+            {"full": {"device": 3}},
+            {"full": {"device": 1, "host": 3}, "swa": {"device": 2}},
+        ],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -90,6 +94,10 @@ class TestMultiTokenizerMixin(unittest.TestCase):
         self.assertEqual(
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
+        )
+        self.assertEqual(
+            single_output.cached_tokens_by_component,
+            [{"full": {"device": 1, "host": 3}, "swa": {"device": 2}}],
         )
 
     def test_get_tokenizer_worker_class_uses_default(self):

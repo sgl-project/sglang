@@ -2999,6 +2999,11 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                loaded_tokens_by_component = (
+                    self.tree_cache.pop_prefetch_loaded_tokens_by_component(req.rid)
+                )
+                if loaded_tokens_by_component:
+                    req.storage_hit_tokens_by_component = loaded_tokens_by_component
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

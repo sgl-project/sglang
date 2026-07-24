@@ -174,6 +174,9 @@ class MatchResult(NamedTuple):
                             window) and will be load-back into the SWA device pool.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
+        matched_tokens_by_component: Cached token counts matched for each cache
+                            component and device/host source. Storage attribution
+                            is added separately after async prefetch completes.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -186,8 +189,21 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
     swa_host_hit_length: int = 0
     mamba_host_hit_length: int = 0
+    matched_tokens_by_component: Optional[dict[str, dict[str, int]]] = None
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+
+    def with_matched_tokens(self, component: str, **sources: int) -> MatchResult:
+        breakdown = {
+            name: dict(source_counts)
+            for name, source_counts in (self.matched_tokens_by_component or {}).items()
+        }
+        source_counts = {name: value for name, value in sources.items() if value > 0}
+        if source_counts:
+            breakdown[component] = source_counts
+        else:
+            breakdown.pop(component, None)
+        return self._replace(matched_tokens_by_component=breakdown or None)
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -205,6 +221,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        matched_tokens_by_component=None,
     )
 
 
@@ -343,6 +360,39 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_mamba(self) -> bool:
         return False
+
+    @staticmethod
+    def _nonzero_cache_sources(**sources: int) -> dict[str, int]:
+        return {source: value for source, value in sources.items() if value > 0}
+
+    @classmethod
+    def _cached_tokens_for_component(
+        cls,
+        component: str,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        sources = cls._nonzero_cache_sources(
+            device=device,
+            host=host,
+            storage=storage,
+        )
+        return {component: sources} if sources else {}
+
+    def build_cached_tokens_by_component(
+        self,
+        req: Req,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        return {}
+
+    def pop_prefetch_loaded_tokens_by_component(self, req_id: str) -> dict[str, int]:
+        return {}
 
     def supports_streaming_session(self) -> bool:
         return False

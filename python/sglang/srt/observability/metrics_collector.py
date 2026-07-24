@@ -1526,6 +1526,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
+        self.cached_tokens_by_component_total = Counter(
+            name="sglang:cached_tokens_by_component_total",
+            documentation="Number of cached tokens by cache component and source.",
+            labelnames=list(labels.keys()) + ["component", "cache_source"],
+        )
 
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
@@ -1657,6 +1662,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         e2e_latency: float,
         has_grammar: bool,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
+        cached_tokens_by_component: Optional[Dict[str, Dict[str, int]]] = None,
         spec_verify_ct: int = 0,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
@@ -1688,6 +1694,30 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 # Fallback for backward compatibility
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
+        # In PD, prefill owns cache-source attribution. Skip decode-local values
+        # to avoid double-counting the same request across both engines.
+        if cached_tokens_by_component and labels.get("engine_type") != "decode":
+            storage_backend = "unknown"
+            if cached_tokens_details:
+                storage_backend = (
+                    cached_tokens_details.get("storage_backend") or "unknown"
+                )
+            for component, source_counts in cached_tokens_by_component.items():
+                for source, value in source_counts.items():
+                    if value <= 0:
+                        continue
+                    source_label = (
+                        f"storage_{storage_backend}" if source == "storage" else source
+                    )
+                    component_labels = {
+                        **labels,
+                        "component": component,
+                        "cache_source": source_label,
+                    }
+                    self.cached_tokens_by_component_total.labels(
+                        **component_labels
+                    ).inc(value)
 
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:

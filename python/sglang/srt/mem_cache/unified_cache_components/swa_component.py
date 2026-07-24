@@ -150,12 +150,15 @@ class SWAComponent(TreeComponent):
     ) -> MatchResult:
         ct = self.component_type
         n_swa = 0
+        swa_device_hit = 0
         swa_host_hit = 0
+        swa_host_tokens = 0
         node = result.best_match_node
         root = self.cache.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is not None:
+                swa_device_hit += min(len(cd.value), self.sliding_window_size - n_swa)
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
                 # TODO(hzh): load_back may currently restore a full host-tombstone
@@ -164,14 +167,19 @@ class SWAComponent(TreeComponent):
                 # worth of pages, cap swa_host_hit at sliding_window_size
                 # here so the scheduler budget matches the actual device-pool
                 # consumption.
+                swa_host_tokens += min(
+                    len(cd.host_value), self.sliding_window_size - n_swa
+                )
                 swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
             else:
                 break
             node = node.parent
-        if swa_host_hit > 0:
-            return result._replace(
-                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit)
+        if swa_device_hit > 0 or swa_host_tokens > 0:
+            return result.with_matched_tokens(
+                str(ct), device=swa_device_hit, host=swa_host_tokens
+            )._replace(
+                swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
             )
         return result
 
@@ -721,7 +729,7 @@ class SWAComponent(TreeComponent):
         *,
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
-    ) -> None:
+    ) -> int:
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
@@ -729,7 +737,7 @@ class SWAComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
-            return
+            return 0
 
         if phase == CacheTransferPhase.LOAD_BACK:
             assert transfers and transfers[0].device_indices is not None
@@ -749,16 +757,16 @@ class SWAComponent(TreeComponent):
                 allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
-            return
+            return 0
 
         if phase == CacheTransferPhase.PREFETCH:
-            self._commit_prefetch(
+            return self._commit_prefetch(
                 node,
                 transfers,
                 insert_result=insert_result,
                 pool_storage_result=pool_storage_result,
             )
-            return
+        return 0
 
     def _release_swa_host(self, host_indices: torch.Tensor) -> None:
         if host_indices is not None and host_indices.numel() > 0:
@@ -787,7 +795,7 @@ class SWAComponent(TreeComponent):
         *,
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
-    ) -> None:
+    ) -> int:
         """Fill the prefetched SWA window onto the leaf→anchor path.
 
         All-or-nothing over one full window: ``loaded_pages`` is the cross-rank
@@ -797,7 +805,7 @@ class SWAComponent(TreeComponent):
         tombstones and releasing slices that already have host_value.
         """
         if not transfers:
-            return
+            return 0
         ct = self.component_type
         page_size = self.cache.page_size
         host_indices = transfers[0].host_indices
@@ -816,12 +824,14 @@ class SWAComponent(TreeComponent):
             or loaded_pages < window_require_pages
         ):
             self._release_swa_host(host_indices)
-            return
+            return 0
 
         # Buffer covers token range [loaded_start, total_len).
         loaded_start = insert_result.total_len - window_require_pages * page_size
+        active_window_start = insert_result.total_len - self.sliding_window_size
 
         # Walk leaf → anchor; ``pos`` is the right edge of ``cur`` in tokens.
+        committed_tokens = 0
         pos, cur = insert_result.total_len, target
         while cur is not anchor and pos > loaded_start:
             node_start = pos - len(cur.key)
@@ -833,10 +843,14 @@ class SWAComponent(TreeComponent):
 
             cd = cur.component_data[ct]
             if cd.host_value is None and fill_len > 0:
-                # Tombstone: split off the in-buffer tail if needed, then fill.
+                served_from_device = cd.value is not None
+                # Split off the in-buffer tail if needed, then retain its host copy.
                 if fill_start > node_start:
                     self.cache._split_node(cur.key, cur, fill_start - node_start)
                 self._attach_swa_host_value(cur, slice_)
+                if not served_from_device:
+                    attributed_start = max(fill_start, active_window_start)
+                    committed_tokens += max(0, pos - attributed_start)
             else:
                 # Already has SWA (or empty overlap): drop this slice.
                 self._release_swa_host(slice_)
@@ -847,6 +861,7 @@ class SWAComponent(TreeComponent):
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
             self._release_swa_host(host_indices[: pos - loaded_start])
+        return committed_tokens
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

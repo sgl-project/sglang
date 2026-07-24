@@ -52,6 +52,11 @@ class _StubArgs:
         self.stat_loggers = stat_loggers
 
 
+class _TokenizerArgs(_StubArgs):
+    prompt_tokens_buckets = None
+    generation_tokens_buckets = None
+
+
 class TestCollectorClassAttrs(unittest.TestCase):
     """All five collectors expose four DI hook class attrs, all defaulting to
     None so the existing prometheus_client backend is used unchanged."""
@@ -127,9 +132,49 @@ class TestResolveCollectorClass(unittest.TestCase):
         self.assertEqual(STAT_LOGGER_ROLE_EXPERT_DISPATCH, "expert_dispatch")
 
 
+class _RecordingGauge:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.calls = []
+        self._labels = {}
+        type(self).instances.append(self)
+
+    def labels(self, **kwargs):
+        self._labels = kwargs
+        return self
+
+    def set(self, value):
+        self.calls.append(("set", self._labels, value))
+
+    def inc(self, amount=1):
+        self.calls.append(("inc", self._labels, amount))
+
+
+class _RecordingCounter(_RecordingGauge):
+    pass
+
+
+class _RecordingHistogram(_RecordingGauge):
+    def observe(self, value):
+        self.calls.append(("observe", self._labels, value))
+
+
+class _RecordingSummary(_RecordingGauge):
+    def observe(self, value):
+        self.calls.append(("observe", self._labels, value))
+
+
 class TestDefaultBackend(unittest.TestCase):
-    """Without any subclass override, collectors instantiate the real
-    prometheus_client classes; the existing behavior is unchanged."""
+    """Collector backend behavior and component cache metric emissions."""
+
+    def setUp(self):
+        _RecordingGauge.instances = []
+        _RecordingCounter.instances = []
+        _RecordingHistogram.instances = []
+        _RecordingSummary.instances = []
 
     def test_default_path_uses_prometheus_client(self):
         labels = {"cache_type": "test_default"}
@@ -138,6 +183,93 @@ class TestDefaultBackend(unittest.TestCase):
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
         )
+
+    def test_tokenizer_cached_tokens_by_component_metric_reports_sources(self):
+        class RaySwapTokenizer(TokenizerMetricsCollector):
+            _counter_cls = _RecordingCounter
+            _histogram_cls = _RecordingHistogram
+
+        collector = RaySwapTokenizer(server_args=_TokenizerArgs(), labels={})
+        collector.observe_one_finished_request(
+            labels={},
+            prompt_tokens=10,
+            generation_tokens=1,
+            cached_tokens=10,
+            e2e_latency=0.1,
+            has_grammar=False,
+            cached_tokens_details={
+                "device": 6,
+                "host": 0,
+                "storage": 4,
+                "storage_backend": "MooncakeStore",
+            },
+            cached_tokens_by_component={
+                "full": {"device": 6, "storage": 4},
+                "swa": {"device": 3, "host": 2},
+            },
+        )
+
+        component_counter = next(
+            c
+            for c in _RecordingCounter.instances
+            if c.kwargs["name"] == "sglang:cached_tokens_by_component_total"
+        )
+        self.assertEqual(
+            component_counter.calls,
+            [
+                (
+                    "inc",
+                    {"component": "full", "cache_source": "device"},
+                    6,
+                ),
+                (
+                    "inc",
+                    {"component": "full", "cache_source": "storage_MooncakeStore"},
+                    4,
+                ),
+                ("inc", {"component": "swa", "cache_source": "device"}, 3),
+                ("inc", {"component": "swa", "cache_source": "host"}, 2),
+            ],
+        )
+        cached_tokens_counter = next(
+            c
+            for c in _RecordingCounter.instances
+            if c.kwargs["name"] == "sglang:cached_tokens_total"
+        )
+        full_component_calls = [
+            (method, {"cache_source": labels["cache_source"]}, value)
+            for method, labels, value in component_counter.calls
+            if labels["component"] == "full"
+        ]
+        self.assertEqual(full_component_calls, cached_tokens_counter.calls)
+
+    def test_tokenizer_cached_tokens_by_component_metric_skips_decode_engine(self):
+        class RaySwapTokenizer(TokenizerMetricsCollector):
+            _counter_cls = _RecordingCounter
+            _histogram_cls = _RecordingHistogram
+
+        collector = RaySwapTokenizer(
+            server_args=_TokenizerArgs(), labels={"engine_type": ""}
+        )
+        collector.observe_one_finished_request(
+            labels={"engine_type": "decode"},
+            prompt_tokens=10,
+            generation_tokens=1,
+            cached_tokens=10,
+            e2e_latency=0.1,
+            has_grammar=False,
+            cached_tokens_details={"storage_backend": "MooncakeStore"},
+            cached_tokens_by_component={
+                "full": {"device": 6, "storage": 4},
+            },
+        )
+
+        component_counter = next(
+            c
+            for c in _RecordingCounter.instances
+            if c.kwargs["name"] == "sglang:cached_tokens_by_component_total"
+        )
+        self.assertEqual(component_counter.calls, [])
 
 
 if __name__ == "__main__":

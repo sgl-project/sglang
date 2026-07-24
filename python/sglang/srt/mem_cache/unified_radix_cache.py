@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -479,6 +480,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_loaded_tokens_by_component_by_reqid: dict[str, dict[str, int]] = (
+            {}
+        )
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
@@ -2023,6 +2027,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
+    def _commit_prefetched_component_tokens(
+        self,
+        last_host_node: UnifiedTreeNode,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        insert_result: InsertResult,
+        pool_storage_result: Optional[PoolTransferResult],
+    ) -> dict[str, int]:
+        committed_tokens = {}
+        for component_type, transfers in comp_xfers.items():
+            count = (
+                self.components[component_type].commit_hicache_transfer(
+                    last_host_node,
+                    CacheTransferPhase.PREFETCH,
+                    transfers,
+                    insert_result=insert_result,
+                    pool_storage_result=pool_storage_result,
+                )
+                or 0
+            )
+            if count > 0:
+                committed_tokens[str(component_type)] = count
+        return committed_tokens
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -2068,14 +2095,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
-        for ct, xfers in comp_xfers.items():
-            self.components[ct].commit_hicache_transfer(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                xfers,
-                insert_result=insert_result,
-                pool_storage_result=operation.pool_storage_result,
-            )
+        committed_component_tokens = self._commit_prefetched_component_tokens(
+            last_host_node,
+            comp_xfers,
+            insert_result,
+            operation.pool_storage_result,
+        )
 
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]
@@ -2089,6 +2114,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        self.prefetch_loaded_tokens_by_component_by_reqid[req_id] = (
+            committed_component_tokens
+        )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2193,8 +2221,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_loaded_tokens_by_component(self, req_id: str) -> dict[str, int]:
+        return self.prefetch_loaded_tokens_by_component_by_reqid.pop(req_id, {})
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_loaded_tokens_by_component_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2665,6 +2697,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components
+
+    def build_cached_tokens_by_component(
+        self,
+        req: Req,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        breakdown = self._cached_tokens_for_component(
+            str(ComponentType.FULL),
+            device=device,
+            host=host,
+            storage=storage,
+        )
+
+        if self.supports_swa():
+            component = str(ComponentType.SWA)
+            matched_sources = req.matched_tokens_by_component.get(component, {})
+            host = max(0, matched_sources.get("host", 0))
+            storage = min(
+                host,
+                max(
+                    0,
+                    req.storage_hit_tokens_by_component.get(component, 0),
+                ),
+            )
+            sources = self._nonzero_cache_sources(
+                device=max(0, matched_sources.get("device", 0)),
+                host=host - storage,
+                storage=storage,
+            )
+            if sources:
+                breakdown[component] = sources
+
+        return breakdown
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

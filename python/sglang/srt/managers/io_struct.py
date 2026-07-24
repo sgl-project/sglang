@@ -1274,6 +1274,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+    # Cached token counts grouped by cache component and source.
+    cached_tokens_by_component: Optional[List[Optional[Dict[str, Dict[str, int]]]]] = (
+        None
+    )
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
@@ -1356,6 +1360,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+    # Cached token counts grouped by cache component and source.
+    cached_tokens_by_component: Optional[List[Optional[Dict[str, Dict[str, int]]]]] = (
+        None
+    )
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 

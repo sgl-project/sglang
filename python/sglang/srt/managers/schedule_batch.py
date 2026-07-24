@@ -896,6 +896,7 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        self.matched_tokens_by_component: Dict[str, Dict[str, int]] = {}
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -903,6 +904,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        self.storage_hit_tokens_by_component: Dict[str, int] = {}
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1004,6 +1006,7 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.cached_tokens_by_component: Dict[str, Dict[str, int]] = {}
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
@@ -1268,6 +1271,9 @@ class Req(ReqDllmMixin):
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
+            )
+            self.matched_tokens_by_component = (
+                match_result.matched_tokens_by_component or {}
             )
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
@@ -2300,6 +2306,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+                    req.cached_tokens_by_component = (
+                        self.tree_cache.build_cached_tokens_by_component(
+                            req,
+                            device=device_portion,
+                            host=host_portion,
+                            storage=storage_portion,
+                        )
+                    )
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
