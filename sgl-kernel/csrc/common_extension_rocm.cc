@@ -68,7 +68,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   /*
    * From csrc/allreduce
+   *
+   * CDNA-only: these collectives are not built on RDNA, so
+   * skip their registration there -- otherwise the extension links against
+   * symbols that were never compiled.
    */
+#ifndef SGL_IS_RDNA
   m.def(
       "init_custom_ar(Tensor meta, Tensor rank_data, "
       "str[] handles, int[] offsets, int rank, "
@@ -128,6 +133,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // !SGL_IS_RDNA
 
   /*
    * From csrc/moe
