@@ -36,6 +36,9 @@ class HybridAttnBackend(AttentionBackend):
         self.needs_cpu_seq_lens = (
             prefill_backend.needs_cpu_seq_lens or decode_backend.needs_cpu_seq_lens
         )
+        # Speculative-decoding helpers (build_eagle_verify_input) read these off
+        # model_runner.attn_backend directly, so mirror the sub-backends here.
+        self.max_context_len = model_runner.model_config.context_len
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
@@ -91,6 +94,17 @@ class HybridAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
+
+    def _spec_verify_backend(self) -> AttentionBackend:
+        return self.decode_backend if self.spec_attn_is_decode else self.prefill_backend
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return self._spec_verify_backend().get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        self._spec_verify_backend().update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
 
     def forward(
         self,
