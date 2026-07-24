@@ -35,23 +35,18 @@ logger = logging.getLogger(__name__)
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    The HPC-Ops bf16xfp32 router GEMM caches the fp32 weight split into
-    persistent buffers whose addresses captured CUDA graphs replay; in-place
-    loader writes (``param.data.copy_()``) are invisible to that cache, so
-    an update would silently keep serving the old router weights. Returns an
-    error message when such a cache is active, None otherwise.
+    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
+    writes are invisible to it, so an update would silently keep serving the
+    old weights. The check is startup-determined and rank-uniform, so an
+    update never proceeds on some workers while rejected on others.
     """
-    from sglang.kernels.ops.attention.dsv4.gemm import (
-        bf16xfp32_weight_split_cache_active,
-    )
+    from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
 
-    if bf16xfp32_weight_split_cache_active():
+    if hpc_bf16xfp32_gemm_enabled():
         return (
             "Online weight updates are not supported while the HPC-Ops "
-            "bf16xfp32 router GEMM optimization is active (the cached "
-            "weight split would keep serving the old weights). Restart the "
-            "server, or launch with the optimization disabled to use "
-            "online weight updates."
+            "bf16xfp32 GEMM optimization is enabled: the cached weight "
+            "split would keep serving the old weights."
         )
     return None
 

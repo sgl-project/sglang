@@ -13,8 +13,9 @@ import torch
 from sglang.kernels.ops.attention.dsv4.gemm import (
     _hpc_gemm_bf16xfp32_available,
     _linear_bf16_fp32_hpc,
-    bf16xfp32_weight_split_cache_active,
+    hpc_bf16xfp32_gemm_enabled,
     linear_bf16_fp32,
+    mark_hpc_bf16xfp32_gemm_enabled,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +34,7 @@ class TestLinearBf16Fp32Hpc(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        mark_hpc_bf16xfp32_gemm_enabled()
         torch.manual_seed(0)
 
     def test_matches_fp32_reference(self):
@@ -71,27 +73,17 @@ class TestLinearBf16Fp32Hpc(CustomTestCase):
         # The kernel leaves the cached split-K workspace zeroed.
         self.assertTrue((cache[3] == 0).all().item())
 
-    def test_online_weight_updates_rejected_while_cache_active(self):
-        # This optimization does not support SGLang's online weight-update
-        # APIs: the loaders write in place (param.data.copy_()), which the
-        # split cache cannot observe. The weight updater must reject updates
-        # while a cache is active instead of serving stale router logits.
+    def test_online_weight_updates_rejected_when_enabled(self):
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             _unsupported_derived_weight_cache_error,
         )
 
-        k, n = _ROUTER_SHAPES[1]
-        x = torch.randn(16, k, dtype=torch.bfloat16, device="cuda")
-        w = torch.randn(n, k, dtype=torch.float32, device="cuda")
-        _linear_bf16_fp32_hpc(x, w)  # populate the cache
-        self.assertTrue(bf16xfp32_weight_split_cache_active())
+        self.assertTrue(hpc_bf16xfp32_gemm_enabled())
         self.assertIsNotNone(_unsupported_derived_weight_cache_error())
 
     def test_split_buffers_stable_for_cuda_graph(self):
-        # Captured graphs replay the split buffers by address. The cache key
-        # is layout-only (no _version), so even an in-place write to the
-        # weight must never reallocate the buffers; content updates are
-        # rejected at the weight-update APIs instead.
+        # Captured graphs replay the split buffers by address; an in-place
+        # weight write must never reallocate them.
         k, n = _ROUTER_SHAPES[1]
         x = torch.randn(16, k, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(n, k, dtype=torch.float32, device="cuda")
@@ -113,9 +105,6 @@ class TestLinearBf16Fp32Hpc(CustomTestCase):
             out, torch.mm(x.float(), w_orig.t()), rtol=0.08, atol=0.01
         )
 
-        # An in-place write (the loaders' param.data.copy_()) must not churn
-        # the cached buffers: the captured addresses stay valid, and both
-        # eager and replay keep consistently using the frozen split.
         w.data.copy_(torch.randn_like(w))
         out_eager = _linear_bf16_fp32_hpc(x, w)
         cache_after = getattr(w, "_sglang_bf16xfp32_weight_cache")
