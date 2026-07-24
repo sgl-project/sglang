@@ -371,6 +371,7 @@ class HeliosCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             skip_sequence_parallel=True,
+            is_cross_attention=True,
         )
 
     def project_kv(self, encoder_hidden_states):

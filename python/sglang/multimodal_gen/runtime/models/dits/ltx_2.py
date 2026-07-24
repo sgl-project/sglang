@@ -673,6 +673,7 @@ class LTX2Attention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
+        is_cross_attention: bool = False,
     ) -> None:
         super().__init__()
 
@@ -776,6 +777,7 @@ class LTX2Attention(nn.Module):
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                is_cross_attention=is_cross_attention,
             )
         else:
             self.attn = USPAttention(
@@ -789,6 +791,7 @@ class LTX2Attention(nn.Module):
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                is_cross_attention=is_cross_attention,
             )
 
     def forward(
@@ -1073,6 +1076,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn2",
             quant_config=quant_config,
+            is_cross_attention=True,
         )
         self.audio_attn2 = LTX2Attention(
             query_dim=audio_dim,
@@ -1086,6 +1090,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn2",
             quant_config=quant_config,
+            is_cross_attention=True,
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
@@ -1102,6 +1107,7 @@ class LTX2TransformerBlock(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_to_video_attn",
             quant_config=quant_config,
+            is_cross_attention=True,
         )
         self.video_to_audio_attn = LTX2Attention(
             query_dim=audio_dim,
@@ -1120,6 +1126,7 @@ class LTX2TransformerBlock(nn.Module):
             ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,
+            is_cross_attention=True,
         )
 
         # 4. Feedforward layers
