@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.constants import (
@@ -18,6 +19,7 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
@@ -289,6 +291,11 @@ class SchedulerWeightUpdaterManager:
                     all_payloads, payload, group=self.tp_cpu_group
                 )
                 payload = all_payloads
+            if payload is not None:
+                # Normalize to one ChecksumInfo per rank so the wire shape is a
+                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
+                per_rank = payload if isinstance(payload, list) else [payload]
+                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )

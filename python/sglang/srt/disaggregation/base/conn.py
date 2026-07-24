@@ -49,7 +49,13 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Number of rows before the slice axis in each per-slot state tensor.
+    state_slice_outer_counts: List[List[int]]
     is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int

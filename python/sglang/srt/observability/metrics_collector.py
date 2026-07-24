@@ -1934,7 +1934,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
-            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )

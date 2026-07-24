@@ -209,6 +209,15 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
             obj, end = JSONDecoder().raw_decode(input_str, start)
             return obj, end
         raise
+    except AssertionError as e:
+        # partial_json_parser.fix_fast() asserts on some partial/ambiguous inputs
+        # (e.g. trailing non-whitespace after an otherwise-fixable prefix) instead
+        # of signaling "incomplete". Convert to JSONDecodeError so streaming
+        # callers treat it as not-yet-complete (wait for more tokens) rather than
+        # raising and failing the request.
+        raise JSONDecodeError(
+            "partial_json_parser assertion (treat as incomplete)", input_str, 0
+        ) from e
 
 
 def _is_complete_json(input_str: str) -> bool:
@@ -311,6 +320,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 # If all types are the same, return unified type
                 if len(set(types)) == 1:
                     return types[0]
+                # If it's an optional type, return original type.
+                if len(set(types)) == 2 and "null" in types:
+                    return [t for t in types if t != "null"][0]
                 # When types differ, prioritize string (safest)
                 if "string" in types:
                     return "string"

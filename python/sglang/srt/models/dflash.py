@@ -404,9 +404,13 @@ class DFlashDraftModel(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
-            raise ValueError(
-                "DFlashDraftModel requires `input_embeds` (use the target embedding)."
-            )
+            if hasattr(self, "forward_embed"):
+                input_embeds = self.forward_embed(input_ids)
+            else:
+                raise ValueError(
+                    "DFlashDraftModel requires `input_embeds` (use the target "
+                    "embedding)."
+                )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 

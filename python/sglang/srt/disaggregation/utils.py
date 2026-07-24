@@ -737,6 +737,124 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def compute_mamba_state_slice_blocks(
+    src_dim: int,
+    dst_dim: int,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank_in_group: int,
+    local_tp_rank_in_group: int,
+    conv_shard_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Blocks to copy one mamba state item across differing attn-TP sizes.
+
+    Returns ``(src_dim_start, dst_dim_start, num_dims)`` triples in units of the
+    sliceable (3rd) dimension. Single-axis states (temporal_state, or when
+    ``conv_shard_groups`` is None) return one contiguous block -- byte-identical to
+    the legacy behavior.
+
+    GDN conv_state is ``cat([query | key | value])`` where each sub-block (full
+    dims == ``conv_shard_groups``, e.g. ``[key_dim, key_dim, value_dim]``) is
+    head-sharded INDEPENDENTLY across attn-TP. In the SCATTER direction
+    (1 prefill rank -> several decode ranks) a single contiguous slice straddles
+    the q/k/v boundaries and delivers wrong channels. The AGGREGATION direction
+    (several prefill ranks -> 1 decode rank) has the symmetric problem: a single
+    contiguous write interleaves the sub-blocks by writer. Both directions emit one
+    block per sub-block for conv_state; temporal_state and non-GDN states (when
+    ``conv_shard_groups`` is None) keep the single contiguous slice.
+    """
+    use_subdims = (
+        conv_shard_groups is not None
+        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
+    )
+
+    if src_attn_tp_size > dst_attn_tp_size:
+        # Aggregation: several prefill ranks each write their shard into one decode slot.
+        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+        local_writer_idx = local_tp_rank_in_group % writers_per_decode
+        if not use_subdims:
+            return [(0, local_writer_idx * src_dim, src_dim)]
+        # conv_state: a plain contiguous write would interleave the sub-blocks by
+        # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
+        # independently head-sharded sub-block at its grouped offset so the decode
+        # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
+        blocks: List[Tuple[int, int, int]] = []
+        src_off = 0
+        dst_off = 0
+        for full_sd in conv_shard_groups:
+            src_sub = full_sd // src_attn_tp_size
+            dst_sub = full_sd // dst_attn_tp_size
+            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
+            src_off += src_sub
+            dst_off += dst_sub
+        return blocks
+
+    # Scatter: 1 prefill rank feeds several decode ranks.
+    if not use_subdims:
+        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+        return [(src_dim_start, 0, dst_dim)]
+
+    # conv_state: gather the decode rank's [q | k | v] shard from the three
+    # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
+    blocks: List[Tuple[int, int, int]] = []
+    src_off = 0
+    dst_off = 0
+    for full_sd in conv_shard_groups:
+        src_sub = full_sd // src_attn_tp_size  # this prefill rank's shard of sub-block
+        dst_sub = full_sd // dst_attn_tp_size  # this decode rank's shard of sub-block
+        src_start = src_off + (dst_tp_rank_in_group * dst_sub) % src_sub
+        blocks.append((src_start, dst_off, dst_sub))
+        src_off += src_sub
+        dst_off += dst_sub
+    return blocks
+
+
+def compute_mamba_state_slice_byte_blocks(
+    *,
+    src_item_len: int,
+    dst_item_len: int,
+    src_dim: int,
+    dst_dim: int,
+    outer_count: int,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank_in_group: int,
+    local_tp_rank_in_group: int,
+    conv_shard_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Convert logical TP slices into physical byte blocks for one state slot.
+
+    ``outer_count`` is one for the usual ``[slice_dim, ...]`` layout. Kimi
+    conv state is ``[K - 1, slice_dim]``, so each logical channel slice expands
+    into one byte block per convolution row.
+    """
+    src_bytes_per_dim = src_item_len // (src_dim * outer_count)
+    dst_bytes_per_dim = dst_item_len // (dst_dim * outer_count)
+    logical_blocks = compute_mamba_state_slice_blocks(
+        src_dim=src_dim,
+        dst_dim=dst_dim,
+        src_attn_tp_size=src_attn_tp_size,
+        dst_attn_tp_size=dst_attn_tp_size,
+        dst_tp_rank_in_group=dst_tp_rank_in_group,
+        local_tp_rank_in_group=local_tp_rank_in_group,
+        conv_shard_groups=conv_shard_groups,
+    )
+
+    blocks = []
+    for outer_idx in range(outer_count):
+        src_row_offset = outer_idx * src_dim * src_bytes_per_dim
+        dst_row_offset = outer_idx * dst_dim * dst_bytes_per_dim
+        for src_dim_start, dst_dim_start, num_dims in logical_blocks:
+            blocks.append(
+                (
+                    src_row_offset + src_dim_start * src_bytes_per_dim,
+                    dst_row_offset + dst_dim_start * dst_bytes_per_dim,
+                    num_dims * src_bytes_per_dim,
+                )
+            )
+    return blocks
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -744,6 +862,8 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
+    slice_outer_counts: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -752,6 +872,8 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
+    kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
 
 
 def setup_state_kv_args(
@@ -780,7 +902,9 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_slice_outer_counts = []
     kv_args.is_hybrid_mla_backend = False
+    kv_args.state_conv_shard_groups = []
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -837,8 +961,25 @@ def setup_state_kv_args(
             kv_args.is_hybrid_mla_backend = is_mla_backend(
                 token_to_kv_pool.full_kv_pool
             )
+            conv_shard_groups = (
+                token_to_kv_pool.get_state_conv_shard_groups()
+                if hasattr(token_to_kv_pool, "get_state_conv_shard_groups")
+                else None
+            )
+            slice_outer_counts = (
+                token_to_kv_pool.get_state_slice_outer_counts()
+                if hasattr(token_to_kv_pool, "get_state_slice_outer_counts")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
+                slice_outer_counts,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
@@ -950,8 +1091,25 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
+            conv_shard_groups = (
+                req_to_token_pool.get_state_conv_shard_groups()
+                if hasattr(req_to_token_pool, "get_state_conv_shard_groups")
+                else None
+            )
+            slice_outer_counts = (
+                req_to_token_pool.get_state_slice_outer_counts()
+                if hasattr(req_to_token_pool, "get_state_slice_outer_counts")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
+                slice_outer_counts,
             )
 
 

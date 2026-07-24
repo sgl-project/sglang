@@ -61,15 +61,7 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    try:
-        torch.get_device_module(device).set_device(ps.gpu_id)
-    except Exception:
-        logger.warning(
-            f"Context: {device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
-        )
-        raise
-
-    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=ps.gpu_id)
+    backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not server_args.enable_p2p_check:
@@ -143,27 +135,10 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs, gpu_id: int) -> str:
+def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     backend = get_default_distributed_backend(device)
     if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
         backend = "mooncake"
-        if server_args.mooncake_ib_device:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                get_ib_devices_for_gpu,
-            )
-
-            ib_device_for_gpu = get_ib_devices_for_gpu(
-                server_args.mooncake_ib_device, gpu_id
-            )
-            mooncake_ib_device = (
-                ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-            )
-            try:
-                from mooncake import ep as mooncake_ep
-
-                mooncake_ep.set_device_filter(mooncake_ib_device)
-            except:
-                pass  # A warning will be raised in `init_distributed_environment`
     return backend
 
 
@@ -225,15 +200,24 @@ def _init_parallel_groups(
     moe_dp_size: int,
     dcp_size: int,
 ) -> None:
+    is_ep_joiner = server_args.is_ep_joiner
+    is_scale_joiner = server_args.is_ep_scale_joiner
+    rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
+    world_size = (
+        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
+    )
+    rank = rank_offset + tp_size * pp_rank + tp_rank
+
     init_distributed_environment(
         backend=backend,
-        world_size=tp_size * pp_size,
-        rank=tp_size * pp_rank + tp_rank,
+        world_size=world_size,
+        rank=rank,
         local_rank=gpu_id,
         distributed_init_method=dist_init_method,
         timeout=server_args.dist_timeout,
         moe_a2a_backend=server_args.moe_a2a_backend,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -245,7 +229,9 @@ def _init_parallel_groups(
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
         enable_symm_mem=server_args.enable_symm_mem,
-        recovered_rank=server_args.elastic_ep_rejoin,
+        recovered_rank=is_ep_joiner,
+        rank_offset=rank_offset,
+        max_world_size=server_args.max_ep_size,
     )
     initialize_dp_attention(
         server_args=server_args,
