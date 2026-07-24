@@ -64,13 +64,17 @@ class PrefillDelayer:
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        self._mixed_slot_guard = get_bool_env_var(
+            "SGLANG_PREFILL_DELAYER_MIXED_SLOT_GUARD", "true"
+        )
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
             f"token_usage_low_watermark={self._token_usage_low_watermark} "
             f"queue_min_ratio={self._queue_min_ratio} "
             f"max_delay_ms={self._max_delay_ms} "
-            f"queue_trigger_enabled={self._queue_trigger_enabled}"
+            f"queue_trigger_enabled={self._queue_trigger_enabled} "
+            f"mixed_slot_guard={self._mixed_slot_guard}"
         )
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
@@ -95,9 +99,9 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len.
+        # waiting_queue_len, max_running_requests.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
             device=self._gather_device,
         )
@@ -157,12 +161,14 @@ class PrefillDelayer:
             running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
             waiting_queue_len=waiting_queue_len,
+            max_running_requests=max_running_requests,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_max_running_requests = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -203,6 +209,7 @@ class PrefillDelayer:
                     **wait_info,
                 )
 
+            max_running_requests = int(global_max_running_requests.max().item())
             if not self.enable_dp_attention:
                 max_running_requests = (
                     max_running_requests + self.dp_size - 1
@@ -279,6 +286,40 @@ class PrefillDelayer:
                     **wait_info,
                 )
 
+            # After #31835, ranks that fail KV admission correctly report
+            # local_prefillable=False, so a high-utilization DP step commonly
+            # lands here instead of the historical "all" branch. The generic
+            # mixed timeout eventually releases prefill after max_delay_passes,
+            # even while decode has too few free request slots; that shifts the
+            # workload toward TTFT at a large TPOT/throughput cost.
+            #
+            # Preserve the post-KV-gate correctness, but under explicit slot
+            # pressure retain the old decode-protection behavior: wait until
+            # slots free rather than timing out. max_running_requests is a
+            # rank-invariant server setting; running/max-prefill are gathered.
+            if self._mixed_slot_guard:
+                effective_max_running = int(
+                    global_max_running_requests.max().item()
+                )
+                global_running_batch_max = int(global_running_batch.max().item())
+                global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
+                slot_condition = (
+                    effective_max_running is not None
+                    and effective_max_running > 0
+                    and global_max_prefill_bs_max > 0
+                    and effective_max_running - global_running_batch_max
+                    < global_max_prefill_bs_max
+                )
+                if slot_condition:
+                    next_state = prev_state or _State()
+                    next_state = next_state.bump_delayed_count()
+                    return _NegotiateOutput(
+                        next_state=next_state,
+                        output_allow=False,
+                        output_reason="delay",
+                        **debug_info,
+                    )
+
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if prev_delayed_count < self._max_delay_passes - 1:
                 next_state = prev_state or _State()
@@ -307,6 +348,7 @@ class PrefillDelayer:
         running_batch: int = 0,
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
+        max_running_requests: int = 0,
     ):
         local_info = torch.tensor(
             [
@@ -315,6 +357,7 @@ class PrefillDelayer:
                 running_batch,
                 max_prefill_bs,
                 waiting_queue_len,
+                max_running_requests,
             ],
             device=self._gather_device,
             dtype=torch.int64,
