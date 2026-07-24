@@ -108,7 +108,7 @@ class NixlBackendConfig:
 
         for key, value in config_data.items():
             # These keys are consumed by SGLang itself, not by NIXL plugins.
-            if key in _SGLANG_NIXL_CONFIG_KEYS:
+            if key in _SGLANG_NIXL_CONFIG_KEYS or key == "active":
                 continue
             initparams[key] = str(value)
 
@@ -121,7 +121,7 @@ class NixlBackendSelection:
     # Priority order for File-based plugins in case of auto selection
     FILE_PLUGINS = ["3FS", "POSIX", "GDS_MT", "GDS"]
     # Priority order for File-based plugins in case of auto selection (add more as needed)
-    OBJ_PLUGINS = ["OBJ"]  # Based on Amazon S3 SDK
+    OBJ_PLUGINS = ["OBJ", "DOCA_MEMOS"]
 
     def __init__(
         self, plugin: str = "auto", nixlconfig: Optional[NixlBackendConfig] = None
@@ -130,7 +130,7 @@ class NixlBackendSelection:
         Args:
             plugin: Plugin to use (default "auto" selects best available).
                    Can be a file plugin (3FS, POSIX, GDS, GDS_MT) or
-                   an object plugin (OBJ).
+                   an object plugin (OBJ, DOCA_MEMOS).
         """
         self.plugin = plugin
         self.backend_name = None
@@ -166,19 +166,43 @@ class NixlBackendSelection:
                 )
                 return False
 
+            if self.backend_name == "DOCA_MEMOS":
+                from sglang.srt.mem_cache.mmap_allocator import (
+                    HUGEPAGE_BYTES_2MB,
+                    HUGEPAGE_MODE_REQUIRED,
+                    hugepage_mode,
+                    hugepage_size_requested,
+                )
+
+                hugepage_size = hugepage_size_requested()
+                if (
+                    hugepage_mode(hugepage_size) != HUGEPAGE_MODE_REQUIRED
+                    or hugepage_size != HUGEPAGE_BYTES_2MB
+                ):
+                    logger.error(
+                        "NIXL DOCA_MEMOS requires "
+                        "SGLANG_HUGEPAGE_MODE=required, "
+                        "SGLANG_HUGEPAGE_SIZE=2MB, and hugetlb-backed host pools."
+                    )
+                    return False
+
             # obtain initparams for the backend from the NIXL config
             initparams = (
                 self.nixlconfig.get_backend_initparams(self.backend_name)
                 if self.nixlconfig
                 else {}
             )
+            if self.backend_name == "DOCA_MEMOS":
+                # HiCache requires real existence checks rather than the
+                # plugin's assume-success default.
+                initparams.setdefault("query_mem_mode", "actual")
 
-            # Create backend and set memory type
-            if self.backend_name in self.OBJ_PLUGINS and "bucket" not in initparams:
+            # Create backend and set memory type (S3 OBJ requires a bucket; DOCA_MEMOS does not)
+            if self.backend_name == "OBJ" and "bucket" not in initparams:
                 bucket = os.environ.get("AWS_DEFAULT_BUCKET")
                 if not bucket:
                     logger.error(
-                        "AWS_DEFAULT_BUCKET environment variable must be set for object storage"
+                        "AWS_DEFAULT_BUCKET environment variable must be set for OBJ object storage"
                     )
                     return False
 

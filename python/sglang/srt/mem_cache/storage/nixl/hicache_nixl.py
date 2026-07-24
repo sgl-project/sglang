@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import time
@@ -18,7 +19,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
+from sglang.srt.mem_cache.mmap_allocator import (
+    MEM_BACKEND_HUGEPAGE,
+    alloc_mmap,
+    tensor_mem_backend,
+)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
@@ -182,6 +187,13 @@ class HiCacheNixl(HiCacheStorage):
         if self._l3_cleaner is not None:
             self._l3_cleaner.start()
 
+    def _format_key(self, key: str) -> str:
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        if self.backend_selector.mem_type == "FILE":
+            return self.file_manager.get_file_path(key)
+        return key
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
@@ -220,9 +232,7 @@ class HiCacheNixl(HiCacheStorage):
 
     def _create_query_tuple(self, key: str) -> tuple:
         """Build the NIXL query_memory tuple for a single key."""
-        if self.backend_selector.mem_type == "FILE":
-            return (0, 0, 0, self.file_manager.get_file_path(key))
-        return (0, 0, 0, key)
+        return (0, 0, 0, self._format_key(key))
 
     def _query_keys_exist(self, keys: List[str]) -> List[bool]:
         if not keys:
@@ -333,11 +343,10 @@ class HiCacheNixl(HiCacheStorage):
         raise NotImplementedError("deprecated; use batch_set_v1")
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
-        super().register_mem_pool_host(mem_pool_host)
         self._logical_anchor = False
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
-        self.is_zero_copy = self.mem_pool_host.layout in [
+        self.is_zero_copy = mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
         ]
@@ -348,6 +357,7 @@ class HiCacheNixl(HiCacheStorage):
             # actual KV bytes; component pools carry the data through v2 APIs.
             # Still write a small marker object per page so batch_exists_v2 can
             # use the anchor key to gate sidecar lookups.
+            super().register_mem_pool_host(mem_pool_host)
             self.is_zero_copy = False
             self._logical_anchor = True
             marker_numel = 4096 if self.needs_page_alignment else 1
@@ -366,6 +376,13 @@ class HiCacheNixl(HiCacheStorage):
             )
             return
 
+        self._validate_host_pool_doca_memos(
+            mem_pool_host,
+            is_zero_copy=self.is_zero_copy,
+            buffers=[kv],
+        )
+        super().register_mem_pool_host(mem_pool_host)
+
         if self.needs_page_alignment and self.is_zero_copy:
             # Check that the kv_buffer base AND per-page strides are multiples of
             # the OS page size so every pointer passed to NIXL (base + p * stride)
@@ -374,7 +391,7 @@ class HiCacheNixl(HiCacheStorage):
             # if either condition fails.
             # 4096: O_DIRECT alignment is FS-dependent (some allow 512 B); 4 KiB
             # is the safe lower bound all known FSes accept, and real page-sizes meet it.
-            if not self.mem_pool_host.is_stride_page_aligned(4096):
+            if not mem_pool_host.is_stride_page_aligned(4096):
                 logger.warning(
                     "HiCacheNixl: O_DIRECT is active but the host kv_buffer is "
                     "not OS-page-aligned (base or per-page stride). Falling back "
@@ -410,11 +427,23 @@ class HiCacheNixl(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
-        super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
         is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
+        buffers = (
+            [buf for buf in host_pool.get_hybrid_pool_buffer() if buf.numel() > 0]
+            if is_zero_copy
+            else []
+        )
+        self._validate_host_pool_doca_memos(
+            host_pool,
+            is_zero_copy=is_zero_copy,
+            buffers=buffers,
+        )
+
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
         if is_zero_copy:
-            for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
+            for i, buf in enumerate(buffers):
                 self._pre_register_host(
                     buf.data_ptr(),
                     buf.numel() * buf.element_size(),
@@ -449,6 +478,36 @@ class HiCacheNixl(HiCacheStorage):
             host_pool_name,
             is_zero_copy,
         )
+
+    def _validate_host_pool_doca_memos(
+        self,
+        host_pool: HostKVCache,
+        is_zero_copy: bool,
+        buffers: List[torch.Tensor],
+    ) -> None:
+        if self.backend_selector.backend_name != "DOCA_MEMOS":
+            return
+        if getattr(host_pool, "layout", None) not in (
+            "page_first",
+            "page_first_direct",
+        ):
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS requires host pools to use "
+                "page_first or page_first_direct layout."
+            )
+        if not is_zero_copy:
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS requires host pools to support "
+                "zero-copy page buffers."
+            )
+        if not buffers or any(
+            tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE for buf in buffers
+        ):
+            raise RuntimeError(
+                "HiCache NIXL DOCA_MEMOS requires every host-pool buffer to be "
+                "hugetlb-backed. Set SGLANG_HUGEPAGE_MODE=required, "
+                "SGLANG_HUGEPAGE_SIZE=2MB, and reserve enough 2 MiB huge pages."
+            )
 
     def _hybrid_pool_supports_zero_copy(
         self, host_pool: HostKVCache, host_pool_name: PoolName
@@ -760,11 +819,8 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Mismatch between number of key_strs and host_buffers")
             return [False] * len(keys)
 
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._xfer_pre_registered(host_buffers, file_paths, direction)
-        else:  # mem_type == "OBJ"
-            success = self._xfer_pre_registered(host_buffers, key_strs, direction)
+        storage_keys = [self._format_key(k) for k in key_strs]
+        success = self._xfer_pre_registered(host_buffers, storage_keys, direction)
 
         # READ results are consumed by _batch_get_postprocess, which pairs
         # entries 2*i / 2*i+1 for non-MLA zero-copy: it needs one bool per

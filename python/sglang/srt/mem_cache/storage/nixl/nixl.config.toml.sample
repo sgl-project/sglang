@@ -5,6 +5,14 @@
 #    are mutually exclusive
 ################################################################################
 
+# Whether to enable the progress thread. Default: True
+# nixl_enable_prog_thread = true
+# Thread synchronization mode. Default: None
+# nixl_sync_mode = "strict"
+# HiCache host KV hugepages: set env SGLANG_HUGEPAGE_SIZE=2MB.
+# DOCA_MEMOS also requires SGLANG_HUGEPAGE_MODE=required.
+# Required for NIXL DOCA_MEMOS; reserve vm.nr_hugepages on the host.
+# DOCA_MEMOS L3 I/O requires --hicache-mem-layout page_first or page_first_direct.
 
 ########################################
 # GLOBAL NIXL HICACHE SETTINGS
@@ -131,3 +139,16 @@ use_virtual_addressing = "true"
 
 # Default bucket name
 bucket = ""
+
+
+########################################
+# DOCA_MEMOS OBJECT BACKEND
+########################################
+# Configuration for DOCA_MEMOS backend.
+# Requires pre-allocated hugepages (``sysctl vm.nr_hugepages``).
+
+# [plugin.doca_memos]
+# active = true
+# device_name = "/dev/ng0n1"  # NVMe namespace character device
+# nguid = "00000000000000000000000000000000"
+# query_mem_mode = "actual"  # required for correct HiCache existence checks

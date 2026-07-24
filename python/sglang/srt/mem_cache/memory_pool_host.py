@@ -10,7 +10,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
@@ -21,6 +20,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MambaPool
+from sglang.srt.mem_cache.mmap_allocator import memory_available_bytes
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -52,7 +52,6 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -121,9 +120,8 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -758,8 +756,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
@@ -1155,8 +1152,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "
@@ -1706,8 +1702,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "

@@ -475,6 +475,10 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # off: normal pages; prefer: hugepages with normal-page fallback;
+    # required: hugepages only, failing immediately when unavailable.
+    # Empty preserves compatibility: off when SIZE is empty, otherwise prefer.
+    SGLANG_HUGEPAGE_MODE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
