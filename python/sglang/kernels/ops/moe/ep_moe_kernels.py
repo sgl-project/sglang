@@ -1033,6 +1033,8 @@ def _fwd_kernel_ep_scatter_1(
     )
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
+    # cur_expert_start can be written by a different warp in this CTA.
+    tl.debug_barrier()
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
