@@ -791,6 +791,7 @@ class TestNixlStaging(CustomTestCase):
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
+        mgr._staging_ctx = PrefillStagingContext()
         strategy = MagicMock()
         strategy.check_ready.return_value = (False, 0, -1, 0, -1)
         kv_chunk = TransferKVChunk(
