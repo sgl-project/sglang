@@ -285,10 +285,26 @@ class MambaAttnBackendBase(AttentionBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        # Plan-stream fixup hook: mamba plan-time metadata (state slot indices,
-        # per-bs static query_start_loc) is draft-output independent — nothing
-        # to redo.
-        pass
+        # Plan-stream fixup: slot indices / static query_start_loc are
+        # draft-independent, but tree verify (topk > 1) copies the
+        # draft-produced tree links into the captured buffers on the plan
+        # stream, racing the draft — re-copy after the stream join. Eager
+        # verify reads the spec_info tensors directly; parent links are
+        # derived from these buffers at execution time.
+        if self.topk <= 1 or cuda_graph_bs is None:
+            return
+        if (
+            not isinstance(spec_info, EagleVerifyInput)
+            or spec_info.retrieve_next_token is None  # dummy / capture runs
+        ):
+            return
+        bs_without_pad = spec_info.retrieve_next_token.shape[0]
+        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_token
+        )
+        self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_sibling
+        )
 
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
