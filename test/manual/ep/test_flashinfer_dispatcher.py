@@ -21,6 +21,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         server_args = ServerArgs(model_path="dummy")
         server_args.moe_runner_backend = "flashinfer_cutlass"
         server_args.moe_a2a_backend = "flashinfer"
+        cls.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         initialize_moe_config(server_args)
 
@@ -57,8 +58,12 @@ class TestFlashinferDispatcher(CustomTestCase):
             params_dtype=torch.bfloat16,
         )
 
+    def set_dispatch_type(self, dispatch_type):
+        self.__class__.server_args.flashinfer_a2a_dispatch_type = dispatch_type
+
     def test_dispatch_basic(self):
         """Test basic dispatch functionality"""
+        self.set_dispatch_type("bf16")
         num_tokens = 16
         hidden_size = 128
         router_topk = 1  # Single expert per token for simplicity
@@ -143,6 +148,7 @@ class TestFlashinferDispatcher(CustomTestCase):
 
     def test_dispatch_with_empty_tokens(self):
         """Test dispatch when there are no tokens (edge case)"""
+        self.set_dispatch_type("bf16")
         # This tests the dummy token handling
         num_tokens = 16
         hidden_size = 1
@@ -251,6 +257,7 @@ class TestFlashinferDispatcher(CustomTestCase):
 
     def test_dispatch_with_fp4_quantization(self):
         """Test dispatch with FP4 quantization enabled"""
+        self.set_dispatch_type("nvfp4")
         num_tokens = 128
         hidden_size = 128
         router_topk = 1  # Single expert per token for simplicity
@@ -312,6 +319,72 @@ class TestFlashinferDispatcher(CustomTestCase):
             num_tokens * world_size * (hidden_size // 16),
         )
         self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
+
+    def test_dispatch_with_mxfp8_quantization(self):
+        """Test dispatch with MXFP8 quantization enabled"""
+        self.set_dispatch_type("mxfp8")
+        num_tokens = 128
+        hidden_size = 128
+        router_topk = 1
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        num_experts = world_size
+        num_local_experts = 1
+
+        set_dp_buffer_len(
+            global_dp_buffer_len=num_tokens * world_size,
+            local_dp_buffer_len=num_tokens,
+            dp_max_padding=True,
+            global_num_tokens=None,
+        )
+
+        hidden_states = torch.randn(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+
+        target_rank = (rank + 1) % world_size
+        target_expert = target_rank
+        topk_ids = torch.full(
+            (num_tokens, router_topk), target_expert, dtype=torch.int32, device="cuda"
+        )
+        topk_weights = torch.ones(
+            (num_tokens, router_topk), dtype=torch.float32, device="cuda"
+        )
+
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
+        )
+
+        dispatcher = self.create_dispatcher(
+            router_topk=router_topk,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+        )
+        dispatcher.set_quant_config({"input_global_scale": None})
+
+        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
+
+        self.assertEqual(
+            dispatch_output.hidden_states.shape,
+            (num_tokens * world_size, hidden_size),
+        )
+        self.assertEqual(dispatch_output.hidden_states.dtype, torch.float8_e4m3fn)
+        self.assertEqual(dispatch_output.output_dtype, torch.bfloat16)
+
+        self.assertIsNotNone(dispatch_output.hidden_states_scale)
+        self.assertEqual(
+            dispatch_output.hidden_states_scale.shape,
+            (num_tokens * world_size, hidden_size // 32),
+        )
+        self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
+        self.assertEqual(
+            dispatch_output.topk_output.topk_ids.shape,
+            (num_tokens * world_size, router_topk),
+        )
+        self.assertEqual(dispatch_output.topk_output.topk_ids.dtype, torch.int32)
 
 
 if __name__ == "__main__":
