@@ -6,7 +6,11 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    TargetVerifyTopk1Output,
+    draft_extend_topk1_postprocess,
+    draft_topk1_postprocess,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -70,6 +74,7 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    EagleVerifyStepResult,
     build_eagle_verify_input,
     prepare_for_draft,
     prepare_for_draft_extend,
@@ -867,40 +872,49 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        target_verify_topk1_output: Optional[TargetVerifyTopk1Output],
     ):
+        if target_verify_topk1_output is None:
+            accept_lens = batch_result.accept_lens
+            num_correct_drafts = accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    accept_lens.numel() * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=accept_lens.device,
+                )
+                + accept_lens
+                - 1
+            )
+            # Cast before entering the plan stream. Casting there creates a
+            # cross-stream dependency that can race with MTP draft-extend.
+            draft_extend_tokens = batch_result.next_token_ids.to(torch.int64)
+        else:
+            num_correct_drafts = target_verify_topk1_output.num_correct_drafts
+            select_index = target_verify_topk1_output.select_index
+            draft_extend_tokens = target_verify_topk1_output.draft_tokens
+
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
-
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
                 draft_extend_input,
                 batch,
-                next_token_ids,
+                draft_extend_tokens,
                 self.speculative_num_draft_tokens,
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
@@ -955,9 +969,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Gather the per-request last-position indexer top-k as the next loop's
-        # seed (select_index already picks the last accepted position per req).
-        dsa_seed_topk_indices = None
+        # Resolve the DSA source before postprocessing. The graph owns a static
+        # capture buffer, while eager execution publishes into the batch buffer.
+        dsa_extend_topk_capture = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_cuda_graph:
                 dsa_extend_topk_capture = (
@@ -965,41 +979,76 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
-            # Fancy indexing returns a fresh tensor (detached from the buffer).
-            dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
+            assert dsa_extend_topk_capture is not None
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
-        if self.server_args.speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+        fused_topk1 = (
+            _is_cuda
+            and self.topk == 1
+            and not self.server_args.speculative_use_rejection_sampling
+        )
+        if fused_topk1:
+            # Reduce the selected logits rows directly. The final reduction
+            # launch also gathers hidden states and the optional DSA seed, so
+            # none of the three selected-row tensors are materialized by ATen.
+            (
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+                dsa_seed_topk_indices,
+            ) = draft_extend_topk1_postprocess(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
+                select_index,
+                hidden_states=draft_logits_output.hidden_states,
+                dsa_topk_indices=dsa_extend_topk_capture,
             )
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
+            # Gather the per-request last-position indexer top-k as the next loop's
+            # seed (select_index already picks the final accept position per req).
+            # Fancy indexing returns a fresh tensor (detached from the buffer).
+            dsa_seed_topk_indices = (
+                dsa_extend_topk_capture[select_index]
+                if dsa_extend_topk_capture is not None
+                else None
             )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
-        ret_hidden_states = draft_logits_output.hidden_states
+
+            # Reorganize the spec info for the next batch
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+
+            # The draft-extend graph only anchors full logits; selected-row topk is
+            # owned by the worker for both graph and eager paths.
+            if self.server_args.speculative_use_rejection_sampling:
+                (
+                    ret_draft_probs,
+                    ret_topk_p,
+                    ret_topk_index,
+                ) = sample_draft_proposal(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info.temperatures,
+                )
+            elif self.topk == 1 and not _is_hip:
+                # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+                # MTP draft selection on FP8 logits.
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+                ret_draft_probs = None
+            else:
+                probs = renorm_draft_probs(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info,
+                    self.server_args.speculative_use_rejection_sampling,
+                )
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                ret_draft_probs = None
+            ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -1194,7 +1243,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            verify_step = self._verify_for_draft_extend(
+                batch, grammar_barrier=grammar_barrier
+            )
+            batch_output = verify_step.batch_result
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1212,7 +1264,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._draft_extend_for_decode(
+                        batch,
+                        batch_output,
+                        verify_step.target_verify_topk1_output,
+                    )
 
             return batch_output
 
@@ -1497,7 +1553,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+    def _run_verify(
+        self,
+        batch: ScheduleBatch,
+        enable_target_verify_topk1: bool,
+        grammar_barrier=None,
+    ) -> EagleVerifyStepResult:
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,
@@ -1511,8 +1572,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
+            enable_target_verify_topk1=enable_target_verify_topk1,
             grammar_barrier=grammar_barrier,
         )
+
+    def _verify_for_draft_extend(
+        self, batch: ScheduleBatch, grammar_barrier=None
+    ) -> EagleVerifyStepResult:
+        return self._run_verify(
+            batch,
+            enable_target_verify_topk1=True,
+            grammar_barrier=grammar_barrier,
+        )
+
+    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        return self._run_verify(
+            batch,
+            enable_target_verify_topk1=False,
+            grammar_barrier=grammar_barrier,
+        ).batch_result
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

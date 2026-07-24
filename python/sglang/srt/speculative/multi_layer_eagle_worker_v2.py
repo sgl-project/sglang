@@ -1004,5 +1004,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=False,
+            enable_target_verify_topk1=False,
             grammar_barrier=grammar_barrier,
-        )
+        ).batch_result

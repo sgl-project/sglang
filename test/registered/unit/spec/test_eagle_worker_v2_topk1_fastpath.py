@@ -1,4 +1,4 @@
-"""Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
+"""Equivalence and ownership tests for EAGLE topk=1 fast paths.
 
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
 cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
@@ -12,10 +12,23 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_target_verify import (
+    maybe_eagle_sample_target_verify_topk1,
+)
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_common import EagleVerifyStepResult
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+)
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    MultiLayerEagleWorkerV2,
+)
+from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -108,6 +121,41 @@ def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=
     return FakeDraftBackendFactory
 
 
+def _make_target_verify_selection_case(device: torch.device):
+    batch_size, num_tokens, vocab_size = 1, 2, 16
+    logits = torch.zeros(
+        (batch_size * num_tokens, vocab_size), device=device, dtype=torch.float32
+    )
+    additive_penalty = torch.zeros((batch_size, vocab_size), device=device)
+    additive_penalty[:, 3] = 10.0
+    sampling_info = SimpleNamespace(
+        is_all_greedy=True,
+        acc_additive_penalties=additive_penalty,
+        acc_scaling_penalties=None,
+        logit_bias=None,
+    )
+    retrieve_index = torch.arange(
+        batch_size * num_tokens, dtype=torch.long, device=device
+    ).view(batch_size, num_tokens)
+    retrieve_next_token = torch.tensor([[1, -1]], dtype=torch.long, device=device)
+    verify_input = SimpleNamespace(
+        spec_input_type=SpecInputType.EAGLE_VERIFY,
+        tree_topk=1,
+        draft_token_num=num_tokens,
+        max_tree_depth=num_tokens,
+        draft_token=torch.tensor([0, 3], dtype=torch.long, device=device),
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        sampling_info=sampling_info,
+        seq_lens=torch.tensor([32], dtype=torch.int32, device=device),
+    )
+    logits_output = SimpleNamespace(next_token_logits=logits)
+    return verify_input, batch, logits_output
+
+
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
     def test_fast_path_matches_slow_path(self):
         bs = 3
@@ -142,6 +190,125 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+
+class TestTargetVerifyFusionOwnership(CustomTestCase):
+    @staticmethod
+    def _make_verify_worker(worker_cls):
+        worker = object.__new__(worker_cls)
+        worker._target_worker = object()
+        worker.req_to_token_pool = object()
+        worker.token_to_kv_pool_allocator = object()
+        worker.plan_stream = object()
+        worker.plan_stream_ctx = object()
+        worker.topk = 1
+        worker.speculative_num_steps = 5
+        worker.speculative_num_draft_tokens = 6
+        worker.device = "cpu"
+        return worker
+
+    def test_target_verify_topk1_is_enabled_only_for_internal_single_layer(self):
+        batch = object()
+        batch_result = GenerationBatchResult()
+        verify_step = EagleVerifyStepResult(batch_result, None)
+        worker = self._make_verify_worker(EAGLEWorkerV2)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_verify:
+            worker.verify(batch)
+            worker._verify_for_draft_extend(batch)
+
+        generic_call, fused_call = run_verify.call_args_list
+        self.assertFalse(generic_call.kwargs["enable_target_verify_topk1"])
+        self.assertTrue(fused_call.kwargs["enable_target_verify_topk1"])
+
+        multi_layer = self._make_verify_worker(MultiLayerEagleWorkerV2)
+        with patch(
+            "sglang.srt.speculative.multi_layer_eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_multi_layer_verify:
+            multi_layer.verify(batch)
+        self.assertFalse(
+            run_multi_layer_verify.call_args.kwargs["enable_target_verify_topk1"]
+        )
+
+
+@unittest.skipUnless(
+    is_cuda() and torch.cuda.is_available(), "NVIDIA CUDA is required for this test."
+)
+class TestTargetVerifyTopk1Selection(CustomTestCase):
+    def setUp(self):
+        self.device = torch.device("cuda")
+
+    def test_applies_logits_transform_once(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+
+        result = maybe_eagle_sample_target_verify_topk1(
+            verify_input, batch, logits_output
+        )
+
+        self.assertIsNotNone(result)
+        torch.testing.assert_close(
+            result.predict,
+            torch.tensor([3, 3], dtype=torch.int32, device=self.device),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            logits_output.next_token_logits[:, 3],
+            torch.full((2,), 10.0, device=self.device),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_fallbacks(self):
+        cases = (
+            "non_greedy",
+            "input_type",
+            "topk",
+            "idle",
+            "simulation",
+            "logits_stride",
+            "draft_layout",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                verify_input, batch, logits_output = _make_target_verify_selection_case(
+                    self.device
+                )
+                simulation = 0
+                if case == "non_greedy":
+                    batch.sampling_info.is_all_greedy = False
+                elif case == "input_type":
+                    verify_input.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY
+                elif case == "topk":
+                    verify_input.tree_topk = 2
+                elif case == "idle":
+                    batch.forward_mode = ForwardMode.IDLE
+                elif case == "simulation":
+                    simulation = 1
+                elif case == "logits_stride":
+                    logits_output.next_token_logits = torch.empty(
+                        (16, 2), device=self.device
+                    ).t()
+                elif case == "draft_layout":
+                    verify_input.draft_token = torch.tensor(
+                        [[0, -1], [3, -1]], dtype=torch.long, device=self.device
+                    )[:, 0]
+
+                with patch(
+                    "sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", simulation
+                ):
+                    result = maybe_eagle_sample_target_verify_topk1(
+                        verify_input,
+                        batch,
+                        logits_output,
+                    )
+                self.assertIsNone(result)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

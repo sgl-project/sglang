@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -8,6 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.topk1 import TargetVerifyTopk1Output
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult, _async_d2h
 from sglang.srt.model_executor.forward_batch_info import (
@@ -16,6 +18,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_target_verify import (
+    maybe_eagle_sample_target_verify_topk1,
+)
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -52,6 +57,14 @@ if TYPE_CHECKING:
         EAGLEDraftCudaGraphRunner,
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+
+@dataclass(frozen=True)
+class EagleVerifyStepResult:
+    """Worker-internal verify result retained only until draft-extend starts."""
+
+    batch_result: GenerationBatchResult
+    target_verify_topk1_output: Optional[TargetVerifyTopk1Output]
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -409,7 +422,7 @@ def _finalize_accept_tree_path(
     token_to_kv_pool_allocator: Any,
     num_draft_tokens: int,
 ) -> torch.Tensor:
-    """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
+    """Tree drafting (topk > 1): move the accept path -- KV slots, predict,
     hidden_states -- to the contiguous front of each per-req block, which the
     downstream chain-layout code (draft-extend select_index, committed-KV reads)
     assumes. Returns compacted predict; mutates logits_output.hidden_states
@@ -437,7 +450,7 @@ def _compact_accept_to_front(
     *,
     num_draft_tokens: int,
 ) -> torch.Tensor:
-    """Gather the accepted tree path to the front of each per-req block.
+    """Gather the accept tree path to the front of each per-req block.
 
     ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
     ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
@@ -467,19 +480,22 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    enable_target_verify_topk1: bool,
     grammar_barrier=None,
-) -> GenerationBatchResult:
+) -> EagleVerifyStepResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
-    The single-layer eagle verify body is the source of truth (superset). Two
-    switches encode the multi-layer worker's preserved-verbatim differences:
+    The single-layer eagle verify body is the source of truth (superset). These
+    options encode worker-specific behavior:
 
     - ``metadata_ready_pre_pad``: multi-layer marks forward metadata ready
       pre-pad unconditionally; single-layer relies on eagle_prepare_for_verify
       marking it only when the cuda-graph path ran.
-    - ``finalize_tree_path``: single-layer compacts the accepted tree path to
+    - ``finalize_tree_path``: single-layer compacts the accept tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+    - ``enable_target_verify_topk1``: only the single-layer internal
+      verify-to-draft-extend path enables the CUDA topk=1 optimization.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -606,12 +622,28 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
-    new_seq_lens = batch.seq_lens + accept_lens
+    target_verify_topk1_output = (
+        maybe_eagle_sample_target_verify_topk1(
+            verify_input,
+            batch,
+            logits_output,
+            vocab_mask,
+        )
+        if enable_target_verify_topk1
+        else None
+    )
+    if target_verify_topk1_output is not None:
+        predict = target_verify_topk1_output.predict
+        accept_lens = target_verify_topk1_output.accept_lens
+        accept_index = target_verify_topk1_output.accept_index
+        new_seq_lens = target_verify_topk1_output.new_seq_lens
+    else:
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -634,7 +666,9 @@ def run_eagle_verify(
         num_draft_tokens,
     )
 
-    if not batch.forward_mode.is_idle():
+    if target_verify_topk1_output is not None:
+        bonus_tokens = target_verify_topk1_output.bonus_tokens
+    elif not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
@@ -653,7 +687,7 @@ def run_eagle_verify(
         compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
-        # topk == 1 needs nothing here: the accepted path is already the front
+        # topk == 1 needs nothing here: the accept path is already the front
         # chain, so the whole compaction is an identity transform.
         predict = _finalize_accept_tree_path(
             batch,
@@ -672,15 +706,18 @@ def run_eagle_verify(
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
     # batch.input_ids rebind in prepare_for_draft_extend.
     # Scheduler pins it in batch_record_buf for the 2-iter window.
-    return GenerationBatchResult(
-        logits_output=logits_output,
-        next_token_ids=predict,
-        can_run_cuda_graph=can_run_cuda_graph,
-        speculative_num_draft_tokens=num_draft_tokens,
-        next_draft_input=next_draft_input,
-        accept_lens=accept_lens,
-        new_seq_lens=new_seq_lens,
-        routed_experts_output=forward_batch_output.routed_experts_output,
-        indexer_topk_output=forward_batch_output.indexer_topk_output,
-        extra_keep_alive_refs=[verify_forward_batch],
+    return EagleVerifyStepResult(
+        batch_result=GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=predict,
+            can_run_cuda_graph=can_run_cuda_graph,
+            speculative_num_draft_tokens=num_draft_tokens,
+            next_draft_input=next_draft_input,
+            accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
+            indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
+        ),
+        target_verify_topk1_output=target_verify_topk1_output,
     )
