@@ -378,14 +378,6 @@ class Envs:
     # Emit five-second aggregate diagnostics for Mooncake prefill transfer
     # queues, high-level send stages, and synchronous engine calls.
     SGLANG_DISAGGREGATION_TRANSFER_DEBUG = EnvBool(False)
-    # Experimental Mooncake-only decode session pool. Each additional session
-    # owns a separate TransferEngine/RPC endpoint while registering the same
-    # decode KV buffers. A value of 1 preserves the existing singleton path.
-    SGLANG_DISAGGREGATION_DECODE_SESSION_POOL_SIZE = EnvInt(1)
-    # Soft target used to spread active rooms across decode sessions. Once all
-    # sessions reach the target, allocation continues on the least-loaded
-    # session instead of rejecting inference requests. 0 disables the target.
-    SGLANG_DISAGGREGATION_DECODE_ROOMS_PER_SESSION = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
