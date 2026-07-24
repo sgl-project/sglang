@@ -486,14 +486,6 @@ class DeepseekSparseAttnBackend(
                     f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
                     f"({parallel.attn_tp_size}) under dp-attention."
                 )
-            if self.use_fused_topk and not envs.SGLANG_DSA_DCP_ENABLE_FUSED_TOPK.get():
-                # The fused v2 transform is decode-shaped and ~2x slower on
-                # large extend chunks; stay unfused under DCP.
-                print_warning_once(
-                    "Disabling fused DSA top-k under DCP; set "
-                    "SGLANG_DSA_DCP_ENABLE_FUSED_TOPK=1 to override."
-                )
-                self.use_fused_topk = False
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
