@@ -10,17 +10,178 @@ once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
+import copy
+import dataclasses
+import hashlib
 import inspect
 import json
 import logging
+import os
 import time
 
+import grpc
 from aiohttp import web
+from smg_grpc_servicer.sglang import request_manager as grpc_request_manager
+from smg_grpc_servicer.sglang import servicer as grpc_servicer
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqType,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.server_args import set_global_server_args_for_tokenizer
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+# gRPC defaults to a small 4MB message cap. SMG sends already-preprocessed
+# pixel tensors, so use a larger bounded default and keep an env override.
+_DEFAULT_GRPC_MAX_MESSAGE_MB = 512
+
+
+def _grpc_max_message_bytes() -> int:
+    raw = os.environ.get("SGLANG_GRPC_MAX_MESSAGE_MB")
+    mb = _DEFAULT_GRPC_MAX_MESSAGE_MB
+    if raw is not None:
+        try:
+            mb = int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_GRPC_MAX_MESSAGE_MB=%r; falling back to %dMB",
+                raw,
+                _DEFAULT_GRPC_MAX_MESSAGE_MB,
+            )
+    return max(mb, 1) * 1024 * 1024
+
+
+def _with_grpc_message_size_options(options, max_message_bytes: int):
+    keys = {"grpc.max_send_message_length", "grpc.max_receive_message_length"}
+    merged = [(k, v) for k, v in options if k not in keys]
+    merged.extend(
+        [
+            ("grpc.max_send_message_length", max_message_bytes),
+            ("grpc.max_receive_message_length", max_message_bytes),
+        ]
+    )
+    return merged
+
+
+def _patch_grpc_message_size_options() -> None:
+    if getattr(grpc, "_sglang_message_size_options_patched", False):
+        return
+
+    max_message_bytes = _grpc_max_message_bytes()
+    original_aio_server = grpc.aio.server
+    original_insecure_channel = grpc.insecure_channel
+
+    def aio_server_with_message_size(*args, **kwargs):
+        if "options" in kwargs:
+            kwargs["options"] = [] if kwargs["options"] is None else kwargs["options"]
+            kwargs["options"] = _with_grpc_message_size_options(
+                kwargs["options"], max_message_bytes
+            )
+        elif len(args) >= 3:
+            args = list(args)
+            args[2] = [] if args[2] is None else args[2]
+            args[2] = _with_grpc_message_size_options(args[2], max_message_bytes)
+        else:
+            kwargs["options"] = _with_grpc_message_size_options([], max_message_bytes)
+        return original_aio_server(*args, **kwargs)
+
+    def insecure_channel_with_message_size(target, options=None, *args, **kwargs):
+        options = [] if options is None else options
+        options = _with_grpc_message_size_options(options, max_message_bytes)
+        return original_insecure_channel(target, options, *args, **kwargs)
+
+    grpc.aio.server = aio_server_with_message_size
+    grpc.insecure_channel = insecure_channel_with_message_size
+    grpc._sglang_message_size_options_patched = True
+
+
+def _patch_grpc_request_manager_shm_transport() -> None:
+    """wrap shm/cuda-ipc features before sending to scheduler"""
+    cls = grpc_request_manager.GrpcRequestManager
+    original_send = cls._send_to_scheduler
+    if getattr(original_send, "_sglang_wraps_shm_features", False):
+        return
+
+    def copy_multimodal_request(obj):
+        if not isinstance(obj, TokenizedGenerateReqInput) or obj.mm_inputs is None:
+            return obj
+
+        mm_items = [copy.copy(item) for item in obj.mm_inputs.mm_items]
+        for item in mm_items:
+            item.set_pad_value()
+        mm_inputs = dataclasses.replace(obj.mm_inputs, mm_items=mm_items)
+        return dataclasses.replace(obj, mm_inputs=mm_inputs)
+
+    async def send_to_scheduler_with_shm(self, obj):
+        if obj is not None:
+            obj = copy_multimodal_request(obj)
+            obj = wrap_shm_features(obj)
+        return await original_send(self, obj)
+
+    send_to_scheduler_with_shm._sglang_wraps_shm_features = True
+    cls._send_to_scheduler = send_to_scheduler_with_shm
+
+
+def _hash_grpc_bytes(chunks) -> int:
+    hasher = hashlib.sha256()
+    for chunk in chunks:
+        hasher.update(len(chunk).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(chunk)
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
+def _encode_grpc_shape(shape) -> bytes:
+    return b"".join(
+        int(dim).to_bytes(8, byteorder="big", signed=False) for dim in shape
+    )
+
+
+def _hash_grpc_mm_proto(mm_proto) -> int | None:
+    """hash for multimodal data"""
+    if mm_proto.image_data:
+        return _hash_grpc_bytes(mm_proto.image_data)
+
+    if not mm_proto.HasField("pixel_values"):
+        return None
+
+    chunks = [
+        mm_proto.pixel_values.dtype.encode(),
+        _encode_grpc_shape(mm_proto.pixel_values.shape),
+        mm_proto.pixel_values.data,
+    ]
+    for key in sorted(mm_proto.model_specific_tensors):
+        tensor_data = mm_proto.model_specific_tensors[key]
+        chunks.extend(
+            [
+                key.encode(),
+                tensor_data.dtype.encode(),
+                _encode_grpc_shape(tensor_data.shape),
+                tensor_data.data,
+            ]
+        )
+    return _hash_grpc_bytes(chunks)
+
+
+def _patch_grpc_multimodal_hashes() -> None:
+    """for processed-vlm input, hash on raw proto bytes is faster than hashing before scheduler dispatch (on python objects)"""
+    cls = grpc_servicer.SGLangSchedulerServicer
+    original_parse = cls._parse_mm_inputs
+    if getattr(original_parse, "_sglang_sets_mm_hash", False):
+        return
+
+    def parse_mm_inputs_with_hash(self, mm_proto):
+        mm_inputs = original_parse(self, mm_proto)
+        mm_hash = _hash_grpc_mm_proto(mm_proto)
+        if mm_hash is not None and len(mm_inputs.mm_items) == 1:
+            mm_inputs.mm_items[0].hash = mm_hash
+        return mm_inputs
+
+    parse_mm_inputs_with_hash._sglang_sets_mm_hash = True
+    cls._parse_mm_inputs = parse_mm_inputs_with_hash
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -164,6 +325,11 @@ async def serve_grpc(server_args, model_info=None):
             "If already installed, there may be a broken import due to a "
             "version mismatch — see the chained exception above for details."
         ) from e
+
+    set_global_server_args_for_tokenizer(server_args)
+    _patch_grpc_message_size_options()
+    _patch_grpc_multimodal_hashes()
+    _patch_grpc_request_manager_shm_transport()
 
     sidecar_app = web.Application()
     sidecar_runner = None
