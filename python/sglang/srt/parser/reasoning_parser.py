@@ -218,24 +218,38 @@ class BaseReasoningFormatDetector:
 
         return StreamingParseResult()
 
+    def _strip_leading_think_start(self, text: str) -> str:
+        think_start_text = self.think_start_token + self.think_start_self_label
+        if text.startswith(think_start_text):
+            return text[len(think_start_text) :]
+        return text
+
     def finish(self) -> StreamingParseResult:
         """
-        Called once when the stream ends. If force_nonempty_content is set
-        and the stream ended mid-reasoning, reclassifies the accumulated
-        reasoning (plus any partial token still buffered) as normal text.
+        Called once when the stream ends mid-reasoning. With stream_reasoning=False
+        the whole thinking block is buffered and only emitted on the end token, so a
+        stream cut short (e.g. max_tokens) leaves the trace stuck in _buffer; flush it
+        here instead of dropping it. force_nonempty_content reclassifies that trace as
+        normal text; otherwise it stays reasoning.
         """
-        if self._force_nonempty_content and self._in_reasoning:
-            # stream_reasoning=False never clears _buffer, so the opening think
-            # token (stripped only from the base class's local view) survives here.
-            buffer = self._buffer
-            think_start_text = self.think_start_token + self.think_start_self_label
-            if buffer.startswith(think_start_text):
-                buffer = buffer[len(think_start_text) :]
+        if not self._in_reasoning:
+            return StreamingParseResult()
+
+        # stream_reasoning=False never clears _buffer, so the opening think token
+        # (stripped only from the base class's local view) survives here.
+        buffer = self._strip_leading_think_start(self._buffer)
+        self._buffer = ""
+
+        if self._force_nonempty_content:
             normal_text = self._accumulated_reasoning + buffer
             self._accumulated_reasoning = ""
-            self._buffer = ""
             if normal_text:
                 return StreamingParseResult(normal_text=normal_text)
+            return StreamingParseResult()
+
+        if not self.stream_reasoning and buffer:
+            return StreamingParseResult(reasoning_text=buffer)
+
         return StreamingParseResult()
 
 
@@ -1368,6 +1382,22 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(normal_text=out_normal)
 
         return StreamingParseResult()
+
+    def finish(self) -> StreamingParseResult:
+        # This detector keeps _in_reasoning pinned True and tracks phase via
+        # _reasoning_done, so the base finish() (keyed on _in_reasoning) would
+        # misfile a truncated answer tail as reasoning. Flush by phase instead.
+        buffer = self._buffer
+        self._buffer = ""
+        if not self._reasoning_done:
+            ret = StreamingParseResult(
+                reasoning_text=self._strip_leading_think_start(buffer)
+            )
+        elif self._saw_text_start and not self._saw_text_end:
+            ret = StreamingParseResult(normal_text=buffer)
+        else:
+            return StreamingParseResult()
+        return self._maybe_apply_force_nonempty_content(ret)
 
 
 class ReasoningParser:
