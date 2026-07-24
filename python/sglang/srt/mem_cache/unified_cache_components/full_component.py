@@ -143,11 +143,11 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
-            self.cache._evict_device_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
+            parent = self.cache._evict_device_leaf(x, tracker)
+            if parent is not None and parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    (self.cache.eviction_strategy.get_priority(parent), parent),
                 )
 
     def drive_host_eviction(
@@ -164,11 +164,11 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_host_leaves:
                 continue
-            self.cache._evict_host_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
+            parent = self.cache._evict_host_leaf(x, tracker)
+            if parent in self.cache.evictable_host_leaves:
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    (self.cache.eviction_strategy.get_priority(parent), parent),
                 )
 
     def acquire_component_lock(
