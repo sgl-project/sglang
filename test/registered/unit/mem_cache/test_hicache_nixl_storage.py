@@ -297,7 +297,10 @@ class TestNixlUnified(CustomTestCase):
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
     def tearDown(self):
-        """Clean up test directories."""
+        """Release NIXL registrations before their backing tensors are collected."""
+        hicache = getattr(self, "hicache", None)
+        if hicache is not None:
+            hicache.close()
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir, ignore_errors=True)
 
@@ -518,9 +521,11 @@ class TestNixlUnified(CustomTestCase):
             },
         )
         try:
-            return HiCacheNixl(storage_config=obj_config, file_path="")
+            hicache = HiCacheNixl(storage_config=obj_config, file_path="")
         except Exception as e:
             self.skipTest(f"NIXL OBJ backend unavailable: {e}")
+        self.addCleanup(hicache.close)
+        return hicache
 
     @unittest.skipUnless(
         MinioFixture.is_available(), "minio binary or boto3 not available"
