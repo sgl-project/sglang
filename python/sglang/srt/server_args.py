@@ -7261,9 +7261,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+        if self.enable_deepseek_v4_fp4_indexer and not (
+            is_sm100_supported() or is_sm120_supported()
+        ):
             raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
