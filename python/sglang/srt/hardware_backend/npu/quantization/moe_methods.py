@@ -1120,3 +1120,183 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
             transposed=True,
             **scale_args,
         )
+
+
+# ---------------------------------------------------------------------------
+#  NPUMXFP4W4A4MoEMethod
+# ---------------------------------------------------------------------------
+class NPUMXFP4W4A4MoEMethod(_NPUMoEMethodBase):
+    """MXFP4 W4A4 MoE on Ascend A5 – packed-fp4 weights AND fp4 activations.
+
+    Both weights and activations are single-level MXFP4 (packed uint8
+    ``[E, N, K//2]`` weights + e8m0 block scales). Serves the online config path
+    (``--quantization mxfp4``, experts branch, weights quantised from BF16 at
+    load time) and the offline ModelSlim ``W4A4_MXFP4`` scheme (weights already
+    packed); the two are told apart by weight dtype in
+    ``process_weights_after_loading``.
+
+    The **weight** format is byte-identical to W4A8 MXFP (both are MXFP4), so the
+    packed-fp4 layout helpers on :class:`NPUMXFP4W4A8MoEMethod` are reused. The
+    difference from W4A8 is entirely on the activation side:
+
+    * gmm1 **fuses** gate/up + swiglu + fp4 requant into one kernel
+      (``npu_grouped_matmul_swiglu_quant_v2`` with ``quant_dtype=fp4``), the same
+      fused shape as MXFP8 — unlike W4A8, whose fp4-gmm1 emits bf16 and needs a
+      separate swiglu + fp8 requant. The runner therefore calls
+      ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2.
+    * ``npu_moe_init_routing_v2`` has no fp4 quant_mode, so the activation quant
+      is never fused into routing: the dispatcher hands over bf16 and gmm1
+      quantises the hidden states to fp4 itself (mirrors the MXFP8 DeepEP path).
+
+    Mirrors vllm-ascend ``AscendW4A4MXFP4DynamicFusedMoEMethod`` (single-level;
+    A2/A3 have no grouped dual-level kernel). TP only.
+    """
+
+    def __init__(self, weight_prefix: str):
+        super().__init__(quant_config=None)
+        if weight_prefix not in ("w13", "w2"):
+            raise ValueError(
+                f"weight_prefix must be 'w13' or 'w2', got '{weight_prefix}'"
+            )
+        self.weight_prefix = weight_prefix
+        if weight_prefix == "w13":
+            self.matmul = GroupedMatmulSwigluQuant()
+        else:
+            self.matmul = GroupedMatmul()
+        # Built lazily on first NPU use (w13 only). HiddenStatesDynamicQuant
+        # resolves the fp4 dtype and touches torch.ops.npu, neither of which is
+        # safe at construction on CPU — the CPU unit tests build this kernel to
+        # check weight registration, so eager construction would break them.
+        self._hidden_states_quantizer = None
+
+    def _get_hidden_states_quantizer(self) -> HiddenStatesDynamicQuant:
+        if self._hidden_states_quantizer is None:
+            self._hidden_states_quantizer = HiddenStatesDynamicQuant(
+                quant_dtype=_get_float4_e2m1fn_x2_dtype()
+            )
+        return self._hidden_states_quantizer
+
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, weight_prefix: str
+    ) -> None:
+        self._validate_weight_prefix(layer, weight_prefix)
+
+        weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight").data
+        if weight.dtype == torch.uint8:
+            # Offline (ModelSlim) path: checkpoint already holds packed-fp4 uint8
+            # weights and uint8 e8m0 block scales.
+            scale: torch.Tensor = getattr(layer, f"{weight_prefix}_weight_scale").data
+        else:
+            weight, scale = NPUMXFP4W4A8MoEMethod._quantize_weight_online(
+                weight, weight_prefix
+            )
+
+        # Packed-fp4 weight/scale layout is identical to W4A8 MXFP (FRACTAL_NZ +
+        # transpose); reuse those helpers rather than duplicate them.
+        setattr(
+            layer,
+            f"{weight_prefix}_weight",
+            Parameter(
+                NPUMXFP4W4A8MoEMethod._process_weight_fp4(weight), requires_grad=False
+            ),
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            Parameter(
+                NPUMXFP4W4A8MoEMethod._process_scale_fp4(scale), requires_grad=False
+            ),
+        )
+
+        if weight_prefix == "w13":
+            # No fp4 quant_mode in npu_moe_init_routing_v2: keep routing in bf16
+            # and let apply_fused_gmm1_swiglu quantise to fp4 itself.
+            self._set_dispatcher_output_dtype(layer, "bf16")
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gate/up projection, swiglu and fp4 requantisation in one kernel (gmm1).
+
+        Returns the fp4 activations and their e8m0 block scale — exactly what the
+        w2 gmm needs, so the runner skips its activation step for W4A4.
+
+        ``pertoken_scale`` is always None here (the bf16 dispatcher does no
+        routing quant), so the hidden states are quantised to fp4 in place.
+        """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self._get_hidden_states_quantizer()(
+                hidden_states
+            )
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        return self.matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            # swiglu output requantised to fp4; unlike e4m3, fp4 IS in the op's
+            # QUANT_DTYPES so x_dtype/weight_dtype must be passed explicitly.
+            quant_dtype=fp4_dtype,
+            x_dtype=fp4_dtype,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
+
+    def apply(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        weight_prefix: str,
+        group_list_type,
+    ) -> torch.Tensor:
+        """gmm2 (down projection) with fp4 activations and fp4 weights.
+
+        Mirrors the MXFP8 w2 gmm (``scale`` + explicit scale dtypes), differing
+        only in ``x_dtype``/``weight_dtype`` = fp4. This matches vllm-ascend's
+        W4A4 gmm2 (``scale=`` weight scale, not ``antiquant_scale``).
+        """
+        if weight_prefix != "w2":
+            raise ValueError(
+                f"NPUMXFP4W4A4MoEMethod.apply only serves the w2 gmm, got "
+                f"'{weight_prefix}'. gmm1 fuses swiglu into a single op and must "
+                f"go through apply_fused_gmm1_swiglu, which returns a scale too."
+            )
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        scale_args: Dict[str, Any] = {
+            "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
+            "per_token_scale": [pertoken_scale],
+            "scale_dtype": e8m0_dtype,
+            "per_token_scale_dtype": e8m0_dtype,
+            "x_dtype": fp4_dtype,
+            "weight_dtype": fp4_dtype,
+        }
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens,
+            output_dtype,
+            group_list_type=group_list_type,
+            transposed=True,
+            **scale_args,
+        )

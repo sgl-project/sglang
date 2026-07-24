@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP4W4A4MoEMethod,
     NPUMXFP4W4A8MoEMethod,
     NPUMXFP8MoEMethod,
 )
@@ -92,6 +93,41 @@ class NPUMXFP4W4A8FusedMoEMethod(UnquantizedFusedMoEMethod):
 
         layer.w13_kernel = NPUMXFP4W4A8MoEMethod()
         layer.w2_kernel = NPUMXFP4W4A8MoEMethod()
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        self._aiter_runner = None
+
+
+class NPUMXFP4W4A4FusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Online MXFP4 W4A4 MoE entry point for Ascend A5 (experts branch of
+    ``--quantization mxfp4``).
+
+    The generic FusedMoE method owns BF16 weight creation, post-load
+    orchestration, and apply. This subclass only installs the W4A4 per-GMM
+    kernels; those kernels quantize the loaded weights to packed MXFP4 and run
+    fp4 activations through a fused gmm1 (swiglu + fp4 requant) and an fp4 gmm2.
+
+    Unlike W4A8/MXFP8 the two prefixes need distinct kernels: w13 fuses swiglu
+    into gmm1 (``GroupedMatmulSwigluQuant``) while w2 is a plain grouped matmul.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            raise ValueError(
+                "MXFP4 W4A4 MoE on Ascend requires --moe-runner-backend "
+                f"'auto' or 'ascend', got {backend.value!r}."
+            )
+
+        layer.w13_kernel = NPUMXFP4W4A4MoEMethod("w13")
+        layer.w2_kernel = NPUMXFP4W4A4MoEMethod("w2")
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)

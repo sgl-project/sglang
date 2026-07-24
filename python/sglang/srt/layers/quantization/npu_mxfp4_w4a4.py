@@ -40,14 +40,27 @@ from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
+# MXFP4 block (group) size. The reduction dim K must be a multiple of this for the
+# block scales to tile evenly; non-aligned layers fall back to BF16.
+MXFP4_W4A4_GROUP_SIZE = 32
+
 
 class Mxfp4W4A4Config(QuantizationConfig):
-    """Single-level MXFP4 W4A4 online quantization config for Ascend NPU.
+    """MXFP4 W4A4 online quantization config for Ascend NPU.
 
-    True W4(weight) A4(activation): both weights and activations are quantised
-    to single-level MXFP4 (``float4_e2m1fn_x2``). The device-specific linear
-    method is selected in ``get_quant_method``; only Ascend NPU is wired up
-    today (on other devices ``mxfp4`` maps to the upstream ``Mxfp4Config``).
+    True W4(weight) A4(activation): both weights and activations are MXFP4
+    (``float4_e2m1fn_x2``). ``get_quant_method`` dispatches per layer type, and
+    only Ascend NPU is wired up today (on other devices ``mxfp4`` maps to the
+    upstream ``Mxfp4Config``):
+
+    * ``LinearBase`` → dual-level MXFP4 (``NPUDualLevelMXFP4LinearMethod``);
+      single-level RTN degenerated under greedy decoding, so the finer FP8 L0
+      scale is used for the non-expert layers.
+    * ``FusedMoE`` → single-level MXFP4 experts
+      (``NPUMXFP4W4A4FusedMoEMethod``). MoE has no grouped dual-level kernel, so
+      the experts stay single-level; the online-RTN risk is contained by the
+      mixed-precision layout (only the experts drop to W4A4 — the surrounding
+      Linear layers keep the more accurate dual-level MXFP4).
     """
 
     def __init__(
@@ -108,6 +121,21 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            # MXFP4 block scales use group_size=32, so a reduction dim K that is
+            # not a multiple of 32 does not tile evenly — the same constraint that
+            # forces the W4A8 path to skip such layers. Qwen3.5 vision MLP
+            # linear_fc2 (K=4304, 4304/32=134.5) hits this; fall back to BF16,
+            # mirroring how the offline msmodelslim yaml leaves linear_fc2
+            # unquantized. LLM text layers and the tp=1 vision QKV are 32-aligned.
+            if layer.input_size % MXFP4_W4A4_GROUP_SIZE != 0:
+                logger.warning(
+                    "mxfp4 W4A4: skipping %s (input_size=%d not a multiple of "
+                    "%d); falling back to unquantized BF16.",
+                    prefix,
+                    layer.input_size,
+                    MXFP4_W4A4_GROUP_SIZE,
+                )
+                return UnquantizedLinearMethod()
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUDualLevelMXFP4LinearMethod,
@@ -124,11 +152,31 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 "kernel exists in this config. Add a device branch here when one lands."
             )
         elif isinstance(layer, FusedMoE):
-            # MoE single-level MXFP4 W4A4 not yet implemented; fall back to unquantised
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+                    NPUMXFP4W4A4FusedMoEMethod,
+                )
+
+                # Experts run single-level MXFP4 (packed fp4 weights + fp4
+                # activations). Single-level, not dual-level: there is no
+                # grouped dual-level matmul kernel, so the online-RTN accuracy
+                # risk is mitigated by keeping this to the experts only (the
+                # mixed-precision layout — non-expert layers stay MXFP8/BF16).
+                # Requires Ascend 950 (A5).
+                return NPUMXFP4W4A4FusedMoEMethod(self)
+            # MoE single-level MXFP4 W4A4 has no CUDA/other-device kernel; fall
+            # back to unquantised rather than fail load on non-NPU backends.
             logger.warning(
-                "MXFP4 W4A4 quantization is not yet supported for FusedMoE layers "
-                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
-                "run in full precision (BF16/FP16).",
+                "MXFP4 W4A4 MoE is only implemented for the Ascend NPU backend "
+                "(prefix=%s); falling back to unquantized MoE (full precision).",
                 prefix,
             )
             return UnquantizedFusedMoEMethod(

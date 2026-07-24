@@ -10,6 +10,7 @@ from .modelslim_mxfp4_w4a8 import ModelSlimMXFP4W4A8Scheme
 from .modelslim_mxfp4 import ModelSlimMXFP4Scheme
 
 # isort: on
+from .modelslim_mxfp4_w4a4_moe import ModelSlimMXFP4W4A4MoEScheme
 from .modelslim_mxfp4_w4a8_moe import ModelSlimMXFP4W4A8MoEScheme
 from .modelslim_mxfp8_moe import ModelSlimMXFP8MoEScheme
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
@@ -26,6 +27,7 @@ __all__ = [
     "ModelSlimMXFP4Scheme",
     "ModelSlimMXFP8MoEScheme",
     "ModelSlimMXFP4W4A8MoEScheme",
+    "ModelSlimMXFP4W4A4MoEScheme",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",
     "ModelSlimW4A4Int4MoE",

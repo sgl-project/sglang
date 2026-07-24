@@ -27,21 +27,38 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     """
     Dynamic per‑token quantisation of hidden states.
 
-    ``torch.float8_e4m3fn`` selects the MX (block-scaled) op, whose scale is a
-    ``float8_e8m0fnu`` block scale ``[N, K//64, 2]`` rather than one scalar per
-    token; the int8/int4 dtypes keep the plain per-token op.
+    ``torch.float8_e4m3fn`` and packed fp4 (``float4_e2m1fn_x2``) both select the
+    MX (block-scaled) op, whose scale is a ``float8_e8m0fnu`` block scale
+    ``[N, K//64, 2]`` rather than one scalar per token; the int8/int4 dtypes keep
+    the plain per-token op.
 
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
     def __init__(self, quant_dtype: torch.dtype) -> None:
         super().__init__(quant_dtype)
-        if quant_dtype == torch.float8_e4m3fn:
+        if quant_dtype == torch.float8_e4m3fn or self._is_packed_fp4(quant_dtype):
             self._op = torch.ops.npu.npu_dynamic_mx_quant
         elif quant_dtype in (torch.int8, torch.quint4x2):
             self._op = torch.ops.npu.npu_dynamic_quant
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
+
+    @staticmethod
+    def _is_packed_fp4(quant_dtype) -> bool:
+        """True when ``quant_dtype`` is torch_npu's packed fp4 enum.
+
+        fp4 shares ``npu_dynamic_mx_quant`` with fp8 (both are MX block-scaled),
+        but its dtype must be the torch_npu enum (``float4_e2m1fn_x2``), not a
+        plain torch dtype -- see ``_get_float4_e2m1fn_x2_dtype``. The import is
+        lazy so this module stays importable on CUDA/CPU/AMD/XPU CI.
+        """
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            _get_float4_e2m1fn_x2_dtype,
+        )
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        return fp4_dtype is not None and quant_dtype == fp4_dtype
 
     def __call__(
         self, hidden_states: torch.Tensor
