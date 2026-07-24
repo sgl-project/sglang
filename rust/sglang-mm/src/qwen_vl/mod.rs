@@ -311,11 +311,48 @@ mod python {
         Ok((pos.into_pyarray_bound(py), delta))
     }
 
+    /// Drive the same native Qwen request pipeline used by `sglang-server`.
+    #[pyfunction]
+    fn process_native_mm_payload<'py>(
+        py: Python<'py>,
+        payload: Vec<u8>,
+        spec_json: String,
+    ) -> PyResult<(
+        Vec<i32>,
+        Bound<'py, PyArray1<f32>>,
+        Vec<(u32, u32, u32)>,
+        Vec<u64>,
+        Vec<(u32, u32)>,
+        Bound<'py, PyArray1<i64>>,
+        i64,
+    )> {
+        let output = py
+            .allow_threads(move || {
+                let pipeline = crate::registry::native_pipeline_from_spec(&spec_json)?;
+                crate::native_driver::process(&pipeline, &payload, |_| {
+                    Err("native parity API requires input_ids".into())
+                })
+                .map_err(|error| error.to_string())
+            })
+            .map_err(PyValueError::new_err)?;
+        let mm = output.mm;
+        Ok((
+            output.input_ids,
+            mm.features.into_pyarray_bound(py),
+            mm.grids.into_iter().map(|[t, h, w]| (t, h, w)).collect(),
+            mm.hashes,
+            mm.offsets,
+            mm.mrope.into_pyarray_bound(py),
+            mm.mrope_delta,
+        ))
+    }
+
     pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         let m = PyModule::new_bound(parent.py(), "qwen_vl")?;
         m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
         m.add_function(wrap_pyfunction!(smart_resize_py, &m)?)?;
         m.add_function(wrap_pyfunction!(mrope_image_only_py, &m)?)?;
+        m.add_function(wrap_pyfunction!(process_native_mm_payload, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
     }

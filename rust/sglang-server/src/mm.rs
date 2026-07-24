@@ -30,22 +30,8 @@ use crate::tokenizer::TextTokenizer;
 
 pub mod native;
 
-/// One native result: everything the drain-time Python adapter needs to build
-/// the scheduler's `MultimodalProcessorOutput` without any processing logic.
-pub struct NativeMmResult {
-    /// Per-image `pixel_values`, concatenated (split by grid products).
-    pub features: Vec<f32>,
-    /// Per-image `[t, h, w]` patch grids.
-    pub grids: Vec<[u32; 3]>,
-    /// Per-image feature hashes (`MultimodalDataItem.hash`), precomputed in
-    /// the worker so the scheduler's `set_pad_value` never hashes the buffer.
-    pub hashes: Vec<u64>,
-    /// Per-image inclusive `(start, end)` token offsets in the expanded ids.
-    pub offsets: Vec<(u32, u32)>,
-    /// Flattened row-major `[3, input_len]` M-RoPE positions.
-    pub mrope: Vec<i64>,
-    pub mrope_delta: i64,
-}
+/// One native result: everything the drain-time Python adapter needs.
+pub type NativeMmResult = sglang_mm::native_driver::NativeMmResult;
 
 /// Results parked between a worker's `MmEncoded` and the scheduler's drain.
 /// An entry is stored strictly before `MmEncoded` is emitted and popped by

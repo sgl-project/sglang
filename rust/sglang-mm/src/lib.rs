@@ -8,6 +8,7 @@
 
 pub mod common;
 pub mod inkling;
+pub mod native_driver;
 pub mod qwen_vl;
 pub mod registry;
 

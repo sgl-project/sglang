@@ -28,6 +28,7 @@ blake3 = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmpv = "1"
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the
 # extension never links the system OpenSSL.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }

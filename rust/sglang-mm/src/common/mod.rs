@@ -1,4 +1,5 @@
 pub mod fetch;
+pub mod payload;
 pub mod resize;
 pub mod tokens;
 pub mod transforms;
@@ -53,6 +54,7 @@ mod python {
     use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
+    use pyo3::types::PyBytes;
 
     use super::{decode_rgb, pool, resize};
 
@@ -111,6 +113,14 @@ mod python {
     }
 
     #[pyfunction]
+    pub fn fetch_bytes<'py>(py: Python<'py>, source: String) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py
+            .allow_threads(move || super::fetch::fetch_bytes(&source))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    #[pyfunction]
     pub fn base64_decode<'py>(
         py: Python<'py>,
         encoded: &str,
@@ -132,6 +142,7 @@ mod python {
         m.add_function(wrap_pyfunction!(scaled_dims, &m)?)?;
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(data_hash, &m)?)?;
+        m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
         m.add_function(wrap_pyfunction!(base64_decode, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
