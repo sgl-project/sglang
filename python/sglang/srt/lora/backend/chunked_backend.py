@@ -242,19 +242,14 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             )
 
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        # Upper bound on chunk segments any replay batch of N <= max_num_tokens
-        # tokens can produce: within each chunk-size tier the segment count is
-        # sum_groups(ceil(g_i / c)) <= ceil(N / c) + (num_groups - 1). The
-        # >=256-token tier gives ceil(max_num_tokens / chunk_top); smaller
-        # tiers are bounded by ceil(255 / MIN_CHUNK_SIZE) = 16; adapter groups
-        # per batch are bounded by max_loras_per_batch.
+        # Worst-case chunk segments for any replay batch: ceil(N / chunk_top)
+        # (bounded by 16 for the small tiers) plus one per adapter group.
         chunk_top = self._determine_chunk_size_for_tokens(max_num_tokens)
         max_num_segments = (
             max((max_num_tokens + chunk_top - 1) // chunk_top, 16)
             + self.max_loras_per_batch
         )
-        # Every extend request contributes at least one token, so request
-        # count is bounded by the token bucket.
+        # Each extend request has >= 1 token, so bs is bounded by the bucket.
         max_bs = max_num_tokens
         with torch.device(self.device):
             self.prefill_cuda_graph_batch_info = LoRABatchInfo(
@@ -312,10 +307,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         has_unused_cuda_graph_segments = False
 
         if use_prefill_cuda_graph:
-            # Same in-place refresh as the decode CUDA graph path below, but
-            # against the prefill-sized static buffers. The captured kernel
-            # grids span all allocated segment slots; unused slots no-op via
-            # the padded seg_indptr tail (seg_start == seg_end).
+            # In-place refresh of the prefill-sized static buffers; unused
+            # segment slots no-op via the padded seg_indptr tail.
             batch_info = self.prefill_cuda_graph_batch_info
             batch_info.bs = bs
             batch_info.num_segments = num_segments
@@ -455,8 +448,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
         return dataclasses.replace(
             batch_info,
-            # lm_head LoRA runs in the eager tail outside any captured prefill
-            # graph, on freshly allocated pruned metadata.
+            # lm_head LoRA runs in the eager tail, outside any captured graph.
             use_cuda_graph=False,
             num_segments=num_segments,
             max_len=chunk_size,

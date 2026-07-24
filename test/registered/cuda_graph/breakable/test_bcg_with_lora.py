@@ -1,22 +1,10 @@
 """LoRA under the breakable (BCG) prefill CUDA graph.
 
-For each LoRA kernel backend (csgmv and triton), launches the same
-LoRA-enabled server twice — once with --cuda-graph-backend-prefill=breakable
-and once with =disabled — and compares per-token prompt logprobs for:
-  * single LoRA requests across prompt lengths spanning several token buckets,
-  * base-model (no-adapter) requests served by the same LoRA-enabled server,
-  * one multi-request batch mixing LoRA and base requests (bs > 1 replay).
-
-Three guards against passing vacuously:
-  * scrapes the breakable server's logs for a "Prefill batch ... cuda graph:
-    True" line — the scheduler reports can_run_cuda_graph per batch, which is
-    True only when PrefillCudaGraphRunner.execute actually served the batch;
-  * repeats that scrape on a log window during which a lone adapter-carrying
-    request is the only work in flight, so the line cannot come from a
-    base-model or warmup batch — catching a fallback that ejects only
-    adapter-carrying batches to eager prefill;
-  * asserts the adapter materially changes prompt logprobs while the prefill
-    graph is enabled, which catches a graph captured without LoRA applied.
+For csgmv and triton, launches the same LoRA-enabled server with the prefill
+graph breakable vs disabled and compares per-token prompt logprobs for LoRA,
+base, and mixed batches. Guards against vacuous passes by scraping the logs
+for graph-served prefill batches (including a window where a lone LoRA
+request is the only work in flight) and asserting the adapter moves logprobs.
 """
 
 import os
@@ -44,12 +32,10 @@ BASE_MODEL = "Qwen/Qwen3-4B"
 LORA_ADAPTER = "nissenj/Qwen3-4B-lora-v2"
 LORA_NAME = "lora0"
 
-# Max absolute per-token prompt logprob difference tolerated between the
-# graph-enabled and graph-disabled runs (bf16; graph replay pads the token
-# axis up to the captured bucket, which can perturb GEMM tiling slightly).
+# Max per-token prompt logprob diff tolerated between graph and eager runs
+# (bf16; token-axis padding can perturb GEMM tiling slightly).
 GRAPH_VS_EAGER_TOLERANCE = 1e-1
-# The adapter must move at least one prompt logprob by this much, otherwise
-# LoRA was not applied under the graph at all.
+# The adapter must move at least one prompt logprob by this much.
 LORA_EFFECT_THRESHOLD = 5e-2
 
 # Prompt lengths chosen to land in different captured token buckets.
@@ -143,8 +129,7 @@ class BCGLoRAServerMixin:
 
     @classmethod
     def _logs_appended_since(cls, sizes):
-        # Binary read: the size snapshot is a byte offset, and text-mode
-        # seek() is only defined for tell() cookies.
+        # Binary read: the size snapshot is a byte offset.
         chunks = []
         for path, start in zip((cls.stdout_path, cls.stderr_path), sizes):
             with open(path, "rb") as f:
@@ -155,17 +140,10 @@ class BCGLoRAServerMixin:
     @classmethod
     def _probe_lora_replay_window(cls):
         """Send one adapter-carrying request with nothing else in flight and
-        return the log text appended while it ran. Any "Prefill batch" line
-        in this window belongs to that request, so a "cuda graph: True" match
-        here pins the graph replay to a LoRA batch specifically — the
-        file-wide scrape in test_prefill_graph_replay_logged is also
-        satisfied by base-model or warmup batches. Polls because the server
-        process flushes its log pipes asynchronously.
-        """
-        # Baseline only once the log files go quiet: the pipe-dump threads
-        # flush asynchronously, so a line from an earlier (base-model) batch
-        # could otherwise drain into the probe window and satisfy the guard
-        # for the wrong batch.
+        return the log text appended while it ran; any "Prefill batch" line
+        in the window belongs to that request."""
+        # Baseline once the logs go quiet, so an earlier batch's line cannot
+        # drain into the window (the pipe-dump threads flush asynchronously).
         sizes = cls._log_sizes()
         quiet_deadline = time.monotonic() + 10
         while time.monotonic() < quiet_deadline:
@@ -229,10 +207,8 @@ class BCGLoRAServerMixin:
             shutil.rmtree(log_dir, ignore_errors=True)
 
     def test_prefill_graph_replay_logged(self):
-        # can_run_cuda_graph is True in the scheduler's per-batch prefill log
-        # only when PrefillCudaGraphRunner.execute served the batch; without
-        # this, an init-time or per-batch fallback to eager prefill would make
-        # the equivalence tests below pass vacuously.
+        # "cuda graph: True" is logged only when PrefillCudaGraphRunner
+        # served the batch; catches an across-the-board eager fallback.
         logs = ""
         for path in (self.stdout_path, self.stderr_path):
             with open(path) as f:
@@ -245,11 +221,8 @@ class BCGLoRAServerMixin:
         )
 
     def test_lora_request_replays_prefill_graph(self):
-        # The file-wide scrape above is also satisfied by base-model or
-        # warmup batches. This window held a lone adapter-carrying request,
-        # so it fails if LoRA batches specifically fall back to eager
-        # prefill (e.g. an eligibility gate keyed on active adapters) even
-        # while base batches keep replaying the graph.
+        # The probe window held a lone adapter-carrying request, so this
+        # fails if LoRA batches specifically fall back to eager prefill.
         prefill_lines = [
             line
             for line in self.lora_replay_window.splitlines()
@@ -257,9 +230,8 @@ class BCGLoRAServerMixin:
         ]
         self.assertTrue(
             any(PREFILL_GRAPH_REPLAY_PATTERN.search(line) for line in prefill_lines),
-            "The lone adapter-carrying probe request was not served by the "
-            "prefill CUDA graph; LoRA batches are falling back to eager "
-            f"prefill. Prefill lines in the probe window: {prefill_lines}",
+            "LoRA probe request was not served by the prefill CUDA graph. "
+            f"Prefill lines in the probe window: {prefill_lines}",
         )
 
     def test_lora_prefill_logprobs_match_eager(self):

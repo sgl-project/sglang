@@ -1297,13 +1297,8 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
 
 
 class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
-    """LoRA no longer auto-disables the breakable prefill CUDA graph.
-
-    Guards test_bcg_with_lora.py against passing vacuously: if a rule in
-    _disable_breakable_cudagraph_if_incompatible re-disables the prefill
-    graph for LoRA, this turns red even though the e2e comparison would
-    still (trivially) pass.
-    """
+    """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
+    test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
 
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
@@ -1331,9 +1326,8 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
 
     def test_lora_still_disables_tc_piecewise_prefill_graph(self):
-        # LoRA remains incompatible with tc_piecewise (Dynamo); pin the rule
-        # itself, with the hardware rule neutralized so this is meaningful on
-        # CPU-only CI runners.
+        # Pin the tc_piecewise LoRA rule itself, with the hardware rule
+        # neutralized so this runs on CPU-only CI.
         args = ServerArgs(model_path="dummy", enable_lora=True)
         args.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),

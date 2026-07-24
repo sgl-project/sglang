@@ -140,25 +140,16 @@ class LoRAManager:
         # ===== END TO BE REFACTORED ====
 
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        """Allocate static LoRA batch metadata for the prefill CUDA graph.
-
-        Called during PrefillCudaGraphRunner.__init__() (before capture) when
-        the prefill graph backend captures LoRA kernels. Sized by the largest
-        captured prefill token bucket.
-        """
+        """Allocate the static prefill-CUDA-graph LoRA metadata, sized by the
+        largest captured token bucket. Called before capture."""
         self.lora_backend.init_prefill_cuda_graph_batch_info(
             max_num_tokens=max_num_tokens
         )
 
     @property
     def supports_prefill_cuda_graph(self) -> bool:
-        """Whether LoRA kernels can be captured into the prefill CUDA graph.
-
-        MoE LoRA is excluded for now: its intermediate CUDA graph buffers are
-        sized by the decode batch size, not by prefill token buckets. DP
-        attention is excluded because per-rank graph eligibility could
-        diverge across ranks (see can_use_prefill_cuda_graph).
-        """
+        """Whether LoRA kernels can be captured into the prefill CUDA graph;
+        excludes MoE LoRA and DP attention."""
         return (
             self.lora_backend.supports_prefill_cuda_graph
             and not self.lora_backend.is_moe_lora
@@ -167,34 +158,23 @@ class LoRAManager:
 
     @property
     def prefill_cuda_graph_max_bs(self) -> Optional[int]:
-        """Request-count cap for LoRA batches replaying the prefill CUDA
-        graph; None until init_prefill_cuda_graph_batch_info() ran."""
+        """Request-count cap for prefill-graph LoRA batches; None until
+        init_prefill_cuda_graph_batch_info() ran."""
         return self.lora_backend.prefill_cuda_graph_max_bs
 
     def can_use_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
-        """Whether this batch can be served from the static prefill CUDA graph
-        LoRA metadata.
-
-        Used both by prepare_lora_batch (to pick the in-place update path) and
-        by PrefillCudaGraphRunner.can_run_graph (to reject LoRA batches whose
-        metadata was not prepared in the static buffers). The two must stay
-        consistent: a graph replay with LoRA enabled must only happen for a
-        batch whose metadata went through the in-place path.
-        """
+        """Whether this batch can use the static prefill-graph LoRA metadata;
+        shared by prepare_lora_batch and can_run_graph so they stay consistent."""
         max_bs = self.lora_backend.prefill_cuda_graph_max_bs
         max_tokens = self.lora_backend.prefill_cuda_graph_max_tokens
         if max_bs is None or max_tokens is None:
             return False
-        # Under DP attention this predicate depends on per-rank batch shapes
-        # and could diverge across ranks (some replaying the graph, some
-        # eager), desyncing collectives; keep LoRA prefill on the eager path.
+        # DP attention: per-rank eligibility could diverge across ranks and
+        # desync collectives; keep LoRA prefill eager.
         if self.enable_dp_attention:
             return False
-        # Restrict to extend modes that are NOT also decode-CUDA-graph modes
-        # (TARGET_VERIFY, DLLM_EXTEND): those are owned by the decode static
-        # batch info path in prepare_lora_batch, so letting them pass here
-        # would let a prefill graph replay read buffers that were never
-        # refreshed for the batch.
+        # Decode-CUDA-graph extend modes (TARGET_VERIFY, DLLM_EXTEND) are
+        # owned by the decode static batch info path.
         if (
             not forward_batch.forward_mode.is_extend()
             or forward_batch.forward_mode.is_cuda_graph()
@@ -443,9 +423,8 @@ class LoRAManager:
             and bs <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
-        # Extend batches eligible for the prefill CUDA graph update the static
-        # prefill batch info in place instead of allocating fresh metadata, so
-        # kernels captured in the prefill graph read current values at replay.
+        # Eligible extend batches refresh the static prefill batch info in
+        # place so captured kernels read current values at replay.
         use_prefill_cuda_graph = not use_cuda_graph and self.can_use_prefill_cuda_graph(
             forward_batch
         )

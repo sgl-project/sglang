@@ -19,10 +19,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         device: the device where the backend runs.
     """
 
-    # Whether this backend can serve LoRA batches under a captured prefill
-    # (EXTEND) CUDA graph. Backends that support it must implement
-    # init_prefill_cuda_graph_batch_info() and honor
-    # use_prefill_cuda_graph in prepare_lora_batch().
+    # Supporting backends implement init_prefill_cuda_graph_batch_info() and
+    # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
@@ -30,12 +28,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.device = device
         self.init_lm_head_config()
         self._is_moe_lora = False
-        # Static LoRA batch metadata read by kernels captured in the prefill
-        # CUDA graph; allocated by init_prefill_cuda_graph_batch_info() on
-        # supporting backends, refreshed in place every prefill batch.
+        # Static metadata read by prefill-CUDA-graph kernels, refreshed in
+        # place every prefill batch.
         self.prefill_cuda_graph_batch_info: LoRABatchInfo | None = None
-        # Per-batch limits an EXTEND batch must satisfy to be served from the
-        # static prefill metadata (requests and total extend tokens).
+        # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
 
@@ -176,16 +172,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         pass
 
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
-        """Allocate static LoRA batch metadata for the prefill CUDA graph.
-
-        Called during PrefillCudaGraphRunner.__init__() (before capture) when
-        the prefill graph backend captures LoRA kernels. Unlike decode, prefill
-        segments are ragged, so seg_lens/seg_indptr must be refreshed in place
-        every batch by prepare_lora_batch(use_prefill_cuda_graph=True).
-
-        Args:
-            max_num_tokens: the largest captured prefill token bucket
-        """
+        """Allocate static LoRA batch metadata for the prefill CUDA graph,
+        sized for the largest captured token bucket. Called before capture."""
         raise NotImplementedError(
             f"LoRA backend {type(self).__name__} does not support the prefill CUDA graph."
         )
@@ -350,18 +338,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
-        This method provides a hook for each backend to conduct its own preparation
-        logic for each forward batch.
-
-        Args:
-            forward_batch: the ForwardBatch object for current forward pass
-            weight_indices: list of indices of lora weights to be applied for current batch
-            lora_ranks: list of lora ranks corresponding to weight_indices
-            scalings: list of scaling factors corresponding to weight_indices
-            use_cuda_graph: whether this (decode-family) batch updates the static
-                decode CUDA graph batch info in place
-            use_prefill_cuda_graph: whether this (extend) batch updates the static
-                prefill CUDA graph batch info in place
+        use_cuda_graph / use_prefill_cuda_graph select in-place updates of the
+        static decode / prefill CUDA graph batch info respectively.
         """
         pass
 

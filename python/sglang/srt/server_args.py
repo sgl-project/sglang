@@ -4134,10 +4134,8 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
-            # LoRA under tc_piecewise is blocked by Dynamo: per-batch
-            # LoRABatchInfo rebinds break guards, and LoRA kernel tuning-config
-            # lookups (torch.cuda.get_device_name) land inside traced regions.
-            # LoRA is supported under the breakable/full prefill backends.
+            # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
+            # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",

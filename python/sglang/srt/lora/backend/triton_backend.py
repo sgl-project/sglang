@@ -16,12 +16,8 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-# Segment slots baked into kernel launch grids captured by the prefill CUDA
-# graph. The triton backend uses one segment per request, so this bounds the
-# request count a LoRA batch may have while replaying the prefill graph
-# (larger batches fall back to eager prefill). Kept small because every
-# captured LoRA kernel launches a (cdiv(max_len, 16) * cdiv(rank, 16),
-# num_slots) grid and unused slots cost a no-op block each.
+# Fixed segment slots (one per request) baked into the captured prefill LoRA
+# kernel grids; batches with more requests fall back to eager prefill.
 PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
 
 
@@ -194,9 +190,8 @@ class TritonLoRABackend(BaseLoRABackend):
         num_slots = PREFILL_CUDA_GRAPH_LORA_SEGMENTS
         mlpb = self.max_loras_per_batch
         with torch.device(self.device):
-            # bs is pinned at num_slots so the (.., bs) launch grids recorded
-            # by the prefill graph cover any replay batch; slots beyond the
-            # live batch size keep seg_lens == 0 and no-op in-kernel.
+            # bs pinned at num_slots so the captured grids cover any replay
+            # batch; slots past the live batch keep seg_lens == 0 and no-op.
             self.prefill_cuda_graph_batch_info = LoRABatchInfo(
                 bs=num_slots,
                 use_cuda_graph=True,
@@ -286,10 +281,8 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info.num_segments = forward_batch.batch_size
         elif use_prefill_cuda_graph:
             batch_info = self.prefill_cuda_graph_batch_info
-            # batch_info.bs stays pinned at the allocated slot count: the
-            # launch grids recorded by the prefill graph iterate every slot,
-            # and slots past the live batch no-op via seg_lens == 0. Ragged
-            # extend lengths are refreshed in place each batch.
+            # bs stays pinned at the allocated slot count; slots past the
+            # live batch no-op via seg_lens == 0.
             batch_info.num_segments = bs
             batch_info.max_len = max(forward_batch.extend_seq_lens_cpu)
             batch_info.seg_lens[:bs].copy_(
