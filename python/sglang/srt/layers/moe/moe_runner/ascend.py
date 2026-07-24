@@ -12,11 +12,13 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUGeluAndMul,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
+    NPUSwigluMXFP8Quant,
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP4W4A8MoEMethod,
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW8A8Int8MoEMethod,
@@ -96,6 +98,17 @@ class AscendRunnerCore(MoeRunnerCore):
             # both dispatchers: ascend_tp gets its activation quant fused into
             # routing, DeepEP dispatches bf16 and gmm1 quantises it itself.
             self.activation = None
+        elif isinstance(kernel, NPUMXFP4W4A8MoEMethod):
+            if get_moe_a2a_backend().is_deepep():
+                raise ValueError(
+                    "MXFP4 W4A8 MoE on Ascend is TP-only: it takes its "
+                    "activation quant from npu_moe_init_routing_v2(quant_mode=3), "
+                    "which the DeepEP dispatch path does not go through. Run "
+                    "without --moe-a2a-backend deepep."
+                )
+            # W4A8 gmm1 (fp4 weight) produces bf16 output → separate swiglu +
+            # FP8 requant step, unlike MXFP8 which fuses everything into gmm1.
+            self.activation = NPUSwigluMXFP8Quant()
         elif get_moe_a2a_backend().is_deepep():
             # DeepEP path: use a unified kernel that decides quantisation
             is_quant_kernel = isinstance(

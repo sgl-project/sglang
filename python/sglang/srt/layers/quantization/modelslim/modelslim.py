@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
+    ModelSlimMXFP4W4A8MoEScheme,
     ModelSlimMXFP4W4A8Scheme,
     ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
@@ -247,6 +248,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
             ("W8A8_MXFP8", ModelSlimMXFP8MoEScheme),
+            ("W4A8_MXFP", ModelSlimMXFP4W4A8MoEScheme),
         ]
 
         # Try multiple naming conventions:

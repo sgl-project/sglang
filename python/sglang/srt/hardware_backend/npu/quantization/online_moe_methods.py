@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP4W4A8MoEMethod,
+    NPUMXFP8MoEMethod,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -62,4 +65,34 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
         # Inherited apply() consults this; aiter is CUDA/ROCm-only.
+        self._aiter_runner = None
+
+
+class NPUMXFP4W4A8FusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Online MXFP4 W4A8 MoE entry point for Ascend A5.
+
+    The generic FusedMoE method owns BF16 weight creation, post-load orchestration,
+    and apply. This subclass only installs the W4A8 per-GMM kernels; those kernels
+    quantize the loaded weights to packed MXFP4 and select MXFP8 activations.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            raise ValueError(
+                "MXFP4 W4A8 MoE on Ascend requires --moe-runner-backend "
+                f"'auto' or 'ascend', got {backend.value!r}."
+            )
+
+        layer.w13_kernel = NPUMXFP4W4A8MoEMethod()
+        layer.w2_kernel = NPUMXFP4W4A8MoEMethod()
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
         self._aiter_runner = None
