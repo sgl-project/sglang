@@ -119,4 +119,11 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 
+# Install vocab for gpt-oss
+RUN mkdir -p /root/.cache/tiktoken \
+    && wget -O /root/.cache/tiktoken/cl100k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken \
+    && wget -O /root/.cache/tiktoken/o200k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+
+ENV TIKTOKEN_ENCODING_BASE=/root/.cache/tiktoken
+
 CMD ["/bin/bash"]
