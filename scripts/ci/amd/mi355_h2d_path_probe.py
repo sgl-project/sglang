@@ -51,7 +51,7 @@ def _make_source(case: str, size: int, rank: int, world_size: int, weka_path: st
     elif case == "pinned":
         source = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         source.fill_(rank)
-    elif case == "weka_mmap":
+    elif case in ("weka_mmap", "weka_small_sync", "weka_small_pinned_batch"):
         _warm_weka_segment(weka_path, size, rank, world_size)
         file = open(weka_path, "rb", buffering=0)
         mapping = mmap.mmap(file.fileno(), length=size, access=mmap.ACCESS_READ)
@@ -71,12 +71,41 @@ def _time_copy(destination: torch.Tensor, source: torch.Tensor, gpu_id: int) -> 
     return time.perf_counter() - start
 
 
+def _time_small_copy_round(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+    gpu_id: int,
+    chunk_size: int,
+    copy_count: int,
+    round_index: int,
+    pinned_batch: bool,
+) -> float:
+    max_chunks = source.numel() // chunk_size
+    torch.cuda.synchronize(gpu_id)
+    start = time.perf_counter()
+    pinned_sources = []
+    for copy_index in range(copy_count):
+        chunk_index = (round_index * copy_count + copy_index) % max_chunks
+        source_chunk = source.narrow(0, chunk_index * chunk_size, chunk_size)
+        if pinned_batch:
+            source_chunk = source_chunk.pin_memory()
+            pinned_sources.append(source_chunk)
+            destination.copy_(source_chunk, non_blocking=True)
+        else:
+            destination.copy_(source_chunk, non_blocking=False)
+    torch.cuda.synchronize(gpu_id)
+    pinned_sources.clear()
+    return time.perf_counter() - start
+
+
 def _worker(
     rank: int,
     world_size: int,
     case: str,
     size: int,
     iterations: int,
+    small_copy_size: int,
+    small_copy_count: int,
     weka_path: str,
     barrier,
     result_queue,
@@ -92,27 +121,67 @@ def _worker(
 
         properties = torch.cuda.get_device_properties(rank)
         source, resources = _make_source(case, size, rank, world_size, weka_path)
-        destination = torch.empty(size, dtype=torch.uint8, device=f"cuda:{rank}")
+        is_small_copy = case in ("weka_small_sync", "weka_small_pinned_batch")
+        destination_size = small_copy_size if is_small_copy else size
+        destination = torch.empty(
+            destination_size, dtype=torch.uint8, device=f"cuda:{rank}"
+        )
 
         barrier.wait()
-        _time_copy(destination, source, rank)
+        if is_small_copy:
+            _time_small_copy_round(
+                destination,
+                source,
+                rank,
+                small_copy_size,
+                1,
+                0,
+                case == "weka_small_pinned_batch",
+            )
+        else:
+            _time_copy(destination, source, rank)
         barrier.wait()
 
         concurrent_samples = []
-        for _ in range(iterations):
+        for iteration in range(iterations):
             barrier.wait()
-            concurrent_samples.append(_time_copy(destination, source, rank))
+            if is_small_copy:
+                elapsed = _time_small_copy_round(
+                    destination,
+                    source,
+                    rank,
+                    small_copy_size,
+                    small_copy_count,
+                    iteration,
+                    case == "weka_small_pinned_batch",
+                )
+            else:
+                elapsed = _time_copy(destination, source, rank)
+            concurrent_samples.append(elapsed)
             barrier.wait()
 
         isolated_samples = []
         for active_rank in range(world_size):
             barrier.wait()
             if rank == active_rank:
-                for _ in range(iterations):
-                    isolated_samples.append(_time_copy(destination, source, rank))
+                for iteration in range(iterations):
+                    if is_small_copy:
+                        elapsed = _time_small_copy_round(
+                            destination,
+                            source,
+                            rank,
+                            small_copy_size,
+                            small_copy_count,
+                            iteration,
+                            case == "weka_small_pinned_batch",
+                        )
+                    else:
+                        elapsed = _time_copy(destination, source, rank)
+                    isolated_samples.append(elapsed)
             barrier.wait()
 
-        gib = size / (1024**3)
+        bytes_per_sample = small_copy_size * small_copy_count if is_small_copy else size
+        gib = bytes_per_sample / (1024**3)
         result_queue.put(
             {
                 "rank": rank,
@@ -120,6 +189,8 @@ def _worker(
                 "cpus": rank_cpus,
                 "device_name": properties.name,
                 "uuid": str(getattr(properties, "uuid", "unknown")),
+                "copy_count": small_copy_count if is_small_copy else 1,
+                "copy_size": small_copy_size if is_small_copy else size,
                 "concurrent_gib_s": [gib / elapsed for elapsed in concurrent_samples],
                 "isolated_gib_s": [gib / elapsed for elapsed in isolated_samples],
             }
@@ -149,6 +220,8 @@ def _run_case(
     case: str,
     size: int,
     iterations: int,
+    small_copy_size: int,
+    small_copy_count: int,
     weka_path: str,
     world_size: int,
 ) -> list[dict]:
@@ -164,6 +237,8 @@ def _run_case(
                 case,
                 size,
                 iterations,
+                small_copy_size,
+                small_copy_count,
                 weka_path,
                 barrier,
                 result_queue,
@@ -205,6 +280,8 @@ def _write_summary(payload: dict) -> None:
         summary.write(
             f"Buffer: {payload['buffer_mib']} MiB; "
             f"iterations: {payload['iterations']}; "
+            f"small copies: {payload['small_copy_count']} x "
+            f"{payload['small_copy_kib']} KiB; "
             f"Weka source: `{payload['weka_file'] or 'unavailable'}`\n\n"
         )
         for case, results in payload["cases"].items():
@@ -233,6 +310,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--buffer-mib", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--small-copy-kib", type=int, default=1536)
+    parser.add_argument("--small-copy-count", type=int, default=16)
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()
@@ -240,14 +319,17 @@ def main() -> None:
         raise RuntimeError(f"Expected 8 GPUs, found {world_size}")
 
     size = args.buffer_mib * 1024 * 1024
+    small_copy_size = args.small_copy_kib * 1024
     weka_source = _find_weka_source(size)
     cases = ["pageable", "pinned"]
     if weka_source is not None:
-        cases.append("weka_mmap")
+        cases.extend(["weka_mmap", "weka_small_sync", "weka_small_pinned_batch"])
 
     payload = {
         "buffer_mib": args.buffer_mib,
         "iterations": args.iterations,
+        "small_copy_kib": args.small_copy_kib,
+        "small_copy_count": args.small_copy_count,
         "weka_file": str(weka_source) if weka_source else None,
         "cases": {},
     }
@@ -257,6 +339,8 @@ def main() -> None:
             case,
             size,
             args.iterations,
+            small_copy_size,
+            args.small_copy_count,
             str(weka_source or ""),
             world_size,
         )

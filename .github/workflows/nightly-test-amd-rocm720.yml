@@ -1311,7 +1311,8 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 scripts/ci/amd/mi355_h2d_path_probe.py \
-              --buffer-mib 512 --iterations 5
+              --buffer-mib 512 --iterations 3 \
+              --small-copy-kib 1536 --small-copy-count 16
           echo "$(<github_summary.md)" >> "$GITHUB_STEP_SUMMARY" || true
 
   nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720:
