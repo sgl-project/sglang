@@ -292,6 +292,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # when BCG is enabled: every requested resolution is captured at warmup so
     # serving never triggers a fresh capture.
     enable_breakable_cuda_graph: bool = False
+    # DiT CUDA-graph mode: "off", "breakable" (same as
+    # --enable-breakable-cuda-graph), or "full" -- capture the whole forward,
+    # SP collectives included, as one graph (model-agnostic; any tensor
+    # signature change falls back to eager permanently).
+    dit_cuda_graph: str = "off"
     # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
     # inputs are padded up to the smallest bucket that fits, so prompts of
     # different lengths reuse one captured graph. Warmup captures one graph per
@@ -530,6 +535,18 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_breakable_cuda_graph_support(self):
+        if self.dit_cuda_graph not in ("off", "breakable", "full"):
+            raise ValueError(
+                f"--dit-cuda-graph must be off/breakable/full, got "
+                f"{self.dit_cuda_graph!r}"
+            )
+        if self.enable_breakable_cuda_graph and self.dit_cuda_graph == "off":
+            logger.warning(
+                "--enable-breakable-cuda-graph is deprecated; use "
+                "--dit-cuda-graph breakable."
+            )
+            self.dit_cuda_graph = "breakable"
+        self.enable_breakable_cuda_graph = self.dit_cuda_graph == "breakable"
         if not self.enable_breakable_cuda_graph:
             return
 
@@ -548,6 +565,7 @@ class ServerArgs(DisaggServerArgsMixin):
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
+        self.dit_cuda_graph = "off"
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
@@ -1514,6 +1532,17 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--dit-cuda-graph",
+            type=str,
+            choices=["off", "breakable", "full"],
+            default=ServerArgs.dit_cuda_graph,
+            help="DiT CUDA-graph mode. 'breakable' captures graph segments "
+            "split at attention (dynamic shapes via text buckets; see "
+            "--bcg-text-buckets). 'full' captures the whole forward, SP "
+            "collectives included, as one graph: model-agnostic, and any "
+            "tensor-signature change falls back to eager permanently.",
         )
         parser.add_argument(
             "--enable-breakable-cuda-graph",
