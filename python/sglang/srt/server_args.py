@@ -1633,6 +1633,8 @@ class ServerArgs:
             help="Set multimodal attention backend.",
             choices=[
                 "sdpa",
+                "cudnn_sdpa",
+                "dynamic_cudnn_sdpa",
                 "fa3",
                 "fa4",
                 "triton_attn",

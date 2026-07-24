@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import math
 import warnings
+from contextlib import nullcontext
 from functools import lru_cache, partial
 from typing import Any, Callable, Optional, Tuple
 
@@ -11,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
@@ -272,6 +274,9 @@ class VisionSdpaAttention(nn.Module):
             else 1.0 / math.sqrt(self.head_size)
         )
 
+    def _sdpa_context(self, q: torch.Tensor):
+        return nullcontext()
+
     @staticmethod
     @lru_cache(maxsize=128)
     def _generate_mask_cache(
@@ -309,7 +314,7 @@ class VisionSdpaAttention(nn.Module):
     def generate_patch_attention_mask(
         self,
         s: int,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor | SingletonCache | None,
         flatten_batch: bool = False,
     ) -> Optional[torch.Tensor]:
         r"""
@@ -321,7 +326,7 @@ class VisionSdpaAttention(nn.Module):
         Returns:
             attention mask tensor or None
         """
-        if cu_seqlens is None:
+        if cu_seqlens is None or isinstance(cu_seqlens, SingletonCache):
             return None
 
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
@@ -385,20 +390,28 @@ class VisionSdpaAttention(nn.Module):
         else:
             # SDPA
             # [b, h, s, head_size]
-            output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout,
-                is_causal=False,
-                scale=self.scale,
-            )
+            with self._sdpa_context(q):
+                output = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attention_mask,
+                    dropout_p=self.dropout,
+                    is_causal=False,
+                    scale=self.scale,
+                )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
         output = rearrange(output, "b h s d -> (b s) h d")
 
         return output
+
+
+class VisionCudnnSdpaAttention(VisionSdpaAttention):
+    def _sdpa_context(self, q: torch.Tensor):
+        if q.device.type == "cuda":
+            return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+        return nullcontext()
 
 
 class VisionTritonAttention(nn.Module):
@@ -943,9 +956,98 @@ class VisionIntelXPUAttention(nn.Module):
         return output
 
 
+def _get_cuda_platform_vision_backend() -> str:
+    major, minor = get_device_capability()
+    if major == 9:
+        return "fa3"
+    if major == 10 and minor != 3:
+        return "fa4"
+    return "triton_attn"
+
+
+class VisionDynamicCudnnSdpaAttention(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.cudnn_attn = VisionCudnnSdpaAttention(**kwargs)
+        self.platform_backend = _get_cuda_platform_vision_backend()
+        platform_cls = {
+            "triton_attn": VisionTritonAttention,
+            "fa3": VisionFlash3Attention,
+            "fa4": VisionFlash4Attention,
+        }[self.platform_backend]
+        self.platform_attn = platform_cls(**kwargs)
+
+    def _use_cudnn_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        attention_mask: Optional[torch.Tensor],
+        window_size: Tuple[int, int],
+        s_aux: Optional[torch.Tensor],
+        seq_len: int,
+    ) -> bool:
+        if self.platform_backend != "fa3":
+            return False
+        has_varlen_seqlens = cu_seqlens is not None and not isinstance(
+            cu_seqlens, SingletonCache
+        )
+        if has_varlen_seqlens or attention_mask is not None:
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        if q.shape[1] != k.shape[1]:
+            return False
+        if window_size != (-1, -1) or s_aux is not None:
+            return False
+        return q.shape[-1] in (64, 80, 128) and seq_len <= 1025
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self._use_cudnn_sdpa(
+            q,
+            k,
+            cu_seqlens,
+            kwargs.get("attention_mask", None),
+            kwargs.get("window_size", (-1, -1)),
+            kwargs.get("s_aux", None),
+            seq_len,
+        ):
+            return self.cudnn_attn(
+                q,
+                k,
+                v,
+                bsz=bsz,
+                cu_seqlens=None,
+                softmax_scale=softmax_scale,
+                **kwargs,
+            )
+        return self.platform_attn(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            bsz=bsz,
+            seq_len=seq_len,
+            softmax_scale=softmax_scale,
+            **kwargs,
+        )
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
+    "cudnn_sdpa": VisionCudnnSdpaAttention,
+    "dynamic_cudnn_sdpa": VisionDynamicCudnnSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,
     "flashinfer_cudnn": VisionFlashInferAttention,
@@ -1149,7 +1251,7 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - CUDA (Hopper SM90): "fa3"
+        - CUDA (Hopper SM90): "dynamic_cudnn_sdpa"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
@@ -1162,7 +1264,7 @@ class VisionAttention(nn.Module):
         elif is_cuda():
             major, minor = get_device_capability()
             if major == 9:
-                backend = "fa3"
+                backend = "dynamic_cudnn_sdpa"
             elif major == 10 and minor != 3:
                 backend = "fa4"
             else:
