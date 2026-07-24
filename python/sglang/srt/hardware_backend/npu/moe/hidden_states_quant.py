@@ -33,9 +33,7 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def __init__(
-        self, quant_dtype: torch.dtype, use_mx_quant: bool = False
-    ) -> None:
+    def __init__(self, quant_dtype: torch.dtype, use_mx_quant: bool = False) -> None:
         super().__init__(quant_dtype)
         self._op = (
             torch.ops.npu.npu_dynamic_mx_quant
