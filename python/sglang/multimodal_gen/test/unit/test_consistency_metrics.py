@@ -33,11 +33,15 @@ def _disable_remote_official_gt_case_map(monkeypatch):
 
 
 def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
-    revision_path = f"/ci-data/{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
-
-    assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
-    assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
-    assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+    # GT must be pinned to an immutable commit (not a moving branch) so results are
+    # reproducible and the per-URL download cache invalidates on regeneration.
+    assert test_utils.SGL_TEST_FILES_CI_DATA_REVISION != "main"
+    pinned_revision_path = (
+        f"/{test_utils.SGL_TEST_FILES_CI_DATA_REPO}/"
+        f"{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
+    )
+    assert pinned_revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    assert pinned_revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
 def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
