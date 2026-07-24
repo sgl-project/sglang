@@ -26,20 +26,26 @@ class ConfigArgumentMerger:
         # NOTE: The current code does not support actions other than "store_true" and "store".
         if parser is not None:
             self.parser = parser
+            supported_action_dests = {
+                action.dest
+                for action in parser._actions
+                if isinstance(
+                    action, (argparse._StoreTrueAction, argparse._StoreAction)
+                )
+            }
             self.store_true_actions = [
                 action.dest
                 for action in parser._actions
                 if isinstance(action, argparse._StoreTrueAction)
             ]
             self.unsupported_actions = {
-                a.dest: a
-                for a in parser._actions
-                if a.option_strings
-                and not isinstance(a, argparse._StoreTrueAction)
-                and not isinstance(a, argparse._StoreAction)
-                and "--config" not in a.option_strings
-                and "--help" not in a.option_strings
-                and "-h" not in a.option_strings
+                action.dest: action
+                for action in parser._actions
+                if action.option_strings
+                and "--config" not in action.option_strings
+                and "--help" not in action.option_strings
+                and "-h" not in action.option_strings
+                and action.dest not in supported_action_dests
             }
         elif boolean_actions is not None:
             # Legacy interface for compatibility
