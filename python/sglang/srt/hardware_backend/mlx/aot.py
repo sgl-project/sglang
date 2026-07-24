@@ -139,7 +139,23 @@ def _build_rope_kernel(inputs: MlxAOTKernelBuildInputs) -> MlxAOTRoPEKernel:
         # AOT kernel currently requires rope_dim == head_dim.
         return MlxAOTRoPEKernel()
 
-    base = float(getattr(rope, "base", 10000.0))
+    # The kernel computes vanilla RoPE from a scalar base. Scaled variants
+    # such as YarnRoPE/Llama3RoPE/SuScaledRoPE expose no ``base`` and bake
+    # their scaling into precomputed ``_freqs`` (plus an ``mscale`` factor
+    # applied outside mx.fast.rope), while linear scaling keeps ``base`` but
+    # sets ``scale != 1`` on nn.RoPE. The kernel has inputs for none of
+    # these, so they must fall back to mx.fast.rope.
+    base = getattr(rope, "base", None)
+    if base is None:
+        return MlxAOTRoPEKernel()
+    if getattr(rope, "_freqs", None) is not None:
+        return MlxAOTRoPEKernel()
+    if float(getattr(rope, "mscale", 1.0)) != 1.0:
+        return MlxAOTRoPEKernel()
+    if float(getattr(rope, "scale", 1.0)) != 1.0:
+        return MlxAOTRoPEKernel()
+    base = float(base)
+
     num_qo_heads = get_num_heads(sample_attn)
     if num_qo_heads is None:
         return MlxAOTRoPEKernel()
