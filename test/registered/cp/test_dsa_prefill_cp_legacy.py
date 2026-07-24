@@ -122,6 +122,7 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env={"SGLANG_ENABLE_CP_V2": "0"},
         )
 
     @classmethod
