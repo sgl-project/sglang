@@ -1345,7 +1345,15 @@ class DeepseekV4AttnBackend(
         self,
         bs: int,
     ) -> Optional[DSV4RawDecodeMetadata]:
-        """Return raw metadata that already aliases the EAGLE graph inputs."""
+        """Captured decode metadata for ``bs`` reusable without re-planning, else
+        ``None`` (caller re-plans and copies).
+
+        Reusable = a ``DSV4RawDecodeMetadata`` whose ``req_pool_indices`` /
+        ``seq_lens`` view the persistent graph buffers the runner refreshes each
+        replay. The ``needs_cpu_seq_lens`` / ``is_dspark_draft`` guards reject
+        configs that still hold raw metadata but rebuild host ``seq_lens_cpu``
+        per forward, which the aliased device buffers do not carry.
+        """
         if not self.is_draft_runner or self.needs_cpu_seq_lens or self.is_dspark_draft:
             return None
         metadata = self.cuda_graph_metadata_of_bucket_and_bs[
@@ -2093,6 +2101,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         else:
             if not active_backends:
                 return
+            # Only real DECODE can reuse captured raw metadata: it aliases the
+            # req/seq graph buffers the runner refreshes before this call. IDLE
+            # instead rebinds seq_lens/req_pool_indices to fresh ones/zeros in
+            # init_forward_metadata_out_graph, so its captured raw metadata no
+            # longer tracks those live buffers — IDLE must take the copy path.
             captured_metadata = []
             if inner_fb.actual_forward_mode.is_decode():
                 for backend in active_backends:
