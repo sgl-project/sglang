@@ -1,4 +1,4 @@
-"""Unit tests for the kernel-check model (CPU).
+"""Unit tests for the invariant-check model (CPU).
 
 Proves the (bucket x level) matrix, the unconditional data layer, the throttled
 reporter, and the self-registration used by the CI coverage meta-test — all on
@@ -10,9 +10,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import KernelCheckLevel, envs
-from sglang.srt.utils import kernel_check as kc
-from sglang.srt.utils.kernel_check import (
+from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.utils import invariants as ic
+from sglang.srt.utils.invariants import (
     Bucket,
     Finite,
     InRange,
@@ -47,16 +47,16 @@ _INJECTION_COVERAGE = {
 
 class TestKernelCheck(CustomTestCase):
     def _strict(self):
-        return envs.SGLANG_KERNEL_CHECK.override(int(KernelCheckLevel.STRICT))
+        return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
 
     def _warn(self):
-        return envs.SGLANG_KERNEL_CHECK.override(int(KernelCheckLevel.WARN))
+        return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.WARN))
 
     def _off(self):
-        return envs.SGLANG_KERNEL_CHECK.override(int(KernelCheckLevel.OFF))
+        return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.OFF))
 
     def test_crash_matrix(self):
-        L = KernelCheckLevel
+        L = InvariantCheckLevel
         expected = {
             (Bucket.SOFTEN, L.OFF): False,
             (Bucket.SOFTEN, L.WARN): False,
@@ -72,7 +72,7 @@ class TestKernelCheck(CustomTestCase):
             (Bucket.FATAL_UNCONTAINABLE, L.STRICT): True,
         }
         for (bucket, level), want in expected.items():
-            self.assertEqual(kc._crashes(bucket, level), want, f"{bucket} @ {level}")
+            self.assertEqual(ic._crashes(bucket, level), want, f"{bucket} @ {level}")
 
     def test_recover_applied_even_when_off(self):
         bad = torch.tensor([[float("nan"), 1.0]])
@@ -110,7 +110,7 @@ class TestKernelCheck(CustomTestCase):
         bad = torch.tensor([[float("nan"), 1.0]])
         with self._warn():
             with mock.patch.object(torch, "_assert_async") as m:
-                with self.assertLogs(kc.logger, level="WARNING") as cap:
+                with self.assertLogs(ic.logger, level="WARNING") as cap:
                     expect(_GUARD, bad.clone())
         m.assert_not_called()  # warn counts, does not crash
         self.assertTrue(any("test.guard" in line for line in cap.output))

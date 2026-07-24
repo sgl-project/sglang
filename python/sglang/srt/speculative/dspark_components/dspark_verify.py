@@ -37,7 +37,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.srt.utils.kernel_check import Bucket, Invariant, NotNaN, expect
+from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.

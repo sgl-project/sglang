@@ -1,4 +1,4 @@
-"""Kernel value/index validity checks — the kernel-check model.
+"""Value/index validity checks — the invariant-check model.
 
 Each check has two layers:
 
@@ -6,7 +6,7 @@ Each check has two layers:
     Belongs to correctness / memory-safety; NOT gated. It may live in `recover`
     here, or inside the kernel itself (then declare `recover=None`, signal-only).
   * signal layer (detect + log/crash): the costly reduction + report. Gated by
-    SGLANG_KERNEL_CHECK (off / warn / strict).
+    SGLANG_INVARIANT_CHECK (off / warn / strict).
 
 A `Bucket` classifies an invariant by blast radius and recoverability; the
 (bucket x level) matrix decides whether a hit crashes, logs, or is silent.
@@ -25,7 +25,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.environ import KernelCheckLevel, envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +39,17 @@ class Bucket(enum.Enum):
     FATAL_UNCONTAINABLE = "fatal_uncontainable"  # no containment; global corruption
 
 
-def resolve_level() -> KernelCheckLevel:
+def resolve_level() -> InvariantCheckLevel:
     """Current signal level, bridging the legacy ASYNC_ASSERT flag.
 
-    Until every callsite migrates, an unset SGLANG_KERNEL_CHECK inherits
+    Until every callsite migrates, an unset SGLANG_INVARIANT_CHECK inherits
     SGLANG_ENABLE_ASYNC_ASSERT=true as STRICT so CI keeps failing loud.
     """
-    if envs.SGLANG_KERNEL_CHECK.is_set():
-        return KernelCheckLevel(envs.SGLANG_KERNEL_CHECK.get())
+    if envs.SGLANG_INVARIANT_CHECK.is_set():
+        return InvariantCheckLevel(envs.SGLANG_INVARIANT_CHECK.get())
     if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
-        return KernelCheckLevel.STRICT
-    return KernelCheckLevel.OFF
+        return InvariantCheckLevel.STRICT
+    return InvariantCheckLevel.OFF
 
 
 class Property:
@@ -115,7 +115,7 @@ _REGISTRY: dict[str, Invariant] = {}
 
 
 class Invariant:
-    """A declared kernel-check invariant. Constructing one registers it.
+    """A declared invariant. Constructing one registers it.
 
     `recover` is the optional python-side data layer (branchless, idempotent on
     clean input). Leave it None when the data layer lives inside the kernel;
@@ -133,7 +133,7 @@ class Invariant:
         if bucket is Bucket.FATAL_UNCONTAINABLE and recover is not None:
             raise ValueError(f"uncontainable FATAL {name!r} cannot have a recover")
         if name in _REGISTRY:
-            raise ValueError(f"duplicate kernel-check invariant {name!r}")
+            raise ValueError(f"duplicate invariant {name!r}")
         self.name = name
         self.bucket = bucket
         self.prop = prop
@@ -192,7 +192,7 @@ class _CheckReporter:
             level = logging.INFO if bucket is Bucket.SOFTEN else logging.WARNING
             logger.log(
                 level,
-                "kernel-check [%s]: +%d hit(s), %d total. %s",
+                "invariant-check [%s]: +%d hit(s), %d total. %s",
                 key,
                 total - last,
                 total,
@@ -204,19 +204,19 @@ class _CheckReporter:
 _reporter = _CheckReporter()
 
 
-def _crashes(bucket: Bucket, level: KernelCheckLevel) -> bool:
+def _crashes(bucket: Bucket, level: InvariantCheckLevel) -> bool:
     """The (bucket x level) crash decision — pure, matches the RFC matrix."""
     if bucket is Bucket.SOFTEN:
         return False
     if bucket is Bucket.FATAL_UNCONTAINABLE:
-        return level >= KernelCheckLevel.WARN
-    return level == KernelCheckLevel.STRICT  # GUARD, FATAL_CONTAINABLE
+        return level >= InvariantCheckLevel.WARN
+    return level == InvariantCheckLevel.STRICT  # GUARD, FATAL_CONTAINABLE
 
 
-def _signal(ok: torch.Tensor, *, inv: Invariant, level: KernelCheckLevel, msg: str):
+def _signal(ok: torch.Tensor, *, inv: Invariant, level: InvariantCheckLevel, msg: str):
     if _crashes(inv.bucket, level):
         # Loud: async assert surfaces at the next sync point (no CPU sync).
-        torch._assert_async(ok.all(), f"kernel-check FAILED [{inv.name}]: {msg}")
+        torch._assert_async(ok.all(), f"invariant-check FAILED [{inv.name}]: {msg}")
         return
     _reporter.record(f"{inv.name}@rank{_get_rank()}", inv.bucket, (~ok).sum(), msg)
 
@@ -230,10 +230,10 @@ def expect(
     """Assert `inv` holds over `value`, per the (bucket x level) matrix.
 
     The data layer (`inv.recover`) is applied unconditionally; only detection +
-    reporting is gated by SGLANG_KERNEL_CHECK. Returns the recovered value.
+    reporting is gated by SGLANG_INVARIANT_CHECK. Returns the recovered value.
     """
     level = resolve_level()
-    if level >= KernelCheckLevel.WARN and value is not None and value.numel() > 0:
+    if level >= InvariantCheckLevel.WARN and value is not None and value.numel() > 0:
         detail = f"{inv.prop.name}: {msg}" if msg else inv.prop.name
         _signal(inv.prop.ok(value), inv=inv, level=level, msg=detail)
 
