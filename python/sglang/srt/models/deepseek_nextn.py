@@ -64,12 +64,14 @@ from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
 def _gather_dsa_topk_indices_for_cp(
-    topk_indices: torch.Tensor,
+    topk_indices,
     local_num_tokens: int,
     cp_size: int,
     forward_batch: ForwardBatch,
     stream,
 ) -> torch.Tensor:
+    if isinstance(topk_indices, (tuple, list)):
+        topk_indices = torch.cat(list(topk_indices), dim=0).squeeze(1)
     if (
         is_dsa_prefill_cp_round_robin_split()
         and topk_indices.shape[0] < local_num_tokens
