@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import jinja2
+import numpy as np
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
@@ -41,6 +43,13 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        if request.encoding_format not in ("float", "base64"):
+            return (
+                "Unsupported encoding_format "
+                f"{request.encoding_format!r}. "
+                "Supported values are 'float' and 'base64'."
+            )
+
         if not (input := request.input):
             return "Input cannot be empty"
 
@@ -254,18 +263,53 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_embedding_response(ret)
+        try:
+            response = self._build_embedding_response(ret, request.encoding_format)
+        except ValueError as e:
+            return self.create_error_response(str(e))
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
+    @staticmethod
+    def _encode_embedding_base64(embedding: List[float]) -> str:
+        """Encode dense embeddings as little-endian float32 base64.
+
+        Uses one vectorized numpy conversion instead of per-element Python
+        serialization: at embedding response sizes the per-float cost is
+        measurable at high request rates, and little-endian float32 bytes
+        let clients decode with a zero-copy frombuffer.
+        """
+        if not isinstance(embedding, list):
+            raise ValueError(
+                "encoding_format='base64' only supports dense embedding lists"
+            )
+        try:
+            values = np.asarray(embedding, dtype="<f4")
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "encoding_format='base64' only supports dense float embeddings"
+            ) from e
+        if values.ndim != 1:
+            raise ValueError(
+                "encoding_format='base64' only supports dense float embeddings"
+            )
+        return base64.b64encode(values.tobytes()).decode("ascii")
+
+    def _build_embedding_response(
+        self,
+        ret: List[Dict[str, Any]],
+        encoding_format: str = "float",
+    ) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0
 
         for idx, ret_item in enumerate(ret):
+            embedding = ret_item["embedding"]
+            if encoding_format == "base64":
+                embedding = self._encode_embedding_base64(embedding)
             embedding_objects.append(
                 EmbeddingObject(
-                    embedding=ret_item["embedding"],
+                    embedding=embedding,
                     index=idx,
                 )
             )

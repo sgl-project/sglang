@@ -37,6 +37,31 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
 
+### Output Encoding Formats
+
+The OpenAI-compatible embeddings endpoint supports two `encoding_format` values:
+
+- `"float"` (default): returns each embedding as a JSON list of floats.
+- `"base64"`: returns each dense embedding as a base64 string containing little-endian float32 bytes — about 2.9x smaller than the float-list form and decodable with a zero-copy `np.frombuffer`.
+
+```python
+import base64
+import numpy as np
+import requests
+
+payload = {
+    "model": "Qwen/Qwen3-Embedding-4B",
+    "input": "What is the capital of France?",
+    "encoding_format": "base64",
+}
+
+response = requests.post(url + "/v1/embeddings", json=payload).json()
+embedding = np.frombuffer(
+    base64.b64decode(response["data"][0]["embedding"]), dtype="<f4"
+)
+print("Embedding:", embedding)
+```
+
 
 ## Multimodal Embedding Example
 
