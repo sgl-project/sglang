@@ -98,6 +98,38 @@ async def test_streaming_generation_waits_for_every_choice_terminal():
 
 
 @pytest.mark.asyncio
+async def test_legacy_incremental_stream_restores_cumulative_choices():
+    runtime = _runtime(
+        [
+            {"index": 0, "output_ids": [10], "meta_info": {}},
+            {"index": 1, "output_ids": [20], "meta_info": {}},
+            {
+                "index": 0,
+                "output_ids": [11],
+                "meta_info": {"finish_reason": {"type": "stop"}},
+            },
+            {
+                "index": 1,
+                "output_ids": [21],
+                "meta_info": {"finish_reason": {"type": "length"}},
+            },
+        ],
+        incremental=True,
+    )
+    callback = _Callback()
+    obj = SimpleNamespace(sampling_params={"n": 2}, rid="request")
+
+    await runtime._run_generate(obj, callback, True, None)
+
+    assert [call[0]["output_ids"] for call in callback.calls] == [
+        [10],
+        [20],
+        [10, 11],
+        [20, 21],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_typed_streaming_normalizes_cumulative_choices_before_callback():
     def _meta(tokens, *, finished=False):
         return {

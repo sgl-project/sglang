@@ -479,6 +479,11 @@ class RuntimeHandle:
                 offsets = {
                     index: _TypedChoiceOffsets() for index in range(expected_choices)
                 }
+                legacy_output_ids = (
+                    {index: [] for index in range(expected_choices)}
+                    if incremental and not typed_generation
+                    else None
+                )
                 async for chunk in gen:
                     choice_index = int(chunk.get("index") or 0)
                     if not 0 <= choice_index < expected_choices:
@@ -502,15 +507,23 @@ class RuntimeHandle:
                             return
                         terminal_choices.add(choice_index)
                         request_finished = len(terminal_choices) == expected_choices
-                    callback_chunk = (
-                        _normalize_typed_stream_chunk(
+                    if typed_generation:
+                        callback_chunk = _normalize_typed_stream_chunk(
                             chunk,
                             offsets[choice_index],
                             incremental=incremental,
                         )
-                        if typed_generation
-                        else chunk
-                    )
+                    elif incremental:
+                        assert legacy_output_ids is not None
+                        legacy_output_ids[choice_index].extend(
+                            chunk.get("output_ids") or []
+                        )
+                        callback_chunk = dict(chunk)
+                        callback_chunk["output_ids"] = list(
+                            legacy_output_ids[choice_index]
+                        )
+                    else:
+                        callback_chunk = chunk
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,
                         ready_event,
