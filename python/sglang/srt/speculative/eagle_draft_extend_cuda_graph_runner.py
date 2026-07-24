@@ -490,13 +490,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
         if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens // self.captured_req_width
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max_num_tokens
-            )
-            bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
+            # Size replay buckets from raw request counts, matching can_run_graph().
+            # scaled/aligned global_num_tokens_cpu can over-pad or exceed capture_bs.
+            max_batch_size = max(forward_batch.original_global_num_tokens_cpu)
+            bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
