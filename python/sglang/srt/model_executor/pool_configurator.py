@@ -185,11 +185,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * effective_num_layers
-                * kv_size
+            # Local import avoids a cycle with kv_cache_configurator.
+            from sglang.srt.mem_cache.kv_cache_configurator import (
+                calculate_mla_kv_cache_dim,
             )
+
+            # Keep pool sizing aligned with the actual backend-specific layout.
+            # DSA FP8 backends can store scales and BF16 RoPE data alongside KV.
+            mla_kv_cache_dim = calculate_mla_kv_cache_dim(
+                model_config=model_config,
+                kv_cache_dtype=kv_cache_dtype,
+                server_args=kvc.server_args,
+            )
+            cell_size = mla_kv_cache_dim * effective_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

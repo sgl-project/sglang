@@ -1270,6 +1270,25 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
+    model_arch = hf_config.architectures[0]
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and major == 12
+        and kv_cache_dtype == "fp8_e4m3"
+        and not is_hip()
+    )
+
+    if is_glm_sm12_fp8:
+        backend = "flashinfer_sparse_mla"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
+            f"prefill={backend}, decode={backend}."
+        )
+        return declared
 
     if view.enable_hisparse:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend

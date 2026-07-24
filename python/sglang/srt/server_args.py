@@ -329,6 +329,7 @@ DSA_CHOICES = [
     "flashmla_sparse_q8",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
