@@ -301,6 +301,8 @@ class _TransferChunk:
 
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Implements teardown() below, so runtime PD role switching is supported.
+    supports_role_switch = True
 
     def __init__(
         self,
@@ -318,6 +320,9 @@ class MoriKVManager(CommonKVManager):
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
+        # Set by teardown() to make worker threads exit (PoC: P<->D role switch).
+        self._stopped = False
+        self._worker_threads: List[threading.Thread] = []
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -328,7 +333,10 @@ class MoriKVManager(CommonKVManager):
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
             for shard, queue in enumerate(self._transfer_queues):
-                threading.Thread(
+                # Track the thread so teardown() can join it: otherwise every
+                # P->D->P flip that re-enters PREFILL leaks _num_shards threads
+                # (each parked forever in FastQueue.get()).
+                t = threading.Thread(
                     target=self._transfer_worker,
                     args=(queue,),
                     daemon=True,
@@ -336,7 +344,9 @@ class MoriKVManager(CommonKVManager):
                         f"mori-xfer-dp{self.system_dp_rank}-"
                         f"tp{self.attn_tp_rank}-s{shard}"
                     ),
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
@@ -435,6 +445,11 @@ class MoriKVManager(CommonKVManager):
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
             task = queue.get()
+            # teardown() pushes a None sentinel to unblock get() and stop the
+            # worker: FastQueue.get() blocks indefinitely, so checking _stopped
+            # alone can never wake a parked worker during a role switch.
+            if task is None:
+                break
             try:
                 task.sender._run_chunk(task)
             except Exception as exc:
@@ -553,9 +568,17 @@ class MoriKVManager(CommonKVManager):
         return payload
 
     def _start_bootstrap_thread(self) -> None:
+        # Poll with a timeout so the worker can observe _stopped and exit
+        # promptly (recv_multipart() would block forever and make teardown,
+        # i.e. runtime P<->D role switch, hang).
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def bootstrap_worker():
-            while True:
+            while not self._stopped:
                 try:
+                    if not poller.poll(timeout=500):
+                        continue
                     msg = self.server_socket.recv_multipart()
                     payload = self._validate_message(msg)
                     if payload is None:
@@ -567,9 +590,13 @@ class MoriKVManager(CommonKVManager):
                     else:
                         self._handle_transfer_message(payload)
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Bootstrap worker failed")
 
-        threading.Thread(target=bootstrap_worker, daemon=True).start()
+        t = threading.Thread(target=bootstrap_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
 
     def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
         bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
@@ -581,9 +608,14 @@ class MoriKVManager(CommonKVManager):
                     self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
 
     def _start_decode_thread(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def decode_worker():
-            while True:
+            while not self._stopped:
                 try:
+                    if not poller.poll(timeout=500):
+                        continue
                     msg = self.server_socket.recv_multipart()
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
@@ -630,9 +662,69 @@ class MoriKVManager(CommonKVManager):
                             bootstrap_room,
                         )
                 except Exception:
+                    if self._stopped:
+                        break
                     logger.exception("Decode status worker failed")
 
-        threading.Thread(target=decode_worker, daemon=True).start()
+        t = threading.Thread(target=decode_worker, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
+
+    def teardown(self) -> None:
+        """Stop worker threads and release transport resources so this
+        KVManager can be discarded during a P<->D role switch.
+
+        The KV cache pool memory is owned by the scheduler and is NOT freed
+        here; only mori-side registrations / sockets / engine are released.
+        """
+        self._stopped = True
+        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
+        # timeout; push a None sentinel per shard to wake and stop them so the
+        # join below returns instead of leaking the thread.
+        for queue in getattr(self, "_transfer_queues", []):
+            try:
+                queue.put(None)
+            except Exception:
+                logger.exception("Failed to signal mori transfer worker on teardown")
+        # Join workers before touching their sockets: ZMQ sockets aren't
+        # thread-safe, so don't close server_socket while a worker may poll it.
+        for t in self._worker_threads:
+            t.join(timeout=3.0)
+        self._worker_threads = []
+        # Drop the queues so their buffered tasks/senders are released too.
+        self._transfer_queues = []
+        try:
+            self.server_socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close mori server_socket during teardown")
+        # destroy() force-closes every socket in the context (incl. per-thread
+        # cached PUSH sockets); plain term() would block waiting on them.
+        try:
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            logger.exception("Failed to destroy mori zmq context during teardown")
+        # Deregister RDMA memory and drop the IOEngine reference.
+        try:
+            for descs in (self.kv_mem_descs, self.aux_mem_descs):
+                for desc in descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+            for component_descs in self.state_mem_descs:
+                for desc in component_descs:
+                    try:
+                        self.engine.deregister_memory(desc)
+                    except Exception:
+                        pass
+        finally:
+            self.kv_mem_descs = []
+            self.aux_mem_descs = []
+            self.state_mem_descs = []
+            self.engine = None
+        logger.info(
+            "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
+        )
 
     def _compute_prefill_unique_rank(self) -> int:
         """Unique id per prefill sender, encoding TP/PP/CP ranks.

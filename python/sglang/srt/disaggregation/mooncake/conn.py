@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -155,6 +156,8 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    # Implements teardown() below, so runtime PD role switching is supported.
+    supports_role_switch = True
 
     def __init__(
         self,
@@ -168,6 +171,9 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        # Set by teardown() to make worker threads exit (P<->D role switch).
+        self._stopped = False
+        self._worker_threads: List[threading.Thread] = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -203,7 +209,10 @@ class MooncakeKVManager(CommonKVManager):
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
-                threading.Thread(
+                # Track the thread so teardown() can join it: otherwise every
+                # P->D->P flip that re-enters PREFILL leaks threads
+                # (each parked forever in FastQueue.get()).
+                t = threading.Thread(
                     target=self.transfer_worker,
                     args=(
                         queue,
@@ -216,7 +225,9 @@ class MooncakeKVManager(CommonKVManager):
                         i,
                     ),
                     daemon=True,
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -225,11 +236,13 @@ class MooncakeKVManager(CommonKVManager):
                     envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
                 )
                 self._failed_session_probe_shutdown = threading.Event()
-                threading.Thread(
+                t = threading.Thread(
                     target=self._failed_session_probe_loop,
                     name="MooncakeFailedSessionProbe",
                     daemon=True,
-                ).start()
+                )
+                t.start()
+                self._worker_threads.append(t)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -274,6 +287,94 @@ class MooncakeKVManager(CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+
+    def teardown(self) -> None:
+        """Stop worker threads and release transport resources so this
+        KVManager can be discarded during a P<->D role switch.
+
+        The KV cache pool memory is owned by the scheduler and is NOT freed
+        here; only mooncake-side registrations / sockets are released.
+        """
+        self._stopped = True
+
+        # Stop the failed-session probe loop (PREFILL role) if running.
+        probe_shutdown = getattr(self, "_failed_session_probe_shutdown", None)
+        if probe_shutdown is not None:
+            probe_shutdown.set()
+
+        # Stop the heartbeat checker thread (DECODE role) if running.
+        heartbeat_shutdown = getattr(self, "_heartbeat_shutdown", None)
+        if heartbeat_shutdown is not None:
+            heartbeat_shutdown.set()
+
+        # Transfer workers (PREFILL role) park in FastQueue.get(), which has no
+        # timeout; push a None sentinel per shard to wake and stop them so the
+        # join below returns instead of leaking the thread.
+        for queue in getattr(self, "transfer_queues", []):
+            try:
+                queue.put(None)
+            except Exception:
+                logger.exception(
+                    "Failed to signal mooncake transfer worker on teardown"
+                )
+
+        # Shutdown thread pool executors (PREFILL role).
+        for executor in getattr(self, "executors", []):
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python < 3.9 does not support cancel_futures
+                executor.shutdown(wait=False)
+            except Exception:
+                logger.exception("Failed to shutdown executor on teardown")
+        self.executors = []
+
+        # Join workers before touching their sockets: ZMQ sockets aren't
+        # thread-safe, so don't close server_socket while a worker may poll it.
+        for t in self._worker_threads:
+            t.join(timeout=3.0)
+        self._worker_threads = []
+
+        # Drop the queues so their buffered tasks/senders are released too.
+        self.transfer_queues = []
+
+        # Close cached PUSH sockets (used by _connect for status sync).
+        with self._socket_lock:
+            for sock in self._socket_cache.values():
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+            for monitor in self._monitor_cache.values():
+                try:
+                    monitor.close()
+                except Exception:
+                    pass
+            self._socket_cache.clear()
+            self._monitor_cache.clear()
+
+        try:
+            self.server_socket.close(linger=0)
+        except Exception:
+            logger.exception("Failed to close mooncake server_socket during teardown")
+
+        # destroy() force-closes every socket in the context; plain term()
+        # would block waiting on them.
+        try:
+            self._zmq_ctx.destroy(linger=0)
+        except Exception:
+            logger.exception("Failed to destroy mooncake zmq context during teardown")
+
+        # Deregister memory from the transfer engine.
+        try:
+            self.deregister_buffer_to_engine()
+        except Exception:
+            logger.exception("Failed to deregister buffers during teardown")
+
+        logger.info(
+            "MooncakeKVManager torn down (was role=%s)",
+            self.disaggregation_mode.value,
+        )
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1278,6 +1379,11 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # teardown() pushes a None sentinel to unblock get() and stop
+                # the worker: FastQueue.get() blocks indefinitely, so checking
+                # _stopped alone can never wake a parked worker during a role switch.
+                if kv_chunk is None:
+                    break
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1501,11 +1607,25 @@ class MooncakeKVManager(CommonKVManager):
                 )
 
     def start_prefill_thread(self):
+        # Poll with a timeout so the worker can observe _stopped and exit
+        # promptly (recv_multipart() would block forever and make teardown,
+        # i.e. runtime P<->D role switch, hang).
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
+            while not self._stopped:
+                try:
+                    if not poller.poll(timeout=500):
+                        continue
+                    waiting_req_bytes = self.server_socket.recv_multipart()
+                except Exception:
+                    if self._stopped:
+                        break
+                    logger.exception("Bootstrap thread failed")
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -1597,12 +1717,28 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        t = threading.Thread(target=bootstrap_thread, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
 
     def start_decode_thread(self):
+        # Poll with a timeout so the worker can observe _stopped and exit
+        # promptly (recv_multipart() would block forever and make teardown,
+        # i.e. runtime P<->D role switch, hang).
+        poller = zmq.Poller()
+        poller.register(self.server_socket, zmq.POLLIN)
+
         def decode_thread():
-            while True:
-                msg = self.server_socket.recv_multipart()
+            while not self._stopped:
+                try:
+                    if not poller.poll(timeout=500):
+                        continue
+                    msg = self.server_socket.recv_multipart()
+                except Exception:
+                    if self._stopped:
+                        break
+                    logger.exception("Decode thread failed")
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -1668,8 +1804,11 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     self.update_status(bootstrap_room, status)
 
-        threading.Thread(target=decode_thread).start()
-        self._start_heartbeat_checker_thread()
+        t = threading.Thread(target=decode_thread, daemon=True)
+        t.start()
+        self._worker_threads.append(t)
+        t = self._start_heartbeat_checker_thread()
+        self._worker_threads.append(t)
 
     def add_transfer_request(
         self,

@@ -225,6 +225,9 @@ class CommonKVManager(BaseKVManager):
             self.max_failures = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
+            # Event used to signal the heartbeat checker thread to exit
+            # during teardown (e.g. runtime P<->D role switch).
+            self._heartbeat_shutdown = threading.Event()
             # If a timeout happens on the decode side, it means decode instances
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
@@ -879,12 +882,18 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
-    def _start_heartbeat_checker_thread(self):
-        """Start the heartbeat checker thread for Decode worker."""
+    def _start_heartbeat_checker_thread(self) -> threading.Thread:
+        """Start the heartbeat checker thread for Decode worker.
+
+        Returns the thread object so callers can track/join it during teardown.
+        """
 
         def heartbeat_checker():
-            while True:
-                time.sleep(self.heartbeat_interval)
+            while not self._heartbeat_shutdown.is_set():
+                # Use Event.wait() instead of time.sleep() so teardown can
+                # wake this thread immediately by setting the event.
+                if self._heartbeat_shutdown.wait(self.heartbeat_interval):
+                    break
                 with self.connection_lock:
                     addresses = list(self.prefill_info_table.keys())
 
@@ -923,7 +932,13 @@ class CommonKVManager(BaseKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        threading.Thread(target=heartbeat_checker, daemon=True).start()
+        t = threading.Thread(
+            target=heartbeat_checker,
+            name="HeartbeatChecker",
+            daemon=True,
+        )
+        t.start()
+        return t
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""

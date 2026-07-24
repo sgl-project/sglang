@@ -2935,6 +2935,13 @@ class ServerArgs:
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         NS("disagg"),
     ] = 1
+    # Allow runtime P<->D role switching for this instance. When enabled, the
+    # bootstrap server is always started (so a flipped-to-prefill instance can
+    # serve bootstrap) and the /pd_role_switch control endpoint is active.
+    enable_pd_role_switch: A[
+        bool,
+        "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
+    ] = False
     optimistic_prefill_attempts: A[
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
