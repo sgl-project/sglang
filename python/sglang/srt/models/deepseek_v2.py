@@ -184,6 +184,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_forward,
     get_model,
@@ -1783,6 +1784,7 @@ class DeepseekV2AttentionMLA(
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
+            and not get_exec().deterministic.enable_deterministic_inference
             and not self.is_packed_weight
             and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
         )
