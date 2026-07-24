@@ -293,6 +293,11 @@ is_sm80_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
     )
 )
+is_sm89_supported = lru_cache(maxsize=1)(
+    lambda: is_cuda()
+    and torch.cuda.get_device_capability() == (8, 9)
+    and tuple(map(int, torch.version.cuda.split(".")[:2])) >= (11, 0)
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
