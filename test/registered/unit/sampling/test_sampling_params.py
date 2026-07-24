@@ -272,6 +272,46 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    def test_logit_bias_boundary_values_are_valid(self):
+        """The documented -100 and 100 boundaries are accepted."""
+        sp = self._make(logit_bias={"0": -100, "1": 100.0})
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_out_of_range_raises(self):
+        """Values outside the documented [-100, 100] range are rejected."""
+        for bias in (-100.01, 100.01):
+            with self.subTest(bias=bias):
+                sp = self._make(logit_bias={"0": bias})
+                with self.assertRaisesRegex(ValueError, "negative infinity"):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_non_finite_raises(self):
+        """NaN and positive infinity are unsafe sampling biases."""
+        for bias in (float("nan"), float("inf")):
+            with self.subTest(bias=bias):
+                sp = self._make(logit_bias={"0": bias})
+                with self.assertRaisesRegex(ValueError, "negative infinity"):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_negative_infinity_hard_mask_is_valid(self):
+        """Negative infinity is supported as an internal hard-token mask."""
+        sp = self._make(logit_bias={"0": float("-inf")})
+        sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_float64_overflow_regression(self):
+        """Regression test for a float64 value that overflows float32 tensors."""
+        sp = self._make(logit_bias={"0": -8.988465674311579e307})
+        with self.assertRaisesRegex(ValueError, "negative infinity"):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_non_numeric_value_raises(self):
+        """Strings and booleans are not valid numeric bias values."""
+        for bias in ("-50", True):
+            with self.subTest(bias=bias):
+                sp = self._make(logit_bias={"0": bias})
+                with self.assertRaisesRegex(ValueError, "must be numbers"):
+                    sp.verify(self.VOCAB_SIZE)
+
     def test_multiple_grammars_raises(self):
         """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
         sp = self._make(json_schema='{"type":"object"}', regex="abc")
