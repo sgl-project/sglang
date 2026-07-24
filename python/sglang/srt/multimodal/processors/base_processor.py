@@ -38,6 +38,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -528,7 +529,11 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.disable_fast_image_processor
         ):
-            if _is_cpu or get_server_args().rl_on_policy_target is not None:
+            if (
+                _is_cpu
+                or use_mlx()
+                or get_server_args().rl_on_policy_target is not None
+            ):
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
