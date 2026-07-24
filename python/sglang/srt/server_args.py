@@ -4176,6 +4176,19 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
+            # TcPiecewise makes the trtllm_mla prefill fall back to the
+            # flashinfer-MLA implementation, which faults (illegal address)
+            # on an FP8 KV cache.
+            (
+                "MLA attention with FP8 KV cache",
+                lambda: self.kv_cache_dtype.startswith("fp8")
+                and (
+                    _resolved_view(self).attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                    or _resolved_view(self).prefill_attention_backend
+                    in ("trtllm_mla", "flashinfer_mla")
+                ),
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
