@@ -42,9 +42,10 @@ def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
 # Draft step logits: NaN is a bug, but -inf is legitimate (masking). The data
 # layer lives downstream (probs one-hot below, or the fast kernel's clamp).
 _DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN())
-# Draft sampling probs: a degenerate (all-NaN) row makes multinomial raise.
+# Draft sampling probs: SOFTEN (tolerate + count), matching the original
+# unconditional clamp; an all-NaN row would otherwise make multinomial raise.
 _DRAFT_PROBS = Invariant(
-    "dspark.draft.probs", Bucket.GUARD, NotNaN(), recover=_one_hot_token0
+    "dspark.draft.probs", Bucket.SOFTEN, NotNaN(), recover=_one_hot_token0
 )
 
 
