@@ -831,21 +831,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
 
-        # GDN has two parallel input projections. We opt into the fused
-        # AR+RMSNorm+MXFP4 quant epilogue only when ``in_proj_qkvz`` is MXFP4
-        # (it dominates the bytes). The bf16 sidecar is requested *only* when
-        # ``in_proj_ba`` is NOT MXFP4 - otherwise we'd write the sidecar to
-        # HBM just to have ``in_proj_ba`` re-quantize it back, which is a
-        # net regression. Some MXFP4 checkpoints quantize ``in_proj_ba``
-        # too; in that case we feed the same ``(fp4, scale)`` pair to both
-        # projections and skip the sidecar entirely.
+        # GDN has two parallel input projections. Opt into the fused quant
+        # epilogue on ``in_proj_qkvz`` (it dominates the bytes).
         self._fused_ar_quant_format = _detect_fused_ar_quant_format(
             self.linear_attn.in_proj_qkvz
         )
-        # The bf16 sidecar (keep_bf16=True) is only needed when ``in_proj_ba`` is
-        # an unquantized (bf16) consumer. It can be dropped when ``in_proj_ba`` is
-        # already quantized in the checkpoint, letting the single fused
-        # AR+RMSNorm+quant kernel emit only (quant, scale).
+        # Emit the bf16 sidecar only for an unquantized ``in_proj_ba``; when it
+        # is already quantized, skip it and let the single kernel emit only
+        # (quant, scale) (a sidecar would just be re-quantized, a regression).
         _ba_quantized = bool(_detect_fused_ar_quant_format(self.linear_attn.in_proj_ba))
         self._emit_bf16_for_ba = bool(self._fused_ar_quant_format) and not _ba_quantized
 

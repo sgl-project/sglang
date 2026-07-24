@@ -149,42 +149,6 @@ def _try_fused_allreduce_rmsnorm_quant(
             layernorm.variance_epsilon,
             emit_bf16=emit_bf16,
         )
-        # One-shot diagnostic: confirms the new path is firing and which
-        # dispatch path (1-stage / 2-stage / fallback) was selected.
-        # Remove after triage.
-        if quant_result is not None and not getattr(
-            _try_fused_allreduce_rmsnorm_quant, "_logged", False
-        ):
-            M = hidden_states.shape[0]
-            K = hidden_states.shape[-1]
-            tb = hidden_states.numel() * hidden_states.element_size()
-            use_direct = (
-                M <= 4
-                or (K <= 4096 and M <= 32)
-                or (K <= 6144 and M <= 16)
-                or (K == 8192 and M <= 8)
-            )
-            path = (
-                "1stage"
-                if (use_direct and K % 32 == 0 and K <= 16384 and M <= 80)
-                else (
-                    "2stage"
-                    if (K % 32 == 0 and K <= 8192 and tb <= 512 * 1024)
-                    else "fallback"
-                )
-            )
-            import logging as _lg
-
-            _lg.getLogger(__name__).warning(
-                "[fused-ar-mxfp4] FIRING path=%s M=%d K=%d total_bytes=%d "
-                "emit_bf16=%s",
-                path,
-                M,
-                K,
-                tb,
-                emit_bf16,
-            )
-            _try_fused_allreduce_rmsnorm_quant._logged = True
         if quant_result is None:
             return None
 
@@ -725,14 +689,11 @@ class LayerCommunicator:
                         quant_format,
                         emit_bf16=emit_bf16,
                     )
-                    # Otherwise fall back to the per-group FP8 fused path for
-                    # layers that opt in via enable_fused_ar_quant (#24651).
-                    # Requires a *positive* per-group FP8 signal (quant_format
-                    # == "fp8"): an empty quant_format means the consumer is
-                    # unquantized (bf16) and must receive a plain tensor, not a
-                    # (fp8, scale) tuple - otherwise the downstream GEMM crashes
-                    # with 'tuple has no attribute dtype'. "fp8_per_token" and
-                    # "mxfp4" have their own fused paths above.
+                    # Else per-group FP8 fused path (opt-in via
+                    # enable_fused_ar_quant, #24651). Needs a positive per-group
+                    # FP8 signal (quant_format == "fp8"); an empty quant_format
+                    # means a bf16 consumer that must get a plain tensor, not a
+                    # (fp8, scale) tuple. "fp8_per_token"/"mxfp4" handled above.
                     if (
                         quant_result is None
                         and quant_format == "fp8"
@@ -817,12 +778,10 @@ class LayerCommunicator:
                         and (quant_format == "fp8_per_token")
                         and not emit_bf16
                     ):
-                        # Use gemma_weight (weight + 1) for Gemma-style norms so
-                        # the standard aiter rmsnorm kernel matches GemmaRMSNorm
-                        # semantics; plain RMSNorm has no gemma_weight and uses
-                        # its raw weight. ``emit_bf16`` requests a bf16 sidecar
-                        # (GDN ``in_proj_ba``) that this 2-tuple fast path can't
-                        # serve, so those layers fall through to the plain norm.
+                        # gemma_weight (weight + 1) makes the aiter rmsnorm match
+                        # GemmaRMSNorm; plain RMSNorm falls back to raw weight.
+                        # emit_bf16 (GDN in_proj_ba sidecar) is unsupported by
+                        # this 2-tuple fast path, so those layers use plain norm.
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
                             getattr(

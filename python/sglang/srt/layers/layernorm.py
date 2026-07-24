@@ -98,23 +98,15 @@ _has_rocm_triton_gemma_rms_norm = False
 _aiter_per_1x128_quant = None
 _aiter_per_token_quant = None
 _aiter_fp8_dtype = None
-_use_aiter_bpreshuffle_gfx95 = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
-    from sglang.srt.layers.quantization.fp8_utils import (
-        _use_aiter_bpreshuffle_gfx95,
-    )
-
-    # Cache the per-1x128 HIP quant functor and the FP8 dtype so the
-    # keep_bf16 fallback path in ``_forward_with_allreduce_fusion_quant_per_group``
-    # does not re-import aiter on every forward.
+    # Cache HIP quant functors and the FP8 dtype so fallback paths don't
+    # re-import aiter on every forward.
     _aiter_per_1x128_quant = _aiter.get_hip_quant(_aiter.QuantType.per_1x128)
-    # Per-token HIP quant functor for the fused AR+RMSNorm+per-token-FP8-quant
-    # path. Cached so the fallback path does not re-import aiter every forward.
     _aiter_per_token_quant = _aiter.get_hip_quant(_aiter.QuantType.per_Token)
     _aiter_fp8_dtype = _aiter.dtypes.fp8
 
@@ -381,30 +373,16 @@ def _forward_with_allreduce_fusion_quant_per_token(
 ):
     """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter path).
 
-    This is the per-token counterpart of
-    ``_forward_with_allreduce_fusion_quant_per_group``. It targets FP8 GEMM
-    consumers that expect per-token (1xK) activation scales - e.g. attention
-    ``qkv_proj`` / GDN ``in_proj_qkvz`` prepared with
-    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` - for which the per-1x128 group scales
-    produced by the per-group path would be the wrong layout.
+    Per-token counterpart of ``_forward_with_allreduce_fusion_quant_per_group``,
+    for FP8 GEMM consumers needing per-token (1xK) activation scales (attention
+    ``qkv_proj`` / GDN ``in_proj_qkvz`` under ``SGLANG_USE_AITER_FP8_PER_TOKEN``).
 
-    Returns one of:
-
-    * ``((fp8, scale), residual)``        when ``keep_bf16=False``
-    * ``((bf16, fp8, scale), residual)``  when ``keep_bf16=True``
-    * ``None``                            when no fused path is available
-
-    Uses the single-kernel aiter ``custom_fused_ar_rms_quant``
-    (``post_per_token_quant=True``) when possible, collapsing AR+RMSNorm and the
-    per-token quant into one launch. Falls back to a 2-kernel path (fused
-    AR+RMSNorm + separate per-token quant) when the single kernel declines the
-    shape or when ``keep_bf16=True`` (the single kernel emits no bf16 sidecar).
-    ``scale`` is always returned with shape ``(M, 1)`` to match the per-token
-    a8w8 GEMM.
-
-    ``keep_bf16`` mirrors the per-group helper: GDN layers need the
-    unquantized bf16 normed output for the small ``in_proj_ba`` projection in
-    addition to ``(fp8, scale)`` for the FP8 ``in_proj_qkvz``.
+    Returns ``((fp8, scale), residual)``, or ``((bf16, fp8, scale), residual)``
+    when ``keep_bf16=True``, or ``None`` if no fused path applies. ``scale`` has
+    shape ``(M, 1)``. Uses the single-kernel ``custom_fused_ar_rms_quant``
+    (``post_per_token_quant=True``) when possible, else a 2-kernel fallback
+    (fused AR+RMSNorm + separate quant), which is also used for ``keep_bf16``
+    (single kernel emits no bf16 sidecar) needed by GDN ``in_proj_ba``.
     """
     if residual is None or not _use_aiter or _aiter_per_token_quant is None:
         return None
@@ -427,12 +405,9 @@ def _forward_with_allreduce_fusion_quant_per_token(
     if world_size <= 1:
         return None
 
-    # Preferred: single fused AR+RMSNorm+per-token-quant kernel (collapses the
-    # AR+RMSNorm and the standalone per-token quant launches into one). The
-    # single kernel does not emit a bf16 sidecar, so it only serves the
-    # keep_bf16=False case (e.g. attention qkv_proj, or GDN when in_proj_ba is
-    # also quantized). keep_bf16=True (GDN bf16 gating consumer) uses the
-    # 2-kernel fallback below.
+    # Preferred: single kernel collapsing AR+RMSNorm and the per-token quant.
+    # It emits no bf16 sidecar, so it only serves keep_bf16=False; keep_bf16
+    # (GDN bf16 gating consumer) uses the 2-kernel fallback below.
     if not keep_bf16:
         result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
             x, residual, weight, norm_module.variance_epsilon
@@ -443,9 +418,8 @@ def _forward_with_allreduce_fusion_quant_per_token(
                 scale_out = scale_out.view(-1, 1)
             return (fp8_out, scale_out), residual_out
 
-    # Fallback: fused AR+RMSNorm then a separate per-token quant. Still removes
-    # the standalone all-reduce vs. unfused, and is the only path able to emit
-    # the bf16 sidecar required when keep_bf16=True.
+    # Fallback: fused AR+RMSNorm + separate per-token quant. Still saves the
+    # standalone all-reduce, and is the only path that emits the bf16 sidecar.
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
         x, residual, weight, norm_module.variance_epsilon
     )
