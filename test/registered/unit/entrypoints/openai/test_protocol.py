@@ -109,6 +109,16 @@ class TestCompletionRequest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
 
+    def test_null_max_tokens_uses_default(self):
+        """Explicit max_tokens=None falls back to the default (like OpenAI)"""
+        request = CompletionRequest(model="test-model", prompt="Hello", max_tokens=None)
+        self.assertEqual(request.max_tokens, 16)
+
+    def test_zero_max_tokens_rejected(self):
+        """max_tokens=0 still fails validation"""
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="test-model", prompt="Hello", max_tokens=0)
+
 
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
