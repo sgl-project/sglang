@@ -396,6 +396,8 @@ class DefaultModelLoader(BaseModelLoader):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
+        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
+            allowed_keys.add("enable_gds")
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
@@ -403,6 +405,13 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Unexpected extra config keys for load format "
                 f"{load_config.load_format}: "
                 f"{unexpected_keys}"
+            )
+
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
             )
 
     def _maybe_download_from_modelscope(
@@ -606,8 +615,10 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    enable_gds=enable_gds,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
