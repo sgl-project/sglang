@@ -2,6 +2,7 @@
 
 import fnmatch
 import logging
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, cast
 
 import torch
@@ -137,6 +138,33 @@ class QuarkConfig(QuantizationConfig):
             if name.startswith("language_model."):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
+
+    # Env-gated: quantize otherwise-excluded (bf16) ATTENTION PROJECTIONS to
+    # dynamic W8A8 fp8 to cut decode HBM traffic. Off by default so the bf16
+    # baseline is untouched. Never touches kv_b_proj (absorbed into w_kc/w_vc
+    # for the MLA decode bmm) or the indexer/router/MLP/lm_head/embedding.
+    _FP8_ATTN_PROJ_DEFAULT = "o_proj"
+    _FP8_ATTN_PROJ_NEVER = ("kv_b_proj",)
+
+    def _maybe_fp8_attn_proj_method(self, prefix: str):
+        if os.environ.get("SGLANG_FP8_ATTN_PROJ", "0") != "1":
+            return None
+        if "self_attn" not in prefix or ".indexer" in prefix:
+            return None
+        if any(prefix.endswith(s) for s in self._FP8_ATTN_PROJ_NEVER):
+            return None
+        layers = os.environ.get(
+            "SGLANG_FP8_ATTN_PROJ_LAYERS", self._FP8_ATTN_PROJ_DEFAULT
+        )
+        suffixes = [x.strip() for x in layers.split(",") if x.strip()]
+        if not any(prefix.endswith(s) for s in suffixes):
+            return None
+        from sglang.srt.layers.quantization.fp8_attn_proj import (
+            Fp8AttnProjBlockMethod,
+        )
+        self._quantized_layers.add(prefix)
+        logger.info("[fp8-attn-proj] quantizing %s to dynamic block fp8", prefix)
+        return Fp8AttnProjBlockMethod()
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
