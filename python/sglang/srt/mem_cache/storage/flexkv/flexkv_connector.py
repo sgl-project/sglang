@@ -330,7 +330,7 @@ class FlexKVConnector:
 
         values = [
             ("operation", context.operation),
-            ("action", action),
+            ("act", action),
             ("status", status),
         ]
         for name in ("direction", "blocks", "op_id", "graph_id"):
@@ -354,7 +354,7 @@ class FlexKVConnector:
             if name in fields:
                 values.append((name, fields.pop(name)))
         if "transfer_mode" in fields:
-            values.append(("transfer_mode", fields.pop("transfer_mode")))
+            values.append(("mode", fields.pop("transfer_mode")))
         error = fields.pop("error", None)
         values.extend((name, value) for name, value in fields.items())
         if elapsed_s is not None:

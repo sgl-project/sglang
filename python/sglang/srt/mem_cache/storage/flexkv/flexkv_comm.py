@@ -845,9 +845,9 @@ class FlexKVLayerDoneCounter:
             rank = getattr(self, "world_rank", -1)
             timeout_s = getattr(self, "wait_timeout_s", None)
             logger.error(
-                "[ERROR][FlexKV-SGLang] operation=load action=wait "
+                "[ERROR][FlexKV-SGLang] operation=load act=wait "
                 "status=timeout direction=H2D flexkv_task_ids=%s "
-                "transfer_mode=layerwise rank=%d counter_id=%d layer=%d "
+                "mode=layerwise rank=%d counter_id=%d layer=%d "
                 "wait_count=%d timeout=%s",
                 task_ids,
                 rank,
