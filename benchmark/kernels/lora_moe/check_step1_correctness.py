@@ -297,10 +297,15 @@ def main() -> int:
     parser.add_argument("--replays", type=int, default=3)
     parser.add_argument("--deep-replays", type=int, default=100)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument(
+        "--source-revision",
+        default="",
+        help="explicit source identity when running from an exported tree",
+    )
     arguments = parser.parse_args()
 
     device = torch.device(arguments.device)
-    source_revision = capture_source_revision()
+    source_revision = arguments.source_revision or capture_source_revision()
     cases = [
         candidate
         for candidate in step1_matrix(str(device), source_revision)
