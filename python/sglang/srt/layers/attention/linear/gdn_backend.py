@@ -183,6 +183,8 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
+        self.uses_flashinfer_prefill = prefill_backend.is_flashinfer()
+
         # Verify kernel: use FlashInfer when the selected FlashInfer kernel
         # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
         # bf16-state adapter in FlashInferGDNKernel.
@@ -264,6 +266,54 @@ class GDNKernelDispatcher:
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
             **kwargs,
+        )
+
+    def try_fused_extend(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor],
+        no_prefix: bool,
+    ) -> Optional[tuple]:
+        if not self.uses_flashinfer_prefill:
+            return None
+
+        shape = dict(
+            num_q_heads=num_q_heads,
+            num_k_heads=num_k_heads,
+            num_v_heads=num_v_heads,
+            head_q_dim=head_q_dim,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+        )
+        if not self.extend_kernel.can_use_fused_prefill(mixed_qkv, **shape):
+            return None
+
+        return self.extend_kernel.extend_fused(
+            mixed_qkv,
+            a,
+            b,
+            **shape,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            out=out,
+            no_prefix=no_prefix,
         )
 
     def extend(
@@ -558,6 +608,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+
+        if not is_target_verify:
+            fused_result = self.kernel_dispatcher.try_fused_extend(
+                mixed_qkv,
+                a,
+                b,
+                num_q_heads=layer.num_q_heads,
+                num_k_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                head_q_dim=layer.head_q_dim,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                query_start_loc=query_start_loc,
+                out=kwargs.get("out"),
+                no_prefix=(
+                    forward_batch.extend_prefix_lens_cpu is not None
+                    and not any(forward_batch.extend_prefix_lens_cpu)
+                ),
+            )
+            if fused_result is not None:
+                core_attn_out, _, _ = fused_result
+                if needs_state_gather:
+                    conv_states[cache_indices] = conv_states_contig
+                    ssm_states[cache_indices] = ssm_states_contig
+                return core_attn_out
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim

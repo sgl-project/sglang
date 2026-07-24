@@ -9,6 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.triton.fla_math import l2norm_row_values
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -51,6 +52,27 @@ def l2norm_fwd_kernel1(
 #     ],
 #     key=["D", "NB"],
 # )
+@triton.jit
+def _l2norm_row_block(
+    x,
+    y,
+    eps,
+    i_t,
+    T,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # The packed fused path's 0-ULP contract also depends on this block-pointer
+    # load and round-to-nearest store in the input dtype. The numerical formula
+    # itself is shared with that kernel.
+    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    b_y = l2norm_row_values(b_x, eps)
+    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
@@ -61,13 +83,7 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_var = tl.sum(b_x * b_x, axis=1)
-    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    _l2norm_row_block(x, y, eps, tl.program_id(0), T, D, BT, BD)
 
 
 def l2norm_fwd(

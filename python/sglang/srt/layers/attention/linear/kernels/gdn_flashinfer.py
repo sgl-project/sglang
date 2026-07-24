@@ -21,6 +21,7 @@ from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Lazy import for FlashInfer GDN kernels
 # ---------------------------------------------------------------------------
@@ -300,6 +301,157 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         # Output: [seq, HV, V] -> [1, seq, HV, V]
+        core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
+
+        # Return (output, last_recurrent_state, h) to match Triton kernel interface.
+        # h=None since FlashInfer doesn't provide intermediate states.
+        return core_attn_out, None, None
+
+    @staticmethod
+    def can_use_fused_prefill(
+        mixed_qkv: torch.Tensor,
+        *,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ) -> bool:
+        total_dim = (
+            num_q_heads * head_q_dim
+            + num_k_heads * head_k_dim
+            + num_v_heads * head_v_dim
+        )
+        return (
+            mixed_qkv.shape[1] == total_dim
+            and mixed_qkv.stride(1) == 1
+            and num_q_heads == num_k_heads
+            and head_q_dim == head_k_dim == 128
+            and num_v_heads > 0
+            and num_v_heads & (num_v_heads - 1) == 0
+        )
+
+    def extend_fused(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        no_prefix: bool = False,
+        **kwargs,
+    ) -> tuple:
+        """Run the fused FlashInfer prefill path."""
+        from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+
+        q_fi, k_fi, v_fi, alpha_fi, beta_fi = gdn_prefill_fused(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            num_qk_heads=num_q_heads,
+            num_v_heads=num_v_heads,
+            head_qk_dim=head_q_dim,
+            head_v_dim=head_v_dim,
+        )
+        q_fi = q_fi[0]
+        k_fi = k_fi[0]
+        v_fi = v_fi[0]
+        alpha_fi = alpha_fi[0]
+        beta_fi = beta_fi[0]
+
+        total_seq_len = q_fi.shape[0]
+        num_v_heads = v_fi.shape[1]
+        head_v_dim = v_fi.shape[2]
+
+        if self.use_state_pool:
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+        else:
+            # SM90: negative (pad) indices remap to the last slot, the reserved
+            # sentinel.
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
+
+        if out is not None:
+            expected_shape = (1, total_seq_len, num_v_heads, head_v_dim)
+            assert (
+                out.shape == expected_shape
+            ), f"direct-write out buffer {tuple(out.shape)} != expected {expected_shape}"
+        output_buf = out.squeeze(0) if out is not None else None
+
+        # When no request in the batch has a prefix, skip the pool gather and
+        # let the kernel zero-seed via initial_state=None. Bit-identical: freed
+        # pool slots are cleared, so the gather would materialize zeros anyway
+        # (and this also insulates fresh prefills from any stale slot content).
+        if no_prefix:
+            initial_state_fi = None
+        else:
+            gathered = ssm_states[ssm_cache_indices]
+            # SM90 state must be float32; SM100 keeps the pool's bf16.
+            initial_state_fi = (
+                gathered.contiguous()
+                if self.use_state_pool
+                else gathered.to(torch.float32)
+            )
+
+        extra = {}
+        if self.use_state_pool:
+            # Pre-allocate bf16 output_state so the kernel compiles and writes
+            # the bf16 state path directly, avoiding a fp32 allocation and a
+            # subsequent fp32->bf16 conversion in the scatter step.
+            num_seqs = query_start_loc.numel() - 1
+            extra["output_state"] = ssm_states.new_empty(
+                (num_seqs,) + ssm_states.shape[1:]
+            )
+
+        output_fi, output_state_fi = self._prefill_fn(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=initial_state_fi,
+            output_final_state=True,
+            cu_seqlens=(
+                query_start_loc  # already int32
+                if self.use_state_pool
+                else query_start_loc.to(torch.int64)
+            ),
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+            **extra,
+        )
+
+        # Write back state to pool
+        ssm_states.index_copy_(
+            0,
+            ssm_cache_indices,
+            output_state_fi.to(ssm_states.dtype),
+        )
+
+        # Output: [seq, HV, V] -> [1, seq, HV, V]. When out= was honored this is
+        # a view of the caller's buffer, so its data_ptr matches and the caller
+        # skips its copy.
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
         # Return (output, last_recurrent_state, h) to match Triton kernel interface.
