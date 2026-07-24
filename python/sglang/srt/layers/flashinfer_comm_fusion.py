@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -45,9 +46,10 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    if not (is_sm90_supported() or is_sm100_supported()):
+    if not (is_sm90_supported() or is_sm100_supported() or is_sm120_supported()):
         raise ValueError(
-            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+            "FlashInfer allreduce fusion requires SM90, SM10X, or SM120 "
+            "NVIDIA GPUs."
         )
 
     if backend == "auto":

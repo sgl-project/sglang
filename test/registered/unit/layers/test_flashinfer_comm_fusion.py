@@ -81,7 +81,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
         )
 
         # Blackwell: mnnvl on both single-node and multi-node.
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
                 "mnnvl",
@@ -94,6 +97,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         with (
             patch.object(fusion, "is_sm100_supported", return_value=False),
             patch.object(fusion, "is_sm90_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
         ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
@@ -102,13 +106,26 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
 
-        # Architectures outside SM90/SM10X are unsupported. Both pre-SM90
-        # and post-SM10X devices (e.g. SM120) must fail closed.
-        for arch in ("pre_sm90", "post_sm10x"):
+        # SM120: auto uses trtllm on single-node, multi-node is unsupported.
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=False),
+            patch.object(fusion, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
+                "trtllm",
+            )
+            with self.assertRaises(ValueError):
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
+
+        # Architectures outside SM90/SM10X/SM120 are unsupported.
+        for arch in ("pre_sm90", "post_sm120"):
             with (
                 self.subTest(arch=arch),
                 patch.object(fusion, "is_sm100_supported", return_value=False),
                 patch.object(fusion, "is_sm90_supported", return_value=False),
+                patch.object(fusion, "is_sm120_supported", return_value=False),
             ):
                 with self.assertRaises(ValueError):
                     fusion.resolve_flashinfer_allreduce_fusion_backend(single_node)
@@ -132,6 +149,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         with (
             patch.object(fusion, "is_sm100_supported", return_value=False),
             patch.object(fusion, "is_sm90_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
         ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_mnnvl),
@@ -146,7 +164,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
 
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_mnnvl),
                 "mnnvl",
@@ -154,11 +175,26 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
 
-        for arch in ("pre_sm90", "post_sm10x"):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=False),
+            patch.object(fusion, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(
+                    single_node_trtllm
+                ),
+                "trtllm",
+            )
+            with self.assertRaises(ValueError):
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_mnnvl)
+
+        for arch in ("pre_sm90", "post_sm120"):
             with (
                 self.subTest(arch=arch),
                 patch.object(fusion, "is_sm100_supported", return_value=False),
                 patch.object(fusion, "is_sm90_supported", return_value=False),
+                patch.object(fusion, "is_sm120_supported", return_value=False),
             ):
                 for args in (
                     single_node_mnnvl,

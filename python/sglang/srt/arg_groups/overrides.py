@@ -1644,8 +1644,8 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     """Slot pass at the monolith tail: auto-enable FlashInfer AllReduce
-    Fusion on SM90/SM100 for models with explicit support. auto resolves to
-    mnnvl on Blackwell (single- and multi-node) and trtllm on SM90
+    Fusion on SM90/SM100/SM120 for models with explicit support. auto resolves
+    to mnnvl on SM100 (single- and multi-node) and trtllm on SM90/SM120
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
@@ -1653,14 +1653,15 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
-        and (is_sm90_supported() or is_sm100_supported())
+        and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
         and view.tp_size > 1
         and not view.enable_dp_attention
         and (view.nnodes == 1 or is_sm100_supported())
         and view.moe_a2a_backend == "none"
     ):
         logger.info(
-            f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+            f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X/SM120 "
+            f"for {model_arch}"
         )
         return {"flashinfer_allreduce_fusion_backend": "auto"}
     return {}
