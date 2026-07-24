@@ -579,21 +579,32 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder result: scheduler_port + 3
     """
     configure_logger(server_args)
+    set_global_server_args(server_args)
 
-    for name, val in [
-        ("--encoder-urls", server_args.encoder_urls),
-        ("--denoiser-urls", server_args.denoiser_urls),
-        ("--decoder-urls", server_args.decoder_urls),
-    ]:
+    is_glm_ar_fanout = (
+        type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig"
+        and server_args.srt_encoder_url is not None
+        and server_args.encoder_urls is None
+        and server_args.decoder_urls is None
+    )
+    required_urls = [("--denoiser-urls", server_args.denoiser_urls)]
+    if not is_glm_ar_fanout:
+        required_urls.extend(
+            [
+                ("--encoder-urls", server_args.encoder_urls),
+                ("--decoder-urls", server_args.decoder_urls),
+            ]
+        )
+    for name, val in required_urls:
         if val is None:
             raise ValueError(f"{name} is required for --disagg-role server")
 
     host = server_args.host or "127.0.0.1"
     base_port = server_args.scheduler_port
 
-    encoder_work_endpoints = parse_url_string(server_args.encoder_urls)
+    encoder_work_endpoints = parse_url_string(server_args.encoder_urls or "")
     denoiser_work_endpoints = parse_url_string(server_args.denoiser_urls)
-    decoder_work_endpoints = parse_url_string(server_args.decoder_urls)
+    decoder_work_endpoints = parse_url_string(server_args.decoder_urls or "")
 
     encoder_result_ep = f"tcp://{host}:{base_port + 1}"
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
@@ -628,6 +639,9 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        denoiser_capacity=1 if is_glm_ar_fanout else 2,
+        server_args=server_args,
+        glm_ar_fanout=is_glm_ar_fanout,
     )
     diffusion_server.start()
 
@@ -701,6 +715,24 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    role_tp = role_par["tp_size"] or 1
+    role_sp = role_par["sp_degree"] or 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
+    )
+    if role_tp * role_sp * cfg_degree * server_args.dp_size > server_args.num_gpus:
+        logger.warning(
+            "Disabling CFG parallel for %s role because tp=%d, sp=%d, cfg=%d, "
+            "dp=%d requires more than %d devices",
+            role_type.value,
+            role_tp,
+            role_sp,
+            cfg_degree,
+            server_args.dp_size,
+            server_args.num_gpus,
+        )
+        role_overrides["enable_cfg_parallel"] = False
+        role_overrides["cfg_parallel_degree"] = 1
 
     base_dict = {
         f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)

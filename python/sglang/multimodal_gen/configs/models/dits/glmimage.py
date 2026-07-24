@@ -20,6 +20,21 @@ class GlmImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            r"^(transformer_blocks\.\d+\.attn1)\.to_q\.(.*)$": (
+                r"\1.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn1)\.to_k\.(.*)$": (
+                r"\1.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(transformer_blocks\.\d+\.attn1)\.to_v\.(.*)$": (
+                r"\1.to_qkv.\2",
+                2,
+                3,
+            ),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
         }

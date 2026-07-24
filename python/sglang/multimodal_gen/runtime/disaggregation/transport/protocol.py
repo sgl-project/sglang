@@ -117,6 +117,7 @@ class TransferRegisterMsg:
     work_endpoint: str = ""
     # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
     preallocated_slots: list = field(default_factory=list)
+    max_batch_size: int = 1
 
 
 def encode_transfer_msg(msg: Any) -> list[bytes]:
