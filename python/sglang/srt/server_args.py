@@ -5666,13 +5666,15 @@ class ServerArgs:
 
         none-mode target-verify (FlashInfer WY output-only kernel) and the
         accepted-state recovery both replay a CONTIGUOUS accepted prefix keyed by
-        one scalar accept-length per request, so:
-          * topk>1 (EAGLE tree) drafts would verify correctly but recover h_K from
-            the wrong linear-prefix tokens -- a silent mis-decode; and
-          * mamba radix tracking (extra_buffer) cannot source its interval-crossing
-            snapshot, which none-mode omits (no cached intermediate SSM states).
-        Both are fail-fast here; the second also has a runtime backstop in
-        HybridLinearAttnBackend.update_mamba_state_after_mtp_verify.
+        one scalar accept-length per request, so topk>1 (EAGLE tree) drafts would
+        verify correctly but recover h_K from the wrong linear-prefix tokens -- a
+        silent mis-decode. That is fail-fast here.
+
+        Mamba radix tracking (extra_buffer) IS supported: none-mode caches no
+        intermediate SSM states, so it recomputes the interval-crossing snapshot
+        via a second boundary recovery pass, on both the FlashInfer and Triton
+        recover paths (each writes the folded boundary state to the ping-pong
+        track slot via a separate output-state index).
 
         none-mode is also rejected alongside either ReplaySSM flag: this is the
         single point that keeps RecoverSSM and ReplaySSM apart, so the runtime
@@ -5697,13 +5699,6 @@ class ServerArgs:
                 "prefix and cannot follow an EAGLE tree, so topk>1 would silently "
                 "commit the wrong SSM state. Got "
                 f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
-            )
-        if self.enable_mamba_extra_buffer():
-            raise ValueError(
-                "--gdn-mtp-cache-mode=none is not compatible with mamba extra_buffer "
-                "(radix prefix caching): tracked prefix states require the cached "
-                "intermediate SSM states that none-mode omits. Use "
-                "--disable-radix-cache or --mamba-radix-cache-strategy no_buffer."
             )
 
     def _handle_sampling_backend(self):

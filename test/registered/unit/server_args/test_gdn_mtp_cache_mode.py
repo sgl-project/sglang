@@ -85,7 +85,10 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                 sa = make_server_args(speculative_eagle_topk=topk)
                 self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
 
-    def test_none_mode_rejects_mamba_extra_buffer(self):
+    def test_none_mode_allows_mamba_extra_buffer(self):
+        # none-mode + extra_buffer is supported on both recover paths (FlashInfer
+        # and Triton): a boundary pass recomputes the tracked prefix state at
+        # runtime, so arg-validation accepts the config.
         for strategy in ("extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
                 sa = make_server_args(
@@ -93,13 +96,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                     disable_radix_cache=False,
                     mamba_radix_cache_strategy=strategy,
                 )
-                with self.assertRaises(ValueError) as cm:
-                    sa._validate_gdn_mtp_cache_mode()
-                self.assertIn(
-                    "--gdn-mtp-cache-mode=none is not compatible with mamba "
-                    "extra_buffer",
-                    str(cm.exception),
-                )
+                self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
 
     def test_extra_buffer_disabled_when_radix_cache_off(self):
         sa = make_server_args(

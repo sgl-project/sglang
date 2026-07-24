@@ -986,6 +986,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         # indices; contents are refreshed each step before replay.
         self._rec_state_idx_buf: Optional[torch.Tensor] = None
         self._rec_acc_steps_buf: Optional[torch.Tensor] = None
+        # Interval-checkpoint (mamba radix track) recovery buffers, used only when
+        # gdn_mtp_cache_mode=none runs with mamba radix tracking (extra_buffer):
+        # a second recovery pass reconstructs the state at the exact track
+        # boundary and writes it to the ping-pong track slot. Output slots come
+        # from mamba_track_indices, accepted_steps from mamba_steps_to_track (both
+        # -1-masked to reserved slot 0 / step 0 for non-crossing requests).
+        self._rec_track_idx_buf: Optional[torch.Tensor] = None
+        self._rec_track_steps_buf: Optional[torch.Tensor] = None
         self._rec_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         # Sorted bucket sizes for which a recovery graph was captured at warmup.
         # None until capture_recovery_graphs() succeeds; while None, recovery runs
@@ -1282,16 +1290,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         if self._recover_ssm:
             conv_states = mamba_caches.conv[0]
             intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
-            if mamba_track_indices is not None:
-                raise RuntimeError(
-                    "--gdn-mtp-cache-mode=none is not supported with mamba radix "
-                    "tracking because tracked prefix states require cached "
-                    "intermediate SSM states."
-                )
-            # Write h_K directly without materializing outputs.
+            # Mamba radix tracking (extra_buffer) in none-mode is supported on both
+            # recovery paths (FlashInfer via native output_state_indices, Triton via
+            # the output-index arg): a second boundary pass recomputes the tracked
+            # prefix state, which none-mode does not cache.
+            # Write h_K directly without materializing outputs; when tracking is
+            # active, also recompute + write the boundary checkpoint state to the
+            # ping-pong track slot.
             self._no_cache_mtp_recompute(
                 accepted_steps=last_correct_step_indices,
                 state_indices_tensor=state_indices_tensor,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
             )
             # Conv-state rollback uses the cached (deduplicated sliding-window)
             # conv windows via the strided-read scatter variant.
@@ -1301,6 +1311,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 state_indices_tensor,
                 last_correct_step_indices,
             )
+            # Conv boundary checkpoint: mirror the SSM boundary pass by writing the
+            # tracked prefix conv window to the ping-pong track slot (same masked
+            # scatter the full-mode path uses; step == -1 rows are skipped).
+            if mamba_track_indices is not None:
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
         else:
             scatter_mamba_states_after_mtp_verify(
                 mamba_caches,
@@ -1327,15 +1347,37 @@ class HybridLinearAttnBackend(AttentionBackend):
         v = mixed[:, q_dim + k_dim : q_dim + k_dim + v_dim].view(1, n_tok, Hv, Dv)
         return k, v
 
-    def _fi_recovery_launch(self, n, stash_per_layer, pool, gated_delta_rule_mtp):
+    def _fi_recovery_launch(
+        self,
+        n,
+        stash_per_layer,
+        pool,
+        gated_delta_rule_mtp,
+        init_idx_buf=None,
+        out_idx_buf=None,
+        acc_steps_buf=None,
+    ):
         """Issue the per-layer FlashInfer recovery launches for the first ``n``
         rows, reading the stable index buffers and the [:n] stash slices. Shared
         by warmup graph capture, graph-less eager fallback, and the warm-compile
         pass. The stash is pre-shaped [pool_size, T, H] so [:n] is [n, T, H].
         FI recovery reads k/v from strided views of the persistent conv-out
-        buffer, a/b from the stash."""
-        _state_idx = self._rec_state_idx_buf[:n]
-        _acc_steps = self._rec_acc_steps_buf[:n]
+        buffer, a/b from the stash.
+
+        Defaults reconstruct h_K in place at the accepted length (init == output ==
+        the request's working SSM slot). The interval-checkpoint boundary pass
+        overrides ``out_idx_buf`` (ping-pong track slot) and ``acc_steps_buf`` (the
+        per-request boundary step) while keeping ``init_idx_buf`` at the working
+        slot, since h_0 lives there — so it MUST run before the in-place working
+        recovery overwrites h_0 with h_K."""
+        init_idx_buf = self._rec_state_idx_buf if init_idx_buf is None else init_idx_buf
+        out_idx_buf = self._rec_state_idx_buf if out_idx_buf is None else out_idx_buf
+        acc_steps_buf = (
+            self._rec_acc_steps_buf if acc_steps_buf is None else acc_steps_buf
+        )
+        _init_idx = init_idx_buf[:n]
+        _out_idx = out_idx_buf[:n]
+        _acc_steps = acc_steps_buf[:n]
         _T = self.linear_attn_backend._no_cache_draft_token_num
         for layer_id, stash in stash_per_layer.items():
             layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
@@ -1356,8 +1398,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 v=v_bat,
                 b=stash["b"][:n],
                 initial_state_source=layer_ssm_states,
-                initial_state_indices=_state_idx,
-                output_state_indices=_state_idx,
+                initial_state_indices=_init_idx,
+                output_state_indices=_out_idx,
                 accepted_steps=_acc_steps,
                 disable_state_update=False,
                 disable_output=True,
@@ -1416,6 +1458,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             self._rec_acc_steps_buf = torch.empty(
                 pool.size, dtype=torch.int32, device=dev
             )
+            # Boundary (interval-checkpoint) pass buffers: ping-pong track output
+            # slots and the per-request boundary step. Allocated here so the
+            # eager boundary launch reuses address-stable buffers.
+            self._rec_track_idx_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
+            self._rec_track_steps_buf = torch.empty(
+                pool.size, dtype=torch.int32, device=dev
+            )
         # Dummy indices → reserved slot 0 during capture (records only; the real
         # per-step indices are copied in before each replay).
         self._rec_state_idx_buf.fill_(0)
@@ -1471,11 +1522,22 @@ class HybridLinearAttnBackend(AttentionBackend):
         self,
         accepted_steps: torch.Tensor,
         state_indices_tensor: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
     ):
         """Recover accepted GDN SSM state for gdn_mtp_cache_mode=none.
 
         Replays the state-update recurrence over stashed post-conv k/v/a/b and
         writes h_{accepted_step} directly to the request's SSM state slot.
+
+        When mamba radix tracking is active (extra_buffer), a request's accepted
+        draft window may cross a track boundary. none-mode caches no intermediate
+        state, so it also runs a second FlashInfer boundary pass that folds only
+        ``mamba_steps_to_track`` steps from h_0 and writes the resulting boundary
+        state to the ping-pong track slot ``mamba_track_indices``. That pass reads
+        h_0 from the working slot, so it MUST run before the in-place working
+        recovery overwrites h_0 with h_K. Requests that cross no boundary carry
+        step == -1 and are redirected to reserved slot 0 / step 0 (harmless).
         """
         # Local imports to avoid a circular dependency at module load time.
         from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -1513,6 +1575,14 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         use_fi_recovery = fi_recovery_kernel(self.linear_attn_backend) is not None
 
+        # Interval-checkpoint boundary pass runs on both recovery paths. FI uses
+        # native output_state_indices; the Triton recover kernel takes a separate
+        # output-index arg (default in-place). Per-step Triton boundary tensors are
+        # built below (FI uses the stable _rec_track_* buffers instead).
+        do_boundary = mamba_track_indices is not None
+        track_out_i32 = None
+        track_steps_i32 = None
+
         # One launch per GDN layer. Factored into a closure so it can run either
         # inline (CUDA graph capture) or on the side stream (eager overlap).
         B_bucket = None
@@ -1533,6 +1603,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 self._rec_acc_steps_buf = torch.empty(
                     pool_size, dtype=torch.int32, device=dev
                 )
+                self._rec_track_idx_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_track_steps_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
             # Smallest warmup-captured bucket >= B (None → eager, no graph).
             B_bucket = self._rec_pad_to_bucket(B)
             logger.debug("[gdn_recovery] FI recovery B=%d bucket=%s", B, B_bucket)
@@ -1545,13 +1621,38 @@ class HybridLinearAttnBackend(AttentionBackend):
                 # their recovery output is discarded harmlessly).
                 self._rec_state_idx_buf[B:B_bucket].fill_(0)
                 self._rec_acc_steps_buf[B:B_bucket].fill_(0)
+            if do_boundary:
+                # Boundary pass output slots come from mamba_track_indices, its
+                # fold count from mamba_steps_to_track. Requests crossing no
+                # boundary carry step == -1 → redirect to reserved slot 0 / step 0
+                # (folds 0 steps, writing h_0 to the discard slot). The boundary
+                # always runs eager at exact size B, so no bucket padding.
+                _fi_track_idx_i32 = mamba_track_indices.to(torch.int32).contiguous()
+                _fi_track_steps_i32 = mamba_steps_to_track.to(torch.int32).contiguous()
+                crossed = _fi_track_steps_i32 >= 0
+                self._rec_track_idx_buf[:B].copy_(
+                    torch.where(crossed, _fi_track_idx_i32, 0)
+                )
+                self._rec_track_steps_buf[:B].copy_(
+                    torch.where(crossed, _fi_track_steps_i32, 0)
+                )
+        elif do_boundary:
+            # Triton boundary: per-step regular tensors (no stable buffers). The
+            # recover kernel already skips rows with a negative output index, so
+            # non-crossing requests (step == -1) get output slot -1 (skipped on
+            # store) instead of being redirected to a discard slot. h_0 is read
+            # from the working slot (state_idx_i32) for all rows.
+            track_steps_i32 = mamba_steps_to_track.to(torch.int32).contiguous()
+            track_out_i32 = torch.where(
+                track_steps_i32 >= 0,
+                mamba_track_indices.to(torch.int32),
+                torch.full_like(track_steps_i32, -1),
+            ).contiguous()
 
-        def _run_recovery():
-            if use_fi_recovery:
-                # One launch per GDN layer, reading the stable index buffers.
-                self._fi_recovery_launch(B, stash_per_layer, pool, gated_delta_rule_mtp)
-                return
-
+        def _triton_recover_launch(init_indices, out_indices, acc_steps):
+            # One recover launch per GDN layer. init_indices supplies h_0; the
+            # folded state is written to out_indices (== init_indices for in-place
+            # working recovery, the track slot for the boundary pass).
             for layer_id, stash in stash_per_layer.items():
                 layer_cache = pool.mamba2_layer_cache(layer_id)
                 layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
@@ -1577,16 +1678,45 @@ class HybridLinearAttnBackend(AttentionBackend):
                     v=v_recov,
                     b=stash["b"][:actual_seq_len],
                     initial_state_source=layer_ssm_states,
-                    initial_state_indices=state_idx_i32,
-                    accepted_steps=accepted_steps_i32,
+                    initial_state_indices=init_indices,
+                    accepted_steps=acc_steps,
                     cache_steps=cache_steps,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
+                    output_state_indices=out_indices,
                 )
+
+        def _run_boundary():
+            # Interval-checkpoint recovery: fold mamba_steps_to_track steps from h_0
+            # (working slot) and write the boundary state to the ping-pong track
+            # slot. Must run before _run_recovery() overwrites h_0 with h_K.
+            if use_fi_recovery:
+                self._fi_recovery_launch(
+                    B,
+                    stash_per_layer,
+                    pool,
+                    gated_delta_rule_mtp,
+                    init_idx_buf=self._rec_state_idx_buf,
+                    out_idx_buf=self._rec_track_idx_buf,
+                    acc_steps_buf=self._rec_track_steps_buf,
+                )
+                return
+            _triton_recover_launch(state_idx_i32, track_out_i32, track_steps_i32)
+
+        def _run_recovery():
+            if use_fi_recovery:
+                # One launch per GDN layer, reading the stable index buffers.
+                self._fi_recovery_launch(B, stash_per_layer, pool, gated_delta_rule_mtp)
+                return
+
+            # In-place working recovery: out == init == the working SSM slot.
+            _triton_recover_launch(state_idx_i32, state_idx_i32, accepted_steps_i32)
 
         # During CUDA graph capture, recovery must stay on the capture stream
         # (it is normally eager / outside the graph; this is a safety guard).
         if torch.cuda.is_current_stream_capturing():
+            if do_boundary:
+                _run_boundary()
             _run_recovery()
             return
 
@@ -1605,14 +1735,20 @@ class HybridLinearAttnBackend(AttentionBackend):
         if use_fi_recovery and B_bucket is not None:
             # Replay the warmup-captured graph for this bucket on the side stream
             # (pure async launch — overlaps draft_extend + next draft). No capture
-            # ever happens on the live path.
+            # ever happens on the live path. The boundary pass runs eager (not
+            # captured), before the working replay, so it reads h_0 before the
+            # graph overwrites it with h_K.
             with torch.cuda.stream(self._recovery_stream):
+                if do_boundary:
+                    _run_boundary()
                 self._rec_graphs[B_bucket].replay()
         else:
             # No warmup graph (Triton fallback, B beyond the largest captured
             # bucket, or capture disabled/failed): eager recovery on the side
             # stream — the known-good overlap path.
             with torch.cuda.stream(self._recovery_stream):
+                if do_boundary:
+                    _run_boundary()
                 _run_recovery()
 
         self._recovery_event.record(self._recovery_stream)
@@ -1624,6 +1760,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         if not use_fi_recovery:
             state_idx_i32.record_stream(self._recovery_stream)
             accepted_steps_i32.record_stream(self._recovery_stream)
+            if do_boundary:
+                # Triton boundary reads these per-step tensors on the side stream.
+                track_out_i32.record_stream(self._recovery_stream)
+                track_steps_i32.record_stream(self._recovery_stream)
         self._recovery_event_pending = True
 
 

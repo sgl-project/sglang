@@ -518,6 +518,7 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
     b,
     h0_source,
     h0_indices,
+    out_indices,
     accepted_steps,
     T,
     stride_a,
@@ -563,6 +564,15 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
     idx = tl.load(h0_indices + i_n)
     p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
     b_h = tl.load(p_h0, mask=(idx >= 0) & mask_h, other=0).to(tl.float32)
+
+    # Output slot may differ from the read (h_0) slot: the interval-checkpoint
+    # boundary pass reads h_0 from the working slot and writes the folded boundary
+    # state to a separate ping-pong track slot. out_indices == h0_indices gives the
+    # default in-place recovery. out_idx < 0 rows are skipped on store.
+    out_idx = tl.load(out_indices + i_n)
+    p_out = (
+        h0_source + out_idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
+    )
 
     b_A_log = tl.load(p_A_log).to(tl.float32)
     b_A_coeff = -tl.exp(b_A_log)
@@ -611,7 +621,7 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
         p_b += stride_b
         p_a += stride_a
 
-    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=(idx >= 0) & mask_h)
+    tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=(out_idx >= 0) & mask_h)
 
 
 def fused_sigmoid_gating_delta_rule_recover_final_state(
@@ -629,13 +639,22 @@ def fused_sigmoid_gating_delta_rule_recover_final_state(
     cache_steps: int,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    output_state_indices: Optional[torch.Tensor] = None,
 ):
     """Recovery-only GDN recurrence for gdn_mtp_cache_mode=none.
 
     This writes h_{accepted_step} directly back to the SSM state slot and
     skips output materialization, intermediate state writes, and the follow-up
     scatter used by the generic target-verify path.
+
+    ``output_state_indices`` defaults to ``initial_state_indices`` (in-place
+    recovery of h_K). The interval-checkpoint boundary pass overrides it with the
+    ping-pong track slots (and passes ``accepted_steps`` = the per-request boundary
+    step) so the folded boundary state is written there instead; rows with a
+    negative output index are skipped on store.
     """
+    if output_state_indices is None:
+        output_state_indices = initial_state_indices
     _, total_tokens, H, K = k.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -665,6 +684,7 @@ def fused_sigmoid_gating_delta_rule_recover_final_state(
         b=b,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        out_indices=output_state_indices,
         accepted_steps=accepted_steps,
         T=T,
         stride_a=stride_a,
