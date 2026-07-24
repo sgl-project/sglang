@@ -52,6 +52,11 @@ def kda_replayssm_exact_fold_kernel(
     stride_rawk_slot: tl.constexpr,
     stride_gk_slot: tl.constexpr,
     stride_beta_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_rawv_layer: tl.constexpr,
+    stride_rawk_layer: tl.constexpr,
+    stride_gk_layer: tl.constexpr,
+    stride_beta_layer: tl.constexpr,
     stride_indices: tl.constexpr,
     stride_accept: tl.constexpr,
     stride_track: tl.constexpr,
@@ -69,8 +74,20 @@ def kda_replayssm_exact_fold_kernel(
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
-    i_hv = tl.program_id(2)
+    # program_id(2) packs (layer, v-head): layer-major so a single launch folds
+    # all KDA layers. num_layers=1 launches (per-layer entry) keep i_layer == 0.
+    i_hvl = tl.program_id(2)
+    # int64: layer stride * i_layer overflows int32 at K3 scale (69 layers x
+    # ~34M-element per-layer stride > 2^31).
+    i_layer = (i_hvl // HV).to(tl.int64)
+    i_hv = i_hvl % HV
     i_h = i_hv // (HV // H)
+    # Shift the layer-indexed bases once; every pointer below is layer-relative.
+    h0 = h0 + i_layer * stride_state_layer
+    rawv_cache = rawv_cache + i_layer * stride_rawv_layer
+    rawk_cache = rawk_cache + i_layer * stride_rawk_layer
+    gk_cache = gk_cache + i_layer * stride_gk_layer
+    beta_cache = beta_cache + i_layer * stride_beta_layer
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
@@ -213,6 +230,90 @@ def commit_kda_replayssm_spec(
         rawk_cache.stride(0),
         gk_cache.stride(0),
         beta_cache.stride(0),
+        0,  # stride_*_layer unused: single-layer entry, i_layer == 0
+        0,
+        0,
+        0,
+        0,
+        ssm_state_indices.stride(0),
+        accept_lens.stride(0),
+        stride_track,
+        stride_steps,
+        H=num_k_heads,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        MAX_CACHE_LEN=max_cache_len,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        NULL_BLOCK_ID=null_block_id,
+        HAS_TRACK=has_track,
+        num_warps=1,
+        num_stages=3,
+    )
+
+
+def commit_kda_replayssm_spec_all_layers(
+    checkpoint_state: torch.Tensor,  # [num_layers, num_slots, HV, V, K] fp32, in place
+    rawv_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, V]
+    rawk_cache: torch.Tensor,  # [num_layers, num_slots, H,  L, K]
+    gk_cache: torch.Tensor,  # [num_layers, num_slots, HV, L, K] fp32
+    beta_cache: torch.Tensor,  # [num_layers, num_slots, HV, L]    fp32
+    ssm_state_indices: torch.Tensor,  # [B] int   (shared across layers)
+    accept_lens: torch.Tensor,  # [B] int
+    max_cache_len: int,
+    num_k_heads: int,
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    null_block_id: int = 0,
+) -> None:
+    """Fold every layer's accepted window in a single launch.
+
+    Replaces the per-layer Python loop over commit_kda_replayssm_spec (one launch
+    per KDA layer -> ~69 tiny eager launches at bs=1, dispatch-bound). The layer
+    is packed into the head grid axis (program_id(2) = layer * HV + head), so the
+    result is bit-identical to the loop -- each (layer, head, v-tile) block runs
+    the same per-slot recurrent replay. ssm_state_indices / accept_lens / track
+    are per-request and shared across layers.
+    """
+    num_layers, num_slots, HV, V, K = checkpoint_state.shape
+    B = ssm_state_indices.shape[0]
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 32)
+    grid = (triton.cdiv(V, BV), B, HV * num_layers)
+    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if has_track:
+        track_idx_t = mamba_track_indices
+        steps_t = mamba_steps_to_track
+        stride_track = track_idx_t.stride(0)
+        stride_steps = steps_t.stride(0)
+    else:
+        track_idx_t = ssm_state_indices  # unused (HAS_TRACK False); valid ptr
+        steps_t = accept_lens
+        stride_track = 0
+        stride_steps = 0
+    kda_replayssm_exact_fold_kernel[grid](
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        gk_cache,
+        beta_cache,
+        ssm_state_indices,
+        accept_lens,
+        track_idx_t,
+        steps_t,
+        checkpoint_state.stride(1),
+        rawv_cache.stride(1),
+        rawk_cache.stride(1),
+        gk_cache.stride(1),
+        beta_cache.stride(1),
+        checkpoint_state.stride(0),
+        rawv_cache.stride(0),
+        rawk_cache.stride(0),
+        gk_cache.stride(0),
+        beta_cache.stride(0),
         ssm_state_indices.stride(0),
         accept_lens.stride(0),
         stride_track,
@@ -255,23 +356,21 @@ def commit_kda_replayssm_after_verify(
     )
 
     L = spec_state.replayssm_rawv.shape[-2]
-    num_layers = spec_state.temporal.shape[0]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    for li in range(num_layers):
-        commit_kda_replayssm_spec(
-            checkpoint_state=spec_state.temporal[li],
-            rawv_cache=spec_state.replayssm_rawv[li],
-            rawk_cache=spec_state.replayssm_rawk[li],
-            gk_cache=spec_state.replayssm_g[li],
-            beta_cache=spec_state.replayssm_beta[li],
-            ssm_state_indices=state_batch_indices,
-            accept_lens=accept_lens,
-            max_cache_len=L,
-            num_k_heads=num_k_heads,
-            mamba_track_indices=mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=null_block_id,
-        )
+    commit_kda_replayssm_spec_all_layers(
+        checkpoint_state=spec_state.temporal,
+        rawv_cache=spec_state.replayssm_rawv,
+        rawk_cache=spec_state.replayssm_rawk,
+        gk_cache=spec_state.replayssm_g,
+        beta_cache=spec_state.replayssm_beta,
+        ssm_state_indices=state_batch_indices,
+        accept_lens=accept_lens,
+        max_cache_len=L,
+        num_k_heads=num_k_heads,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=null_block_id,
+    )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).
