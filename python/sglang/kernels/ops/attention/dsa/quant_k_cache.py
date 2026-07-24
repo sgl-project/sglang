@@ -283,7 +283,7 @@ def _quantize_k_cache_fast_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
