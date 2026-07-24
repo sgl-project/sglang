@@ -85,6 +85,7 @@ class FunctionCallParser:
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
+        "nanbeige": Qwen3CoderDetector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
         "hermes": HermesDetector,

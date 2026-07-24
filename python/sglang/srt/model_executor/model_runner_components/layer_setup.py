@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
+from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -16,6 +17,9 @@ class AttentionAndMoeLayers(NamedTuple):
     dsa_indexers: list[Any]
     mha_companion_layers: list[Any]
 
+def _get_loop_num(hf_config: Any) -> int:
+    # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
+    return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     attention_layers: list[Any] = []
@@ -23,6 +27,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     moe_fusions: list[Any] = []
     dsa_indexers: list[Any] = []
     mha_companion_layers: list[Any] = []
+    # Loop models (Nanbeige / IQuestLoopCoder) store one RadixAttention per loop
+    # in a ModuleList. Prefill CUDA graph indexes by layer_id, so expand and
+    # reorder to a dense [0..N) list.
+    has_loop_attn = False
     for layer in layer_model.layers:
         attn_layer = None
         mha_companion_layer = None
@@ -59,8 +67,13 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 attn_layer = layer
 
         if attn_layer is not None:
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
+            # Loop models: one RadixAttention per loop; expand for layer_id indexing.
+            if isinstance(attn_layer, nn.ModuleList):
+                attention_layers.extend(attn_layer)
+                has_loop_attn = True
+            else:
+                attention_layers.append(attn_layer)
+                mha_companion_layers.append(mha_companion_layer)
         elif hasattr(layer, "mixer"):
             attention_layers.append(None)
             mha_companion_layers.append(None)
@@ -89,6 +102,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
             dsa_indexer = layer.self_attn.indexer
         dsa_indexers.append(dsa_indexer)
+
+    # Reorder so attention_layers[i] matches RadixAttention.layer_id.
+    if has_loop_attn:
+        attention_layers.sort(key=lambda x: x.layer_id)
 
     return AttentionAndMoeLayers(
         attention_layers,
@@ -129,7 +146,7 @@ def resolve_layer_indices(
     num_effective_layers = pp_range.end_layer - pp_range.start_layer
 
     # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
-    loop_num = getattr(model_config.hf_config, "loop_num", 1)
+    loop_num = _get_loop_num(model_config.hf_config)
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
