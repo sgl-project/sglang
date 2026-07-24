@@ -1,7 +1,7 @@
 import json
 import unittest
 from io import BytesIO
-from typing import Optional
+from typing import List, Optional, Tuple, Union
 
 import requests
 import torch
@@ -10,6 +10,7 @@ import torch
 # be missing in transformers==4.57.1. Inject a lightweight implementation so
 # the model can import successfully without downgrading transformers.
 import transformers.activations as _hf_activations
+from einops import rearrange
 from PIL import Image
 from transformers import (
     AutoModel,
@@ -709,6 +710,300 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
+
+
+class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "deepseek-ai/Janus-Pro-7B"
+    chat_template = "janus-pro"
+
+    @classmethod
+    def _init_visual(cls):
+        import glob
+        import os
+
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from transformers import AutoConfig
+
+        from sglang.srt.model_loader.weight_utils import (
+            download_weights_from_hf,
+            pt_weights_iterator,
+        )
+
+        # Construct a custom VisionTower class here because there is no remote code
+        # available on Huggingface Hub for (https://huggingface.co/deepseek-ai/Janus-Pro-7B/tree/main).
+        # Hence, ``AutoModel.from_pretrained`` can't be used.
+        #
+        # Reuse some components from ``sglang.srt.models.deepseek_janus_pro`` as
+        # some parts of the code are ported from the official repository.
+        from sglang.srt.models.deepseek_janus_pro import (
+            CLIPVisionTower,
+            DropPath,
+            LayerScale,
+            Mlp,
+            MlpProjector,
+            SigLIP_MODEL_CONFIG,
+            SigLIPVisionCfg,
+            VisionTransformer,
+        )
+
+        # Rewrite the embeddings computation parts that involve attention to
+        # make it not depend on QKVParallelLinear / RowParallelLinear /
+        # tensor-parallel state which are unavailable outside the engine
+        # runtime.
+        #
+        # The code is adapted from the official ``deepseek-ai/Janus`` repository
+        # (https://github.com/deepseek-ai/Janus/tree/main).
+        class Attention(nn.Module):
+            fused_attn: bool
+
+            def __init__(
+                self,
+                dim: int,
+                num_heads: int = 8,
+                qkv_bias: bool = False,
+                qk_norm: bool = False,
+                attn_drop: float = 0.0,
+                proj_drop: float = 0.0,
+                norm_layer: nn.Module = nn.LayerNorm,
+            ) -> None:
+                super().__init__()
+                assert dim % num_heads == 0, "dim should be divisible by num_heads"
+                self.num_heads = num_heads
+                self.head_dim = dim // num_heads
+                self.scale = self.head_dim**-0.5
+                self.fused_attn = True
+
+                self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+                self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+                self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+                self.attn_drop = nn.Dropout(attn_drop)
+                self.proj = nn.Linear(dim, dim)
+                self.proj_drop = (
+                    nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                B, N, C = x.shape
+                qkv = (
+                    self.qkv(x)
+                    .reshape(B, N, 3, self.num_heads, self.head_dim)
+                    .permute(2, 0, 3, 1, 4)
+                )
+                q, k, v = qkv.unbind(0)
+                q, k = self.q_norm(q), self.k_norm(k)
+
+                if self.fused_attn:
+                    x = F.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        dropout_p=self.attn_drop.p if self.training else 0.0,
+                    )
+                else:
+                    q = q * self.scale
+                    attn = q @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    attn = self.attn_drop(attn)
+                    x = attn @ v
+
+                x = x.transpose(1, 2).reshape(B, N, C)
+                x = self.proj(x)
+                x = self.proj_drop(x)
+                return x
+
+        class AttentionBlock(nn.Module):
+            def __init__(
+                self,
+                dim: int,
+                num_heads: int,
+                mlp_ratio: float = 4.0,
+                qkv_bias: bool = False,
+                qk_norm: bool = False,
+                proj_drop: float = 0.0,
+                attn_drop: float = 0.0,
+                init_values: Optional[float] = None,
+                drop_path: float = 0.0,
+                act_layer: nn.Module = nn.GELU,
+                norm_layer: nn.Module = nn.LayerNorm,
+                mlp_layer: nn.Module = Mlp,
+            ) -> None:
+                super().__init__()
+                self.norm1 = norm_layer(dim)
+                self.attn = Attention(
+                    dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    norm_layer=norm_layer,
+                )
+                self.ls1 = (
+                    LayerScale(dim, init_values=init_values)
+                    if init_values
+                    else nn.Identity()
+                )
+                self.drop_path1 = (
+                    DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+                )
+
+                self.norm2 = norm_layer(dim)
+                self.mlp = mlp_layer(
+                    in_features=dim,
+                    hidden_features=int(dim * mlp_ratio),
+                    act_layer=act_layer,
+                    drop=proj_drop,
+                )
+                self.ls2 = (
+                    LayerScale(dim, init_values=init_values)
+                    if init_values
+                    else nn.Identity()
+                )
+                self.drop_path2 = (
+                    DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+                x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+                return x
+
+        class VisionTower(CLIPVisionTower):
+            def __init__(
+                self,
+                model_name: str = "siglip_large_patch16_384",
+                image_size: Union[Tuple[int, int], int] = 336,
+                select_feature: str = "patch",
+                select_layer: int = -2,
+                select_layers: Optional[List] = None,
+                ckpt_path: str = "",
+                pixel_mean: Optional[List[float]] = None,
+                pixel_std: Optional[List[float]] = None,
+                **kwargs,
+            ):
+                super().__init__(
+                    model_name=model_name,
+                    image_size=image_size,
+                    select_feature=select_feature,
+                    select_layer=select_layer,
+                    select_layers=select_layers,
+                    ckpt_path=ckpt_path,
+                    pixel_mean=pixel_mean,
+                    pixel_std=pixel_std,
+                    **kwargs,
+                )
+
+            def build_vision_tower(self, vision_tower_params):
+                # We already know that the configs from https://huggingface.co/deepseek-ai/Janus-Pro-7B/blob/main/config.json#L49
+                # SigLIP is used. For this test, to avoid unnecessary code,
+                # we override the ``build_vision_tower`` method to construct
+                # ``VisionTransformer``.
+                self.select_feature = "same"
+                model_name = vision_tower_params.get(
+                    "model_name", "siglip_so400m_patch14_384"
+                )
+                vision_cfg = SigLIPVisionCfg(**SigLIP_MODEL_CONFIG[model_name])
+
+                select_layer = vision_tower_params.get("select_layer", 1)
+                if select_layer <= 0:
+                    layers = min(
+                        vision_cfg.layers, vision_cfg.layers + select_layer + 1
+                    )
+                else:
+                    layers = min(vision_cfg.layers, select_layer)
+
+                vision_tower = VisionTransformer(
+                    img_size=vision_tower_params.get("image_size", -1),
+                    patch_size=vision_cfg.patch_size,
+                    embed_dim=vision_cfg.width,
+                    depth=layers,
+                    num_heads=vision_cfg.heads,
+                    mlp_ratio=vision_cfg.mlp_ratio,
+                    class_token=vision_cfg.class_token,
+                    global_pool=vision_cfg.global_pool,
+                    ignore_head=vision_tower_params.get("ignore_head", True),
+                    weight_init=vision_tower_params.get("weight_init", "skip"),
+                    num_classes=0,
+                    # Force to use testing custom ``AttentionBlock``
+                    block_fn=AttentionBlock,
+                )
+
+                forward_kwargs = dict()
+                return vision_tower, forward_kwargs
+
+        config = AutoConfig.from_pretrained(cls.model_path)
+        vision_config = config.vision_config
+
+        cls.vision_model = VisionTower(**vision_config.params).eval().to(cls.device)
+
+        aligner_config = config.aligner_config
+        cls.aligner = MlpProjector(aligner_config.params).eval().to(cls.device)
+
+        # Load weights to vision tower and aligner
+
+        hf_folder = download_weights_from_hf(
+            cls.model_path,
+            cache_dir=None,
+            # Janus-Pro ships only *.bin on the hub
+            allow_patterns=["*.bin"],
+        )
+
+        shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.bin")))
+        if not shard_files:
+            raise RuntimeError(f"No .bin weight shards found in {hf_folder}")
+        iterator = pt_weights_iterator(shard_files)
+
+        vision_state, aligner_state = {}, {}
+        for name, tensor in iterator:
+            if name.startswith("vision_model."):
+                vision_state[name[len("vision_model.") :]] = tensor
+            elif name.startswith("aligner."):
+                aligner_state[name[len("aligner.") :]] = tensor
+
+        miss_v, _ = cls.vision_model.load_state_dict(vision_state, strict=False)
+        miss_a, _ = cls.aligner.load_state_dict(aligner_state, strict=False)
+
+        if miss_v:
+            raise RuntimeError(f"vision_model missing weights: {miss_v[:5]}")
+        if miss_a:
+            raise RuntimeError(f"aligner missing weights: {miss_a[:5]}")
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"]
+            bs, n = pixel_values.shape[0:2]
+            pixel_values = pixel_values.to(
+                device=cls.vision_model.device, dtype=cls.vision_model.dtype
+            )
+
+            images = rearrange(pixel_values, "b n c h w -> (b n) c h w")
+            images_embeds = cls.aligner(cls.vision_model(images))
+            images_embeds = rearrange(
+                images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n
+            )
+
+            return images_embeds
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        # Unlike other processors, ``VLChatProcessor`` takes the argument ``prompt``
+        # instead of ``text``
+        inputs = self.processor(
+            prompt=text,
+            images=self.main_image,
+            return_tensors="pt",
+        )
+
+        return inputs, text
 
 
 if __name__ == "__main__":
