@@ -97,6 +97,7 @@ from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    is_hip,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -235,6 +236,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # config) — correct for mixed lengths since any request with
         # kv_len > index_topk falls back to the sparse graph. Adds ~52 graphs and
         # ~2x capture time.
+        #
+        # Scoped to HIP (AMD): the k-only dense-decode fast path has only been
+        # validated on MI355X. This is common (non-hardware-gated) code, so on
+        # CUDA we deliberately keep the original behavior (no dual-graph) to
+        # avoid silently changing the CUDA decode path for DSA models (e.g.
+        # DeepSeek-V3.2). CUDA can opt in later once validated there.
         self.dsa_dual_graph = False
         self.dsa_index_topk: Optional[int] = None
         from sglang.srt.configs.model_config import (
@@ -243,7 +250,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         hf_config = model_runner.model_config.hf_config
-        if is_deepseek_dsa(hf_config):
+        if is_hip() and is_deepseek_dsa(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_dual_graph = self.dsa_index_topk is not None
         if self.dsa_dual_graph:
