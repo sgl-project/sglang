@@ -513,7 +513,9 @@ class RuntimeHandle:
                             offsets[choice_index],
                             incremental=incremental,
                         )
-                        callback_chunk["legacy_meta_info"] = chunk.get("meta_info") or {}
+                        callback_chunk["legacy_meta_info"] = (
+                            chunk.get("meta_info") or {}
+                        )
                         if incremental:
                             assert legacy_output_ids is not None
                             legacy_output_ids[choice_index].extend(
@@ -571,9 +573,7 @@ class RuntimeHandle:
                         callback_item["legacy_output_ids"] = list(
                             item.get("output_ids") or []
                         )
-                        callback_item["legacy_meta_info"] = (
-                            item.get("meta_info") or {}
-                        )
+                        callback_item["legacy_meta_info"] = item.get("meta_info") or {}
                     callback_item.setdefault("index", index)
                     keep_going = await self._send_with_backpressure(
                         chunk_callback,

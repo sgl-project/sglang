@@ -44,6 +44,11 @@ pub enum ResponseMetadata {
     },
 }
 
+type GenerateMetadata = (
+    HashMap<String, String>,
+    serde_json::Map<String, serde_json::Value>,
+);
+
 impl ResponseMetadata {
     pub fn into_legacy(self) -> Result<HashMap<String, String>, &'static str> {
         match self {
@@ -59,15 +64,7 @@ impl ResponseMetadata {
         }
     }
 
-    pub fn into_generate(
-        self,
-    ) -> Result<
-        (
-            HashMap<String, String>,
-            serde_json::Map<String, serde_json::Value>,
-        ),
-        &'static str,
-    > {
+    pub fn into_generate(self) -> Result<GenerateMetadata, &'static str> {
         match self {
             Self::Generate { legacy, typed } => Ok((legacy, typed)),
             Self::Legacy(_) => Err("expected combined Generate metadata"),
