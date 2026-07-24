@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_a5,
     is_xpu,
 )
 
@@ -50,6 +51,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_npu_a5 = is_npu_a5()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -999,6 +1001,14 @@ class GemmaRMSNorm(MultiPlatformOp):
                 x, self.weight, residual, self.variance_epsilon
             )
             return norm_out, residual
+
+        if _is_npu_a5:
+            # npu_gemma_rms_norm has no kernel registered for Ascend A5
+            # (socVersion ascend950). Gemma RMSNorm == normalize(x) * (1 + weight)
+            # equals a plain rms_norm with gamma = 1 + weight, so fall back to
+            # npu_rms_norm which is implemented on A5. A2/A3 keep the fused op.
+            x, _ = torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.variance_epsilon)
+            return x
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
         return x

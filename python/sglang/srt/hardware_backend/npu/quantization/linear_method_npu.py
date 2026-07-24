@@ -2,6 +2,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
@@ -203,10 +204,15 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
-            # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
-            # re-layout to [in, out] / [in//64, out, 2] strided views below.
+            # layer.weight_scale holds one uint8 scale per 32 input elements.
+            # Pair the scales for the NPU kernel, padding an odd final count
+            # (e.g. K=4304 -> 135 scales -> 136 -> 68 pairs).
             n_dim, k_dim = layer.weight_scale.data.shape
-            scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+            scale_data = layer.weight_scale.data
+            if k_dim % 2 != 0:
+                scale_data = F.pad(scale_data, (0, 1), mode="constant", value=0)
+                k_dim += 1
+            scale = scale_data.reshape(n_dim, k_dim // 2, 2)
             layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False

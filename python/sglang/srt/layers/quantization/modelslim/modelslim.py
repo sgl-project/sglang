@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP4Scheme,
     ModelSlimMXFP4W4A8Scheme,
+    ModelSlimMXFP8MoEScheme,
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -168,7 +169,14 @@ class ModelSlimConfig(QuantizationConfig):
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            packed_modules_mapping_subset = {
+                name: packed_names
+                for name, packed_names in self.packed_modules_mapping.items()
+                if isinstance(packed_names, list)
+            }
+            packed_modules_mapping_subset.update(
+                self.packed_modules_mapping.get(key, {})
+            )
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
@@ -238,6 +246,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("W8A8_MXFP8", ModelSlimMXFP8MoEScheme),
         ]
 
         # Try multiple naming conventions:
