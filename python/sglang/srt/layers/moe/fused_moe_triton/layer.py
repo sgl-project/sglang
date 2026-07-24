@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import heapq
+import json
 import logging
+import statistics
+import threading
+import time
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -91,6 +96,178 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+_weight_load_profile_lock = threading.Lock()
+_weight_load_profile_sequence = 0
+_weight_load_profile = {
+    "first_start": None,
+    "last_end": None,
+    "tasks": 0,
+    "src_bytes": 0,
+    "dst_bytes": 0,
+    "noncontiguous": 0,
+    "nonzero_offset": 0,
+    "view_backing_storage": 0,
+    "durations": [],
+    "categories": {},
+    "top_slow": [],
+}
+
+
+def _new_weight_load_bucket() -> dict:
+    return {
+        "tasks": 0,
+        "src_bytes": 0,
+        "dst_bytes": 0,
+        "durations": [],
+    }
+
+
+def _profiled_moe_weight_copy(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    *,
+    kind: str,
+    shard_id: str,
+    tp_rank: int,
+    layer_id: int,
+) -> None:
+    if not envs.SGLANG_MOE_WEIGHT_LOAD_AGGREGATE_PROFILE.get():
+        dst.copy_(src)
+        return
+
+    start = time.perf_counter()
+    dst.copy_(src)
+    end = time.perf_counter()
+    elapsed = end - start
+    src_bytes = src.numel() * src.element_size()
+    dst_bytes = dst.numel() * dst.element_size()
+    backing_bytes = src.untyped_storage().nbytes()
+    category_key = (
+        f"{kind}|{shard_id}|{src.dtype}|{tuple(src.shape)}|"
+        f"offset={int(src.storage_offset() != 0)}|"
+        f"view={int(backing_bytes > src_bytes)}"
+    )
+    event = {
+        "elapsed_s": elapsed,
+        "kind": kind,
+        "shard_id": shard_id,
+        "layer_id": layer_id,
+        "tp_rank": tp_rank,
+        "src_shape": tuple(src.shape),
+        "src_stride": tuple(src.stride()),
+        "src_dtype": str(src.dtype),
+        "src_contiguous": src.is_contiguous(),
+        "src_storage_offset": src.storage_offset(),
+        "src_bytes": src_bytes,
+        "src_backing_bytes": backing_bytes,
+        "dst_storage_offset": dst.storage_offset(),
+        "thread_id": threading.get_ident(),
+        "cuda_device": (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        ),
+    }
+
+    global _weight_load_profile_sequence
+    with _weight_load_profile_lock:
+        profile = _weight_load_profile
+        profile["first_start"] = (
+            start
+            if profile["first_start"] is None
+            else min(profile["first_start"], start)
+        )
+        profile["last_end"] = (
+            end if profile["last_end"] is None else max(profile["last_end"], end)
+        )
+        profile["tasks"] += 1
+        profile["src_bytes"] += src_bytes
+        profile["dst_bytes"] += dst_bytes
+        profile["noncontiguous"] += int(not src.is_contiguous())
+        profile["nonzero_offset"] += int(src.storage_offset() != 0)
+        profile["view_backing_storage"] += int(backing_bytes > src_bytes)
+        profile["durations"].append(elapsed)
+
+        bucket = profile["categories"].setdefault(
+            category_key, _new_weight_load_bucket()
+        )
+        bucket["tasks"] += 1
+        bucket["src_bytes"] += src_bytes
+        bucket["dst_bytes"] += dst_bytes
+        bucket["durations"].append(elapsed)
+
+        _weight_load_profile_sequence += 1
+        top_slow = profile["top_slow"]
+        item = (elapsed, _weight_load_profile_sequence, event)
+        if len(top_slow) < 20:
+            heapq.heappush(top_slow, item)
+        elif elapsed > top_slow[0][0]:
+            heapq.heapreplace(top_slow, item)
+
+
+def _weight_load_quantile(sorted_values: list[float], quantile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    return sorted_values[round((len(sorted_values) - 1) * quantile)]
+
+
+def emit_moe_weight_load_profile(tp_rank: int) -> None:
+    if not envs.SGLANG_MOE_WEIGHT_LOAD_AGGREGATE_PROFILE.get():
+        return
+
+    with _weight_load_profile_lock:
+        profile = _weight_load_profile
+        durations = sorted(profile["durations"])
+        categories = []
+        for key, bucket in profile["categories"].items():
+            bucket_durations = sorted(bucket["durations"])
+            categories.append(
+                {
+                    "key": key,
+                    "tasks": bucket["tasks"],
+                    "src_bytes": bucket["src_bytes"],
+                    "dst_bytes": bucket["dst_bytes"],
+                    "sum_elapsed_s": sum(bucket_durations),
+                    "p50_s": _weight_load_quantile(bucket_durations, 0.50),
+                    "p95_s": _weight_load_quantile(bucket_durations, 0.95),
+                    "p99_s": _weight_load_quantile(bucket_durations, 0.99),
+                    "max_s": max(bucket_durations, default=0.0),
+                }
+            )
+        categories.sort(key=lambda item: item["sum_elapsed_s"], reverse=True)
+        payload = {
+            "tp_rank": tp_rank,
+            "tasks": profile["tasks"],
+            "src_bytes": profile["src_bytes"],
+            "dst_bytes": profile["dst_bytes"],
+            "noncontiguous": profile["noncontiguous"],
+            "nonzero_offset": profile["nonzero_offset"],
+            "view_backing_storage": profile["view_backing_storage"],
+            "copy_wall_span_s": (
+                profile["last_end"] - profile["first_start"]
+                if profile["first_start"] is not None
+                else 0.0
+            ),
+            "sum_elapsed_s": sum(durations),
+            "p50_s": statistics.median(durations) if durations else 0.0,
+            "p95_s": _weight_load_quantile(durations, 0.95),
+            "p99_s": _weight_load_quantile(durations, 0.99),
+            "max_s": max(durations, default=0.0),
+            "over_10ms": sum(value >= 0.010 for value in durations),
+            "over_100ms": sum(value >= 0.100 for value in durations),
+            "over_1s": sum(value >= 1.0 for value in durations),
+            "categories": categories,
+            "top_slow": [
+                event
+                for _, _, event in sorted(
+                    profile["top_slow"], key=lambda item: item[0], reverse=True
+                )
+            ],
+        }
+    print(
+        "SGLANG_MOE_WEIGHT_LOAD_AGGREGATE "
+        + json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        flush=True,
+    )
 
 
 def _get_deepep_comm_group(a2a_backend):
@@ -539,7 +716,14 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            _profiled_moe_weight_copy(
+                expert_data,
+                loaded_weight,
+                kind="scale",
+                shard_id=shard_id,
+                tp_rank=tp_rank,
+                layer_id=getattr(self, "layer_id", -1),
+            )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -611,7 +795,14 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+        _profiled_moe_weight_copy(
+            expert_data,
+            loaded_weight,
+            kind="w13",
+            shard_id=shard_id,
+            tp_rank=tp_rank,
+            layer_id=getattr(self, "layer_id", -1),
+        )
 
     def _load_w2(
         self,
@@ -681,7 +872,14 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        _profiled_moe_weight_copy(
+            expert_data,
+            loaded_weight,
+            kind="w2",
+            shard_id=shard_id,
+            tp_rank=tp_rank,
+            layer_id=getattr(self, "layer_id", -1),
+        )
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,

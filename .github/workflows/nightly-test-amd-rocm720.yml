@@ -1333,26 +1333,9 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720:
-    name: dsv4-pro-fp4-load-exp / ${{ matrix.experiment }}
+    name: dsv4-pro-fp4-load-exp / aggregate-profile
     if: github.event_name == 'workflow_dispatch' && contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp-rocm720,')
     runs-on: linux-mi35x-gpu-8
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - experiment: baseline
-            prefetch: "0"
-            h2d_threads: "0"
-          - experiment: prefetch-2
-            prefetch: "1"
-            h2d_threads: "0"
-          - experiment: h2d-4
-            prefetch: "0"
-            h2d_threads: "4"
-          - experiment: prefetch-2-h2d-4
-            prefetch: "1"
-            h2d_threads: "4"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1391,18 +1374,28 @@ jobs:
             echo SGLANG_LOAD_DIAG_END
           '
 
-      - name: Load-only DeepSeek-V4-Pro FP4 (${{ matrix.experiment }})
+      - name: Prewarm DeepSeek-V4-Pro FP4 checkpoint
+        timeout-minutes: 15
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            python3 scripts/ci/amd/prewarm_hf_snapshot.py \
+              --model-cache /sgl-data/hf-cache/hub/models--deepseek-ai--DeepSeek-V4-Pro \
+              --link-path /tmp/dsv4-pro-fp4-model --workers 8
+          bash scripts/ci/amd/amd_ci_exec.sh free -h
+
+      - name: Load-only DeepSeek-V4-Pro FP4 aggregate profile
         timeout-minutes: 90
         run: |
           > github_summary.md
-          echo "## DeepSeek-V4-Pro FP4 load-only: ${{ matrix.experiment }}" >> github_summary.md
+          echo "## DeepSeek-V4-Pro FP4 load-only: aggregate profile" >> github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            -e SGLANG_DSV4_LOAD_EXPERIMENT="${{ matrix.experiment }}" \
-            -e SGLANG_DSV4_LOAD_PREFETCH="${{ matrix.prefetch }}" \
-            -e SGLANG_DSV4_PREFETCH_THREADS=2 \
-            -e SGLANG_DSV4_WEIGHT_LOAD_THREADS="${{ matrix.h2d_threads }}" \
+            -e DEEPSEEK_V4_PRO_MODEL_PATH_FP4=/tmp/dsv4-pro-fp4-model \
+            -e SGLANG_DSV4_LOAD_EXPERIMENT=aggregate-profile \
+            -e SGLANG_DSV4_LOAD_PREFETCH=0 \
+            -e SGLANG_DSV4_WEIGHT_LOAD_THREADS=4 \
             -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
+            -e SGLANG_MOE_WEIGHT_LOAD_AGGREGATE_PROFILE=1 \
             -e SGLANG_SORT_WEIGHT_FILES=0 \
             python3 run_suite.py --hw amd \
               --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro-fp4-load-exp \

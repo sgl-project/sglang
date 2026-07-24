@@ -86,6 +86,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    emit_moe_weight_load_profile,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -3074,6 +3077,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        emit_moe_weight_load_profile(get_parallel().tp_rank)
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
