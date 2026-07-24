@@ -268,9 +268,6 @@ def split_graph(
     return split_gm, outputs
 
 
-# we share the global graph pool among all the backends
-global_graph_pool = None
-
 compilation_start_time = 0.0
 
 

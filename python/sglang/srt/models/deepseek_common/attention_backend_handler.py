@@ -11,8 +11,8 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import use_intel_amx_backend
+from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
@@ -31,7 +31,11 @@ class AttentionBackendRegistry:
 
 def _dispatch_mla_subtype(attn, forward_batch):
     if _is_hip:
-        if attn.rocm_fused_decode_mla and forward_batch.forward_mode.is_decode():
+        if (
+            attn.rocm_fused_decode_mla
+            and forward_batch.forward_mode.is_decode()
+            and attn.current_attention_backend == "aiter"
+        ):
             return AttnForwardMethod.MLA_FUSED_ROPE_ROCM
         else:
             return AttnForwardMethod.MLA
@@ -114,7 +118,7 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
@@ -129,8 +133,15 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
+    # FA4 absorbed MLA feeds q_nope through the qv argument, which
+    # flash_attn.cute only implements on SM100/SM110 (not SM120); keep the
+    # pre-existing MHA chunked-KV path elsewhere. Deterministic inference
+    # requires MLA and rejects fa4 on other archs at startup (server_args).
+    if not is_sm100_or_sm110_supported():
+        return AttnForwardMethod.MHA_CHUNKED_KV
+    if get_exec().deterministic.enable_deterministic_inference:
+        return _dispatch_mla_subtype(attn, forward_batch)
+    return _handle_attention_backend(attn, forward_batch, "fa4")
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
@@ -183,7 +194,7 @@ def handle_attention_triton(attn, forward_batch):
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
-    if get_global_server_args().enable_deterministic_inference:
+    if get_server_args().enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (

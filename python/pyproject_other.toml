@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,9 +30,10 @@ runtime_common = [
   "einops",
   "fastapi",
   "gguf",
+  "helion==0.2.6",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -126,7 +127,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.68",
+  "torchada>=0.1.74",
 ]
 
 diffusion_musa = [
@@ -162,6 +163,7 @@ diffusion_mps = [
 
 test = [
   "accelerate",
+  "pymupdf",
   "expecttest",
   "gguf",
   "jsonlines",
@@ -190,10 +192,19 @@ dev_mps = ["sglang[all_mps]", "sglang[test]"]
 [project.scripts]
 sglang = "sglang.cli.main:main"
 
+# Rust extension modules are auto-discovered by setup.py from the cargo
+# workspace in ../rust; this allowlist restricts which of them this platform
+# builds (case-insensitive substrings of the target module). grpc is
+# intentionally omitted here (it needs proto/tonic); ROCm only builds mm.
+# NOTE: setup.py reads this with a line regex, not a TOML parser — keep the
+# assignment on a single line.
+[tool.sglang]
+rust-extensions = ["multimodal"]
+
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "kernels/**/*"
 ]
 
 [tool.setuptools.packages.find]

@@ -194,6 +194,9 @@ class StagingAllocator:
         self.watermark_round = 0
         self.watermark_tail = 0
         self.lock = threading.Lock()
+        # Lazily created on the decode side by the first scatter; stays None
+        # until then so release_room can drain it without a defensive check.
+        self._scatter_stream = None
 
         logger.info(
             f"StagingAllocator (ring+overcommit): "
@@ -708,9 +711,11 @@ def compute_head_slice_params(
         unique_head_idx = local_tp_rank // src_replication
         dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
-        src_head_start = (
-            dst_tp_rank_in_group * dst_heads_per_rank
-        ) % src_heads_per_rank
+        # GQA replication: consecutive decode ranks share a KV head
+        # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
+        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+        unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 

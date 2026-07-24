@@ -61,7 +61,7 @@ class SchedulerRequestReceiver:
     model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
-    get_last_forward_mode: Callable[[], Any]
+    get_last_batch: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
@@ -79,7 +79,7 @@ class SchedulerRequestReceiver:
             self.scripted_scheduler_hook.step()
 
         if self.recv_skipper is not None:
-            if not self.recv_skipper.handle(self.get_last_forward_mode()):
+            if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
         recv_reqs = self._pull_raw_reqs()
@@ -167,7 +167,10 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            _local_ctrl = (
+                self.server_args.enable_dp_attention_local_control_broadcast
+                or self.server_args.is_ep_scale_joiner
+            )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -223,11 +226,12 @@ class SchedulerRequestReceiver:
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                if error_code is None:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                elif isinstance(error_code, HTTPStatus):
+                    status_code = error_code
+                else:
+                    status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs

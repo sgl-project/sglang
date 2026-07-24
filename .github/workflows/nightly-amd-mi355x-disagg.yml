@@ -118,6 +118,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Clean up prior Slurm jobs from this runner
         continue-on-error: true
@@ -215,6 +218,16 @@ jobs:
           if [ -n "$ACTIVE_JOBS" ]; then
             echo "Cancelling jobs for ${JOB_TAG}: $ACTIVE_JOBS"
             scancel $ACTIVE_JOBS
+          fi
+
+      - name: Clean up MI355X scratch
+        if: always()
+        continue-on-error: true
+        run: |
+          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+          if [ -d "$LOG_DIR" ]; then
+            echo "Removing MI355X scratch directory: $LOG_DIR"
+            rm -rf "$LOG_DIR"
           fi
 
   collect-results:
