@@ -14,7 +14,16 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import torch
 
@@ -61,6 +70,97 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+_PlanInfoT = TypeVar("_PlanInfoT", bound=Sequence[int])
+
+# flashinfer-python==0.6.14 PrefillPlanInfo::ToVector() field positions.
+_FLASHINFER_PREFILL_PLAN_INFO_LENGTH = 15
+_FLASHINFER_PREFILL_PADDED_BATCH_SIZE_INDEX = 0
+_FLASHINFER_PREFILL_TOTAL_NUM_ROWS_INDEX = 1
+_FLASHINFER_PREFILL_CTA_TILE_Q_INDEX = 3
+_FLASHINFER_PREFILL_ENABLE_CUDA_GRAPH_INDEX = 13
+_FLASHINFER_PREFILL_SPLIT_KV_INDEX = 14
+
+
+def _narrow_deterministic_cuda_graph_decode_plan(
+    plan_info: _PlanInfoT,
+    *,
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> _PlanInfoT:
+    """Narrow FlashInfer 0.6.14's deterministic FA2 decode plan to initialized q tiles.
+
+    Tensor-core decode reuses ``PrefillPlanInfo``. With split-KV disabled, its
+    CUDA-graph padding has no validity mask, so only the initialized q-tile
+    entries may be launched.
+    """
+    if len(plan_info) != _FLASHINFER_PREFILL_PLAN_INFO_LENGTH:
+        raise RuntimeError(
+            "Unexpected FlashInfer FA2 plan ABI for deterministic CUDA-graph "
+            f"decode: expected {_FLASHINFER_PREFILL_PLAN_INFO_LENGTH} fields from "
+            f"flashinfer_python==0.6.14, got {len(plan_info)}."
+        )
+    if batch_size <= 0:
+        raise RuntimeError(
+            "Invalid FlashInfer decode plan batch_size: expected a positive value, "
+            f"got {batch_size}."
+        )
+    if num_qo_heads <= 0 or num_kv_heads <= 0:
+        raise RuntimeError(
+            "Invalid FlashInfer decode head counts: num_qo_heads and num_kv_heads "
+            f"must be positive, got {num_qo_heads} and {num_kv_heads}."
+        )
+    if num_qo_heads % num_kv_heads != 0:
+        raise RuntimeError(
+            "Invalid FlashInfer decode head counts: "
+            f"num_qo_heads ({num_qo_heads}) must be divisible by "
+            f"num_kv_heads ({num_kv_heads})."
+        )
+    if plan_info[_FLASHINFER_PREFILL_ENABLE_CUDA_GRAPH_INDEX] != 1:
+        raise RuntimeError(
+            "Invalid FlashInfer FA2 prefill plan: expected a CUDA graph plan, "
+            f"got enable_cuda_graph={plan_info[_FLASHINFER_PREFILL_ENABLE_CUDA_GRAPH_INDEX]}."
+        )
+    if plan_info[_FLASHINFER_PREFILL_SPLIT_KV_INDEX] != 0:
+        raise RuntimeError(
+            "Invalid FlashInfer FA2 prefill plan: expected split-KV to be disabled, "
+            f"got split_kv={plan_info[_FLASHINFER_PREFILL_SPLIT_KV_INDEX]}."
+        )
+    if plan_info[_FLASHINFER_PREFILL_TOTAL_NUM_ROWS_INDEX] != batch_size:
+        raise RuntimeError(
+            "Invalid FlashInfer deterministic decode plan: expected one query row "
+            f"per request, got total_num_rows="
+            f"{plan_info[_FLASHINFER_PREFILL_TOTAL_NUM_ROWS_INDEX]} and "
+            f"batch_size={batch_size}."
+        )
+
+    cta_tile_q = plan_info[_FLASHINFER_PREFILL_CTA_TILE_Q_INDEX]
+    if cta_tile_q <= 0:
+        raise RuntimeError(
+            "Invalid FlashInfer FA2 prefill plan: CTA q tile size must be positive, "
+            f"got {cta_tile_q}."
+        )
+
+    group_size = num_qo_heads // num_kv_heads
+    tiles_per_request = (group_size + cta_tile_q - 1) // cta_tile_q
+    # With one q row per request, FA2 packs the GQA group into q rows and
+    # initializes exactly one scheduler entry per CTA q tile. Split-KV-disabled
+    # plans have no validity mask, so the captured grid must stop at that bound.
+    exact_grid_x = batch_size * tiles_per_request
+    padded_batch_size = plan_info[_FLASHINFER_PREFILL_PADDED_BATCH_SIZE_INDEX]
+    if exact_grid_x > padded_batch_size:
+        raise RuntimeError(
+            "Invalid FlashInfer FA2 prefill plan: narrowing would enlarge "
+            f"padded_batch_size from {padded_batch_size} to {exact_grid_x}."
+        )
+    if exact_grid_x == padded_batch_size:
+        return plan_info
+
+    narrowed_plan = list(plan_info)
+    narrowed_plan[_FLASHINFER_PREFILL_PADDED_BATCH_SIZE_INDEX] = exact_grid_x
+    return cast(_PlanInfoT, type(plan_info)(narrowed_plan))
 
 
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
@@ -1743,6 +1843,24 @@ class FlashInferIndicesUpdaterDecode:
 
         if locally_override:
             global_override_indptr_cpu = None
+
+        if (
+            disable_split_kv is True
+            and wrapper.is_cuda_graph_enabled
+            and wrapper.use_tensor_cores
+            and getattr(wrapper, "_backend", None) == "fa2"
+        ):
+            plan_info = getattr(wrapper, "_plan_info", None)
+            if plan_info is None:
+                raise RuntimeError(
+                    "FlashInfer split-KV-disabled CUDA graph decode did not produce a plan."
+                )
+            wrapper._plan_info = _narrow_deterministic_cuda_graph_decode_plan(
+                plan_info,
+                batch_size=bs,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+            )
 
 
 class FlashInferIndicesUpdaterPrefill:
