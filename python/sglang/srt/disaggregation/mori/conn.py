@@ -51,10 +51,9 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 HOST_REGISTRATION_ALIGNMENT = 4096
-# Ionic rejects a non-hugepage MR with exactly 2^18 4KiB mappings
-# (1GiB at a merely 4KiB-aligned address) as BAD_ATTR. Stay one page below
-# that firmware boundary; the value is aligned down further to each KV item.
-DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = (1 << 30) - HOST_REGISTRATION_ALIGNMENT
+# Keep chunk boundaries 2MiB-aligned for hugetlb-backed buffers and below 1GiB
+# for ordinary 4KiB mappings. The value is aligned down further to each KV item.
+DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = 1022 * (1 << 20)
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
@@ -474,12 +473,7 @@ class MoriKVManager(CommonKVManager):
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
         )
-        chunk_limit = int(
-            os.environ.get(
-                "SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES",
-                DEFAULT_HOST_REGISTRATION_CHUNK_BYTES,
-            )
-        )
+        chunk_limit = envs.SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES.get()
         if chunk_limit < HOST_REGISTRATION_ALIGNMENT:
             raise ValueError(
                 "SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES must be at least "

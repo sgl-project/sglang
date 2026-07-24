@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("mori.io", exc_type=ImportError)
 
@@ -183,6 +184,35 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
         )
         self.assertEqual(len(manager.kv_mem_desc_groups[0]), 3)
         self.assertIs(manager.kv_mem_descs[0], manager.kv_mem_desc_groups[0][0])
+
+    def test_host_pool_uses_matching_hip_registration_chunks(self):
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.memory_pool_host._cuda_host_register"
+            ) as register,
+            patch(
+                "sglang.srt.mem_cache.memory_pool_host._cuda_host_unregister"
+            ) as unregister,
+        ):
+            pool = DeepSeekV4PagedHostPool(
+                pool_name="test",
+                device_buffers=[torch.zeros((1, 1), dtype=torch.bfloat16)],
+                item_bytes=1024,
+                num_host_pages=10,
+                slot_page_size=1,
+                pin_memory=True,
+                host_register_chunk_bytes=4096,
+            )
+
+            self.assertEqual(register.call_count, 3)
+            self.assertEqual(
+                [call.args[0].numel() for call in register.call_args_list],
+                [4096, 4096, 2048],
+            )
+            pool.destroy()
+            self.assertEqual(unregister.call_count, 3)
 
     def test_mixed_item_plan_scatters_fragmented_host_rows(self):
         manager = object.__new__(MoriKVManager)
