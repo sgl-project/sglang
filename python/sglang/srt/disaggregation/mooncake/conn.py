@@ -353,18 +353,14 @@ class MooncakeKVManager(CommonKVManager):
         try:
             self.server_socket.close(linger=0)
         except Exception:
-            logger.exception(
-                "Failed to close mooncake server_socket during teardown"
-            )
+            logger.exception("Failed to close mooncake server_socket during teardown")
 
         # destroy() force-closes every socket in the context; plain term()
         # would block waiting on them.
         try:
             self._zmq_ctx.destroy(linger=0)
         except Exception:
-            logger.exception(
-                "Failed to destroy mooncake zmq context during teardown"
-            )
+            logger.exception("Failed to destroy mooncake zmq context during teardown")
 
         # Deregister memory from the transfer engine.
         try:
