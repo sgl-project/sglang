@@ -26,6 +26,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,13 @@ def sample_draft_block(
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             return torch.argmax(step_logits, dim=-1)
 
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
