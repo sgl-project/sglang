@@ -350,6 +350,7 @@ async def async_request_openai_completions(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -478,7 +479,7 @@ async def async_request_openai_chat_completions(
                             "completion_tokens", output_len
                         )
                         output.prompt_len = (response_json.get("usage") or {}).get(
-                            "prompt_tokens", request_func_input.prompt_len
+                            "prompt_tokens", prompt_len
                         )
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
@@ -585,6 +586,7 @@ async def async_request_truss(
         output = RequestFuncOutput.init_new(request_func_input)
 
         generated_text = ""
+        prompt_len = request_func_input.prompt_len
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -604,6 +606,10 @@ async def async_request_truss(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            prompt_len = (data.get("usage") or {}).get(
+                                "prompt_tokens", prompt_len
+                            )
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -626,6 +632,7 @@ async def async_request_truss(
                     output.success = True
                     output.latency = latency
                     output.output_len = request_func_input.output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -720,6 +727,9 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                prompt_len = data["meta_info"].get(
+                                    "prompt_tokens", prompt_len
+                                )
 
                                 # First token
                                 if ttft == 0.0:
@@ -742,6 +752,7 @@ async def async_request_sglang_generate(
                     output.success = True
                     output.latency = latency
                     output.output_len = output_len
+                    output.prompt_len = prompt_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
