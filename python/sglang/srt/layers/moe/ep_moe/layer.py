@@ -8,6 +8,10 @@ import torch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -21,7 +25,11 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -74,12 +82,6 @@ def _a2a_moe_forward_eager(
     i.e. graph-pool storage the pool reuses across shapes) and returns None,
     so eager_on_graph retains no per-shape bridge tensor for this break.
     """
-    from sglang.srt.layers.dp_attention import (
-        get_is_extend_in_batch,
-        set_is_extend_in_batch,
-    )
-    from sglang.srt.layers.moe.topk import StandardTopKOutput
-
     saved_is_extend_in_batch = get_is_extend_in_batch()
     set_is_extend_in_batch(True)
     try:
