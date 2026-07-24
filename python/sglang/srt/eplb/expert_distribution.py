@@ -53,40 +53,33 @@ class ExpertDistributionMetrics:
 
 
 @dataclass
-class TensorAddress:
+class RecordMetadata:
     offset: int
     length: int
     shape: tuple
     dtype: torch.dtype
 
 
-class ExpertRecorderBuffer:
-    def __init__(
-        self,
-        buffer_size_mb: int,
-        device: torch.device = torch.device("cpu"),
-    ):
+class RecordBuffer:
+    def __init__(self, buffer_size_mb: int):
         self._buffer_stream = torch.cuda.Stream()
+        self._buffer_size = buffer_size_mb * 1024 * 1024
         self._buffer = torch.as_tensor(
-            torch.UntypedStorage(buffer_size_mb * 1024 * 1024, device=device),
+            torch.UntypedStorage(self._buffer_size, device=torch.device("cpu")),
             dtype=torch.uint8,
+            pin_memory=True,
         )
-        if self._buffer.device.type == "cpu":
-            self._buffer = self._buffer.pin_memory()
-        # pointer to the current write position in the buffer (in bytes)
-        self._write_ptr = 0
-        # flag to indicate if the buffer is full
-        # (i.e. no more records can be stored until reset)
+        self._head = 0
         self._is_full = False
 
-    def store(self, tensor: torch.Tensor) -> Optional[TensorAddress]:
+    def store(self, tensor: torch.Tensor) -> Optional[RecordMetadata]:
         assert tensor.is_cuda, "Input tensor must be on CUDA device"
 
         if self._is_full:
             return None
         if tensor.numel() == 0:
-            return TensorAddress(
-                offset=self._write_ptr,
+            return RecordMetadata(
+                offset=self._head,
                 length=0,
                 shape=tuple(tensor.shape),
                 dtype=tensor.dtype,
@@ -98,48 +91,32 @@ class ExpertRecorderBuffer:
             .view(-1)
             .view(torch.uint8)
         )
-
         # Keep tensor alive until buffer stream finishes
         t.record_stream(self._buffer_stream)
 
-        # Ensure that the current stream waits for the buffer stream to finish
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream())
-
-        # backup tensor to buffer asynchronously
-        with torch.cuda.stream(self._buffer_stream):
-            ready.wait(self._buffer_stream)
-
-            # compute byte length and buffer slice
-            nbytes = t.numel()
-            start = self._write_ptr
-            end = start + nbytes
-
-            # buffer size check
-            if end <= self._buffer.numel():
-                self._buffer[start:end].copy_(t, non_blocking=True)
-                self._write_ptr = end
-            else:
-                # notice the user
-                logger.info(
-                    "ExpertRecorder's buffer is full. Further records will be dropped until reset."
-                )
-                self._is_full = True
-
-        if self._is_full:
+        nbytes = t.numel()
+        start = self._head
+        end = start + nbytes
+        if end >= self._buffer_size:
+            self._is_full = True
+            logger.info(
+                "ExpertRecorder's buffer is full. Further records will be dropped."
+            )
             return None
 
-        # return address and metadata needed for reconstruction
-        return TensorAddress(
+        # Asynchronously copy tensor data to the pinned buffer
+        with torch.cuda.stream(self._buffer_stream):
+            self._buffer[start:end].copy_(t, non_blocking=True)
+        self._head = end
+
+        return RecordMetadata(
             offset=start,
             length=nbytes,
             shape=tuple(tensor.shape),
             dtype=tensor.dtype,
         )
 
-    def get(self, address: TensorAddress, sync: bool = True) -> torch.Tensor:
-        if sync:
-            self.synchronize()
+    def get(self, address: RecordMetadata) -> torch.Tensor:
         raw_bytes = self._buffer[address.offset : address.offset + address.length]
         return raw_bytes.view(address.dtype).reshape(address.shape).clone()
 
@@ -147,39 +124,24 @@ class ExpertRecorderBuffer:
         self._buffer_stream.synchronize()
 
     def reset(self):
-        self._write_ptr = 0
+        self._head = 0
         self._is_full = False
 
     @property
     def is_full(self) -> bool:
         return self._is_full
 
-    @property
-    def bytes_total(self) -> int:
-        """Total buffer capacity in bytes."""
-        return self._buffer.numel()
-
-    @property
-    def bytes_used(self) -> int:
-        """Bytes written since last reset."""
-        return self._write_ptr
-
-    @property
-    def usage_ratio(self) -> float:
-        """Fraction of buffer used (0.0 ~ 1.0)."""
-        return self._write_ptr / self._buffer.numel()
-
 
 def init_recorder_buffer(
     server_args: ServerArgs,
-) -> Optional[ExpertRecorderBuffer]:
+) -> Optional[RecordBuffer]:
     if server_args.expert_distribution_recorder_mode == "per_token_buffered":
         # preallocate a large pinned CPU buffer
         buffer_size_mb = server_args.expert_distribution_recorder_buffer_size
         # adjust buffer size
         if buffer_size_mb is None or buffer_size_mb <= 0:
             buffer_size_mb = 1024  # default to 1GB
-        return ExpertRecorderBuffer(buffer_size_mb)
+        return RecordBuffer(buffer_size_mb)
     else:
         return None
 
@@ -436,7 +398,7 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[ExpertRecorderBuffer] = None,
+        buffer: Optional[RecordBuffer] = None,
     ) -> "_SinglePassGatherer":
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
@@ -566,7 +528,7 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
             )
         )
 
-    def set_buffer(self, buffer: ExpertRecorderBuffer):
+    def set_buffer(self, buffer: RecordBuffer):
         self._data = buffer
 
     def reset(self):
@@ -851,7 +813,7 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[ExpertRecorderBuffer] = None,
+        buffer: Optional[RecordBuffer] = None,
     ) -> "_Accumulator":
         return _Accumulator.get_class(server_args)(
             server_args, expert_location_metadata, rank, buffer
@@ -872,7 +834,7 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-        buffer: Optional[ExpertRecorderBuffer] = None,
+        buffer: Optional[RecordBuffer] = None,
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
@@ -1067,9 +1029,9 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._data.synchronize()
 
         for record in self._records:
-            # De-reference TensorAddress to actual tensor data
+            # De-reference RecordMetadata to actual tensor data
             for k, v in record.items():
-                if isinstance(v, TensorAddress):
+                if isinstance(v, RecordMetadata):
                     record[k] = self._data.get(v, sync=False)
 
         output = dict(
