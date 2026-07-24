@@ -217,7 +217,9 @@ except Exception:  # pragma: no cover - environment dependent
     _HAS_MORI = False
 
 try:
-    from sglang.srt.disaggregation.common.utils import FastQueue as _FQ  # noqa: E402,F811
+    from sglang.srt.disaggregation.common.utils import (  # noqa: E402,F811
+        FastQueue as _FQ,
+    )
     from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager  # noqa: E402
 
     _HAS_MOONCAKE = True
@@ -279,10 +281,7 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m.enable_trace = False
         m._worker_threads = []
         m.transfer_queues = [_FQ() for _ in range(3)]
-        m.executors = [
-            concurrent.futures.ThreadPoolExecutor(1)
-            for _ in range(3)
-        ]
+        m.executors = [concurrent.futures.ThreadPoolExecutor(1) for _ in range(3)]
         m.server_socket = MagicMock()
         m._zmq_ctx = MagicMock()
         m._socket_lock = threading.Lock()
