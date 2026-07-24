@@ -51,6 +51,12 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
     pub disaggregation_role: Option<DisaggregationRole>,
+    /// Whether the engine was launched with `--enable-http2` (Granian,
+    /// serving cleartext h2c + HTTP/1.1). `Some(true)` ⇒ the router may
+    /// forward over h2c; `Some(false)` / `None` (older SGLang without the
+    /// field) ⇒ stay on HTTP/1.1. Consumed by `manager::register_one` to set
+    /// [`crate::workers::WireProtocol`].
+    pub enable_http2: Option<bool>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -145,6 +151,7 @@ impl WorkerIntrospector {
             served_model_name,
             event_config,
             disaggregation_role,
+            enable_http2: parsed.enable_http2,
         }
     }
 
@@ -330,6 +337,11 @@ struct ServerInfoBody {
     /// bootstrap server binds to exactly this port (no internal offset).
     #[serde(default)]
     disaggregation_bootstrap_port: Option<u16>,
+    /// `ServerArgs.enable_http2`. `true` ⇒ the engine runs Granian and
+    /// serves cleartext h2c alongside HTTP/1.1. Absent on older SGLang
+    /// versions that predate the flag.
+    #[serde(default)]
+    enable_http2: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -573,6 +585,41 @@ mod tests {
         .await;
         let got = fast_introspector().fetch(&url).await;
         assert_eq!(got.disaggregation_role, Some(DisaggregationRole::Plain));
+    }
+
+    /// `enable_http2: true` is surfaced so the manager forwards over h2c.
+    #[tokio::test]
+    async fn fetch_surfaces_enable_http2_true() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "enable_http2": true,
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.enable_http2, Some(true));
+    }
+
+    /// An explicit `enable_http2: false` (HTTP/1.1-only engine) is surfaced
+    /// as `Some(false)`, distinct from the older-SGLang absent case.
+    #[tokio::test]
+    async fn fetch_surfaces_enable_http2_false() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "enable_http2": false,
+        }))
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.enable_http2, Some(false));
+    }
+
+    /// Older SGLang predates `enable_http2`; its absence must read as
+    /// `None` (the manager then keeps the safe HTTP/1.1 default), not as a
+    /// parse failure.
+    #[tokio::test]
+    async fn fetch_enable_http2_absent_is_none() {
+        let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.enable_http2, None);
     }
 
     /// Partial data (`prefill` mode with no bootstrap port) returns
