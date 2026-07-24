@@ -1469,6 +1469,13 @@ class Scheduler(
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
 
+        from sglang.srt.utils.host_shared_memory import (
+            dispose_host_shared_memory_manager,
+        )
+
+        dispose_host_shared_memory_manager()
+
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
