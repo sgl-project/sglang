@@ -93,6 +93,10 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
+from sglang.srt.model_executor.deepep_capacity import (
+    DeepEPCapacityPlan,
+    resolve_deepep_num_max,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -194,6 +198,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
+    log_info_on_rank0,
     numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
@@ -260,6 +265,9 @@ class ModelRunner:
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
+        # Set on target by `_resolve_memory_pool_config`; stays None on draft
+        # workers (the target resolves and exports the shared dispatch bound).
+        self.deepep_capacity_plan: Optional[DeepEPCapacityPlan] = None
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.dcp_size = server_args.dcp_size
@@ -762,6 +770,7 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
+        self.deepep_capacity_plan = result.deepep_capacity_plan
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
@@ -901,6 +910,14 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        """Capture cuda graphs. Requires init_attention_backends() to have run.
+
+        Spec draft runners pass capture_decode_cuda_graph=False
+        because they capture their own decode-style graphs separately.
+        """
+        # Must precede any DeepEP buffer / capture-list build — both read the env.
+        self._maybe_auto_tune_deepep_num_max_dispatch_tokens()
+
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -908,6 +925,37 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+        self._validate_deepep_capture_reservation(
+            get_available_gpu_memory(self.device, self.gpu_id)
+        )
+
+    def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
+        plan = self.deepep_capacity_plan
+        if plan is None or self.is_draft_worker:
+            return
+        prev = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        num_max = resolve_deepep_num_max(plan, self.req_to_token_pool.size)
+        if num_max != prev:
+            log_info_on_rank0(
+                logger,
+                f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={num_max} "
+                f"(decode concurrency={self.req_to_token_pool.size}, "
+                f"ceiling={plan.ceiling}).",
+            )
+
+    def _validate_deepep_capture_reservation(self, after_mem_gb: float):
+        """ERROR, not raise: the diagnostic must surface without killing the serve."""
+        if self.deepep_capacity_plan is None:
+            return
+        safety_floor_gib = 2.0
+        if after_mem_gb < safety_floor_gib:
+            logger.error(
+                "DeepEP capture left only %.2f GiB free (< %.1f GiB safety floor); "
+                "the capacity reservation is too small for this config — "
+                "set --mem-fraction-static lower.",
+                after_mem_gb,
+                safety_floor_gib,
+            )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

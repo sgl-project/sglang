@@ -724,6 +724,11 @@ class ServerArgs:
         "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
         NS("schedule"),
     ] = None
+    # Derived in __post_init__, not a CLI arg: MiB the auto mem_fraction formula
+    # already set aside that deepep_capacity may credit against its reservation
+    # (chunked over-reservation + the flat deepep a2a headroom). None when
+    # mem_fraction_static is user-set.
+    auto_mem_deepep_slack_mib: Optional[float] = None
     max_running_requests: A[
         Optional[int], "The maximum number of running requests.", NS("schedule")
     ] = None
@@ -4566,6 +4571,15 @@ class ServerArgs:
                 if gpu_mem is not None
                 else 0.88
             )
+            if gpu_mem is not None:
+                # Post-capture sizing reserves neither activations nor the a2a
+                # headroom, so there is nothing for deepep_capacity to credit.
+                self.auto_mem_deepep_slack_mib = (
+                    0.0
+                    if self.post_capture_kv_sizing_planned()
+                    else self._auto_mem_chunked_slack()
+                    + self.reserve_for_deepep_a2a_mb()
+                )
 
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
@@ -4580,6 +4594,22 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def _auto_mem_chunked_slack(self) -> float:
+        """MiB the auto formula over-reserves by counting the un-divided
+        chunked_prefill_size that _handle_data_parallelism later divides per-rank.
+        dp_size is checked here because that handler (which forces dp_attention
+        off for dp_size == 1) has not run yet; disagg-decode sizes activations
+        from the decode batch, so it has nothing to credit."""
+        if not (
+            self.chunked_prefill_size > 0
+            and self.enable_dp_attention
+            and self.dp_size > 1
+            and self.disaggregation_mode != "decode"
+        ):
+            return 0.0
+        per_rank = self.chunked_prefill_size // self.dp_size
+        return (max(self.chunked_prefill_size, 2048) - max(per_rank, 2048)) * 1.5
 
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be

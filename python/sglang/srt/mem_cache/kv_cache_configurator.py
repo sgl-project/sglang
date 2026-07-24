@@ -57,6 +57,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.deepep_capacity import (
+    DeepEPCapacityPlan,
+    plan_deepep_capacity,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -70,6 +74,10 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 2 GiB clears the fixed pool overhead of multi-pool models (DSV4's c4/c128/
+# state pools consume ~1.5 GiB before the first KV token).
+_DEEPEP_MIN_KV_BUDGET_GIB = 2.0
 
 _is_hip = is_hip()
 
@@ -130,6 +138,7 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     memory_pool_config: MemoryPoolConfig
     unified_memory_pool: Optional[UnifiedKVPool] = None
+    deepep_capacity_plan: Optional[DeepEPCapacityPlan] = None
 
 
 class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
@@ -179,6 +188,7 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_model_idx: Optional[int] = None
     mambaish_config: Optional[Any] = field(init=False)
+    deepep_capacity_plan: Optional[DeepEPCapacityPlan] = field(init=False, default=None)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     is_inkling_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
@@ -249,6 +259,7 @@ class KVCacheConfigurator:
             token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
             memory_pool_config=config,
             unified_memory_pool=pools.unified_memory_pool,
+            deepep_capacity_plan=self.deepep_capacity_plan,
         )
 
     def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
@@ -1567,6 +1578,8 @@ class KVCacheConfigurator:
                 f"decoding, draft weights are now counted."
             )
 
+        rest_memory = self._reserve_deepep_capacity(rest_memory)
+
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
@@ -1656,7 +1669,98 @@ class KVCacheConfigurator:
                 requested_per_worker,
                 max_num_reqs,
             )
-        return max_num_reqs
+        return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
+
+    def _reserve_deepep_capacity(self, rest_memory: float) -> float:
+        """The RDMA buffer (nvshmem, outside the torch allocator) and the capture
+        footprint both land after the KV pool, so the budget makes room up front."""
+        plan = self.deepep_capacity_plan
+        if plan is None or not plan.auto_sized:
+            return rest_memory
+        if plan.reserve_mib <= 0:
+            logger.info(
+                "DeepEP auto mem reserve: num_max<=%d buffer=%.2f GiB "
+                "capture=%.2f GiB fully credited by chunked slack=%.2f GiB; "
+                "KV budget unchanged (%.2f GiB)",
+                plan.ceiling,
+                plan.rdma_mib / 1024,
+                plan.capture_mib / 1024,
+                plan.slack_mib / 1024,
+                rest_memory,
+            )
+            return rest_memory
+        reserve_gib = plan.reserve_mib / 1024
+        affordable_gib = rest_memory - _DEEPEP_MIN_KV_BUDGET_GIB
+        if affordable_gib <= 0:
+            raise ValueError(
+                f"DeepEP auto mem reserve: the KV budget is only "
+                f"{rest_memory:.2f} GiB before reserving anything for the "
+                f"low_latency buffer + capture "
+                f"({plan.rdma_mib / 1024:.2f} + {plan.capture_mib / 1024:.2f} GiB "
+                f"estimated). Set --mem-fraction-static higher, or lower "
+                f"--max-running-requests."
+            )
+        if reserve_gib > affordable_gib:
+            # The estimate is deliberately conservative — degrade rather than
+            # refuse; the post-capture headroom check reports a genuine shortfall.
+            logger.warning(
+                "DeepEP auto mem reserve %.2f GiB exceeds the available KV "
+                "budget (%.2f GiB); reserving %.2f GiB and keeping %.1f GiB of "
+                "KV cache. Capture may run close to the limit — set "
+                "--mem-fraction-static if it OOMs.",
+                reserve_gib,
+                rest_memory,
+                affordable_gib,
+                _DEEPEP_MIN_KV_BUDGET_GIB,
+            )
+            reserve_gib = affordable_gib
+        logger.info(
+            "DeepEP auto mem reserve: num_max<=%d buffer=%.2f GiB "
+            "capture=%.2f GiB slack=%.2f GiB; KV budget %.2f -> %.2f GiB",
+            plan.ceiling,
+            plan.rdma_mib / 1024,
+            plan.capture_mib / 1024,
+            plan.slack_mib / 1024,
+            rest_memory,
+            rest_memory - reserve_gib,
+        )
+        return rest_memory - reserve_gib
+
+    def _clamp_deepep_low_latency_concurrency(self, max_num_reqs: int) -> int:
+        """The all-to-all buffer is collective: bound each rank by the plan
+        ceiling, then take the EP-group MIN so the bound is uniform and no rank
+        dispatches past the buffer."""
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+        )
+
+        plan = self.deepep_capacity_plan
+        if plan is None:
+            return max_num_reqs
+
+        capped = min(
+            max_num_reqs,
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // plan.tokens_per_req,
+            max(1, plan.ceiling // plan.tokens_per_req),
+        )
+        ep_group = get_moe_ep_group()
+        if ep_group.world_size > 1:
+            tensor = torch.tensor(capped, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=ep_group.cpu_group
+            )
+            capped = int(tensor.item())
+
+        if capped < max_num_reqs:
+            logger.warning(
+                "DeepEP low_latency capped per-rank decode concurrency to %d "
+                "(from %d) to keep the all-to-all dispatch buffer within the "
+                "FINISHED_SUM_TAG bound and uniform across the EP group.",
+                capped,
+                max_num_reqs,
+            )
+        return capped
 
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
@@ -1666,6 +1770,12 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
+        self.deepep_capacity_plan = plan_deepep_capacity(
+            self.server_args,
+            self.model_config,
+            gpu_total_mib=get_device_memory_capacity(self.device),
+            moe_ep_size=self.ps.moe_ep_size,
+        )
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(

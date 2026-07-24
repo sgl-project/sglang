@@ -1468,6 +1468,166 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestDeepEPCaptureBsClamp(unittest.TestCase):
+    """get_batch_sizes_to_capture clamps the decode capture list to the
+    DeepEP low_latency dispatch buffer when deepep runs the low_latency path,
+    so HT can drop --max-running-requests without tripping the dispatch
+    assertion during graph capture.
+    """
+
+    def _make_runner(
+        self, moe_a2a_backend="deepep", deepep_mode="auto", max_draft_tokens=None
+    ):
+        # The non-spec decode capture list for max_bs=512 (see
+        # _generate_decode_cuda_graph_batch_sizes): includes 256 and 512.
+        decode_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + [512]
+        )
+        server_args = SimpleNamespace(
+            moe_a2a_backend=moe_a2a_backend,
+            deepep_mode=deepep_mode,
+            max_speculative_num_draft_tokens=max_draft_tokens,
+            enable_two_batch_overlap=False,
+            enable_torch_compile=False,
+            torch_compile_max_bs=32,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(bs=list(decode_bs)),
+            ),
+        )
+        runner = MagicMock()
+        runner.server_args = server_args
+        # req_to_token_pool.size large enough not to clamp before the DeepEP gate.
+        runner.req_to_token_pool.size = 2048
+        return runner
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_auto_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "auto")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertGreater(max(capture_bs), 0)
+        # DeepEP low_latency buffer default is 128; capture list must not exceed it.
+        self.assertLessEqual(max(capture_bs), 128)
+        self.assertIn(128, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_to_deepep_buffer_in_low_latency_mode(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "low_latency")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertLessEqual(max(capture_bs), 128)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_by_adaptive_max_draft_tokens(self, mock_get_parallel, _):
+        # Adaptive spec: startup captured_req_width=2 but draft tokens can grow to
+        # 8 at runtime; the clamp must use the max (8), so bs*8 <= 128 -> bs <= 16.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "auto", max_draft_tokens=8)
+        capture_bs, _ = get_batch_sizes_to_capture(runner, captured_req_width=2)
+        self.assertLessEqual(max(capture_bs) * 8, 128)
+        self.assertLessEqual(max(capture_bs), 16)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_in_normal_mode(self, mock_get_parallel, _):
+        # normal mode disables cuda graph; the clamp must not fire.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "normal")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertIn(512, capture_bs)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_does_not_clamp_non_deepep_backend(self, mock_get_parallel, _):
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("none", "auto")
+        capture_bs, _ = get_batch_sizes_to_capture(runner)
+        self.assertIn(512, capture_bs)
+
+
+class TestAutoMemChunkedSlack(unittest.TestCase):
+    """_auto_mem_chunked_slack records how much the auto mem_fraction formula
+    over-reserves for chunked-prefill activations under DP attention (it counts
+    the un-divided chunked_prefill_size; the runtime uses the per-rank slice).
+    deepep_capacity credits this slack against its KV-budget reservation.
+    """
+
+    def _slack(self, chunked, dp_size, dp_attention=True, disaggregation_mode="null"):
+        ns = SimpleNamespace(
+            chunked_prefill_size=chunked,
+            enable_dp_attention=dp_attention,
+            dp_size=dp_size,
+            disaggregation_mode=disaggregation_mode,
+        )
+        return ServerArgs._auto_mem_chunked_slack(ns)
+
+    def test_zero_without_dp_attention(self):
+        self.assertEqual(self._slack(32768, 4, dp_attention=False), 0.0)
+
+    def test_zero_for_disagg_decode(self):
+        # Disagg-decode reserved_mem sizes activations from the decode batch,
+        # not chunked_prefill_size — no over-reservation exists to credit.
+        self.assertEqual(self._slack(32768, 4, disaggregation_mode="decode"), 0.0)
+
+    def test_zero_for_single_dp_rank(self):
+        self.assertEqual(self._slack(32768, 1), 0.0)
+
+    def test_zero_when_chunked_disabled(self):
+        self.assertEqual(self._slack(-1, 4), 0.0)
+
+    def test_undivided_minus_per_rank_times_reserve_coef(self):
+        # GLM-5.2 balanced: (32768 - 8192) * 1.5 = 36 GiB.
+        self.assertEqual(self._slack(32768, 4), (32768 - 8192) * 1.5)
+
+    def test_per_rank_floor_matches_reserved_mem_formula(self):
+        # reserved_mem uses max(chunked, 2048); a per-rank slice below 2048
+        # would still be reserved at the 2048 floor, so the slack must subtract
+        # the floored per-rank value or it overstates the credit by 1.5 GiB
+        # here: (8192 - 2048) * 1.5, not (8192 - 1024) * 1.5.
+        self.assertEqual(self._slack(8192, 8), (8192 - 2048) * 1.5)
+
+
 class TestHandleCrashDumpEnv(CustomTestCase):
     _COREDUMP_ENV_KEYS = (
         "CUDA_ENABLE_COREDUMP_ON_EXCEPTION",

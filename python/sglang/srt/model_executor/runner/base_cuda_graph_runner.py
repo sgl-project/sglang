@@ -22,6 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import require_gathered_buffer
@@ -93,6 +94,19 @@ def get_batch_sizes_to_capture(
     capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
     capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
+
+    # A capture bs above the DeepEP low_latency dispatch cap trips the deep_ep assert.
+    from sglang.srt.model_executor.deepep_capacity import is_deepep_low_latency
+
+    if is_deepep_low_latency(server_args):
+        deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        # Adaptive spec can grow draft tokens at runtime, so clamp on the max,
+        # not the startup value.
+        spec_mult = max(
+            captured_req_width, server_args.max_speculative_num_draft_tokens or 0
+        )
+        if max(capture_bs) * spec_mult > deepep_cap:
+            capture_bs = [bs for bs in capture_bs if bs * spec_mult <= deepep_cap]
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
