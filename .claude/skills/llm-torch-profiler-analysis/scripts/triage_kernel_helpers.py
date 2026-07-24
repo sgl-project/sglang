@@ -453,7 +453,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="In-place QK RMSNorm",
         candidate_path=(
             "python/sglang/srt/models/utils.py"
-            "<br>python/sglang/kernels/ops/layernorm/_jit_norm.py"
+            "<br>python/sglang/kernels/ops/layernorm/norm.py"
         ),
         active_keywords=("fused_inplace_qknorm", "minimaxm2rmsnormtp"),
         split_groups=(("apply_qk_norm", "q_norm", "k_norm", "qknorm"),),
