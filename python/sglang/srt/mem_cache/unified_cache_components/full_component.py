@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -18,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -26,8 +26,12 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        CacheAction,
+        ComponentAction,
+    )
     from sglang.srt.mem_cache.unified_radix_cache import (
+        NodeId,
         UnifiedTreeNode,
     )
 
@@ -37,13 +41,6 @@ class FullComponent(TreeComponent):
 
     def __init__(self, cache, params):
         super().__init__(cache, params)
-        allocator = cache.token_to_kv_pool_allocator
-        # When SWA is present, only free full-attention KV here;
-        # SWA KV will be freed by cascade via SWAComponent.evict_component.
-        if ComponentType.SWA in cache.tree_components:
-            self._free_full = allocator.full_attn_allocator.free
-        else:
-            self._free_full = allocator.free
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
 
@@ -60,7 +57,7 @@ class FullComponent(TreeComponent):
             node.component_data[self.component_type].value is not None or node.backuped
         )
 
-    def finalize_match_result(
+    def finalize_match_result_in_tree_core(
         self,
         result: MatchResult,
         params: MatchPrefixParams,
@@ -72,7 +69,7 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         kv_host_hit = 0
         node = result.best_match_node
-        root_node = self.cache.root_node
+        root_node = self.tree_core.root_node
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
@@ -103,6 +100,8 @@ class FullComponent(TreeComponent):
     def evict_component(
         self,
         node: UnifiedTreeNode,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -111,9 +110,9 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            self._free_full(cd.value)
+            device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
-            self.cache.component_evictable_size_[self.component_type] -= freed
+            self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
             # cd.value = None
@@ -121,54 +120,78 @@ class FullComponent(TreeComponent):
         # Host layer
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
-            if self._full_kv_pool_host is not None:
-                self._full_kv_pool_host.free(cd.host_value)
+            host_frees[self.component_type].append(cd.host_value)
             cd.host_value = None
         return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
-    def drive_eviction(
-        self, params: EvictParams, tracker: dict[ComponentType, int]
-    ) -> None:
-        request = params.num_tokens
-        heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
-            for n in self.cache.evictable_device_leaves
+    def _evict_device_start(self, request_cnt: int) -> None:
+        self._evict_device_request_cnt = request_cnt
+        self._evict_device_last_node = None
+        self._evict_device_heap = [
+            (self.tree_core.eviction_strategy.get_priority(n), n)
+            for n in self.tree_core.evictable_device_leaves
         ]
-        heapq.heapify(heap)
+        heapq.heapify(self._evict_device_heap)
+
+    def _evict_device_next_node(
+        self,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> Optional[NodeId]:
         ct = self.component_type
-        while tracker[ct] < request and heap:
-            _, x = heapq.heappop(heap)
-            if x not in self.cache.evictable_device_leaves:
+        lv = self._evict_device_last_node
+        if (
+            lv is not None
+            and lv.parent is not None
+            and lv.parent in self.tree_core.evictable_device_leaves
+        ):
+            heapq.heappush(
+                self._evict_device_heap,
+                (self.tree_core.eviction_strategy.get_priority(lv.parent), lv.parent),
+            )
+        self._evict_device_last_node = None
+        while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
+            _, x = heapq.heappop(self._evict_device_heap)
+            if x not in self.tree_core.evictable_device_leaves:
                 continue
-            self.cache._evict_device_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
-                heapq.heappush(
-                    heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
-                )
+            self._evict_device_last_node = x
+            return x.id
+        return None
+
+    def _evict_device_end(self) -> None:
+        self._evict_device_heap = []
+        self._evict_device_last_node = None
 
     def drive_host_eviction(
-        self, num_tokens: int, tracker: dict[ComponentType, int]
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
-            for n in self.cache.evictable_host_leaves
+            (self.tree_core.eviction_strategy.get_priority(n), n)
+            for n in self.tree_core.evictable_host_leaves
         ]
         heapq.heapify(heap)
         ct = self.component_type
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
-            if x not in self.cache.evictable_host_leaves:
+            if x not in self.tree_core.evictable_host_leaves:
                 continue
-            self.cache._evict_host_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
+            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            if (
+                x.parent is not None
+                and x.parent in self.tree_core.evictable_host_leaves
+            ):
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    (self.tree_core.eviction_strategy.get_priority(x.parent), x.parent),
                 )
 
     def acquire_component_lock(
@@ -182,13 +205,14 @@ class FullComponent(TreeComponent):
         # Only the last host node needs to be protected.
         if lock_host:
             cd = node.component_data[ct]
-            if cd.host_value is None:
+            # write_back mode: the anchor may be device-only (no host_value); pin it anyway.
+            if cd.host_value is None and not self.tree_core.is_write_back:
                 return result
             cd.host_lock_ref += 1
-            self.cache._update_evictable_leaf_sets(node)
+            self.tree_core._update_evictable_leaf_sets(node)
             return result
 
-        root = self.cache.root_node
+        root = self.tree_core.root_node
         cur = node
 
         # Skip the bottom evicted segment
@@ -205,11 +229,11 @@ class FullComponent(TreeComponent):
             ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
-                self.cache.component_evictable_size_[ct] -= key_len
-                self.cache.component_protected_size_[ct] += key_len
+                self.tree_core.component_evictable_size_[ct] -= key_len
+                self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
             cd.lock_ref += 1
-            self.cache.evictable_device_leaves.discard(cur)
+            self.tree_core.evictable_device_leaves.discard(cur)
             cur = cur.parent
         result.delta = delta
         return result
@@ -223,13 +247,16 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         if lock_host:
             cd = node.component_data[ct]
-            if cd.host_value is None or cd.host_lock_ref == 0:
+            if cd.host_lock_ref == 0:
+                return
+            # Mirror of `acquire`. write_back uses a pure counter.
+            if cd.host_value is None and not self.tree_core.is_write_back:
                 return
             cd.host_lock_ref -= 1
-            self.cache._update_evictable_leaf_sets(node)
+            self.tree_core._update_evictable_leaf_sets(node)
             return
 
-        root = self.cache.root_node
+        root = self.tree_core.root_node
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         cur = node
         while cur != root:
@@ -242,11 +269,11 @@ class FullComponent(TreeComponent):
 
             if cd.lock_ref == 1:
                 key_len = len(cd.value)
-                self.cache.component_evictable_size_[ct] += key_len
-                self.cache.component_protected_size_[ct] -= key_len
+                self.tree_core.component_evictable_size_[ct] += key_len
+                self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
-                self.cache._update_evictable_leaf_sets(cur)
+                self.tree_core._update_evictable_leaf_sets(cur)
             cur = cur.parent
 
     # ---- HiCache Hooks ----
@@ -256,7 +283,8 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         *,
-        req: Optional[Req] = None,
+        mamba_pool_idx: Optional[torch.Tensor] = None,
+        host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
@@ -265,7 +293,7 @@ class FullComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             # Full KV backup is handled by the main flow
-            # (write_backup → cache_controller.write on host_value directly).
+            # (cache_controller.write on host_value directly).
             # No extra PoolTransfer needed.
             return None
 
@@ -292,7 +320,7 @@ class FullComponent(TreeComponent):
                         else torch.empty((0,), dtype=torch.int64, device="cpu")
                     ),
                     device_indices=None,
-                    nodes_to_load=nodes,
+                    nodes_to_load=[n.id for n in nodes],
                 )
             ]
 
@@ -304,6 +332,7 @@ class FullComponent(TreeComponent):
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
         *,
+        cache_actions: list[CacheAction | ComponentAction],
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
@@ -315,19 +344,39 @@ class FullComponent(TreeComponent):
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers or transfers[0].device_indices is None:
-                self.cache._update_evictable_leaf_sets(node)
+                self.tree_core._update_evictable_leaf_sets(node)
                 return
 
             xfer = transfers[0]
             device_indices = xfer.device_indices
             offset = 0
-            for n in xfer.nodes_to_load or []:
+            for nid in xfer.nodes_to_load or []:
+                n = self.tree_core.node_by_id(nid)
                 cd = n.component_data[ct]
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
                 offset += n_len
                 # Full uses leaf sets, not LRU
-                self.cache.component_evictable_size_[ct] += n_len
-                self.cache._update_evictable_leaf_sets(n)
+                self.tree_core.component_evictable_size_[ct] += n_len
+                self.tree_core._update_evictable_leaf_sets(n)
 
-            self.cache._update_evictable_leaf_sets(node)
+            self.tree_core._update_evictable_leaf_sets(node)
+
+    def free_host_values(self, host_values: list[torch.Tensor]) -> None:
+        if self._full_kv_pool_host is None:
+            return
+        for host_value in host_values:
+            self._full_kv_pool_host.free(host_value)
+
+    def apply_component_action(self, action: ComponentAction) -> None:
+        if isinstance(action, FreeComponentDeviceSlot):
+            alloc = self.cache.token_to_kv_pool_allocator
+            for indices in action.indices:
+                if self.cache.is_swa_enabled:
+                    alloc.full_attn_allocator.free(indices)
+                else:
+                    alloc.free(indices)
+            return
+        raise AssertionError(
+            f"FullComponent: unhandled ComponentAction {type(action).__name__}"
+        )

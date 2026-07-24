@@ -328,7 +328,8 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            last_node = tree_cache.resolve_node_handle(req.last_node)
+            last_node_to_reqs[last_node].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:

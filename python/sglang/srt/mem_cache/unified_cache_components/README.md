@@ -17,6 +17,15 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 │              UnifiedRadixCache                │
 │            (unified_radix_cache.py)           │
 │                                               │
+│  controller: executes all pool/host I/O and   │
+│  drains the tree's deferred Cache/Component   │
+│  Actions ("tree decides, cache executes")     │
+└──────────────────────┬────────────────────────┘
+                       ▼
+┌───────────────────────────────────────────────┐
+│               UnifiedTreeCore                 │
+│      (unified_cache/unified_tree_core.py)     │
+│                                               │
 │  root_node ──► UnifiedTreeNode (radix tree)   │
 │  components ► {ComponentType → TreeComponent} │
 │  lru_lists ─► {ComponentType → UnifiedLRUList}│
@@ -61,7 +70,10 @@ node.component_data[ComponentType.MAMBA]  # MambaComponent data
 
 | File | Contents |
 |------|----------|
-| `../unified_radix_cache.py` | `UnifiedRadixCache`, `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_radix_cache.py` | `UnifiedRadixCache` — the controller: pool/host I/O, deferred-action draining |
+| `../unified_cache/unified_tree_core.py` | `UnifiedTreeCore` — the tree, LRUs, and size counters; `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_cache/unified_tree_core_interface.py` | `UnifiedTreeCoreInterface`, `NodeId` — the tree/cache boundary contract |
+| `../unified_cache/cache_action.py` | Deferred `CacheAction`/`ComponentAction` types emitted by the tree |
 | `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
 | `full_component.py` | `FullComponent` — standard full-attention KV cache component |
 | `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
@@ -99,7 +111,7 @@ Find the longest cached prefix for a token sequence.
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter
    - Updates `last_access_time` with decreasing timestamps up the path (parent < child)
    - Concatenates matched device indices via `torch.cat` (concat length ≤ K, subsumed by O(K))
-   - Calls `finalize_match_result()` per component (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
+   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes the static `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
 
 ---
 
@@ -254,7 +266,8 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
 | `create_match_validator(match_device_only=False)` | Return a per-match stateful predicate that decides whether a node is a valid match boundary. Full: requires Full device data, or host backup when `match_device_only=False`. SWA: tracks accumulated window length across device/host data. Mamba: requires Mamba device data, or host backup when `match_device_only=False`. | `_match_prefix_helper` | *abstract* |
-| `finalize_match_result()` | Post-process the match result after prefix matching completes. Full/SWA: pass-through. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool, records `branching_seqlen`. | `_match_post_processor` | pass-through |
+| `finalize_match_result_in_tree_core()` | Tree-side post-processing inside the match walk. Full/SWA: host-hit sums. Mamba: records `branching_seqlen` + the host-hit bump. | `_match_post_processor` | pass-through |
+| `finalize_match_result_in_cache()` | Static, cache-level finalize after the walk (receives the cache + NodeId-based result), dispatched class-level by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
 
 ### Insert Phase
 
