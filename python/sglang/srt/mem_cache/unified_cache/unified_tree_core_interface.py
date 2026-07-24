@@ -154,6 +154,18 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
+    def drop_subtree_no_host(
+        self,
+        node_id: NodeId,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> bool:
+        """Drop an unbacked D-leaf's subtree when its write-back backup failed
+        under host pressure; declines (False) if any node is locked."""
+        ...
+
+    @abstractmethod
     def demote(
         self,
         node_id: NodeId,

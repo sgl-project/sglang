@@ -1035,26 +1035,95 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if is_write_back:
                 return self._build_backup_kv_action(node, write_back=True)
             # Write-through: node has no backup, delete entirely.
-            self._record_remove_event(node, medium=StorageMedium.GPU)
-            for comp in self.components:
-                self._evict_component_and_detach_lru(
-                    node,
-                    comp,
-                    target=EvictLayer.ALL,
-                    tracker=tracker,
-                    device_frees=device_frees,
-                    host_frees=host_frees,
-                )
-            self.evictable_device_leaves.discard(node)
-            parent = node.parent
-            self._remove_leaf_from_parent(node)
-            self._update_evictable_leaf_sets(parent)
-            self._iteratively_delete_tombstone_leaf(
+            self._delete_unbacked_device_leaf(
                 node, tracker, device_frees=device_frees, host_frees=host_frees
             )
             return None
         self._demote(node, tracker, device_frees=device_frees, host_frees=host_frees)
         return None
+
+    def drop_subtree_no_host(
+        self,
+        node_id: NodeId,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> bool:
+        """Write-back fallback when a D-leaf's D->H backup fails under host
+        memory pressure: drop the subtree rooted at the unbacked leaf so
+        device eviction keeps making progress instead of leaving its KV
+        unevictable until host space frees up."""
+        node = self.node_by_id(node_id)
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        # A failed backup never issues the D->H copy, so the subtree root has
+        # no host state and no in-flight DMA reading its device slots.
+        assert not node.backuped and node.write_through_pending_id is None
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        descendants: list[UnifiedTreeNode] = []
+        stack = list(node.children.values())
+        while stack:
+            cur = stack.pop()
+            if any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            ):
+                return False
+            descendants.append(cur)
+            stack.extend(cur.children.values())
+        for desc in reversed(descendants):
+            # Host-only by construction: a device descendant would contradict
+            # this node being a D-leaf, and D-leaves evict before ancestors.
+            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
+            assert desc.write_through_pending_id is None
+            self._release_all_component_layers(
+                desc, StorageMedium.CPU, tracker, device_frees, host_frees
+            )
+            self._remove_leaf_from_parent(desc)
+        self._delete_unbacked_device_leaf(
+            node, tracker, device_frees=device_frees, host_frees=host_frees
+        )
+        return True
+
+    def _release_all_component_layers(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Free every component layer on the node and detach it from the LRU
+        lists and evictable leaf sets."""
+        self._record_remove_event(node, medium=medium)
+        for comp in self.components:
+            self._evict_component_and_detach_lru(
+                node,
+                comp,
+                target=EvictLayer.ALL,
+                tracker=tracker,
+                device_frees=device_frees,
+                host_frees=host_frees,
+            )
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+
+    def _delete_unbacked_device_leaf(
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Delete a device leaf that has no host backup, freeing all layers."""
+        self._release_all_component_layers(
+            node, StorageMedium.GPU, tracker, device_frees, host_frees
+        )
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(
+            node, tracker, device_frees=device_frees, host_frees=host_frees
+        )
 
     def drive_host_eviction(
         self,

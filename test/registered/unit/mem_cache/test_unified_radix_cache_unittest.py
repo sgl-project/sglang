@@ -413,6 +413,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
                 self.mem_pool_host = FakeHostPool()
                 self.prefetch_tokens_occupied = 0
                 self.prefetch_args = None
+                self.write_policy = "write_through"
 
             def prefetch_rate_limited(self):
                 return False
@@ -2672,6 +2673,92 @@ class UnifiedRadixCacheSuite:
         )
         # Whole window dropped -> its host buffer is fully released back.
         self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
+
+    def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
+        """Write-back eviction will keep freeing device KV when the host pool
+        is exhausted and host eviction cannot free space to prevent OOM."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        # Two-node chain: the drop must cascade parent-ward across eviction
+        # iterations, not just delete a single leaf.
+        seq_parent = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_parent)
+        seq = seq_parent + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+
+        # Exhaust the KV host pool. The tree has no host leaves, so
+        # evict_host cannot free anything and every D->H backup fails.
+        host_pool = cache.cache_controller.mem_pool_host
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+        self.assertEqual(host_pool.available_size(), 0)
+
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+
+        # The chain is gone entirely: no device hit, no host hit.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertEqual(m.host_hit_length, 0)
+        cache.sanity_check()
+
+    def test_hicache_write_back_drop_respects_pins_then_frees_subtree(self):
+        """The host-pressure drop fallback must decline while any node in the
+        unbacked subtree is host-pinned, then reclaim the whole subtree --
+        including a demoted child's host backup -- once unpinned."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        host_pool = cache.cache_controller.mem_pool_host
+        baseline_host = host_pool.available_size()
+
+        parent_seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, parent_seq)
+        child_seq = parent_seq + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, child_seq)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        child = cache.resolve_node_handle(m.last_device_node)
+
+        # Evict only the child leaf -> real backup + demote, leaving it
+        # host-only under a still-unbacked device parent (write-back backs up
+        # single nodes leaf-first, so this is a normal intermediate state).
+        result = cache.evict(EvictParams(num_tokens=len(child.key)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(child.key))
+        self.assertTrue(child.evicted and child.backuped)
+        parent = child.parent
+        self.assertFalse(parent.backuped)
+        self.assertGreater(baseline_host - host_pool.available_size(), 0)
+
+        # From here every backup fails (controller.write returns None), so
+        # each evict() attempts the drop fallback on the parent.
+        with mock.patch.object(cache.cache_controller, "write", return_value=None):
+            # Pinned subtree root: drop declines, chain stays intact.
+            cache.inc_host_lock_ref(parent.id)
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+            self.assertEqual(result.num_tokens_evicted, 0)
+            cache.dec_host_lock_ref(parent.id)
+
+            # Pinned host-only descendant: drop declines as well.
+            cache.inc_host_lock_ref(child.id)
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+            self.assertEqual(result.num_tokens_evicted, 0)
+            m = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
+            )
+            self.assertEqual(len(m.device_indices), len(parent_seq))
+            cache.dec_host_lock_ref(child.id)
+
+            # Unpinned: the subtree drops and the child's host slots return.
+            result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(parent_seq))
+        self.assertEqual(host_pool.available_size(), baseline_host)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", child_seq))))
+        self.assertEqual(len(m.device_indices), 0)
+        self.assertEqual(m.host_hit_length, 0)
+        cache.sanity_check()
 
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:

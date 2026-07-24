@@ -470,6 +470,22 @@ class UnifiedRadixCache(BasePrefixCache):
                                 device_frees=device_frees,
                                 host_frees=host_frees,
                             )
+                        elif self.tree_core.drop_subtree_no_host(
+                            node_id, tracker, device_frees, host_frees
+                        ):
+                            logger.warning(
+                                "write_back: KV subtree dropped without backup "
+                                "due to host memory pressure, root node %d",
+                                node_id,
+                            )
+                        else:
+                            logger.warning(
+                                "write_back: backup failed under host memory "
+                                "pressure but subtree drop declined (node "
+                                "locked); root node %d stays device-resident "
+                                "until host space frees",
+                                node_id,
+                            )
             finally:
                 self.tree_core.evict_device_end(ct)
 
