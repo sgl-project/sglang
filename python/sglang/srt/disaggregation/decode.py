@@ -1083,6 +1083,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][total_prefix_len:origin_input_len]
+                # req_to_token holds VIRTUAL ids under the unified memory pool
+                # (MultiEndedAllocator), which relocates physical pages -> virtual
+                # != physical after churn. Resolve to current PHYSICAL so prefill's
+                # RDMA write lands in the right decode slots (mirrors prefill
+                # send_kv_chunk). getattr-guarded: no-op without translate_kv_loc.
+                translate_kv_loc = getattr(
+                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                )
+                if translate_kv_loc is not None:
+                    kv_indices = translate_kv_loc(kv_indices.long())
 
             seq_len = origin_input_len
 
