@@ -5,6 +5,40 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
 import torch
+def _expand_fp4_scale_for_deepgemm_runtime(
+    scale: torch.Tensor,
+    logical_k: int,
+    gran_k_b: int = 32,
+    ) -> torch.Tensor:
+        """Expand FP4 expert scale on K dimension for DeepGEMM runtime ABI.
+
+        Checkpoint may store FP4 scales with group_size=128, while current DeepGEMM
+        sm90 fp8×fp4 kernel expects scale groups indexed with gran_k_b=32.
+        In that case, repeat each stored scale along the last dim so that:
+            scale.shape[-1] == ceil_div(logical_k, gran_k_b)
+
+        This does not change checkpoint semantics: one g128 scale is reused for the
+        four contiguous g32 sub-groups it covers.
+        """
+        if scale is None:
+            return scale
+
+        expected_k_groups = (logical_k + gran_k_b - 1) // gran_k_b
+        current_k_groups = scale.shape[2]
+
+        if current_k_groups == expected_k_groups:
+            return scale
+
+        if expected_k_groups % current_k_groups != 0:
+            raise ValueError(
+                f"Cannot expand FP4 scale for DeepGEMM runtime: "
+                f"current shape={tuple(scale.shape)}, "
+                f"logical_k={logical_k}, gran_k_b={gran_k_b}, "
+                f"expected_k_groups={expected_k_groups}"
+            )
+
+        repeat = expected_k_groups // current_k_groups
+        return scale.repeat_interleave(repeat, dim=2).contiguous()
 
 from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.environ import envs
@@ -183,7 +217,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_contig_post_quant
+        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -438,6 +472,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w13_scale_for_gemm = quant_info.w13_scale_e8m0
             else:
                 w13_scale_for_gemm = w13_scale
+
+            w13_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
+                w13_scale_for_gemm,
+                logical_k=k,
+                gran_k_b=32,
+            )
+
+            # print(
+            #     "[g128-debug] gemm0-input",
+            #     "lhs_act=", tuple(hidden_states.shape),
+            #     "lhs_scale=", tuple(hidden_states_scale.shape) if hidden_states_scale is not None else None,
+            #     "rhs_weight=", tuple(w13_weight.shape),
+            #     "rhs_scale=", tuple(w13_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (k + 32 - 1) // 32,
+            #     flush=True,
+            # )
+
             deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (hidden_states, hidden_states_scale),
                 (w13_weight, w13_scale_for_gemm),
@@ -543,6 +594,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w2_scale_for_gemm = quant_info.w2_scale_e8m0
             else:
                 w2_scale_for_gemm = w2_scale
+            
+            w2_scale_for_gemm = _expand_fp4_scale_for_deepgemm_runtime(
+                w2_scale_for_gemm,
+                logical_k=down_k,
+                gran_k_b=32,
+            )
+
+            # print(
+            #     "[g128-debug] gemm1-input",
+            #     "lhs_act=", tuple(down_input.shape),
+            #     "lhs_scale=", tuple(down_input_scale.shape) if down_input_scale is not None else None,
+            #     "rhs_weight=", tuple(w2_weight.shape),
+            #     "rhs_scale=", tuple(w2_scale_for_gemm.shape),
+            #     "expected_rhs_scale_kgroups=", (down_k + 32 - 1) // 32,
+            #     flush=True,
+            # )
+            
             deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked(
                 (down_input, down_input_scale),
                 (w2_weight, w2_scale_for_gemm),
