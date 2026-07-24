@@ -25,7 +25,7 @@ buffers to keep break-point tensors at stable addresses.
 import logging
 import threading
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -216,7 +216,7 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool):
+def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -244,13 +244,12 @@ def eager_on_graph(enable: bool):
 
             # Run the eager function once so it allocates its outputs and
             # writes real data into them. A break may declare a capture stub
-            # (fn._capture_stub): the capture pass only needs the output
+            # (the capture_stub argument): the capture pass only needs the output
             # buffer's address recorded — its contents are never consumed
             # (real values flow at warmup and at every replay via replay_fn,
             # which always calls the real inner). Stubbing lets breaks whose
             # bodies are expensive or rank-coupled (e.g. DeepEP NORMAL a2a)
             # skip that work during capture entirely.
-            capture_stub = getattr(inner, "_capture_stub", None)
             if capture_stub is not None:
                 output = capture_stub(*args, **kwargs)
             else:

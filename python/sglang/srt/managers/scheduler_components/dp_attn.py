@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -370,6 +371,26 @@ def prepare_mlp_sync_batch_raw(
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
 
     return local_batch
+
+
+def make_local_breakable_eligible_fn(
+    tp_worker,
+) -> Callable[[ScheduleBatch], bool]:
+    """Bind the rank-local breakable-replay eligibility check to the
+    worker's target-model prefill graph runner, for the mlp-sync
+    consensus (see PrefillCudaGraphRunner.schedule_batch_replay_eligible).
+    """
+    if isinstance(tp_worker, BaseSpecWorker):
+        tp_worker = tp_worker.target_worker
+
+    def local_breakable_eligible(batch: ScheduleBatch) -> bool:
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            return True
+        return tp_worker.model_runner.prefill_cuda_graph_runner.schedule_batch_replay_eligible(
+            batch
+        )
+
+    return local_breakable_eligible
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)

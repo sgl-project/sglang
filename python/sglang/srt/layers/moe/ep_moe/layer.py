@@ -111,8 +111,9 @@ def _a2a_moe_forward_capture_stub(
     output.zero_()
 
 
-_a2a_moe_forward_eager._capture_stub = _a2a_moe_forward_capture_stub
-bcg_a2a_moe_forward = eager_on_graph(True)(_a2a_moe_forward_eager)
+bcg_a2a_moe_forward = eager_on_graph(True, capture_stub=_a2a_moe_forward_capture_stub)(
+    _a2a_moe_forward_eager
+)
 
 
 class DeepEPMoE(FusedMoE):
