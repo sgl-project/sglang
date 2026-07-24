@@ -12,24 +12,39 @@ inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input)
 
   // step 1: get max
   fVec max_fvec = fVec(-std::numeric_limits<float>::infinity());
-  if constexpr (SIZE < kVecSize) {
-    // SIZE = 1, 2, 4, 8, 16; only the top half is used
-    bVec x_bvec = bVec::loadu(input, SIZE);
-    fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-    x_fvec0 = fVec::set(max_fvec, x_fvec0, SIZE);
-    max_fvec = at::vec::maximum(max_fvec, x_fvec0);
-    x_fvec0.store(out, SIZE);
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    if constexpr (SIZE < kVecSize) {
+      fVec x_fvec = fVec::loadu(input, SIZE);
+      x_fvec = fVec::set(max_fvec, x_fvec, SIZE);
+      max_fvec = at::vec::maximum(max_fvec, x_fvec);
+      x_fvec.store(out, SIZE);
+    } else {
+      for (int d = 0; d < SIZE; d += kVecSize) {
+        fVec x_fvec = fVec::loadu(input + d);
+        max_fvec = at::vec::maximum(max_fvec, x_fvec);
+        x_fvec.store(out + d);
+      }
+    }
   } else {
-    for (int d = 0; d < SIZE; d += kVecSize) {
-      bVec x_bvec = bVec::loadu(input + d);
+    if constexpr (SIZE < kVecSize) {
+      // SIZE = 1, 2, 4, 8, 16; only the top half is used
+      bVec x_bvec = bVec::loadu(input, SIZE);
       fVec x_fvec0, x_fvec1;
       std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
+      x_fvec0 = fVec::set(max_fvec, x_fvec0, SIZE);
       max_fvec = at::vec::maximum(max_fvec, x_fvec0);
-      max_fvec = at::vec::maximum(max_fvec, x_fvec1);
-      x_fvec0.store(out + d);
-      x_fvec1.store(out + d + fVec::size());
+      x_fvec0.store(out, SIZE);
+    } else {
+      for (int d = 0; d < SIZE; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        max_fvec = at::vec::maximum(max_fvec, x_fvec0);
+        max_fvec = at::vec::maximum(max_fvec, x_fvec1);
+        x_fvec0.store(out + d);
+        x_fvec1.store(out + d + fVec::size());
+      }
     }
   }
   float max_val = vec_reduce_max(max_fvec);
@@ -532,8 +547,7 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
     const std::optional<at::Tensor>& correction_bias) {
   CHECK_INPUT(gating_output);
 
-  const auto st = hidden_states.scalar_type();
-  CHECK_EQ(gating_output.scalar_type(), st);
+  const auto st = gating_output.scalar_type();
 
   int64_t num_tokens = hidden_states.size(0);
   int64_t num_experts = gating_output.size(1);
@@ -549,7 +563,7 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "topk_softmax_cpu", [&] {
+  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "topk_softmax_cpu", [&] {
     switch (num_experts) {
       case 1:
         LAUNCH_TOPK_SOFTMAX_KERNEL(1);

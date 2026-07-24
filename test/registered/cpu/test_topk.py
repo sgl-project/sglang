@@ -208,6 +208,33 @@ class TestTopK(CustomTestCase):
             self._run_single_test(123, 256, 4, renormalize, torch.bfloat16)
             self._run_single_test(123, 160, 6, renormalize, torch.bfloat16)
 
+    def test_topk_softmax_mixed_input_dtypes(self):
+        torch.manual_seed(0)
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.float32)
+        correction_bias = torch.randn(128, dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=8,
+            renormalize=True,
+            correction_bias=correction_bias,
+        )
+
+        scores = torch.softmax(gating_output, dim=-1)
+        expected_ids = torch.topk(
+            scores + correction_bias.unsqueeze(0), k=8, dim=-1
+        ).indices
+        expected_weights = scores.gather(1, topk_ids.to(torch.int64))
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+
+        self.assertEqual(
+            torch.sort(topk_ids.to(torch.int64), dim=-1).values.tolist(),
+            torch.sort(expected_ids, dim=-1).values.tolist(),
+        )
+        torch.testing.assert_close(topk_weights, expected_weights)
+
     def test_topk_softmax_with_correction_bias(self):
         """Bias must affect expert selection without becoming a routing weight."""
         for num_tokens, num_experts, topk, with_bias, renormalize in itertools.product(
