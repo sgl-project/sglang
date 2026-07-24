@@ -138,7 +138,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",

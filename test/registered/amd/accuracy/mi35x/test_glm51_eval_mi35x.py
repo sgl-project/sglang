@@ -110,7 +110,7 @@ def get_answer_value(answer_str):
 
 def run_gsm8k_benchmark(
     base_url: str,
-    num_questions: int = 200,
+    num_questions: int = 1319,
     num_shots: int = 5,
     parallel: int = 64,
 ) -> Tuple[float, float, float]:
