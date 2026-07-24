@@ -1109,6 +1109,46 @@ class CommonKVSender(BaseKVSender):
 
         return kv_indices, index_slice, is_last_chunk, False
 
+    def _prepare_layer_send_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+    ) -> Tuple[npt.NDArray[np.int32], slice, bool]:
+        """Common pre-processing for per-layer sends.
+
+        Layer-pipelined transfer sends the same page slice once per layer, so it
+        must not advance curr_idx for every layer. It still needs the same CP
+        rank filtering as send(). Final status is sent separately after metadata
+        is written.
+        """
+        num_indices = len(kv_indices)
+        index_slice = slice(self.curr_idx, self.curr_idx + num_indices)
+
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            cache_key = (self.curr_idx, num_indices)
+            cached_key = getattr(self, "_layer_send_cache_key", None)
+            if cached_key == cache_key:
+                kv_indices, index_slice = self._layer_send_cache
+            else:
+                kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                    self.kv_mgr,
+                    kv_indices,
+                    index_slice,
+                )
+                self._layer_send_cache_key = cache_key
+                self._layer_send_cache = (kv_indices, index_slice)
+        elif self.kv_mgr.is_dummy_cp_rank:
+            return kv_indices, index_slice, True
+
+        return kv_indices, index_slice, len(kv_indices) == 0
+
+    def _prepare_final_metadata_send(self) -> Tuple[slice, bool]:
+        index_slice = slice(self.curr_idx, self.curr_idx)
+        self.curr_idx = self.num_kv_indices
+        if self.kv_mgr.is_dummy_cp_rank:
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+            return index_slice, True
+        return index_slice, False
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],

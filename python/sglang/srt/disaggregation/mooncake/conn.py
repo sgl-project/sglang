@@ -712,6 +712,193 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
         )
 
+    def send_kvcache_layer(
+        self,
+        mooncake_session_id: str,
+        layer_id: int,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_len: Optional[int] = None,
+    ) -> int:
+        """Send KV cache for a single transformer layer via RDMA.
+
+        For MHA models, kv_data_ptrs layout is [K0..K_{N-1}, V0..V_{N-1}].
+        For MLA models, kv_data_ptrs layout is [KV0..KV_{N-1}].
+
+        When dst_attn_tp_size is provided and differs from prefill TP,
+        head slicing is applied for MHA models (MLA is TP-invariant).
+
+        Note: PP (pipeline parallelism) is not supported — layer_id indexes
+        kv_data_ptrs directly assuming all layers are on the current rank.
+        The caller (_get_pipeline_group_size) guards against pp_size > 1.
+        """
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        if self.is_mla_backend:
+            src_kv_ptrs, dst_kv_ptrs_pp, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+            # MLA: single combined KV per layer (TP-invariant, no head slicing)
+            src_ptr = src_kv_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs_pp[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            transfer_blocks = []
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            )
+            need_head_slice = (
+                dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size
+            )
+
+            if not need_head_slice:
+                # Same-TP fast path: transfer full K and V pages
+                k_item_len = self.kv_args.kv_item_lens[layer_id]
+                v_item_len = self.kv_args.kv_item_lens[
+                    layers_current_pp_stage + layer_id
+                ]
+                transfer_blocks = []
+                for src_ptr, dst_ptr, item_len in [
+                    (src_k_ptrs[layer_id], dst_k_ptrs[layer_id], k_item_len),
+                    (src_v_ptrs[layer_id], dst_v_ptrs[layer_id], v_item_len),
+                ]:
+                    for prefill_index, decode_index in zip(
+                        prefill_kv_blocks, dst_kv_blocks
+                    ):
+                        src_addr = src_ptr + int(prefill_index[0]) * item_len
+                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                        length = item_len * len(prefill_index)
+                        transfer_blocks.append((src_addr, dst_addr, length))
+                return self._transfer_data(mooncake_session_id, transfer_blocks)
+            else:
+                # Different-TP path: per-token head slicing for a single layer
+                return self._send_kvcache_layer_head_slice(
+                    mooncake_session_id,
+                    layer_id,
+                    prefill_kv_indices,
+                    dst_kv_indices,
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                    dst_tp_rank,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                )
+
+    def _send_kvcache_layer_head_slice(
+        self,
+        mooncake_session_id: str,
+        layer_id: int,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        src_k_ptrs: list[int],
+        src_v_ptrs: list[int],
+        dst_k_ptrs: list[int],
+        dst_v_ptrs: list[int],
+        layers_current_pp_stage: int,
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+    ) -> int:
+        """Per-layer head-sliced KV transfer for MHA with different TP sizes.
+
+        Mirrors the head-offset math from send_kvcache_slice but applies it
+        to a single layer, using vectorized numpy addressing.
+        """
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        page_size = self.kv_args.page_size
+
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
+        bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
+        src_replication = max(1, self.attn_tp_size // total_kv_heads)
+
+        if self.attn_tp_size > dst_attn_tp_size:
+            src_head_start_offset = 0
+            num_heads_to_send = src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            src_head_start_offset = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start_offset = 0
+
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice
+        heads_bytes_per_token = num_heads_to_send * bytes_per_head_slice
+
+        bytes_per_token_src = src_kv_item_len // page_size
+        bytes_per_token_dst = dst_kv_item_len // page_size
+
+        # Sanity check: slice must fit in destination token slot
+        if heads_bytes_per_token > bytes_per_token_dst:
+            logger.error(
+                f"[{mooncake_session_id}] layer {layer_id}: slice size "
+                f"({heads_bytes_per_token}) exceeds target token slot size "
+                f"({bytes_per_token_dst})"
+            )
+            return -1
+
+        # Vectorized address computation (same pattern as send_kvcache_slice)
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        src_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_src + src_head_slice_offset
+        )
+        dst_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_dst + dst_head_slice_offset
+        )
+
+        for src_layer_ptr, dst_layer_ptr in [
+            (src_k_ptrs[layer_id], dst_k_ptrs[layer_id]),
+            (src_v_ptrs[layer_id], dst_v_ptrs[layer_id]),
+        ]:
+            src_addrs = (
+                src_layer_ptr
+                + prefill_page_indices * src_kv_item_len
+                + src_token_slot_offsets
+            ).reshape(-1)
+            dst_addrs = (
+                dst_layer_ptr
+                + decode_page_indices * dst_kv_item_len
+                + dst_token_slot_offsets
+            ).reshape(-1)
+            src_list = src_addrs.tolist()
+            if not src_list:
+                continue
+            dst_list = dst_addrs.tolist()
+            length_list = [heads_bytes_per_token] * len(src_list)
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_list, dst_list, length_list
+            )
+            if ret != 0:
+                return ret
+        return 0
+
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
@@ -1278,6 +1465,9 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # Early-abort: skip if room already failed (prior layer/chunk failed)
+                if self.request_status.get(kv_chunk.room) == KVPoll.Failed:
+                    continue
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1364,6 +1554,36 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
+                        elif kv_chunk.layer_id is not None:
+                            # Layer-pipelined mode: sync CUDA event, send single layer.
+                            # All layers in the same group share one event; repeated
+                            # synchronize() on an already-completed event is a no-op.
+                            if kv_chunk.cuda_event is not None:
+                                kv_chunk.cuda_event.synchronize()
+                            # Detect TP mismatch for MHA head slicing
+                            if (
+                                not self.is_mla_backend
+                                and self.attn_tp_size
+                                != target_rank_registration_info.dst_attn_tp_size
+                            ):
+                                ret = self.send_kvcache_layer(
+                                    req.mooncake_session_id,
+                                    kv_chunk.layer_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                    dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                )
+                            else:
+                                ret = self.send_kvcache_layer(
+                                    req.mooncake_session_id,
+                                    kv_chunk.layer_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
@@ -1432,8 +1652,9 @@ class MooncakeKVManager(CommonKVManager):
                             break
 
                         if kv_chunk.is_last_chunk:
+                            extra_ret = 0
                             if kv_chunk.state_indices and not skip_state:
-                                self.maybe_send_extra(
+                                extra_ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
@@ -1446,7 +1667,7 @@ class MooncakeKVManager(CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            polls.append(True if ret == 0 else False)
+                            polls.append(extra_ret == 0 and ret == 0)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
@@ -1679,6 +1900,8 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        layer_id: Optional[int] = None,
+        cuda_event: object = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1717,6 +1940,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                layer_id=layer_id,
+                cuda_event=cuda_event,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1823,6 +2048,53 @@ class MooncakeKVSender(CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
+
+    def send_layer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        layer_id: int,
+        cuda_event: object,
+        is_last: bool = False,
+        state_indices: Optional[List[int]] = None,
+    ):
+        """Enqueue a single layer's KV transfer for layer-pipelined mode."""
+        kv_indices, index_slice, should_skip = self._prepare_layer_send_indices(
+            kv_indices,
+        )
+        if should_skip:
+            return
+
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last_chunk=False,
+            layer_id=layer_id,
+            cuda_event=cuda_event,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+        )
+        if is_last:
+            self._record_transfer_indices(kv_indices, None)
+
+    def send_final_metadata(
+        self,
+        state_indices: Optional[List[int]] = None,
+    ):
+        index_slice, should_skip = self._prepare_final_metadata_send()
+        if should_skip:
+            return
+
+        empty_kv_indices = np.array([], dtype=np.int32)
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            empty_kv_indices,
+            index_slice,
+            is_last_chunk=True,
+            aux_index=self.aux_index,
+            state_indices=state_indices,
+            trace_ctx=self.trace_ctx.copy_for_thread(),
+        )
+        self._record_transfer_indices(empty_kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

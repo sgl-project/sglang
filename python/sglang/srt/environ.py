@@ -382,6 +382,26 @@ class Envs:
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
+    # Layer-pipelined KV transfer: overlap RDMA transfer with GPU compute
+    # by splitting prefill into layer groups and transferring each group
+    # incrementally. Only effective in PD disaggregation prefill mode.
+    SGLANG_ENABLE_PIPELINED_KV_TRANSFER = EnvBool(False)
+    # Optional fixed group_size override. When not set, the adaptive formula
+    # below computes group_size automatically based on prompt length.
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(0)
+    SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
+    # Adaptive iteration bounds for the pipeline formula:
+    # target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX) where
+    # t = (avg_tokens - MIN_TOKENS) / (SAT_TOKENS - MIN_TOKENS),
+    # SAT_TOKENS = MIN_TOKENS * SAT_MULTIPLIER (saturation point).
+    # SAT_MULTIPLIER: controls how quickly target_iters decreases as prompt
+    # length grows. Higher = stay at more iterations longer. Tune down for
+    # fast networks (800G IB), up for slower networks (200G-400G IB).
+    # MAX_ITERS: more groups for short prompts (reduces exposed T/N or C/N).
+    # MIN_ITERS: fewer groups for long prompts (compute already hides transfer).
+    SGLANG_PIPELINE_SAT_MULTIPLIER = EnvFloat(3.0)
+    SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
+    SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

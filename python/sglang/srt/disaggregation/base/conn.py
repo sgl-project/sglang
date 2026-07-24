@@ -137,6 +137,33 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def send_layer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        layer_id: int,
+        cuda_event: object,
+        is_last: bool = False,
+        state_indices: Optional[List[int]] = None,
+    ):
+        """Send a single layer's KV cache for layer-pipelined transfer.
+
+        Backends that support layer-pipelined KV transfer should override
+        this method. The default raises NotImplementedError so that
+        unsupported backends fail loudly if pipelining is misconfigured.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
+
+    def send_final_metadata(
+        self,
+        state_indices: Optional[List[int]] = None,
+    ):
+        """Send final metadata after layer-pipelined KV transfer."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support layer-pipelined KV transfer"
+        )
+
     def pop_decode_prefix_len(self) -> int:
         return 0
 
