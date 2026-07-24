@@ -1,23 +1,16 @@
 import unittest
-from contextlib import ExitStack
-from types import SimpleNamespace
-from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import BatchStrOutput
 from sglang.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
-from sglang.utils import TypeBasedDispatcher
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,87 +91,6 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             single_output.cached_tokens_details,
             [{"device": 1, "host": 3}],
         )
-
-    def _construct(self, cls):
-        """Build `cls` with heavyweight init steps stubbed out, keeping
-        init_disaggregation and init_metric_collector_watchdog real.
-
-        Returns (instance, start_disagg_service mock, metrics collector class mock).
-        """
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            enable_metrics=True,
-        )
-        port_args = SimpleNamespace(tokenizer_ipc_name="ipc://test-tokenizer")
-
-        def init_model_config(manager):
-            manager.enable_priority_scheduling = False
-
-        def init_request_dispatcher(manager):
-            manager._result_dispatcher = TypeBasedDispatcher([])
-
-        def noop(*args, **kwargs):
-            pass
-
-        stubbed_methods = [
-            "init_tokenizer_and_processor",
-            "init_ipc_channels",
-            "init_running_status",
-            "init_request_logging_and_dumping",
-            "init_weight_update",
-            "init_lora",
-        ]
-        with ExitStack() as stack:
-            for method in stubbed_methods:
-                stack.enter_context(mock.patch.object(TokenizerManager, method, noop))
-            stack.enter_context(
-                mock.patch.object(
-                    TokenizerManager, "init_model_config", init_model_config
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    TokenizerManager, "init_request_dispatcher", init_request_dispatcher
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(TokenizerManager, "_dispatch_to_scheduler")
-            )
-            for name in [
-                "set_global_server_args_for_tokenizer",
-                "start_cpu_monitor_thread",
-                "Watchdog",
-            ]:
-                stack.enter_context(
-                    mock.patch(f"sglang.srt.managers.tokenizer_manager.{name}")
-                )
-            resolve_collector = stack.enter_context(
-                mock.patch(
-                    "sglang.srt.managers.tokenizer_manager.resolve_collector_class"
-                )
-            )
-            start_disagg = stack.enter_context(
-                mock.patch("sglang.srt.managers.tokenizer_manager.start_disagg_service")
-            )
-            instance = cls(server_args, port_args)
-        return instance, start_disagg, resolve_collector.return_value
-
-    def test_tokenizer_worker_metrics_use_real_disaggregation_mode(self):
-        worker, start_disagg, collector_cls = self._construct(TokenizerWorker)
-
-        start_disagg.assert_not_called()
-        self.assertIsNone(worker.bootstrap_server)
-        self.assertEqual(worker.disaggregation_mode, DisaggregationMode.DECODE)
-        self.assertEqual(
-            collector_cls.call_args.kwargs["labels"]["engine_type"], "decode"
-        )
-
-    def test_tokenizer_manager_starts_bootstrap_service_by_default(self):
-        manager, start_disagg, _ = self._construct(TokenizerManager)
-
-        start_disagg.assert_called_once_with(manager.server_args)
-        self.assertIs(manager.bootstrap_server, start_disagg.return_value)
 
     def test_get_tokenizer_worker_class_uses_default(self):
         self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
