@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
     StagingRegisterInfo,
@@ -41,7 +42,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    compute_mamba_state_slice_blocks,
+    compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -299,6 +300,7 @@ class MooncakeKVManager(CommonKVManager):
             lambda ptr, size: self.engine.batch_register([ptr], [size]),
             self.kv_args,
             count,
+            self.server_args.chunked_prefill_size,
         )
         self.kv_buffer_tensors = None
 
@@ -367,24 +369,21 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
-        try:
-            na = NetworkAddress(req.endpoint, req.dst_port)
-            self._connect(
-                na.to_tcp(),
-                is_ipv6=na.is_ipv6,
-            ).send_multipart(
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                ]
-            )
-        except Exception:
-            pass
+        na = NetworkAddress(req.endpoint, req.dst_port)
+        self._connect(
+            na.to_tcp(),
+            is_ipv6=na.is_ipv6,
+        ).send_multipart(
+            [
+                b"CHUNK_READY",
+                str(req.room).encode("ascii"),
+                str(chunk_idx).encode("ascii"),
+                str(kv_chunk.index_slice.start).encode("ascii"),
+                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                req.mooncake_session_id.encode("ascii"),
+                str(prefill_unique_rank).encode("ascii"),
+            ]
+        )
 
     def _do_staging_transfer(
         self,
@@ -399,10 +398,11 @@ class MooncakeKVManager(CommonKVManager):
     ):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
-        Handles readiness check, transfer, fallback, and CHUNK_READY notification.
-        deferred=True means caller should re-enqueue and break.
+        Handles readiness check, transfer, and CHUNK_READY notification; a chunk
+        that cannot fit returns -1 (the caller fails only this room) instead of
+        falling back to the slice path, which would leak the decode-side
+        allocation. deferred=True means caller should re-enqueue and break.
         """
-        _tp = self.attn_tp_rank
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
@@ -412,11 +412,19 @@ class MooncakeKVManager(CommonKVManager):
             from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
             if c_offset == StagingAllocator.ALLOC_OVERSIZED:
-                raise RuntimeError(
-                    f"[Staging] Chunk staging allocation permanently failed: "
-                    f"chunk exceeds ring buffer total size (room={kv_chunk.room}). "
-                    f"Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                # Fail this room, not the worker thread: the same prefill still
+                # serves other (same-TP, non-staging) decode instances.
+                logger.warning_once(
+                    "[Staging] a chunk exceeds the staging ring; failing affected "
+                    "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
+                    "reduce chunked_prefill_size."
                 )
+                return (-1, False)
+            # Not ready yet: wait (bounded) for a watermark advance, then
+            # re-enqueue to retry. A plain block-until-ready would head-of-line
+            # block other rooms on this single worker thread.
+            with self._staging_ctx.watermark_cv:
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             queue.put(kv_chunk)
             return (-1, True)
 
@@ -428,21 +436,15 @@ class MooncakeKVManager(CommonKVManager):
             target_info,
         )
         if ret == -1:
-            logger.warning(
-                f"[Staging][tp{_tp}] Falling back to per-token slice path "
-                f"(room={kv_chunk.room})"
+            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
+            # not fall back to the slice path (leaks the decode-side allocation).
+            logger.warning_once(
+                "[Staging] a chunk does not fit the staging ring; failing affected "
+                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
+                "reduce chunked_prefill_size."
             )
-            ret = self.send_kvcache_slice(
-                req.mooncake_session_id,
-                kv_chunk.prefill_kv_indices,
-                target_info.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                target_info.dst_tp_rank,
-                target_info.dst_attn_tp_size,
-                target_info.dst_kv_item_len,
-                executor,
-            )
-        elif ret == 0 and not kv_chunk.is_last_chunk:
+            return (-1, False)
+        if ret == 0 and not kv_chunk.is_last_chunk:
             self._send_chunk_ready(req, chunk_idx, kv_chunk, prefill_unique_rank)
         return (ret, False)
 
@@ -946,7 +948,8 @@ class MooncakeKVManager(CommonKVManager):
             )
             if sub_rank != 0:
                 skip_kv = True
-                skip_state = True
+                # Hybrid-MLA KV is replicated across these source ranks, but
+                # TP-sharded state needs every rank for the aggregation path.
 
         if (
             self.attn_cp_size > 1
@@ -982,6 +985,12 @@ class MooncakeKVManager(CommonKVManager):
             src_conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
             src_conv_shard_groups = (
                 src_conv_shard_groups[i] if i < len(src_conv_shard_groups) else []
+            )
+            src_slice_outer_counts = getattr(
+                self.kv_args, "state_slice_outer_counts", []
+            )
+            src_slice_outer_counts = (
+                src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
             )
             if target_rank_registration_info is not None:
                 dst_data_ptrs = (
@@ -1025,6 +1034,7 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
                             src_conv_shard_groups,
+                            src_slice_outer_counts,
                         )
                         or rc
                     )
@@ -1164,6 +1174,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         src_state_conv_shard_groups: list = None,
+        src_state_slice_outer_counts: list[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1205,45 +1216,41 @@ class MooncakeKVManager(CommonKVManager):
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[i]
 
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
-            src_bytes_per_dim = src_item_len // src_dim
-            dst_bytes_per_dim = dst_item_len // dst_dim
-
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
                 if src_state_conv_shard_groups and i < len(src_state_conv_shard_groups)
                 else None
             )
-            # One block for single-axis states; three (q/k/v) for GDN conv_state
-            # on the scatter path.
+            outer_count = (
+                src_state_slice_outer_counts[i]
+                if src_state_slice_outer_counts
+                and i < len(src_state_slice_outer_counts)
+                else 1
+            )
             for (
-                src_dim_start,
-                dst_dim_start,
-                num_dims_to_send,
-            ) in compute_mamba_state_slice_blocks(
+                src_offset,
+                dst_offset,
+                bytes_to_send,
+            ) in compute_mamba_state_slice_byte_blocks(
+                src_item_len=src_item_len,
+                dst_item_len=dst_item_len,
                 src_dim=src_dim,
                 dst_dim=dst_dim,
+                outer_count=outer_count,
                 src_attn_tp_size=self.attn_tp_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
             ):
-                src_dim_offset = src_dim_start * src_bytes_per_dim
-                dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
                 src_addr = (
                     src_state_data_ptrs[i]
                     + src_item_len * int(prefill_mamba_index[0])
-                    + src_dim_offset
+                    + src_offset
                 )
                 dst_addr = (
-                    dst_state_ptr
-                    + dst_item_len * int(dst_mamba_index[0])
-                    + dst_dim_offset
+                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
                 )
-
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -1493,6 +1500,13 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                    if self.enable_staging:
+                        # Purge prefetch bookkeeping for the finished room.
+                        # Snapshot first: the scheduler thread adds concurrently.
+                        for key in list(self._staging_ctx.prefetch_requested):
+                            if key[0] == kv_chunk.room:
+                                self._staging_ctx.prefetch_requested.discard(key)
+                        self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1957,11 +1971,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        self.chunk_staging_infos = []
         if (
             self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
-            self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
