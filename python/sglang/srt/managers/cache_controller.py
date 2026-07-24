@@ -21,7 +21,6 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
-
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -96,11 +95,9 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
-            "Producer finish event should be ready before being reused."
-        )
+        assert (
+            self.events[self.producer_index].finish_event.query()
+        ), "Producer finish event should be ready before being reused."
         return self.producer_index
 
     def set_consumer(self, index: int):
@@ -117,7 +114,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -223,7 +219,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -705,6 +700,7 @@ class HiCacheController:
             self.io_backend == "kernel"
             and self.mem_pool_host.layout == "page_first"
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            and getattr(self.mem_pool_host, "_uses_staged_write_back", True)
         ):
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
