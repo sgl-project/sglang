@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -58,6 +59,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_register,
+    _cuda_host_unregister,
     get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -736,6 +739,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        host_register_chunk_bytes: Optional[int] = None,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
@@ -745,6 +749,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
+        self.host_register_chunk_bytes = host_register_chunk_bytes
+        self._host_register_chunks: list[torch.Tensor] = []
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
@@ -768,6 +774,13 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        chunked_host_registration = bool(
+            self.pin_memory and self.host_register_chunk_bytes
+        )
+        if chunked_host_registration and self.layout != "layer_first":
+            raise ValueError(
+                "Chunked host registration currently requires layer_first layout"
+            )
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -775,7 +788,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     (num_host_pages, self.item_bytes),
                     dtype=self.dtype,
                     device=self.device,
-                    pin_memory=self.pin_memory,
+                    pin_memory=self.pin_memory and not chunked_host_registration,
                     allocator=self.allocator,
                 )
                 for _ in range(self.layer_num)
@@ -799,6 +812,39 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
+
+        if chunked_host_registration:
+            chunk_alignment = math.lcm(4096, self.item_bytes)
+            chunk_bytes = (
+                int(self.host_register_chunk_bytes) // chunk_alignment * chunk_alignment
+            )
+            if chunk_bytes <= 0:
+                raise ValueError(
+                    "host_register_chunk_bytes is smaller than required alignment "
+                    f"{chunk_alignment}"
+                )
+            try:
+                for buffer in self.kv_buffer:
+                    flat = buffer.view(-1)
+                    for offset in range(0, flat.numel(), chunk_bytes):
+                        chunk = flat.narrow(
+                            0, offset, min(chunk_bytes, flat.numel() - offset)
+                        )
+                        _cuda_host_register(chunk)
+                        self._host_register_chunks.append(chunk)
+            except Exception:
+                for chunk in self._host_register_chunks:
+                    _cuda_host_unregister(chunk)
+                self._host_register_chunks.clear()
+                raise
+            logger.info(
+                "Registered V4 host pool '%s' in %d chunks "
+                "(limit=%d bytes, alignment=%d bytes).",
+                self.pool_name,
+                len(self._host_register_chunks),
+                chunk_bytes,
+                chunk_alignment,
+            )
 
         logger.info(
             "Allocating %.2f GB host memory for V4 paged pool '%s' "
@@ -829,6 +875,17 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
         self.clear()
+
+    def destroy(self) -> None:
+        if self._host_register_chunks:
+            if getattr(self, "_destroyed", False):
+                return
+            self._destroyed = True
+            for chunk in self._host_register_chunks:
+                _cuda_host_unregister(chunk)
+            self._host_register_chunks.clear()
+            return
+        super().destroy()
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None

@@ -9,6 +9,7 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
@@ -99,6 +101,12 @@ class HiSparseCoordinator:
                 + page_size
                 - 1
             ) // page_size
+            server_args = get_server_args()
+            host_register_chunk_bytes = (
+                envs.SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES.get()
+                if server_args.disaggregation_transfer_backend == "mori"
+                else None
+            )
             self.mem_pool_host = DeepSeekV4PagedHostPool(
                 pool_name="dsv4_hisparse_c4",
                 device_buffers=self.mem_pool_device.kv_buffer,
@@ -106,6 +114,7 @@ class HiSparseCoordinator:
                 num_host_pages=num_host_pages,
                 slot_page_size=page_size,
                 layout="layer_first",
+                host_register_chunk_bytes=host_register_chunk_bytes,
             )
             self.item_size_bytes = (
                 self.mem_pool_device.kv_cache_total_dim
