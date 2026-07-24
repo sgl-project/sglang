@@ -1,0 +1,67 @@
+name: Bot Update Release Lookup Index
+#
+# Regenerates the Release Lookup index (docs_new/release_lookup/release_index.json)
+# from the repo's git tags so the docs page at /docs/references/release_lookup
+# stays current, and opens a PR with the refreshed index.
+#
+# Triggers on any pushed release tag (main `v*` or `gateway-v*`) -- the moment a
+# new release exists is exactly when the index needs regenerating -- or a manual
+# run. generate_index.py stamps a `generated_at` timestamp that changes every
+# run, so a PR is always opened; the meaningful diff is the newly indexed tag.
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+      - "gateway-v[0-9]+.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-index:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Regenerate against main's docs, not the detached tag commit that
+          # triggered this run. fetch-depth: 0 pulls the full history and all
+          # tags so generate_index.py can walk every release.
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Configure Git and branch
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          # github.run_id is unique per run repo-wide; run_attempt disambiguates re-runs.
+          BRANCH_NAME="bot/update-release-lookup-index-${{ github.run_id }}-${{ github.run_attempt }}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Regenerate release lookup index
+        run: |
+          python docs/release_lookup/generate_index.py \
+            --output docs_new/release_lookup/release_index.json
+
+      - name: Commit and create PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          git add docs_new/release_lookup/release_index.json
+          git commit -m "chore: update release lookup index"
+          git push origin "$BRANCH_NAME"
+          gh pr create \
+            --title "chore: update release lookup index" \
+            --body "Regenerates the Release Lookup index (\`docs_new/release_lookup/release_index.json\`) from the latest release tags so the [Release Lookup](https://docs.sglang.io/docs/references/release_lookup) docs page stays current." \
+            --base main \
+            --head "$BRANCH_NAME"

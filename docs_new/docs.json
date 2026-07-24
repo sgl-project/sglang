@@ -575,7 +575,7 @@
     },
     {
       "source": "/references/release_lookup.html",
-      "destination": "/docs/references/overview"
+      "destination": "/docs/references/release_lookup"
     },
     {
       "source": "/references/torch_compile_cache.html",
@@ -864,7 +864,8 @@
                 ]
               },
               "docs/references/post_training_integration",
-              "docs/references/nightly_precision_regression"
+              "docs/references/nightly_precision_regression",
+              "docs/references/release_lookup"
             ]
           }
         ]
