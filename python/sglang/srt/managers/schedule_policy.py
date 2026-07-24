@@ -787,6 +787,9 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # match locks this node's mamba, so clear any stale full-only skip
+        # carried from a previous scheduling of this req.
+        req.mamba_lock_skip_ids = None
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

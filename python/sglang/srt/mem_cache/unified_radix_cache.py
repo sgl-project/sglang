@@ -305,6 +305,12 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+def _mamba_skip_params(req) -> dict:
+    """skip_lock_node_ids so a full-only-locked last_node's dec skips mamba."""
+    skip_ids = getattr(req, "mamba_lock_skip_ids", None)
+    return {ComponentType.MAMBA: skip_ids} if skip_ids else {}
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -639,7 +645,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
-    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+    def inc_lock_ref(self, node: Any, skip_mamba: bool = False) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
@@ -647,6 +653,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return IncLockRefResult()
         result = IncLockRefResult()
         for component in self._components_tuple:
+            if skip_mamba and component.component_type == ComponentType.MAMBA:
+                # mamba is COW'd to the req's own slot at match, so leave this
+                # node's mamba evictable. Record every non-root node (incl
+                # tombstones) so the matching dec skips a mamba lock we never
+                # took, which may be another req's on a shared node.
+                if node is not self.root_node:
+                    result.skip_lock_node_ids.setdefault(
+                        ComponentType.MAMBA, set()
+                    ).add(node.id)
+                continue
             result = component.acquire_component_lock(node=node, result=result)
 
         self._update_evictable_leaf_sets(node)
@@ -676,6 +692,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self,
         node: UnifiedTreeNode,
         swa_uuid_for_lock: Optional[int] = None,
+        mamba_lock_skip_ids: Optional[set] = None,
     ) -> None:
         """Early-release the SWA portion of a request's tree lock, plus any
         strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
@@ -687,9 +704,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         swa_component.release_window_lock(node, swa_uuid_for_lock)
 
-        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`.
+        # Drop strictly-lower-priority locks (e.g. Mamba) co-located on `node`,
+        # honoring skip ids so we don't drop a mamba lock a full-only inc never
+        # took (matters for FULL+SWA+MAMBA models, e.g. Inkling).
         swa_priority = swa_component.eviction_priority(is_leaf=False)
-        dec_params = DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
+        dec_params = DecLockRefParams(
+            swa_uuid_for_lock=swa_uuid_for_lock,
+            skip_lock_node_ids=(
+                {ComponentType.MAMBA: mamba_lock_skip_ids}
+                if mamba_lock_skip_ids
+                else {}
+            ),
+        )
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf=False) < swa_priority:
                 comp.release_component_lock(node, dec_params)
@@ -782,7 +808,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
+                skip_lock_node_ids=_mamba_skip_params(req),
+            ),
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
@@ -872,9 +901,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
+                skip_lock_node_ids=_mamba_skip_params(req),
+            ),
         )
-        lock_result = self.inc_lock_ref(new_last_node)
+        lock_result = self.inc_lock_ref(new_last_node, skip_mamba=True)
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
@@ -886,6 +918,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # new_last_node was full-only-locked, remember it so its dec skips mamba.
+        req.mamba_lock_skip_ids = lock_result.skip_lock_node_ids.get(
+            ComponentType.MAMBA
+        )
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
