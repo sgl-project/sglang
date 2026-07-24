@@ -632,9 +632,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+        # HiSparse admits up to the host-backed logical capacity.
+        if self.scheduler.enable_hisparse:
+            capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
+        else:
+            capacity = self.max_total_num_tokens
         input_len = self._rebootstrap_prefill_len(req)
-        if input_len > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
+        if input_len > capacity:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
