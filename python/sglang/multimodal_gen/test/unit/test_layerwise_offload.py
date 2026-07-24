@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
+    is_resident_layerwise_module,
 )
 
 
@@ -161,6 +162,7 @@ def _server_args(**kwargs):
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
         dit_offload_prefetch_size=1,
+        dit_layerwise_resident_layers=0.0,
         pin_cpu_memory=False,
     )
     defaults.update(kwargs)
@@ -556,3 +558,126 @@ def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):
     assert restored_bias.data_ptr() % 32 == 0
     assert torch.equal(restored_weight, original_weight)
     assert torch.equal(restored_bias, original_bias)
+
+
+# ---------------------------------------------------------------------------
+# --dit-layerwise-resident-layers: keep N leading layers resident (retained
+# across denoise steps), streaming only the tail with the prefetch window.
+# ---------------------------------------------------------------------------
+class _MultiBlockModel(torch.nn.Module):
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
+
+
+class _ResidentComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_DummyBlock() for _ in range(n)])
+
+
+def _patch_fake_device(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+
+def _resident_manager(model, *, num_layers, prefetch_size=1, resident_layers=0):
+    return LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=num_layers,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=prefetch_size,
+        resident_layers=resident_layers,
+    )
+
+
+def test_resident_layers_retained_until_force_released(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    manager._maybe_init_residency()
+
+    assert manager._num_resident_layers == 2
+    assert {0, 1} <= manager._gpu_layers
+
+    # A non-force release keeps the leading resident layers pinned across steps.
+    manager.release_layer(0)
+    manager.release_layer(1)
+    assert {0, 1} <= manager._gpu_layers
+
+    # force=True (teardown) overrides the retention.
+    manager.release_layer(0, force=True)
+    assert 0 not in manager._gpu_layers
+    manager.release_all()  # force=True by default
+    assert not manager._gpu_layers
+
+
+def test_resident_layers_off_by_default_streams_everything(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=0
+    )
+    manager._maybe_init_residency()
+
+    assert manager._num_resident_layers == 0
+    assert manager.holds_residents is False
+
+    manager.prefetch_layer(2, non_blocking=False)
+    manager.release_layer(2)  # no residents -> released like plain streaming
+    assert 2 not in manager._gpu_layers
+
+
+def test_prepare_for_next_req_repins_residents(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    manager._maybe_init_residency()
+    manager.release_all(force=True)
+    assert not manager._gpu_layers
+
+    # The next denoise re-pins the resident set (union of prefetch window + residents).
+    manager.prepare_for_next_req(non_blocking=False)
+    assert {0, 1, 2} <= manager._gpu_layers
+
+
+def test_holds_residents_reflects_configuration(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    resident = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=2)
+    streaming = _resident_manager(_MultiBlockModel(3), num_layers=3, resident_layers=0)
+    assert resident.holds_residents is True
+    assert streaming.holds_residents is False
+
+
+def test_is_resident_layerwise_module_detector():
+    class _Comp(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        pass
+
+    comp = _Comp()
+    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=True)]
+    assert is_resident_layerwise_module(comp) is True
+
+    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=False)]
+    assert is_resident_layerwise_module(comp) is False
+
+
+def test_configure_resolves_resident_layers_absolute(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=3))
+    assert comp.layerwise_offload_managers[0]._configured_resident_layers == 3
+
+
+def test_configure_resolves_resident_layers_ratio(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
+    # 0.5 * 8 = 4 leading layers resident
+    assert comp.layerwise_offload_managers[0]._configured_resident_layers == 4
