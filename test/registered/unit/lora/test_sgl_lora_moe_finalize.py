@@ -11,6 +11,10 @@ import torch
 
 import sglang.srt.layers.moe.fused_moe_triton.layer as fused_moe_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSglLoraMoeFinalize(unittest.TestCase):

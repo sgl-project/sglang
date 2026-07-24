@@ -14,6 +14,7 @@ from sglang.srt.lora.sgl_lora.bf16 import (
     stock_grouped_lora_b,
 )
 from sglang.srt.lora.sgl_lora.routing import build_virtual_expert_routing
+from sglang.test.moe_lora_signal_gates import require_delta_close
 
 
 class TestSglLoraBf16Core(CustomTestCase):
@@ -151,11 +152,11 @@ class TestSglLoraBf16Core(CustomTestCase):
         )
         a_reference = self._reference_lora_a(hidden, a_weight, route, initial=a_initial)
         valid_pairs = route.virtual_topk_ids.reshape(-1) >= 0
-        torch.testing.assert_close(
+        require_delta_close(
             a_output[valid_pairs],
             a_reference[valid_pairs],
-            rtol=2e-2,
-            atol=2e-2,
+            destination_dtype=torch.bfloat16,
+            label="gate/up LoRA A valid pairs",
         )
         self.assertFalse(
             torch.equal(
@@ -188,7 +189,12 @@ class TestSglLoraBf16Core(CustomTestCase):
             destination_offsets=provider_up_gate_offsets,
             config=self.config,
         )
-        torch.testing.assert_close(destination, b_reference, rtol=2e-2, atol=2e-2)
+        require_delta_close(
+            destination,
+            b_reference,
+            destination_dtype=torch.bfloat16,
+            label="gate/up LoRA B destination",
+        )
         invalid_pairs = ~valid_pairs
         self.assertTrue(
             torch.equal(
@@ -226,7 +232,12 @@ class TestSglLoraBf16Core(CustomTestCase):
             config=self.config,
             input_row_map=row_map,
         )
-        torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+        require_delta_close(
+            output,
+            reference,
+            destination_dtype=torch.bfloat16,
+            label="down LoRA A provider-row map",
+        )
         self.assertTrue(torch.equal(output[2], torch.zeros_like(output[2])))
 
     def test_stock_single_slice_overwrites_base_rows_only_in_target(self):
@@ -258,7 +269,14 @@ class TestSglLoraBf16Core(CustomTestCase):
             destination_offsets=(3,),
             config=self.config,
         )
-        torch.testing.assert_close(destination, reference, rtol=2e-2, atol=2e-2)
+        # Gate only the targeted window; the untouched borders are guarded
+        # bitwise below and must not inflate the signal scale.
+        require_delta_close(
+            destination[:, 3 : 3 + width],
+            reference[:, 3 : 3 + width],
+            destination_dtype=torch.bfloat16,
+            label="single-slice LoRA B target window",
+        )
         self.assertTrue(
             torch.equal(
                 destination[:, :3],

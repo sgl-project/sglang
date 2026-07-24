@@ -23,6 +23,11 @@ from sglang.srt.lora.sgl_lora.bf16 import Bf16MoeLaunchConfig
 from sglang.srt.lora.sgl_lora.deep_gemm_bf16 import DeepGemmBf16LoRAHookBuilder
 from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.moe_lora_signal_gates import (
+    check_delta,
+    require_delta_close,
+    resolve_signal_gates,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
@@ -184,6 +189,8 @@ class TestSglLoraDeepGemmEndToEnd(CustomTestCase):
             )
             * 0.1
         ).to(torch.bfloat16)
+        # B factors are scaled so the LoRA delta clears the signal-gate
+        # validity floor (>= 32 BF16 quanta of the base output, plan §21.1).
         self.gate_b = (
             torch.randn(
                 self.num_adapters,
@@ -192,7 +199,7 @@ class TestSglLoraDeepGemmEndToEnd(CustomTestCase):
                 self.rank,
                 device=self.device,
             )
-            * 0.1
+            * 0.2
         ).to(torch.bfloat16)
         self.down_a = (
             torch.randn(
@@ -212,7 +219,7 @@ class TestSglLoraDeepGemmEndToEnd(CustomTestCase):
                 self.rank,
                 device=self.device,
             )
-            * 0.1
+            * 0.2
         ).to(torch.bfloat16)
 
         self.config = MoeRunnerConfig(
@@ -303,14 +310,37 @@ class TestSglLoraDeepGemmEndToEnd(CustomTestCase):
                         self.token_lora_mapping,
                         output_dtype,
                     )
-                    torch.testing.assert_close(
-                        output,
-                        expected,
-                        rtol=2e-2,
-                        atol=2e-2,
-                    )
                     outputs[name] = output
                     references[name] = expected
+
+            # Base path: signal-gated against the staged reference at the
+            # BF16 computation-precision gate (both pipelines compute BF16).
+            require_delta_close(
+                outputs["base"],
+                references["base"],
+                destination_dtype=torch.bfloat16,
+                label=f"base output {output_dtype}",
+            )
+            # LoRA paths: gate the base-subtracted delta. Subtracting each
+            # side's own base cancels base numerics, so the gate sees only
+            # the LoRA contribution (plan §21.1).
+            for name in ("mixed", "active"):
+                reference_delta = (
+                    references[name].float() - references["base"].float()
+                )
+                observed_delta = outputs[name].float() - outputs["base"].float()
+                gates = resolve_signal_gates(
+                    reference_delta,
+                    destination_dtype=torch.bfloat16,
+                    base_reference=references["base"],
+                )
+                record = check_delta(
+                    observed_delta,
+                    reference_delta,
+                    gates,
+                    label=f"{name} LoRA delta {output_dtype}",
+                )
+                self.assertTrue(record.passed, msg=str(record))
             self.assertGreater(
                 (references["active"] - references["base"]).abs().max().item(),
                 5e-2,

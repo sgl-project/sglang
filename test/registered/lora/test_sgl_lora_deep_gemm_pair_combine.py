@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.moe_lora_signal_gates import require_delta_close
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -128,11 +129,14 @@ class TestSglLoraDeepGemmPairCombine(CustomTestCase):
                     )
                     self._invoke(down, selected_delta, src, ids, weights, output)
                     torch.cuda.synchronize()
-                    torch.testing.assert_close(
+                    # Same BF16 inputs on both sides: the FP32 destination
+                    # genuinely compares at the FP32 gate; BF16 is
+                    # storage-rounding bound.
+                    require_delta_close(
                         output,
                         expected,
-                        rtol=0,
-                        atol=1.6e-2 if output_dtype == torch.bfloat16 else 2e-5,
+                        destination_dtype=output_dtype,
+                        label=f"pair combine has_delta={has_delta}",
                     )
 
     def test_pair_delta_graph_replay_uses_updated_inputs(self):
@@ -157,11 +161,11 @@ class TestSglLoraDeepGemmPairCombine(CustomTestCase):
                 expected = self._reference(down, delta, src, ids, weights, output_dtype)
                 graph.replay()
                 torch.cuda.synchronize()
-                torch.testing.assert_close(
+                require_delta_close(
                     output,
                     expected,
-                    rtol=0,
-                    atol=1.6e-2 if output_dtype == torch.bfloat16 else 2e-5,
+                    destination_dtype=output_dtype,
+                    label="pair combine graph replay",
                 )
 
     def test_typed_contribution_validates_pair_storage(self):
