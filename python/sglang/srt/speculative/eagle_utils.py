@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -668,7 +668,7 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
-        from sglang.srt.speculative.reject_sampling import (
+        from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
 
@@ -740,8 +740,8 @@ def eagle_sample(
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=get_server_args().speculative_accept_threshold_single,
-            threshold_acc=get_server_args().speculative_accept_threshold_acc,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
         )
 
@@ -821,7 +821,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        nxt = max(cur, r.kv_committed_len + double_alloc)
+        # Whole-page accounting: the paged allocator hands out full pages, so
+        # round nxt up to the page boundary or the unaligned tail is allocated
+        # but never recorded — a stranded-tail leak at page_size > 1.
+        nxt = max(
+            cur,
+            (r.kv_committed_len + double_alloc + page_size - 1)
+            // page_size
+            * page_size,
+        )
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
