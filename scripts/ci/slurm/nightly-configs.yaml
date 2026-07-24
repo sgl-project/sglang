@@ -356,3 +356,75 @@ kimik26-fp8-mi355x-mtp-sglang:
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/1p1d-mtp.yaml
+
+# AMD MI355X 2-node 1P1D disaggregation for GLM-5.2 (MXFP4) over MORI. GLM uses
+# GlmMoeDsaForCausalLM (DeepSeek Sparse Attention, auto-selected) with a built-in
+# NextN MTP head. Four variants mirroring the DeepSeek-V4 basic tier:
+#   * (base)      : TP8, no MTP
+#   * -mtp        : TP8 + NextN MTP
+#   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
+#   * -dp8ep8-mtp : DP8 + narrow EP8 + NextN MTP
+# NOTE: checkpoint on disk is amd/GLM-5.1-MXFP4 (only GLM MXFP4 build mirrored).
+glm52-fp4-mi355x-sglang:
+  model: amd/GLM-5.2-MXFP4
+  model-prefix: glm52
+  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d.yaml
+
+glm52-fp4-mi355x-mtp-sglang:
+  model: amd/GLM-5.2-MXFP4
+  model-prefix: glm52
+  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-mtp.yaml
+
+glm52-fp4-mi355x-dp8ep8-sglang:
+  model: amd/GLM-5.2-MXFP4
+  model-prefix: glm52
+  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-dp8ep8.yaml
+
+glm52-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: amd/GLM-5.2-MXFP4
+  model-prefix: glm52
+  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-dp8ep8-mtp.yaml
