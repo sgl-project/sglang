@@ -369,7 +369,6 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         k: Any = None,
         v: Any = None,
         swa_loc: Optional[Any] = None,
-        **kwargs,
     ) -> Any:
         cache_loc = (
             forward_batch.out_cache_loc

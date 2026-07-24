@@ -211,9 +211,18 @@ class ContextParallelStrategy(ABC):
         k: Any = None,
         v: Any = None,
         swa_loc: Optional[Any] = None,
-        **kwargs,
     ) -> Any:
         """Write full-layout K/V to the backend cache if needed."""
+
+    @abstractmethod
+    def materialize_full_mla_kv(
+        self,
+        forward_batch: ForwardBatch,
+        layer: Any,
+        k_nope: Any,
+        k_rope: Any,
+    ) -> Any:
+        """Materialize full-layout MLA K/V for the strategy."""
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
         """Optional attention metadata rewrite for strategies that need it."""

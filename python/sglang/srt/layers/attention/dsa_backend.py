@@ -117,15 +117,13 @@ def materialize_full_kv_cp(
     latent_cache: torch.Tensor,
     k_nope: torch.Tensor,
     k_pe: torch.Tensor,
-    kv_lora_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if is_cp_v2_active(forward_batch):
-        return get_cp_strategy().materialize_full_kv(
+        return get_cp_strategy().materialize_full_mla_kv(
             forward_batch,
-            latent_cache=latent_cache,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            kv_lora_rank=kv_lora_rank,
+            attn_mla.attn_mqa,
+            k_nope,
+            k_pe,
         )
     return attn_mla.rebuild_cp_kv_cache(latent_cache, forward_batch, k_nope, k_pe)
 

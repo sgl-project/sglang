@@ -250,17 +250,24 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         k: Any = None,
         v: Any = None,
         swa_loc: Optional[Any] = None,
-        **kwargs,
     ) -> Any:
-        latent_cache = kwargs["latent_cache"]
-        k_nope = kwargs["k_nope"]
-        k_pe = kwargs["k_pe"]
-        kv_lora_rank = kwargs["kv_lora_rank"]
-        latent_cache[..., :kv_lora_rank] = k_nope.squeeze(1)
-        latent_cache[..., kv_lora_rank:] = k_pe.squeeze(1)
+        raise NotImplementedError(
+            f"{self.name} strategy does not support dense K/V materialization"
+        )
+
+    def materialize_full_mla_kv(
+        self,
+        forward_batch,
+        layer: Any,
+        k_nope: Any,
+        k_rope: Any,
+    ) -> Any:
+        del layer
+        kv_lora_rank = k_nope.shape[-1]
+        latent_cache = torch.cat([k_nope, k_rope], dim=-1).squeeze(1)
         full_latent = self.gather_kv_cache(
             latent_cache.contiguous(), forward_batch, torch.cuda.current_stream()
         )
         k_nope = full_latent[..., :kv_lora_rank].unsqueeze(1)
-        k_pe = full_latent[..., kv_lora_rank:].unsqueeze(1)
-        return k_nope, k_pe
+        k_rope = full_latent[..., kv_lora_rank:].unsqueeze(1)
+        return k_nope, k_rope

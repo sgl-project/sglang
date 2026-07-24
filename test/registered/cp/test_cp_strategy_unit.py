@@ -1,13 +1,14 @@
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     can_dsa_prefill_cp_round_robin_split,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
@@ -104,6 +105,87 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
+
+    def test_dsa_cp_v2_materializes_mla_kv_through_strategy(self):
+        from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
+
+        forward_batch = SimpleNamespace()
+        layer = object()
+        attn_mla = SimpleNamespace(attn_mqa=layer)
+        latent_cache = torch.empty(2, 5)
+        k_nope = torch.empty(2, 1, 3)
+        k_rope = torch.empty(2, 1, 2)
+        full_k_nope = torch.empty(4, 1, 3)
+        full_k_rope = torch.empty(4, 1, 2)
+        strategy = MagicMock()
+        strategy.materialize_full_mla_kv.return_value = (full_k_nope, full_k_rope)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.is_cp_v2_active",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.get_cp_strategy",
+                return_value=strategy,
+            ),
+        ):
+            actual = materialize_full_kv_cp(
+                attn_mla,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_rope,
+            )
+
+        self.assertIs(actual[0], full_k_nope)
+        self.assertIs(actual[1], full_k_rope)
+        strategy.materialize_full_mla_kv.assert_called_once_with(
+            forward_batch,
+            layer,
+            k_nope,
+            k_rope,
+        )
+        strategy.materialize_full_kv.assert_not_called()
+
+    def test_dsa_cp_v1_rebuilds_mla_kv_without_strategy(self):
+        from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
+
+        forward_batch = SimpleNamespace()
+        latent_cache = torch.empty(2, 5)
+        k_nope = torch.empty(2, 1, 3)
+        k_rope = torch.empty(2, 1, 2)
+        full_k_nope = torch.empty(4, 1, 3)
+        full_k_rope = torch.empty(4, 1, 2)
+        rebuild_cp_kv_cache = MagicMock(return_value=(full_k_nope, full_k_rope))
+        attn_mla = SimpleNamespace(rebuild_cp_kv_cache=rebuild_cp_kv_cache)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.is_cp_v2_active",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.get_cp_strategy"
+            ) as get_strategy,
+        ):
+            actual = materialize_full_kv_cp(
+                attn_mla,
+                forward_batch,
+                latent_cache,
+                k_nope,
+                k_rope,
+            )
+
+        self.assertIs(actual[0], full_k_nope)
+        self.assertIs(actual[1], full_k_rope)
+        rebuild_cp_kv_cache.assert_called_once_with(
+            latent_cache,
+            forward_batch,
+            k_nope,
+            k_rope,
+        )
+        get_strategy.assert_not_called()
 
 
 class TestCPZigzagStrategy(CustomTestCase):
@@ -747,6 +829,59 @@ class TestCPInterleaveStrategy(CustomTestCase):
             self.assertTrue(can_dsa_prefill_cp_round_robin_split(active_batch))
             enable_cp_v2.assert_not_called()
 
+    def test_dsa_cp_v1_enablement_uses_legacy_config(self):
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                patch(
+                    "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                    return_value=SimpleNamespace(
+                        attn_cp_size=4,
+                        enable_dsa_prefill_context_parallel=enabled,
+                    ),
+                ),
+                patch(
+                    "sglang.srt.configs.model_config.is_deepseek_dsa"
+                ) as is_deepseek_dsa,
+            ):
+                self.assertEqual(is_dsa_enable_prefill_cp(), enabled)
+                is_deepseek_dsa.assert_not_called()
+
+    def test_dsa_cp_v2_enablement_uses_model_and_topology(self):
+        hf_config = object()
+        server_args = SimpleNamespace(
+            get_model_config=MagicMock(
+                return_value=SimpleNamespace(hf_config=hf_config)
+            )
+        )
+        with (
+            patch(
+                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                return_value=SimpleNamespace(
+                    attn_cp_size=4,
+                    enable_dsa_prefill_context_parallel=False,
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ) as is_deepseek_dsa,
+        ):
+            self.assertTrue(is_dsa_enable_prefill_cp())
+            is_deepseek_dsa.assert_called_once_with(hf_config)
+
     def test_legacy_dsa_split_skips_short_cp_v2_fallback_batch(self):
         short_batch = SimpleNamespace(
             forward_mode=_ExtendMode(),
@@ -925,6 +1060,42 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_interleave_materializes_full_mla_kv(self):
+        strategy = InterleaveCPStrategy(cp_size=2)
+        forward_batch = SimpleNamespace()
+        layer = object()
+        k_nope = torch.arange(6).view(2, 1, 3)
+        k_rope = torch.arange(4).view(2, 1, 2) + 10
+        full_latent = torch.arange(20).view(4, 5)
+
+        with (
+            patch.object(
+                strategy,
+                "gather_kv_cache",
+                return_value=full_latent,
+            ) as gather,
+            patch(
+                "sglang.srt.layers.cp.interleave.torch.cuda.current_stream",
+                return_value=None,
+            ),
+        ):
+            full_k_nope, full_k_rope = strategy.materialize_full_mla_kv(
+                forward_batch,
+                layer,
+                k_nope,
+                k_rope,
+            )
+
+        gather.assert_called_once()
+        packed_kv, gathered_forward_batch, stream = gather.call_args.args
+        self.assertTrue(
+            torch.equal(packed_kv, torch.cat([k_nope, k_rope], dim=-1).squeeze(1))
+        )
+        self.assertIs(gathered_forward_batch, forward_batch)
+        self.assertIsNone(stream)
+        self.assertTrue(torch.equal(full_k_nope, full_latent[:, :3].unsqueeze(1)))
+        self.assertTrue(torch.equal(full_k_rope, full_latent[:, 3:].unsqueeze(1)))
 
 
 if __name__ == "__main__":

@@ -76,6 +76,12 @@ def should_use_dsa_fused_topk(
 
 
 def is_dsa_enable_prefill_cp():
+    if not envs.SGLANG_ENABLE_CP_V2.get():
+        return get_parallel().enable_dsa_prefill_context_parallel
+
+    # Derive from the runtime CP topology + model arch rather than the legacy
+    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
+    # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa
