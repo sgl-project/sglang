@@ -25,7 +25,14 @@ def resolve_chat_encoding_spec(
     if tool_call_parser == "deepseekv32":
         return "dsv32"
 
-    architectures = hf_config.architectures
+    if hf_config is None:
+        return None
+
+    architectures = (
+        hf_config.get("architectures")
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "architectures", None)
+    )
     arch = architectures[0] if architectures else ""
 
     if "DeepseekV4" in arch:
