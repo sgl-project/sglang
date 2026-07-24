@@ -5112,6 +5112,13 @@ class ServerArgs:
             # hierarchical-cache SWA writes moved to the override registry
             # (arg_groups/overrides.py: _step3p_overrides).
             pass
+        elif model_arch in (
+            "GigaChat35ForCausalLM",
+            "GigaChat35ForCausalLMNextN",
+        ):
+            # EAGLE multi-layer + shared-experts-fusion disable moved to the
+            # override registry (arg_groups/overrides.py: _gigachat35_overrides).
+            pass
         elif (
             model_arch in ("Llama4ForConditionalGeneration", "Llama4ForCausalLM")
             and self.device != "cpu"

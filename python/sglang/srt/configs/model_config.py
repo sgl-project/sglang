@@ -619,6 +619,11 @@ class ModelConfig:
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
         if (
             is_draft_model
+            and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
+        if (
+            is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
         ):
             self.hf_config = self.hf_text_config
@@ -808,6 +813,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA

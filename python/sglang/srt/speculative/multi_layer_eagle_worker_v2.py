@@ -159,6 +159,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
             "InklingForConditionalGenerationMTP",
+            "GigaChat35ForCausalLMNextN",
         ]
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
