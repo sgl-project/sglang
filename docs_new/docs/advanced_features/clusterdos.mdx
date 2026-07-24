@@ -1,0 +1,346 @@
+---
+title: "clusterdOS"
+metatags:
+    description: "Deploy SGLang on clusterdOS: proposed integration as a first-class gitapp with sgl-router support, PD-disaggregation, dev-env requirements, and a 30-minute smoke test."
+---
+
+[clusterdOS](https://gitlab.com/aranya-tech/public/clusterdos) is a Kubernetes distribution that bootstraps and maintains a cluster via ArgoCD, treating each capability as an opt-in **gitapp** (Helm chart wrapped as an ArgoCD `Application`). It ships gitapps for Cilium, Rook Ceph, WekaFS, Grafana LGTM, Tailscale, kubevirt, Slurm — and today, for LLM inference, `vllm` + `clusterdos-inference` (vLLM + llm-d).
+
+This page describes a **proposed SGLang integration** into clusterdOS as a peer to that vLLM + llm-d stack: two new gitapps, `sglang` (raw engine) and `clusterdos-sglang-inference` (SGLang + sgl-router with optional PD-disaggregation), coexisting with the existing `inference` gitapp so operators pick the runtime per model.
+
+## Status
+
+- **Proposed** — the design and dev-env / probe details on this page are ready to consume; the chart code is not yet upstreamed. See the [decisions needed](#decisions-needed-before-chart-code-lands) section for what blocks it.
+- **Downstream side**: proposal MR against `gitlab.com/aranya-tech/public/clusterdos`, targeting the `develop` branch.
+- **Upstream side (SGLang)**: this doc + the existing [sgl-router](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router) code + [PD Disaggregation](./pd_disaggregation) doc are the reference material.
+
+## Why this integration
+
+Adding SGLang alongside vLLM+llm-d gives clusterdOS operators a choice on the LLM runtime axis:
+
+- **RadixCache** — trie-based prefix cache with hierarchical LRU eviction; higher hit rate than vLLM's flat prefix cache on shared-prefix workloads.
+- **Speculative-decoding variety** — EAGLE / EAGLE-3 / MTP / N-gram / adaptive draft algorithms.
+- **Native P/D disaggregation** — SGLang engine + sgl-router share a bootstrap-room rendezvous protocol; enable prefill/decode split with a values.yaml toggle instead of a separate stack.
+- **[sgl-router](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router)** — Rust router with distributed block-hash prefix trie, rendezvous-hashing sticky sessions, circuit breaker, and power-of-two-choices load balancing. Same "prefix-cache-aware routing" niche as llm-d, packaged as one binary + one Deployment.
+
+## Dev environment requirements
+
+Two tiers — pick the smallest that matches what you want to validate.
+
+### Tier 1 — Smoke test (evaluate the pitch, ~30 minutes)
+
+Enough hardware to answer "does SGLang boot and serve on our cluster?" — see the [Initial probe](#initial-probe--tryout-sequence) below for the exact steps.
+
+| Requirement | Minimum |
+| --- | --- |
+| Kubernetes | v1.28+ (MicroK8s, kind, k3s, DOKS, EKS, bare-metal — any distro clusterdOS supports today) |
+| Nodes | 1 GPU-capable node |
+| GPU | 1× NVIDIA GPU with ≥ 24 GB VRAM (RTX 4090, L40S, A6000, A100-40GB) |
+| GPU operator | NVIDIA GPU Operator (already in clusterdOS as `nvidiagpuoperator` gitapp) — provides the `nvidia.com/gpu.present=true` node label + device plugin |
+| Storage | emptyDir works for the smoke test (≥ 30 GB free on node) |
+| Egress | HuggingFace Hub reachable from pod network (or a pre-populated HF cache) |
+| Node RAM | ≥ 32 GB (8B model + tokenizer + overhead) |
+| Client tooling | `kubectl` ≥ v1.28, `curl`, `jq` |
+
+Model target: **Qwen3-8B** or **Mistral-7B-Instruct-v0.3** — small enough for a single 24 GB GPU with no tensor parallelism.
+
+### Tier 2 — Full-feature validation (the actual gitapp + router + PD, ~1-2 days)
+
+Everything Tier 1 requires, plus:
+
+| Requirement | Minimum |
+| --- | --- |
+| GPU count | 2× GPU on one node (TP=2 plain routing) OR 2 nodes × 1 GPU (PD-disagg: one prefill + one decode) |
+| Total VRAM | ≥ 64 GB for Qwen3-32B; ≥ 640 GB (8× H100) for a DeepSeek-V3-Instruct PD demo |
+| Networking | Pod-to-pod reachability across nodes; PD mode needs the decode pod to reach the prefill pod on its bootstrap port (default `8998`) |
+| Storage | ReadWriteMany PVC recommended so replicas share the HF cache (avoids per-replica multi-hundred-GB re-downloads) |
+| clusterdOS version | Current `develop` branch; `AGENTS.md` contribution conventions apply |
+| Contributor tooling | `glab`, GPG-signed commit setup per `AGENTS.md` |
+
+### What is NOT required
+
+Deliberate design boundaries to keep the integration lean:
+
+- **No CRDs** beyond what clusterdOS already installs. No Gateway API Inference Extension, no KServe, no cert-manager coupling. Uses only stable Kubernetes APIs (v1 apps, v1 core, v1 rbac, v1 discovery.k8s.io).
+- **No shared filesystem across nodes** for the smoke test — `emptyDir` works.
+- **No InfiniBand / RDMA** for smoke test or plain-mode Tier 2. Only PD-disaggregation with Mooncake benefits from RDMA (and Mooncake falls back to TCP transparently when RDMA is unavailable).
+
+## Initial probe / tryout sequence
+
+Purpose: **before investing days in the full gitapp**, prove SGLang deploys and serves on a real clusterdOS cluster in under 30 minutes. Uses **hand-applied raw manifests** — no Helm, no gitapp wiring, no router. Just answer: does the SGLang container boot and answer a chat completion?
+
+If yes, the full gitapp is worth building. If no, we learn what's missing in the cluster environment first.
+
+### Step 0 — Cluster health check (~2 min)
+
+```bash
+# GPU-capable node present + device plugin healthy
+kubectl get nodes -l nvidia.com/gpu.present=true -o wide
+
+# Nvidia GPU Operator DaemonSets running
+kubectl -n gpu-operator get pods 2>/dev/null || \
+  kubectl -n kube-system get pods -l app.kubernetes.io/component=nvidia-device-plugin
+
+# At least one node reports nvidia.com/gpu capacity
+kubectl describe nodes -l nvidia.com/gpu.present=true | grep -E "nvidia.com/gpu:" | head -5
+```
+
+If any of the above is empty, enable the `nvidiagpuoperator` gitapp in your `install.yaml` first.
+
+### Step 1 — Apply the probe manifest (~5 min)
+
+Save the following as `probe.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sglang-probe
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-probe
+  namespace: sglang-probe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-probe
+  template:
+    metadata:
+      labels:
+        app: sglang-probe
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: engine
+          image: lmsysorg/sglang:latest
+          command: ["python", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=Qwen/Qwen3-8B
+            - --host=0.0.0.0
+            - --port=30000
+          ports:
+            - containerPort: 30000
+              name: http
+          env:
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            # For gated models, create a Secret first:
+            #   kubectl -n sglang-probe create secret generic hf \
+            #     --from-literal=token="$HF_TOKEN"
+            # then uncomment:
+            # - name: HF_TOKEN
+            #   valueFrom: { secretKeyRef: { name: hf, key: token } }
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 32Gi
+              cpu: "8"
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 300
+            periodSeconds: 10
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 30Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sglang-probe
+  namespace: sglang-probe
+spec:
+  selector:
+    app: sglang-probe
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000
+```
+
+Apply:
+
+```bash
+kubectl apply -f probe.yaml
+```
+
+### Step 2 — Wait for readiness (~10-20 min the first time)
+
+Weights download + CUDA-graph capture take most of the wall clock.
+
+```bash
+kubectl -n sglang-probe wait --for=condition=Ready pod \
+  -l app=sglang-probe --timeout=1800s
+
+# In a second terminal — watch progress:
+kubectl -n sglang-probe logs -f -l app=sglang-probe
+```
+
+Expected log milestones:
+
+1. `Downloading Qwen3-8B` — HuggingFace download (~15 GB, 2-5 min on gigabit)
+2. `Loading model` — model init on GPU (~30 sec)
+3. `Capture CUDA graph` — CUDA-graph capture (~2 min)
+4. `The server is fired up and ready to roll!` — server up
+
+Common failures:
+
+- Pod stuck in `ContainerCreating` > 3 min → `kubectl describe pod` for image-pull issues.
+- Pod runs but never Ready → check logs for OOM, HF download failure, or CUDA-graph capture failure. Fallback: add `--disable-cuda-graph` to args.
+
+### Step 3 — Smoke-test the API (~2 min)
+
+```bash
+kubectl -n sglang-probe port-forward svc/sglang-probe 30000:30000 &
+PF_PID=$!
+
+# 1. Model listing
+curl -s http://localhost:30000/v1/models | jq
+
+# 2. One-shot chat completion
+curl -s http://localhost:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "model": "Qwen/Qwen3-8B",
+        "messages": [{"role": "user", "content": "In one sentence: what is a radix cache?"}],
+        "max_tokens": 100
+      }' | jq
+
+# 3. Streaming (SSE)
+curl -N -s http://localhost:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "model": "Qwen/Qwen3-8B",
+        "messages": [{"role": "user", "content": "Count to 5."}],
+        "stream": true,
+        "max_tokens": 30
+      }'
+
+kill $PF_PID
+```
+
+**Success criteria**: (1) `/v1/models` returns the model, (2) chat completion returns a non-empty sensible response, (3) streaming yields incremental deltas ending with `[DONE]`.
+
+If all three pass → SGLang works on your cluster. Green-light the full gitapp.
+
+### Step 4 — Teardown (~10 sec)
+
+```bash
+kubectl delete namespace sglang-probe
+```
+
+### What the probe does NOT cover
+
+Deferred to the gitapp:
+
+- Router-based load balancing across replicas (needs `sgl-router` + EndpointSlice discovery)
+- Prefill/decode disaggregation (needs two Deployments + KV transfer backend)
+- Prometheus scrape autodiscovery
+- Multi-GPU tensor parallelism (add `--tp-size=2` + `nvidia.com/gpu: 2` if you want to spot-check TP)
+- NetworkPolicy hardening
+- HPA / autoscaling
+
+The probe just answers "does the engine boot at all in our environment?" — which unblocks the gitapp engineering.
+
+## Full plan
+
+### Proposed file layout
+
+Mirrors the existing vLLM + llm-d pattern in the clusterdOS repo (`gitapps/vllm/` + `gitapps/clusterdos-inference/`):
+
+```
+gitapps/sglang/
+├── Chart.yaml
+├── values.yaml               # vendor toggle (nvidia|amd), model, GPU count
+└── templates/
+    ├── deployment.yaml       # SGLang engine
+    ├── service.yaml          # ClusterIP :30000
+    └── priorityclass.yaml
+
+gitapps/clusterdos-sglang-inference/
+├── Chart.yaml
+├── values.yaml               # SGLang + sgl-router; PD-mode toggle
+└── templates/
+    ├── sglang-deployment.yaml    # workers labeled role: plain|prefill|decode
+    ├── sglang-service.yaml
+    ├── router-deployment.yaml    # sgl-router with k8s discovery backend
+    ├── router-service.yaml
+    ├── router-rbac.yaml          # get,list,watch on endpointslices
+    ├── servicemonitor.yaml       # Grafana Alloy autodiscover
+    └── networkpolicy.yaml
+```
+
+### install.yaml additions
+
+```yaml
+sglang:
+  enabled: false
+sglangInference:
+  # SGLang + sgl-router prefix-cache-aware routing
+  # Alternative to `inference` (vLLM + llm-d); PD-disaggregation supported
+  enabled: false
+```
+
+### values.yaml — key defaults
+
+Single-GPU dev cluster convention, matching how `clusterdos-inference` ships:
+
+- `gpu.vendor: nvidia`, `gpu.count: 1`
+- `model: mistralai/Mistral-7B-Instruct-v0.3` (matches `clusterdos-inference` default)
+- Single replica, TP=1
+- `router.policy: cache_aware_zmq` (alternatives: `power_of_two`, `sticky`, `round_robin`, `random`, `load_based`)
+- `pdMode.enabled: false` (plain by default; opt-in for prefill/decode split)
+
+### How PD-disaggregation works with sgl-router
+
+When `pdMode.enabled=true`:
+
+1. Two SGLang Deployments (prefill / decode) with distinct pod labels (`role: prefill`, `role: decode`).
+2. Prefill workers run with `--disaggregation-mode=prefill` and expose `--disaggregation-bootstrap-port` (default `8998`).
+3. sgl-router runs with `--service-discovery`, `--prefill-selector role=prefill`, `--decode-selector role=decode`; watches `EndpointSlice` resources and partitions workers via its `PdPoolResolver`.
+4. On each request the router picks a prefill worker (via `--policy`) and a decode peer (host-affinity preferred, min-load fallback), injects `bootstrap_{host,port,room}` into the request body, spawns the prefill request detached, and awaits the decode request — decode's response is what the client sees.
+5. Engine side: the decode worker opens a NIXL/Mooncake connection to `bootstrap_host:bootstrap_port` and pulls KV blocks keyed by `bootstrap_room`. See [PD Disaggregation](./pd_disaggregation) for the transfer backend setup.
+
+The proposal ships both plain and PD-mode as a single gitapp with a values.yaml toggle. The two-Deployment pattern for PD is small enough that deferring it to v2 would just create scope creep.
+
+### Coexistence with the existing `inference` gitapp
+
+- The new gitapps do **not** replace `inference` (vLLM + llm-d).
+- Both can be enabled in the same cluster in different namespaces — no port collisions.
+- Operators pick per model based on workload characteristics.
+
+### License
+
+- clusterdOS: GPLv3+; SGLang: Apache-2.0.
+- SGLang binaries remain Apache-2.0.
+- The wrapper (Chart + templates + values in the clusterdOS repo) is GPLv3+ per the project's license — no impact on SGLang itself.
+
+## Decisions needed before chart code lands
+
+Four decisions on the clusterdOS maintainer side unblock chart implementation:
+
+1. **Naming / scope** — separate `gitapps/clusterdos-sglang-inference/`, OR extend the existing `gitapps/clusterdos-inference/` with a `runtime: vllm|sglang` switch?
+   *Recommendation*: separate gitapp. The existing `clusterdos-inference/values.yaml` has ~40 llm-d-specific fields (scheduler, envoy sidecar, tokenizer sidecar, KV events port) that don't apply to sgl-router; abstracting them would balloon MR scope.
+2. **Router container image source** — sgl-router currently publishes only a nightly staging image at `lmsysorg/sglang-staging:experimental-router-dev` (see [`.github/workflows/nightly-experimental-sgl-router-docker.yml`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/nightly-experimental-sgl-router-docker.yml)). Options: (a) consume the nightly, (b) publish a stable release image upstream first, (c) publish a fork-hosted image (`ghcr.io/<org>/sgl-router:...`). Recommendation: (b) — best long-term contract for downstream distributions.
+3. **Naming convention** — the existing gitapps mix `gitapps/vllm/` (third-party name, no prefix) with `gitapps/clusterdos-inference/` (clusterdOS-authored, prefixed). Proposed: `gitapps/sglang/` + `gitapps/clusterdos-sglang-inference/` to match.
+4. **PD-disagg scope in v1** — ship plain mode only in the first MR and add PD in a follow-up, OR both together? Recommendation: both, because the PD toggle is a values.yaml boolean and the two-Deployment pattern is small.
+
+## References
+
+- clusterdOS repository: [gitlab.com/aranya-tech/public/clusterdos](https://gitlab.com/aranya-tech/public/clusterdos)
+- Reference gitapps to mirror: [`gitapps/vllm/`](https://gitlab.com/aranya-tech/public/clusterdos/-/tree/main/gitapps/vllm) and [`gitapps/clusterdos-inference/`](https://gitlab.com/aranya-tech/public/clusterdos/-/tree/main/gitapps/clusterdos-inference)
+- sgl-router source: [`experimental/sgl-router/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router)
+- sgl-router K8s test manifests (starter reference for chart templates): [`experimental/sgl-router/tests/e2e/k8s_integration/manifests/`](https://github.com/sgl-project/sglang/tree/main/experimental/sgl-router/tests/e2e/k8s_integration/manifests)
+- SGLang PD disaggregation: [PD Disaggregation](./pd_disaggregation)
+- Peer distributions with LLM-serving stacks: [llm-d](./llm-d), [SGLang Model Gateway](./sgl_model_gateway)
