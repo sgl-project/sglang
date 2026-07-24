@@ -1,5 +1,11 @@
-"""TTFT/ITL A/B: Python vs Rust tokenizer manager (SGLANG_RUST_SERVER)
+"""TTFT/ITL A/B/C: Python TM vs Rust TM (native MM) vs Rust TM (Python MM)
 on an image workload.
+
+Arms:
+  python      — Python tokenizer manager
+  rust        — Rust TM + native Qwen MM pipeline
+  rust_py_mm  — Rust TM, MM forced through Python mm_processor
+                (SGLANG_DISABLE_NATIVE_MM=1)
 
 Sweeps either concurrency (default) or image-count (`--image-counts`),
 launching each arm once with identical server args. Outputs a table,
@@ -95,6 +101,25 @@ def bench_args(args, concurrency, image_count, out_dir, arm):
     return ns
 
 
+def arm_env(arm, args):
+    """Server env for one A/B/C arm.
+
+    - python:      Python tokenizer manager
+    - rust:        Rust TM + native Qwen MM pipeline
+    - rust_py_mm:  Rust TM, but MM forced onto Python mm_processor
+                   (SGLANG_DISABLE_NATIVE_MM=1)
+    """
+    rust = arm in ("rust", "rust_py_mm")
+    env = {
+        "SGLANG_RUST_SERVER": str(int(rust)),
+        "SGLANG_VLM_CACHE_SIZE_MB": "0",
+        "SGLANG_DISABLE_NATIVE_MM": str(int(arm == "rust_py_mm")),
+    }
+    if args.gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = args.gpu
+    return env
+
+
 def run_arm(arm, args, out_dir, levels):
     # Wait for the previous arm's port to be released.
     deadline = time.monotonic() + 120
@@ -107,14 +132,13 @@ def run_arm(arm, args, out_dir, levels):
     # The same seeded images are replayed at every level, so turn off the
     # vision-embedding LRU (--disable-radix-cache does not cover it); a hit
     # would skip the ViT forward and understate TTFT at later levels.
-    env = {
-        "SGLANG_RUST_SERVER": str(int(arm == "rust")),
-        "SGLANG_VLM_CACHE_SIZE_MB": "0",
-    }
-    if args.gpu is not None:
-        env["CUDA_VISIBLE_DEVICES"] = args.gpu
+    env = arm_env(arm, args)
     log = open(out_dir / f"server_{arm}.log", "w")
-    print(f"\n=== launching {arm} arm (SGLANG_RUST_SERVER={env['SGLANG_RUST_SERVER']}) ===")
+    print(
+        f"\n=== launching {arm} arm "
+        f"(SGLANG_RUST_SERVER={env['SGLANG_RUST_SERVER']}, "
+        f"SGLANG_DISABLE_NATIVE_MM={env['SGLANG_DISABLE_NATIVE_MM']}) ==="
+    )
     proc = popen_launch_server(
         args.model,
         f"http://127.0.0.1:{args.port}",
@@ -151,11 +175,16 @@ def plot(results, args, out_dir, levels):
 
     xs = [lv[0] for lv in levels]
     xlabel = "image count" if args.image_counts else "max concurrency"
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    colors = {"python": "tab:blue", "rust": "tab:orange"}
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    colors = {
+        "python": "tab:blue",
+        "rust": "tab:orange",
+        "rust_py_mm": "tab:green",
+    }
     xpos = {x: i for i, x in enumerate(xs)}
     for ax, metric in zip(axes, ("ttft", "itl")):
         for arm, arm_results in results.items():
+            color = colors.get(arm, "tab:gray")
             for stat, style in (("mean", "-o"), ("p99", "--s")):
                 pts = [
                     (xpos[x], r[f"{stat}_{metric}_ms"])
@@ -163,16 +192,16 @@ def plot(results, args, out_dir, levels):
                     if r
                 ]
                 if pts:
-                    ax.plot(*zip(*pts), style, color=colors[arm], label=f"{arm} {stat}")
+                    ax.plot(*zip(*pts), style, color=color, label=f"{arm} {stat}")
                     for px, y in pts:
                         ax.annotate(f"{y:.1f}", (px, y), xytext=(0, 5), fontsize=7,
                                     textcoords="offset points", ha="center",
-                                    color=colors[arm])
+                                    color=color)
         ax.set_xticks(list(xpos.values()), [str(x) for x in xs])
         ax.set_yscale("log")
         ax.set(xlabel=xlabel, ylabel="ms", title=metric.upper())
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend()
+        ax.legend(fontsize=8)
     if args.image_counts:
         workload = f"concurrency={args.concurrencies[0]}, {args.image_resolution}"
     else:
@@ -194,8 +223,14 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-    parser.add_argument("--arms", nargs="+", default=["python", "rust"],
-                        choices=["python", "rust"])
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        default=["python", "rust", "rust_py_mm"],
+        choices=["python", "rust", "rust_py_mm"],
+        help="python=Python TM; rust=Rust TM+native MM; "
+        "rust_py_mm=Rust TM+Python MM (SGLANG_DISABLE_NATIVE_MM)",
+    )
     parser.add_argument("--concurrencies", type=int, nargs="+",
                         default=[1, 4, 16, 64, 128, 256, 512, 1024])
     parser.add_argument(
