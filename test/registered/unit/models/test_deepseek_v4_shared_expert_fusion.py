@@ -9,21 +9,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
-
-
 class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
     """The disable decision is a load-time resolution: it writes through to
     the published config via declare_load_time_override."""
@@ -39,7 +24,8 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
 
     def _make_model(self, n_shared_experts=1):
         return SimpleNamespace(
-            config=SimpleNamespace(n_shared_experts=n_shared_experts)
+            config=SimpleNamespace(n_shared_experts=n_shared_experts),
+            quant_config=None,
         )
 
     def _publish(self, enforce):
@@ -55,7 +41,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(unittest.TestCase):
         DeepseekV4ForCausalLM.determine_num_fused_shared_experts(model)
 
         self.assertEqual(model.num_fused_shared_experts, 0)
-        # post-init declaration writes through to the published config
+        # post-init declaration writes through to the published server_args
         self.assertTrue(server_args.disable_shared_experts_fusion)
 
     def test_enables_shared_fusion_when_enforced(self):
