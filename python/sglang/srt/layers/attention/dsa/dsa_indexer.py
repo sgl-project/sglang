@@ -98,6 +98,10 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+if _is_xpu:
+    from sgl_kernel import fp8_mqa_logits as sgl_fp8_mqa_logits
+    from sgl_kernel import fp8_paged_mqa_logits as sgl_fp8_paged_mqa_logits
+
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
@@ -337,7 +341,6 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
@@ -894,6 +897,11 @@ class Indexer(MultiPlatformOp):
                 assert (
                     page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
+        elif _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA only supports page_size 64 or 128, got {page_size}"
         else:
             assert page_size == 64, "only support page size 64"
         # NOTE(dark): this support extend/decode/decode+graph
@@ -985,6 +993,17 @@ class Indexer(MultiPlatformOp):
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
             )
+        elif _is_xpu:
+            logits = sgl_fp8_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                None,
+                max_seq_len,
+                clean_logits=False,
+            )
         elif use_cute_dsl:
             logits = cutedsl_paged_mqa_logits(
                 q_fp8,
@@ -1052,7 +1071,10 @@ class Indexer(MultiPlatformOp):
         if cached_budget is not None:
             return cached_budget
 
-        total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        if _is_xpu:
+            total_mem = torch.xpu.get_device_properties(device_index).total_memory
+        else:
+            total_mem = torch.cuda.get_device_properties(device_index).total_memory
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
         mem_fraction_static = get_server_args().mem_fraction_static
@@ -1073,10 +1095,15 @@ class Indexer(MultiPlatformOp):
             return static_budget
 
         # Match the original free-memory guard: logits_bytes * 2 > free_mem.
-        # torch.cuda.mem_get_info synchronizes the host, so cache the result,
-        # capped by the workload-independent serving-memory headroom.
-        free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
+        # Synchronizes the host; cache the result capped by serving-memory headroom.
+        if _is_xpu:
+            # On XPU, use total_mem budget as the free-memory estimate;
+            # dynamic free-memory query is not supported the same way as CUDA.
+            # TODO Use torch.xpu.mem_get_info() when available (planned end of 2026).
+            budget_bytes = static_budget
+        else:
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
         budget_bytes = max(1, budget_bytes)
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
@@ -1125,13 +1152,19 @@ class Indexer(MultiPlatformOp):
                     page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {page_size}"
         else:
-            assert page_size == 64, "only support page size 64"
+            if _is_xpu:
+                assert page_size in (
+                    64,
+                    128,
+                ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+            else:
+                assert page_size == 64, "only support page size 64"
 
-        assert len(weights.shape) == 3
-        assert (
-            forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        )
+            assert len(weights.shape) == 3
+            assert (
+                forward_batch.seq_lens_cpu is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            )
         weights = weights.squeeze(-1)
 
         if _is_hip and not _use_aiter_preshuffle:
@@ -1206,6 +1239,15 @@ class Indexer(MultiPlatformOp):
                         ke,
                         clean_logits=False,
                     )
+                elif _is_xpu:
+                    logits = sgl_fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
@@ -1257,6 +1299,15 @@ class Indexer(MultiPlatformOp):
                         q_fp8[start:end],
                         kv,
                         scale,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
+                elif _is_xpu:
+                    logits_chunk = sgl_fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
@@ -1406,7 +1457,13 @@ class Indexer(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        if _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+        else:
+            assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         k_fp8_list = []
@@ -1558,7 +1615,13 @@ class Indexer(MultiPlatformOp):
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import fp8_index
 
         page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        if _is_xpu:
+            assert page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+        else:
+            assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
@@ -1735,6 +1798,10 @@ class Indexer(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         if _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+        elif _is_xpu:
+            from sglang.srt.hardware_backend.xpu.kernels.dsa.act_quant import (
+                act_quant,
+            )
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
@@ -1968,7 +2035,7 @@ class Indexer(MultiPlatformOp):
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_xpu:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu
             # creates a Dynamo shape guard. These graph modes never have empty
             # batches.

@@ -4500,6 +4500,11 @@ class ServerArgs:
                     reserved_mem = max(reserved_mem, 10 * 1024)
                 # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
                 reserved_mem += self.reserve_for_deepep_a2a_mb()
+                # XPU: oneDNN allocates scratch space for matmul when
+                # M is not a power-of-2-aligned value (e.g. M=2100).  Reserve extra
+                # headroom so non-aligned prefill lengths don't hit OOM.
+                if is_xpu():
+                    reserved_mem += 2 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -4861,6 +4866,42 @@ class ServerArgs:
                         major, resolved_view(self).quantization
                     )
                     self._set_default_dsa_backends(major)
+
+                elif is_xpu():
+                    self.page_size = 128
+                    logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
+                    if self.kv_cache_dtype == "auto":
+                        self.kv_cache_dtype = "bfloat16"
+                        logger.warning(
+                            f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on XPU."
+                        )
+                    if self.dsa_prefill_backend is None:
+                        self.dsa_prefill_backend = "intel_xpu"
+                    if self.dsa_decode_backend is None:
+                        self.dsa_decode_backend = "intel_xpu"
+                    self.dsa_topk_backend = "torch"
+                    # Disable fused topk (requires sgl-kernel ops not available on XPU)
+                    import os
+
+                    if os.environ.get("SGLANG_DSA_FUSE_TOPK", "0") != "0":
+                        logger.warning(
+                            "Disabling fused topk for DeepSeek DSA on XPU (SGLANG_DSA_FUSE_TOPK=0). Not supported yet."
+                        )
+                    envs.SGLANG_DSA_FUSE_TOPK.set(False)
+                    # Disable CUDA-JIT topk-v2 (TileLang/TVM-based, requires CUDA)
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                    logger.warning(
+                        f"Set DSA backends for XPU: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
+                    )
+                    # Use dsa for both prefill and decode so DeepseekSparseAttnBackend
+                    # handles the full forward pass (KV cache store, DSA indexer, and
+                    # MLA attention) without needing a HybridAttnBackend.
+                    if self.decode_attention_backend is None:
+                        self.decode_attention_backend = "dsa"
+                    # Prefill now uses flash_mla_prefill via the intel_xpu dsa path;
+                    # no longer needs a separate Triton backend.
+                    if self.prefill_attention_backend is None:
+                        self.prefill_attention_backend = "dsa"
 
                 if self.enable_prefill_cp:
                     assert (

@@ -6,9 +6,10 @@ import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
@@ -308,6 +309,11 @@ def _set_k_and_s_triton(
             assert (
                 page_size % 16 == 0
             ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+    elif _is_xpu:
+        assert page_size in (
+            64,
+            128,
+        ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
     else:
         assert page_size == 64
 

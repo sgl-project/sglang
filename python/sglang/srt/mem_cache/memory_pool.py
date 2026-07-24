@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -4273,6 +4274,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 assert (
                     self.page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+        elif is_xpu():
+            assert self.page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
         else:
             assert self.page_size == 64
         self._create_index_buffers()
