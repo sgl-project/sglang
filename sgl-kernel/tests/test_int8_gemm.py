@@ -46,5 +46,21 @@ def test_accuracy(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
 
 
+# PR-B: exercise the SM90 swap-AB buckets (M <= 64). Non-divisible M
+# (17, 48, 63) probe the N-tile padding boundary, where the original M
+# dimension becomes the kernel's N dimension under operand swap.
+@pytest.mark.skipif(
+    is_sm10x(),
+    reason="int8_scaled_mm is only supported on sm90 and lower",
+)
+@pytest.mark.parametrize("M", [1, 2, 7, 8, 16, 17, 32, 48, 63, 64])
+@pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096, 8192])
+@pytest.mark.parametrize("K", [512, 1024, 4096])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+def test_accuracy_small_m_swap_ab(M, N, K, with_bias, out_dtype):
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, "cuda")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
