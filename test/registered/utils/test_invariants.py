@@ -1,7 +1,7 @@
 """Unit tests for the invariant-check model (CPU).
 
 Proves the (bucket x level) matrix, the unconditional data layer, the throttled
-reporter, and the self-registration used by the CI coverage meta-test — all on
+reporter, and the self-registration used by the CI coverage meta-test -- all on
 CPU tensors so it runs on the base-a-test-cpu stage without a GPU.
 """
 
@@ -87,7 +87,7 @@ class TestKernelCheck(CustomTestCase):
         with self._strict():
             with mock.patch.object(torch, "_assert_async") as m:
                 out = expect(_SOFTEN, bad.clone())
-        m.assert_not_called()  # SOFTEN logs, never crashes — even in strict
+        m.assert_not_called()  # SOFTEN logs, never crashes -- even in strict
         self.assertTrue(torch.isfinite(out).all())
 
     def test_guard_crashes_in_strict(self):
@@ -134,7 +134,7 @@ class TestKernelCheck(CustomTestCase):
     def test_injection_coverage_meta(self):
         """Every registered test-namespace invariant must have an injection test.
 
-        Phase 5 broadens the namespace filter to the whole codebase so no real
+        A later change broadens this filter to all namespaces so no real
         GUARD/SOFTEN ships without a triggering test.
         """
         uncovered = [

@@ -1,4 +1,4 @@
-"""Value/index validity checks — the invariant-check model.
+"""Value/index validity checks -- the invariant-check model.
 
 Each check has two layers:
 
@@ -10,8 +10,9 @@ Each check has two layers:
 
 A `Bucket` classifies an invariant by blast radius and recoverability; the
 (bucket x level) matrix decides whether a hit crashes, logs, or is silent.
-Invariants are declared once as module-level `Invariant` objects (registering
-themselves for the CI coverage meta-test) and passed to `expect` at each site.
+Invariants are declared once as module-level `Invariant` objects and passed to
+`expect` at each site; declaring one registers it so a CI meta-test can require
+it has a triggering test.
 
 Detection stays async (no GPU-CPU sync): violations surface via torch's async
 assert at the next sync point, and counts via a pinned-memory readback.
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class Bucket(enum.Enum):
-    """Invariant classification (see RFC decision tree)."""
+    """Invariant classification by blast radius and recoverability."""
 
     SOFTEN = "soften"  # recoverable + legitimate event (never a bug)
     GUARD = "guard"  # recoverable + is-a-bug / root cause unknown
@@ -81,7 +82,7 @@ class NotInf(Property):
 
 
 class Finite(Property):
-    """Neither NaN nor Inf — use when inf is also a bug for this tensor."""
+    """Neither NaN nor Inf -- use when inf is also a bug for this tensor."""
 
     name = "finite"
 
@@ -90,7 +91,7 @@ class Finite(Property):
 
 
 class InRange(Property):
-    """Half-open [lo, hi) — unifies oob / range / index-domain checks."""
+    """Half-open [lo, hi) -- unifies oob / range / index-domain checks."""
 
     def __init__(self, lo, hi):
         self.lo = lo
@@ -205,7 +206,7 @@ _reporter = _CheckReporter()
 
 
 def _crashes(bucket: Bucket, level: InvariantCheckLevel) -> bool:
-    """The (bucket x level) crash decision — pure, matches the RFC matrix."""
+    """The (bucket x level) crash decision, pure and total."""
     if bucket is Bucket.SOFTEN:
         return False
     if bucket is Bucket.FATAL_UNCONTAINABLE:
