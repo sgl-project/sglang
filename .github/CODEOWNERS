@@ -88,7 +88,7 @@
 /sgl-model-gateway/examples/wasm @slin1237
 /test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
-/test/registered/ascend @ping1jing2 @ssshinigami  @e-martirosian
+/test/registered/npu @ping1jing2 @ssshinigami  @e-martirosian
 /test/srt/test_modelopt* @Edwardf0t1
 /python/sglang/srt/layers/gemma4_fused_ops.py @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1 @kpham-sgl @pyc96
 /python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl @pyc96
