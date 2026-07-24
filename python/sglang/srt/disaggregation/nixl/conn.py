@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    build_state_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.environ import envs
@@ -208,6 +209,7 @@ class KVArgsRegisterInfo:
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_state_layer_ids: List[List[int]] = dataclasses.field(default_factory=list)
     dst_homogeneous_mem_kind: Optional[str] = None
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
@@ -245,6 +247,9 @@ class KVArgsRegisterInfo:
         dst_num_slots = (
             int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
         )
+        dst_state_layer_ids = (
+            unpack_int_lists(msg[19], "I") if len(msg) > 19 and len(msg[19]) > 0 else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -264,6 +269,7 @@ class KVArgsRegisterInfo:
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_state_layer_ids=dst_state_layer_ids,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
@@ -1167,6 +1173,7 @@ class NixlKVManager(CommonKVManager):
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                                dst_state_layer_ids=dst_info.dst_state_layer_ids,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -1826,6 +1833,8 @@ class NixlKVManager(CommonKVManager):
         dst_state_indices: List[int],
         dst_gpu_id: int,
         notif: str,
+        src_layer_ids: list[int] = None,
+        dst_layer_ids: list[int] = None,
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
@@ -1836,7 +1845,14 @@ class NixlKVManager(CommonKVManager):
         src_addrs = []
         dst_addrs = []
 
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        pairs = build_state_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
             length = src_state_item_lens[i]
             if length == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
                 continue
@@ -1879,6 +1895,8 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int,
         src_state_conv_shard_groups: list = None,
         src_state_slice_outer_counts: list[int] = None,
+        src_layer_ids: list[int] = None,
+        dst_layer_ids: list[int] = None,
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
@@ -1906,6 +1924,8 @@ class NixlKVManager(CommonKVManager):
                 dst_state_indices,
                 dst_gpu_id,
                 notif,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -1914,13 +1934,20 @@ class NixlKVManager(CommonKVManager):
         src_addrs = []
         dst_addrs = []
 
-        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+        pairs = build_state_entry_pairs(
+            src_layer_ids or [],
+            dst_layer_ids or [],
+            len(src_state_data_ptrs),
+            len(dst_state_data_ptrs),
+        )
+        for i, j in pairs:
+            dst_state_ptr = dst_state_data_ptrs[j]
             src_item_len = src_state_item_lens[i]
-            dst_item_len = dst_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[j]
             if src_item_len == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
                 continue
             src_dim = src_state_dim_per_tensor[i]
-            dst_dim = dst_state_dim_per_tensor[i]
+            dst_dim = dst_state_dim_per_tensor[j]
 
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
@@ -1991,6 +2018,7 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        dst_state_layer_ids: List[List[int]] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -2005,8 +2033,10 @@ class NixlKVManager(CommonKVManager):
         src_state_slice_outer_counts = (
             getattr(self.kv_args, "state_slice_outer_counts", []) or []
         )
+        src_state_layer_ids = getattr(self.kv_args, "state_layer_ids", []) or []
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
+        dst_state_layer_ids = dst_state_layer_ids or []
 
         handles = []
         for i, st in enumerate(state_types):
@@ -2030,12 +2060,14 @@ class NixlKVManager(CommonKVManager):
                 if i < len(src_state_slice_outer_counts)
                 else []
             )
+            src_lids = src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             dst_ptrs = dst_state_data_ptrs[i] if i < len(dst_state_data_ptrs) else []
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
             dst_lens = dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
             dst_dims = (
                 dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
             )
+            dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
@@ -2056,6 +2088,8 @@ class NixlKVManager(CommonKVManager):
                         decode_tp_rank,
                         src_conv,
                         src_outer_counts,
+                        src_layer_ids=src_lids,
+                        dst_layer_ids=dst_lids,
                     )
                 else:
                     h = self._send_mamba_state(
@@ -2067,6 +2101,8 @@ class NixlKVManager(CommonKVManager):
                         dst_indices,
                         dst_gpu_id,
                         comp_notif,
+                        src_layer_ids=src_lids,
+                        dst_layer_ids=dst_lids,
                     )
             elif st in (
                 StateType.SWA,
@@ -2700,6 +2736,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_layer_ids = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_layer_ids", []) or [], "I"
+            )
 
             # Include staging allocator metadata if available
             if (
@@ -2740,6 +2779,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(dst_num_slots).encode("ascii"),
                         packed_kv_data_mem_kinds,
                         packed_kv_item_lens,
+                        packed_state_layer_ids,
                     ]
                 )
 
