@@ -297,6 +297,9 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
+DECODE_STEP_MAX_US = 2_000_000
+
+
 def _accumulate_decode_moment(
     totals: list[float],
     batch_size: int,
@@ -1865,6 +1868,7 @@ class Scheduler(
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -3650,18 +3654,23 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
-        span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
         if is_prefill:
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
             self.total_prefill_busy_us += span_us
             self.total_prefill_uncached_tokens += batch.extend_num_tokens
         else:
             batch_size = len(batch.reqs)
-            _accumulate_decode_moment(
-                self.decode_moment_totals,
-                batch_size,
-                span_us,
-                batch_size + result.num_correct_drafts,
-            )
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
