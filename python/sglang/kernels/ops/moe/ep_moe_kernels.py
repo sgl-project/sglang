@@ -446,6 +446,7 @@ def silu_and_mul_masked_post_quant_fwd(
             GEMM1_ALPHA=gemm1_alpha,
             GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
             E_PADDED=triton.next_power_of_2(E),
+            CONTIGUOUS=False,
             num_warps=1,
         )
         return
@@ -522,21 +523,26 @@ def _silu_and_mul_post_quant_packed_kernel(
     GEMM1_ALPHA: tl.constexpr,
     GEMM1_CLAMP_LIMIT: tl.constexpr,
     E_PADDED: tl.constexpr,
+    CONTIGUOUS: tl.constexpr,
 ):
     # Flat work dim rides axis 0 (x): num_real_tokens*topk can exceed the 65535 grid.y/z limit.
     work_id = tl.program_id(0)
     hidden_dim_block_index = tl.program_id(1)
 
-    e_off = tl.arange(0, E_PADDED)
-    mm = tl.load(masked_m_ptr + e_off, mask=e_off < num_experts, other=0)
-    incl = tl.cumsum(mm)
-    total = tl.sum(mm)
-    if work_id >= total:
-        return
-    excl = incl - mm  # first global slot of each expert
-    owner = (excl <= work_id) & (work_id < incl)
-    expert_id = tl.sum(tl.where(owner, e_off, 0))
-    token_index = work_id - tl.sum(tl.where(owner, excl, 0))
+    if CONTIGUOUS:
+        expert_id = 0
+        token_index = work_id
+    else:
+        e_off = tl.arange(0, E_PADDED)
+        mm = tl.load(masked_m_ptr + e_off, mask=e_off < num_experts, other=0)
+        incl = tl.cumsum(mm)
+        total = tl.sum(mm)
+        if work_id >= total:
+            return
+        excl = incl - mm  # first global slot of each expert
+        owner = (excl <= work_id) & (work_id < incl)
+        expert_id = tl.sum(tl.where(owner, e_off, 0))
+        token_index = work_id - tl.sum(tl.where(owner, excl, 0))
 
     stride_input_0 = tl.cast(stride_input_0, tl.int64)
     stride_input_1 = tl.cast(stride_input_1, tl.int64)
@@ -585,6 +591,63 @@ def _silu_and_mul_post_quant_packed_kernel(
         + token_index * stride_scale_m
     )
     tl.store(scale_ptr + scale_off, packed)
+
+
+def silu_and_mul_contig_post_quant_packed_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale_packed: torch.Tensor,
+    quant_group_size: int,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: float,
+):
+    """Fused alpha SwiGLU and packed UE8M0 quant for flat contiguous MoE."""
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert output.is_contiguous()
+    assert input.dim() == 2 and input.shape[-1] % 2 == 0
+
+    M, _ = input.shape
+    size_n = input.shape[-1] // 2
+    assert tuple(output.shape) == (M, size_n)
+    assert size_n % quant_group_size == 0
+    G = size_n // quant_group_size
+    assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
+    BLOCK_N = quant_group_size * 4
+    assert size_n % BLOCK_N == 0, (
+        "packed UE8M0 path requires size_n % (4*group) == 0"
+    )
+    assert tuple(output_scale_packed.shape) == (M, G // 4)
+    assert output_scale_packed.dtype == torch.int32
+
+    hidden_dim_split = size_n // BLOCK_N
+    scale_physical = output_scale_packed.transpose(0, 1).unsqueeze(0)
+    input_3d = input.unsqueeze(0)
+    output_3d = output.unsqueeze(0)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    grid = (M, hidden_dim_split)
+    _silu_and_mul_post_quant_packed_kernel[grid](
+        input_3d,
+        *input_3d.stride(),
+        output_3d,
+        *output_3d.stride(),
+        scale_physical,
+        *scale_physical.stride(),
+        output_scale_packed,
+        1,
+        size_n,
+        fp8_max,
+        -fp8_max,
+        QUANT_GROUP_SIZE=quant_group_size,
+        BLOCK_N=BLOCK_N,
+        GEMM1_ALPHA=gemm1_alpha,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+        E_PADDED=1,
+        CONTIGUOUS=True,
+        num_warps=1,
+    )
 
 
 @triton.jit
@@ -1395,6 +1458,99 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return output.t()[:m]
+
+
+@triton.jit
+def _bincount_atomic_kernel(
+    ids_ptr,
+    counts_ptr,
+    N,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    expert_range = tl.arange(0, BLOCK_K)
+    mask_k = expert_range < K
+
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    ids = tl.load(ids_ptr + offs_n, mask=mask_n, other=-1).to(tl.int32)
+    matches = (
+        (ids[:, None] == expert_range[None, :])
+        & mask_n[:, None]
+        & mask_k[None, :]
+    )
+    local_counts = tl.sum(matches.to(tl.int32), axis=0)
+    tl.atomic_add(counts_ptr + expert_range, local_counts, mask=mask_k)
+
+
+@triton.jit
+def _pad_and_sum_kernel(
+    counts_ptr,
+    padded_ptr,
+    total_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    expert_range = tl.arange(0, BLOCK_K)
+    mask_k = expert_range < K
+    counts = tl.load(counts_ptr + expert_range, mask=mask_k, other=0)
+    padded = ((counts + (BLOCK_E - 1)) // BLOCK_E) * BLOCK_E
+    padded_masked = tl.where(mask_k, padded, 0)
+    tl.store(padded_ptr + expert_range, padded_masked, mask=mask_k)
+    tl.store(total_ptr, tl.sum(padded_masked, axis=0))
+
+
+def fused_local_bincount_pad_sum(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    block_e: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    K = num_local_experts
+    flat = topk_ids.contiguous().view(-1)
+    N = flat.numel()
+    device = topk_ids.device
+
+    block_k = max(triton.next_power_of_2(K), 8)
+    preferred_tile_n = 128 if N <= 65536 else 256
+    tile_n = max(1, min(preferred_tile_n, 131072 // block_k))
+    counts = torch.zeros(K, dtype=torch.int32, device=device)
+    padded = torch.empty(K, dtype=torch.int32, device=device)
+    total = torch.empty((), dtype=torch.int32, device=device)
+
+    if N > 0:
+        _bincount_atomic_kernel[(triton.cdiv(N, tile_n),)](
+            flat,
+            counts,
+            N,
+            K=K,
+            BLOCK_N=tile_n,
+            BLOCK_K=block_k,
+        )
+    _pad_and_sum_kernel[(1,)](
+        counts,
+        padded,
+        total,
+        K=K,
+        BLOCK_K=block_k,
+        BLOCK_E=block_e,
+    )
+    return padded, total
+
+
+def standard_contig_all_tokens_upper_bound(
+    max_routed_slots: int,
+    num_local_experts: int,
+    block_e: int = 128,
+) -> int:
+    if max_routed_slots <= 0 or num_local_experts <= 0:
+        return 0
+
+    first_blocks = min(max_routed_slots, num_local_experts)
+    extra_blocks = (max_routed_slots - first_blocks) // block_e
+    return (first_blocks + extra_blocks) * block_e
 
 
 @triton.jit

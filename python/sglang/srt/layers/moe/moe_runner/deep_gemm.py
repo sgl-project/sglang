@@ -85,6 +85,23 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     return new_x.transpose(1, 2).contiguous().transpose(1, 2)
 
 
+def _quantize_bf16_standard_input_for_fp8(
+    hidden_states: torch.Tensor,
+    group_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    return sglang_per_token_group_quant_fp8(
+        hidden_states.contiguous(),
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+
 def copy_list_to_gpu_no_ce(arr: List[int]):
     from sgl_kernel.elementwise import copy_to_gpu_no_ce
 
@@ -202,11 +219,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
-        scale_block_size = 128
-
-        recipe_a, recipe_b = (
-            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
-        )
+        use_mxfp8 = quant_info.use_mxfp8
+        if use_mxfp8:
+            assert quant_info.block_shape is not None
+            recipe_a = tuple(quant_info.block_shape)
+            recipe_b = tuple(quant_info.block_shape)
+            scale_block_size = quant_info.block_shape[1]
+        elif quant_info.is_fp4_experts:
+            recipe_a, recipe_b = (1, 128), (1, 32)
+            scale_block_size = 128
+        else:
+            recipe_a, recipe_b = None, None
+            scale_block_size = 128
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -234,7 +258,64 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if (
+            self.config.gemm1_alpha is not None
+            and use_mxfp8
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            from sglang.kernels.ops.moe.ep_moe_kernels import (
+                silu_and_mul_contig_post_quant_packed_fwd,
+            )
+
+            assert self.config.gemm1_clamp_limit is not None
+            assert not self.config.gate_up_interleaved
+            down_input_fp8 = torch.empty(
+                (all_tokens, N // 2),
+                device=gateup_output.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                x_shape=(all_tokens, N // 2),
+                device=gateup_output.device,
+                group_size=scale_block_size,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+            )
+            silu_and_mul_contig_post_quant_packed_fwd(
+                gateup_output,
+                down_input_fp8,
+                down_input_scale,
+                scale_block_size,
+                self.config.gemm1_alpha,
+                self.config.gemm1_clamp_limit,
+            )
+            del gateup_output
+        elif self.config.gemm1_alpha is not None:
+            assert self.config.gemm1_clamp_limit is not None
+            assert not self.config.gate_up_interleaved
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                swiglu_no_interleaved_with_alpha_and_limit,
+            )
+
+            down_input = swiglu_no_interleaved_with_alpha_and_limit(
+                gateup_output.view(-1, N),
+                self.config.gemm1_alpha,
+                self.config.gemm1_clamp_limit,
+            ).contiguous()
+            del gateup_output
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
+        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -648,8 +729,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.DEEP_GEMM
 
 
-@register_pre_permute("standard", "deep_gemm")
-def pre_permute_standard_to_deep_gemm(
+def _pre_permute_standard_to_deep_gemm_masked(
     dispatch_output: StandardDispatchOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -709,8 +789,164 @@ def pre_permute_standard_to_deep_gemm(
     )
 
 
-@register_post_permute("deep_gemm", "standard")
-def post_permute_deep_gemm_to_standard(
+def _pre_permute_standard_to_deep_gemm_contig(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        ep_scatter,
+        fused_local_bincount_pad_sum,
+        standard_contig_all_tokens_upper_bound,
+    )
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+    topk_weights, topk_ids, _ = topk_output
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+
+    num_local_experts = runner_config.num_local_experts
+    K = hidden_states_shape[1]
+    block_e = 128
+
+    if quant_info.w13_weight.dtype == torch.bfloat16:
+        hidden_states_for_scatter = hidden_states.contiguous()
+        hidden_states_scale = None
+        input_dtype = torch.bfloat16
+        quant_block_size = 128
+    else:
+        assert quant_info.use_mxfp8, (
+            "standard DeepGEMM contiguous currently supports MXFP8 experts for "
+            "non-bf16 weights"
+        )
+        assert quant_info.block_shape is not None
+        quant_block_size = quant_info.block_shape[1]
+        hidden_states_for_scatter, hidden_states_scale = (
+            _quantize_bf16_standard_input_for_fp8(
+                hidden_states,
+                quant_block_size,
+            )
+        )
+        input_dtype = torch.float8_e4m3fn
+
+    padded_counts, all_tokens_t = fused_local_bincount_pad_sum(
+        topk_ids,
+        num_local_experts,
+        block_e=block_e,
+    )
+    if hidden_states_device.type == "cuda":
+        all_tokens = standard_contig_all_tokens_upper_bound(
+            topk_ids.numel(),
+            num_local_experts,
+            block_e=block_e,
+        )
+    else:
+        all_tokens = int(all_tokens_t.item())
+
+    input_tensor = torch.empty(
+        (all_tokens, K),
+        device=hidden_states_device,
+        dtype=input_dtype,
+    )
+    if hidden_states_scale is not None:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            scale_size = hidden_states_scale.shape[-1]
+            input_tensor_scale = torch.empty(
+                (scale_size, all_tokens),
+                device=hidden_states_device,
+                dtype=hidden_states_scale.dtype,
+            ).transpose(0, 1)
+        else:
+            input_tensor_scale = torch.empty(
+                (all_tokens, K // quant_block_size),
+                device=hidden_states_device,
+                dtype=hidden_states_scale.dtype,
+            )
+    else:
+        input_tensor_scale = torch.empty(
+            (1,),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+
+    m_indices = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    if hidden_states_device.type == "cuda":
+        m_indices.fill_(-1)
+    output_index = torch.empty_like(topk_ids, dtype=torch.int32)
+    expert_start_loc = torch.empty_like(padded_counts)
+
+    ep_scatter(
+        hidden_states_for_scatter,
+        hidden_states_scale,
+        topk_ids,
+        padded_counts,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        quant_block_size=quant_block_size,
+    )
+    dispose_tensor(hidden_states_for_scatter)
+    if hidden_states_scale is not None:
+        dispose_tensor(hidden_states_scale)
+    if hidden_states_for_scatter is not hidden_states:
+        dispose_tensor(hidden_states)
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["all_tokens"] = all_tokens
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+def _should_use_standard_contiguous_layout(runner_config: MoeRunnerConfig) -> bool:
+    return (
+        envs.SGLANG_ENABLE_DEEPGEMM_PURE_TP_CONTIGUOUS_MOE.get()
+        and runner_config.moe_ep_size <= 1
+    )
+
+
+@register_pre_permute("standard", "deep_gemm")
+def pre_permute_standard_to_deep_gemm(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    use_contig = _should_use_standard_contiguous_layout(runner_config)
+    running_state["use_contig"] = use_contig
+    if use_contig:
+        return _pre_permute_standard_to_deep_gemm_contig(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            running_state,
+        )
+    return _pre_permute_standard_to_deep_gemm_masked(
+        dispatch_output,
+        quant_info,
+        runner_config,
+        running_state,
+    )
+
+
+def _post_permute_deep_gemm_to_standard_masked(
     runner_output: DeepGemmRunnerOutput,
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -749,6 +985,61 @@ def post_permute_deep_gemm_to_standard(
 
     return StandardCombineInput(
         hidden_states=output,
+    )
+
+
+def _post_permute_deep_gemm_to_standard_contig(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> StandardCombineInput:
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    hidden_states_shape = running_state["hidden_states_shape"]
+    hidden_states_dtype = running_state["hidden_states_dtype"]
+    hidden_states_device = running_state["hidden_states_device"]
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+    output_index = running_state["output_index"]
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        output = torch.empty(
+            hidden_states_shape,
+            dtype=hidden_states_dtype,
+            device=hidden_states_device,
+        )
+    ep_gather(runner_output.hidden_states, topk_ids, topk_weights, output_index, output)
+    dispose_tensor(runner_output.hidden_states)
+
+    if runner_config.routed_scaling_factor is not None:
+        output *= runner_config.routed_scaling_factor
+
+    return StandardCombineInput(
+        hidden_states=output,
+    )
+
+
+@register_post_permute("deep_gemm", "standard")
+def post_permute_deep_gemm_to_standard(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> StandardCombineInput:
+    if running_state["use_contig"]:
+        return _post_permute_deep_gemm_to_standard_contig(
+            runner_output,
+            quant_info,
+            runner_config,
+            running_state,
+        )
+    return _post_permute_deep_gemm_to_standard_masked(
+        runner_output,
+        quant_info,
+        runner_config,
+        running_state,
     )
 
 
