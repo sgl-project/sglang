@@ -60,6 +60,7 @@ jobs:
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/ascend/**"
+              - "test/registered/unit/npu/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
@@ -88,6 +89,46 @@ jobs:
         run: |
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
           echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+
+  stage-a-unit-test-npu:
+    needs: [check-changes, pr-gate, set-image-config]
+    if: needs.check-changes.outputs.main_package == 'true'
+    runs-on: linux-aarch64-a2-1
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
+      - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local:8082"
+        run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.trusted-host "${CACHING_URL}"
+
+          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
+
+      - name: Run test
+        timeout-minutes: 15
+        env:
+          SGLANG_IS_IN_CI: true
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite stage-a-unit-test-npu
 
   stage-b-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
@@ -439,6 +480,7 @@ jobs:
       [
         check-changes,
 
+        stage-a-unit-test-npu,
         stage-b-test-1-npu-a2,
         stage-b-test-2-npu-a2,
         stage-b-test-4-npu-a3,
