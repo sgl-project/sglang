@@ -57,7 +57,7 @@ class DecodeKVCacheOffloadManager:
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = get_mha_host_pool_cls(kv_cache)(
                 kv_cache,
-                server_args.hicache_ratio,
+                server_args.resolved_kv_hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
@@ -65,7 +65,7 @@ class DecodeKVCacheOffloadManager:
         elif isinstance(kv_cache, MLATokenToKVPool):
             self.decode_host_mem_pool = MLATokenToKVPoolHost(
                 kv_cache,
-                server_args.hicache_ratio,
+                server_args.resolved_kv_hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
