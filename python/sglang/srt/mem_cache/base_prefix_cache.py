@@ -236,6 +236,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
+    def release_host_resources(self) -> None:
+        """Release pinned host buffers in userspace on graceful shutdown.
+
+        Kernel-side unpinning during process reclaim can stall teardown for
+        tens of seconds (see HostKVCache.destroy). Idempotent.
+        """
+
     @abstractmethod
     def reset(self):
         pass

@@ -22,7 +22,7 @@ from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
 )
 
-from sglang.jit_kernel.timestep_embedding import (
+from sglang.kernels.ops.diffusion.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn

@@ -39,7 +39,7 @@ import unittest
 
 import torch
 
-from sglang.jit_kernel.kda_fused_decode import _CONV_DIM, _CONV_STATE_W, _H, _SEG, covered
+from sglang.kernels.ops.attention.kda_fused_decode import _CONV_DIM, _CONV_STATE_W, _H, _SEG, covered
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,

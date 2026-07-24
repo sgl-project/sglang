@@ -8,6 +8,8 @@ metatags:
 This page focuses on optimal configuration and benchmark results for Qwen3.6-35B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.6-35B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_35b_a3b).
 
 On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
+
+Use image **SGLang `>= v0.5.14`** for these NEXTN configurations. Without `--dataset-path`, `bench_serving --dataset-name random` downloads ShareGPT from Hugging Face; in offline environments, pass a local dataset path (for example a ShareGPT JSON file).
 </Note>
 
 ### Low Latency
@@ -120,6 +122,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -217,6 +220,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -316,6 +320,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -410,6 +415,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -507,6 +513,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -604,6 +611,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -803,6 +811,7 @@ We tested it based on the `RANDOM` dataset.
 ```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
+    --dataset-path /path/to/dataset \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \

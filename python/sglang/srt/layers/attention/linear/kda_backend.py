@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.jit_kernel import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -914,7 +914,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 

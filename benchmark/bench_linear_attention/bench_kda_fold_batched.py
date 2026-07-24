@@ -17,7 +17,7 @@ Usage: python bench_kda_fold_batched.py
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
     commit_kda_replayssm_spec,
     commit_kda_replayssm_spec_all_layers,

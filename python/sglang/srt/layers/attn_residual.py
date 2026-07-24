@@ -76,7 +76,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.jit_kernel.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon

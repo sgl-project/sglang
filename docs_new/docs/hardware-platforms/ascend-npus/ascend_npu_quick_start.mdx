@@ -40,7 +40,7 @@ at least **30GB** of free space. If you need to download model weights, check th
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`)
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.14-cann9.0.0-a3`)
 if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
@@ -52,7 +52,7 @@ adding `--volume /path/to/model:/path/to/model` to the `docker run` command belo
 
 ```shell Command
 # Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3       # Stable release
+export IMAGE=quay.io/ascend/sglang:v0.5.14-cann9.0.0-a3              # Stable release
 # export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
@@ -77,7 +77,7 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 
 ```shell Command
 # Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b       # Stable release
+export IMAGE=quay.io/ascend/sglang:v0.5.14-cann9.0.0-910b             # Stable release
 # export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \

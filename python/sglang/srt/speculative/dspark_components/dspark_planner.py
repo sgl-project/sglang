@@ -7,6 +7,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+    ScheduleVerifyLensTopk,
+    compute_sort_survival,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -30,10 +34,6 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
-)
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
-    ScheduleVerifyLensTopk,
-    compute_sort_survival,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,

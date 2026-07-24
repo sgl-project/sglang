@@ -1,11 +1,11 @@
 """K3 fused o_proj GEMM+AR dispatch (``SGLANG_K3_GEMM_AR``).
 
-Glue between the model and ``jit_kernel.kimi_k3.gemm_ar``: lazily allocates
+Glue between the model and ``kernels.ops.kimi_k3.gemm_ar``: lazily allocates
 the P2P comm region on the TP group and swaps the o_proj RowParallelLinear
 forward for the single fused GEMM+all-reduce kernel at decode shapes
 (falling through to the regular GEMM + AR path whenever the input doesn't
 fit — prefill, capture, non-2D input). Eager-mode only; see
-jit_kernel/kimi_k3/GEMM_AR_README.md.
+kernels/ops/kimi_k3/GEMM_AR_README.md.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     ready-to-launch path."""
     if not _init():
         return
-    from sglang.jit_kernel.kimi_k3 import gemm_ar as mod
+    from sglang.kernels.ops.kimi_k3 import gemm_ar as mod
     from sglang.srt.distributed import (
         get_tensor_model_parallel_rank,
         get_tensor_model_parallel_world_size,

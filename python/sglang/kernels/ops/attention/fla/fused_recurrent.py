@@ -359,7 +359,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     # [BV, K] register tile per warp. ULP-level output differences only
     # (reduction order); small batches keep triton (launch-bound anyway).
     if use_qk_l2norm_in_kernel:
-        from sglang.jit_kernel import kda_packed_decode as kda_decode_cuda
+        from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(
             mixed_qkv,
@@ -661,7 +661,7 @@ def fused_recurrent_kda_packed_decode(
     # [BV, K] register tile per warp. ULP-level output differences only
     # (reduction order); small batches keep triton (launch-bound anyway).
     if use_qk_l2norm_in_kernel:
-        from sglang.jit_kernel import kda_packed_decode as kda_decode_cuda
+        from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(
             mixed_qkv,

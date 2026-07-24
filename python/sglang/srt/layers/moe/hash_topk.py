@@ -190,7 +190,7 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.dsv4 import hash_topk
+            from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,

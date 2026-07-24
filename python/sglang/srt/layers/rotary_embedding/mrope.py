@@ -33,7 +33,7 @@ _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu

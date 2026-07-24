@@ -18,7 +18,7 @@ Usage: python bench_kda_verify_ringwrite.py
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
+from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )

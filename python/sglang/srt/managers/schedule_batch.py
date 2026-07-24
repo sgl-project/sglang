@@ -2618,6 +2618,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        """Reclaim evictable tree-cache entries (shortfall only), then report
+        whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
@@ -2626,13 +2628,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
-        sorted_indices = self._get_decode_retraction_order(
-            self.reqs,
-            server_args,
-            allow_policy_sort=(
-                self.spec_algorithm is None or self.spec_algorithm.is_none()
-            ),
-        )
+        sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
         first_iter = True
@@ -2680,7 +2676,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @staticmethod
     def _get_decode_retraction_order(
-        reqs: List[Req], server_args: ServerArgs, *, allow_policy_sort: bool
+        reqs: List[Req], server_args: ServerArgs
     ) -> List[int]:
         """Return indices ordered from most-preferred to least-preferred to keep.
 
@@ -2690,11 +2686,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = list(range(len(reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
-        # For spec decoding, filter_batch API can only filter requests from the
-        # back, so we can only retract from the back.
-        # TODO(sang): Clean up finish path and support better retract policy.
-        if not allow_policy_sort:
-            return sorted_indices
 
         def length_key(req: Req) -> Tuple[int, int]:
             return (len(req.output_ids), -len(req.origin_input_ids))
@@ -2995,7 +2986,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=False,
                 new_indices_cpu=keep_indices,
             )
 

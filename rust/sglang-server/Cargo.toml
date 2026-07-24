@@ -1,0 +1,40 @@
+[package]
+name = "sglang-server"
+description = "Sglang server in rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Consumed by python/setup.py: registers this crate as a PyO3 extension module.
+[package.metadata.sglang]
+python-module = "sglang.srt.server._core"
+
+[lib]
+name = "sglang_server"
+# cdylib: the pyo3 module imported by the (embedded) Python scheduler process.
+# rlib:   so optional standalone bins / integration tests can link the core.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-stream = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+pyo3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+uuid = { workspace = true }
+
+axum = { version = "0.8.9", features = ["json", "tokio"] }
+core_affinity = "0.8"
+# the dynamo-tokenizers is deps on hf-hub, should bump version together
+dynamo-tokenizers = "1.5.3"
+flume = "0.12.0"
+hf-hub = { version = "0.4", default-features = false }
+regex-syntax = "0.8"
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }

@@ -83,7 +83,7 @@ class LlamaForClassification(nn.Module):
             elif "lm_head" in name:
                 continue
             else:
-                LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
+                LlamaForCausalLM._legacy_load_weights(self, [(name, loaded_weight)])
 
 
 EntryClass = LlamaForClassification

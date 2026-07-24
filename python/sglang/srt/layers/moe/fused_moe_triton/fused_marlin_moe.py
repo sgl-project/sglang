@@ -14,8 +14,8 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
-    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 @triton.jit
@@ -246,7 +246,7 @@ def fused_marlin_moe(
     if M == 1 and topk <= 32 and expert_map is None:
         # Single-token decode: top-k ids are distinct, so alignment is a
         # single-warp sort instead of the align + count_and_sort kernel pair.
-        from sglang.jit_kernel.moe_align_single_token import moe_align_single_token
+        from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
             topk_ids, block_size_m
@@ -403,7 +403,7 @@ def fused_marlin_moe(
             and output.is_contiguous()
             and intermediate_cache3.shape[-1] % 8 == 0
         ):
-            from sglang.jit_kernel.moe_topk_sum import moe_topk_sum
+            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 
             moe_topk_sum(intermediate_cache3, output)
         else:

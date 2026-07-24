@@ -155,7 +155,9 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
-                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    _is_fa3_supported,
+                )
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )

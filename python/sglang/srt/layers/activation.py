@@ -61,22 +61,32 @@ if _is_cuda:
     from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
     from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
 
-    from sglang.jit_kernel.activation import gelu_and_mul as _jit_gelu_and_mul
-    from sglang.jit_kernel.activation import gelu_tanh_and_mul as _jit_gelu_tanh_and_mul
-    from sglang.jit_kernel.activation import relu2
-    from sglang.jit_kernel.activation import silu_and_mul as _jit_silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul as _jit_gelu_and_mul,
+    )
+    from sglang.kernels.ops.activation.activation import (
+        gelu_tanh_and_mul as _jit_gelu_tanh_and_mul,
+    )
+    from sglang.kernels.ops.activation.activation import (
+        relu2,
+    )
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul as _jit_silu_and_mul,
+    )
 
-    # The jit act-and-mul kernels assert the per-rank hidden size is a multiple of
-    # kMaxVecBytes (32B on SM100+, else 16B); route unaligned shapes to sgl_kernel
-    # (e.g. DeepSeek-V2-Lite dense 10944/8=1368 at tp8, 1368 % 16 != 0).
+    # The jit act-and-mul kernel requires the per-rank hidden size to be a
+    # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
+    # RuntimeCheck "hidden size must be divisible by vector size" in
+    # kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
+    # sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
+    # tp8, 1368 % 16 != 0).
     _jit_act_max_vec_bytes: Optional[int] = None
 
     def _jit_act_supported(out: torch.Tensor) -> bool:
         global _jit_act_max_vec_bytes
         if _jit_act_max_vec_bytes is None:
-            from sglang.jit_kernel.utils import get_jit_cuda_arch
-
-            _jit_act_max_vec_bytes = 32 if get_jit_cuda_arch().major >= 10 else 16
+            major, _ = torch.cuda.get_device_capability()
+            _jit_act_max_vec_bytes = 32 if major >= 10 else 16
         return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
 
     def _act_and_mul(jit_fn, sgl_fn, input: torch.Tensor, out=None) -> torch.Tensor:
@@ -194,7 +204,7 @@ class SituAndMul(MultiPlatformOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        from sglang.jit_kernel.kimi_k3.activation import situ_and_mul
+        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
 
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 

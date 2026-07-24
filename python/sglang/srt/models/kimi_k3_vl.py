@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.jit_kernel.vision_rope import (
+from sglang.kernels.ops.attention.vision_rope import (
     apply_fused_qk_complex_rope,
     precompile_fused_qk_complex_rope,
 )
@@ -60,7 +60,7 @@ def _get_mm_attention_backend() -> str:
 
 def _is_fa4_available() -> bool:
     try:
-        from sglang.jit_kernel.flash_attention_v4 import (
+        from sglang.kernels.ops.attention.flash_attention_v4 import (
             is_flash_attention_v4_available,
         )
     except ImportError:

@@ -19,6 +19,7 @@ _GROUPS = (
     "attention",
     "communication",
     "diffusion",
+    "elementwise",
     "embeddings",
     "gemm",
     "grammar",
@@ -30,8 +31,9 @@ _GROUPS = (
     "moe",
     "quantization",
     "sampling",
-    "spatial",
     "speculative",
+    "lplb",
+    "kv_canary",
 )
 
 for _group in _GROUPS:

@@ -1,7 +1,7 @@
 ﻿name: Nightly Test (NPU)
 on:
   schedule:
-    - cron: '0 18 * * *'  # Execute at 2:00 a.m. Beijing Time every day
+    - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
   pull_request:
     branches:
       - main

@@ -1293,7 +1293,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 if x.shape[-1] == self.hidden_size:
-                    from sglang.jit_kernel.per_token_group_quant import (
+                    from sglang.kernels.ops.quantization.per_token_group_quant import (
                         per_token_group_quant,
                     )
 
@@ -1359,14 +1359,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # silently computes the wrong activation). Routing must also
                 # be noaux_tc (sigmoid + correction bias, DeepSeekV3 method),
                 # not the renormalize-softmax default below.
-                from sglang.jit_kernel import trtllm_gen_moe as situ_moe
+                from sglang.kernels.ops.moe import trtllm_gen_moe as situ_moe
 
                 if not situ_moe.available():
                     raise RuntimeError(
                         "activation='situ' with the flashinfer_mxfp4 runner "
                         "needs the private SiTU cubin pool: set "
                         "SGLANG_TRTLLM_GEN_MOE_SDK (see "
-                        "sglang/jit_kernel/trtllm_gen_moe.py)."
+                        "sglang/kernels/ops/moe/trtllm_gen_moe.py)."
                     )
                 # EP is cubin-internal: each rank computes its local expert slice
                 # [offset, +num_local) and the caller all-reduces. ep=1 -> TP path.

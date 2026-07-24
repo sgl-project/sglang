@@ -143,7 +143,7 @@ def _k3_bf16_gemm(
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
         if get_bf16_gemm_backend().is_cutedsl():
-            from sglang.jit_kernel.cutedsl_bf16_gemm import (
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 cutedsl_bf16_gemm,
                 use_cutedsl_bf16_gemm,
             )
@@ -160,7 +160,7 @@ def _k3_bf16_gemm(
 
 
 # Fully fused KDA decode step (conv1d + delta rule + gated RMSNorm in one
-# kernel, jit_kernel/kda_fused_decode). The model hands the output-norm gate
+# kernel, kernels/ops/attention/kda_fused_decode). The model hands the output-norm gate
 # to the KDA backend via an attempt-and-verify stash on the attention layer;
 # unconsumed stashes fall back to the unfused chain + o_norm here.
 
@@ -308,7 +308,7 @@ def _add3(
     True when their producers are at least two kernels back."""
     if c is None:
         return a + b
-    from sglang.jit_kernel import add3
+    from sglang.kernels.ops.elementwise import add3
 
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
@@ -586,7 +586,7 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
+        from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
@@ -1250,7 +1250,7 @@ class KimiK3DeltaAttention(nn.Module):
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
-        (jit_kernel/kda_fused_decode): per-segment transposed fp32 conv
+        (kernels/ops/attention/kda_fused_decode): per-segment transposed fp32 conv
         weights [4, seg], dense fp32 conv bias, fp32 output-norm weight. Stashed on the
         attention layer for the KDA backend; when the shapes do not match
         the compiled kernel the stash stays unset and decode keeps the
@@ -1305,7 +1305,7 @@ class KimiK3DeltaAttention(nn.Module):
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
-                from sglang.jit_kernel.kimi_k3 import kimi_k3_tiny_gemm as gemm
+                from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
 
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
@@ -1495,7 +1495,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         if precomputed is not None
                         else self.g_proj(gate_input)[0]
                     )
-                    from sglang.jit_kernel.kimi_k3 import mla_output_gate
+                    from sglang.kernels.ops.kimi_k3 import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
                         # One kernel for x * sigmoid(gate); double rounding

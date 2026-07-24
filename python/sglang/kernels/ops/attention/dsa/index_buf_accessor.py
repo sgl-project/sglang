@@ -639,6 +639,9 @@ def _get_k_and_s_triton_kernel(
     k_offsets = thread_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
     seq_len = tl.load(seq_len_ptr + batch_id)
+    # Grid axis 1 spans the batch-max seq len; fully-masked blocks store nothing.
+    if block_token_start >= seq_len:
+        return
     token_valid_mask = token_ids < seq_len
 
     pre_batch_idx = tl.arange(0, seq_len_num_pow)

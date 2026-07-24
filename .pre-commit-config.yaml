@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/jit_kernel/flash_attention/cute)
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -116,6 +116,21 @@ repos:
         entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
         language: system
         files: ^experimental/sgl-router/.*\.rs$
+        pass_filenames: false
+      - id: clippy-rust-workspace
+        name: clippy rust/ workspace (auto-fix)
+        # Two steps: apply machine-applicable fixes, then fail on anything left
+        # (combining --fix with -D warnings can abort the fix phase). protoc is
+        # not required: sglang-grpc's build.rs falls back to a vendored binary.
+        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings'
+        language: system
+        files: ^rust/.*\.rs$
+        pass_filenames: false
+      - id: rustfmt-rust-workspace
+        name: rustfmt rust/ workspace
+        entry: bash -c 'cd rust && cargo fmt'
+        language: system
+        files: ^rust/.*\.rs$
         pass_filenames: false
       - id: mint-broken-links
         name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)

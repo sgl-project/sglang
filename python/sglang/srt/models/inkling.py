@@ -72,7 +72,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -625,7 +625,9 @@ class InklingCausalLLM(nn.Module):
             and sconv0 is not None
             and world in (4, 8)  # symm-mem multimem worlds, power-of-two
         ):
-            from sglang.jit_kernel.inkling_ar_fused import compile_inkling_ar_sconv_norm
+            from sglang.kernels.ops.communication.inkling_ar_fused import (
+                compile_inkling_ar_sconv_norm,
+            )
 
             for do_track in (False, True):
                 compile_inkling_ar_sconv_norm(
@@ -644,12 +646,12 @@ class InklingCausalLLM(nn.Module):
         # local/SWA layer (head_dim != 128) that never uses the prologue while
         # later full-attention layers do.
         if is_cuda() and envs.SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE.get():
-            from sglang.jit_kernel.inkling_attn_prologue import (
+            from sglang.kernels.ops.attention.inkling_attn_prologue import (
                 compile_inkling_attn_prologue,
             )
 
             warmed: set = set()
-            warm_mxfp8 = get_server_args().kv_cache_dtype == "mxfp8"
+            warm_mxfp8 = get_model().kv_cache_dtype == "mxfp8"
             for layer in self.layers:
                 attn = layer.attn
                 ks = attn.k_sconv

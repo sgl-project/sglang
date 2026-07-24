@@ -445,7 +445,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
-    from sglang.jit_kernel.trtllm_gen_moe import available as _trtllm_gen_moe_ok
+    from sglang.kernels.ops.moe.trtllm_gen_moe import available as _trtllm_gen_moe_ok
 
     if _trtllm_gen_moe_ok():
         logger.info(
@@ -1882,6 +1882,16 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         if page_size not in [16, 32, 64]:
             logger.warning(
                 f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {page_size} to 64."
+            )
+            page_size = 64
+    if (
+        view.attention_backend == "hpc_ops"
+        or view.decode_attention_backend == "hpc_ops"
+        or view.prefill_attention_backend == "hpc_ops"
+    ):
+        if page_size != 64:
+            logger.warning(
+                f"HPC-Ops attention only supports a page_size of 64, changing page_size from {page_size} to 64."
             )
             page_size = 64
     if page_size != view.page_size:

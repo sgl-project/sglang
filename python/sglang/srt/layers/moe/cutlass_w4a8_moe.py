@@ -18,14 +18,10 @@ if _is_cuda_alike:
     )
 
 if _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import silu_and_mul
 else:
     from sgl_kernel import silu_and_mul
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
-    per_tensor_quant_fp8,
-)
 from sglang.kernels.ops.moe.ep_moe_kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
@@ -38,6 +34,10 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
+)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+    per_tensor_absmax_fp8,
+    per_tensor_quant_fp8,
 )
 
 

@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.quantization import per_token_group_quant
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -58,7 +58,9 @@ _is_musa = is_musa()
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul as _legacy_silu_and_mul,
+    )
 elif _is_musa:
     _silu_and_mul_musa = torch.nn.SwishGLU()
 else:
@@ -187,7 +189,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -1099,7 +1101,7 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.jit_kernel.kimi_k3 import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.kimi_k3 import situ_and_mul_masked_post_quant
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2

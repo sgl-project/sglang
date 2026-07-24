@@ -1,6 +1,6 @@
 """K3 MNNVL fused all-reduce dispatch (``SGLANG_K3_AR_FUSION``).
 
-Glue between the model and the ``jit_kernel.kimi_k3.all_reduce`` kernels,
+Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels,
 mirroring the NCCL-window design (pool + registered segments + find-window
 dispatch), but backed by torch symmetric memory:
 
@@ -84,7 +84,7 @@ def _init_state() -> Optional[_State]:
             "is unavailable; falling back to the regular all-reduce path."
         )
         return None
-    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     mod.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
     _STATE = _State(comm, comm.world_size, group.cpu_group.group_name)
@@ -160,7 +160,7 @@ def all_reduce(
     Call-site contract (see module docstring): the state is initialized,
     ``x`` is bf16 and contiguous, and large inputs live in the symm pool.
     """
-    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     state = _STATE
     assert state is not None
@@ -193,7 +193,7 @@ def all_reduce_low_sm(
     is meant to overlap. ``x`` must live in the symm pool at ANY size.
     ``num_blocks`` / ``unroll`` default to the tuned tables when None.
     """
-    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     state = _STATE
     assert state is not None
@@ -224,7 +224,7 @@ def all_reduce_norm(
     latent|shared buffer viewed as ``[3N, NORM_DIM]`` with ``num_tokens =
     N``). Same dispatch and call-site contract as :func:`all_reduce`.
     """
-    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     state = _STATE
     assert state is not None
@@ -266,7 +266,7 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
     (:func:`gemm_ag_up_proj`) covers this decode batch: TP8, the batch is
     within the kernel's win range, one [num_tokens, 896] staging slice fits
     a push slot, and the phase-counter array covers both launch grids."""
-    from sglang.jit_kernel.kimi_k3 import gemm_ag as mod
+    from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
     state = _STATE
     assert state is not None
@@ -292,7 +292,7 @@ def gemm_ag_up_proj(
     ``b`` / ``c`` the [T, 7168] addends. Caller checked
     :func:`gemm_ag_up_fits`; same call-site contract as
     :func:`all_reduce`."""
-    from sglang.jit_kernel.kimi_k3 import gemm_ag as mod
+    from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
     state = _STATE
     assert state is not None
@@ -319,7 +319,7 @@ def finalize_all_reduce_push_norm(
     row; ``out`` ([T, NORM_DIM] bf16) is output-only. Caller checked
     :func:`finalize_push_fits`; same call-site contract as
     :func:`all_reduce`."""
-    from sglang.jit_kernel.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     state = _STATE
     assert state is not None

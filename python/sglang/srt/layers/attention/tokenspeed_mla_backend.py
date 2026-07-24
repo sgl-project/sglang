@@ -33,12 +33,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
-from sglang.jit_kernel.fp8_quantize import fp8_quantize
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_mla_kv_page_table_for_dcp,
+)
+from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
 )
 from sglang.kernels.ops.attention.utils import (
     mla_quantize_and_rope_for_fp8,
@@ -48,6 +49,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,

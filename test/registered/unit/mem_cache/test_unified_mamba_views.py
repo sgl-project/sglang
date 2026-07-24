@@ -297,7 +297,7 @@ def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
     num_k_heads == num_heads, head_k_dim == head_dim — see
     ``models/kimi_linear.py``), temporal/SSM state ``(HV, V, K)``.
     ``heads_per_rank`` = 96 total KDA heads / attn_tp (12 at the TP8
-    deployment shape, cf. ``jit_kernel/kda_fused_decode.py``)."""
+    deployment shape, cf. ``kernels/ops/attention/kda_fused_decode.py``)."""
     h = heads_per_rank
     return dict(
         layer_num=69,

@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,

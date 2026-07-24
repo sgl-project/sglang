@@ -540,7 +540,9 @@ def causal_conv1d(
         and D % 2 == 0
         and x.stride(1) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import causal_conv1d as _cuda_causal_conv1d
+        from sglang.kernels.ops.mamba.inkling_sconv import (
+            causal_conv1d as _cuda_causal_conv1d,
+        )
 
         return _cuda_causal_conv1d(
             x,
@@ -715,7 +717,7 @@ def update_sconv_cache(
         and x.stride(-1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             update_sconv_cache as _cuda_update_sconv_cache,
         )
 
@@ -970,7 +972,7 @@ def fused_causal_conv1d_update_decode(
         and x.stride(1) == 1
         and sconv_cache.stride(2) == 1
     ):
-        from sglang.jit_kernel.inkling_sconv import (
+        from sglang.kernels.ops.mamba.inkling_sconv import (
             fused_causal_conv1d_update_decode as _cuda_fused_decode,
         )
 
