@@ -230,6 +230,30 @@ class DataParallelController:
             if worker is not None:
                 sock_send(worker, obj)
 
+    def maybe_mark_dead_schedulers_inactive(self) -> None:
+        if self.server_args.elastic_ep_backend is None:
+            return
+
+        for tp_rank, proc in enumerate(self.scheduler_procs):
+            if proc.exitcode is None:
+                continue
+            _, _, dp_rank, _ = compute_dp_attention_world_info(
+                self.server_args.enable_dp_attention,
+                tp_rank,
+                self.server_args.tp_size,
+                self.server_args.dp_size,
+                self.server_args.attn_cp_size,
+            )
+            if not self.status[dp_rank]:
+                continue
+            logger.warning(
+                "[Elastic EP][DPC] scheduler TP%d/DP%d exited; marking inactive",
+                tp_rank,
+                dp_rank,
+            )
+            self.status[dp_rank] = False
+            self._refresh_active_workers()
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if self.server_args.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
@@ -795,6 +819,7 @@ class DataParallelController:
 
     def event_loop(self):
         while True:
+            self.maybe_mark_dead_schedulers_inactive()
             while True:
                 self.soft_watchdog.feed()
                 try:
