@@ -881,7 +881,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 or NVFP4 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
 
 Example (BF16 to MXFP4 requantization):
 
@@ -891,7 +891,24 @@ sglang serve --model-path Qwen/Qwen3-30B-A3B \
     --quantization quark_mxfp4
 ```
 
-The option `--quantization quark_mxfp4` also supports converting FP8 dense and MOE models to MXFP4, following this logic:
+#### Online NVFP4 to MXFP4 Requantization
+
+The option `--quantization quark_mxfp4` supports converting NVFP4 checkpoints (e.g. `nvidia/Kimi-K2.6-NVFP4`) to MXFP4 at load time to allow efficient inference using supported AMD hardware (gfx95x+):
+
+- The quantization metadata of the source NVFP4 checkpoint is read from either `config.json` (`quantization_config`) or a standalone `hf_quant_config.json`;
+- Producer-declared excluded modules will remain in higher precision;
+- NVFP4 checkpoints with mixed precision (`"quant_algo": "MIXED_PRECISION"`, e.g. `nvidia/Qwen3.5-397B-A17B-NVFP4-V2`) are also supported.
+
+Example (NVFP4 to MXFP4 requantization):
+
+```bash
+sglang serve --model-path nvidia/Kimi-K2.6-NVFP4 \
+    --tensor-parallel-size 4 \
+    --quantization quark_mxfp4 \
+```
+#### Online FP8 to MXFP4 Requantization
+
+The option `--quantization quark_mxfp4` supports converting FP8 dense and MOE models to MXFP4, following this logic:
 
 1. Load an FP8 weight tensor,
 2. Dequantize it to BF16,

@@ -231,6 +231,9 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+REQUANTIZATION_METHODS = ["quark_mxfp4"]
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -1408,15 +1411,18 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            # Detect which checkpoint is it. An explicit online-requantization
+            # request (e.g. quark_mxfp4 on top of an NVFP4/mixed checkpoint)
+            # must not be overridden back to the source format
+            if self.quantization not in REQUANTIZATION_METHODS:
+                for _, method in QUANTIZATION_METHODS.items():
+                    quantization_override = method.override_quantization_method(
+                        quant_cfg, self.quantization
+                    )
+                    if quantization_override:
+                        quant_method = quantization_override
+                        self.quantization = quantization_override
+                        break
 
             # Verify quantization configurations.
             if self.quantization is None:

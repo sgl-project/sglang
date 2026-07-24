@@ -2,7 +2,8 @@
 
 import fnmatch
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+import re
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import torch
 
@@ -25,7 +26,11 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
-from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
+from sglang.srt.layers.quantization.quark.utils import (
+    Nvfp4SourceConfig,
+    deep_compare,
+    should_ignore_layer,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
@@ -36,6 +41,209 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
+
+
+def _parse_nvfp4_excludes(hf_quant_config: Dict[str, Any]) -> List[str]:
+    """Extract NVFP4 producer-declared excludes as `re:` patterns.
+
+    Reads the producer-specific key:
+      - `ignore`          - ModelOpt (config.json)
+      - `exclude_modules` - ModelOpt hf_quant_config.json
+      - `exclude`         - AMD Quark export
+
+    Entries are usually fnmatch-style (literal strings work too), but ModelOpt
+    `ignore` lists may already carry `re:`-prefixed regexes (e.g.
+    `re:.*linear_attn\\.in_proj_a$`); those are passed through untouched.
+    Wrapping an already-`re:` entry with another `re:` + `fnmatch.translate`
+    yields a pattern that never matches, silently un-excluding the layer.
+    Returns [] if no key present.
+    """
+    pats = (
+        hf_quant_config.get("ignore")
+        or hf_quant_config.get("exclude_modules")
+        or hf_quant_config.get("exclude")
+        or []
+    )
+    return [p if p.startswith("re:") else "re:" + fnmatch.translate(p) for p in pats]
+
+
+def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"]:
+    """Return an Nvfp4SourceConfig if `config` (the checkpoint's
+    quantization_config dict) describes a supported NVFP4 source, else None.
+
+    Handles two producers:
+      - ModelOpt:  quant_method in {modelopt, modelopt_fp4, nvfp4}
+                   with quant_algo NVFP4/FP4 (or unspecified).
+      - AMD Quark: quant_method == "quark". global_quant_config.weight is a
+                   2-element list [fp4_per_group_gs16, fp8_e4m3_per_tensor].
+
+    compressed-tensors NVFP4 is not supported at this time.
+    """
+    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+
+    quant_method = config.get("quant_method", "")
+    quant_algo = (config.get("quant_algo") or "").upper()
+
+    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in (
+        "",
+        "NVFP4",
+        "FP4",
+    ):
+        return Nvfp4SourceConfig()
+    if quant_method == "quark":
+        gqc = config.get("global_quant_config", {})
+        weight = gqc.get("weight")
+        if not (isinstance(weight, list) and len(weight) == 2):
+            return None
+        w0, w1 = weight
+        is_nvfp4_weight = (
+            isinstance(w0, dict)
+            and w0.get("dtype") == "fp4"
+            and w0.get("qscheme") == "per_group"
+            and w0.get("group_size") == 16
+            and not w0.get("is_dynamic")
+        )
+        is_nvfp4_scale_2 = (
+            isinstance(w1, dict)
+            and w1.get("dtype") == "fp8_e4m3"
+            and w1.get("qscheme") == "per_tensor"
+            and not w1.get("is_dynamic")
+        )
+        if is_nvfp4_weight and is_nvfp4_scale_2:
+            return Nvfp4SourceConfig()
+        return None
+    if quant_method in ("compressed-tensors", "compressed_tensors"):
+        raise NotImplementedError(
+            "Online MXFP4 requantization from compressed-tensors NVFP4 "
+            "checkpoints is not supported at this time."
+        )
+    return None
+
+
+# Target quant specs used when synthesizing a per-layer config for a
+# MIXED_PRECISION source. The MXFP4 spec is the online-requant target shape
+# recognized by `_is_mx_fp4`; the FP8 spec is the per-tensor W8A8 shape
+# recognized by `_is_fp8_w8a8` (no requantization).
+_MXFP4_TARGET_SPEC: Dict[str, Any] = {
+    "weight": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": False,
+        "scale_format": "e8m0",
+    },
+    "input_tensors": {
+        "dtype": "fp4",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+        "scale_format": "e8m0",
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+_FP8_PER_TENSOR_SPEC: Dict[str, Any] = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_tensor",
+        "is_dynamic": False,
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_tensor",
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+def _mixed_precision_layer_map(config: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return {layer_name: quant_algo} for a MIXED_PRECISION source, else None.
+
+    Reads ModelOpt's per-layer `quantized_layers` map (from
+    hf_quant_config.json or config.json's quantization_config). Only the
+    quant_algo string per layer is needed;
+    """
+    if (config.get("quant_algo") or "").upper() != "MIXED_PRECISION":
+        return None
+    quantized_layers = config.get("quantized_layers")
+    if not isinstance(quantized_layers, dict) or not quantized_layers:
+        return None
+    layer_map: Dict[str, str] = {}
+    for name, info in quantized_layers.items():
+        if isinstance(info, dict):
+            layer_map[name] = str(info.get("quant_algo", "")).upper()
+    return layer_map
+
+
+def _build_mixed_precision_layer_quant_config(
+    layer_map: Dict[str, str],
+) -> tuple[Dict[str, Any], bool]:
+    """Collapse a per-layer {name: quant_algo} map into a compact
+    `layer_quant_config` keyed by fnmatch glob patterns.
+    """
+    # suffix tail -> set of algos seen (to detect inconsistency)
+    tail_algos: Dict[str, set] = {}
+    for name, algo in layer_map.items():
+        # Suffix after the last `.layers.<idx>.` (or the whole name if
+        # unindexed); this is the part shared across all layer indices.
+        tail = re.split(r"\.layers\.\d+\.", name, maxsplit=1)[-1]
+        tail_algos.setdefault(tail, set()).add(algo)
+
+    layer_quant_config: Dict[str, Any] = {}
+    has_nvfp4 = False
+    for tail, algos in tail_algos.items():
+        if len(algos) != 1:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} has inconsistent "
+                f"quant algos across layers: {sorted(algos)}. SGLang requires "
+                "all layers in a group to share one algo."
+            )
+        algo = next(iter(algos))
+        pattern = "*" + tail
+        if algo in ("NVFP4", "W4A16_NVFP4"):
+            layer_quant_config[pattern] = _MXFP4_TARGET_SPEC
+            has_nvfp4 = True
+        elif algo == "FP8":
+            layer_quant_config[pattern] = _FP8_PER_TENSOR_SPEC
+        else:
+            raise NotImplementedError(
+                f"MIXED_PRECISION layer group {tail!r} uses unsupported "
+                f"quant algo {algo!r}; online requantization supports NVFP4 "
+                "(-> MXFP4) and FP8 (kept as-is) only."
+            )
+    return layer_quant_config, has_nvfp4
+
+
+def _build_excluded_fp8_config(config: Dict[str, Any]) -> Optional["Fp8Config"]:
+    """Build a load-as-is `Fp8Config` for the excluded layers of a
+    mixed-precision NVFP4 source, or None if excluded layers are bf16.
+
+    Two producer conventions are handled:
+
+    - FP8-serialized base (``quant_method == "fp8"``, e.g.
+      DeepSeek-V4-Pro-NVFP4): the routed experts are NVFP4 (requantized to
+      MXFP4) while attn / shared_experts stay FP8 and are listed in the
+      excludes. Those FP8 layers load through `Fp8LinearMethod`;
+      ``weight_block_size`` selects block (e.g. ``[128, 128]``) vs per-tensor
+      (``None``), so a single config covers either granularity - and a
+      checkpoint carrying only per-tensor or only block layers is handled
+      without any per-layer probing.
+
+    - ModelOpt mixed base (``quant_method`` in {modelopt, modelopt_mixed},
+      e.g. Qwen3.5-397B-A17B-NVFP4-V2): FP8 layers are enumerated in the
+      per-layer ``quantized_layers`` map (loaded via `QuarkW8A8Fp8`), not in
+      the excludes, so the excludes are genuinely bf16 -> None.
+    """
+    if config.get("quant_method") != "fp8":
+        return None
+    # Fp8Config.from_config reads quant_method/activation_scheme/
+    # weight_block_size/packed_modules_mapping straight off the checkpoint's
+    # quantization_config dict, which is exactly what `config` carries here.
+    return Fp8Config.from_config(config)
+
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +272,7 @@ class QuarkConfig(QuantizationConfig):
         is_prequantized: bool = False,
         online_scheme: Optional[str] = None,
         dequantization_config: Optional[QuantizationConfig] = None,
+        excluded_fp8_config: Optional[Fp8Config] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -89,31 +298,49 @@ class QuarkConfig(QuantizationConfig):
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
+        # Load-as-is FP8 config for excluded layers of a mixed-precision source
+        # (e.g. attn / shared_experts kept in FP8 while routed experts are
+        # requantized NVFP4 -> MXFP4). Distinct from `dequantization_config`,
+        # which describes the requantization *source*. `weight_block_size`
+        # selects block vs per-tensor FP8 within `Fp8LinearMethod`.
+        self.excluded_fp8_config = excluded_fp8_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
         self._online_quantized_layers = set()
 
         if isinstance(self.dequantization_config, Fp8Config):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
-    def log_online_quantization(self) -> None:
-        """
-        Log which layers are using online quantization, as well as a count for each layer type.
-        """
-        # Count layers per type (last two parts after ".")
-        type_counts: dict[str, int] = {}
-        for name in self._online_quantized_layers:
-            parts = name.split(".")
-            layer_type = ".".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-            type_counts[layer_type] = type_counts.get(layer_type, 0) + 1
+        self._maybe_disable_shared_experts_fusion()
 
-        type_counts = dict(sorted(type_counts.items()))
-        count = len(self._online_quantized_layers)
+    def _maybe_disable_shared_experts_fusion(self) -> None:
+        """Turn off shared-expert fusion when the producer keeps shared experts
+        in a higher precision than the routed experts.
+        """
+        if self.can_fuse_shared_expert():
+            return
 
-        type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
-        logger.info_once(
-            f"Online {self.online_scheme} quantization: "
-            f"quantized {count} layers in total ({type_summary})."
+        from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+        declare_load_time_override(
+            "QuarkConfig._maybe_disable_shared_experts_fusion",
+            {"disable_shared_experts_fusion": True},
         )
+        logger.info(
+            "Quark: shared experts are excluded from quantization (kept in "
+            "a higher precision) while routed experts are quantized; "
+            "disabling shared experts fusion to avoid loading "
+            "higher-precision shared experts through the quantized "
+            "routed-expert path."
+        )
+
+    @property
+    def quantized_layers(self) -> tuple[list[str], int]:
+        # Consumed by `report_online_quantization` in model_runner. Returns the
+        # unique layer types (last part after ".") and the total layer count.
+        layer_types = sorted(
+            set(name.split(".")[-1] for name in self._online_quantized_layers)
+        )
+        return layer_types, len(self._online_quantized_layers)
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -148,12 +375,13 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
-                if self.dequantization_config is not None:
-                    # In case of online requantization, "exclude" means keeping the original precision.
-                    # NOTE: Only FP8 supported for now.
-                    return Fp8LinearMethod(quant_config=self.dequantization_config)
-                else:
-                    return UnquantizedLinearMethod()
+                # "exclude" means keep the layer in its original precision.
+                # Mixed-precision sources may keep excluded layers in FP8
+                # (block or per-tensor, selected by excluded_fp8_config's
+                # weight_block_size); pure-NVFP4/BF16 sources keep them bf16.
+                if self.excluded_fp8_config is not None:
+                    return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
+                return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
@@ -179,32 +407,89 @@ class QuarkConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "QuarkConfig":
-        if config["quant_method"] != "quark":
-            assert "requantization_method" in config
+        # Requantization dispatch is gated on requantization_method, NOT on
+        # quant_method. Quark-exported NVFP4 carries quant_method="quark" too
+        if config.get("requantization_method") == "quark_mxfp4":
+            hf_config = config["hf_config"]
 
+            # Mixed-precision source: only the NVFP4 layers are requantized to
+            # MXFP4; layers in other precisions (e.g. FP8) load through their
+            # own scheme
+            layer_map = _mixed_precision_layer_map(config)
+            if layer_map is not None:
+                layer_quant_config, has_nvfp4 = (
+                    _build_mixed_precision_layer_quant_config(layer_map)
+                )
+                if not has_nvfp4:
+                    raise NotImplementedError(
+                        "MIXED_PRECISION checkpoint has no NVFP4 layers to "
+                        "requantize; load it with its native quantization "
+                        "method instead of --quantization quark_mxfp4."
+                    )
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                    layer_quant_config=layer_quant_config,
+                    packed_modules_mapping=config.get("packed_modules_mapping"),
+                )
+                # Excluded layers are kept as-is. When the base checkpoint is
+                # FP8-serialized (e.g. DeepSeek-V4-Pro-NVFP4: FP8 attn/
+                # shared_experts, NVFP4 routed experts) they load through FP8;
+                # `weight_block_size` selects block vs per-tensor. Pure
+                # NVFP4/ModelOpt-mixed sources keep excluded layers in bf16, and
+                # their FP8 layers (if any) are enumerated in the layer map.
+                excluded_fp8_config = _build_excluded_fp8_config(config)
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=Nvfp4SourceConfig(),
+                    excluded_fp8_config=excluded_fp8_config,
+                )
+
+            nvfp4_src = _detect_nvfp4_source(config)
+            if nvfp4_src is not None:
+                source_excludes = _parse_nvfp4_excludes(config)
+                quant_config = QuarkConfig._create_online_mxfp4_config(
+                    model_type=hf_config.model_type,
+                    source_excludes=source_excludes,
+                )
+                return cls(
+                    quant_config=quant_config,
+                    hf_config=hf_config,
+                    is_prequantized=False,
+                    dequantization_config=nvfp4_src,
+                )
+
+            # Pure FP8 source: every layer is requantized FP8 -> MXFP4.
             if (
-                config["quant_method"] == "fp8"
-                and config["requantization_method"] == "quark_mxfp4"
-                and config["activation_scheme"] == "dynamic"
+                config.get("quant_method") == "fp8"
+                and config.get("activation_scheme") == "dynamic"
             ):
-                hf_config = config["hf_config"]
                 quant_config = QuarkConfig._create_online_mxfp4_config(
                     model_type=hf_config.model_type
                 )
                 dequantization_config = Fp8Config.from_config(config)
-                quark_config = cls(
+                return cls(
                     quant_config=quant_config,
                     hf_config=hf_config,
                     is_prequantized=False,
                     dequantization_config=dequantization_config,
                     online_scheme=config["requantization_method"],
                 )
-            else:
-                raise NotImplementedError(
-                    f"Requantization into {config['requantization_method']} is not supported, from the original quant_method={config['quant_method']} and activation_scheme={config['activation_scheme']}. "
-                )
 
-            return quark_config
+            raise NotImplementedError(
+                f"Requantization into {config['requantization_method']} is not supported, "
+                f"from the original quant_method={config['quant_method']} "
+                f"and activation_scheme={config.get('activation_scheme')}."
+            )
+
+        if config["quant_method"] != "quark":
+            raise ValueError(
+                f"QuarkConfig.from_config invoked with non-quark quant_method "
+                f"{config['quant_method']!r} but no requantization_method set."
+            )
 
         export_config = config.get("export")
         if export_config is None:
@@ -277,9 +562,19 @@ class QuarkConfig(QuantizationConfig):
         return []
 
     @staticmethod
-    def _create_online_mxfp4_config(model_type: str) -> dict[str, Any]:
+    def _create_online_mxfp4_config(
+        model_type: str,
+        source_excludes: Optional[list[str]] = None,
+        layer_quant_config: Optional[dict[str, Any]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
+    ) -> dict[str, Any]:
         """
         Create a synthetic quant_config for online MXFP4 quantization.
+
+        When `layer_quant_config` is provided (mixed-precision source), the
+        per-layer map is authoritative about which layers are quantized and in
+        what precision, so the model_type-specific default excludes
+        are skipped: non-NVFP4 layers must load through their own scheme
         """
         # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
         # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
@@ -290,34 +585,37 @@ class QuarkConfig(QuantizationConfig):
             "re:.*embed_tokens",
         ]
 
-        # Exclusion for accuracy adapted from
-        # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
-        if model_type in ["deepseek_v3", "deepseek_v32"]:
-            exclude.extend(
-                [
-                    "re:.*model.layers.61.*",
-                    "re:.*self_attn.*",
-                    "re:.*mlp.gate$",
-                ]
-            )
-        elif model_type == "qwen3_5_moe":
+        if source_excludes:
+            exclude.extend(source_excludes)
+        elif layer_quant_config is None:
             # Exclusion for accuracy adapted from
-            # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
-            exclude.extend(
-                [
-                    "re:.*n_proj_a",
-                    "re:.*in_proj_b",
-                    "re:.*in_proj_qkv",
-                    "re:.*in_proj_z",
-                    "re:.*o_proj",
-                    "re:.*out_proj",
-                    "re:.*qkv_proj",
-                    "re:.*shared_expert",
-                ]
-            )
+            # https://huggingface.co/amd/DeepSeek-V3.2-mxfp4/blob/main/config.json
+            if model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4"):
+                exclude.extend(
+                    [
+                        "re:.*model.layers.61.*",
+                        "re:.*self_attn.*",
+                        "re:.*mlp.gate$",
+                    ]
+                )
+            elif model_type == "qwen3_5_moe":
+                # Exclusion for accuracy adapted from
+                # https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4/blob/main/config.json
+                exclude.extend(
+                    [
+                        "re:.*n_proj_a",
+                        "re:.*in_proj_b",
+                        "re:.*in_proj_qkv",
+                        "re:.*in_proj_z",
+                        "re:.*o_proj",
+                        "re:.*out_proj",
+                        "re:.*qkv_proj",
+                        "re:.*shared_expert",
+                    ]
+                )
 
         return {
-            "packed_modules_mapping": {},
+            "packed_modules_mapping": packed_modules_mapping or {},
             "exclude": exclude,
             "global_quant_config": {
                 "weight": {
@@ -337,7 +635,7 @@ class QuarkConfig(QuantizationConfig):
                 "output_tensors": None,
                 "bias": None,
             },
-            "layer_quant_config": {},
+            "layer_quant_config": layer_quant_config or {},
             "layer_type_quant_config": {},
             "export": {
                 "kv_cache_group": [],
@@ -635,9 +933,6 @@ class QuarkLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
-        if self.quantization_config.online_scheme is not None:
-            self.quantization_config.log_online_quantization()
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -689,9 +984,6 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
-
-        if self.quantization_config.online_scheme is not None:
-            self.quantization_config.log_online_quantization()
 
     def create_weights(
         self,
