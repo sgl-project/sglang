@@ -187,15 +187,15 @@ jobs:
               - ".github/workflows/pr-test-amd.yml"
             jit_kernel:
               - "python/sglang/kernels/**"
-              - "test/registered/jit/**"
+              - "test/registered/kernels/**"
               - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/srt/observability/**"
               - "python/sglang/kernels/ops/diffusion/**"
-              - "test/registered/jit/diffusion/**"
-              - "test/registered/jit/benchmark/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 

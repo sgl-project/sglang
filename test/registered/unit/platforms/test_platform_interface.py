@@ -20,6 +20,7 @@ from sglang.srt.platforms.device_mixin import (
 )
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -251,6 +252,47 @@ class TestCudaDeviceMixin(CustomTestCase):
     def test_cuda_srt_platform_capabilities(self):
         base = CudaSRTPlatform()
         self.assertTrue(base.supports_fp8())
+        self.assertTrue(base.support_cuda_graph())
+        self.assertTrue(base.support_piecewise_cuda_graph())
+
+
+class TestXpuDeviceMixin(CustomTestCase):
+    """Tests for XPU device operation defaults."""
+
+    def test_default_get_device_returns_xpu_device(self):
+        base = XpuSRTPlatform()
+        self.assertEqual(base.get_device(2), torch.device("xpu", 2))
+
+    # TODO: @patch("torch.xpu.get_device_capability", return_value=(9, 0))
+    @patch("torch.ops.sgl_kernel.query_device.default", return_value=(9, 0))
+    def test_default_get_device_capability_uses_xpu(self, mock_get_device_capability):
+        base = XpuSRTPlatform()
+        self.assertEqual(base.get_device_capability(0), DeviceCapability(9, 0))
+        mock_get_device_capability.assert_called_once_with(0)
+
+    def test_pin_memory_available_for_xpu_targets(self):
+        base = XpuSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="xpu"))
+        self.assertTrue(base.is_pin_memory_available(device=torch.device("xpu", 0)))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    @patch("torch.xpu.manual_seed_all")
+    @patch("torch.manual_seed")
+    @patch("sglang.srt.platforms.device_mixin.np.random.seed")
+    @patch("sglang.srt.platforms.device_mixin.random.seed")
+    def test_default_seed_everything_seeds_xpu(
+        self, mock_random_seed, mock_np_seed, mock_torch_seed, mock_xpu_seed
+    ):
+        XpuSRTPlatform.seed_everything(123)
+        mock_random_seed.assert_called_once_with(123)
+        mock_np_seed.assert_called_once_with(123)
+        mock_torch_seed.assert_called_once_with(123)
+        mock_xpu_seed.assert_called_once_with(123)
+
+    def test_xpu_srt_platform_capabilities(self):
+        base = XpuSRTPlatform()
+        self.assertFalse(base.supports_fp8())
         self.assertTrue(base.support_cuda_graph())
         self.assertTrue(base.support_piecewise_cuda_graph())
 

@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.rope import FusedSetKVBufferArg
-from sglang.kernels.ops.layernorm._jit_norm import (
+from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )
