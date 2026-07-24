@@ -42,3 +42,11 @@ def test_materializes_noncontiguous_tensor():
     source = torch.arange(16).reshape(4, 4).transpose(0, 1)
     assert not source.is_contiguous()
     _assert_independent_compact_copy(source, _make_loaded_weight_compact(source))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
