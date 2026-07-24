@@ -43,14 +43,28 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import (
+    add_prefix,
+    get_device_sm,
+    is_cuda,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _device_sm = get_device_sm()
+
+
+def _can_fuse_shared_expert(quant_config: Optional[QuantizationConfig]) -> bool:
+    if quant_config is None:
+        return True
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is None or bool(can_fuse_fn())
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
@@ -131,10 +145,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         disable_reason = None
         if not getattr(text_config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif (_device_sm is not None) and (_device_sm < 80):
+        elif not (_is_cuda or _is_hip):
+            disable_reason = (
+                "Shared experts fusion currently requires CUDA or ROCm devices."
+            )
+        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+        elif not _can_fuse_shared_expert(self.quant_config):
+            disable_reason = (
+                "Shared experts fusion is not supported by this quantization config."
+            )
         elif get_parallel().moe_ep_size > 1:
             disable_reason = (
                 "Shared experts fusion is not supported together with expert "

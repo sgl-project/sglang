@@ -535,6 +535,10 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Opt in to AITER FlyDSL MXFP8 MoE on ROCm gfx950. This path requires an
+    # aiter build with MiniMax-M3 MXFP8 tuned fmoe configs and has a distinct
+    # weight/scale layout from the default Triton MXFP8 MoE path.
+    SGLANG_USE_AITER_MXFP8_MOE = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
