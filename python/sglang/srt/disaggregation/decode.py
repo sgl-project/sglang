@@ -1509,14 +1509,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
             ):
-                # alloc_logical_only() already allocated the shared logical pages
-                # used by C4 indexer and C128 KV. These device buffers do not use
-                # the C4 sparse physical-slot mapping; carry their logical page IDs
-                # alongside the independently allocated C4 host page IDs.
+                # alloc_logical_only() allocated the shared pages used by C4
+                # indexer and C128 KV. req_to_token can hold virtual ids under
+                # MultiEndedAllocator, while PD writes physical buffer offsets;
+                # resolve the current physical locations before page conversion.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
+                translate_kv_loc = getattr(
+                    self.token_to_kv_pool_allocator, "translate_kv_loc", None
+                )
+                if translate_kv_loc is not None:
+                    full_kv_indices = translate_kv_loc(full_kv_indices.long())
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,
                     page_size,
