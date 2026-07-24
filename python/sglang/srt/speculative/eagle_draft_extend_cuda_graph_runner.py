@@ -415,6 +415,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            self._plant_war_read_done_node()
 
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -607,10 +608,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on.
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        # a read-done event the scheduler's WAR barrier waits on. In-graph node
+        # and post-replay variants are published after replay below.
+        war_policy = self._war_read_done_policy(
+            self.draft_extend_attn_backend, forward_batch.forward_mode
+        )
+        if war_policy == "pre_replay":
+            self._publish_war_read_done(in_graph=False)
 
         self.raw_bs = raw_bs
         self.bs = bs
@@ -624,6 +628,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with timer_ctx:
             out = self._replay_graph(shape_key, forward_batch)
+
+        if war_policy == "post_replay":
+            self._publish_war_read_done(in_graph=False)
+        elif war_policy == "in_graph":
+            self._publish_war_read_done(in_graph=True)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],

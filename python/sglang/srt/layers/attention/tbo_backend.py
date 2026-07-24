@@ -125,6 +125,13 @@ class TboAttnBackend(AttentionBackend):
                         forward_batch=forward_batch_child
                     )
 
+    @property
+    def in_graph_metadata_reads_shared_buffers(self) -> bool:
+        # Forward from whichever wrapped backend records in-graph metadata.
+        return self.primary.in_graph_metadata_reads_shared_buffers or any(
+            child.in_graph_metadata_reads_shared_buffers for child in self.children
+        )
+
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         self.primary.init_forward_metadata(forward_batch=forward_batch)
         if forward_batch.tbo_children is not None:
