@@ -12,6 +12,7 @@ import unittest
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
+    DraftEnumerationBufferBatch,
     DraftMeshMessage,
     DraftMeshMessageType,
     DraftReqKey,
@@ -248,23 +249,115 @@ class TestDraftControlInbox(CustomTestCase):
         self.assertEqual(seg.end_committed_len, 3)
 
 
+def _enum_batch(
+    rids=("r",),
+    *,
+    num_steps=2,
+    fanout=3,
+    base_committed_lens=None,
+    src_drafter_rank=0,
+    dst_verifier_rank=0,
+    tokens=None,
+) -> DraftEnumerationBufferBatch:
+    rids = list(rids)
+    if base_committed_lens is None:
+        base_committed_lens = [0] * len(rids)
+    if tokens is None:
+        # A well-formed batch_size * (K + 1) * F * K flat block.
+        row_stride = (num_steps + 1) * fanout * num_steps
+        tokens = tuple(range(len(rids) * row_stride))
+    return DraftEnumerationBufferBatch(
+        src_drafter_rank=src_drafter_rank,
+        dst_verifier_rank=dst_verifier_rank,
+        num_steps=num_steps,
+        fanout=fanout,
+        rids=rids,
+        base_committed_lens=list(base_committed_lens),
+        tokens=tokens,
+    )
+
+
+class TestDraftEnumerationBufferBatch(CustomTestCase):
+    def test_valid_block_stride_and_row_slicing(self):
+        # row_stride is the per-row (K + 1) * F * K layout size; num_tokens is
+        # batch_size rows of it. row_tokens(i) slices row i out of the shared
+        # flat buffer, and draft_key(i) keys on the destination verifier.
+        batch = _enum_batch(rids=["a", "b"], num_steps=2, fanout=3)
+        self.assertEqual(batch.row_stride, (2 + 1) * 3 * 2)
+        self.assertEqual(batch.batch_size, 2)
+        self.assertEqual(batch.num_tokens, 2 * batch.row_stride)
+        self.assertEqual(len(batch.tokens), batch.num_tokens)
+        batch.validate()  # should not raise
+
+        stride = batch.row_stride
+        self.assertEqual(batch.row_tokens(0), tuple(range(0, stride)))
+        self.assertEqual(batch.row_tokens(1), tuple(range(stride, 2 * stride)))
+
+    def test_draft_key_uses_dst_verifier_rank(self):
+        # The owning verifier is the destination rank; draft_key must key on it
+        # so the drafter-side table is unambiguous across verifier ranks.
+        batch = _enum_batch(rids=["req-9", "req-10"], dst_verifier_rank=4)
+        self.assertEqual(
+            batch.draft_key(0), DraftReqKey(src_verifier_rank=4, request_id="req-9")
+        )
+        self.assertEqual(
+            batch.draft_key(1), DraftReqKey(src_verifier_rank=4, request_id="req-10")
+        )
+
+    def test_num_steps_below_one_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_batch(num_steps=0, fanout=3, tokens=()).validate()
+
+    def test_fanout_below_one_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_batch(num_steps=2, fanout=0, tokens=()).validate()
+
+    def test_negative_base_committed_len_raises(self):
+        with self.assertRaises(ValueError):
+            _enum_batch(rids=["r"], base_committed_lens=[-1]).validate()
+
+    def test_rids_base_committed_lens_length_mismatch_raises(self):
+        # batch_size must be consistent across the parallel per-row arrays.
+        with self.assertRaises(ValueError):
+            _enum_batch(rids=["a", "b"], base_committed_lens=[0]).validate()
+
+    def test_duplicate_rids_raise(self):
+        # One row per request: duplicate rids would resolve to the same seat and
+        # make the verifier-side scatter's winning row/stamp nondeterministic.
+        with self.assertRaises(ValueError):
+            _enum_batch(rids=["a", "a"], base_committed_lens=[0, 0]).validate()
+
+    def test_wrong_tokens_length_raises(self):
+        # One token short of the batch_size * (K + 1) * F * K block.
+        batch = _enum_batch(rids=["a", "b"], num_steps=2, fanout=3)
+        short = DraftEnumerationBufferBatch(
+            src_drafter_rank=batch.src_drafter_rank,
+            dst_verifier_rank=batch.dst_verifier_rank,
+            num_steps=batch.num_steps,
+            fanout=batch.fanout,
+            rids=batch.rids,
+            base_committed_lens=batch.base_committed_lens,
+            tokens=batch.tokens[:-1],
+        )
+        with self.assertRaises(ValueError):
+            short.validate()
+
+
 class TestDraftMeshMessageEnvelope(CustomTestCase):
     def test_from_control_batch_sets_discriminant_and_slot(self):
         batch = DraftControlBatch(dst_drafter_rank=0)
         msg = DraftMeshMessage.from_control_batch(batch)
         self.assertEqual(msg.message_type, DraftMeshMessageType.CONTROL_BATCH)
         self.assertIs(msg.control_batch, batch)
-        self.assertIsNone(msg.tail_stream_output_batch)
+        self.assertIsNone(msg.enumeration_buffer_batch)
 
-    def test_from_tail_stream_output_batch_sets_discriminant_and_slot(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
-
-        batch = DraftTailStreamOutputBatch()
-        msg = DraftMeshMessage.from_tail_stream_output_batch(batch)
+    def test_from_enumeration_buffer_batch_sets_discriminant_and_slot(self):
+        batch = _enum_batch()
+        msg = DraftMeshMessage.from_enumeration_buffer_batch(batch)
         self.assertEqual(
-            msg.message_type, DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
+            msg.message_type, DraftMeshMessageType.ENUMERATION_BUFFER_BATCH
         )
-        self.assertIs(msg.tail_stream_output_batch, batch)
+        self.assertIs(msg.enumeration_buffer_batch, batch)
         self.assertIsNone(msg.control_batch)
 
 
