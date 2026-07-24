@@ -8,7 +8,9 @@ import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 
-from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+    per_tensor_quant_fp8,
+)
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
