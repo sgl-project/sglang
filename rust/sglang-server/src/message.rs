@@ -2,11 +2,13 @@
 //! buffers are `bytes::Bytes`, so egress fan-out to detok shards is a refcount bump.
 //! Grouped by wire: [`body`] (the `/generate` HTTP body fan-out), [`request`]
 //! (the in-flight request + scheduler-wire encodes), [`chunk`] (the egress-ring
-//! frames and decoded chunk events).
+//! frames and decoded chunk events), [`sampling`] (sampling-params
+//! normalization, the Python `SamplingParams` port).
 
 mod body;
 mod chunk;
 mod request;
+pub mod sampling;
 
 pub use body::GenerateBody;
 pub use chunk::{
