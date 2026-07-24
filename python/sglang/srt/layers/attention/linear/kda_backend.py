@@ -254,12 +254,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        # mamba_cache.conv is [..., kernel-1, dim] while conv_states_shape expects the window length (kernel-1) at shape[-1], hence the transpose.
-        self.conv_states_shape = (
+        # `causal_conv1d_update` consumes conv state as (..., dim, width). The
+        # GPU/CPU pool stores it as (..., width==kernel-1, dim), so it is
+        # transposed per call; the NPU pool (`_init_npu_conv_state`) already
+        # stores (..., dim, width), so the transpose is skipped there.
+        self._conv_state_pretransposed = is_npu()
+        # conv_states_shape carries the window length (kernel-1) at shape[-1].
+        self.conv_states_shape = self._conv_state_to_kernel_layout(
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
-        )
+        ).shape
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         # KDA FlashInfer speculative decode (target_verify) is linear-chain only --
@@ -279,6 +282,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
+
+    def _conv_state_to_kernel_layout(self, conv_states: torch.Tensor) -> torch.Tensor:
+        """Return conv state in the (..., dim, width) layout the update kernel
+        expects. No-op on NPU, where the pool already stores that layout."""
+        if self._conv_state_pretransposed:
+            return conv_states
+        return conv_states.transpose(-1, -2)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -321,7 +331,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         qkv = causal_conv1d_update(
             mixed_qkv,
-            conv_states.transpose(-1, -2),
+            self._conv_state_to_kernel_layout(conv_states),
             layer.conv_weights,
             layer.bias,
             activation="silu",
@@ -399,16 +409,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
+        conv_states = self._conv_state_to_kernel_layout(mamba_cache_params.conv[0])
 
         ssm_states = mamba_cache_params.temporal
 
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         if self.forward_metadata.has_mamba_track_mask:
+            # Tracked window is (n, width, dim); the NPU pool stores conv slots
+            # as (..., dim, width), so swap the last two axes before writing.
+            tracked_conv = mixed_qkv[self.forward_metadata.track_conv_indices]
+            if self._conv_state_pretransposed:
+                tracked_conv = tracked_conv.transpose(-1, -2)
             mamba_cache_params.conv[0][
                 self.forward_metadata.conv_states_mask_indices
-            ] = mixed_qkv[self.forward_metadata.track_conv_indices]
+            ] = tracked_conv
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         q, k, v = mixed_qkv.transpose(0, 1).split(splits, dim=0)
@@ -531,7 +546,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
-            conv_states.transpose(-1, -2),
+            self._conv_state_to_kernel_layout(conv_states),
             layer.conv_weights,
             layer.bias,
             activation="silu",
