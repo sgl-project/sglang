@@ -433,11 +433,35 @@ class HiCacheNixl(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
-        super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
         is_zero_copy = self._hybrid_pool_supports_zero_copy(host_pool, host_pool_name)
+        buffers = host_pool.get_hybrid_pool_buffer() if is_zero_copy else []
+        if self.backend_selector.backend_name == "DOCA_MEMOS":
+            if getattr(host_pool, "layout", None) not in (
+                "page_first",
+                "page_first_direct",
+            ):
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires hybrid host pools to use "
+                    "page_first or page_first_direct layout."
+                )
+            if not is_zero_copy:
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires hybrid host pools to "
+                    "support zero-copy page buffers."
+                )
+            if any(tensor_mem_backend(buf) != MEM_BACKEND_HUGEPAGE for buf in buffers):
+                raise RuntimeError(
+                    "HiCache NIXL DOCA_MEMOS requires every hybrid host-pool "
+                    "buffer to be hugetlb-backed. Set SGLANG_HUGEPAGE_SIZE=2MB "
+                    "and reserve enough 2 MiB huge pages so alloc_mmap does not "
+                    "fall back to normal pages."
+                )
+
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
         if is_zero_copy:
-            for i, buf in enumerate(host_pool.get_hybrid_pool_buffer()):
+            for i, buf in enumerate(buffers):
                 self._pre_register_host(
                     buf.data_ptr(),
                     buf.numel() * buf.element_size(),

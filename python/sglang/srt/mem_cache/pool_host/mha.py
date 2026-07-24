@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPo
 from sglang.srt.mem_cache.mmap_allocator import memory_available_bytes
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -658,7 +657,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         requested_bytes = self.size * self.size_per_token
-        available_bytes = memory_available_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = memory_available_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
