@@ -532,7 +532,7 @@ class Envs:
     # Maximum byte length of one CPU RDMA registration. Keep it 2MiB-aligned
     # so the same chunks can be individually cudaHostRegister'd on hugetlb
     # storage and registered with MoRI without subrange peer-memory mappings.
-    SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES = EnvInt(1022 * (1 << 20))
+    SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES = EnvInt(256 * (1 << 20))
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.
     SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
