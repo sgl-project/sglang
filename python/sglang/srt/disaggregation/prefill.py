@@ -755,7 +755,10 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        # Device support is already handled upstream in model_runner where
+        # piecewise_cuda_graph_runner is initialized (None for unsupported devices)
         can_run_cuda_graph = result.can_run_cuda_graph
+
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,

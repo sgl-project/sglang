@@ -28,6 +28,35 @@ logger = logging.getLogger(__name__)
 _USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
 
 
+def _device_ptr_type_str(ptr: int, device_type: str) -> str:
+    """Return a diagnostic string for XPU pointer type classification.
+
+    XPU kernel-space pointers have bit 63 set (e.g., 0xffff81ab54e01000),
+    while user-space pointers don't. Returns empty string for non-XPU devices.
+    """
+    if device_type != "xpu":
+        return ""
+    if ptr & (1 << 63):
+        return ", ptr_type=XPU-kernel-space"
+    else:
+        return ", ptr_type=XPU-user-space"
+
+
+def _should_use_triton_staging(device: torch.device) -> bool:
+    """Determine whether to use Triton staging kernels for a given device.
+
+    XPU device pointers have bit 63 set (e.g., 0xffff81ab54e01000), which
+    exceeds torch.int64 range. The Triton kernels store layer_ptrs as int64
+    and perform pointer arithmetic, which can overflow on XPU. Fall back to
+    the torch path for XPU, which handles device pointers correctly.
+    """
+    if not _USE_TRITON_STAGING:
+        return False
+    if device.type == "xpu":
+        return False
+    return True
+
+
 @triton.jit
 def _fused_gather_to_staging_kernel(
     layer_ptrs,
@@ -130,22 +159,79 @@ class StagingBuffer:
         custom_mem_pool=None,
     ):
         self.size_bytes = size_bytes
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        # If device string includes index (e.g., "xpu:3"), use that instead of gpu_id
+        if device.index is not None and device.index != gpu_id:
+            logger.warning(
+                f"Device index mismatch: device={device} (index={device.index}) "
+                f"but gpu_id={gpu_id}. Using device.index={device.index}."
+            )
+            gpu_id = device.index
+        # If device has no index, update it to match gpu_id
+        elif device.index is None:
+            device = torch.device(device.type, gpu_id)
+
         self.device = device
         self.gpu_id = gpu_id
 
-        torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
-            with torch.cuda.use_mem_pool(custom_mem_pool):
+        if device.type == "xpu" and custom_mem_pool is not None:
+            logger.warning(
+                f"Custom memory pools not supported on XPU. "
+                f"Using default allocator instead. Memory may not be RDMA-compatible."
+            )
+
+        if device.type == "cuda":
+            torch.cuda.set_device(gpu_id)
+            if custom_mem_pool is not None:
+                with torch.cuda.use_mem_pool(custom_mem_pool):
+                    self.buffer = torch.empty(
+                        size_bytes, dtype=torch.uint8, device=device
+                    )
+                alloc_method = "custom_mem_pool (cuMemCreate)"
+            else:
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "custom_mem_pool (cuMemCreate)"
-        else:
+                alloc_method = "cudaMalloc (NVLink incompatible!)"
+        elif device.type == "xpu":
+            torch.xpu.set_device(gpu_id)
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
-            alloc_method = "cudaMalloc"
+            alloc_method = "default allocator"
+        else:
+            raise RuntimeError(f"Unsupported device type: {device.type}")
+
         self.data_ptr = self.buffer.data_ptr()
 
+        self.device_module = torch.get_device_module(device)
+
+        # Require at least one of default_stream or current_stream for synchronization safety
+        if hasattr(self.device_module, "default_stream"):
+            self._default_stream = self.device_module.default_stream(device)
+        elif hasattr(self.device_module, "current_stream"):
+            # XPU path: verify we're in default context by checking stream ID
+            captured_stream = self.device_module.current_stream(device)
+            # Assume stream with id=0 is the default stream for most backends
+            if hasattr(captured_stream, "stream_id") and captured_stream.stream_id != 0:
+                logger.warning(
+                    f"StagingBuffer initialized in non-default stream context "
+                    f"(stream_id={captured_stream.stream_id}). This may cause "
+                    f"synchronization issues. Initialize outside 'with stream():' blocks."
+                )
+            self._default_stream = captured_stream
+        else:
+            raise RuntimeError(
+                f"Device {device.type} does not support default_stream or current_stream. "
+                f"Cannot safely synchronize gather/scatter operations. "
+                f"This device is not supported for disaggregation."
+            )
+
+        self._gather_stream = self.device_module.Stream(device=device)
+        self._scatter_stream = self.device_module.Stream(device=device)
+
+        ptr_type_str = _device_ptr_type_str(self.data_ptr, device.type)
         logger.info(
             f"StagingBuffer allocated: {size_bytes / (1024*1024):.1f} MB "
-            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
+            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}{ptr_type_str}"
         )
 
     def get_ptr(self) -> int:
@@ -195,10 +281,17 @@ class StagingAllocator:
         self.watermark_tail = 0
         self.lock = threading.Lock()
 
+        # Determine device type for pointer classification
+        if isinstance(device, str):
+            device_type = device.split(":")[0]
+        else:
+            device_type = device.type
+
+        ptr_type_str = _device_ptr_type_str(self.base_ptr, device_type)
         logger.info(
             f"StagingAllocator (ring+overcommit): "
             f"{total_size_bytes / (1024*1024):.1f} MB "
-            f"on {device}, ptr=0x{self.base_ptr:x}"
+            f"on {device}, ptr=0x{self.base_ptr:x}{ptr_type_str}"
         )
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
@@ -332,14 +425,20 @@ def _gather_all_layers_torch(
     """torch.gather path: zero per-layer allocation, one kernel per layer."""
     import numpy as np
 
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
     num_layers = len(k_buffers)
     head_dim = k_buffers[0].shape[-1]
     dtype_size = k_buffers[0].element_size()
     num_tokens = len(page_indices_np) * page_size
     per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    if device.index is not None:
+        if hasattr(device_module, "set_device"):
+            device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     if page_size == 1:
@@ -350,16 +449,12 @@ def _gather_all_layers_torch(
 
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    # Stream synchronization with default stream (always present after __init__ fix)
+    staging_buffer._gather_stream.wait_stream(staging_buffer._default_stream)
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_module.stream(staging_buffer._gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -406,6 +501,8 @@ def _gather_all_layers_triton(
     """Triton fused kernel path: single kernel launch for all layers."""
     import numpy as np
 
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
     num_layers = len(k_buffers)
     head_dim = k_buffers[0].shape[-1]
     total_heads = k_buffers[0].shape[1]
@@ -416,8 +513,12 @@ def _gather_all_layers_triton(
     per_layer_bytes = per_layer_elems * dtype_size
     total_bytes = per_layer_bytes * num_layers * 2
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    if device.index is not None:
+        if hasattr(device_module, "set_device"):
+            device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     layer_ptrs = torch.tensor(
@@ -430,17 +531,13 @@ def _gather_all_layers_triton(
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
-    if not hasattr(staging_buffer, "_gather_stream"):
-        staging_buffer._gather_stream = torch.cuda.Stream(device=device)
-
-    staging_buffer._gather_stream.wait_stream(
-        torch.cuda.default_stream(torch.device(device))
-    )
+    # Stream synchronization with default stream (always present after __init__ fix)
+    staging_buffer._gather_stream.wait_stream(staging_buffer._default_stream)
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(staging_buffer._gather_stream):
+    with device_module.stream(staging_buffer._gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -473,7 +570,10 @@ def gather_all_layers_to_staging(
     Returns total bytes written.
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
-    if _USE_TRITON_STAGING:
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
+    device = k_buffers[0].device
+    if _should_use_triton_staging(device):
         return _gather_all_layers_triton(
             k_buffers,
             v_buffers,
@@ -508,6 +608,8 @@ def _scatter_staging_to_kv_torch(
     total_kv_heads: int,
 ) -> None:
     """torch path for scatter."""
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
     num_layers = len(k_buffers)
     head_dim = k_buffers[0].shape[-1]
     dtype_size = k_buffers[0].element_size()
@@ -575,6 +677,8 @@ def _scatter_staging_to_kv_triton(
     total_kv_heads: int,
 ) -> None:
     """Triton fused kernel path for scatter."""
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
     num_layers = len(k_buffers)
     head_dim = k_buffers[0].shape[-1]
     total_heads = k_buffers[0].shape[1]
@@ -658,7 +762,10 @@ def scatter_staging_to_kv(
     total_kv_heads: int,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
-    if _USE_TRITON_STAGING:
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
+    device = k_buffers[0].device
+    if _should_use_triton_staging(device):
         return _scatter_staging_to_kv_triton(
             staging_buffer_view,
             k_buffers,
