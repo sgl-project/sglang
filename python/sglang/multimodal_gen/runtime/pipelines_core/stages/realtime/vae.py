@@ -36,12 +36,16 @@ class RealtimeVAEDecodeState(BaseRealtimeState):
     def __init__(self):
         super().__init__()
         self.reset_causal_decode_state = None
+        self.taehv_streaming_decoder = None
+        self.taehv_output_queue: list[torch.Tensor] = []
 
     def dispose(self):
         reset_causal_decode_state = self.reset_causal_decode_state
         self.reset_causal_decode_state = None
         if callable(reset_causal_decode_state):
             reset_causal_decode_state()
+        self.taehv_streaming_decoder = None
+        self.taehv_output_queue.clear()
 
 
 class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
@@ -75,6 +79,13 @@ class RealtimeImageVAEEncodingStage(ImageVAEEncodingStage):
 
 class CausalVaeDecodingStage(DecodingStage):
     """Decode realtime chunks with a persistent causal VAE cache when available."""
+
+    @staticmethod
+    def _taehv_checkpoint_path(server_args: ServerArgs) -> str | None:
+        value = getattr(
+            server_args.pipeline_config.vae_config, "taehv_checkpoint_path", None
+        )
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
     @staticmethod
     def _supports_wan_decoder_cache(vae) -> bool:
@@ -169,6 +180,101 @@ class CausalVaeDecodingStage(DecodingStage):
 
         return (image / 2 + 0.5).clamp(0, 1)
 
+    def _get_or_create_taehv_streaming_decoder(
+        self,
+        decode_state: RealtimeVAEDecodeState,
+        server_args: ServerArgs,
+    ):
+        if decode_state.taehv_streaming_decoder is not None:
+            return decode_state.taehv_streaming_decoder
+
+        if not hasattr(self, "_taehv_model"):
+            checkpoint_path = self._taehv_checkpoint_path(server_args)
+            if checkpoint_path is None:
+                raise RuntimeError(
+                    "TAEHV realtime decode requires "
+                    "--vae-config.taehv-checkpoint-path"
+                )
+
+            try:
+                from taehv import TAEHV
+            except ImportError as exc:
+                raise RuntimeError(
+                    "TAEHV realtime decode requires the `taehv` package. "
+                    "Install it and set --vae-config.taehv-checkpoint-path "
+                    "to a TAEHV checkpoint."
+                ) from exc
+
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            self._taehv_model = TAEHV(checkpoint_path=checkpoint_path).to(
+                get_local_torch_device(), vae_dtype
+            )
+            self._taehv_model.eval()
+
+        try:
+            from taehv import StreamingTAEHV
+        except ImportError as exc:
+            raise RuntimeError(
+                "TAEHV realtime decode requires the `taehv` package. "
+                "Install it and set --vae-config.taehv-checkpoint-path "
+                "to a TAEHV checkpoint."
+            ) from exc
+
+        decoder = StreamingTAEHV(self._taehv_model)
+        decode_state.taehv_streaming_decoder = decoder
+        return decoder
+
+    @torch.no_grad()
+    def decode_taehv_streaming(
+        self,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+        decode_state: RealtimeVAEDecodeState,
+        *,
+        first_chunk: bool,
+    ) -> torch.Tensor:
+        decoder = self._get_or_create_taehv_streaming_decoder(decode_state, server_args)
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        latents = latents.to(get_local_torch_device(), dtype=vae_dtype)
+
+        # SGLang/Wan uses NCTHW. TAEHV uses NTCHW and consumes model latents
+        # directly, without the full-VAE scale/shift path.
+        latents_ntchw = latents.permute(0, 2, 1, 3, 4).contiguous()
+        target_frames = max(
+            1,
+            latents_ntchw.shape[1] * int(decoder.taehv.t_upscale)
+            - (int(decoder.taehv.frames_to_trim) if first_chunk else 0),
+        )
+
+        if first_chunk:
+            decoder.reset()
+            decode_state.taehv_output_queue.clear()
+
+        produced: list[torch.Tensor] = []
+        for latent_t in latents_ntchw.split(1, dim=1):
+            frame = decoder.decode(latent_t)
+            if frame is not None:
+                produced.append(frame)
+            while True:
+                frame = decoder.decode()
+                if frame is None:
+                    break
+                produced.append(frame)
+
+        decode_state.taehv_output_queue.extend(produced)
+        if not decode_state.taehv_output_queue:
+            raise RuntimeError("TAEHV produced no frames for realtime chunk")
+
+        all_frames = torch.cat(decode_state.taehv_output_queue, dim=1)
+        take = min(target_frames, all_frames.shape[1])
+        if take == 0:
+            raise RuntimeError("TAEHV produced no frames for realtime chunk")
+
+        frames_ntchw = all_frames[:, :take].contiguous()
+        remaining = all_frames[:, take:].contiguous()
+        decode_state.taehv_output_queue = [remaining] if remaining.shape[1] > 0 else []
+        return frames_ntchw.permute(0, 2, 1, 3, 4).contiguous()
+
     @torch.no_grad()
     def forward(
         self,
@@ -186,11 +292,19 @@ class CausalVaeDecodingStage(DecodingStage):
         if batch.block_idx == 0 and callable(reset_causal_state):
             reset_causal_state()
 
-        frames = self.decode_causal(
-            batch.latents,
-            server_args,
-            first_chunk=batch.block_idx == 0,
-        )
+        if self._taehv_checkpoint_path(server_args) is not None:
+            frames = self.decode_taehv_streaming(
+                batch.latents,
+                server_args,
+                decode_state,
+                first_chunk=batch.block_idx == 0,
+            )
+        else:
+            frames = self.decode_causal(
+                batch.latents,
+                server_args,
+                first_chunk=batch.block_idx == 0,
+            )
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
         return OutputBatch(
