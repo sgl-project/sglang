@@ -894,6 +894,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if transfer_metric.transfer_total_bytes is None:
             return result if result else None
 
+        # Backend-measured byte-weighted per-chunk average bandwidth (GB/s).
+        # Independent of the transfer-latency computation below: reflects true
+        # NIC throughput (Σ bytes / Σ active per-chunk transfer time), so it is
+        # not inflated by inter-chunk idle the way total_bytes / latency is.
+        if transfer_metric.avg_chunk_bandwidth_gb_s is not None:
+            result["avg_chunk_bw_gb_s"] = transfer_metric.avg_chunk_bandwidth_gb_s
+            if self.enable_metrics:
+                self.metrics_collector.observe_kv_transfer_avg_chunk_bw(
+                    transfer_metric.avg_chunk_bandwidth_gb_s
+                )
+
         # Transfer latency, size, and speed
         if transfer_metric.transfer_latency_s is not None:
             transfer_latency_s = transfer_metric.transfer_latency_s

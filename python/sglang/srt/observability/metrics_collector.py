@@ -514,6 +514,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
+        self.kv_transfer_avg_chunk_bw_gb_s = Histogram(
+            name="sglang:kv_transfer_avg_chunk_bw_gb_s",
+            documentation=(
+                "Histogram of byte-weighted average per-chunk KV cache transfer "
+                "bandwidth in GB/s (total bytes / total active per-chunk transfer "
+                "time; excludes inter-chunk idle)."
+            ),
+            labelnames=labels.keys(),
+            buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
+        )
         self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
             documentation="Histogram of KV cache transfer latency in ms.",
@@ -1138,6 +1148,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
         self._log_histogram(self.kv_transfer_total_mb, total_mb)
         self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+
+    def observe_kv_transfer_avg_chunk_bw(self, avg_chunk_bw_gb_s: float) -> None:
+        self._log_histogram(self.kv_transfer_avg_chunk_bw_gb_s, avg_chunk_bw_gb_s)
 
     def observe_kv_transfer_bootstrap(
         self,
