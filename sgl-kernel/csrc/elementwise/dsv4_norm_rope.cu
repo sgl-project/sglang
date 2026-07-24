@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 // DeepSeek-V4 fused norm + RoPE kernels, ported from JIT kernel
-// python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh
+// python/sglang/kernels/jit/csrc/deepseek_v4/main_norm_rope.cuh
 // to sgl-kernel AOT compilation with CUDA + HIP (ROCm) support.
 
 #ifndef USE_ROCM
