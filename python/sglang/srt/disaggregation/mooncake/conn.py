@@ -1300,6 +1300,18 @@ class MooncakeKVManager(CommonKVManager):
                         )
                     continue
 
+                # Mark the room as actively transferring so the prefill
+                # scheduler can tell in-flight transfers apart from requests
+                # still waiting for decode-side metadata (parity with the NIXL
+                # backend). update_status() takes the max of the current and
+                # new state for non-Failed updates, so a concurrently set
+                # Success is never downgraded. A concurrently set Failed
+                # (decode-side abort in the bootstrap thread) is not shielded,
+                # but that race pre-exists with the terminal status update at
+                # the end of this loop, and the extra window here (right
+                # after the dequeue-time Failed check) is negligible.
+                self.update_status(kv_chunk.room, KVPoll.Transferring)
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1790,6 +1802,7 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self._transfer_start_time: Optional[float] = None
         self._init_trace_ctx()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
@@ -1803,6 +1816,11 @@ class MooncakeKVSender(CommonKVSender):
         )
         if should_skip:
             return
+
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
@@ -1828,6 +1846,14 @@ class MooncakeKVSender(CommonKVSender):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
+                if (
+                    status == KVPoll.Success
+                    and self._transfer_start_time is not None
+                    and self._transfer_metric.transfer_latency_s is None
+                ):
+                    self._transfer_metric.transfer_latency_s = (
+                        time.perf_counter() - self._transfer_start_time
+                    )
                 self.conclude_state = status
                 self.trace_ctx.trace_req_finish()
             elif status == KVPoll.Bootstrapping:
