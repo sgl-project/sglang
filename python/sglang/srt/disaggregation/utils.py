@@ -732,7 +732,6 @@ def filter_dsa_shared_pages_for_cp_rank(
     *,
     position_offset: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Select this CP rank's interleaved pages and map them to local storage."""
     page_indices = np.asarray(page_indices, dtype=np.int32)
     positions = np.flatnonzero(page_indices % cp_size == cp_rank)
     return (
@@ -748,7 +747,6 @@ def prepare_dsa_shared_state_indices(
     cp_rank: int,
     cp_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Pair local Shared-DSA source pages with matching decode pages."""
     src_pages, positions = filter_dsa_shared_pages_for_cp_rank(
         src_page_indices,
         cp_rank,

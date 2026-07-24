@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler as lu_mod
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
     ResBlock,
@@ -237,7 +237,7 @@ def test_latent_upsampler_forward_parity_cuda(
 
 @requires_cuda
 def test_resblock_actually_uses_triton_kernel_cuda():
-    from sglang.jit_kernel.diffusion.triton import group_norm_silu as triton_mod
+    from sglang.kernels.ops.diffusion.triton import group_norm_silu as triton_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")

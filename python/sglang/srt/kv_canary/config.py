@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sglang.jit_kernel.kv_canary.consts import (
+from sglang.kernels.ops.kv_canary.consts import (
     RealKvHashMode,
 )
 from sglang.srt.environ import envs

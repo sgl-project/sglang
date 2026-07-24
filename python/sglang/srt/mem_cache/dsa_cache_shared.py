@@ -10,9 +10,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
-
-"""Page-sharded DSA KV and indexer cache for context-parallel prefill."""
 
 from __future__ import annotations
 
@@ -599,8 +596,6 @@ class SharedDSAPageLayout:
 
 
 class SharedDSATokenToKVPool(DSATokenToKVPool):
-    """DSA pool with page-sharded Main KV and indexer cache across CP ranks."""
-
     def __init__(
         self,
         *args,

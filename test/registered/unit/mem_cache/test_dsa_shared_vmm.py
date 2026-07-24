@@ -158,10 +158,10 @@ def _run_shared_pool(rank: int, world_size: int, port: int):
     os.environ["WORLD_SIZE"] = str(world_size)
     torch.cuda.set_device(rank)
 
-    from sglang.jit_kernel.fused_store_index_cache import (
+    from sglang.kernels.ops.attention.dsa import index_buf_accessor
+    from sglang.kernels.ops.attention.fused_store_index_cache import (
         fused_store_index_k_cache,
     )
-    from sglang.kernels.ops.attention.dsa import index_buf_accessor
     from sglang.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,

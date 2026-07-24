@@ -10,7 +10,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
 
 from __future__ import annotations
 
@@ -120,8 +119,6 @@ class _SharedDSAHostPageAllocator:
 
 
 class SharedDSAHostPoolGroup(HostPoolGroup):
-    """Transfer DSA Main and Indexer between shared L1 and shared L2."""
-
     def __init__(
         self,
         entries,
@@ -313,18 +310,18 @@ def build_shared_dsa_hicache_stack(
     server_args,
     kv_pool,
     full_layer_mapping,
-    page_size,
-    tp_group,
     load_cache_event,
-    attn_cp_group,
-    attn_tp_group=None,
-    pp_group=None,
     storage_backend=None,
     prefetch_threshold=256,
     model_name=None,
     storage_backend_extra_config=None,
     enable_storage_metrics=False,
 ):
+    page_size = params.page_size
+    tp_group = params.tp_cache_group
+    attn_cp_group = params.attn_cp_cache_group
+    attn_tp_group = params.attn_tp_cache_group
+    pp_group = params.pp_cache_group
     if attn_cp_group is None:
         raise ValueError("DSA shared HiCache requires an attention CP group.")
     if storage_backend is not None:

@@ -1131,7 +1131,6 @@ class TestSharedDSAHiCacheDispatch(CustomTestCase):
                 params=params,
                 server_args=server_args,
                 load_cache_event=object(),
-                attn_cp_group="cp",
             )
 
         build.assert_called_once()
@@ -1175,7 +1174,6 @@ class TestSharedDSAHiCacheDispatch(CustomTestCase):
                 prefetch_threshold=256,
                 enable_storage_metrics=False,
                 load_cache_event=object(),
-                attn_cp_group="cp",
             )
 
         build.assert_called_once()

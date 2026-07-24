@@ -426,6 +426,9 @@ class ServerArgs(DisaggServerArgsMixin):
     srt_encoder_connect_timeout: int = 3.05
     srt_encoder_timeout: int = 100
 
+    # SGLang server for PE model inference
+    pe_server_url: str | None = None
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -1936,6 +1939,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.srt_encoder_timeout,
             help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
             "Increase value if connection between diffusion server and AR model server is slow.",
+        )
+
+        # SGLang server for PE model inference
+        parser.add_argument(
+            "--pe-server-url",
+            type=str,
+            default=ServerArgs.pe_server_url,
+            help="URL of SGLang server for PE model",
         )
 
         return parser

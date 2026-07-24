@@ -1,5 +1,3 @@
-"""End-to-end accuracy test for DSA shared KV cache on GLM-5.2."""
-
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
