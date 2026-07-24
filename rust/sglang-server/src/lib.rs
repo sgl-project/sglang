@@ -17,6 +17,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+mod ring;
 mod runtime;
 mod tokenizer;
 mod tokenizer_manager;

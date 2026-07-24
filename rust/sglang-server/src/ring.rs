@@ -142,7 +142,7 @@ impl EgressProducer {
 
 impl EgressConsumer {
     /// The underlying receiver, so the dispatcher can drain it via
-    /// [`channels::recv`](crate::runtime::channels::recv) (data + shutdown select).
+    /// [`tokenizer_manager::recv`](crate::tokenizer_manager::recv) (data + shutdown select).
     pub fn receiver(&self) -> &flume::Receiver<Bytes> {
         &self.rx
     }
