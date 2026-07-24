@@ -7,7 +7,6 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -72,10 +71,9 @@ pub fn resize_rgb<'py>(
         .as_slice()
         .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
         .to_vec();
-    let out = py.allow_threads(move || {
-        pool().install(|| resize::resize_lanczos_rgb(&data, h, w, out_h, out_w))
-    });
-    Ok(out.into_pyarray_bound(py))
+    let out =
+        py.detach(move || pool().install(|| resize::resize_lanczos_rgb(&data, h, w, out_h, out_w)));
+    Ok(out.into_pyarray(py))
 }
 
 #[pyfunction]
@@ -95,14 +93,14 @@ pub fn image_decode_rgb<'py>(
     data: Vec<u8>,
 ) -> PyResult<(usize, usize, Bound<'py, PyArray1<u8>>)> {
     let (rgb, h, w) = py
-        .allow_threads(move || decode_rgb(&data))
+        .detach(move || decode_rgb(&data))
         .map_err(PyValueError::new_err)?;
-    Ok((h, w, rgb.into_pyarray_bound(py)))
+    Ok((h, w, rgb.into_pyarray(py)))
 }
 
 #[pyfunction]
 pub fn data_hash(py: Python<'_>, data: Vec<u8>) -> u64 {
-    py.allow_threads(move || {
+    py.detach(move || {
         let digest = blake3::hash(&data);
         u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
     })
@@ -115,17 +113,17 @@ pub fn base64_decode<'py>(
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
     use base64::Engine;
     let decoded = py
-        .allow_threads(|| {
+        .detach(|| {
             base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|e| format!("base64 decode error: {e}"))
         })
         .map_err(PyValueError::new_err)?;
-    Ok(pyo3::types::PyBytes::new_bound(py, &decoded))
+    Ok(pyo3::types::PyBytes::new(py, &decoded))
 }
 
 pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new_bound(parent.py(), "common")?;
+    let m = PyModule::new(parent.py(), "common")?;
     m.add_function(wrap_pyfunction!(resize_rgb, &m)?)?;
     m.add_function(wrap_pyfunction!(scaled_dims, &m)?)?;
     m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
