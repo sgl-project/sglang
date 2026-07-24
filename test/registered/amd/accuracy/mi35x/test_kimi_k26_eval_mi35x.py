@@ -53,6 +53,11 @@ class TestKimiK26EvalMI35x(CustomTestCase):
             "triton",
             "--prefill-attention-backend",
             "aiter",
+            # Isolation test: match the MI355X 1P1D disagg recipe's page_size to
+            # check whether page_size=256 alone (vs the single-node default 1)
+            # degrades GSM8K accuracy on the triton decode / MLA path.
+            "--page-size",
+            "256",
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
