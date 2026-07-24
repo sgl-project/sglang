@@ -62,6 +62,12 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
+    # Under PP the draft model only runs on its host PP rank (the last one);
+    # other ranks have no draft worker and thus no draft KV pool.
+    parallel = get_parallel()
+    if parallel.pp_size > 1 and parallel.pp_rank != parallel.pp_size - 1:
+        return None
+
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]

@@ -385,7 +385,7 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-        if self.ps.pp_size > 1:
+        if self.ps.pp_size > 1 and not self.is_draft_worker:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."

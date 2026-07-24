@@ -193,14 +193,19 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    # PP partitions layers across ranks, so each rank holds only a slice
+    # (num_effective_layers < model_num_layers). PP+EAGLE and PP+DSpark
+    # explicitly support MTP draft models on the last PP rank, so the
+    # per-rank slice must not trigger the "PP incompatible with MTP" guard.
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
+        or (num_effective_layers == model_num_layers)
         or (
-            (not spec_algorithm.is_none())
-            and (num_effective_layers == model_num_layers)
+            (num_effective_layers != model_num_layers)
+            and (spec_algorithm.is_eagle() or spec_algorithm.is_dspark())
         )
-    ), "PP is not compatible with MTP models."
+    ), "PP is not compatible with MTP models except when using EAGLE or DSpark speculative decoding."
 
 
 def adjust_hybrid_swa_layer_ids(
