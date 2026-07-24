@@ -289,7 +289,7 @@ impl WorkerRegistry {
                 worker.model_id().to_string(),
                 worker.url().to_string(),
                 worker.is_healthy(),
-                0.0, // TODO: Get actual load
+                worker.load() as f64,
             );
         }
 
@@ -413,7 +413,7 @@ impl WorkerRegistry {
                     worker.model_id().to_string(),
                     worker.url().to_string(),
                     is_healthy,
-                    0.0, // TODO: Get actual load
+                    worker.load() as f64,
                 );
             }
         }
@@ -652,6 +652,7 @@ impl WorkerRegistry {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
+        let mesh_sync_ref = self.mesh_sync.clone();
 
         let handle = tokio::spawn(async move {
             let mut interval =
@@ -667,17 +668,16 @@ impl WorkerRegistry {
                 }
 
                 // Get all workers from registry
-                let workers: Vec<Arc<dyn Worker>> = workers_ref
+                let workers: Vec<(WorkerId, Arc<dyn Worker>)> = workers_ref
                     .iter()
-                    .map(|entry| entry.value().clone())
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
                     .collect();
 
-                // Perform health checks in parallel for better performance
-                // This is especially important when there are many workers
+                // Perform health checks in parallel for workers that have health checks enabled
                 let health_futures: Vec<_> = workers
                     .iter()
-                    .filter(|worker| !worker.metadata().health_config.disable_health_check)
-                    .map(|worker| {
+                    .filter(|(_, worker)| !worker.metadata().health_config.disable_health_check)
+                    .map(|(_, worker)| {
                         let worker = worker.clone();
                         async move {
                             let _ = worker.check_health_async().await;
@@ -685,6 +685,19 @@ impl WorkerRegistry {
                     })
                     .collect();
                 futures::future::join_all(health_futures).await;
+
+                // Sync all workers' state to mesh (health + load)
+                if let Some(ref mesh_sync) = *mesh_sync_ref.read().unwrap() {
+                    for (worker_id, worker) in &workers {
+                        mesh_sync.sync_worker_state(
+                            worker_id.as_str().to_string(),
+                            worker.model_id().to_string(),
+                            worker.url().to_string(),
+                            worker.is_healthy(),
+                            worker.load() as f64,
+                        );
+                    }
+                }
             }
         });
 
@@ -831,5 +844,86 @@ mod tests {
         let llama_workers_after = registry.get_by_model("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_register_syncs_real_load_to_mesh() {
+        use smg_mesh::{stores::StateStores, sync::MeshSyncManager};
+
+        let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
+        let mesh_sync = Arc::new(MeshSyncManager::new(stores, "node1".to_string()));
+
+        let registry = WorkerRegistry::new();
+        registry.set_mesh_sync(Some(mesh_sync.clone()));
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "llama-3".to_string());
+        let worker: Arc<dyn Worker> = Arc::from(Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        ) as Box<dyn Worker>);
+
+        // Simulate 3 in-flight requests before registration
+        worker.increment_load();
+        worker.increment_load();
+        worker.increment_load();
+
+        let worker_id = registry.register(worker);
+
+        // Verify mesh received the real load, not hardcoded 0.0
+        let state = mesh_sync
+            .get_worker_state(worker_id.as_str())
+            .expect("worker state should exist in mesh after register");
+        assert_eq!(
+            state.load, 3.0,
+            "mesh sync load should be 3.0 (actual in-flight count), not 0.0"
+        );
+    }
+
+    #[test]
+    fn test_update_worker_health_syncs_real_load_to_mesh() {
+        use smg_mesh::{stores::StateStores, sync::MeshSyncManager};
+
+        let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
+        let mesh_sync = Arc::new(MeshSyncManager::new(stores, "node1".to_string()));
+
+        let registry = WorkerRegistry::new();
+        registry.set_mesh_sync(Some(mesh_sync.clone()));
+
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "llama-3".to_string());
+        let worker: Arc<dyn Worker> = Arc::from(Box::new(
+            BasicWorkerBuilder::new("http://worker1:8080")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build(),
+        ) as Box<dyn Worker>);
+
+        // Register with zero load first
+        let worker_id = registry.register(worker.clone());
+        assert_eq!(
+            mesh_sync.get_worker_state(worker_id.as_str()).unwrap().load,
+            0.0
+        );
+
+        // Simulate 5 in-flight requests after registration
+        for _ in 0..5 {
+            worker.increment_load();
+        }
+
+        // update_worker_health should sync the current real load
+        registry.update_worker_health(&worker_id, true);
+
+        let state = mesh_sync
+            .get_worker_state(worker_id.as_str())
+            .expect("worker state should exist in mesh after health update");
+        assert_eq!(
+            state.load, 5.0,
+            "mesh sync load should be 5.0 after health update, not 0.0"
+        );
     }
 }
