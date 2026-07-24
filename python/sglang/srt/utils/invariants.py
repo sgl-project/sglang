@@ -34,11 +34,8 @@ class Bucket(enum.Enum):
 
 
 def resolve_level() -> InvariantCheckLevel:
-    """Current signal level, bridging the legacy ASYNC_ASSERT flag.
-
-    Until every callsite migrates, an unset SGLANG_INVARIANT_CHECK inherits
-    SGLANG_ENABLE_ASYNC_ASSERT=true as STRICT so CI keeps failing loud.
-    """
+    """Current signal level; an unset SGLANG_INVARIANT_CHECK falls back to the
+    legacy SGLANG_ENABLE_ASYNC_ASSERT=true as STRICT so CI keeps failing loud."""
     if envs.SGLANG_INVARIANT_CHECK.is_set():
         return InvariantCheckLevel(envs.SGLANG_INVARIANT_CHECK.get())
     if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
@@ -47,12 +44,11 @@ def resolve_level() -> InvariantCheckLevel:
 
 
 class Property:
-    """A per-element validity predicate over a tensor. Detection only."""
+    """A per-element validity predicate; returns an elementwise bool, no reduction."""
 
     name: str
 
     def ok(self, value: torch.Tensor) -> torch.Tensor:
-        """Elementwise bool, True where the value is fine (no reduction here)."""
         raise NotImplementedError
 
 
@@ -130,11 +126,9 @@ _REGISTRY: dict[str, Invariant] = {}
 
 
 class Invariant:
-    """A declared invariant; constructing one registers it.
-
-    `recover` is the optional python-side data layer (None = signal-only, data
-    layer in the kernel). FATAL_UNCONTAINABLE must not have a recover.
-    """
+    """A declared invariant; constructing one registers it. `recover` is the
+    optional python-side data layer (None = signal-only, in the kernel);
+    FATAL_UNCONTAINABLE forbids it."""
 
     def __init__(
         self,
@@ -170,12 +164,9 @@ _FLUSH_EVERY = 512
 
 
 class _CheckReporter:
-    """Sync-free per-(rank, name) hit counter, logged on a call cadence.
-
-    Counts accumulate on-device and mirror to pinned host memory via a
-    non-blocking copy; the host reads the (stale) count on a later call. First
-    hit logs immediately; the rest are batched.
-    """
+    """Sync-free per-(rank, name) hit counter. Counts accumulate on-device and
+    mirror to pinned host via a non-blocking copy; the host reads the (stale)
+    count on a later call. First hit logs immediately, the rest on a cadence."""
 
     def __init__(self):
         self._dev: dict[str, torch.Tensor] = {}
@@ -241,11 +232,9 @@ def expect(
     *,
     msg: str = "",
 ) -> Optional[torch.Tensor]:
-    """Assert `inv` holds over `value`, per the (bucket x level) matrix.
-
-    The data layer (`inv.recover`) is applied unconditionally; only detection +
-    reporting is gated by SGLANG_INVARIANT_CHECK. Returns the recovered value.
-    """
+    """Check `inv` over `value` per the (bucket x level) matrix. The data layer
+    (`inv.recover`) is applied unconditionally; only detection is gated. Returns
+    the recovered value."""
     level = resolve_level()
     if level >= InvariantCheckLevel.WARN and value is not None and value.numel() > 0:
         detail = f"{inv.prop.name}: {msg}" if msg else inv.prop.name

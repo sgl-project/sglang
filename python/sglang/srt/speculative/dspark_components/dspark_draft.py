@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
-    """Clamp degenerate (all-NaN) rows to a one-hot on token 0."""
     degenerate = torch.isnan(probs[:, :1])
     one_hot = torch.zeros_like(probs)
     one_hot[:, 0] = 1.0
