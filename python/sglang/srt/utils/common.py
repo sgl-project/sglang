@@ -2036,6 +2036,108 @@ def kill_process_tree(
         _wait_for_reap_or_raise(killed, wait_timeout)
 
 
+def graceful_kill_process_tree(
+    parent_pid=None,
+    include_parent: bool = False,
+    skip_pid: int = None,
+    timeout: float = 10.0,
+):
+    """Gracefully terminate a process tree: SIGTERM first, wait, then SIGKILL stragglers.
+
+    Args:
+        parent_pid: Target PID, defaults to current process.
+        include_parent: Also kill the parent after children are done.
+        skip_pid: A child PID to leave untouched.
+        timeout: Seconds to wait before escalating to SIGKILL.
+    """
+    if parent_pid is None:
+        parent_pid = os.getpid()
+        include_parent = False
+
+    try:
+        itself = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = itself.children(recursive=True)
+
+    signaled = []
+    for child in children:
+        if child.pid == skip_pid:
+            continue
+        try:
+            logger.info(
+                f"Sending SIGTERM to child process {child.pid} ({child.name()})"
+            )
+            child.terminate()
+            signaled.append(child)
+        except psutil.NoSuchProcess:
+            pass
+
+    if signaled:
+        logger.info(
+            f"Waiting up to {timeout}s for {len(signaled)} child process(es) "
+            "to terminate gracefully..."
+        )
+        deadline = time.monotonic() + timeout
+        alive = signaled
+        while True:
+            alive = _still_holding_resources(alive)
+            if not alive or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if alive:
+            logger.warning(
+                f"{len(alive)} child process(es) did not terminate within "
+                f"{timeout}s, sending SIGKILL: pids={[p.pid for p in alive]}"
+            )
+            for child in alive:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            kill_deadline = time.monotonic() + 3
+            while _still_holding_resources(alive) and time.monotonic() < kill_deadline:
+                time.sleep(0.1)
+        else:
+            logger.info("All child processes terminated gracefully.")
+
+    if include_parent:
+        try:
+            itself.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
+def install_graceful_sigterm_handler(
+    logger: logging.Logger,
+    label: str,
+    on_shutdown: Optional[Callable[[], None]] = None,
+    is_shutting_down: Optional[Callable[[], bool]] = None,
+):
+    """Install a SIGTERM handler that unwinds through process cleanup.
+
+    An already-running cleanup is left uninterrupted. Other exits remain nonzero
+    so an active SubprocessWatchdog still treats them as unexpected.
+    """
+
+    def _handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if is_shutting_down is not None and is_shutting_down():
+            logger.info("SIGTERM received in %s while cleanup is in progress.", label)
+            return
+        logger.info("SIGTERM received in %s; starting cleanup before exit.", label)
+        if on_shutdown is not None:
+            try:
+                on_shutdown()
+            except Exception:
+                logger.exception("Error in SIGTERM cleanup hook")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def monkey_patch_p2p_access_check():
     """
     Monkey patch the slow p2p access check.

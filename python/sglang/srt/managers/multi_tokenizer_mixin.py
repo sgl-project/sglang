@@ -37,6 +37,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -48,6 +49,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
+    ShutdownReq,
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
@@ -460,6 +462,13 @@ class MultiTokenizerRouter:
         self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
+
+    def dispatch_scheduler_shutdown(self) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            async_sock_send(self.send_to_scheduler, ShutdownReq()),
+            self._loop,
+        )
+        future.result(timeout=envs.SGLANG_SCHEDULER_SHUTDOWN_TIMEOUT.get())
 
     def _run_loop(self):
         self._loop.run_forever()
