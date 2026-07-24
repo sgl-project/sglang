@@ -2,6 +2,7 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -179,7 +180,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, MalformedJSON):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -359,6 +360,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            # Reset state: without this the failed buffer is re-parsed and
+            # re-emitted on every subsequent chunk (infinite duplicated text).
+            self._buffer = ""
             return StreamingParseResult(normal_text=current_text)
 
     def structure_info(self) -> _GetInfoFunc:
