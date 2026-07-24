@@ -42,15 +42,15 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
-
-# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
-# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+
+# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
+# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache_components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -382,6 +382,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_cache_actions(result.cache_actions)
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
+        # Finalizers must not emit actions; the walk's were applied above.
+        assert not result.cache_actions
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -409,20 +411,13 @@ class UnifiedRadixCache(BasePrefixCache):
             return EvictResult()
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
-        device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
 
         request_by_type = {
             ComponentType.FULL: params.num_tokens,
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
         }
-        try:
-            self._evict_components(request_by_type, tracker, device_frees, host_frees)
-        finally:
-            # Drain even on a mid-walk raise: tombstoned slots must reach the
-            # allocator or they leak.
-            self._drain_frees(device_frees, host_frees)
+        self._evict_components(request_by_type, tracker)
 
         if (
             self.cache_controller is not None
@@ -437,12 +432,53 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
+    def _free_values(
+        self,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Free a tree-side step's returned values right away, matching the
+        pre-split inline frees (keeps pool space current)."""
+        # Both drains must run even if one raises.
+        try:
+            self._drain_device_frees(device_frees)
+        finally:
+            self._drain_host_frees(host_frees)
+
+    def _evict_device_next_node(
+        self, component_type: ComponentType, tracker: dict[ComponentType, int]
+    ) -> Optional[NodeId]:
+        """Advance the eviction walk one node, draining its frees."""
+        result = self.tree_core.evict_device_next_node(component_type, tracker)
+        self._free_values(result.device_frees, result.host_frees)
+        return result.node_id
+
+    def _evict_device_leaf(
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> Optional[BackupKV]:
+        """Evict one device leaf, draining its frees; returns the deferred
+        write-back BackupKV when one must run before the demote."""
+        result = self.tree_core.evict_device_leaf(node_id, tracker, self.is_write_back)
+        self._free_values(result.device_frees, result.host_frees)
+        return result.backup_kv
+
+    def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
+        """Demote a backed-up node, draining its frees."""
+        result = self.tree_core.demote(node_id, tracker)
+        self._free_values(result.device_frees, result.host_frees)
+
+    def _drop_subtree_no_host(
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Run the write-back drop fallback, draining its frees."""
+        result = self.tree_core.drop_subtree_no_host(node_id, tracker)
+        self._free_values(result.device_frees, result.host_frees)
+        return result.is_dropped
+
     def _evict_components(
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
@@ -452,13 +488,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while (
-                    node_id := self.tree_core.evict_device_next_node(
-                        ct, tracker, device_frees, host_frees
-                    )
+                    node_id := self._evict_device_next_node(ct, tracker)
                 ) is not None:
-                    backup_kv = self.tree_core.evict_device_leaf(
-                        node_id, tracker, device_frees, host_frees, self.is_write_back
-                    )
+                    backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
                         written = self._execute_and_commit_kv_backup(
@@ -466,15 +498,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         if written > 0:
                             self.writing_check(write_back=True)
-                            self.tree_core.demote(
-                                node_id,
-                                tracker,
-                                device_frees=device_frees,
-                                host_frees=host_frees,
-                            )
-                        elif self.tree_core.drop_subtree_no_host(
-                            node_id, tracker, device_frees, host_frees
-                        ):
+                            self._demote(node_id, tracker)
+                        elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
                                 "due to host memory pressure, root node %d",
@@ -488,9 +513,6 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
-                    # Drain per victim, matching the pre-split inline frees
-                    # (keeps host space current for later backups this round).
-                    self._drain_frees(device_frees, host_frees)
             finally:
                 self.tree_core.evict_device_end(ct)
 
@@ -522,14 +544,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         if self.disable:
             return
-        device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        try:
-            self.tree_core.dec_swa_lock_only(
-                node_id, swa_uuid_for_lock, device_frees, host_frees
-            )
-        finally:
-            self._drain_frees(device_frees, host_frees)
+        result = self.tree_core.dec_swa_lock_only(node_id, swa_uuid_for_lock)
+        self._free_values(result.device_frees, result.host_frees)
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         if self.disable:
@@ -732,8 +748,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply and consume: a spent list cannot be double-applied (double free).
         for action in actions:
             self._apply_cache_action(action)
-        if isinstance(actions, list):
-            actions.clear()
+        actions.clear()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         # Component actions route to their component class; the rest are
@@ -772,30 +787,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[ct].free_host_values(host_values)
         host_frees.clear()
 
-    def _drain_frees(
-        self,
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
-        # Both drains must run even if one raises.
-        try:
-            self._drain_device_frees(device_frees)
-        finally:
-            self._drain_host_frees(host_frees)
-
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
-        device_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        host_frees: dict[ComponentType, list[torch.Tensor]] = defaultdict(list)
-        try:
-            self.tree_core.drive_host_eviction(
-                component_type, num_tokens, tracker, device_frees, host_frees
-            )
-        finally:
-            self._drain_frees(device_frees, host_frees)
+        result = self.tree_core.drive_host_eviction(component_type, num_tokens, tracker)
+        self._free_values(result.device_frees, result.host_frees)
         return tracker[component_type]
 
     # ---- HiCache: Backup / LoadBack ----
@@ -1262,6 +1260,8 @@ class UnifiedRadixCache(BasePrefixCache):
             pool_storage_result=operation.pool_storage_result,
         )
         self._apply_cache_actions(commit_actions)
+        # The commit emits via commit_actions only; the walk's were applied above.
+        assert not insert_result.cache_actions
 
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]

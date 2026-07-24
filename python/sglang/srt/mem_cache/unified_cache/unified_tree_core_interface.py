@@ -7,6 +7,7 @@ a Rust TreeCore) can satisfy it without subclassing the Python tree.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
@@ -16,6 +17,48 @@ from sglang.srt.mem_cache.events import KVCacheEventMixin
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
+
+
+class WithValuesToFree(msgspec.Struct):
+    """Component-keyed device/host values a tree-side step freed, for the
+    Controller to drain right after the call returns."""
+
+    device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
+        default_factory=lambda: defaultdict(list)
+    )
+    host_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+    def __del__(self) -> None:
+        # Drop tripwire: every returned value must be drained before disposal.
+        assert (
+            not self.device_frees and not self.host_frees
+        ), "WithValuesToFree dropped with undrained values"
+
+
+class EvictDeviceNextNodeResult(WithValuesToFree):
+    node_id: Optional[NodeId] = None
+
+
+class EvictDeviceLeafResult(WithValuesToFree):
+    backup_kv: Optional[BackupKV] = None
+
+
+class DemoteResult(WithValuesToFree):
+    pass
+
+
+class DropSubtreeNoHostResult(WithValuesToFree):
+    is_dropped: bool = False
+
+
+class DriveHostEvictionResult(WithValuesToFree):
+    pass
+
+
+class DecSwaLockOnlyResult(WithValuesToFree):
+    pass
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -110,14 +153,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def dec_swa_lock_only(
-        self,
-        node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
-        """Decrease only the SWA (and lower-priority co-located) reference counts,
-        collecting freed device slots into ``device_frees``."""
+        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+    ) -> DecSwaLockOnlyResult:
+        """Decrease only the SWA (and lower-priority co-located) reference
+        counts; the result carries the freed slots."""
         ...
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
@@ -131,48 +170,31 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def evict_device_next_node(
-        self,
-        component_type: ComponentType,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """The next evictable node, or None when the walk is exhausted."""
+        self, component_type: ComponentType, tracker: dict[ComponentType, int]
+    ) -> EvictDeviceNextNodeResult:
+        """The next evictable node (None node_id when the walk is exhausted)."""
         ...
 
     @abstractmethod
     def evict_device_leaf(
-        self,
-        node_id: NodeId,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-        is_write_back: bool,
-    ) -> Optional[BackupKV]:
-        """Evict a leaf's device value; returns a BackupKV when a D->H backup must
-        run (write_back) before the node can be demoted."""
+        self, node_id: NodeId, tracker: dict[ComponentType, int], is_write_back: bool
+    ) -> EvictDeviceLeafResult:
+        """Evict a leaf's device value; the result carries a BackupKV when a
+        D->H backup must run (write_back) before the node can be demoted."""
         ...
 
     @abstractmethod
     def drop_subtree_no_host(
-        self,
-        node_id: NodeId,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> bool:
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
-        under host pressure; declines (False) if any node is locked."""
+        under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
 
     @abstractmethod
     def demote(
-        self,
-        node_id: NodeId,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
+        self, node_id: NodeId, tracker: dict[ComponentType, int]
+    ) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""
         ...
 
@@ -282,9 +304,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         component_type: ComponentType,
         num_tokens: int,
         tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
+    ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
 

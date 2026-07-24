@@ -833,7 +833,7 @@ class MambaComponent(TreeComponent):
                     host_frees,
                 )
             finally:
-                self.cache._drain_frees(device_frees, host_frees)
+                self.cache._free_values(device_frees, host_frees)
             return
         if isinstance(action, FreeComponentDeviceSlot):
             for indices in action.indices:

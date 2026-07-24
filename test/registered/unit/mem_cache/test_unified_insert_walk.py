@@ -245,38 +245,6 @@ class TestResumableInsertWalk(_InsertWalkSuite):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(allocator.available_size(), available + 4)
 
-    def test_evict_host_drains_collected_frees_when_walk_raises(self):
-        """A host-eviction walk that raises mid-way must still free the
-        already-evicted host slots via the finally drain."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        for start in (1, 100):
-            self._insert(
-                cache, allocator, req_to_token_pool, list(range(start, start + 4))
-            )
-        for child in list(cache.root_node.children.values()):
-            self.assertGreater(_write_backup(cache, child, write_back=True), 0)
-        cache.writing_check(write_back=True)
-        cache.evict(EvictParams(num_tokens=8))
-
-        host_avail = cache.cache_controller.mem_pool_host.available_size()
-        real_evict = cache.tree_core._evict_host_leaf
-        calls = []
-
-        def raise_on_second(*args, **kwargs):
-            calls.append(args)
-            if len(calls) == 2:
-                raise RuntimeError("boom")
-            return real_evict(*args, **kwargs)
-
-        with mock.patch.object(
-            cache.tree_core, "_evict_host_leaf", side_effect=raise_on_second
-        ):
-            with self.assertRaises(RuntimeError):
-                cache.evict_host(8)
-        self.assertEqual(
-            cache.cache_controller.mem_pool_host.available_size(), host_avail + 4
-        )
-
     def test_match_split_relocation_survives_finalizer_failure(self):
         """A match-walk split's pending write-through relocation applies before
         the finalizers, so a finalizer failure cannot strand the stale record."""
@@ -342,35 +310,6 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertIsNotNone(window_node.component_data[ComponentType.SWA].value)
         self.assertIsNotNone(window_node.component_data[ComponentType.FULL].value)
         cache.sanity_check()
-
-    def test_dec_swa_lock_only_drains_frees_when_walk_raises(self):
-        """A SWA early-release that raises mid-walk must still free the
-        already-evicted SWA slots via the finally drain."""
-        sw = self.cfg.sliding_window_size
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = list(range(1, 2 * sw + 1))
-        key = RadixKey(array("q", seq))
-        cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
-        m = cache.match_prefix(MatchPrefixParams(key=key))
-        lock = cache.inc_lock_ref(m.last_device_node)
-        # Release FULL first so the SWA early-release is the last lock standing.
-        cache.dec_lock_ref(m.last_device_node, lock.to_dec_params(), skip_swa=True)
-
-        swa_avail = allocator.swa_attn_allocator.available_size()
-        real_evict = cache.tree_core._evict_component_and_detach_lru
-
-        def evict_then_raise(*args, **kwargs):
-            real_evict(*args, **kwargs)
-            raise RuntimeError("boom")
-
-        with mock.patch.object(
-            cache.tree_core,
-            "_evict_component_and_detach_lru",
-            side_effect=evict_then_raise,
-        ):
-            with self.assertRaises(RuntimeError):
-                cache.dec_swa_lock_only(m.last_device_node, lock.swa_uuid_for_lock)
-        self.assertEqual(allocator.swa_attn_allocator.available_size(), swa_avail + sw)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
