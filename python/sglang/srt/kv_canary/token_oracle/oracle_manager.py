@@ -66,8 +66,13 @@ def _build_generalized_req_id_per_token(
         per_req = int(forward_batch.spec_info.draft_token_num)
         result = _expand_uniform(generalized_req_ids_per_row, per_req)
     elif forward_mode.is_draft_extend_v2():
-        per_req = int(forward_batch.spec_info.num_tokens_per_req)
-        result = _expand_uniform(generalized_req_ids_per_row, per_req)
+        per_req = forward_batch.spec_info.num_tokens_per_req
+        if per_req is not None:
+            result = _expand_uniform(generalized_req_ids_per_row, int(per_req))
+        else:
+            # Ragged draft-extend (after prefill): expand by real extend lens.
+            lens = forward_batch.extend_seq_lens.to(torch.int64)
+            result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
     elif forward_mode.is_extend():
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:

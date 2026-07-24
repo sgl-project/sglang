@@ -808,6 +808,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         batch.spec_info,
                         batch.global_num_tokens,
                         batch.global_num_tokens_for_logprob,
+                        is_extend_in_batch=batch.is_extend_in_batch,
                     )
                 )
             else:
