@@ -51,9 +51,9 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 KV_MEM_KINDS = {"VRAM", "DRAM"}
 HOST_REGISTRATION_ALIGNMENT = 4096
-# Keep chunk boundaries 2MiB-aligned for hugetlb-backed buffers and below 1GiB
-# for ordinary 4KiB mappings. The value is aligned down further to each KV item.
-DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = 1022 * (1 << 20)
+# Ionic can retain at least 400 HIP-pinned 256MiB MRs in one PD (100GiB total),
+# while the fourth ~1GiB MR is rejected. Align down further to each KV item.
+DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = 256 * (1 << 20)
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
