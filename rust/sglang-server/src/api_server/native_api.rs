@@ -36,26 +36,34 @@ use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind};
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/generate", post(generate))
-        // `/health` runs the generation round-trip by default (env-gated, else
-        // plain 200); `/health_generate` always does. Mirrors Python.
-        .route("/health", get(health))
-        .route("/health_generate", get(health_generate))
+        .merge(health_routes())
 }
 
-/// `GET /health` — liveness. By default (env true, mirroring Python) runs the same
-/// 1-token round-trip as `/health_generate`; env false → plain 200 (routing the
+/// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
+/// router build (server startup) — changing them on a live process needs a
+/// restart. The deep-probe handler is built once with
+/// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
+/// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
+/// Python) decides whether `/health` shares it or is a plain 200 (routing the
 /// request already proves the frontend is up).
-async fn health(state: State<AppState>) -> Response {
-    if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
-        health_generate(state).await
+fn health_routes() -> Router<AppState> {
+    let timeout =
+        std::time::Duration::from_secs(crate::environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
+    let probe = get(move |state: State<AppState>| health_generate(state, timeout));
+    let health = if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+        probe.clone()
     } else {
-        StatusCode::OK.into_response()
-    }
+        get(|| async { StatusCode::OK.into_response() })
+    };
+    Router::new()
+        .route("/health", health)
+        .route("/health_generate", probe)
 }
 
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
-/// producing output. 200 iff the egress heartbeat advances within the timeout,
-/// else 503. (`/health` delegates here when its env gate is on.)
+/// producing output. 200 iff the egress heartbeat advances within `timeout`
+/// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
+/// (`/health` uses the same handler when its env gate is on.)
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
@@ -63,7 +71,7 @@ async fn health(state: State<AppState>) -> Response {
 /// server passes immediately and a backlog never false-503s (the analogue of
 /// Python's `last_receive_tstamp`). The `HEALTH_CHECK` skip + `http_worker_ipc`
 /// ack are irrelevant here: this single-process server owns the egress ring.
-async fn health_generate(State(state): State<AppState>) -> Response {
+async fn health_generate(State(state): State<AppState>, timeout: std::time::Duration) -> Response {
     let baseline = state
         .egress_activity
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -92,9 +100,8 @@ async fn health_generate(State(state): State<AppState>) -> Response {
     // frame, so without this abort it leaks one detok entry per call.
     let _abort_guard = AbortGuard::new(state.senders.clone(), id, rid);
 
-    // Watch the heartbeat advance. `SGLANG_HEALTH_CHECK_TIMEOUT` defaults to 20s.
-    let timeout = crate::environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    // Watch the heartbeat advance (timeout frozen at router build, default 20s).
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if state
             .egress_activity
