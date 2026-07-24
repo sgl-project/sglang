@@ -1900,7 +1900,15 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    # Avoid D2H sync when prefix_lens defaults to seq_lens (DFLASH draft case)
+                    # In that case: min(seq_lens, window+seq_lens-seq_lens) = min(seq_lens, window)
+                    # which can be computed on CPU using seq_lens_cpu
+                    if seq_lens_cpu is not None and torch.equal(prefix_lens, seq_lens):
+                        paged_kernel_lens_sum = int(
+                            torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
+                        )
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
