@@ -1391,7 +1391,14 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
+        self._capture_after_last_layer = False
         for layer_id in self.layers_to_capture:
+            if layer_id >= len(self.layers):
+                # "Capture before layer num_layers" == the output of the last
+                # decoder layer (the input of the final norm). No such module
+                # exists, so record it and capture after the decoder loop.
+                self._capture_after_last_layer = True
+                continue
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
     @property
@@ -1461,6 +1468,13 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "hidden_states": hidden_states,
                     "residual": residual,
                 }
+            )
+
+        # Capture the output of the last decoder layer (the input of the
+        # final norm), consistent with the per-layer captures above.
+        if getattr(self, "_capture_after_last_layer", False):
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
             )
 
         # Apply final normalization
