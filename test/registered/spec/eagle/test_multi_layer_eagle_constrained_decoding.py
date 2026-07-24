@@ -1,0 +1,90 @@
+import unittest
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
+from sglang.test.test_utils import (
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_cuda_ci(est_time=140, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestMultiLayerEagleConstrainedDecoding(
+    CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
+):
+    """Exercise grammar masking through the multi-layer EAGLE verify path.
+
+    ``run_eagle_verify`` now owns the vocabulary-mask generation shared by the
+    single- and multi-layer workers. These end-to-end assertions ensure the
+    multi-layer caller keeps using that path and that both JSON and regex
+    constraints survive target verification in overlap and non-overlap modes.
+    """
+
+    max_running_requests = 48
+    attention_backend = "triton"
+    spec_steps = 3
+    spec_topk = 1
+    spec_draft_tokens = 4
+    page_size = 1
+    other_launch_args = []
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    grammar_backend = "xgrammar"
+    disable_overlap = True
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        launch_args = [
+            "--trust-remote-code",
+            "--attention-backend",
+            cls.attention_backend,
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model",
+            cls.draft_model,
+            "--speculative-num-steps",
+            cls.spec_steps,
+            "--speculative-eagle-topk",
+            cls.spec_topk,
+            "--speculative-num-draft-tokens",
+            cls.spec_draft_tokens,
+            "--enable-multi-layer-eagle",
+            "--page-size",
+            str(cls.page_size),
+            "--mem-fraction-static",
+            "0.75",
+            "--max-running-requests",
+            str(cls.max_running_requests),
+            "--grammar-backend",
+            cls.grammar_backend,
+        ]
+        if cls.disable_overlap:
+            launch_args.append("--disable-overlap-schedule")
+        launch_args.extend(cls.other_launch_args)
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=launch_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestMultiLayerEagleConstrainedDecodingV2(TestMultiLayerEagleConstrainedDecoding):
+    disable_overlap = False
+
+
+if __name__ == "__main__":
+    unittest.main()
