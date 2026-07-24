@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 import struct
 import threading
@@ -49,6 +50,8 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 KV_MEM_KINDS = {"VRAM", "DRAM"}
+DEFAULT_HOST_REGISTRATION_CHUNK_BYTES = 1 << 30
+HOST_REGISTRATION_ALIGNMENT = 4096
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
@@ -216,6 +219,7 @@ class KVArgsRegisterInfo:
     dst_port: int
     engine_desc: EngineDesc
     dst_kv_mem_descs: List[MemoryDesc]
+    dst_kv_mem_desc_groups: List[List[MemoryDesc]]
     dst_kv_mem_kinds: List[str]
     dst_kv_item_lens: List[int]
     dst_aux_mem_descs: List[MemoryDesc]
@@ -237,6 +241,25 @@ class KVArgsRegisterInfo:
         dst_port = int(payload[2].decode("ascii"))
         engine_desc = EngineDesc.unpack(payload[3])
         dst_kv_mem_descs = _unpack_mem_desc_list(payload[4])
+        dst_kv_mem_desc_groups = (
+            _unpack_mem_desc_lists(payload[15])
+            if len(payload) > 15 and payload[15]
+            else []
+        )
+        if dst_kv_mem_desc_groups:
+            if any(not group for group in dst_kv_mem_desc_groups):
+                raise ValueError("Destination KV descriptor groups cannot be empty")
+            if dst_kv_mem_descs and len(dst_kv_mem_descs) != len(
+                dst_kv_mem_desc_groups
+            ):
+                raise ValueError(
+                    "Destination KV descriptor-group metadata does not match "
+                    "logical descriptors"
+                )
+            if not dst_kv_mem_descs:
+                dst_kv_mem_descs = [group[0] for group in dst_kv_mem_desc_groups]
+        else:
+            dst_kv_mem_desc_groups = [[desc] for desc in dst_kv_mem_descs]
         dst_aux_mem_descs = _unpack_mem_desc_list(payload[5])
         dst_state_mem_descs = _unpack_mem_desc_lists(payload[6])
         gpu_id = int(payload[7].decode("ascii"))
@@ -276,6 +299,7 @@ class KVArgsRegisterInfo:
             dst_port=dst_port,
             engine_desc=engine_desc,
             dst_kv_mem_descs=dst_kv_mem_descs,
+            dst_kv_mem_desc_groups=dst_kv_mem_desc_groups,
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_kv_item_lens=dst_kv_item_lens,
             dst_aux_mem_descs=dst_aux_mem_descs,
@@ -368,6 +392,7 @@ class MoriKVManager(CommonKVManager):
         self.engine = self._init_engine()
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
+        self.kv_mem_desc_groups: List[List[MemoryDesc]] = []
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[List[MemoryDesc]] = []
         self.transfer_lock = threading.Lock()
@@ -440,23 +465,68 @@ class MoriKVManager(CommonKVManager):
         return engine
 
     def _register_local_buffers(self) -> None:
+        if not hasattr(self, "kv_mem_desc_groups"):
+            self.kv_mem_desc_groups = []
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
             len(self.kv_args.kv_data_ptrs),
         )
-        for ptr, length, mem_kind in zip(
+        chunk_limit = int(
+            os.environ.get(
+                "SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES",
+                DEFAULT_HOST_REGISTRATION_CHUNK_BYTES,
+            )
+        )
+        if chunk_limit < HOST_REGISTRATION_ALIGNMENT:
+            raise ValueError(
+                "SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES must be at least "
+                f"{HOST_REGISTRATION_ALIGNMENT}, got {chunk_limit}"
+            )
+        for ptr, length, item_len, mem_kind in zip(
             self.kv_args.kv_data_ptrs,
             self.kv_args.kv_data_lens,
+            self.kv_args.kv_item_lens,
             self.kv_args.kv_data_mem_kinds,
         ):
             is_host = mem_kind == "DRAM"
-            mem_desc = self.engine.register_memory(
-                ptr,
-                length,
-                -1 if is_host else self.kv_args.gpu_id,
-                MemoryLocationType.CPU if is_host else MemoryLocationType.GPU,
+            chunk_alignment = math.lcm(HOST_REGISTRATION_ALIGNMENT, item_len)
+            aligned_chunk_limit = chunk_limit // chunk_alignment * chunk_alignment
+            if is_host and aligned_chunk_limit == 0:
+                raise ValueError(
+                    "MoRI host registration chunk limit is smaller than buffer "
+                    f"alignment {chunk_alignment}"
+                )
+            register_chunk_size = (
+                aligned_chunk_limit
+                if is_host and length > aligned_chunk_limit
+                else length
             )
-            self.kv_mem_descs.append(mem_desc)
+            desc_group: List[MemoryDesc] = []
+            offset = 0
+            while offset < length:
+                chunk_size = min(register_chunk_size, length - offset)
+                desc_group.append(
+                    self.engine.register_memory(
+                        ptr + offset,
+                        chunk_size,
+                        -1 if is_host else self.kv_args.gpu_id,
+                        MemoryLocationType.CPU if is_host else MemoryLocationType.GPU,
+                    )
+                )
+                offset += chunk_size
+            if not desc_group:
+                raise ValueError("Cannot register an empty KV memory region")
+            if len(desc_group) > 1:
+                logger.info(
+                    "Split %.2f GiB MoRI host KV region into %d chunks "
+                    "(limit %.2f GiB, alignment %d bytes)",
+                    length / (1 << 30),
+                    len(desc_group),
+                    chunk_limit / (1 << 30),
+                    chunk_alignment,
+                )
+            self.kv_mem_desc_groups.append(desc_group)
+            self.kv_mem_descs.append(desc_group[0])
         for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
             desc = self.engine.register_memory(
                 ptr,
@@ -779,13 +849,26 @@ class MoriKVManager(CommonKVManager):
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
     def _get_mla_mem_desc_slices(self, peer_info: KVArgsRegisterInfo) -> tuple[
-        List[MemoryDesc],
-        List[MemoryDesc],
+        List[List[MemoryDesc]],
+        List[List[MemoryDesc]],
         List[str],
         List[int],
     ]:
-        src_descs = self.kv_mem_descs
+        src_desc_groups = getattr(
+            self, "kv_mem_desc_groups", [[desc] for desc in self.kv_mem_descs]
+        )
         dst_mem_descs = peer_info.dst_kv_mem_descs
+        dst_desc_groups = getattr(
+            peer_info,
+            "dst_kv_mem_desc_groups",
+            [[desc] for desc in dst_mem_descs],
+        )
+        if len(src_desc_groups) != len(self.kv_mem_descs):
+            raise ValueError("Source KV descriptor groups do not match logical buffers")
+        if len(dst_desc_groups) != len(dst_mem_descs):
+            raise ValueError(
+                "Destination KV descriptor groups do not match logical buffers"
+            )
         dst_mem_kinds = _normalize_kv_mem_kinds(
             peer_info.dst_kv_mem_kinds, len(dst_mem_descs)
         )
@@ -797,10 +880,10 @@ class MoriKVManager(CommonKVManager):
 
         # Most deployments register only the decode rank's local PP stage.
         # In that case the descriptor order already matches the prefill side.
-        if len(dst_mem_descs) == len(src_descs):
+        if len(dst_mem_descs) == len(src_desc_groups):
             return (
-                src_descs,
-                dst_mem_descs,
+                src_desc_groups,
+                dst_desc_groups,
                 dst_mem_kinds,
                 dst_item_lens or list(self.kv_args.kv_item_lens),
             )
@@ -810,7 +893,9 @@ class MoriKVManager(CommonKVManager):
         compression_ratios = self.kv_args.mla_compression_ratios
         if compression_ratios is None:
             end_layer = (
-                end_layer if end_layer is not None else start_layer + len(src_descs)
+                end_layer
+                if end_layer is not None
+                else start_layer + len(src_desc_groups)
             )
             dst_indices = list(range(start_layer, end_layer))
         else:
@@ -840,15 +925,15 @@ class MoriKVManager(CommonKVManager):
                 )
             )
 
-        if len(dst_indices) != len(src_descs) or (
+        if len(dst_indices) != len(src_desc_groups) or (
             dst_indices and max(dst_indices) >= len(dst_mem_descs)
         ):
             raise ValueError(
                 "Destination MLA KV descriptors do not match prefill pp configuration"
             )
         return (
-            src_descs,
-            [dst_mem_descs[i] for i in dst_indices],
+            src_desc_groups,
+            [dst_desc_groups[i] for i in dst_indices],
             [dst_mem_kinds[i] for i in dst_indices],
             (
                 [dst_item_lens[i] for i in dst_indices]
@@ -859,23 +944,104 @@ class MoriKVManager(CommonKVManager):
 
     def _submit_batch_transfer_plan(
         self,
-        src_desc: MemoryDesc,
-        dst_desc: MemoryDesc,
+        src_desc: MemoryDesc | List[MemoryDesc],
+        dst_desc: MemoryDesc | List[MemoryDesc],
         plan: BatchTransferPlan,
     ) -> List[TransferStatus]:
         if plan.empty():
             return []
 
-        transfer_uid = self.engine.allocate_transfer_uid()
+        src_group = src_desc if isinstance(src_desc, list) else [src_desc]
+        dst_group = dst_desc if isinstance(dst_desc, list) else [dst_desc]
 
-        statuses = self.engine.batch_write(
-            [src_desc],
-            [plan.local_offsets],
-            [dst_desc],
-            [plan.remote_offsets],
-            [plan.sizes],
-            [transfer_uid],
-        )
+        def submit_one(
+            source: MemoryDesc,
+            destination: MemoryDesc,
+            subplan: BatchTransferPlan,
+        ) -> List[TransferStatus]:
+            transfer_uid = self.engine.allocate_transfer_uid()
+            return self.engine.batch_write(
+                [source],
+                [subplan.local_offsets],
+                [destination],
+                [subplan.remote_offsets],
+                [subplan.sizes],
+                [transfer_uid],
+            )
+
+        if len(src_group) == 1 and len(dst_group) == 1:
+            return submit_one(src_group[0], dst_group[0], plan)
+
+        def descriptor_spans(
+            group: List[MemoryDesc],
+        ) -> List[Tuple[int, int]]:
+            spans: List[Tuple[int, int]] = []
+            start = 0
+            for desc in group:
+                size = int(desc.size)
+                if size <= 0:
+                    raise ValueError(f"MoRI memory descriptor has invalid size {size}")
+                spans.append((start, start + size))
+                start += size
+            return spans
+
+        def locate_offset(offset: int, spans: List[Tuple[int, int]]) -> int:
+            if offset < 0:
+                raise ValueError(f"MoRI transfer offset cannot be negative: {offset}")
+            for index, (start, end) in enumerate(spans):
+                if start <= offset < end:
+                    return index
+            raise ValueError(
+                f"MoRI transfer offset {offset} exceeds registered size "
+                f"{spans[-1][1]}"
+            )
+
+        src_spans = descriptor_spans(src_group)
+        dst_spans = descriptor_spans(dst_group)
+        split_plans: Dict[Tuple[int, int], Tuple[List[int], List[int], List[int]]] = {}
+        for local_offset, remote_offset, size in zip(
+            plan.local_offsets, plan.remote_offsets, plan.sizes
+        ):
+            remaining = int(size)
+            if remaining <= 0:
+                raise ValueError(
+                    f"MoRI transfer size must be positive, got {remaining}"
+                )
+            local_cursor = int(local_offset)
+            remote_cursor = int(remote_offset)
+            while remaining:
+                src_index = locate_offset(local_cursor, src_spans)
+                dst_index = locate_offset(remote_cursor, dst_spans)
+                src_start, src_end = src_spans[src_index]
+                dst_start, dst_end = dst_spans[dst_index]
+                part_size = min(
+                    remaining,
+                    src_end - local_cursor,
+                    dst_end - remote_cursor,
+                )
+                local_parts, remote_parts, sizes = split_plans.setdefault(
+                    (src_index, dst_index), ([], [], [])
+                )
+                local_parts.append(local_cursor - src_start)
+                remote_parts.append(remote_cursor - dst_start)
+                sizes.append(part_size)
+                local_cursor += part_size
+                remote_cursor += part_size
+                remaining -= part_size
+
+        statuses: List[TransferStatus] = []
+        for (src_index, dst_index), (
+            local_offsets,
+            remote_offsets,
+            sizes,
+        ) in split_plans.items():
+            statuses.extend(
+                submit_one(
+                    src_group[src_index],
+                    dst_group[dst_index],
+                    BatchTransferPlan(local_offsets, remote_offsets, sizes),
+                )
+            )
         return statuses
 
     def _build_contiguous_transfer_plan(
@@ -1918,7 +2084,14 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_infos is None:
             return False
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
-        packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
+        has_chunked_kv = any(len(group) > 1 for group in self.kv_mgr.kv_mem_desc_groups)
+        # Old peers do not understand descriptor groups. Omit the legacy flat
+        # list when chunking is active so they fail closed instead of writing
+        # past the first registered chunk.
+        packed_kv_descs = (
+            b"" if has_chunked_kv else _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
+        )
+        packed_kv_desc_groups = _pack_mem_desc_lists(self.kv_mgr.kv_mem_desc_groups)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
         packed_state_descs = _pack_mem_desc_lists(self.kv_mgr.state_mem_descs)
         gpu_id = str(self.kv_mgr.kv_args.gpu_id).encode("ascii")
@@ -1953,6 +2126,7 @@ class MoriKVReceiver(CommonKVReceiver):
                 packed_state_dim_per_tensor,
                 packed_kv_mem_kinds,
                 packed_kv_item_lens,
+                packed_kv_desc_groups,
             ]
             try:
                 with lock:
