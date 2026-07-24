@@ -1583,9 +1583,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"]["response_sent_to_client_ts"] = (
-                        state.time_stats.get_response_sent_to_client_realtime()
-                    )
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1616,9 +1616,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"]["response_sent_to_client_ts"] = (
-                        state.time_stats.get_response_sent_to_client_realtime()
-                    )
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
                 yield out
             else:
                 if (
@@ -2992,9 +2992,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[
-            ScaleElasticEPReqOutput
-        ] = await self.scale_elastic_ep_communicator(obj)
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase

@@ -217,8 +217,10 @@ fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 
         .unwrap_or(default)
 }
 
-fn legacy_metadata(meta_info: ResponseMetadata) -> Result<HashMap<String, String>, Status> {
-    meta_info.into_legacy().map_err(Status::internal)
+fn legacy_metadata(meta_info: ResponseMetadata) -> Result<HashMap<String, String>, Box<Status>> {
+    meta_info
+        .into_legacy()
+        .map_err(|error| Box::new(Status::internal(error)))
 }
 
 fn json_to_prost_value(value: serde_json::Value) -> prost_types::Value {
@@ -259,16 +261,16 @@ const TYPED_META_KEYS: &[&str] = &[
 
 const MAX_TYPED_GENERATION_CHOICES: i32 = 1024;
 
-fn expected_generation_choices(request: &proto::GenerateRequest) -> Result<usize, Status> {
+fn expected_generation_choices(request: &proto::GenerateRequest) -> Result<usize, Box<Status>> {
     let choices = request
         .sampling_params
         .as_ref()
         .and_then(|params| params.n)
         .unwrap_or(1);
     if !(1..=MAX_TYPED_GENERATION_CHOICES).contains(&choices) {
-        return Err(Status::invalid_argument(format!(
+        return Err(Box::new(Status::invalid_argument(format!(
             "sampling_params.n must be between 1 and {MAX_TYPED_GENERATION_CHOICES}, got {choices}"
-        )));
+        ))));
     }
     Ok(choices as usize)
 }
@@ -624,7 +626,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             Ok(meta_info) => meta_info,
                             Err(status) => {
                                 abort_guard.abort_now();
-                                yield Err(status);
+                                yield Err(*status);
                                 break;
                             }
                         };
@@ -639,7 +641,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         let meta_info = match legacy_metadata(data.meta_info) {
                             Ok(meta_info) => meta_info,
                             Err(status) => {
-                                yield Err(status);
+                                yield Err(*status);
                                 break;
                             }
                         };
@@ -712,7 +714,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             Ok(meta_info) => meta_info,
                             Err(status) => {
                                 abort_guard.abort_now();
-                                yield Err(status);
+                                yield Err(*status);
                                 break;
                             }
                         };
@@ -727,7 +729,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         let meta_info = match legacy_metadata(data.meta_info) {
                             Ok(meta_info) => meta_info,
                             Err(status) => {
-                                yield Err(status);
+                                yield Err(*status);
                                 break;
                             }
                         };
@@ -777,7 +779,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
-        let expected_choices = expected_generation_choices(&req)?;
+        let expected_choices = expected_generation_choices(&req).map_err(|status| *status)?;
 
         let SubmittedRequest { key, mut receiver } = self
             .bridge
@@ -904,7 +906,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::TextEmbedResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: legacy_metadata(data.meta_info)?,
+                    meta_info: legacy_metadata(data.meta_info).map_err(|status| *status)?,
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),
@@ -944,7 +946,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::EmbedResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: legacy_metadata(data.meta_info)?,
+                    meta_info: legacy_metadata(data.meta_info).map_err(|status| *status)?,
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),
@@ -991,7 +993,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
                 Ok(Response::new(proto::ClassifyResponse {
                     embedding: data.embedding.unwrap_or_default(),
-                    meta_info: legacy_metadata(data.meta_info)?,
+                    meta_info: legacy_metadata(data.meta_info).map_err(|status| *status)?,
                 }))
             }
             ResponseChunk::Error(msg) => Err(Status::internal(msg)),
@@ -1455,7 +1457,7 @@ impl SglangServiceImpl {
 
         match chunk {
             ResponseChunk::Data(data) | ResponseChunk::Finished(data) => {
-                let meta_info = legacy_metadata(data.meta_info)?;
+                let meta_info = legacy_metadata(data.meta_info).map_err(|status| *status)?;
                 Ok(Response::new(proto::OpenAiResponse {
                     json_body: data.json_bytes.unwrap_or_default(),
                     status_code: openai_status_code(&meta_info, 200),

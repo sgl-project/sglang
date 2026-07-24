@@ -652,10 +652,10 @@ fn set_on_ready_for_rid(
 ) -> PyResult<()> {
     let should_notify = {
         let mut state = lock_or_recover(state.as_ref(), "state");
-        if !state
+        if state
             .channels
             .get(key.rid())
-            .is_some_and(|channel| channel.incarnation == key.incarnation)
+            .is_none_or(|channel| channel.incarnation != key.incarnation)
         {
             return Ok(());
         }
@@ -983,10 +983,10 @@ fn extract_legacy_meta_info(chunk: &Bound<'_, PyDict>) -> HashMap<String, String
         && let Ok(meta_dict) = meta_obj.cast::<PyDict>()
     {
         for (k, v) in meta_dict.iter() {
-            if let Ok(key) = k.extract::<String>() {
-                if let Ok(value) = py_value_to_json_string(&v) {
-                    meta.insert(key, value);
-                }
+            if let Ok(key) = k.extract::<String>()
+                && let Ok(value) = py_value_to_json_string(&v)
+            {
+                meta.insert(key, value);
             }
         }
     }
