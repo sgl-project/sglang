@@ -45,6 +45,62 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
 
+
+import ipaddress
+import logging
+import re
+from urllib.parse import urlparse
+import requests
+
+logger = logging.getLogger(__name__)
+
+_BLOCKED_HOSTS = {
+    '169.254.169.254',  # AWS/GCP/Azure metadata
+    'metadata.google.internal',
+    'metadata.internal',
+    '100.100.100.200',  # Alibaba Cloud
+}
+
+_PRIVATE_RANGES = [
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('::1/128'),
+]
+
+
+def is_private_ip(host: str) -> bool:
+    # Block cloud metadata and known internal hostnames first
+    if host.lower() in _BLOCKED_HOSTS:
+        return True
+    # Then check if it's a private/reserved IP
+    try:
+        addr = ipaddress.ip_address(host)
+        for net in _PRIVATE_RANGES:
+            if addr in net:
+                return True
+        return False
+    except ValueError:
+        return False
+
+
+def validate_resource_url(url: str) -> None:
+    if not url:
+        raise ValueError('URL must not be empty')
+    if url.startswith('file://'):
+        raise ValueError('file:// protocol is not allowed for security reasons')
+    if url.startswith(('http://', 'https://')):
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f'Could not parse hostname from URL: {url}')
+        if is_private_ip(host):
+            raise ValueError(f'Access to private/internal IP is blocked: {host}')
+    elif not url.startswith('data:'):
+        raise ValueError(f'Unsupported URL protocol in: {url[:30]}...')
+
+
 def ensure_numpy(x):
     """Convert torch.Tensor to numpy array if needed (v5 compat)."""
     return x.numpy() if isinstance(x, torch.Tensor) else x
