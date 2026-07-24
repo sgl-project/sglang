@@ -861,9 +861,7 @@ def build_state_entry_pairs(
     n_src: int,
     n_dst: int,
 ) -> List[Tuple[int, int]]:
-    """Map prefill-local state entries to decode-global entries. Under PP the
-    prefill stage holds a subset of the mamba layers, so positional indexing
-    into the dst lists is wrong; pair entries by global layer id instead."""
+    """Pair prefill-local transfer entries with decode entries by layer id."""
     if src_layer_ids and dst_layer_ids:
         # Layer ids repeat once per state tensor (tensor-major x layer flatten),
         # so pair the k-th occurrence on each side rather than a plain id lookup.
@@ -882,7 +880,7 @@ def build_state_entry_pairs(
         # Without layer ids a positional pairing would silently transfer the
         # wrong layers (e.g. PP prefill peered with a stale decode server).
         raise RuntimeError(
-            "PP-heterogeneous mamba state transfer requires state_layer_ids on "
+            "PP-heterogeneous transfer requires layer ids on "
             f"both peers; got src={n_src} dst={n_dst} entries"
         )
     return [(i, i) for i in range(n_src)]
