@@ -56,6 +56,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    grow_multi_ctas_kv_counter_buffer_if_needed,
+    make_persistent_multi_ctas_kv_counter_buffer,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import (
@@ -147,7 +151,7 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sglang.jit_kernel.flash_attention import (
+    from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
@@ -518,8 +522,16 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
+            self._multi_ctas_kv_counter_buffer = (
+                make_persistent_multi_ctas_kv_counter_buffer(
+                    torch.device(self.device),
+                    self.num_q_heads,
+                    max_batch_size=model_runner.max_running_requests,
+                )
+            )
         else:
             self.workspace_buffer = None
+            self._multi_ctas_kv_counter_buffer = None
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -708,7 +720,7 @@ class DeepseekSparseAttnBackend(
         # when the fold is disabled; such metadata is never dispatched to v2.
         if not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         return plan_topk_v2(seqlens_expanded)
 
@@ -721,7 +733,7 @@ class DeepseekSparseAttnBackend(
         # nothing to refresh.
         if metadata.topk_v2_plan is None:
             return
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
@@ -1740,7 +1752,7 @@ class DeepseekSparseAttnBackend(
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 
@@ -2430,7 +2442,7 @@ class DeepseekSparseAttnBackend(
             (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
             materialization.
         """
-        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
         )
 
@@ -2956,6 +2968,15 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
+        self._multi_ctas_kv_counter_buffer = (
+            grow_multi_ctas_kv_counter_buffer_if_needed(
+                self._multi_ctas_kv_counter_buffer,
+                torch.device(self.device),
+                self.num_q_heads,
+                batch_size,
+            )
+        )
+
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
@@ -2984,6 +3005,7 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
         return out
@@ -3204,7 +3226,7 @@ class DeepseekSparseAttnMultiStepBackend:
         # This is 3x faster than calling the single-backend copy 3 times
         if self.speculative_num_steps > 3:
             try:
-                from sglang.jit_kernel.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.fused_metadata_copy import (
                     fused_metadata_copy_multi_cuda,
                 )
 

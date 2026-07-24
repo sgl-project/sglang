@@ -59,11 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
 
@@ -152,7 +148,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.rot_weight = None
         if _is_npu:
-            rot_weight_path = get_model().model_path + "/rot.safetensors"
+            rot_weight_path = get_server_args().model_path + "/rot.safetensors"
             if os.path.isfile(rot_weight_path):
                 self.rot_weight = load_file(rot_weight_path)
                 self.rot_weight = self.rot_weight["rot.weight"].npu()
@@ -165,7 +161,8 @@ class DeepseekModelNextN(nn.Module):
 
         layer_name = "decoder"
         if _is_npu and (
-            get_spec().speculative_draft_model_path == get_model().model_path
+            get_server_args().speculative_draft_model_path
+            == get_server_args().model_path
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
@@ -204,7 +201,7 @@ class DeepseekModelNextN(nn.Module):
         if (
             _is_npu
             and self.quant_config is None
-            and get_model().quantization is not None
+            and get_server_args().quantization is not None
         ):
             # ascend mtp unquant
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
@@ -380,7 +377,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
