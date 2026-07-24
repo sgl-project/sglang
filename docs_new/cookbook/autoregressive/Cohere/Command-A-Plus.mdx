@@ -1,0 +1,297 @@
+---
+title: Command A+
+description: "Deploy Cohere Command A+ with SGLang — a 218B-parameter (25B active) Mixture-of-Experts vision-language model for agentic, multilingual, and reasoning tasks. Verified BF16/FP8/W4A4 recipes + benchmarks on NVIDIA B300."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel. Command A+ support is included in current SGLang releases (PR [#26106](https://github.com/sgl-project/sglang/pull/26106)); the `lmsysorg/sglang:latest` Docker image ships it.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:latest
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. Command A+ ships in three precisions — **BF16**, **FP8**, and **W4A4 (NVFP4)** — each verified on NVIDIA B300 at the tensor-parallel size its weights need (BF16 → 4 GPUs, FP8 → 2 GPUs, W4A4 → 1 GPU). The single **Balanced** strategy reflects the one verified operating point per precision:
+
+- **Balanced** — good speed with several users at once. Use for typical multi-user serving.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/CohereLabs/command-a-plus.jsx";
+import { benchmarks } from "/src/snippets/configs/CohereLabs/command-a-plus-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Command A+** (`command-a-plus-05-2026`) is Cohere's open-weights flagship: a **218B-parameter sparse Mixture-of-Experts** model that activates just **25B parameters per token**, built for agentic, multilingual, and reasoning-heavy enterprise workloads. It is a **vision-language model** (`image-text-to-text`) — a SigLIP vision encoder feeds a `cohere2_moe` text backbone of 32 layers with **128 experts (8 routed + 4 shared per token)**, grouped-query attention (128 query / 8 KV heads), and an interleaved **sliding-window (4096) + global attention** pattern in a 3:1 ratio. It understands **48 languages**, supports **tool / function calling** and citation-grounded answers, and has an **extended-thinking** mode. Context length is up to **200K tokens** (128K input / 64K output recommended). Released May 2026 under the **Apache 2.0** license.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16%"}} />
+    <col style={{width: "40%"}} />
+    <col style={{width: "20%"}} />
+    <col style={{width: "24%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>HuggingFace repo</th>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Tested on B300</th>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700}}>Quantization scheme</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16">command-a-plus-05-2026-bf16</a></td>
+      <td style={{padding: "9px 12px"}}>4× B300 (TP=4)</td>
+      <td style={{padding: "9px 12px"}}>Unquantized</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/CohereLabs/command-a-plus-05-2026-fp8">command-a-plus-05-2026-fp8</a></td>
+      <td style={{padding: "9px 12px"}}>2× B300 (TP=2)</td>
+      <td style={{padding: "9px 12px"}}>compressed-tensors W8A8 (per-channel weight / per-token activation) on experts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>W4A4</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/CohereLabs/command-a-plus-05-2026-w4a4">command-a-plus-05-2026-w4a4</a></td>
+      <td style={{padding: "9px 12px"}}>1× B300 (TP=1)</td>
+      <td style={{padding: "9px 12px"}}>NVFP4 4-bit weights + activations on experts (quantization-aware distilled)</td>
+    </tr>
+  </tbody>
+</table>
+
+**Recommended generation:** `temperature=0.6`, `top_p=0.95` (informational; SGLang reads the model's `generation_config.json` defaults — do not hardcode these in client code).
+
+**Resources:** [BF16](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) · [FP8](https://huggingface.co/CohereLabs/command-a-plus-05-2026-fp8) · [W4A4](https://huggingface.co/CohereLabs/command-a-plus-05-2026-w4a4) on HuggingFace.
+
+## 2. Configuration Tips
+
+**MoE runner backend per precision (Blackwell).** On Blackwell (B200 / B300) the recipes pick the MoE runner that fits each checkpoint's quantization (verified on B300), and the Deploy panel bakes it in:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "34%"}} />
+    <col style={{width: "48%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>MoE runner</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}><code>--moe-runner-backend cutlass</code></td>
+      <td style={{padding: "9px 12px"}}>Fastest unquantized MoE path on Blackwell; attention auto-selects <code>trtllm_mha</code>.</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}>default (Triton)</td>
+      <td style={{padding: "9px 12px"}}>The checkpoint uses per-channel / per-token (PTPC) FP8 on the experts, which the FlashInfer and CUTLASS FP8 MoE fast paths don't support — Triton is the correct path.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>W4A4</strong></td>
+      <td style={{padding: "9px 12px"}}><code>--moe-runner-backend flashinfer_trtllm</code></td>
+      <td style={{padding: "9px 12px"}}>Selects the FlashInfer TRT-LLM-GEN NVFP4 fused-MoE kernel for the 4-bit experts.</td>
+    </tr>
+  </tbody>
+</table>
+
+**Multimodal serving (image + text).** When you serve images at concurrency, enable CUDA-IPC transport for the vision features and raise the feature-cache budget — the default 1024 MiB exhausts under sustained multimodal load and silently falls back to the slower path:
+
+```bash Command
+SGLANG_USE_CUDA_IPC_TRANSPORT=1 SGLANG_MM_FEATURE_CACHE_MB=8192 \
+sglang serve --model-path CohereLabs/command-a-plus-05-2026-w4a4 \
+  --tp 1 --trust-remote-code --moe-runner-backend flashinfer_trtllm \
+  --host 0.0.0.0 --port 30000
+```
+
+**Context length.** The benchmarks below were measured at a bounded `--context-length 12288`. The model's native maximum is 200K; omit `--context-length` to let SGLang size the KV pool from available memory. Because most layers use a 4096-token sliding window (only every 4th layer is full-attention), long-context KV stays modest, so large contexts are practical on a single node.
+
+**Memory fraction.** Recipes were verified at the default memory fraction; raising `--mem-fraction-static` to `0.9` changed throughput by `<0.5%` at the tested concurrencies (these workloads are MoE-compute-bound, not KV-bound).
+
+**Hardware footprint — two recipe families.** **Blackwell (B200 / B300):** BF16 `cutlass` TP=4, FP8 Triton TP=2, W4A4 `flashinfer_trtllm` TP=1 — **B300 is benchmark-verified**; B200 runs the same commands but is **not yet benchmarked** (shown *Not Verified*). **Hopper (H100 / H200):** plain tensor parallelism on the default Triton FusedMoE runner, sized from Cohere's official guidance — **BF16 TP=8, FP8 TP=4**. **H200 is benchmark-verified** (on an 8× H200 node); H100 uses the same recipe but is not yet benchmarked. **W4A4 (NVFP4) is Blackwell-only** — the Hopper dequant path isn't validated, so the Deploy panel greys out W4A4 on H100/H200. Each precision runs at a different tensor-parallel size (its smallest viable footprint), so compare cells by **tokens/sec/GPU**, not absolute TTFT/TPOT — e.g. on H200 at the same load, FP8 (TP=4) matches BF16's (TP=8) latency while delivering ~2× the tokens/sec/GPU.
+
+**Current-build note (prefill CUDA graph).** On recent SGLang `main` (verified at commit `20b2817`), Command A+'s `cohere2_moe` crashes during `tc_piecewise` prefill-graph capture (`AssertionError: Index not registered in index_to_user_object_weakref`). The **Hopper cells therefore launch with `--cuda-graph-backend-prefill disabled`** — the decode CUDA graph stays on (throughput is representative), and only the prefill graph is dropped (which raises TTFT on long inputs). The Blackwell numbers were measured on an earlier commit (`7cead0f`) before this regression landed; if you hit the same crash on Blackwell, add the same flag.
+
+**Hierarchical KV cache.** For a 218B model, host-tier KV offload can extend effective cache capacity — toggle it in the **Hierarchical KV Cache** card of the [Playground above](#playground).
+
+## 3. Advanced Usage
+
+{/* Each runnable example lives in an <Accordion>; its real server output is in the
+    following <Accordion title="Example Output">. Outputs were captured from a live
+    Command A+ server on B300 (verbatim). */}
+
+### 3.1 Reasoning
+
+Command A+ has an extended-thinking mode. Enable the `cohere_command4` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to separate the thinking trace from the final answer. This is a **separate-field** parser: the thinking lands in `message.reasoning_content` and the answer in `message.content`. Thinking is on by default; pass `chat_template_kwargs={"reasoning": False}` to turn it off.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="CohereLabs/command-a-plus-05-2026-bf16",
+    messages=[{"role": "user", "content": "What is 15% of 240? Think step by step."}],
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user asks: "What is 15% of 240? Think step by step." This is a simple math
+problem. The user requests step-by-step. I can solve: 15% = 0.15. Multiply 240 * 0.15 =
+240 * 15/100 = (240 * 15)/100 = 3600/100 = 36. So answer: 36. Provide step-by-step
+reasoning.
+Answer: Sure! Let's break it down step by step.
+
+**Step 1: Understand what "15%" means**
+"15%" is the same as 15 out of 100, or the decimal 0.15.
+
+**Step 2: Set up the multiplication**
+To find 15% of 240, multiply 240 by 0.15.
+
+**Step 3: Do the math**
+240 × 15 = 240 × (10 + 5) = 2400 + 1200 = 3600, then 3600 / 100 = 36
+
+**Step 4: Write the answer**
+15% of 240 is **36**.
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `cohere_command4` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Because thinking is on by default, the assistant turn may also populate `message.reasoning_content` — print both so the output isn't a misleading `None`.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+    },
+}]
+resp = client.chat.completions.create(
+    model="CohereLabs/command-a-plus-05-2026-bf16",
+    messages=[{"role": "user", "content": "What's the weather in Toronto right now?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: The user is asking for the weather in Toronto. I have access to a weather
+function called "get_weather" that takes a city name as a parameter. The user has
+specifically mentioned "Toronto" as the city. This seems like a straightforward request
+that doesn't violate any safety guidelines. I should proceed with calling the weather
+function.
+
+Let me check the function signature:
+- Function name: get_weather
+- Required parameter: city (string)
+- The user provided "Toronto" as the city
+
+I have all the required parameters, so I can proceed with the function call.
+Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_21733d22011b4a2fbd66f683', function=Function(arguments='{"city": "Toronto"}', name='get_weather'), type='function', index=0)]
+```
+
+</Accordion>
+
+### 3.3 Vision (Image + Text)
+
+Command A+ accepts image input. Send an image via the OpenAI `image_url` content part (a public URL or a `data:` base64 URI). See the multimodal serving tip in §2 for the CUDA-IPC flags that keep image prefill fast under load.
+
+<Accordion title="Vision Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="CohereLabs/command-a-plus-05-2026-bf16",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image in one sentence."},
+            {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+        ],
+    }],
+)
+print(resp.choices[0].message.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+A man in a yellow shirt is ironing a shirt on an ironing board mounted on the back of a yellow taxi on a busy city street.
+```
+
+</Accordion>
