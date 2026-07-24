@@ -288,6 +288,15 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+# Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
+# This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
+is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 11],
+        cuda_version=(12, 8),
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
