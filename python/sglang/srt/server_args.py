@@ -6206,7 +6206,7 @@ class ServerArgs:
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'mxfp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
 
         if view.moe_runner_backend == "flashinfer_trtllm_routed":
             assert view.quantization in [

@@ -770,6 +770,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
+            nfse = runner_config.num_fused_shared_experts or 0
             trtllm_fp8_block_scale_moe_out_wrapper(
                 routing_logits=router_logits,
                 routing_bias=correction_bias,
@@ -781,7 +782,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 output=symm_output,
                 num_experts=quant_info.global_num_experts,
-                top_k=topk_config.top_k,
+                top_k=topk_config.top_k - nfse,
                 n_group=topk_config.num_expert_group,
                 topk_group=topk_config.topk_group,
                 intermediate_size=quant_info.intermediate_size,
@@ -797,6 +798,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
+                num_fused_shared_experts=nfse if nfse > 0 else None,
             )
         output = symm_output
     else:

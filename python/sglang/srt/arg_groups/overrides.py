@@ -2033,10 +2033,19 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
         )
         return {"disable_shared_experts_fusion": True}
     if runner in ("flashinfer_trtllm", "experimental_sgl_trtllm"):
-        logger.warning(
-            "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
-        )
-        return {"disable_shared_experts_fusion": True}
+        # FP8 block-scale (fp8, mxfp8) supports fused shared experts via
+        # num_fused_shared_experts in trtllm_fp8_block_scale_moe; other
+        # quant types (BF16, FP4, per-tensor FP8) do not. The kernel also
+        # does not support expert parallel (EP > 1), so fusion must be
+        # disabled in that case as well.
+        if view.quantization not in ["fp8", "mxfp8"] or view.ep_size > 1:
+            logger.info(
+                "FlashInfer TRTLLM MoE is enabled, but fused shared experts "
+                "are only supported for fp8/mxfp8 quantization with ep_size == 1. "
+                "--disable-shared-experts-fusion is automatically set."
+            )
+            return {"disable_shared_experts_fusion": True}
+        return {}
     if runner == "flashinfer_trtllm_routed":
         logger.warning(
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
