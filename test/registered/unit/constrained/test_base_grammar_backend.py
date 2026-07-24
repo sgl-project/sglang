@@ -314,6 +314,32 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_stop_tokens_include_tokenizer_eos(self, mock_xgrammar_cls):
+        """Tokenizer-level stop tokens reach XGrammar even when the model
+        config's eos_token_id list omits them."""
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        args = self._make_server_args("xgrammar")
+
+        class Tok:
+            eos_token_id = 151645
+            additional_stop_token_ids = [151646]
+
+        create_grammar_backend(args, Tok(), 32000, {151643})
+        self.assertEqual(
+            mock_xgrammar_cls.call_args.kwargs["model_eos_token_ids"],
+            [151643, 151645, 151646],
+        )
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_no_stop_tokens_passes_none(self, mock_xgrammar_cls):
+        """With no EOS information at all, pass None so XGrammar auto-detects."""
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        args = self._make_server_args("xgrammar")
+
+        create_grammar_backend(args, "tok", 32000, None)
+        self.assertIsNone(mock_xgrammar_cls.call_args.kwargs["model_eos_token_ids"])
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
         from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
 
