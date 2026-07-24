@@ -1296,6 +1296,60 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         self.assertIn((Phase.DECODE, "backend"), args._cuda_graph_config_locked)
 
 
+class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
+    """LoRA no longer auto-disables the breakable prefill CUDA graph; guards
+    test_bcg_with_lora.py against a rule re-disabling it (vacuous pass)."""
+
+    def _handled_args(self, **overrides):
+        args = ServerArgs(model_path="dummy", **overrides)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        with (
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+        ):
+            args._handle_cuda_graph_config()
+        return args
+
+    def test_enable_lora_keeps_breakable_prefill_graph(self):
+        args = self._handled_args(enable_lora=True)
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_paths_keep_breakable_prefill_graph(self):
+        args = self._handled_args(lora_paths=["dummy/lora-adapter"])
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
+    def test_lora_still_disables_tc_piecewise_prefill_graph(self):
+        # Pin the tc_piecewise LoRA rule itself, with the hardware rule
+        # neutralized so this runs on CPU-only CI.
+        args = ServerArgs(model_path="dummy", enable_lora=True)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        with (
+            patch("sglang.srt.server_args.is_hip", return_value=False),
+            patch("sglang.srt.server_args.is_npu", return_value=False),
+            patch("sglang.srt.server_args.is_cpu", return_value=False),
+            patch("sglang.srt.server_args.is_mps", return_value=False),
+            patch("sglang.srt.server_args.is_xpu", return_value=False),
+        ):
+            args._disable_tc_piecewise_cudagraph_if_incompatible()
+
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+
 class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
     """The BCG "multimodal model" rule exempts archs on the BCG multimodal
     opt-in allowlist (multimodal_breakable_cuda_graph_supported_model_archs)."""

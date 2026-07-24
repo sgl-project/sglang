@@ -16,9 +16,14 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+# Fixed segment slots (one per request) baked into the captured prefill LoRA
+# kernel grids; batches with more requests fall back to eager prefill.
+PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
+
 
 class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
+    supports_prefill_cuda_graph = True
 
     def __init__(
         self,
@@ -181,6 +186,27 @@ class TritonLoRABackend(BaseLoRABackend):
                 permutation=torch.zeros(max_tokens, dtype=torch.int32),
             )
 
+    def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
+        num_slots = PREFILL_CUDA_GRAPH_LORA_SEGMENTS
+        mlpb = self.max_loras_per_batch
+        with torch.device(self.device):
+            # bs pinned at num_slots so the captured grids cover any replay
+            # batch; slots past the live batch keep seg_lens == 0 and no-op.
+            self.prefill_cuda_graph_batch_info = LoRABatchInfo(
+                bs=num_slots,
+                use_cuda_graph=True,
+                num_segments=num_slots,
+                seg_lens=torch.zeros(num_slots, dtype=torch.int32),
+                seg_indptr=torch.zeros(num_slots + 1, dtype=torch.int32),
+                max_len=0,
+                weight_indices=torch.zeros(num_slots, dtype=torch.int32),
+                lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
+                scalings=torch.zeros(mlpb, dtype=torch.float),
+                permutation=None,
+            )
+        self.prefill_cuda_graph_max_bs = num_slots
+        self.prefill_cuda_graph_max_tokens = max_num_tokens
+
     def compute_sgemm_routing(self, use_cuda_graph: bool):
         """Sort tokens by adapter and build merged segments for sgemm LoRA."""
         bi = self.batch_info
@@ -231,6 +257,7 @@ class TritonLoRABackend(BaseLoRABackend):
         lora_ranks: list[int],
         scalings: list[float],
         use_cuda_graph: bool,
+        use_prefill_cuda_graph: bool = False,
     ):
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
@@ -252,6 +279,17 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
+        elif use_prefill_cuda_graph:
+            batch_info = self.prefill_cuda_graph_batch_info
+            # bs stays pinned at the allocated slot count; slots past the
+            # live batch no-op via seg_lens == 0.
+            batch_info.num_segments = bs
+            batch_info.max_len = max(forward_batch.extend_seq_lens_cpu)
+            batch_info.seg_lens[:bs].copy_(
+                forward_batch.extend_seq_lens, non_blocking=True
+            )
+            batch_info.seg_lens[bs:].zero_()
+            torch.cumsum(batch_info.seg_lens, dim=0, out=batch_info.seg_indptr[1:])
         else:
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
@@ -364,6 +402,9 @@ class TritonLoRABackend(BaseLoRABackend):
 
         return dataclasses.replace(
             batch_info,
+            # lm_head LoRA runs in the eager tail outside any captured prefill
+            # graph, on freshly allocated pruned metadata.
+            use_cuda_graph=False,
             bs=num_segments,
             num_segments=num_segments,
             max_len=max(seg_lens_cpu),

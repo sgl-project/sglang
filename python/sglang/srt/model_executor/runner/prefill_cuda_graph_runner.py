@@ -267,6 +267,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # default False; the assignment below sets the real value once the
         # backend type is known.
         self._is_full_backend = False
+        # Same ordering requirement: capture_prepare reads this.
+        self._capture_lora = False
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -286,6 +288,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Auto: scale request slots with the chunked prefill size.
                 max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
             self._capture_req_slots = min(max_req, self.max_bs)
+
+        # BCG/Full record LoRA kernels, so the metadata they read must live in
+        # static buffers refreshed in place per batch; unsupported LoRA
+        # configs were already routed to the eager runner.
+        self._capture_lora = model_runner.server_args.enable_lora and isinstance(
+            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+        )
+        if self._capture_lora:
+            model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
+                max_num_tokens=self.max_num_tokens
+            )
+            # Clamp Full's request slots to the LoRA segment-slot count
+            # rather than fail capture.
+            lora_max_bs = model_runner.lora_manager.prefill_cuda_graph_max_bs
+            if self._capture_req_slots > lora_max_bs:
+                logger.info(
+                    "Clamping full prefill CUDA graph request slots from %d to %d "
+                    "to fit the LoRA backend's static segment slots.",
+                    self._capture_req_slots,
+                    lora_max_bs,
+                )
+                self._capture_req_slots = lora_max_bs
+
+        if self._is_full_backend:
             self._full_cg_seq_lens_cpu = torch.zeros(
                 (self._capture_req_slots,), dtype=torch.int64, device="cpu"
             )
@@ -681,6 +707,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
+        # LoRA batches may only replay the graph when prepare_lora_batch put
+        # their metadata in the static buffers (same predicate); keyed off
+        # enable_lora, not lora_ids, which is non-None even without LoRA.
+        if self.model_runner.server_args.enable_lora and not (
+            self._capture_lora
+            and self.model_runner.lora_manager.can_use_prefill_cuda_graph(forward_batch)
+        ):
+            return False
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -850,7 +884,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_token_non_padded=self._capture_num_token_non_padded(num_tokens),
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
+                # All-None ids are safe: kernels no-op at rank 0 and replay
+                # refreshes the static batch info with live values.
+                lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -895,6 +931,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if forward_batch.lora_ids is not None:
+            # Fill the static prefill LoRA batch info the captured kernels
+            # will read (all-None ids: ranks stay 0, kernels no-op).
+            lora_manager = self.model_runner.lora_manager
+            assert lora_manager.can_use_prefill_cuda_graph(forward_batch), (
+                f"Capture batch (req slots {self._capture_req_slots}, bucket "
+                f"{num_tokens}) exceeds the LoRA backend's prefill CUDA graph "
+                "limits; the graph would read stale LoRA metadata at replay."
+            )
+            lora_manager.prepare_lora_batch(forward_batch)
         if self._is_full_backend:
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
         else:
