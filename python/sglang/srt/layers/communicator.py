@@ -71,7 +71,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -834,8 +834,14 @@ class LayerCommunicator:
         if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             return False
 
+        # Decode-only fusion: flashinfer all-reduce fusion helps decode TPOT but regresses
+        # prefill on sm100 (#17237). Restrict the entire fusion predicate to DECODE batches
+        # so prefill/extend/MIXED keep the baseline standalone post-MoE all-reduce.
+        is_decode = forward_batch.forward_mode == ForwardMode.DECODE
+
         return (
-            (
+            is_decode
+            and (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
                     _use_aiter
