@@ -93,12 +93,12 @@ fn chat_request(header: Option<(&str, &str)>) -> Request<Body> {
         .unwrap()
 }
 
-/// Parse `sgl_router_requests_total{...,outcome="success"} N` lines into a
+/// Parse `sgl_router_worker_requests_total{...,outcome="success"} N` lines into a
 /// map of worker_url -> success count.
 fn success_counts(metrics: &str) -> std::collections::HashMap<String, u64> {
     let mut counts = std::collections::HashMap::new();
     for line in metrics.lines() {
-        let Some(rest) = line.strip_prefix("sgl_router_requests_total{") else {
+        let Some(rest) = line.strip_prefix("sgl_router_worker_requests_total{") else {
             continue;
         };
         if !rest.contains(r#"outcome="success""#) {

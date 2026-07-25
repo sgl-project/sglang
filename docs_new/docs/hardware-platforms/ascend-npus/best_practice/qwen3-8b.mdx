@@ -4,23 +4,28 @@ metatags:
   description: "Best Practice for Qwen3-8B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-8B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-8B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-8B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3-8b).
+
+On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/ascend_npu_reference#hardware) for details.
+</Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 5ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) |
-| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 6K+1.5K | 11.79ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in6k-out1k5-bs16) |
+| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 5ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) |
+| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 6k+1.5k | 11.79ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in6k-out1k5-bs16) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 37ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) |
-
+| Qwen3-8B | Atlas 800I A3 | 1 | PD Mixed | 3.5k+1.5k | 37ms | W8A8 INT8 | [Optimal Configuration](#qwen3-8b-w8a8-1p-in3k5-out1k5-37ms) |
 
 ## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3-8B W8A8 1P IN3K5 OUT1K5 37ms
 
@@ -34,7 +39,7 @@ This guide describes the best practice data for Qwen3-8B on the Ascend NPU.
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 37ms
 
@@ -72,7 +77,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -98,14 +102,16 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -130,7 +136,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 3.5K+1.5K
+**Dataset**: 3.5k+1.5k
 
 **TPOT**: 5ms
 
@@ -168,7 +174,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -192,14 +197,16 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 5
+    --speculative-num-draft-tokens 5 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \
@@ -224,7 +231,7 @@ python -m sglang.bench_serving \
 
 **Quantization**: W8A8 INT8
 
-**Dataset**: 6K+1.5K
+**Dataset**: 6k+1.5k
 
 **TPOT**: 11.79ms
 
@@ -262,7 +269,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -286,14 +292,16 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 5
+    --speculative-num-draft-tokens 5 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
 
 We tested it based on the `RANDOM` dataset.
 
-```shell Command
+```bash Command
 python -m sglang.bench_serving \
     --dataset-name random \
     --backend sglang \

@@ -28,7 +28,7 @@ GSM_DATASET_PATH = None
 # Default server arguments shared across all hybrid-attn-backend tests
 DEFAULT_HYBRID_ATTN_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "8",
     "--prefill-attention-backend",
     "fa3",

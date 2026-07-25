@@ -19,11 +19,11 @@ MODELS = [
 
 
 class TestVLMEncoderDP(MMMUMultiModelTestBase):
-    # --cuda-graph-max-bs 32 last-wins over the kit's default 64.
+    # --cuda-graph-max-bs-decode 32 last-wins over the kit's default 64.
     other_args = [
         "--mm-enable-dp-encoder",
         "--tp=4",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "32",
     ]
 

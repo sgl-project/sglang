@@ -44,11 +44,12 @@ the full contract):
 | Field | Type | Purpose |
 |---|---|---|
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. |
-| `dockerImages` | `{[hwId]: string}` | Per-hw image name for `docker run` framing. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
+| `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|quant` (most specific) then `hw`. Use a `hw\|quant` key only when one quant on a shared GPU needs a different image (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); otherwise key by plain `hw`. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
-| `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. Optional; the button only appears when this AND `benchmarks` are present. |
+| `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. `speed` should carry `--flush-cache` (bench_serving's `random` prompts are deterministic — warm reruns hit the radix cache and inflate throughput; measure cache-cold). Optional; the button only appears when this AND `benchmarks` are present. |
 | `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `accuracyLabels` (below) + `benchmarkCommands.accuracy`. |
 | `accuracyLabels` | `[key, label, unit][]` | The eval set rendered in the benchmark card and the "⚡ Reproduce" modal — **the engine ships no default**, every config declares its own (e.g. DSv4: GPQA/AIME25/GSM8K; Qwen3.5: GSM8K/MMMU). Required whenever the benchmarks carry accuracy data; without it the accuracy rows silently don't render. Every key used in `benchmarks[].accuracy`, `defaultAccuracy`, and `benchmarkCommands.accuracy` must appear here. |
+| `latencyPercentile` | `"Mean" \| "P50"` | Optional, **temporary**; the percentile the benchmark TTFT/TPOT values are. **Default `"P50"`** — the card renders `TTFT (<pct>)` / `TPOT (<pct>)`. Set `"Mean"` only for legacy data recorded as Mean (being re-measured to P50). A benchmarks entry may carry its own `latencyPercentile` to override the page value per cell (entry → config → `"P50"`). `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU** = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. |
 | `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the model's HF id (`<hf-org>/<model-slug>`); it prefills the issue template's free-form `model` input when the issue opens. **Don't prune this block** — without it the engine falls back to `deepseek-ai/deepseek-v4` and submissions from your page get mislabeled. |
 
 ## 2.2 Author the 5-dim matrix (`cells[]`)
@@ -146,6 +147,38 @@ schemas (full reference in the `_playground.jsx` header):
 - Constraints are AND across keys, OR within each key's array.
 - Bare `disabled: true` / `disable: true` is a static always-disabled form
   (used for "Coming soon" chips).
+- `disable` may also be an ARRAY of `{when: constraint, reason}` items (OR
+  across items, first match wins and supplies its own tooltip) — for
+  conditions that need OR across keys or per-condition reasons, e.g. the
+  GLM-5.2 CP knob (grayed on non-Hopper hw OR multi-node, different reasons).
+- Constraint keys are the 5 cell dims (`hw`/`variant`/`quant`/`strategy`/
+  `nodes`) plus cross-axis live facts: `dpAttnOn` (effective DP-Attention on),
+  `cpOn` (effective prefill-CP on), `cpStrategy` (effective CP layout),
+  `cpSizeTarget` (the only enable-able CP size — see below), `effTp`
+  (effective TP degree — override else derived), and `pdMode` (live
+  PD-Disagg role).
+- On the `attention` axis, knob-level `hide`/`disable` (on the knob object,
+  not a value entry) hides/grays the whole select; apply() skips
+  knobs/values that are disabled under the live facts, so stale picks never
+  emit a blocked combination. Interleave prefill-CP + DP-Attention is
+  deliberately NOT grayed (combined support is planned upstream even though
+  current releases assert `dp_size == 1` for interleave) — the engine shows
+  a warning hint below the command box instead.
+- The CP knob emits `--attn-cp-size N --enable-prefill-cp --cp-strategy S`,
+  where S is: an optional `{ id: "cpStrategy", values: [null, "interleave",
+  "zigzag"] }` knob's pick > the strategy already baked in the base cell
+  (legacy mode flags map in: in-seq-split → zigzag, round-robin-split →
+  interleave) > "interleave". Declare the cpStrategy knob only on models
+  whose runtime accepts both layouts (DeepSeek-V4 rejects zigzag; DSA
+  zigzag forces deepep + ep=tp + batch_size=1 — label it experimental).
+- CP sizes auto-gate in the engine to the runtime derivation
+  `attn_cp_size = tp/dp` (both in the grayed options and in apply), so
+  configs list plain size values — no per-value `effTp` constraints needed.
+  A model whose runtime honors arbitrary `--attn-cp-size` opts out with
+  `freeSize: true` on the cp knob.
+- Only expose a CP knob on models with model-side CP integration in SGLang
+  (DeepSeek-family / Qwen-MoE / Mellum); on others the emitted flags do
+  nothing or crash (that's why Hy3 and MiniMax-M3 have no CP knob).
 
 ## 2.4 Create the MDX page
 

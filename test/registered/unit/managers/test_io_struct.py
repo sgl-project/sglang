@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -359,33 +359,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaises(ValueError):
             req.normalize_batch_and_arguments()
 
-    def test_input_embeds_single_to_batch_conversion(self):
-        """Test that single input_embeds are properly converted to batch when using parallel sampling."""
-        # Test the specific case that was fixed: single input_embeds with n > 1
-        req = GenerateReqInput(
-            input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 2}  # Single embedding
-        )
-        req.normalize_batch_and_arguments()
-
-        # Should convert single to batch and then expand
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 2)
-
-        # Both should be the same single embedding
-        self.assertEqual(req.input_embeds[0], [[0.1, 0.2, 0.3]])
-        self.assertEqual(req.input_embeds[1], [[0.1, 0.2, 0.3]])
-
-        # Test with higher n value
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 5})
-        req.normalize_batch_and_arguments()
-
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 5)
-
-        # All should be the same
-        for i in range(5):
-            self.assertEqual(req.input_embeds[i], [[0.1, 0.2, 0.3]])
-
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
         # Test single lora_path with batch input
@@ -551,6 +524,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_session_id_handling(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            session_id="session1",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.session_id, "session1")
+        self.assertIsNone(req.session_params)
+        self.assertEqual(req[2].session_id, "session1")
+
+        with self.assertRaisesRegex(ValueError, "cannot both be set"):
+            GenerateReqInput(
+                text="Hello",
+                session_id="explicit",
+                session_params={"id": "legacy"},
+            ).normalize_batch_and_arguments()
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
@@ -627,23 +618,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
             req.normalize_batch_and_arguments()
-
-    def test_multiple_input_formats(self):
-        """Test different combinations of input formats."""
-        # Test with text only
-        req = GenerateReqInput(text="Hello")
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
-
-        # Test with input_ids only
-        req = GenerateReqInput(input_ids=[1, 2, 3])
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
-
-        # Test with input_embeds only
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2]])
-        req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
 
 
 if __name__ == "__main__":

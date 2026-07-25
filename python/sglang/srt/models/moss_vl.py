@@ -15,14 +15,15 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.conv import Conv3dLayer
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,10 +48,14 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+# Below this image count the per-image loop beats the vectorized path (which has a
+# fixed setup cost); both give the same result.
+_VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
 # ==================== Vision Components ====================
@@ -162,6 +167,7 @@ class MossVLVisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -169,6 +175,7 @@ class MossVLVisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -319,8 +326,11 @@ class MossVLVisionModel(nn.Module):
             wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        max_grid_size = int(grid_thw[:, 1:].max())
+        # transformers 5.12's rotary forward takes 1-D position_ids on the input device (grid_thw is CPU).
+        rotary_pos_emb_full = self.rotary_pos_emb(
+            torch.arange(max_grid_size, device=self.device)
+        )
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
@@ -394,6 +404,120 @@ class MossVLVisionModel(nn.Module):
 
         return torch.cat(patch_pos_embeds_permute)
 
+    def fast_pos_embed_interpolate_vectorized(
+        self, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Vectorized fast_pos_embed_interpolate (no per-image loop).
+
+        Same result as the loop version; the cost no longer scales with the number
+        of images.
+        """
+        num_grid_per_side = int(self.num_position_embeddings**0.5)
+        m = self.spatial_merge_size
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        grid_list = grid_thw if isinstance(grid_thw, list) else grid_thw.tolist()
+        ts = [int(g[0]) for g in grid_list]
+        hs = [int(g[1]) for g in grid_list]
+        ws = [int(g[2]) for g in grid_list]
+        num_images = len(grid_list)
+
+        hw_list = [h * w for h, w in zip(hs, ws)]
+        thw_list = [t * s for t, s in zip(ts, hw_list)]
+        total_hw = sum(hw_list)
+        total_out = sum(thw_list)
+
+        def _exclusive_prefix(sizes):
+            out, acc = [], 0
+            for s in sizes:
+                out.append(acc)
+                acc += s
+            return torch.tensor(out, device=device, dtype=torch.long)
+
+        hw_off = _exclusive_prefix(hw_list)
+        thw_off = _exclusive_prefix(thw_list)
+        image_arange = torch.arange(num_images, device=device)
+
+        base_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(hw_list, device=device)
+        )
+        base_local = torch.arange(total_hw, device=device) - hw_off[base_image_id]
+        w_of = torch.tensor(ws, device=device)[base_image_id]
+        row = base_local // w_of
+        col = base_local % w_of
+
+        uniq_h, inv_h = torch.unique(
+            torch.tensor(hs, device=device), return_inverse=True
+        )
+        uniq_w, inv_w = torch.unique(
+            torch.tensor(ws, device=device), return_inverse=True
+        )
+        h_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
+            for h in uniq_h.tolist()
+        ]
+        w_luts = [
+            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
+            for w in uniq_w.tolist()
+        ]
+        h_lut_off = _exclusive_prefix([len(x) for x in h_luts])
+        w_lut_off = _exclusive_prefix([len(x) for x in w_luts])
+        h_idxs = torch.cat(h_luts)[h_lut_off[inv_h[base_image_id]] + row]
+        w_idxs = torch.cat(w_luts)[w_lut_off[inv_w[base_image_id]] + col]
+
+        h_floor = h_idxs.int()
+        w_floor = w_idxs.int()
+        h_ceil = (h_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+        w_ceil = (w_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        base_h = h_floor * num_grid_per_side
+        base_h_ceil = h_ceil * num_grid_per_side
+        indices = torch.stack(
+            [
+                base_h + w_floor,
+                base_h + w_ceil,
+                base_h_ceil + w_floor,
+                base_h_ceil + w_ceil,
+            ],
+            dim=0,
+        ).to(dtype=torch.long)
+        weights = torch.stack(
+            [
+                (1 - dh) * (1 - dw),
+                (1 - dh) * dw,
+                dh * (1 - dw),
+                dh * dw,
+            ],
+            dim=0,
+        ).to(dtype=dtype)
+        pe = self.pos_embed(indices) * weights[:, :, None]
+        base_embeds = pe[0] + pe[1] + pe[2] + pe[3]  # [total_hw, C]
+
+        out_image_id = torch.repeat_interleave(
+            image_arange, torch.tensor(thw_list, device=device)
+        )
+        pos_in_image = torch.arange(total_out, device=device) - thw_off[out_image_id]
+        hw_of_out = torch.tensor(hw_list, device=device)[out_image_id]
+        frame_idx = pos_in_image // hw_of_out
+        local_idx = pos_in_image % hw_of_out
+        patch = base_embeds[hw_off[out_image_id] + local_idx]
+
+        all_w = torch.tensor(ws, device=device)[out_image_id]
+        rows = local_idx // all_w
+        cols = local_idx % all_w
+        out_within = (
+            frame_idx * hw_of_out
+            + ((rows // m) * (all_w // m) + (cols // m)) * m * m
+            + (rows % m) * m
+            + (cols % m)
+        )
+        merged = torch.empty_like(patch)
+        merged[out_within + thw_off[out_image_id]] = patch
+        return merged
+
     def forward(
         self,
         x: torch.Tensor,
@@ -402,7 +526,13 @@ class MossVLVisionModel(nn.Module):
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        if (
+            envs.SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED.get()
+            and grid_thw.shape[0] >= _VECTORIZED_VL_POS_EMBED_MIN_IMAGES
+        ):
+            pos_embeds = self.fast_pos_embed_interpolate_vectorized(grid_thw)
+        else:
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         x = x + pos_embeds
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -421,12 +551,20 @@ class MossVLVisionModel(nn.Module):
                 cu_seqlens.to(torch.int32),
             ]
         )
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         x = x.unsqueeze(1)
 
         deepstack_features = []
         for layer_idx, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                forward_metadata=forward_metadata,
+            )
             if layer_idx in self.deepstack_visual_indexes:
                 deepstack_features.append(x)
 
@@ -481,7 +619,7 @@ class MossVLTextCrossAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model_parallel_size = get_tensor_model_parallel_world_size()
+        self.model_parallel_size = get_parallel().tp_size
         self.num_heads = config.num_attention_heads
         self.num_local_heads = self.num_heads // self.model_parallel_size
         self.num_key_value_heads = config.num_key_value_heads
@@ -753,10 +891,10 @@ class MossVLSelfAttention(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -864,7 +1002,7 @@ class MossVLSelfAttentionDecoderLayer(nn.Module):
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
+            if get_server_args().rl_on_policy_target is not None
             else {}
         )
         self.input_layernorm = RMSNorm(

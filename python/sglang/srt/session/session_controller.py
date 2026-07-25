@@ -302,6 +302,7 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            return_sampling_mask=req.return_sampling_mask,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
@@ -365,10 +366,10 @@ class SessionController:
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         elif session_id is None:
             logger.warning("session id is None, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
@@ -379,7 +380,7 @@ class SessionController:
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"
             )
-            return OpenSessionReqOutput(session_id, True)
+            return OpenSessionReqOutput(session_id=session_id, success=True)
 
     def close(self, recv_req: CloseSessionReqInput):
         session_id = recv_req.session_id

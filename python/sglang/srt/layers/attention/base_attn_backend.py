@@ -38,6 +38,12 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
+    prefill_attention_backend_str: Optional[str] = None
+    decode_attention_backend_str: Optional[str] = None
+
+    supports_ragged_verify_graph: bool = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -81,6 +87,13 @@ class AttentionBackend(ABC):
 
         Default: no-op.
         """
+
+    def draft_extend_metadata_captured_in_graph(self) -> bool:
+        """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
+        this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
+        graph, so a replaying runner may skip the eager
+        :py:meth:`init_forward_metadata_out_graph` call."""
+        return False
 
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True

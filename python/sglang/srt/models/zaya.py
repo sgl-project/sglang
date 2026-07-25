@@ -31,9 +31,13 @@ for the full design notes):
   averaging across MoE layers) and MOD (mixture-of-depths skip expert).
 - Per-layer :class:`ResidualScaling` keeps the residual stream in fp32 with
   affine scale/bias both on the residual and on the post-mixer hidden states.
-- Per-request CCA state (``conv_state`` + ``prev_hs``) is managed by
-  SGLang's centralized ``MambaPool`` inside ``HybridReqToTokenPool``,
-  accessed via ``get_req_to_token_pool().mamba2_layer_cache()``.
+- Per-request CCA state (``conv_state`` + ``prev_hs``) lives in SGLang's
+  centralized ``MambaPool`` inside ``HybridReqToTokenPool``. The per-request
+  state plumbing (slot indices, prefix mask, cuda-graph buffers) is owned by
+  ``ShortConvAttnBackend`` and reached via
+  ``get_attn_backend().conv_state_metadata()``, so the model holds no pool
+  access; CCA runs its own conv (:func:`cca_extend` / :func:`cca_decode`)
+  against the returned handle.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -50,11 +54,8 @@ from torch import nn
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -73,19 +74,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
-
-
-# Attribute names used to memoize the per-request MambaPool slot indices on the
-# ForwardBatch. The req -> slot mapping is identical for every CCA layer in a
-# step, so caching it here makes the lookup (and its GPU->CPU sync) run once per
-# forward step instead of once per attention layer.
-_MAMBA_INDICES_ATTR = "_zaya_mamba_indices"
-_MAMBA_INDICES_CPU_ATTR = "_zaya_mamba_indices_cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +135,187 @@ def _apply_norm_with_fp32_residual(
     call, ×120 norms per step).
     """
     return norm(residual.to(target_dtype))
+
+
+# ---------------------------------------------------------------------------
+# CCA conv-state kernels (v1 torch)
+#
+# ZAYA1-specific conv step: the CCA conv is a causal two-stage conv over
+# ``qk = [W_q hs || W_k hs]`` plus a one-token ``prev_hs`` lag for val_proj2.
+# The per-request conv state lives in the centralized MambaPool; the backend
+# (ShortConvAttnBackend) hands out the slot indices + prefix flags and CCA runs
+# these functions against them. ``conv_qk`` is the module's two-stage conv;
+# both functions mutate ``conv_state`` / ``prev_hs_state`` in place and return
+# ``(qk_out, v2_input)`` -- the conv output ``[T, in_out_ch]`` and the (shifted)
+# ``val_proj2`` input ``[T, hidden_size]``.
+# ---------------------------------------------------------------------------
+
+
+def cca_extend(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    conv_qk: nn.Module,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    slot_ids: List[int],
+    has_prefix: List[bool],
+    extend_seq_lens_cpu: List[int],
+    total_padding: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prefill / extend conv-state step (v1, pure torch).
+
+    Walks each request in the batch, applies ``conv_qk`` with the request's own
+    initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
+    otherwise), writes the updated ``conv_state`` / ``prev_hs_state`` back, and
+    returns the concatenated ``(qk_out, v2_input)`` in the original token layout.
+
+    ``slot_ids`` is the host mirror of the per-request MambaPool slot indices and
+    ``has_prefix[i]`` is ``True`` when request ``i`` resumes a cached prefix.
+
+    The Triton swap (:func:`cca_conv1d_fn`) removes this per-request loop.
+    """
+    dtype = hidden_states.dtype
+    if total_padding is None:
+        total_padding = conv_state.shape[-1]
+    in_out_ch = qk.shape[-1]
+    hidden_size = hidden_states.shape[-1]
+
+    qk_out = torch.empty_like(qk)
+    v2_input = torch.empty_like(hidden_states)
+
+    # Fresh-prefill fast path: when no request has a cached prefix the per-request
+    # convs can be coalesced into a single packed convolution. Each request's
+    # segment is laid out as ``[total_padding zeros, S_i tokens]``.
+    all_fresh = bool(extend_seq_lens_cpu) and not any(has_prefix)
+
+    if all_fresh:
+        seq_lens = [int(s) for s in extend_seq_lens_cpu]
+        pad = total_padding
+        offsets_in = [0]
+        for s in seq_lens:
+            offsets_in.append(offsets_in[-1] + s + pad)
+        packed = qk.new_zeros((1, in_out_ch, offsets_in[-1]))
+        start = 0
+        for i, s in enumerate(seq_lens):
+            end = start + s
+            packed[0, :, offsets_in[i] + pad : offsets_in[i + 1]] = qk[
+                start:end
+            ].transpose(0, 1)
+            start = end
+
+        packed_out = conv_qk(packed)  # [1, C, offsets_in[-1] - pad]
+
+        start = 0
+        for i, s in enumerate(seq_lens):
+            end = start + s
+            a_i = offsets_in[i]
+            qk_out[start:end] = packed_out[0, :, a_i : a_i + s].transpose(0, 1)
+            new_state = packed[0, :, a_i + s : a_i + s + pad]
+            conv_state[slot_ids[i]] = new_state.to(conv_state.dtype)
+
+            hs_cur = hidden_states[start:end]
+            first = hidden_states.new_zeros((1, hidden_size))
+            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+            prev_hs_state[slot_ids[i]] = (
+                hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            )
+            start = end
+    else:
+        start = 0
+        for i, seq_len in enumerate(extend_seq_lens_cpu):
+            end = start + int(seq_len)
+            slot = slot_ids[i]
+            prefix = bool(has_prefix[i])
+
+            qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
+            if prefix:
+                left_pad = conv_state[slot].unsqueeze(0).to(dtype)
+            else:
+                left_pad = qk_cur.new_zeros((1, in_out_ch, total_padding))
+            padded = torch.cat([left_pad, qk_cur], dim=-1)
+
+            out = conv_qk(padded)  # [1, C, S_cur]
+            qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+
+            new_state = padded[..., -total_padding:]
+            conv_state[slot] = new_state.squeeze(0).to(conv_state.dtype)
+
+            hs_cur = hidden_states[start:end]
+            if prefix:
+                first = prev_hs_state[slot].squeeze(-1).to(dtype).unsqueeze(0)
+            else:
+                first = hidden_states.new_zeros((1, hidden_size))
+            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+
+            prev_hs_state[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            start = end
+
+    return qk_out, v2_input
+
+
+def cca_decode(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    conv_qk: nn.Module,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    mamba_indices: torch.Tensor,
+    total_padding: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Single-token decode conv-state step (v1, pure torch).
+
+    Gathers each request's cached ``conv_state`` / ``prev_hs_state`` via
+    ``index_select``, runs ``conv_qk`` on the ``[T, C, total_padding + 1]``
+    window, and scatters the updated state back with ``index_copy_``. All ops are
+    on-device (``mamba_indices`` is a device ``long`` tensor), so this stays
+    CUDA-graph capturable. Returns ``(qk_out, prev_hs)`` where ``prev_hs`` is the
+    previous hidden state feeding ``val_proj2``.
+
+    The Triton swap is :func:`cca_conv1d_update`.
+    """
+    dtype = hidden_states.dtype
+    if total_padding is None:
+        total_padding = conv_state.shape[-1]
+
+    left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
+    cur = qk.unsqueeze(-1)  # [T, C, 1]
+    padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding + 1]
+    out = conv_qk(padded)  # [T, C, 1]
+    qk_out = out.squeeze(-1)  # [T, C]
+
+    new_state = padded[..., -total_padding:]
+    conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
+
+    # Read the previous hidden state (val_proj2 input) BEFORE overwriting the
+    # slot with the current token.
+    prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
+    prev_hs_state.index_copy_(
+        0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
+    )
+    return qk_out, prev_hs
+
+
+# Fused kernel seam (TODO) -- perf swap for the v1 torch paths above. These
+# mirror the ``causal_conv1d_fn`` / ``causal_conv1d_update`` contract but for
+# CCA's two-stage *grouped* conv (conv_qk[0] depthwise + conv_qk[1] grouped
+# per-head), which the stock depthwise ``causal_conv1d`` cannot express. Once
+# implemented they replace the per-request loop in ``cca_extend`` and the
+# separate gather/conv/scatter launches in ``cca_decode`` with a single
+# index-driven kernel. Same ``(qk_out, v2_input)`` return contract.
+
+
+def cca_conv1d_fn(*args, **kwargs):
+    raise NotImplementedError(
+        "Fused CCA prefill conv-with-state kernel not implemented yet; "
+        "the model uses cca_extend (v1 torch) in the meantime."
+    )
+
+
+def cca_conv1d_update(*args, **kwargs):
+    raise NotImplementedError(
+        "Fused CCA decode conv-with-state kernel not implemented yet; "
+        "the model uses cca_decode (v1 torch) in the meantime."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +377,9 @@ class CCA(nn.Module):
         self.total_padding = self.padding0 + self.padding1
 
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
 
@@ -403,58 +578,6 @@ class CCA(nn.Module):
 
     # ----- helpers ---------------------------------------------------------
 
-    @staticmethod
-    def _get_mamba_indices(forward_batch: ForwardBatch) -> torch.Tensor:
-        """Per-request MambaPool slot indices as an int64 device tensor.
-
-        The req -> slot mapping depends only on ``forward_batch.req_pool_indices``,
-        which is constant for every CCA layer within one forward step. Computing
-        it inside each of the ~60 attention layers would issue one redundant
-        gather per layer, so it is computed once and memoized on the ForwardBatch
-        (whose lifetime is exactly one forward step). The lookup is pure on-device
-        work, so this stays compatible with CUDA graph capture on the decode path.
-        """
-        cached = getattr(forward_batch, _MAMBA_INDICES_ATTR, None)
-        if cached is None:
-            cached = (
-                get_req_to_token_pool()
-                .get_mamba_indices(forward_batch.req_pool_indices)
-                .to(torch.long)
-            )
-            setattr(forward_batch, _MAMBA_INDICES_ATTR, cached)
-        return cached
-
-    @staticmethod
-    def _get_mamba_indices_cpu(
-        forward_batch: ForwardBatch, mamba_indices: torch.Tensor
-    ) -> list[int]:
-        """Host mirror of :meth:`_get_mamba_indices`, memoized per forward step.
-
-        Only the extend/prefill path needs the indices on the host to drive its
-        per-request Python loop; the decode path indexes the pool entirely
-        on-device. Memoizing turns the previous one-``.tolist()``-sync-per-layer
-        behavior into a single GPU->CPU sync per forward step. This helper is
-        never reached on the decode path that CUDA graphs capture.
-        """
-        cached = getattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, None)
-        if cached is None:
-            cached = mamba_indices.tolist()
-            setattr(forward_batch, _MAMBA_INDICES_CPU_ATTR, cached)
-        return cached
-
-    def _get_pool_state(self, forward_batch: ForwardBatch):
-        """Retrieve per-request CCA state from the centralized MambaPool.
-
-        ``conv_state`` / ``prev_hs_state`` are layer-local pool views, but the
-        ``mamba_indices`` req -> slot mapping is shared across layers and so is
-        memoized on the ForwardBatch (see :meth:`_get_mamba_indices`).
-        """
-        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_id)
-        conv_state = layer_cache.conv[0]
-        prev_hs_state = layer_cache.conv[1]
-        mamba_indices = self._get_mamba_indices(forward_batch)
-        return conv_state, prev_hs_state, mamba_indices
-
     def _normalize_qk(
         self, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -585,201 +708,22 @@ class CCA(nn.Module):
         value = self._slice_v_per_rank(value_full)
         return query, key, value
 
-    def _forward_extend(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prefill / extend path.
-
-        Walks every request in the batch, applies the conv with each request's
-        own initial state (zero on first chunk, cached otherwise), writes the
-        updated state and ``prev_hs`` back into the centralized MambaPool, and
-        returns the concatenated q/k/v in the original token layout.
-        """
-        dtype = hidden_states.dtype
-        T = hidden_states.shape[0]
-
-        q_raw, _ = self.linear_q(hidden_states)  # [T, latent_q]
-        k_raw, _ = self.linear_k(hidden_states)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, in_out_ch]
-
-        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
-        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
-
-        qk_out = torch.empty_like(qk)
-        v2_input = torch.empty_like(hidden_states)
-
-        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
-        # Host view of the slot indices to drive the per-request loop below.
-        # Memoized on the ForwardBatch, so the GPU->CPU sync runs once per forward
-        # step rather than once per attention layer (~60 syncs/step otherwise).
-        mamba_idx_cpu = self._get_mamba_indices_cpu(forward_batch, mamba_indices)
-
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-
-        # Fresh-prefill fast path: when no request has a cached prefix the
-        # per-request convs (one launch each, ×60 attention layers ×B requests)
-        # can be coalesced into a single packed convolution. The conv chain is
-        # two ``kernel_size=2`` convs (effective receptive field = 3), so each
-        # request's S valid outputs are produced from the packed positions
-        # ``[a_i, a_i + S_i - 1]`` where the input segment for request i is
-        # ``[pad, pad, x_0, ..., x_{S-1}]`` of length ``S_i + total_padding``.
-        all_fresh = bool(extend_seq_lens_cpu) and not any(
-            int(p) > 0 for p in extend_prefix_lens_cpu
-        )
-
-        if all_fresh:
-            seq_lens = [int(s) for s in extend_seq_lens_cpu]
-            pad = self.total_padding
-            # Build packed buffer: per request -> [pad zeros, S_i tokens].
-            offsets_in = [0]
-            for s in seq_lens:
-                offsets_in.append(offsets_in[-1] + s + pad)
-            packed = qk.new_zeros((1, self.in_out_ch, offsets_in[-1]))
-            start = 0
-            for i, s in enumerate(seq_lens):
-                end = start + s
-                packed[0, :, offsets_in[i] + pad : offsets_in[i + 1]] = qk[
-                    start:end
-                ].transpose(0, 1)
-                start = end
-
-            packed_out = self._conv_qk_run(packed)  # [1, C, offsets_in[-1] - pad]
-
-            start = 0
-            for i, s in enumerate(seq_lens):
-                end = start + s
-                a_i = offsets_in[i]
-                qk_out[start:end] = packed_out[0, :, a_i : a_i + s].transpose(0, 1)
-                new_state = packed[0, :, a_i + s : a_i + s + pad]
-                conv_state[mamba_idx_cpu[i]] = new_state.to(conv_state.dtype)
-
-                hs_cur = hidden_states[start:end]
-                first = hidden_states.new_zeros((1, self.hidden_size))
-                v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-                prev_hs_state[mamba_idx_cpu[i]] = (
-                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
-                )
-                start = end
-        else:
-            start = 0
-            for i, seq_len in enumerate(extend_seq_lens_cpu):
-                end = start + int(seq_len)
-                mamba_idx = mamba_idx_cpu[i]
-                has_prefix = int(extend_prefix_lens_cpu[i]) > 0
-
-                qk_cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S_cur]
-                if has_prefix:
-                    left_pad = conv_state[mamba_idx].unsqueeze(0).to(dtype)
-                else:
-                    left_pad = qk_cur.new_zeros((1, self.in_out_ch, self.total_padding))
-                padded = torch.cat([left_pad, qk_cur], dim=-1)
-
-                out = self._conv_qk_run(padded)  # [1, C, S_cur]
-                qk_out[start:end] = out.squeeze(0).transpose(0, 1)
-
-                new_state = padded[..., -self.total_padding :]
-                conv_state[mamba_idx] = new_state.squeeze(0).to(conv_state.dtype)
-
-                hs_cur = hidden_states[start:end]
-                if has_prefix:
-                    first = prev_hs_state[mamba_idx].squeeze(-1).to(dtype).unsqueeze(0)
-                else:
-                    first = hidden_states.new_zeros((1, self.hidden_size))
-                shifted = torch.cat([first, hs_cur[:-1]], dim=0)
-                v2_input[start:end] = shifted
-
-                prev_hs_state[mamba_idx] = (
-                    hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
-                )
-
-                start = end
-
-        query_conv = qk_out[:, : self.latent_q_dim].view(
-            T, self.num_q_heads, self.head_dim
-        )
-        key_conv = qk_out[:, self.latent_q_dim :].view(
-            T, self.num_k_heads, self.head_dim
-        )
-
-        query, key = self._add_grouped_qk_means(
-            query_conv, key_conv, query_pre, key_base
-        )
-        query, key = self._normalize_qk(query, key)
-
-        v1, _ = self.val_proj1(hidden_states)
-        v2, _ = self.val_proj2(v2_input)
-        value_full = torch.cat([v1, v2], dim=-1).view(
-            T, self.num_k_heads_full, self.head_dim
-        )
-        value = self._slice_v_per_rank(value_full)
-        return query, key, value
-
-    def _forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-token decode path for a whole batch.
-
-        Reads each request's cached conv state and ``prev_hs`` from the
-        centralized MambaPool via ``index_select``, runs the conv on the
-        small ``[T, C, total_padding+1]`` window, and writes back via
-        ``index_copy_``.
-        """
-        T = hidden_states.shape[0]
-        dtype = hidden_states.dtype
-
-        conv_state, prev_hs_state, mamba_indices = self._get_pool_state(forward_batch)
-
-        q_raw, _ = self.linear_q(hidden_states)
-        k_raw, _ = self.linear_k(hidden_states)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, C]
-
-        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
-        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
-
-        left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
-        cur = qk.unsqueeze(-1)  # [T, C, 1]
-        padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding+1]
-        out = self._conv_qk_run(padded)  # [T, C, 1]
-        qk_out = out.squeeze(-1)  # [T, C]
-
-        new_state = padded[..., -self.total_padding :]
-        conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
-
-        query_conv = qk_out[:, : self.latent_q_dim].view(
-            T, self.num_q_heads, self.head_dim
-        )
-        key_conv = qk_out[:, self.latent_q_dim :].view(
-            T, self.num_k_heads, self.head_dim
-        )
-
-        query, key = self._add_grouped_qk_means(
-            query_conv, key_conv, query_pre, key_base
-        )
-        query, key = self._normalize_qk(query, key)
-
-        prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
-        v1, _ = self.val_proj1(hidden_states)
-        v2, _ = self.val_proj2(prev_hs)
-        value_full = torch.cat([v1, v2], dim=-1).view(
-            T, self.num_k_heads_full, self.head_dim
-        )
-        value = self._slice_v_per_rank(value_full)
-        prev_hs_state.index_copy_(
-            0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
-        )
-        return query, key, value
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project ``hidden_states`` into ``(q, k, v)`` honoring per-request state.
+
+        The per-request conv-state plumbing (slot gather/scatter, prefix mask,
+        cuda-graph buffers) is owned by :class:`ShortConvAttnBackend
+        <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`,
+        reached via ``get_attn_backend().conv_state_metadata``; CCA runs its own
+        two-stage grouped conv (:func:`cca_extend` / :func:`cca_decode`) against
+        that handle, so this module holds no pool access. Those functions return
+        the conv output ``qk_out`` and the ``val_proj2`` input ``v2_input`` (the
+        shifted / previous hidden state), updating the ``conv_state`` /
+        ``prev_hs`` pool slots in place.
 
         ``q`` / ``k`` are returned in fp32 (the normalize step keeps fp32 for
         stability); ``v`` is returned in the input dtype since the caller
@@ -800,10 +744,63 @@ class CCA(nn.Module):
                 zero.view(0, self.num_k_heads, self.head_dim),
             )
 
+        T = hidden_states.shape[0]
+        q_raw, _ = self.linear_q(hidden_states)  # [T, latent_q]
+        k_raw, _ = self.linear_k(hidden_states)
+        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, in_out_ch]
+
+        query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
+        key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
+
+        # The backend hands out the per-request conv-state handle (slot indices,
+        # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
+        # conv against it and gets back the conv output + val_proj2 input, with
+        # the conv_state / prev_hs pool slots updated in place.
+        meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
+        conv_state = meta.layer_cache.conv[0]
+        prev_hs_state = meta.layer_cache.conv[1]
         if forward_batch.forward_mode.is_decode_or_idle():
-            return self._forward_decode(hidden_states, forward_batch)
-        # EXTEND / MIXED / DLLM_EXTEND all share the prefill loop.
-        return self._forward_extend(hidden_states, forward_batch)
+            qk_out, v2_input = cca_decode(
+                qk,
+                hidden_states,
+                self.conv_qk,
+                conv_state,
+                prev_hs_state,
+                meta.cache_indices,
+                self.total_padding,
+            )
+        else:
+            qk_out, v2_input = cca_extend(
+                qk,
+                hidden_states,
+                self.conv_qk,
+                conv_state,
+                prev_hs_state,
+                meta.slot_ids_cpu,
+                meta.has_prefix_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.total_padding,
+            )
+
+        query_conv = qk_out[:, : self.latent_q_dim].view(
+            T, self.num_q_heads, self.head_dim
+        )
+        key_conv = qk_out[:, self.latent_q_dim :].view(
+            T, self.num_k_heads, self.head_dim
+        )
+
+        query, key = self._add_grouped_qk_means(
+            query_conv, key_conv, query_pre, key_base
+        )
+        query, key = self._normalize_qk(query, key)
+
+        v1, _ = self.val_proj1(hidden_states)
+        v2, _ = self.val_proj2(v2_input)
+        value_full = torch.cat([v1, v2], dim=-1).view(
+            T, self.num_k_heads_full, self.head_dim
+        )
+        value = self._slice_v_per_rank(value_full)
+        return query, key, value
 
 
 # ---------------------------------------------------------------------------
@@ -833,8 +830,8 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
         # The head split, the ``o_proj`` RowParallel all-reduce, and the
         # RadixAttention KV cache are all organized on the *global* TP group,
         # and ``ZayaConfig.mamba2_cache_params`` sizes the conv-state cache on
@@ -843,7 +840,7 @@ class ZayaAttention(nn.Module):
         # ``use_dp_attention_reduce``), which this model does not wire up, so
         # require the two groups to coincide and fail fast instead of silently
         # mis-sizing the conv-state cache.
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
         assert attn_tp_size == self.tp_size, (
             f"ZAYA1 head-parallel attention requires the attention TP group "
             f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
@@ -1143,7 +1140,7 @@ class ZayaBlock(nn.Module):
         self.mlp_expansion = int(config.zaya_mlp_expansion)
         self.topk = int(getattr(config, "moe_router_topk", 1))
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if self.tp_size > self.num_moe_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than the "
