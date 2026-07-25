@@ -115,7 +115,9 @@ def match_prefix_for_req(
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(tree_cache, match_result)
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
     (
         req.prefix_indices,
         req.last_node,
@@ -290,7 +292,7 @@ class SchedulePolicy:
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
                     match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result
+                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (

@@ -2038,6 +2038,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Internal callers (and the session sentinel / None) pass a non-int through.
         return node_handle
 
-    def root_node_handle(self) -> NodeId:
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node.id

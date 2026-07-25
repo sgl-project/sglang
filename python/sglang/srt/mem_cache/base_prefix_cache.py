@@ -204,11 +204,13 @@ class MatchResult(NamedTuple):
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
 
-def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
+def zero_match_result(
+    tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
+) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
         return match_result
-    root = tree_cache.root_node_handle()
+    root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
         # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
         # without allocating a fresh empty tensor.
@@ -278,9 +280,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return node_handle
 
-    def root_node_handle(self) -> Any:
+    def root_node_handle(self, extra_key: Optional[str] = None) -> Any:
         """The root handle as match results carry it -- the raw node by default,
-        the root's NodeId for UnifiedRadixCache."""
+        the root's NodeId for UnifiedRadixCache. extra_key scopes the root for
+        implementations that shard trees per cache namespace."""
         return self.root_node
 
     def is_backuped(self, node: Any) -> bool:
