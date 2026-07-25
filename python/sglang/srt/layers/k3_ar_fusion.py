@@ -72,26 +72,25 @@ def _init_state() -> Optional[_State]:
             return None
     else:
         # Auto: attempt only inside the validated envelope — SM100/SM103
-        # (the arches the fused kernels were measured on), no
+        # (the arches the fused kernels were measured on) and no
         # --enable-symm-mem (its pynccl allocator context misroutes the
         # o_proj/MoE outputs away from the k3 symm pool -> the pull path's
-        # symm-pool contract fails, see _find_mc_ptr), and no DCP (never
-        # validated together). The CustomAllReduceV2 multicast probe below
-        # is the remaining capability gate. SGLANG_K3_AR_FUSION=1 still
-        # force-attempts anywhere.
+        # symm-pool contract fails, see _find_mc_ptr). DCP composes: the
+        # TP-group reduces the fusion covers (KDA o_proj, latent|shared MoE)
+        # are DCP-transparent, validated on DCP8 fp8/fi_a2a GB300 (GSM8K
+        # in-band; bs=1 +19%, bs=64 +9%). The CustomAllReduceV2 multicast
+        # probe below is the remaining capability gate.
+        # SGLANG_K3_AR_FUSION=1 still force-attempts anywhere.
         from sglang.srt.runtime_context import get_server_args
         from sglang.srt.utils.common import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None
-        server_args = get_server_args()
-        if server_args.enable_symm_mem or server_args.dcp_size > 1:
+        if get_server_args().enable_symm_mem:
             logger.info(
-                "K3 all-reduce fusion auto-probe: skipping "
-                "(enable_symm_mem=%s, dcp_size=%d are outside the validated "
-                "envelope; set SGLANG_K3_AR_FUSION=1 to force).",
-                server_args.enable_symm_mem,
-                server_args.dcp_size,
+                "K3 all-reduce fusion auto-probe: skipping under "
+                "--enable-symm-mem (allocator contexts conflict; set "
+                "SGLANG_K3_AR_FUSION=1 to force)."
             )
             return None
     from sglang.srt.distributed import get_tensor_model_parallel_world_size
