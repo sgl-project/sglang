@@ -928,9 +928,7 @@ class DeepseekV4AttnBackend(
             seq_lens_casual = self._dspark_seq_lens_casual(
                 seq_lens=seq_lens, block_size=block_size
             )
-            req_pool_indices_repeated = req_pool_indices.repeat_interleave(
-                block_size
-            )
+            req_pool_indices_repeated = req_pool_indices.repeat_interleave(block_size)
             core_attn_metadata = self.make_core_attn_metadata(
                 req_to_token=self.req_to_token,
                 req_pool_indices_repeated=req_pool_indices_repeated,

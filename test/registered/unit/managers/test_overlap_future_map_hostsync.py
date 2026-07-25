@@ -284,6 +284,5 @@ class TestFutureMapHostSync(unittest.TestCase):
             self.assertEqual(event.synchronize_calls, 0)
 
 
-
 if __name__ == "__main__":
     unittest.main()

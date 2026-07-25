@@ -341,9 +341,11 @@ class DSparkVerifyPlanner:
             else:
                 tier_tensor = torch.tensor(
                     [
-                        int(local_tier_num_tokens)
-                        if broadcast_group.rank_in_group == 0
-                        else -1
+                        (
+                            int(local_tier_num_tokens)
+                            if broadcast_group.rank_in_group == 0
+                            else -1
+                        )
                     ],
                     dtype=torch.int64,
                 )
@@ -673,9 +675,7 @@ class DSparkVerifyPlanner:
             and confidence is not None
             and budget is not None
         )
-        is_source = (
-            broadcast_group_size == 1 or broadcast_group.rank_in_group == 0
-        )
+        is_source = broadcast_group_size == 1 or broadcast_group.rank_in_group == 0
         if broadcast_group_size == 1 and not ready:
             return None
 

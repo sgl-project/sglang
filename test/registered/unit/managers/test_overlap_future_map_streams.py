@@ -42,9 +42,7 @@ class TestOverlapFutureMapStreams(unittest.TestCase):
         relay = _make_relay(self.device)
         publish_stream = torch.cuda.Stream(device=self.device)
         d2h_stream = torch.cuda.Stream(device=self.device)
-        expected = torch.tensor(
-            [[11.0, 12.0], [13.0, 14.0]], device=self.device
-        )
+        expected = torch.tensor([[11.0, 12.0], [13.0, 14.0]], device=self.device)
         setup_ready = torch.cuda.Event()
         setup_ready.record()
         publish_stream.wait_event(setup_ready)
@@ -53,9 +51,7 @@ class TestOverlapFutureMapStreams(unittest.TestCase):
         with torch.cuda.stream(publish_stream):
             relay.scatter(self.indices, expected)
             _delay_current_stream()
-            relay.issue_ring_copy(
-                stream=d2h_stream, publish_stream=publish_stream
-            )
+            relay.issue_ring_copy(stream=d2h_stream, publish_stream=publish_stream)
 
         torch.cuda.synchronize(self.device)
         self.assertTrue(torch.equal(relay.conf_ring[0], expected.cpu()))

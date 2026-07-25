@@ -52,9 +52,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
         planner.server_args = SimpleNamespace(tp_size=2)
         planner.verify_num_draft_tokens = 4
         group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32))
-        batch = SimpleNamespace(
-            spec_verify_tier_num_tokens=-1, batch_size=lambda: 2
-        )
+        batch = SimpleNamespace(spec_verify_tier_num_tokens=-1, batch_size=lambda: 2)
 
         with (
             mock.patch(
@@ -74,9 +72,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             ),
             mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
         ):
-            planner._coordinate_verify_tier(
-                batch=batch, local_tier_num_tokens=3
-            )
+            planner._coordinate_verify_tier(batch=batch, local_tier_num_tokens=3)
 
         self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
         gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
@@ -151,9 +147,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             ) as tier_broadcast,
             mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
         ):
-            planner._coordinate_verify_tier(
-                batch=batch, local_tier_num_tokens=-1
-            )
+            planner._coordinate_verify_tier(batch=batch, local_tier_num_tokens=-1)
 
         self.assertEqual(batch.spec_verify_tier_num_tokens, 3)
         tier_broadcast.assert_called_once()
@@ -164,9 +158,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
         planner.verify_num_draft_tokens = 4
         batch = SimpleNamespace(batch_size=lambda: 2)
         self.assertEqual(
-            planner._conservative_tp_verify_tier(
-                batch=batch, local_tier_num_tokens=0
-            ),
+            planner._conservative_tp_verify_tier(batch=batch, local_tier_num_tokens=0),
             0,
         )
 
@@ -199,9 +191,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             ),
             mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
         ):
-            planner._coordinate_verify_tier(
-                batch=batch, local_tier_num_tokens=8
-            )
+            planner._coordinate_verify_tier(batch=batch, local_tier_num_tokens=8)
 
         self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
         gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
@@ -213,9 +203,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
         planner._is_verify_all = True
         planner._budget_planner = SimpleNamespace(forced_budget_frac=0.5)
         group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32))
-        batch = SimpleNamespace(
-            spec_verify_tier_num_tokens=-1, batch_size=lambda: 2
-        )
+        batch = SimpleNamespace(spec_verify_tier_num_tokens=-1, batch_size=lambda: 2)
 
         with (
             mock.patch(
@@ -235,9 +223,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             ),
             mock.patch.object(planner, "_maybe_gather_dp_verify_tier") as gather,
         ):
-            planner._coordinate_verify_tier(
-                batch=batch, local_tier_num_tokens=-1
-            )
+            planner._coordinate_verify_tier(batch=batch, local_tier_num_tokens=-1)
 
         self.assertEqual(batch.spec_verify_tier_num_tokens, 8)
         gather.assert_called_once_with(batch=batch, local_tier_num_tokens=8)
@@ -272,9 +258,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
         planner = object.__new__(DSparkVerifyPlanner)
         planner._budget_planner = object()
         planner.verify_num_draft_tokens = 4
-        group = _FakeBroadcastGroup(
-            torch.empty(0, dtype=torch.int32), rank_in_group=0
-        )
+        group = _FakeBroadcastGroup(torch.empty(0, dtype=torch.int32), rank_in_group=0)
 
         with mock.patch.object(
             ScheduleVerifyLensTopk,
@@ -332,7 +316,9 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             mock.patch.object(
                 RaggedVerifyLayout,
                 "from_verify_lens",
-                side_effect=AssertionError("dynamic compact graph materialized lengths"),
+                side_effect=AssertionError(
+                    "dynamic compact graph materialized lengths"
+                ),
             ),
             mock.patch.object(
                 RaggedVerifyLayout,
@@ -382,9 +368,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
             )
 
         self.assertIs(result, layout)
-        self.assertEqual(
-            unavailable_assemble.call_args.kwargs["graph_num_tokens"], 8
-        )
+        self.assertEqual(unavailable_assemble.call_args.kwargs["graph_num_tokens"], 8)
 
     def _assert_eager_tp_layout_stays_device_side(
         self, *, mode: RaggedVerifyMode
@@ -446,9 +430,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
         self.assertEqual(assemble.call_args.kwargs["graph_num_tokens"], 8)
 
     def test_cap_accept_tp_fallback_stays_device_side(self):
-        self._assert_eager_tp_layout_stays_device_side(
-            mode=RaggedVerifyMode.CAP_ACCEPT
-        )
+        self._assert_eager_tp_layout_stays_device_side(mode=RaggedVerifyMode.CAP_ACCEPT)
 
     def test_compact_eager_tp_fallback_stays_device_side(self):
         self._assert_eager_tp_layout_stays_device_side(mode=RaggedVerifyMode.COMPACT)
@@ -508,9 +490,7 @@ class TestDSparkPlannerZeroOverhead(unittest.TestCase):
 
     def test_worker_confidence_publication_gate(self):
         worker = object.__new__(DSparkWorkerV2)
-        worker._verify_planner = SimpleNamespace(
-            needs_confidence_publication=False
-        )
+        worker._verify_planner = SimpleNamespace(needs_confidence_publication=False)
         worker._observers = SimpleNamespace(needs_budget_telemetry=False)
         self.assertFalse(worker._should_publish_confidence(None))
         self.assertFalse(worker._should_publish_confidence(torch.ones(1)))
@@ -605,9 +585,7 @@ class TestDSparkDeviceOnlyLengths(unittest.TestCase):
         self.assertIsNone(seen["seq_lens_sum"])
 
     def test_draft_retains_eager_cpu_mirror_fallback(self):
-        seen = self._run_draft(
-            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32)
-        )
+        seen = self._run_draft(seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int32))
         self.assertEqual(seen["seq_lens_cpu"].tolist(), [14, 24])
         self.assertEqual(seen["seq_lens_sum"], 38)
 

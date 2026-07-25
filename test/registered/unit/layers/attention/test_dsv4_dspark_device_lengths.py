@@ -23,8 +23,8 @@ class _DeviceSeqLensGuard:
 class TestDSV4DSparkDeviceLengths(unittest.TestCase):
     def test_device_only_draft_block_never_materializes_seq_lens_on_host(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DSV4Metadata,
             DeepseekV4AttnBackend,
+            DSV4Metadata,
         )
 
         backend = object.__new__(DeepseekV4AttnBackend)

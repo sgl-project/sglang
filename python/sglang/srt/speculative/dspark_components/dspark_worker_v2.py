@@ -679,9 +679,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
 
-    def _should_publish_confidence(
-        self, confidence: Optional[torch.Tensor]
-    ) -> bool:
+    def _should_publish_confidence(self, confidence: Optional[torch.Tensor]) -> bool:
         return confidence is not None and (
             self._verify_planner.needs_confidence_publication
             or self._observers.needs_budget_telemetry
