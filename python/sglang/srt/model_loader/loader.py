@@ -2019,8 +2019,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         except (AssertionError, AttributeError):
             pass
 
-    _HASH_STREAM_CHUNK_BYTES = 8 << 20  # 8 MiB pinned D2H chunks
-
     @staticmethod
     def _new_content_hasher():
         import xxhash
