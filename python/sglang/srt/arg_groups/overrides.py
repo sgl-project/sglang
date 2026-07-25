@@ -49,6 +49,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_mnnvl_fabric_device,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -396,12 +397,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["dcp_replicate_q_proj"] = True
 
         device_name = get_device_name()
-        normalized_device_name = (device_name or "").upper()
-        dcp_comm_backend = (
-            "fi_a2a"
-            if any(name in normalized_device_name for name in ("GB200", "GB300"))
-            else "a2a"
-        )
+        dcp_comm_backend = "fi_a2a" if is_mnnvl_fabric_device() else "a2a"
         logger.info(
             "Kimi-K3 DCP selects communication backend on "
             f"{device_name!r}: {server_args.dcp_comm_backend!r} -> "

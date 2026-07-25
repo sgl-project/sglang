@@ -76,6 +76,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
+    is_mnnvl_fabric_device,
     is_mps,
     is_musa,
     is_no_spec_infer_or_topk_one,
@@ -7385,6 +7386,37 @@ class ServerArgs:
             "1" if requested_transport == "cuda_ipc" else "0"
         )
 
+    def _handle_custom_all_reduce_v2_multinode(self):
+        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
+        # intra-node only. On MNNVL-fabric devices (GB200/GB300) the eager pull
+        # path works across nodes via the symm-mem workspace, so opt into the
+        # multinode mode automatically (a failed fabric rendezvous falls back
+        # to the legacy path at init). Elsewhere force-disable v2 on
+        # multi-node so the dispatch falls back to the legacy CustomAllreduce
+        # path, unless the MNNVL opt-in is set explicitly.
+        if self.nnodes <= 1 or not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+            return
+        if (
+            not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set()
+            and is_mnnvl_fabric_device()
+        ):
+            logger.info(
+                "MNNVL fabric device detected with nnodes=%d: enabling "
+                "custom all-reduce v2 multinode mode "
+                "(SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1; set it "
+                "to 0 to opt out).",
+                self.nnodes,
+            )
+            envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.set("1")
+        if not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get():
+            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
+                    "(custom all-reduce v2 is intra-node only).",
+                    self.nnodes,
+                )
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
+
     def _handle_environment_variables(self):
         self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -7396,22 +7428,7 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
-        # intra-node only. Force-disable on multi-node so the dispatch falls back
-        # to the legacy CustomAllreduce path, unless the MNNVL opt-in is set (the
-        # eager pull path works across nodes via the symm-mem workspace).
-        if (
-            self.nnodes > 1
-            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
-            and not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
-        ):
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
+        self._handle_custom_all_reduce_v2_multinode()
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
@@ -7671,7 +7688,9 @@ class ServerArgs:
         if self.use_mla_backend():
             decode_allowed.add("cutedsl")
             prefill_allowed.add("cutedsl")
-        resolved_linear_decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        resolved_linear_decode = (
+            self.linear_attn_decode_backend or self.linear_attn_backend
+        )
         resolved_linear_prefill = (
             self.linear_attn_prefill_backend or self.linear_attn_backend
         )

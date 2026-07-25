@@ -1,4 +1,8 @@
-"""K3 MNNVL fused all-reduce dispatch (``SGLANG_K3_AR_FUSION``).
+"""K3 MNNVL fused all-reduce dispatch.
+
+Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
+available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
+1 = attempt anywhere and warn when unavailable).
 
 Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels,
 mirroring the NCCL-window design (pool + registered segments + find-window
@@ -12,7 +16,7 @@ dispatch), but backed by torch symmetric memory:
   group's CustomAllReduceV2 workspace), large ones take the in-place NVLS
   2shot on ``x``'s multicast address (rendezvous cached per segment).
 
-Call-site contract when ``SGLANG_K3_AR_FUSION`` is on: ``enabled()`` was
+Call-site contract when the fusion is active: ``enabled()`` was
 checked once (which initializes the state), ``x`` is bf16 and contiguous,
 tensors above the push threshold are allocated under :func:`symm_alloc`,
 and the residual is identical on every rank (a fully reduced tensor such
@@ -62,8 +66,18 @@ def _init_state() -> Optional[_State]:
     if _INITIALIZED:
         return _STATE
     _INITIALIZED = True
-    if not envs.SGLANG_K3_AR_FUSION.get():
-        return None
+    explicit = envs.SGLANG_K3_AR_FUSION.is_set()
+    if explicit:
+        if not envs.SGLANG_K3_AR_FUSION.get():
+            return None
+    else:
+        # Auto: attempt on the arches the fused kernels were measured on
+        # (SM100/SM103, i.e. B200/B300/GB200/GB300); the CustomAllReduceV2
+        # multicast probe below is the remaining capability gate.
+        from sglang.srt.utils.common import get_device_sm
+
+        if get_device_sm() not in (100, 103):
+            return None
     from sglang.srt.distributed import get_tensor_model_parallel_world_size
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
@@ -79,10 +93,16 @@ def _init_state() -> Optional[_State]:
         or comm.disabled
         or comm.mc_base_ptr == 0
     ):
-        logger.warning(
-            "SGLANG_K3_AR_FUSION requested but CustomAllReduceV2 with multicast "
-            "is unavailable; falling back to the regular all-reduce path."
-        )
+        if explicit:
+            logger.warning(
+                "SGLANG_K3_AR_FUSION requested but CustomAllReduceV2 with multicast "
+                "is unavailable; falling back to the regular all-reduce path."
+            )
+        else:
+            logger.info(
+                "K3 all-reduce fusion auto-probe: CustomAllReduceV2 with "
+                "multicast is unavailable; using the regular all-reduce path."
+            )
         return None
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
