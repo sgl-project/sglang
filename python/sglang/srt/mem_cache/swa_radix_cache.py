@@ -783,7 +783,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self,
         node: TreeNode,
         swa_uuid_for_lock: Optional[int] = None,
-        mamba_lock_skip_ids: Optional[set] = None,  # unused, signature parity only
+        skip_lock_node_ids: Optional[dict] = None,  # unused, signature parity only
     ):
         """
         Decrement only the swa_lock_ref (and swa_protected_size_) along the chain

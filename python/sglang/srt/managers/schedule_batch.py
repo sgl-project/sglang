@@ -907,9 +907,9 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
-        # nodes left mamba-unlocked on the decode hold (already COW'd), so their
-        # dec skips mamba. See UnifiedRadixCache.inc_lock_ref(skip_mamba=True).
-        self.mamba_lock_skip_ids: Optional[set[int]] = None
+        # per-component nodes this req skipped locking (e.g. mamba on the decode
+        # hold, already COW'd), so their dec releases only what it took.
+        self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -1523,7 +1523,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
-        self.mamba_lock_skip_ids = None
+        self.skip_lock_node_ids = {}
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -3126,7 +3126,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.tree_cache.dec_swa_lock_only(
                             req.last_node,
                             req.swa_uuid_for_lock,
-                            mamba_lock_skip_ids=req.mamba_lock_skip_ids,
+                            skip_lock_node_ids=req.skip_lock_node_ids,
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():

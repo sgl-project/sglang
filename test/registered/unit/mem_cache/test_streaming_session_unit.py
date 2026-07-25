@@ -69,7 +69,7 @@ class _FakeReq:
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
-        self.mamba_lock_skip_ids = None
+        self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -189,7 +189,7 @@ def test_nth_mid_abort_nukes_session_slot():
 
 
 def test_release_session_threads_mamba_skip_ids():
-    """release_session must forward the slot's mamba_lock_skip_ids to
+    """release_session must forward the slot's skip_lock_node_ids to
     dec_lock_ref. The first req's last_node may be full-only-locked (mamba
     skipped at inc), so without the skip set the release would drop a mamba
     lock the session never took -- another request's, on a shared node."""
@@ -208,7 +208,7 @@ def test_release_session_threads_mamba_skip_ids():
         kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
         last_node=lock_node,
         cache_protected_len=0,
-        mamba_lock_skip_ids={42},
+        skip_lock_node_ids={ComponentType.MAMBA: {42}},
     )
 
     tree_cache.release_session("session-a")
