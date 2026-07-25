@@ -93,6 +93,52 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     return component, cache, owned
 
 
+class TestMambaRatioEnvGate(unittest.TestCase):
+    """SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK gates the pool ratio: off restores the
+    original base 3 (overlap 5, lazy 4, no_buffer 3), on drops the base to 2
+    (overlap 4, lazy 3) while no_buffer stays 3. Guards the flag wiring so the
+    ratio can never drift out of sync with whether the decode lock is skipped."""
+
+    @staticmethod
+    def _ratio(*, extra_buffer, lazy, disable_overlap, skip):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        server_args = SimpleNamespace(
+            disable_radix_cache=False,
+            disable_overlap_schedule=disable_overlap,
+            enable_mamba_extra_buffer=lambda: extra_buffer,
+            enable_mamba_extra_buffer_lazy=lambda: lazy,
+        )
+        fake = SimpleNamespace(server_args=server_args)
+        with envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.override(skip):
+            return KVCacheConfigurator._calculate_mamba_ratio(fake)
+
+    def test_flag_off_restores_original_ratios(self):
+        r = lambda **kw: self._ratio(skip=False, **kw)
+        self.assertEqual(
+            r(extra_buffer=False, lazy=False, disable_overlap=True), 3
+        )  # no_buffer
+        self.assertEqual(
+            r(extra_buffer=True, lazy=True, disable_overlap=False), 4
+        )  # lazy
+        self.assertEqual(
+            r(extra_buffer=True, lazy=False, disable_overlap=False), 5
+        )  # overlap
+
+    def test_flag_on_drops_base_but_keeps_no_buffer(self):
+        r = lambda **kw: self._ratio(skip=True, **kw)
+        self.assertEqual(
+            r(extra_buffer=False, lazy=False, disable_overlap=True), 3
+        )  # no_buffer
+        self.assertEqual(
+            r(extra_buffer=True, lazy=True, disable_overlap=False), 3
+        )  # lazy
+        self.assertEqual(
+            r(extra_buffer=True, lazy=False, disable_overlap=False), 4
+        )  # overlap
+
+
 class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.

@@ -896,13 +896,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         self._dec_req_lock(req)
-        # Decode reads the request's own COW'd mamba slot, never this node's, so
-        # leave the node mamba-evictable. Safe only because any future COW source
-        # is the COWing request's own admission-locked last_node (recorded only if
-        # still present, locked before the next alloc) -- not this evictable node.
-        # A scheduler that matched a whole batch before locking would break that.
+        # Opt-in: leave the matched-prefix mamba evictable during decode (it is
+        # already COW'd to the request's own slot, never read from this node again).
+        # Safe only because any future COW source is the COWing request's own
+        # admission-locked last_node (recorded only if still present, locked before
+        # the next alloc) -- not this evictable node. A scheduler that matched a
+        # whole batch before locking would break that. Off = original full lock.
+        skip_lock_components = (
+            (ComponentType.MAMBA,)
+            if envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+            else ()
+        )
         lock_result = self.inc_lock_ref(
-            new_last_node, skip_lock_components=(ComponentType.MAMBA,)
+            new_last_node, skip_lock_components=skip_lock_components
         )
 
         # Update req fields

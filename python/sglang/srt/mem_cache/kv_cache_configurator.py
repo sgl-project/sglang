@@ -97,11 +97,13 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
-# mamba pool size / max_running_requests. Base dropped 3 to 2 because skipping
-# the matched-prefix mamba lock on decode frees one resident slot per request
-# (overlap 5->4, lazy 4->3). no_buffer keeps effective 3 (adds NO_BUFFER back):
-# its binding limit is the prefill->decode peak, not the decode steady state.
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 2
+# base ratio of mamba pool size to max_running_requests. Under
+# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
+# per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
+# stays at effective 3 either way: its binding limit is the prefill->decode peak,
+# which the decode-time drop does not shrink.
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
@@ -1577,6 +1579,11 @@ class KVCacheConfigurator:
         if self.server_args.disable_radix_cache:
             return 1
 
+        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
+        base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
+            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
+        )
+
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
             # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
@@ -1591,12 +1598,13 @@ class KVCacheConfigurator:
                     not self.server_args.enable_mamba_extra_buffer_lazy()
                 ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
-        else:
-            # no_buffer: keep effective 3, the prefill->decode peak needs ~3
-            # slots/req and this leaf-only mode has no ping-pong to absorb it.
+        elif skip_decode_lock:
+            # no_buffer under skip: add the base drop back so effective stays 3,
+            # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
+            # has no ping-pong to absorb it.
             additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        return base + additional_ratio
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
