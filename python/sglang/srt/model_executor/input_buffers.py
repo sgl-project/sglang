@@ -66,11 +66,34 @@ def share_input_buffers_in(obj) -> None:
             setattr(obj, name, share_input_buffer(name, buffer))
 
 
+# Values that index the rope table, the KV pool, req_to_token, or the mamba
+# state pool, so stale content is unsafe to execute.
+_INDEX_SEMANTIC_BUFFERS = frozenset(
+    {
+        "positions",
+        "mrope_positions",
+        "out_cache_loc",
+        "req_pool_indices",
+        "mamba_track_indices",
+        "mamba_track_mask",
+    }
+)
+
+
 @dataclass
 class ForwardInputBuffers:
 
     def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
         return share_input_buffer(name, new_buffer)
+
+    def reset_index_buffers(self) -> None:
+        """Zero the index-semantic buffers this set declares."""
+        for f in fields(self):
+            if f.name not in _INDEX_SEMANTIC_BUFFERS:
+                continue
+            buffer = getattr(self, f.name)
+            if buffer is not None:
+                buffer.zero_()
 
     def share_buffers(self):
         # disable share input buffer on npu due to accuracy issue

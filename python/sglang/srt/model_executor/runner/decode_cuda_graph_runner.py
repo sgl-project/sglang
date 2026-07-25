@@ -848,6 +848,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # captured graph needs before capturing.
         self.buffers.seq_lens.fill_(self.seq_len_fill_value)
         self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+        # Capture runs real forwards, so a mid-serving recapture would index --
+        # and write KV -- through the previous batch's live values. Replay is
+        # already covered by the registry's padding policy.
+        self.buffers.reset_index_buffers()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
