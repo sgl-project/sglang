@@ -328,6 +328,21 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
     ##### Public API #####
 
+    def build_cached_tokens_by_component(
+        self,
+        req: Req,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        return self._cached_tokens_for_component(
+            "full",
+            device=device,
+            host=host,
+            storage=storage,
+        )
+
     def reset(self):
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)

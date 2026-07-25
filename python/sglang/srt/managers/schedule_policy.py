@@ -133,6 +133,7 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    req.matched_tokens_by_component = match_result.matched_tokens_by_component or {}
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len

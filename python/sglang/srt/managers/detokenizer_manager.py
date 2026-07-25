@@ -447,6 +447,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
+            cached_tokens_by_component=recv_obj.cached_tokens_by_component,
             image_tokens=recv_obj.image_tokens,
             audio_tokens=recv_obj.audio_tokens,
             video_tokens=recv_obj.video_tokens,

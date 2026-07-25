@@ -90,6 +90,10 @@ class SchedulerOutputStreamer:
 
         return None
 
+    @staticmethod
+    def get_cached_tokens_by_component(req: Req) -> Optional[dict]:
+        return req.cached_tokens_by_component or None
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -278,6 +282,7 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    cached_tokens_by_component: list = field(default_factory=list)
     image_tokens: list = field(default_factory=list)
     audio_tokens: list = field(default_factory=list)
     video_tokens: list = field(default_factory=list)
@@ -395,6 +400,9 @@ class _GenerationStreamAccumulator:
 
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        self.cached_tokens_by_component.append(
+            SchedulerOutputStreamer.get_cached_tokens_by_component(req)
+        )
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -581,6 +589,7 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            cached_tokens_by_component=self.cached_tokens_by_component,
             image_tokens=self.image_tokens,
             audio_tokens=self.audio_tokens,
             video_tokens=self.video_tokens,

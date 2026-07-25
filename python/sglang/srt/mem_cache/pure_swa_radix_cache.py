@@ -39,6 +39,17 @@ class PureSWARadixCache(RadixCache):
         ), "sliding_window_size must be set for PureSWARadixCache"
         return True
 
+    def build_cached_tokens_by_component(
+        self,
+        req: Req,
+        *,
+        device: int,
+        host: int,
+        storage: int,
+    ) -> dict[str, dict[str, int]]:
+        # Pure-SWA does not define component-specific source attribution yet.
+        return {}
+
     def swa_evictable_size(self):
         return self.evictable_size_
 
