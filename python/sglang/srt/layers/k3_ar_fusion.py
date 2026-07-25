@@ -71,12 +71,28 @@ def _init_state() -> Optional[_State]:
         if not envs.SGLANG_K3_AR_FUSION.get():
             return None
     else:
-        # Auto: attempt on the arches the fused kernels were measured on
-        # (SM100/SM103, i.e. B200/B300/GB200/GB300); the CustomAllReduceV2
-        # multicast probe below is the remaining capability gate.
+        # Auto: attempt only inside the validated envelope — SM100/SM103
+        # (the arches the fused kernels were measured on), no
+        # --enable-symm-mem (its pynccl allocator context misroutes the
+        # o_proj/MoE outputs away from the k3 symm pool -> the pull path's
+        # symm-pool contract fails, see _find_mc_ptr), and no DCP (never
+        # validated together). The CustomAllReduceV2 multicast probe below
+        # is the remaining capability gate. SGLANG_K3_AR_FUSION=1 still
+        # force-attempts anywhere.
+        from sglang.srt.runtime_context import get_server_args
         from sglang.srt.utils.common import get_device_sm
 
         if get_device_sm() not in (100, 103):
+            return None
+        server_args = get_server_args()
+        if server_args.enable_symm_mem or server_args.dcp_size > 1:
+            logger.info(
+                "K3 all-reduce fusion auto-probe: skipping "
+                "(enable_symm_mem=%s, dcp_size=%d are outside the validated "
+                "envelope; set SGLANG_K3_AR_FUSION=1 to force).",
+                server_args.enable_symm_mem,
+                server_args.dcp_size,
+            )
             return None
     from sglang.srt.distributed import get_tensor_model_parallel_world_size
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (

@@ -108,6 +108,23 @@ class TestK3ArFusionGate(CustomTestCase):
         ):
             self.assertFalse(mod.enabled())
 
+    def test_auto_skips_symm_mem_and_dcp(self):
+        """Bug regression: the auto-probe engaged the fusion under
+        --enable-symm-mem + DCP, where the pynccl allocator context misroutes
+        the o_proj/MoE outputs away from the k3 symm pool and the pull path's
+        symm-pool assertion kills the server at graph-capture warmup. Unset
+        env + symm-mem or dcp_size>1 must stay on the regular all-reduce
+        path (explicit SGLANG_K3_AR_FUSION=1 still force-attempts)."""
+        for symm, dcp in ((True, 1), (False, 8), (True, 8)):
+            mod = self._reset()
+            with _cleared(envs.SGLANG_K3_AR_FUSION), patch(
+                "sglang.srt.utils.common.get_device_sm", return_value=103
+            ), patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=SimpleNamespace(enable_symm_mem=symm, dcp_size=dcp),
+            ):
+                self.assertFalse(mod.enabled(), f"symm={symm} dcp={dcp}")
+
 
 if __name__ == "__main__":
     unittest.main()
