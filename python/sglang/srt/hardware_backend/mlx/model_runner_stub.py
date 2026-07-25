@@ -200,8 +200,10 @@ class MlxModelRunnerStub(ModelRunner):
         if has_aux_state:
             ratio = self._aux_state_slots_per_request()
             limits.append(
+                # Same bound as the base resolver's mamba_state_pool, but sized
+                # from the unsharded flag value, so it keeps its own remedy.
                 ConcurrencyLimit(
-                    source="aux_state_pool",
+                    source="mamba_state_pool",
                     value=aux_state_size // ratio,
                     detail=f"max_mamba_cache_size={aux_state_size} / {ratio} "
                     f"slots per request",

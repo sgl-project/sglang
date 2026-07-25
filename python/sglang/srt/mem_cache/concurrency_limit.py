@@ -4,8 +4,8 @@ Independent bounds (user request, KV capacity, hybrid state pool, ...) compete
 for the concurrency ceiling. Carrying them as data instead of nested `min()`
 calls lets the server report which one bound the result and how to raise it.
 
-The remedies name user-facing CLI flags, so renaming a flag means updating them
-here too.
+The remedies below name user-facing CLI flags, so renaming a flag means updating
+them here; callers that build a `ConcurrencyLimit` inline carry their own.
 """
 
 from __future__ import annotations
