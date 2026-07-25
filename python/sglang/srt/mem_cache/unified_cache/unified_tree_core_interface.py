@@ -19,9 +19,11 @@ from sglang.srt.mem_cache.events import KVCacheEventMixin
 NodeId = int
 
 
-class WithValuesToFree(msgspec.Struct):
-    """Component-keyed device/host values a tree-side step freed, for the
-    Controller to drain right after the call returns."""
+class BaseEvictionResult(msgspec.Struct):
+    """Base of the eviction step results: the component-keyed device/host
+    values the step freed, for the Controller to drain right after the call
+    returns, plus `tracker` -- the step's per-component evicted counts for the
+    Controller to accumulate."""
 
     device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
@@ -29,35 +31,38 @@ class WithValuesToFree(msgspec.Struct):
     host_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
     )
+    tracker: dict[ComponentType, int] = msgspec.field(
+        default_factory=lambda: defaultdict(int)
+    )
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
         assert (
             not self.device_frees and not self.host_frees
-        ), "WithValuesToFree dropped with undrained values"
+        ), "BaseEvictionResult dropped with undrained values"
 
 
-class EvictDeviceNextNodeResult(WithValuesToFree):
+class EvictDeviceNextNodeResult(BaseEvictionResult):
     node_id: Optional[NodeId] = None
 
 
-class EvictDeviceLeafResult(WithValuesToFree):
+class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
 
 
-class DemoteResult(WithValuesToFree):
+class DemoteResult(BaseEvictionResult):
     pass
 
 
-class DropSubtreeNoHostResult(WithValuesToFree):
+class DropSubtreeNoHostResult(BaseEvictionResult):
     is_dropped: bool = False
 
 
-class DriveHostEvictionResult(WithValuesToFree):
+class DriveHostEvictionResult(BaseEvictionResult):
     pass
 
 
-class DecSwaLockOnlyResult(WithValuesToFree):
+class DecSwaLockOnlyResult(BaseEvictionResult):
     pass
 
 
@@ -172,29 +177,26 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted)."""
+        """The next evictable node (None node_id when the walk is exhausted);
+        tracker is the caller's running totals, read for the doneness check."""
         ...
 
     @abstractmethod
     def evict_device_leaf(
-        self, node_id: NodeId, tracker: dict[ComponentType, int], is_write_back: bool
+        self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
         """Evict a leaf's device value; the result carries a BackupKV when a
         D->H backup must run (write_back) before the node can be demoted."""
         ...
 
     @abstractmethod
-    def drop_subtree_no_host(
-        self, node_id: NodeId, tracker: dict[ComponentType, int]
-    ) -> DropSubtreeNoHostResult:
+    def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Drop an unbacked D-leaf's subtree when its write-back backup failed
         under host pressure; declines (is_dropped=False) if any node is locked."""
         ...
 
     @abstractmethod
-    def demote(
-        self, node_id: NodeId, tracker: dict[ComponentType, int]
-    ) -> DemoteResult:
+    def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""
         ...
 
@@ -300,10 +302,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def drive_host_eviction(
-        self,
-        component_type: ComponentType,
-        num_tokens: int,
-        tracker: dict[ComponentType, int],
+        self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...

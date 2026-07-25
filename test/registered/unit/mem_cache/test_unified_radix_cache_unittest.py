@@ -2984,11 +2984,8 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(node.backuped)
         self.assertFalse(node.evicted)
 
-        tracker = {c: 0 for c in cache.tree_components}
         # Tree op defers: returns a BackupKV and leaves the node on device (no demote).
-        leaf_result = cache.tree_core.evict_device_leaf(
-            node.id, tracker, is_write_back=True
-        )
+        leaf_result = cache.tree_core.evict_device_leaf(node.id, is_write_back=True)
         self.assertIsNotNone(leaf_result.backup_kv)
         cache._free_values(leaf_result.device_frees, leaf_result.host_frees)
 
@@ -2998,7 +2995,7 @@ class UnifiedRadixCacheSuite:
 
         # Demote needs a completed backup: _demote asserts on the un-backed node.
         with self.assertRaises(AssertionError):
-            cache.tree_core.demote(node.id, {c: 0 for c in cache.tree_components})
+            cache.tree_core.demote(node.id)
 
         cache.sanity_check()
 

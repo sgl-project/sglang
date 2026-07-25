@@ -442,34 +442,47 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             self._drain_host_frees(host_frees)
 
+    def _accumulate_tracker(
+        self,
+        tracker: dict[ComponentType, int],
+        delta: dict[ComponentType, int],
+    ) -> None:
+        """Fold a step result's evicted delta into the running totals."""
+        for ct, n in delta.items():
+            tracker[ct] += n
+
     def _evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> Optional[NodeId]:
-        """Advance the eviction walk one node, draining its frees."""
+        """Advance the eviction walk one node, consuming its step result."""
         result = self.tree_core.evict_device_next_node(component_type, tracker)
         self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
         return result.node_id
 
     def _evict_device_leaf(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> Optional[BackupKV]:
-        """Evict one device leaf, draining its frees; returns the deferred
-        write-back BackupKV when one must run before the demote."""
-        result = self.tree_core.evict_device_leaf(node_id, tracker, self.is_write_back)
+        """Evict one device leaf, consuming its step result; returns the
+        deferred write-back BackupKV when one must run before the demote."""
+        result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
         self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
         return result.backup_kv
 
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
-        """Demote a backed-up node, draining its frees."""
-        result = self.tree_core.demote(node_id, tracker)
+        """Demote a backed-up node, consuming its step result."""
+        result = self.tree_core.demote(node_id)
         self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
 
     def _drop_subtree_no_host(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> bool:
-        """Run the write-back drop fallback, draining its frees."""
-        result = self.tree_core.drop_subtree_no_host(node_id, tracker)
+        """Run the write-back drop fallback, consuming its step result."""
+        result = self.tree_core.drop_subtree_no_host(node_id)
         self._free_values(result.device_frees, result.host_frees)
+        self._accumulate_tracker(tracker, result.tracker)
         return result.is_dropped
 
     def _evict_components(
@@ -789,10 +802,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
-        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
-        result = self.tree_core.drive_host_eviction(component_type, num_tokens, tracker)
+        result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
-        return tracker[component_type]
+        return result.tracker.get(component_type, 0)
 
     # ---- HiCache: Backup / LoadBack ----
 
