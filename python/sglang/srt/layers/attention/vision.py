@@ -785,9 +785,8 @@ class VisionAscendAttention(nn.Module):
         if not _is_npu:
             raise Exception("VisionAscendAttention is only available for ascend npu")
         super().__init__()
-        # The Ascend fused attention path does not yet consume SGLang's
-        # SDPA-style additive masks. Keep masked callers correct while retaining
-        # the optimized Ascend path for the common unmasked vision workload.
+        # Ascend fused attention does not support SGLang's additive masks, so
+        # masked inputs must stay on SDPA.
         self.sdpa_fallback = VisionSdpaAttention(**kwargs)
 
     def forward(
@@ -1069,10 +1068,6 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
-        # Keep the resolved name alongside the implementation. Graph runners need
-        # the effective backend after applying CLI, model, and platform defaults;
-        # reading the raw server argument again loses that information when it is
-        # left unset.
         self.qkv_backend_name: str = qkv_backend
 
         self.customized_position_embedding_applier = (
