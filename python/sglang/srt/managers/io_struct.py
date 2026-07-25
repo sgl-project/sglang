@@ -2036,7 +2036,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    serialized_tensors: str
+    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
