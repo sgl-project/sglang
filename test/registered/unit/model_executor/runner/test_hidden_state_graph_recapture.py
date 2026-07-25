@@ -3,8 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -62,6 +64,33 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
             spec_info=None,
         )
 
+    @staticmethod
+    def _make_prefill_runner_for_can_run(capture_hidden_mode):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner.enable_lora = False
+        runner._capture_chunked_prefix = False
+        runner.capture_hidden_mode = capture_hidden_mode
+        runner.capture_num_tokens = [4]
+        runner.max_num_tokens = 4
+        return runner
+
+    @staticmethod
+    def _make_prefill_forward_batch(capture_hidden_mode, spec_capture_hidden_mode):
+        return SimpleNamespace(
+            batch_size=1,
+            input_embeds=None,
+            replace_embeds=None,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=SimpleNamespace(capture_hidden_mode=spec_capture_hidden_mode),
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+            input_ids=list(range(4)),
+        )
+
     def test_stronger_graph_is_reused_for_weaker_modes(self):
         runner = self._make_runner(DecodeCudaGraphRunner, CaptureHiddenMode.FULL)
 
@@ -100,6 +129,41 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
             self.assertEqual(runner.capture_hidden_mode, CaptureHiddenMode.NULL)
             runner.backend.cleanup.assert_not_called()
             runner.capture.assert_not_called()
+
+    def test_spec_worker_override_is_the_effective_runtime_mode(self):
+        runner = self._make_prefill_runner_for_can_run(CaptureHiddenMode.LAST)
+        forward_batch = self._make_prefill_forward_batch(
+            CaptureHiddenMode.LAST,
+            CaptureHiddenMode.FULL,
+        )
+
+        self.assertTrue(runner.can_run_graph(forward_batch))
+        for runner_cls in (
+            DecodeCudaGraphRunner,
+            PrefillCudaGraphRunner,
+            CPUGraphRunner,
+        ):
+            graph_runner = self._make_runner(runner_cls, CaptureHiddenMode.LAST)
+            with self.subTest(runner_cls=runner_cls):
+                graph_runner._validate_capture_hidden_mode(forward_batch)
+
+    def test_prefill_graph_falls_back_for_stronger_effective_mode(self):
+        runner = self._make_prefill_runner_for_can_run(CaptureHiddenMode.LAST)
+        forward_batch = self._make_prefill_forward_batch(
+            CaptureHiddenMode.FULL,
+            CaptureHiddenMode.LAST,
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_prefill_graph_accepts_weaker_spec_mode(self):
+        runner = self._make_prefill_runner_for_can_run(CaptureHiddenMode.FULL)
+        forward_batch = self._make_prefill_forward_batch(
+            CaptureHiddenMode.NULL,
+            CaptureHiddenMode.LAST,
+        )
+
+        self.assertTrue(runner.can_run_graph(forward_batch))
 
 
 if __name__ == "__main__":

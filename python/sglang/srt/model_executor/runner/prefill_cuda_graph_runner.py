@@ -73,7 +73,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
-    get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -1053,7 +1052,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if (
             capture_hidden_mode is not None
-            and capture_hidden_mode != self.capture_hidden_mode
+            and self.capture_hidden_mode < capture_hidden_mode
         ):
             return False
         if return_logprob and not self._uses_eager_prefill_tail():
@@ -1650,11 +1649,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        required_capture_hidden_mode = get_required_capture_hidden_mode(
-            forward_batch.capture_hidden_mode,
-            forward_batch.spec_info,
-        )
-        if self.capture_hidden_mode < required_capture_hidden_mode:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
                 "The runtime hidden-state mode exceeds the fixed CUDA graph "
                 f"capture mode ({self.capture_hidden_mode.name})."

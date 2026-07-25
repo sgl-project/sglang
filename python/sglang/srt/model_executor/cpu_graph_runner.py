@@ -858,12 +858,7 @@ class CPUGraphRunner:
                     return forward, out
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        required_capture_hidden_mode = get_required_capture_hidden_mode(
-            forward_batch.capture_hidden_mode,
-            forward_batch.spec_info,
-        )
-
-        if self.capture_hidden_mode < required_capture_hidden_mode:
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
                 "The runtime hidden-state mode exceeds the fixed CPU graph "
                 f"capture mode ({self.capture_hidden_mode.name})."
