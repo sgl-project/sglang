@@ -49,6 +49,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # True for cross-request reuse matches (scheduler-side lookups against the
+    # shared radix tree). False (default) for self-match lookups such as the
+    # one in `cache_unfinished_req`, which must keep trusting the device-only
+    # validators for the request's own freshly-computed nodes.
+    for_reuse: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
