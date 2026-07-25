@@ -31,8 +31,10 @@ def _triton_reference(
     )
 
 
-def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = torch.randn(num_tokens, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+def _make_case(
+    case: str, num_tokens: int, dtype: torch.dtype = torch.bfloat16
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.randn(num_tokens, NUM_EXPERTS, dtype=dtype, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.float32, device="cuda")
     if case == "random":
         pass
@@ -78,9 +80,10 @@ def _make_case(case: str, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
 @pytest.mark.parametrize(
     "renormalize,apply_scale", [(True, True), (False, False), (True, False)]
 )
-def test_route_radix_vs_triton(num_tokens, case, renormalize, apply_scale):
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32])
+def test_route_radix_vs_triton(num_tokens, case, renormalize, apply_scale, score_dtype):
     torch.manual_seed(num_tokens)
-    scores, bias = _make_case(case, num_tokens)
+    scores, bias = _make_case(case, num_tokens, dtype=score_dtype)
     args = (scores, bias, TOPK, renormalize, 2.5, apply_scale)
 
     ref_w, ref_i = _triton_reference(scores, bias, renormalize, 2.5, apply_scale)
@@ -98,6 +101,20 @@ def test_route_radix_vs_triton(num_tokens, case, renormalize, apply_scale):
             atol=0.0,
             equal_nan=True,
         )
+
+
+def test_route_radix_fp32_beats_bf16_rounding():
+    """fp32 scores must be routed on their FP32 values, not a bf16
+    round-trip: construct two experts whose scores are equal after bf16
+    rounding but differ in fp32, and check the fp32 winner is the true
+    max. Guards against a load path that silently downcasts."""
+    scores = torch.full((1, NUM_EXPERTS), -10.0, dtype=torch.float32, device="cuda")
+    bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
+    # bf16(1.0 + 2**-9) == bf16(1.0): identical under bf16, distinct in fp32.
+    scores[0, 7] = 1.0
+    scores[0, 700] = 1.0 + 2**-9
+    _, ids = route_radix(scores, bias, TOPK, True, 2.5, False, sorted=True)
+    assert ids[0, 0].item() == 700, f"fp32 ordering lost: top-1 = {ids[0, 0].item()}"
 
 
 def test_route_radix_unsorted_id_order():
