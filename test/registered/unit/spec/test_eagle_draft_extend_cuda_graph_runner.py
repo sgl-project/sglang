@@ -123,10 +123,12 @@ class TestEagleDraftExtendCudaGraphRunner(CustomTestCase):
 
     def test_replay_bucket_uses_raw_request_count(self):
         cases = (
-            # Standalone: the global max is 7 requests. No ceil alignment.
+            # Pre-fix execute() derives max([6, 4]), leading to over-padding.
+            # Fixed execute() derives max([3, 2]), selecting bucket 3 (global max req).
+            ("standalone_overpad", False, 2, 2, [6, 4], [3, 2]),
             # Pre-fix execute() derives max([35, 20]), exceeding max bucket 8.
-            # Fixed execute() derives max([7, 4]), selecting bucket 7.
-            ("standalone_scaled", False, 5, 4, [35, 20], [7, 4]),
+            # Fixed execute() derives max([7, 4]), selecting bucket 7 (global max req).
+            ("standalone_crash", False, 5, 4, [35, 20], [7, 4]),
         )
         for (
             name,
