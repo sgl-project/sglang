@@ -82,6 +82,7 @@ from sglang.srt.utils.common import (
     is_npu,
     is_remote_url,
     is_sm90_supported,
+    is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
     is_xpu,
@@ -265,6 +266,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper+
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2585,6 +2587,7 @@ class ServerArgs:
                 "eic",
                 "simm",
                 "mori",
+                "shm",
             ],
         ),
         NS("memory"),
@@ -4222,19 +4225,6 @@ class ServerArgs:
             (
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
-            ),
-            # TcPiecewise makes the trtllm_mla prefill fall back to the
-            # flashinfer-MLA implementation, which faults (illegal address)
-            # on an FP8 KV cache.
-            (
-                "MLA attention with FP8 KV cache",
-                lambda: self.kv_cache_dtype.startswith("fp8")
-                and (
-                    _resolved_view(self).attention_backend
-                    in ("trtllm_mla", "flashinfer_mla")
-                    or _resolved_view(self).prefill_attention_backend
-                    in ("trtllm_mla", "flashinfer_mla")
-                ),
             ),
         ]
         for _name, predicate in rules:
@@ -7261,9 +7251,11 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
-        if self.enable_deepseek_v4_fp4_indexer and not is_sm100_supported():
+        if self.enable_deepseek_v4_fp4_indexer and not (
+            is_sm100_supported() or is_sm120_supported()
+        ):
             raise ValueError(
-                "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
+                "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
@@ -7379,10 +7371,19 @@ class ServerArgs:
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
-                deepseek_deterministic_attention_backends = ["fa3", "triton"]
-                if attention_backend not in deepseek_deterministic_attention_backends:
+                if (
+                    attention_backend
+                    not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                ):
                     raise ValueError(
-                        f"Currently only {deepseek_deterministic_attention_backends} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                        f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
+                    )
+                if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
+                    raise ValueError(
+                        "Deterministic inference with DeepSeek models on the fa4 "
+                        "attention backend requires SM100/SM110: it runs "
+                        "absorbed MLA, whose qv argument flash_attn.cute only "
+                        "implements on those archs."
                     )
 
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
