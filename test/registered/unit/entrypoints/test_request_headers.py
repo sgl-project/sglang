@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 from fastapi import HTTPException
+
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,9 +39,9 @@ class TestRequestHeaders(CustomTestCase):
             "x-override-disagg-prefill-dp-rank": "3",
             "x-override-priority": "10",
         }
-        
+
         apply_header_overrides(obj, headers)
-        
+
         self.assertEqual(obj.rid, "test-rid-123")
         self.assertEqual(obj.bootstrap_host, "localhost")
         self.assertEqual(obj.bootstrap_port, 8080)
@@ -62,9 +63,9 @@ class TestRequestHeaders(CustomTestCase):
             "x-override-rid": "test-rid-123",
             "x-override-priority": "5",
         }
-        
+
         apply_header_overrides(obj, headers)
-        
+
         self.assertEqual(obj.rid, "test-rid-123")
         self.assertEqual(obj.priority, 5)
         self.assertIsNone(obj.bootstrap_host)
@@ -74,9 +75,9 @@ class TestRequestHeaders(CustomTestCase):
         """Verify behavior when no headers are provided."""
         obj = SimpleNamespace(rid=None, priority=None)
         headers = {}
-        
+
         apply_header_overrides(obj, headers)
-        
+
         # Should not raise any error, and attributes should remain None
         self.assertIsNone(obj.rid)
         self.assertIsNone(obj.priority)
@@ -87,10 +88,10 @@ class TestRequestHeaders(CustomTestCase):
         headers = {
             "x-override-priority": "invalid-int",
         }
-        
+
         with self.assertRaises(HTTPException) as context:
             apply_header_overrides(obj, headers)
-            
+
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("invalid x-override-priority header", context.exception.detail)
 
