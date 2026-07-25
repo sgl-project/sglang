@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
     UnifiedLRUList,
@@ -160,9 +161,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
-        # TODO(Jialin): make the TreeCore configurable so an alternative
-        # implementation (e.g. a Rust TreeCore) can be swapped in.
-        self.tree_core = UnifiedTreeCore(params, self.components)
+        self.tree_core = create_tree_core(
+            name=envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(),
+            params=params,
+            components=self.components,
+        )
+        # Components execute boundary actions through the tree core.
+        for component in self.components.values():
+            component.tree_core = self.tree_core
 
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 

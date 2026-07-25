@@ -847,6 +847,8 @@ class Envs:
 
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+    # Registered TreeCore backend serving the unified radix cache.
+    SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
