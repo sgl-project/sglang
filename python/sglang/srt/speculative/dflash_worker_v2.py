@@ -1705,6 +1705,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=int(self.block_size),
             )
 
+        # Constrain every chain position before accept picks from it.
         if grammar_mask is not None:
             grammar_mask.apply(logits_output.next_token_logits)
 

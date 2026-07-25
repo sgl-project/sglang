@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.constrained.base_grammar_backend import (
+    BaseGrammarObject,
+    GrammarMask,
+)
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -45,7 +48,7 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    grammars: Optional[List] = None
+    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
@@ -242,7 +245,7 @@ class SamplingBatchInfo:
         first_grammar = next(grammar for grammar in self.grammars if grammar)
 
         # TODO(lianmin): Maybe we can reuse the existing mask?
-        bitmask = first_grammar.allocate_vocab_mask(
+        vocab_mask = first_grammar.allocate_vocab_mask(
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
             device=self.device,
@@ -251,11 +254,11 @@ class SamplingBatchInfo:
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(bitmask, i)
+                grammar.fill_vocab_mask(vocab_mask, i)
 
         # Move the mask to the device if needed
-        bitmask = first_grammar.move_vocab_mask(bitmask, self.device)
-        self.grammar_mask = GrammarMask(first_grammar, bitmask)
+        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
+        self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:

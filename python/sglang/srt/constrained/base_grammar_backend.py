@@ -124,10 +124,10 @@ class GrammarMask(NamedTuple):
     """
 
     grammar: BaseGrammarObject
-    bitmask: torch.Tensor
+    vocab_mask: torch.Tensor
 
     def apply(self, logits: torch.Tensor) -> None:
-        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.bitmask)
+        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
 
 
 class InvalidGrammarObject(BaseGrammarObject):

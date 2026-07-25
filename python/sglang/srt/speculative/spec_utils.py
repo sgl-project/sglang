@@ -613,7 +613,7 @@ def build_grammar_vocab_mask(
     tree: GrammarTree,
     sampling_info: SamplingBatchInfo,
     device,
-    barrier: Optional[Callable[[], None]] = None,
+    barrier: Optional[Callable[[], None]],
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 

@@ -440,6 +440,9 @@ class NGRAMWorker(BaseSpecWorker):
                     ),
                     sampling_info=batch.sampling_info,
                     device=verify_input.retrieve_next_token.device,
+                    # NGRAM drafts from a host corpus lookup, so it stays on the
+                    # synchronous path and has no pending FSM advance to run.
+                    barrier=None,
                 )
 
             # Sample
