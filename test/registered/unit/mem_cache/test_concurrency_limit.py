@@ -23,30 +23,30 @@ def _limit(source, value, remedy="raise it"):
 
 class TestConcurrencyLimit(CustomTestCase):
     def test_binds_to_the_smallest_limit(self):
-        limits = [_limit("kv_capacity", 400), _limit("mamba_state_pool", 26)]
-        resolved, binding = resolve_concurrency_limit(limits)
-        self.assertEqual(resolved, 26)
+        binding = resolve_concurrency_limit(
+            [_limit("kv_capacity", 400), _limit("mamba_state_pool", 26)]
+        )
+        self.assertEqual(binding.value, 26)
         self.assertEqual(binding.source, "mamba_state_pool")
 
     def test_ties_report_the_first_listed(self):
-        limits = [_limit("max_running_requests", 74), _limit("kv_capacity", 74)]
-        _, binding = resolve_concurrency_limit(limits)
+        binding = resolve_concurrency_limit(
+            [_limit("max_running_requests", 74), _limit("kv_capacity", 74)]
+        )
         self.assertEqual(binding.source, "max_running_requests")
 
     def test_downgrade_names_the_binding_limit_and_remedy(self):
         limits = [
             ConcurrencyLimit("max_running_requests", 74, "--max-running-requests=74"),
             _limit("kv_capacity", 400),
-            _limit("mamba_state_pool", 26, remedy="set --max-mamba-cache-size 370"),
+            _limit("mamba_state_pool", 26, remedy="--max-mamba-cache-size 370"),
         ]
-        resolved, binding = resolve_concurrency_limit(limits)
-        is_downgrade, message = format_concurrency_report(
-            resolved, binding, limits, requested=74
-        )
+        binding = resolve_concurrency_limit(limits)
+        is_downgrade, message = format_concurrency_report(binding, limits, requested=74)
         self.assertTrue(is_downgrade)
         self.assertIn("reduced from the requested 74 to 26", message)
-        self.assertIn("mamba_state_pool", message)
-        self.assertIn("set --max-mamba-cache-size 370", message)
+        self.assertIn("bound by mamba_state_pool", message)
+        self.assertIn("--max-mamba-cache-size 370", message)
         self.assertIn("kv_capacity=400", message)
 
     def test_request_honored_is_not_a_downgrade(self):
@@ -54,26 +54,28 @@ class TestConcurrencyLimit(CustomTestCase):
             ConcurrencyLimit("max_running_requests", 32, "--max-running-requests=32"),
             _limit("kv_capacity", 400),
         ]
-        resolved, binding = resolve_concurrency_limit(limits)
-        is_downgrade, message = format_concurrency_report(
-            resolved, binding, limits, requested=32
-        )
+        binding = resolve_concurrency_limit(limits)
+        is_downgrade, message = format_concurrency_report(binding, limits, requested=32)
         self.assertFalse(is_downgrade)
         self.assertIn("bound by max_running_requests", message)
+        # The user's own request carries no remedy.
+        self.assertNotIn("To raise it", message)
 
     def test_sole_limit_omits_the_other_limits_clause(self):
         limits = [_limit("kv_capacity", 400)]
-        resolved, binding = resolve_concurrency_limit(limits)
-        _, message = format_concurrency_report(resolved, binding, limits)
+        _, message = format_concurrency_report(
+            resolve_concurrency_limit(limits), limits
+        )
         self.assertNotIn("other limits", message)
 
-    def test_no_request_still_reports_the_binding_limit(self):
-        limits = [_limit("kv_capacity", 400), _limit("estimate", 2048)]
-        resolved, binding = resolve_concurrency_limit(limits)
-        is_downgrade, message = format_concurrency_report(resolved, binding, limits)
+    def test_no_request_still_reports_binding_and_remedy(self):
+        limits = [_limit("kv_capacity", 400), _limit("heuristic_estimate", 2048)]
+        binding = resolve_concurrency_limit(limits)
+        is_downgrade, message = format_concurrency_report(binding, limits)
         self.assertFalse(is_downgrade)
-        self.assertEqual(resolved, 400)
+        self.assertEqual(binding.value, 400)
         self.assertIn("bound by kv_capacity", message)
+        self.assertIn("To raise it", message)
 
 
 class TestLimitConstructors(CustomTestCase):
@@ -89,13 +91,25 @@ class TestLimitConstructors(CustomTestCase):
         self.assertEqual(heuristic_limit(10**7, 1024).value, 4096)
 
     def test_state_pool_remedy_sizes_for_the_target(self):
-        limit = state_pool_limit(131, slots_per_request=5, target=74)
+        limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=1, target=74)
         self.assertEqual(limit.value, 26)
         self.assertIn("--max-mamba-cache-size 370", limit.remedy)
 
+    def test_state_pool_remedy_scales_back_to_the_global_flag(self):
+        # The pool size read from server_args is per shard, but
+        # --max-mamba-cache-size is global and gets divided by attn_dp_size.
+        limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=4, target=74)
+        self.assertEqual(limit.value, 26)
+        self.assertIn("--max-mamba-cache-size 1480", limit.remedy)
+        self.assertIn("per shard", limit.detail)
+
     def test_state_pool_remedy_defaults_to_one_more_request(self):
-        limit = state_pool_limit(131, slots_per_request=5)
+        limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=1)
         self.assertIn("--max-mamba-cache-size 135", limit.remedy)
+
+    def test_state_pool_target_zero_is_not_treated_as_unset(self):
+        limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=1, target=0)
+        self.assertIn("--max-mamba-cache-size 0", limit.remedy)
 
 
 if __name__ == "__main__":

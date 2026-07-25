@@ -3,6 +3,9 @@
 Independent bounds (user request, KV capacity, hybrid state pool, ...) compete
 for the concurrency ceiling. Carrying them as data instead of nested `min()`
 calls lets the server report which one bound the result and how to raise it.
+
+The remedies name user-facing CLI flags, so renaming a flag means updating them
+here too.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ def heuristic_limit(token_capacity: int, context_len: int) -> ConcurrencyLimit:
     lo, hi = HEURISTIC_BOUNDS
     estimated = int(token_capacity / context_len * HEURISTIC_TOKENS_PER_REQUEST)
     return ConcurrencyLimit(
-        source="estimate",
+        source="heuristic_estimate",
         value=max(min(estimated, hi), lo),
         detail=f"token_capacity / context_len * {HEURISTIC_TOKENS_PER_REQUEST}, "
         f"clamped to [{lo}, {hi}]",
@@ -61,35 +64,40 @@ def heuristic_limit(token_capacity: int, context_len: int) -> ConcurrencyLimit:
 
 
 def state_pool_limit(
-    max_mamba_cache_size: int, slots_per_request: int, target: Optional[int] = None
+    per_shard_pool_size: int,
+    slots_per_request: int,
+    attn_dp_size: int,
+    target: Optional[int] = None,
 ) -> ConcurrencyLimit:
-    """Hybrid (mamba / linear-attention) state pool bound. `target` is the
-    concurrency the remedy sizes for, defaulting to one more than fits."""
-    value = max_mamba_cache_size // slots_per_request
-    target = target or (value + 1)
+    """Hybrid (mamba / linear-attention) state pool bound.
+
+    `per_shard_pool_size` is the resolved per-DP-shard slot count, so the remedy
+    scales back up: --max-mamba-cache-size is a global value that the server
+    divides by `attn_dp_size`. `target` is the concurrency the remedy sizes for,
+    defaulting to one more request than currently fits.
+    """
+    value = per_shard_pool_size // slots_per_request
+    if target is None:
+        target = value + 1
     return ConcurrencyLimit(
         source="mamba_state_pool",
         value=value,
-        detail=f"max_mamba_cache_size={max_mamba_cache_size} / "
+        detail=f"max_mamba_cache_size={per_shard_pool_size} per shard / "
         f"{slots_per_request} slots per request",
-        remedy=f"set --max-mamba-cache-size {target * slots_per_request}, raise "
-        f"--mamba-full-memory-ratio, or halve the state size with "
-        f"--mamba-ssm-dtype bfloat16",
+        remedy=f"try one of: --max-mamba-cache-size "
+        f"{target * slots_per_request * attn_dp_size}, a larger "
+        f"--mamba-full-memory-ratio, or --mamba-ssm-dtype bfloat16",
     )
 
 
-def resolve_concurrency_limit(
-    limits: List[ConcurrencyLimit],
-) -> Tuple[int, ConcurrencyLimit]:
-    """Return the effective ceiling and the limit that bound it. Ties resolve
-    to the first entry, so list limits in the order they should be reported."""
+def resolve_concurrency_limit(limits: List[ConcurrencyLimit]) -> ConcurrencyLimit:
+    """Return the limit that bound the ceiling; its value is the resolution.
+    Ties resolve to the first entry, so list limits in reporting order."""
     assert limits, "at least one concurrency limit is required"
-    binding = min(limits, key=lambda limit: limit.value)
-    return binding.value, binding
+    return min(limits, key=lambda limit: limit.value)
 
 
 def format_concurrency_report(
-    resolved: int,
     binding: ConcurrencyLimit,
     limits: List[ConcurrencyLimit],
     requested: Optional[int] = None,
@@ -100,16 +108,15 @@ def format_concurrency_report(
         f"{limit.source}={limit.value}" for limit in limits if limit is not binding
     )
     others = f"; other limits: {others}" if others else ""
+    remedy = f" To raise it: {binding.remedy}." if binding.remedy else ""
 
-    is_downgrade = requested is not None and resolved < requested
-    if is_downgrade:
-        remedy = f" To raise it: {binding.remedy}." if binding.remedy else ""
+    if requested is not None and binding.value < requested:
         return True, (
             f"max_running_requests reduced from the requested {requested} to "
-            f"{resolved} (per dp worker), bound by {binding.source} "
+            f"{binding.value} (per dp worker), bound by {binding.source} "
             f"({binding.detail}){others}.{remedy}"
         )
     return False, (
-        f"max_running_requests={resolved} (per dp worker), bound by "
-        f"{binding.source} ({binding.detail}){others}."
+        f"max_running_requests={binding.value} (per dp worker), bound by "
+        f"{binding.source} ({binding.detail}){others}.{remedy}"
     )

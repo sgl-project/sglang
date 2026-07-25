@@ -1627,51 +1627,57 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def resolve_max_num_reqs(self, token_capacity: int) -> int:
+    def resolve_max_num_reqs(self, token_capacity: int, report: bool = True) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
-        limits = [kv_capacity_limit(token_capacity)]
-
+        token capacity. `report` logs which limit bound the result; the
+        post-capture resize caller opts out because it logs its own summary."""
+        # Order matters: ties are attributed to the first limit listed.
+        limits = []
         requested_per_worker = None
         if self.server_args.max_running_requests is not None:
             requested = user_request_limit(
                 self.server_args.max_running_requests, self.ps.attn_dp_size
             )
             requested_per_worker = requested.value
-            limits.insert(0, requested)
-        else:
+            limits.append(requested)
+        limits.append(kv_capacity_limit(token_capacity))
+        if requested_per_worker is None:
             limits.append(
                 heuristic_limit(token_capacity, self.model_config.context_len)
             )
 
         if self.mambaish_config is not None:
+            ratio = self._calculate_mamba_ratio()
             limits.append(
                 state_pool_limit(
                     self.server_args.max_mamba_cache_size,
-                    self._calculate_mamba_ratio(),
+                    ratio,
+                    self.ps.attn_dp_size,
                     requested_per_worker,
                 )
             )
 
-        max_num_reqs, binding = resolve_concurrency_limit(limits)
+        binding = resolve_concurrency_limit(limits)
+        max_num_reqs = binding.value
 
         if self.mambaish_config is not None and max_num_reqs <= 0:
             raise RuntimeError(
                 f"Hybrid (mamba/linear-attention) state cache is too small to serve "
                 f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                f"mamba_ratio={self._calculate_mamba_ratio()}, resulting max_num_reqs={max_num_reqs}. "
+                f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
                 f"Try: (1) reduce --max-running-requests, "
                 f"(2) increase --mem-fraction-static, or "
                 f"(3) use GPUs with more memory."
             )
 
-        is_downgrade, message = format_concurrency_report(
-            max_num_reqs, binding, limits, requested_per_worker
-        )
-        if is_downgrade:
-            logger.warning(message)
-        else:
-            logger.info(message)
+        if report:
+            is_downgrade, message = format_concurrency_report(
+                binding, limits, requested_per_worker
+            )
+            if is_downgrade:
+                logger.warning(message)
+            else:
+                logger.info(message)
         return max_num_reqs
 
     def _resolve_memory_pool_config(
