@@ -7,14 +7,14 @@
 //     topk_output   = topk(hidden_states, router_logits)
 //     routed_input  = routed_expert_down_proj(hidden_states)  // [3584, 7168] 51.4 MB
 //
-// Two entry points, both consuming fp32 logits:
+// One entry point:
 //
-//   route_radix_fp32     radix-select top-k over [M, 896] fp32 logits.
-//                        route_radix.cuh is bf16-only, so the fp32 logits the
-//                        cuBLAS gate GEMV produces used to fall back to the
-//                        Triton router -- 7.04 us instead of 2.4 us per layer at
-//                        T=1 on a GB300, across 92 MoE layers.
-//   fused_front_epilogue the merged-front epilogue. The gate and the down-proj
+//   fused_front_epilogue the merged-front epilogue.  Plain [M, 896] fp32 logits
+//                        are handled by route_radix.cuh, which took fp32 support
+//                        in #237; this kernel exists for what that cannot do --
+//                        read the gate slice of a wider merged GEMM output in
+//                        place (row stride 896 + latent) and fold the latent
+//                        cast into the same launch. The gate and the down-proj
 //                        read the same activations, so their weights are merged
 //                        and one cuBLAS GEMM emits [M, 896 + 3584]. It can only
 //                        emit one dtype: bf16 would round the router logits and
@@ -60,22 +60,34 @@ inline constexpr uint32_t kFGTTopK = 16;
 // 7 warps: 896 experts / 224 threads = 4 experts per thread in the epilogue, and
 // one expert per warp per pass in phase 1.  Keeping the block at route_radix's
 // shape lets the epilogue reuse its radix-select verbatim.
+// Default block size when no tuned config is supplied: 896 / 224 = 4 experts
+// per thread, the shape route_radix.cuh uses.
 inline constexpr uint32_t kFGTBlockSize = 224;
-inline constexpr uint32_t kFGTWarps = kFGTBlockSize / 32;
 // Largest batch the fused kernel serves; above this the gate GEMM is already
 // near the memory-read floor and cuBLAS + route_radix_fp32 wins.
 inline constexpr uint32_t kFGTMaxTokens = 16;
 
-struct FusedGateTopKTrait {
+/// Block size is a tunable: it sets how many experts each thread owns in the
+/// radix select (kNumExperts / kBlockSize).  It must be at least kRadixSize/2 =
+/// 128 threads (the split-bin search puts 2 bins per thread) and must divide the
+/// expert count into an even per-thread count (the loads are fp32x2 pairs), so
+/// 224 (4 experts/thread) and 448 (2 experts/thread) are the legal choices for
+/// 896 experts.
+template <uint32_t kBlockSize_>
+struct MoEFrontTrait {
   static constexpr uint32_t kNumExperts = kFGTNumExperts;
   static constexpr uint32_t kTopK = kFGTTopK;
-  static constexpr uint32_t kVecSize = 4;  // epilogue: experts per thread
+  static constexpr uint32_t kBlockSize = kBlockSize_;
+  static constexpr uint32_t kVecSize = kNumExperts / kBlockSize;  // experts per thread
+  static constexpr uint32_t kNumWarps = kBlockSize / 32;
 
   static constexpr uint32_t kRadixBits = 8;
   static constexpr uint32_t kRadixSize = 1 << kRadixBits;
   static constexpr uint32_t kRadixRounds = 32 / kRadixBits;
-  static constexpr uint32_t kBlockSize = kFGTBlockSize;
-  static constexpr uint32_t kNumWarps = kFGTWarps;
+
+  static_assert(kNumExperts % kBlockSize == 0, "block size must divide the expert count");
+  static_assert(kVecSize % 2 == 0, "experts per thread must be even (fp32x2 loads)");
+  static_assert(kBlockSize >= kRadixSize / 2, "block must cover the split-bin search lanes");
 
   struct alignas(16) MatchBin {
     uint32_t bin;
@@ -152,15 +164,14 @@ fgt_block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32
 
 /// Radix-select top-k over one token's fp32 logits.  Lifted from
 /// route_radix.cuh; the only change is the input dtype (fp32 in place of bf16).
-template <bool kUsePDL>
+template <bool kUsePDL, typename T>
 SGL_DEVICE void fgt_select_topk(
     const MoEFrontParams& params,
-    typename FusedGateTopKTrait::Smem& smem,
+    typename T::Smem& smem,
     int m,
     uint32_t tx,
     uint32_t warp_id,
     uint32_t lane_id) {
-  using T = FusedGateTopKTrait;
   constexpr uint32_t kVecSize = T::kVecSize;
   constexpr uint32_t kRadixLanes = T::kRadixSize / 2;
   enum { BAR_SUM = 1 };
@@ -173,7 +184,12 @@ SGL_DEVICE void fgt_select_topk(
     bias_vec.load(params.bias, tx);
     device::AlignedVector<fp32x2_t, kVecSize / 2> lv;
     lv.load(params.logits + (long long)m * params.logits_stride, tx);
-    const float logit[kVecSize] = {lv[0].x, lv[0].y, lv[1].x, lv[1].y};
+    float logit[kVecSize];
+#pragma unroll
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      logit[2 * i + 0] = lv[i].x;
+      logit[2 * i + 1] = lv[i].y;
+    }
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
       const float sx = fgt_sigmoid_match(logit[2 * i + 0]);
@@ -310,67 +326,42 @@ SGL_DEVICE void fgt_select_topk(
   __syncthreads();  // smem reuse across the token loop
 }
 
-/// Router-only entry: radix-select top-k over **fp32** logits.
-///
-/// route_radix.cuh is bf16-only, so K3's unfused-front path (which produces fp32
-/// logits from the cuBLAS gate GEMM) silently falls back to the Triton router --
-/// 7.04 us instead of 2.4 us per layer at T=1 on a GB300.  This is the same
-/// radix-select, reading the fp32 logits in place.
-template <bool kUsePDL>
-__global__ __launch_bounds__(kFGTBlockSize)  //
-    void route_radix_fp32_kernel(const __grid_constant__ MoEFrontParams params) {
-  using namespace device;
-  using T = FusedGateTopKTrait;
-  __shared__ typename T::Smem smem;
-  const uint32_t tx = threadIdx.x;
-  // grid.x == M exactly; no row guard (an early return would deadlock the
-  // block-wide barriers inside the select).
-  PDLWaitPrimary<kUsePDL>();
-  fgt_select_topk<kUsePDL>(params, smem, (int)blockIdx.x, tx, tx / 32, tx % 32);
-}
-
-/// Merged-front epilogue: consumes one fp32 GEMM output [M, E + latent] and
-/// emits both routing results and the bf16 routed_input.
-///
-/// The K3 MoE front runs two GEMMs over the same `hidden_states`: the router
-/// gate ([896, 7168], 12.85 MB) and routed_expert_down_proj ([3584, 7168],
-/// 51.4 MB).  Merging their weights lets cuBLAS read the activations once and
-/// keeps the tensor-core GEMM (which beats a hand-written cudacore GEMV by ~3x
-/// at this size), but the merged GEMM can only emit one dtype.  Emitting bf16
-/// would round the router logits and change routing on a few percent of rows;
-/// emitting fp32 keeps routing exact and leaves a cast to do -- which this
-/// kernel folds into the top-k launch, so the front still costs two kernels.
-///
-/// grid.x == M, one CTA per token, matching route_radix's shape.
-template <bool kUsePDL>
-__global__ __launch_bounds__(kFGTBlockSize)  //
+/// Tunables: `kBlockSize` sets the experts-per-thread of the radix select,
+/// `kCastVec` the fp32 elements each thread converts per step (the cast moves
+/// [T, 3584] fp32 in and bf16 out, which dominates the epilogue at large T), and
+/// `kCastFirst` whether the cast is issued before the select (loads in flight
+/// during the radix rounds) or after it.
+template <bool kUsePDL, uint32_t kBlockSize, uint32_t kCastVec, bool kCastFirst>
+__global__ __launch_bounds__(kBlockSize)  //
     void fused_front_epilogue_kernel(const __grid_constant__ MoEFrontParams params) {
   using namespace device;
-  using T = FusedGateTopKTrait;
+  using T = MoEFrontTrait<kBlockSize>;
   __shared__ typename T::Smem smem;
   const uint32_t tx = threadIdx.x;
   const int m = (int)blockIdx.x;
 
   PDLWaitPrimary<kUsePDL>();
 
-  // Cast the latent slice: [E, E + latent) fp32 -> [0, latent) bf16.  Done
-  // before the select so these loads are in flight during the radix rounds.
-  {
+  // Cast the latent slice: [E, E + latent) fp32 -> [0, latent) bf16.
+  auto cast_latent = [&]() {
     const fp32_t* src = params.logits + (long long)m * params.logits_stride + T::kNumExperts;
     bf16_t* dst = params.routed_out + (long long)m * params.routed_stride;
-    for (int i = (int)tx * 4; i < params.latent; i += (int)kFGTBlockSize * 4) {
-      AlignedVector<fp32x2_t, 2> v;
-      v.load(src, i / 4);
-      AlignedVector<bf16_t, 4> o;
-      o[0] = cast<bf16_t>(v[0].x);
-      o[1] = cast<bf16_t>(v[0].y);
-      o[2] = cast<bf16_t>(v[1].x);
-      o[3] = cast<bf16_t>(v[1].y);
-      o.store(dst, i / 4);
+    for (int i = (int)tx * kCastVec; i < params.latent; i += (int)kBlockSize * kCastVec) {
+      AlignedVector<fp32x2_t, kCastVec / 2> v;
+      v.load(src, i / kCastVec);
+      AlignedVector<bf16_t, kCastVec> o;
+#pragma unroll
+      for (uint32_t j = 0; j < kCastVec / 2; ++j) {
+        o[2 * j + 0] = cast<bf16_t>(v[j].x);
+        o[2 * j + 1] = cast<bf16_t>(v[j].y);
+      }
+      o.store(dst, i / kCastVec);
     }
-  }
+  };
 
-  fgt_select_topk<kUsePDL>(params, smem, m, tx, tx / 32, tx % 32);
+  if (kCastFirst) cast_latent();
+  fgt_select_topk<kUsePDL, T>(params, smem, m, tx, tx / 32, tx % 32);
+  if (!kCastFirst) cast_latent();
 }
 
 }  // namespace sglang
@@ -386,7 +377,10 @@ struct FusedFrontEpilogueKernel {
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
-      bool apply_scale) {
+      bool apply_scale,
+      int64_t block_size,
+      int64_t cast_vec,
+      bool cast_first) {
     using namespace host;
 
     auto M_ = SymbolicSize{"num_tokens"};
@@ -435,62 +429,46 @@ struct FusedFrontEpilogueKernel {
     params.latent = latent;
     params.routed_stride = static_cast<long long>(routed.stride(0));
 
-    LaunchKernel(M, sglang::kFGTBlockSize, device.unwrap())
-        .enable_pdl(kUsePDL)(sglang::fused_front_epilogue_kernel<kUsePDL>, params);
+    // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
+    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
+    RuntimeCheck(
+        cast_vec == 2 || cast_vec == 4 || cast_vec == 8,
+        "fused_front_epilogue: cast_vec must be 2, 4 or 8");
+    RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
+
+#define SGL_FRONT_LAUNCH(BS, CV, CF)                                            \
+  LaunchKernel(M, BS, device.unwrap())                                          \
+      .enable_pdl(kUsePDL)(sglang::fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
+#define SGL_FRONT_DISPATCH_CV(BS, CF)        \
+  do {                                       \
+    if (cast_vec == 2) {                     \
+      SGL_FRONT_LAUNCH(BS, 2, CF);           \
+    } else if (cast_vec == 4) {              \
+      SGL_FRONT_LAUNCH(BS, 4, CF);           \
+    } else {                                 \
+      SGL_FRONT_LAUNCH(BS, 8, CF);           \
+    }                                        \
+  } while (0)
+#define SGL_FRONT_DISPATCH_BS(CF)            \
+  do {                                       \
+    if (block_size == 448) {                 \
+      SGL_FRONT_DISPATCH_CV(448, CF);        \
+    } else {                                 \
+      SGL_FRONT_DISPATCH_CV(224, CF);        \
+    }                                        \
+  } while (0)
+
+    RuntimeCheck(
+        block_size == 224 || block_size == 448,
+        "fused_front_epilogue: block_size must be 224 or 448");
+    if (cast_first) {
+      SGL_FRONT_DISPATCH_BS(true);
+    } else {
+      SGL_FRONT_DISPATCH_BS(false);
+    }
+#undef SGL_FRONT_DISPATCH_BS
+#undef SGL_FRONT_DISPATCH_CV
+#undef SGL_FRONT_LAUNCH
   }
 };
 
-template <bool kUsePDL>
-struct RouteRadixFp32Kernel {
-  static void
-  run(const tvm::ffi::TensorView logits,
-      const tvm::ffi::TensorView bias,
-      const tvm::ffi::TensorView out_w,
-      const tvm::ffi::TensorView out_i,
-      int64_t topk,
-      double routed_scaling_factor,
-      bool renormalize,
-      bool apply_scale) {
-    using namespace host;
-
-    auto M_ = SymbolicSize{"num_tokens"};
-    auto E_ = SymbolicSize{"num_experts"};
-    auto K_ = SymbolicSize{"topk"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-
-    TensorMatcher({M_, E_}).with_dtype<fp32_t>().with_device(device).with_strides({-1, 1}).verify(logits);
-    TensorMatcher({E_}).with_dtype<fp32_t>().with_device(device).verify(bias);
-    TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
-    TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
-
-    RuntimeCheck(
-        E_.unwrap() == sglang::kFGTNumExperts && K_.unwrap() == sglang::kFGTTopK &&
-            topk == sglang::kFGTTopK,
-        "route_radix_fp32 is specialized for E=896, topk=16");
-    // fgt_select_topk indexes rows by num_experts, so the logits must be densely
-    // packed (which also keeps the 16B vectorized row loads aligned).
-    RuntimeCheck(
-        logits.stride(0) == static_cast<int64_t>(sglang::kFGTNumExperts),
-        "route_radix_fp32: logits must be row-dense [M, 896]");
-
-    const auto M = static_cast<int>(M_.unwrap());
-    if (M == 0) return;
-
-    auto params = sglang::MoEFrontParams{};
-    params.bias = static_cast<const fp32_t*>(bias.data_ptr());
-    params.logits = static_cast<fp32_t*>(logits.data_ptr());
-    params.out_w = static_cast<fp32_t*>(out_w.data_ptr());
-    params.out_i = static_cast<int32_t*>(out_i.data_ptr());
-    params.M = M;
-    params.out_w_stride = static_cast<long long>(out_w.stride(0));
-    params.out_i_stride = static_cast<long long>(out_i.stride(0));
-    params.routed_scaling_factor = static_cast<float>(routed_scaling_factor);
-    params.renormalize = renormalize ? 1 : 0;
-    params.apply_scale = apply_scale ? 1 : 0;
-    params.logits_stride = static_cast<int>(sglang::kFGTNumExperts);
-
-    LaunchKernel(M, sglang::kFGTBlockSize, device.unwrap())
-        .enable_pdl(kUsePDL)(sglang::route_radix_fp32_kernel<kUsePDL>, params);
-  }
-};

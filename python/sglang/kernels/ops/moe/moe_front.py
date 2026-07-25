@@ -7,12 +7,8 @@ runs three ops over the same `hidden_states [T, 7168]`:
     topk_output   = topk(hidden_states, router_logits)
     routed_input  = routed_expert_down_proj(hidden_states)   # [3584, 7168] 51.4 MB
 
-Two things make that faster, and which one to use depends only on the token count.
-
-**route_radix_fp32** -- radix-select top-k over fp32 logits.  `route_radix` is
-bf16-only, so the fp32 logits the cuBLAS gate GEMV produces silently fell back to
-the Triton router: 7.04 us instead of 2.4 us per layer at T=1, across 92 MoE
-layers.  Always a win, so it is unconditional.
+Plain [M, 896] fp32 logits go to route_radix (which took fp32 support in #237).
+This module covers what that cannot: the merged front.
 
 **fused_front** -- the two GEMMs share their input, so their weights are merged
 and one cuBLAS GEMM emits `[T, 896 + 3584]` fp32; a single epilogue kernel then
@@ -55,11 +51,59 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+import json
+import os
+
 NUM_EXPERTS = 896
 TOPK = 16
 
 # Above this token count the merged GEMM stops paying; see the table above.
 MERGED_FRONT_MAX_TOKENS = 1024
+
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "moe_front")
+
+# Kernel tunables, per token bucket, from the JSON table.
+#   block_size  threads per CTA; sets experts-per-thread in the radix select
+#               (896 / block_size). 224 -> 4, 448 -> 2.
+#   cast_vec    fp32 elements each thread converts per step in the latent cast.
+#   cast_first  issue the cast before the select (loads in flight during the
+#               radix rounds) or after it.
+# Fallbacks when no tuned table matches the device. Both were the sweep's most
+# common winners: cast_vec 8 is 32 B/thread, the Blackwell vector-load limit, and
+# it won at every one of the 28 token counts measured; issuing the cast after the
+# select beat issuing it before almost everywhere.
+DEFAULT_EPILOGUE_CONFIG = {"block_size": 224, "cast_vec": 8, "cast_first": False}
+
+_tables = {}
+
+
+def _table(kind: str, device_name: str):
+    path = os.path.join(_CONFIG_DIR, f"{kind},E={NUM_EXPERTS},topk={TOPK},device_name={device_name}.json")
+    if path not in _tables:
+        table = None
+        if os.path.exists(path):
+            with open(path) as f:
+                table = {int(k): v for k, v in json.load(f)["configs"].items()}
+        _tables[path] = table
+    return _tables[path]
+
+
+def _device_name(device) -> str:
+    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+
+
+def get_config(kind: str, num_tokens: int, device, default: dict) -> dict:
+    """Tuned config for the nearest token bucket at or below `num_tokens`."""
+    table = _table(kind, _device_name(device))
+    if not table:
+        return dict(default)
+    pick = min(table)
+    for k in sorted(table):
+        if k <= num_tokens:
+            pick = k
+        else:
+            break
+    return dict(table[pick])
 
 
 @cache_once
@@ -70,7 +114,6 @@ def _jit_module() -> Module:
         *args,
         cuda_files=["moe/moe_front.cuh"],
         cuda_wrappers=[
-            ("route_radix_fp32", f"RouteRadixFp32Kernel<{args}>::run"),
             ("front_epilogue", f"FusedFrontEpilogueKernel<{args}>::run"),
         ],
         # No fast-math: scoring and expert-id selection must stay comparable to
@@ -89,58 +132,6 @@ def available() -> bool:
     except Exception as e:  # pragma: no cover - toolchain dependent
         logging.getLogger(__name__).warning(f"Failed to load the JIT MoE front kernels: {e}")
         return False
-
-
-# --------------------------------------------------------------------------
-# router-only: fp32 logits -> top-k
-# --------------------------------------------------------------------------
-
-
-def route_radix_fp32_covered(
-    logits: torch.Tensor, bias: Optional[torch.Tensor], topk: int
-) -> bool:
-    """Row-dense [M, 896] fp32 logits, fp32 bias, top-16."""
-    return (
-        logits.dim() == 2
-        and logits.dtype == torch.float32
-        and logits.shape[1] == NUM_EXPERTS
-        and logits.stride(1) == 1
-        and logits.stride(0) == NUM_EXPERTS
-        and bias is not None
-        and bias.dtype == torch.float32
-        and bias.numel() == NUM_EXPERTS
-        and int(topk) == TOPK
-        and logits.shape[0] > 0
-    )
-
-
-def route_radix_fp32(
-    logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int = TOPK,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Radix-select top-k over fp32 logits.
-
-    Winners come out in expert-id order, the same contract as
-    ``moe_route_radix.route_radix(..., sorted=False)``.
-    """
-    M = logits.shape[0]
-    weights = torch.empty((M, topk), dtype=torch.float32, device=logits.device)
-    ids = torch.empty((M, topk), dtype=torch.int32, device=logits.device)
-    _jit_module().route_radix_fp32(
-        logits,
-        correction_bias,
-        weights,
-        ids,
-        topk,
-        float(routed_scaling_factor if routed_scaling_factor is not None else 1.0),
-        bool(renormalize),
-        bool(apply_routed_scaling_factor_on_output),
-    )
-    return weights, ids
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +166,47 @@ def fused_front_covered(
     )
 
 
+def fused_front_epilogue_only(
+    merged: torch.Tensor,
+    correction_bias: torch.Tensor,
+    latent: int,
+    topk: int = TOPK,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+    config: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The epilogue alone, over an already-computed merged GEMM output.
+
+    Exists so the kernel can be tuned without the cuBLAS GEMM dominating the
+    measurement; :func:`fused_front` is the production entry point.
+    """
+    M = merged.shape[0]
+    device = merged.device
+    if config is None:
+        config = get_config("epilogue", M, device, DEFAULT_EPILOGUE_CONFIG)
+
+    weights = torch.empty((M, topk), dtype=torch.float32, device=device)
+    ids = torch.empty((M, topk), dtype=torch.int32, device=device)
+    routed = torch.empty((M, latent), dtype=torch.bfloat16, device=device)
+
+    _jit_module().front_epilogue(
+        merged,
+        correction_bias,
+        weights,
+        ids,
+        routed,
+        topk,
+        float(routed_scaling_factor if routed_scaling_factor is not None else 1.0),
+        bool(renormalize),
+        bool(apply_routed_scaling_factor_on_output),
+        int(config["block_size"]),
+        int(config["cast_vec"]),
+        bool(config["cast_first"]),
+    )
+    return weights, ids, routed
+
+
 def fused_front(
     hidden_states: torch.Tensor,
     merged_weight: torch.Tensor,
@@ -184,6 +216,7 @@ def fused_front(
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
+    config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Merged front GEMM + fused top-k/cast epilogue.
 
@@ -192,6 +225,8 @@ def fused_front(
     """
     M = hidden_states.shape[0]
     device = hidden_states.device
+    if config is None:
+        config = get_config("epilogue", M, device, DEFAULT_EPILOGUE_CONFIG)
 
     # fp32 out keeps routing exact; the extra output traffic versus bf16 is
     # M x (896 + latent) x 2 bytes, negligible against the 64 MB weight read at
@@ -212,5 +247,8 @@ def fused_front(
         float(routed_scaling_factor if routed_scaling_factor is not None else 1.0),
         bool(renormalize),
         bool(apply_routed_scaling_factor_on_output),
+        int(config["block_size"]),
+        int(config["cast_vec"]),
+        bool(config["cast_first"]),
     )
     return weights, ids, routed

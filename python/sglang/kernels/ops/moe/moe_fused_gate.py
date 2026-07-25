@@ -314,16 +314,6 @@ def moe_fused_gate(
         if moe_route_radix.covered(scores, bias, topk):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
-        # Same radix-select for fp32 logits.  route_radix above is bf16-only, so
-        # callers that produce fp32 logits -- K3's unfused-front path, where
-        # MoEGate runs a cuBLAS bf16 x bf16 -> fp32 GEMV -- used to land on the
-        # Triton kernel below: 7.04 us instead of 2.4 us per layer at T=1 on a
-        # GB300, x92 MoE layers on every decode step.
-        from sglang.kernels.ops.moe import moe_front
-
-        if moe_front.route_radix_fp32_covered(scores, bias, topk) and moe_front.available():
-            return moe_front.route_radix_fp32(*radix_args)
-
     M, N = scores.shape
     K = topk
     K_routed = topk - num_fused_shared_experts
