@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
+    PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -615,6 +616,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self._insert_helper(self.root_node, key, value, params)
         return result
+
+    @property
+    def is_write_back(self) -> bool:
+        return (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -1505,24 +1513,89 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
+                    if self._drop_subtree_no_host(node, tracker):
+                        logger.warning(
+                            "write_back: KV subtree dropped without backup "
+                            "due to host memory pressure, root node %d",
+                            node.id,
+                        )
+                    else:
+                        logger.warning(
+                            "write_back: backup failed under host memory "
+                            "pressure but subtree drop declined (node "
+                            "locked); root node %d stays device-resident "
+                            "until host space frees",
+                            node.id,
+                        )
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
-                self._record_remove_event(node, medium=StorageMedium.GPU)
-                for comp in self._components_tuple:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                parent = node.parent
-                self._remove_leaf_from_parent(node)
-                self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._delete_unbacked_device_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _drop_subtree_no_host(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Write-back fallback when a D-leaf's D->H backup fails under host
+        memory pressure: drop the subtree rooted at the unbacked leaf so
+        device eviction keeps making progress instead of leaving its KV
+        unevictable until host space frees up."""
+
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        # A failed backup never issues the D->H copy, so the subtree root has
+        # no host state and no in-flight DMA reading its device slots.
+        assert not node.backuped and node.write_through_pending_id is None
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        descendants: list[UnifiedTreeNode] = []
+        stack = list(node.children.values())
+        while stack:
+            cur = stack.pop()
+            if any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            ):
+                return False
+            descendants.append(cur)
+            stack.extend(cur.children.values())
+        for desc in reversed(descendants):
+            # Host-only by construction: a device descendant would contradict
+            # this node being a D-leaf, and D-leaves evict before ancestors.
+            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
+            assert desc.write_through_pending_id is None
+            self._release_all_component_layers(desc, StorageMedium.CPU, tracker)
+            self._remove_leaf_from_parent(desc)
+        self._delete_unbacked_device_leaf(node, tracker)
+        return True
+
+    def _release_all_component_layers(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Free every component layer on the node and detach it from the LRU
+        lists and evictable leaf sets."""
+        self._record_remove_event(node, medium=medium)
+        for comp in self._components_tuple:
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
+            )
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+
+    def _delete_unbacked_device_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Delete a device leaf that has no host backup, freeing all layers."""
+        self._release_all_component_layers(node, StorageMedium.GPU, tracker)
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1683,8 +1756,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Lock path & pre-evict if device pool is insufficient
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
-        kv_tokens = len(kv_xfer.host_indices)
 
+        # Let each component pre-allocate per-request state for the load-back;
+        # the finally below lets components recover it unless the load succeeds.
+        preps: dict[ComponentType, PrepareLoadBackResult] = {
+            comp.component_type: comp.prepare_load_back(best_match_node, req=req)
+            for comp in self._components_tuple
+        }
+        success = False
+        try:
+            success = self._load_back_transfers(
+                best_match_node=best_match_node,
+                mem_quota=mem_quota,
+                req=req,
+                kv_xfer=kv_xfer,
+                result=result,
+                ancestor_lock_params=ancestor_lock_params,
+                host_anchor_params=host_anchor_params,
+            )
+            return success
+        finally:
+            for comp in self._components_tuple:
+                comp.finalize_load_back(req, preps[comp.component_type], success)
+
+    def _load_back_transfers(
+        self,
+        *,
+        best_match_node: UnifiedTreeNode,
+        mem_quota: Optional[int],
+        req,
+        kv_xfer: PoolTransfer,
+        result: IncLockRefResult,
+        ancestor_lock_params: Optional[DecLockRefParams],
+        host_anchor_params: Optional[DecLockRefParams],
+    ) -> bool:
+        kv_tokens = len(kv_xfer.host_indices)
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
