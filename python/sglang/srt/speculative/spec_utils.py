@@ -555,11 +555,8 @@ def generate_token_bitmask(
 class StagedGrammarTree:
     """The verify tree copied to the host for the grammar bitmask traversal.
 
-    Stage it where the tree becomes available -- before the target verify forward
-    is launched, so the copies run right after the draft -- and resolve() it where
-    build_grammar_vocab_mask needs the values. Everything launched in between
-    overlaps the transfer. Algorithms whose tree is already on the host (NGRAM
-    builds it there) skip this and pass their arrays straight through.
+    Stage before the target verify launch and resolve() after it, so the copies
+    run behind the draft and everything launched in between overlaps them.
     """
 
     def __init__(
@@ -597,10 +594,9 @@ def build_grammar_vocab_mask(
 ) -> Optional[torch.Tensor]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify forward is launched: the traversal is pure host
-    work over the already-known draft tree, so it overlaps that forward. The tree
-    arrays must be on the host by then -- see StagedGrammarTree for algorithms
-    whose tree lives on device.
+    Call it after the target verify launch: the traversal is pure host work, so it
+    overlaps that forward. The tree arrays must be on the host by then -- see
+    StagedGrammarTree for algorithms whose tree lives on device.
     """
     vocab_mask = generate_token_bitmask(
         reqs,
@@ -617,8 +613,7 @@ def build_grammar_vocab_mask(
     # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
-    # Otherwise the mask left over from the previous extend stage is applied instead,
-    # producing wrong results.
+    # Otherwise the extend stage's leftover mask is applied instead.
     sampling_info.vocab_mask = None
     return vocab_mask
 

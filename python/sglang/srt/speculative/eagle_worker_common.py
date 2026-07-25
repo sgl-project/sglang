@@ -529,8 +529,7 @@ def run_eagle_verify(
             ),
         )
 
-    # The draft tree lives on device, so stage it now: the copies run right after
-    # the draft, and the host resolves them only past the target verify launch.
+    # Must stay ahead of the target verify launch below; resolved past it.
     grammar_tree = (
         StagedGrammarTree(
             verify_input.retrieve_next_token,
