@@ -44,10 +44,8 @@ def _derive_tree_links(
     """Host-side (retrive_next_token, retrive_next_sibling), matching what
     reconstruct_indices_from_tree_mask produces on device.
 
-    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate
-    parent is the largest such j < i. First child and next sibling then follow
-    from the parents alone: the first child of i is the smallest k > i parented
-    by i, and i's next sibling is the smallest k > i sharing i's parent.
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
+    is the largest such j < i, and both links follow from the parents alone.
     """
     tree = mask.reshape(bs, draft_token_num, draft_token_num)
     node_order = np.arange(draft_token_num)
@@ -104,7 +102,6 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        # Host draft tree staged for the grammar bitmask; see _prepare_for_speculative_decoding.
         self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
@@ -312,9 +309,7 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        # Grammar walks this tree on the host to build its bitmask. Stash the host
-        # arrays it needs; the links are derived from them after the verify forward
-        # is launched, so no device round trip and nothing runs while the GPU idles.
+        # Staged for the grammar bitmask, derived after the verify launch below.
         self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
         # generate positions and some indices using tree_mask
@@ -429,8 +424,8 @@ class NGRAMWorker(BaseSpecWorker):
             verify_input: NgramVerifyInput = batch.spec_info
             vocab_mask = None
             if batch.has_grammar:
-                # Derived here, under the verify forward, from the host tree: no
-                # device round trip and nothing to wait on.
+                # From the host tree rather than the device output: no readback to
+                # wait on, and deriving here keeps it under the verify forward.
                 mask, req_drafts = self.grammar_tree_host
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
@@ -449,8 +444,8 @@ class NGRAMWorker(BaseSpecWorker):
 
                 if vocab_mask is not None:
                     assert verify_input.grammar is not None
-                    # non_blocking is safe here: the bitmask source is pinned and
-                    # stream order keeps the copy ahead of apply_vocab_mask.
+                    # non_blocking is safe: the bitmask source is pinned, and stream
+                    # order keeps the copy ahead of apply_vocab_mask.
                     vocab_mask = vocab_mask.to(
                         verify_input.retrieve_next_token.device, non_blocking=True
                     )
