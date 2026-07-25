@@ -18,6 +18,7 @@ mod ids;
 mod message;
 mod ring;
 mod runtime;
+mod tokenizer;
 mod tokenizer_manager;
 
 use pyo3::prelude::*;

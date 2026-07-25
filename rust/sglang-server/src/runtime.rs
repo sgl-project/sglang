@@ -16,3 +16,4 @@
 mod runnable;
 
 // Re-export so stages keep importing `crate::runtime::Runnable`.
+pub use runnable::Runnable;
