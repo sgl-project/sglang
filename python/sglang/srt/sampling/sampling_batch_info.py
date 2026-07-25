@@ -10,6 +10,7 @@ import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
+    GrammarRow,
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
@@ -244,17 +245,20 @@ class SamplingBatchInfo:
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
 
-        # TODO(lianmin): Maybe we can reuse the existing mask?
         vocab_mask = first_grammar.allocate_vocab_mask(
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
             device=self.device,
         )
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(vocab_mask, i)
+        # Rows omitted here (finished / terminated / non-grammar requests) retain
+        # the freshly allocated buffer's unconstrained value.
+        entries = [
+            GrammarRow(row=row, grammar=grammar)
+            for row, grammar in enumerate(self.grammars)
+            if grammar and not grammar.finished and not grammar.is_terminated()
+        ]
+        first_grammar.fill_vocab_mask_batched(entries, vocab_mask)
 
         # Move the mask to the device if needed
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
