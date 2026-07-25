@@ -613,7 +613,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
-        if batch.has_grammar and logits_output.next_token_logits is not None:
+        if batch.has_grammar:
             # Grammar barrier: advance the previous batch's FSM over its committed
             # tokens before building this batch's bitmask. Runs after the target
             # launch, so the advance and the traversal both overlap the forward.
