@@ -5,17 +5,11 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 
 def _is_lingbot_video_block(name: str, module) -> bool:
-    """FSDP shard predicate: shard each transformer block (``blocks.<digit>``).
-
-    Module-level (not a lambda) so it is picklable across the multiprocessing
-    spawn that launches GPU workers.
-    """
     return "blocks" in name and str.isdigit(name.split(".")[-1])
 
 
 @dataclass
 class LingBotVideoMoEArchConfig(DiTArchConfig):
-
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_lingbot_video_block]
     )
@@ -39,13 +33,11 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
     axes_dims: tuple[int, ...] = (32, 48, 48)
     axes_lens: tuple[int, ...] = (4096, 512, 512)
 
-    # --- projection biases (match upstream config.json) ---
     qkv_bias: bool = False
     out_bias: bool = True
     patch_embed_bias: bool = True
     timestep_mlp_bias: bool = True
 
-    # --- MoE (DeepSeek-V3 style) ---
     num_experts: int = 128
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 768
@@ -64,11 +56,5 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
 
 @dataclass
 class LingBotVideoMoEConfig(DiTConfig):
-    """DiT config for the LingBot-Video MoE 30B model.
-
-    ``prefix="LingBotVideo"`` matches the upstream ``model_index.json``
-    transformer class prefix so weight loading resolves correctly.
-    """
-
     arch_config: DiTArchConfig = field(default_factory=LingBotVideoMoEArchConfig)
     prefix: str = "LingBotVideo"

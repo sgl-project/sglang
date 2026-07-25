@@ -1156,8 +1156,7 @@ def _register_configs():
         sampling_param_cls=LingBotVideoMoESamplingParams,
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
         hf_model_paths=[
-            "robbyant/lingbot-video-moe-30b-a3b",
-            "/mnt/storage01/lipan02/lingbot-video-moe-30b-a3b",
+            "robbyant/lingbot-video-moe-30b-a3b"
         ],
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
