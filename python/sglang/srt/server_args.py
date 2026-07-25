@@ -3644,8 +3644,27 @@ class ServerArgs:
         # Breakable CUDA Graph captures one complete prefill and is the graph
         # mode validated for this encoder-style attention.
         if getattr(model_config, "is_embedding_gemma", False):
+            # This is an encoder-only model even though its HF architecture is
+            # named Gemma3TextModel. Marking it as embedding mode enables the
+            # FlashAttention raw-K/V fast path, which does not write or read
+            # the paged KV cache during its single prefill forward.
+            self.is_embedding = True
             self.disable_radix_cache = True
             self.chunked_prefill_size = -1
+            requested_prefill_backend = (
+                self.prefill_attention_backend or self.attention_backend
+            )
+            if (
+                is_cuda()
+                and (is_sm90_supported() or is_sm100_supported())
+                and requested_prefill_backend in (None, "fa3", "fa4")
+            ):
+                # Hopper/Blackwell's default FA backend can consume raw K/V
+                # tensors for a single embedding prefill. Enable its no-KV
+                # pool path before memory-pool sizing; an explicit non-FA
+                # backend retains the existing paged-KV behavior.
+                self.prefill_only_disable_kv_cache = True
+                self._validate_prefill_only_disable_kv_cache_args()
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
