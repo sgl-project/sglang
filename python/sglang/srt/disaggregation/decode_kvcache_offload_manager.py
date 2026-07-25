@@ -105,6 +105,9 @@ class DecodeKVCacheOffloadManager:
         self.offload_inflight = {}
         logger.info("Enable offload kv cache for decode side")
 
+    def release_host_resources(self) -> None:
+        self.decode_host_mem_pool.destroy()
+
     def _mark_offload_started(self, rid):
         self.offload_inflight[rid] = self.offload_inflight.get(rid, 0) + 1
 

@@ -136,7 +136,8 @@ class SpeculativeAlgorithm(Enum):
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
-        return self.is_eagle()
+        # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
+        return self.is_eagle() or self.is_standalone()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
