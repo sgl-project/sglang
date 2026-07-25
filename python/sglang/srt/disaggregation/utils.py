@@ -855,7 +855,7 @@ def compute_mamba_state_slice_byte_blocks(
     return blocks
 
 
-def build_state_entry_pairs(
+def build_transfer_entry_pairs(
     src_layer_ids: List[int],
     dst_layer_ids: List[int],
     n_src: int,
@@ -1023,11 +1023,7 @@ def setup_state_kv_args(
             )
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
-            layer_ids = (
-                token_to_kv_pool.get_state_layer_ids()
-                if hasattr(token_to_kv_pool, "get_state_layer_ids")
-                else None
-            )
+            layer_ids = token_to_kv_pool.get_state_layer_ids()
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

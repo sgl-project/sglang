@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    build_state_entry_pairs,
+    build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.environ import envs
@@ -95,8 +95,6 @@ def _nixl_device_id(mem_kind: str, gpu_id: int) -> int:
 
 
 def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
-    if not kinds:
-        return "VRAM"
     unique = set(kinds)
     if len(unique) != 1:
         raise NotImplementedError(
@@ -385,6 +383,7 @@ class NixlKVManager(CommonKVManager):
         self.src_mem_kind = (
             _homogeneous_kv_mem_kind(self.kv_args.kv_data_mem_kinds, "source")
             if disaggregation_mode == DisaggregationMode.PREFILL
+            and self.kv_args.kv_data_mem_kinds
             else None
         )
         try:
@@ -938,9 +937,6 @@ class NixlKVManager(CommonKVManager):
         peer_info.kv_xfer_segments = prepared_segments
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
-        assert self.src_mem_kind is not None
-        src_mem_kind = self.src_mem_kind
-
         # If prefill does not run speculative decoding (the usual case),
         # decode with speculative decoding will have more kv items.
         # Prefill having more kv items is impossible.
@@ -953,6 +949,8 @@ class NixlKVManager(CommonKVManager):
             )
         if n_src == 0:
             return
+        assert self.src_mem_kind is not None
+        src_mem_kind = self.src_mem_kind
         decode_only_spec_dec = n_dst > n_src
         if (
             self.is_mla_backend
@@ -1000,7 +998,7 @@ class NixlKVManager(CommonKVManager):
                 else self._num_slots_src
             )
 
-            pairs = build_state_entry_pairs(
+            pairs = build_transfer_entry_pairs(
                 self.kv_args.kv_layer_ids,
                 peer_info.dst_kv_layer_ids,
                 n_src,
@@ -1886,7 +1884,7 @@ class NixlKVManager(CommonKVManager):
         src_addrs = []
         dst_addrs = []
 
-        pairs = build_state_entry_pairs(
+        pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
             len(src_state_data_ptrs),
@@ -1976,7 +1974,7 @@ class NixlKVManager(CommonKVManager):
         src_addrs = []
         dst_addrs = []
 
-        pairs = build_state_entry_pairs(
+        pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
             len(src_state_data_ptrs),
@@ -2076,7 +2074,7 @@ class NixlKVManager(CommonKVManager):
         src_state_slice_outer_counts = (
             getattr(self.kv_args, "state_slice_outer_counts", []) or []
         )
-        src_state_layer_ids = getattr(self.kv_args, "state_layer_ids", []) or []
+        src_state_layer_ids = self.kv_args.state_layer_ids
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
@@ -2774,7 +2772,7 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
-                for layer_id in getattr(self.kv_mgr.kv_args, "kv_layer_ids", [])
+                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
             )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
@@ -2789,7 +2787,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
             packed_state_layer_ids = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_layer_ids", []) or [], "I"
+                self.kv_mgr.kv_args.state_layer_ids, "I"
             )
 
             # Include staging allocator metadata if available
@@ -2805,9 +2803,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
             if self.kv_mgr.kv_args.kv_item_lens:
                 dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-                dst_num_slots = (
-                    self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
-                )
+                dst_num_slots = self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
             else:
                 dst_kv_item_len = 0
                 dst_num_slots = 0

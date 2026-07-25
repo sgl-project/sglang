@@ -104,9 +104,7 @@ class TestKimiLinearHeterogeneousTPDisaggregation(PDDisaggregationServerBase):
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
 
-class TestKimiLinearPipelineDisaggregation(
-    TestKimiLinearHeterogeneousTPDisaggregation
-):
+class TestKimiLinearPipelineDisaggregation(TestKimiLinearHeterogeneousTPDisaggregation):
     prefill_tp_size = 1
     decode_tp_size = 1
     decode_base_gpu_id = 2

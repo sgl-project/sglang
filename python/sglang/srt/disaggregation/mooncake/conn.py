@@ -43,7 +43,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    build_state_entry_pairs,
+    build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -628,7 +628,7 @@ class MooncakeKVManager(CommonKVManager):
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
             if src_layer_ids or dst_layer_ids:
-                pairs = build_state_entry_pairs(
+                pairs = build_transfer_entry_pairs(
                     src_layer_ids,
                     dst_layer_ids,
                     len(src_data_ptrs),
@@ -743,7 +743,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
-            src_layer_ids=getattr(self.kv_args, "kv_layer_ids", []),
+            src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
         )
 
@@ -1025,7 +1025,7 @@ class MooncakeKVManager(CommonKVManager):
             src_slice_outer_counts = (
                 src_slice_outer_counts[i] if i < len(src_slice_outer_counts) else []
             )
-            src_state_layer_ids = getattr(self.kv_args, "state_layer_ids", [])
+            src_state_layer_ids = self.kv_args.state_layer_ids
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
@@ -1201,7 +1201,7 @@ class MooncakeKVManager(CommonKVManager):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
         transfer_blocks = []
-        pairs = build_state_entry_pairs(
+        pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
             len(src_state_data_ptrs),
@@ -1271,7 +1271,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
-        pairs = build_state_entry_pairs(
+        pairs = build_transfer_entry_pairs(
             src_layer_ids or [],
             dst_layer_ids or [],
             len(src_state_data_ptrs),
@@ -1993,11 +1993,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
             packed_state_layer_ids = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_layer_ids", []) or [], "I"
+                self.kv_mgr.kv_args.state_layer_ids, "I"
             )
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
-                for layer_id in getattr(self.kv_mgr.kv_args, "kv_layer_ids", [])
+                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
