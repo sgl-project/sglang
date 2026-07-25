@@ -77,7 +77,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -176,7 +175,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
@@ -188,7 +186,6 @@ python3 -m sglang.launch_server \
     --node-rank 0 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --max-running-requests 432 \
     --context-length 8192 \
     --dtype bfloat16 \
@@ -198,6 +195,7 @@ python3 -m sglang.launch_server \
     --ep-dispatch-algorithm static \
     --disable-radix-cache \
     --moe-a2a-backend ascend_fuseep \
+    --fuseep-mode 2 \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 3 \

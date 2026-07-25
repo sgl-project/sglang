@@ -8,7 +8,8 @@ from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
-from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -50,11 +51,7 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -62,7 +59,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
+        self.tp_rank = ps.tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
@@ -108,10 +105,6 @@ class NGRAMWorker(BaseSpecWorker):
                 corpus_path,
                 loaded,
             )
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
 
     @property
     def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
@@ -237,7 +230,7 @@ class NGRAMWorker(BaseSpecWorker):
         # spliced in from spec_info. Sync mode and grammar batches process
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         i = 0
         for req in batch.reqs:
             prev_tokens = (
@@ -351,7 +344,7 @@ class NGRAMWorker(BaseSpecWorker):
         i, stride = 0, self.draft_token_num
         # Same splice condition as _prepare_draft_tokens: only overlap mode
         # has accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.

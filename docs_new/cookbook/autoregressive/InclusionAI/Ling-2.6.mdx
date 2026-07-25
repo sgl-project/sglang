@@ -45,7 +45,7 @@ import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flas
 - Native context is 128K. Enable YaRN (`--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 2.0, ...}}'`) to extend to 256K — the snippet does this for you.
 - `--tool-call-parser qwen25` matches the model's `<tool_call>...</tool_call>` schema.
 - The recommended baseline does **not** include `--reasoning-parser qwen3`. Ling-2.6 is a controllable-reasoning model whose chat template defaults to `detailed thinking off`; the SGLang `qwen3` reasoning parser, in contrast, assumes default-thinking semantics and would mis-route normal output into `reasoning_content`. Only enable it if you specifically want `<think>...</think>` blocks split out — see [§4.3 Thinking Mode](#4-3-thinking-mode).
-- **MTP (multi-token prediction)** is supported. Add `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-scheduler-strategy extra_buffer` to enable it — see the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash#run-inference) for the full example.
+- **MTP (multi-token prediction)** is supported. Add `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-radix-cache-strategy extra_buffer` to enable it — see the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash#run-inference) for the full example.
 
 ### 3.2 Ling-2.6-1T
 

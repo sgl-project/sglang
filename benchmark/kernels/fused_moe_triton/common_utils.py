@@ -84,6 +84,7 @@ def get_model_config(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
+        "MellumForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
