@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -32,12 +33,10 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.dsa_cache_shared import (
     SharedDSAPageLayout,
     SharedDSATokenToKVPool,
-    _export_dsa_shareable_handles,
-    _release_partial_vmm_mapping,
-    _synchronize_vmm_stage,
-    _validate_same_host_group,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.shared_kv.layout import OwnerShardedLayout
+from sglang.srt.mem_cache.shared_kv.synchronization import SharedWritePublisher
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,9 +44,27 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+def make_shared_dsa_layout(
+    cp_size: int,
+    page_size: int,
+    pages_per_rank: int,
+    *,
+    local_pages_per_layer: int | None = None,
+) -> SharedDSAPageLayout:
+    return SharedDSAPageLayout(
+        OwnerShardedLayout(
+            cp_size=cp_size,
+            ownership_granule=page_size,
+            logical_rows=cp_size * pages_per_rank * page_size,
+            physical_blocks_per_rank=pages_per_rank,
+        ),
+        local_pages_per_layer=local_pages_per_layer,
+    )
+
+
 class TestSharedDSAPageLayout(CustomTestCase):
     def setUp(self):
-        self.layout = SharedDSAPageLayout(cp_size=4, page_size=4, pages_per_rank=3)
+        self.layout = make_shared_dsa_layout(4, 4, 3)
 
     def test_logical_pages_map_to_rank_major_segments(self):
         logical_pages = torch.arange(12, dtype=torch.int64)
@@ -58,17 +75,6 @@ class TestSharedDSAPageLayout(CustomTestCase):
         self.assertTrue(
             torch.equal(self.layout.translate_pages(logical_pages), expected)
         )
-
-    def test_rejects_cross_host_cp_group(self):
-        def gather(hosts, _local_host, group):
-            hosts[:] = ["host-a", "host-b"]
-
-        with (
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.all_gather_object", side_effect=gather),
-            self.assertRaisesRegex(ValueError, "same host"),
-        ):
-            _validate_same_host_group("cp-cpu")
 
     def test_logical_pages_map_to_rank_local_segments(self):
         logical_pages = torch.arange(12, dtype=torch.int64)
@@ -125,7 +131,7 @@ class TestSharedDSAPageLayout(CustomTestCase):
         )
 
     def test_uneven_tail_stays_inside_owner_segment(self):
-        layout = SharedDSAPageLayout(cp_size=4, page_size=64, pages_per_rank=3)
+        layout = make_shared_dsa_layout(4, 64, 3)
         logical_pages = torch.arange(10, dtype=torch.int64)
 
         translated = layout.translate_pages(logical_pages)
@@ -134,8 +140,8 @@ class TestSharedDSAPageLayout(CustomTestCase):
         self.assertTrue(torch.all(translated < layout.cp_size * layout.pages_per_rank))
 
     def test_different_segment_strides_keep_the_same_owner(self):
-        main_layout = SharedDSAPageLayout(4, 64, pages_per_rank=128)
-        index_layout = SharedDSAPageLayout(4, 64, pages_per_rank=256)
+        main_layout = make_shared_dsa_layout(4, 64, 128)
+        index_layout = make_shared_dsa_layout(4, 64, 256)
         slots = torch.arange(0, 16 * 64, 64)
 
         for owner_rank in range(4):
@@ -147,10 +153,10 @@ class TestSharedDSAPageLayout(CustomTestCase):
             )
 
     def test_slab_rank_stride_is_independent_from_layer_capacity(self):
-        layout = SharedDSAPageLayout(
-            cp_size=4,
-            page_size=4,
-            pages_per_rank=12,
+        layout = make_shared_dsa_layout(
+            4,
+            4,
+            12,
             local_pages_per_layer=3,
         )
         logical_pages = torch.arange(12, dtype=torch.int64)
@@ -160,8 +166,119 @@ class TestSharedDSAPageLayout(CustomTestCase):
             [0, 12, 24, 36, 1, 13, 25, 37, 2, 14, 26, 38],
         )
 
+    def test_layout_wraps_model_neutral_owner_sharding(self):
+        owner_layout = OwnerShardedLayout(
+            cp_size=4,
+            ownership_granule=64,
+            logical_rows=12 * 64,
+        )
+
+        layout = SharedDSAPageLayout(owner_layout)
+
+        self.assertIs(layout.owner_layout, owner_layout)
+        self.assertEqual(layout.pages_per_rank, 3)
+
 
 class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
+    def test_main_family_preserves_allocation_contract_and_publisher_order(self):
+        events = []
+        family = SimpleNamespace(
+            slab=SimpleNamespace(global_views=["global"], local_views=["local"]),
+            layout=OwnerShardedLayout(
+                cp_size=4,
+                ownership_granule=64,
+                logical_rows=4 * 6 * 64,
+                physical_blocks_per_rank=6,
+            ),
+        )
+        pool = SimpleNamespace(
+            size=1000,
+            page_size=64,
+            shared_size=4,
+            layer_num=2,
+            kv_cache_dim=656,
+            store_dtype=torch.uint8,
+            shared_rank=0,
+            memory_saver_adapter=SimpleNamespace(
+                region=lambda _memory_type: nullcontext()
+            ),
+            _get_cp_group=lambda: SimpleNamespace(cpu_group="cpu"),
+        )
+
+        def create_family(**_kwargs):
+            events.append("family")
+            return family
+
+        def create_publisher(_group):
+            events.append("publisher")
+            return "publisher"
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.dsa_cache_shared.OwnerShardedFamily.create",
+                side_effect=create_family,
+            ) as create,
+            patch(
+                "sglang.srt.mem_cache.dsa_cache_shared.SharedWritePublisher",
+                side_effect=create_publisher,
+            ),
+        ):
+            SharedDSATokenToKVPool._create_buffers(pool)
+
+        spec = create.call_args.kwargs["spec"]
+        self.assertEqual(events, ["family", "publisher"])
+        self.assertEqual(spec.num_layers, 2)
+        self.assertEqual(spec.logical_rows_per_layer, 4 * 6 * 64)
+        self.assertEqual(spec.ownership_granule, 64)
+        self.assertEqual(spec.storage_rows_per_granule, 64)
+        self.assertEqual(spec.row_shape, (1, 656))
+        self.assertEqual(spec.dtype, torch.uint8)
+        self.assertFalse(spec.map_rank_local)
+        self.assertFalse(create.call_args.kwargs["zero_initialize"])
+        self.assertEqual(pool.shared_write_publisher, "publisher")
+
+    def test_index_family_preserves_compressed_page_contract(self):
+        family = SimpleNamespace(
+            slab=SimpleNamespace(
+                global_views=["global"],
+                local_views=["local"],
+                rank_local_views=["rank-local"],
+            ),
+            layout=OwnerShardedLayout(
+                cp_size=4,
+                ownership_granule=64,
+                logical_rows=4 * 5 * 64,
+                physical_blocks_per_rank=5,
+            ),
+        )
+        pool = SimpleNamespace(
+            index_buf_size=1000,
+            page_size=64,
+            shared_size=4,
+            layer_num=2,
+            index_k_with_scale_buffer_dtype=torch.uint8,
+            shared_rank=0,
+            custom_mem_pool=None,
+            _index_buffer_shape=lambda pages: (pages, 576),
+            _get_cp_group=lambda: SimpleNamespace(cpu_group="cpu"),
+        )
+
+        with patch(
+            "sglang.srt.mem_cache.dsa_cache_shared.OwnerShardedFamily.create",
+            return_value=family,
+        ) as create:
+            SharedDSATokenToKVPool._create_index_buffers(pool)
+
+        spec = create.call_args.kwargs["spec"]
+        self.assertEqual(spec.num_layers, 2)
+        self.assertEqual(spec.logical_rows_per_layer, 4 * 5 * 64)
+        self.assertEqual(spec.ownership_granule, 64)
+        self.assertEqual(spec.storage_rows_per_granule, 1)
+        self.assertEqual(spec.row_shape, (576,))
+        self.assertEqual(spec.dtype, torch.uint8)
+        self.assertTrue(spec.map_rank_local)
+        self.assertFalse(create.call_args.kwargs["zero_initialize"])
+
     def test_shared_main_k_writer_receives_quantized_fp8_bytes(self):
         pool = SimpleNamespace(
             use_dsa=True,
@@ -210,104 +327,8 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
             write_fn=pool._write_owned_mla_kv_buffer,
         )
 
-    def test_vmm_stage_reports_local_rank_failure_with_cause(self):
-        local_error = RuntimeError("cuMemCreate(POSIX_FD): CUDA_ERROR_OUT_OF_MEMORY")
-
-        with (
-            patch(
-                "sglang.srt.mem_cache.dsa_cache_shared.dist.get_world_size",
-                return_value=2,
-            ),
-            patch(
-                "sglang.srt.mem_cache.dsa_cache_shared.dist.all_gather_object",
-                side_effect=lambda output, value, group: output.__setitem__(0, value),
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "DSA shared VMM allocation failed on rank 0.*OUT_OF_MEMORY",
-            ) as raised,
-        ):
-            _synchronize_vmm_stage("group", 0, "allocation", local_error)
-
-        self.assertIs(raised.exception.__cause__, local_error)
-
-    def test_vmm_stage_reports_remote_rank_failure(self):
-        gathered_errors = [None, "cuMemMap(rank=0): CUDA_ERROR_INVALID_VALUE"]
-
-        with (
-            patch(
-                "sglang.srt.mem_cache.dsa_cache_shared.dist.get_world_size",
-                return_value=2,
-            ),
-            patch(
-                "sglang.srt.mem_cache.dsa_cache_shared.dist.all_gather_object",
-                side_effect=lambda output, _value, group: output.__setitem__(
-                    slice(None), gathered_errors
-                ),
-            ),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "DSA shared VMM mapping failed on rank 1.*cuMemMap",
-            ),
-        ):
-            _synchronize_vmm_stage("group", 0, "mapping", None)
-
-    def test_partial_vmm_cleanup_uses_recorded_addresses(self):
-        drv = MagicMock()
-        mapped_addresses = [0x3000, 0x1000]
-
-        _release_partial_vmm_mapping(
-            drv,
-            base_va=0x1000,
-            total_bytes=0x4000,
-            mapped_addresses=mapped_addresses,
-            segment_bytes=0x1000,
-        )
-
-        self.assertEqual(
-            drv.cuMemUnmap.call_args_list,
-            [call(0x1000, 0x1000), call(0x3000, 0x1000)],
-        )
-        drv.cuMemAddressFree.assert_called_once_with(0x1000, 0x4000)
-
-    def test_posix_transport_is_reused_after_fabric_fallback(self):
-        import sglang.srt.mem_cache.dsa_cache_shared as shared
-
-        shared._shared_vmm_use_fabric = None
-        with patch.object(
-            shared,
-            "export_shareable_handles",
-            return_value=([], [7], False),
-        ) as export:
-            _export_dsa_shareable_handles([1], "group", 0)
-            _export_dsa_shareable_handles([2], "group", 0)
-
-        self.assertEqual(
-            export.call_args_list,
-            [
-                call([1], "group", 0, try_fabric=True, log_fallback=True),
-                call([2], "group", 0, try_fabric=False, log_fallback=False),
-            ],
-        )
-
-    def test_shared_allocation_supports_fabric_and_posix_export(self):
-        import sglang.srt.mem_cache.dsa_cache_shared as shared
-
-        handle_types = SimpleNamespace(
-            CU_MEM_HANDLE_TYPE_FABRIC=0x8,
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR=0x1,
-        )
-        drv = SimpleNamespace(CUmemAllocationHandleType=handle_types)
-
-        with patch.object(shared, "_shared_vmm_use_fabric", None):
-            self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x9)
-        with patch.object(shared, "_shared_vmm_use_fabric", False):
-            self.assertEqual(shared._shareable_allocation_handle_types(drv), 0x1)
-
     def test_index_pages_use_index_segment_stride(self):
-        pool = SimpleNamespace(
-            index_layout=SharedDSAPageLayout(4, 64, pages_per_rank=256)
-        )
+        pool = SimpleNamespace(index_layout=make_shared_dsa_layout(4, 64, 256))
         pages = torch.tensor([0, 1, 4, 5, -1], dtype=torch.int32)
 
         translated = SharedDSATokenToKVPool.translate_index_pages(pool, pages)
@@ -315,29 +336,20 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
         self.assertEqual(translated.tolist(), [0, 256, 1, 257, -1])
 
     def test_index_slots_use_index_segment_stride(self):
-        pool = SimpleNamespace(
-            index_layout=SharedDSAPageLayout(4, 64, pages_per_rank=256)
-        )
+        pool = SimpleNamespace(index_layout=make_shared_dsa_layout(4, 64, 256))
         slots = torch.tensor([0, 64, 256, 320, -1], dtype=torch.int64)
 
         translated = SharedDSATokenToKVPool.translate_index_slots(pool, slots)
 
         self.assertEqual(translated.tolist(), [0, 16384, 64, 16448, -1])
 
-    def test_write_fence_is_collective_and_mandatory(self):
-        calls = []
-        fence = torch.zeros(1, dtype=torch.int32)
-        pool = SimpleNamespace(
-            shared_write_fence=fence,
-            shared_cp_group=SimpleNamespace(
-                _all_reduce_in_place=lambda tensor: calls.append(tensor.clone())
-            ),
-        )
+    def test_write_fence_uses_model_neutral_publisher(self):
+        publisher = MagicMock(spec=SharedWritePublisher)
+        pool = SimpleNamespace(shared_write_publisher=publisher)
 
         SharedDSATokenToKVPool.synchronize_shared_writes(pool)
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].item(), 1)
+        publisher.publish.assert_called_once_with()
 
     def test_indexer_runs_one_shared_write_fence_before_read(self):
         calls = []
@@ -354,7 +366,7 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
             shared_rank=2,
             layer_transfer_counter=None,
             start_layer=0,
-            index_layout=SharedDSAPageLayout(4, 64, pages_per_rank=3),
+            index_layout=make_shared_dsa_layout(4, 64, 3),
             rank_local_index_k_with_scale_buffer=[expected],
             synchronize_shared_writes=lambda: calls.append("fence"),
         )
@@ -415,7 +427,7 @@ class TestSharedDSATokenToKVPoolHelpers(CustomTestCase):
 
     def test_attention_translates_main_slots_to_canonical_layout(self):
         pool = SimpleNamespace(
-            main_layout=SharedDSAPageLayout(4, 64, pages_per_rank=3),
+            main_layout=make_shared_dsa_layout(4, 64, 3),
         )
         slots = torch.tensor([0, 64, 128, 192, 256, -1], dtype=torch.int64)
 
