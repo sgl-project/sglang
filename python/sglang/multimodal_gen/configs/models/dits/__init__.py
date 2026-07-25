@@ -8,11 +8,11 @@ from sglang.multimodal_gen.configs.models.dits.ideogram import (
     Ideogram4DistilledDiTConfig,
     Ideogram4DiTConfig,
 )
-from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
-    LingBotWorldVideoConfig,
-)
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
+)
+from sglang.multimodal_gen.configs.models.dits.lingbot_world import (
+    LingBotWorldVideoConfig,
 )
 from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig

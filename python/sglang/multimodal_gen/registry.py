@@ -1035,7 +1035,7 @@ def _register_configs():
         ],
         model_detectors=[
             # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
-            lambda hf_id: "sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower(),
+            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
         ],
     )
 
@@ -1117,10 +1117,8 @@ def _register_configs():
             "jdopensource/JoyAI-Echo",
         ],
         model_detectors=[
-            lambda hf_id: (
-                ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
-                and "image-edit" not in hf_id.lower()
-            ),
+            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+            and "image-edit" not in hf_id.lower(),
         ],
     )
 
@@ -1155,9 +1153,6 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LingBotVideoMoESamplingParams,
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
-        hf_model_paths=[
-            "robbyant/lingbot-video-moe-30b-a3b"
-        ],
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
         ],
