@@ -34,16 +34,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
-# committed to, so REPO and REVISION must be bumped together. New GT now
-# publishes to sgl-project/ci-data-diffusion; the pins below still resolve
-# against sgl-project/ci-data (readable but frozen). When you bump REVISION to a
-# freshly generated commit, switch REPO to sgl-project/ci-data-diffusion too
-# (and update the URL assertion in the consistency-metrics unit test).
+# This PyTorch 2.13 upgrade branch intentionally uses GT regenerated for its
+# dependency stack. These commits predate the migration to
+# sgl-project/ci-data-diffusion, so keep the repository and revisions together
+# when merging from main. New GT is published to ci-data-diffusion; when these
+# revisions are next regenerated, switch SGL_TEST_FILES_CI_DATA_REPO to
+# "sgl-project/ci-data-diffusion" and update the revisions in the same change.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data"
-
 SGL_TEST_FILES_CI_DATA_REVISION = "24e7ed4125e0a2ecb21b84e3d3756647afe31610"
 
+# The NPU pin is regenerated independently on its own cadence.
 if current_platform.is_npu():
     SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
 
