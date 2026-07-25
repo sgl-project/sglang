@@ -416,9 +416,25 @@ class DFlashDraftConfig:
     def resolve_target_layer_ids(
         self,
         *,
-        target_num_layers: int,
+        target_num_layers: Optional[int],
         draft_num_layers: Optional[int] = None,
     ) -> List[int]:
+        if target_num_layers is None:
+            if self.target_layer_ids is not None:
+                if not self.target_layer_ids:
+                    raise ValueError(
+                        "DFLASH dflash_config.target_layer_ids must be non-empty."
+                    )
+                # Explicit IDs define the minimum compatible target depth. The
+                # target worker validates them again against the runtime model.
+                target_num_layers = max(max(self.target_layer_ids) + 1, 1)
+            elif draft_num_layers is not None:
+                target_num_layers = int(draft_num_layers)
+            else:
+                raise ValueError(
+                    "target_num_layers is required when target_layer_ids and "
+                    "draft_num_layers are both unavailable."
+                )
         target_num_layers = int(target_num_layers)
         if target_num_layers <= 0:
             raise ValueError(

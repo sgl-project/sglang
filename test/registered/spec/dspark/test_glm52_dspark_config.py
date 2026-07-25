@@ -69,6 +69,19 @@ class TestGLM52RedHatDSparkConfig(CustomTestCase):
         self.assertEqual(parsed.target_layer_ids, [8, 23, 39, 55, 70])
         self.assertIsNone(parsed.num_target_layers)
 
+    def test_explicit_aux_layers_resolve_without_trained_target_depth(self):
+        parsed = parse_dflash_draft_config(
+            draft_hf_config=_glm52_redhat_dspark_config()
+        )
+
+        self.assertEqual(
+            parsed.resolve_target_layer_ids(
+                target_num_layers=None,
+                draft_num_layers=parsed.require_num_layers(),
+            ),
+            [8, 23, 39, 55, 70],
+        )
+
     def test_dspark_parser_prefers_speculators_tokens_for_gamma(self):
         parsed = parse_dspark_draft_config(
             draft_hf_config=_glm52_redhat_dspark_config()
@@ -162,8 +175,8 @@ class TestGLM52RedHatDSparkConfig(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must be a non-empty list"):
             parse_dspark_draft_config(draft_hf_config=raw_config)
 
-    def test_generic_dspark_draft_model_is_not_registered_yet(self):
-        self.assertNotIn("DSparkDraftModel", {cls.__name__ for cls in EntryClass})
+    def test_generic_dspark_draft_model_is_registered(self):
+        self.assertIn("DSparkDraftModel", {cls.__name__ for cls in EntryClass})
 
     def test_hf_loader_falls_back_for_missing_top_level_model_type(self):
         raw_config = _glm52_redhat_dspark_config_dict()
