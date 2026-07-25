@@ -1646,8 +1646,10 @@ class KVCacheConfigurator:
                 heuristic_limit(token_capacity, self.model_config.context_len)
             )
 
-        if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
+        ratio = (
+            self._calculate_mamba_ratio() if self.mambaish_config is not None else None
+        )
+        if ratio is not None:
             limits.append(
                 state_pool_limit(
                     self.server_args.max_mamba_cache_size,
@@ -1660,7 +1662,7 @@ class KVCacheConfigurator:
         binding = resolve_concurrency_limit(limits)
         max_num_reqs = binding.value
 
-        if self.mambaish_config is not None and max_num_reqs <= 0:
+        if ratio is not None and max_num_reqs <= 0:
             raise RuntimeError(
                 f"Hybrid (mamba/linear-attention) state cache is too small to serve "
                 f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "

@@ -26,7 +26,7 @@ class ConcurrencyLimit:
 
     source: str
     value: int
-    # How the value was derived, e.g. "max_mamba_cache_size=131 / 5 per request".
+    # How the value was derived, e.g. "max_mamba_cache_size=131 per shard / 5 ...".
     detail: str
     # Flags that raise this bound; None for the user's own request.
     remedy: Optional[str] = None
@@ -73,20 +73,27 @@ def state_pool_limit(
 
     `per_shard_pool_size` is the resolved per-DP-shard slot count, so the remedy
     scales back up: --max-mamba-cache-size is a global value that the server
-    divides by `attn_dp_size`. `target` is the concurrency the remedy sizes for,
-    defaulting to one more request than currently fits.
+    divides by `attn_dp_size`. `target` is the concurrency to size for; without
+    one the remedy names the flags but no number, since the only sizes we could
+    invent are either one request more than today or far past what fits.
     """
-    value = per_shard_pool_size // slots_per_request
     if target is None:
-        target = value + 1
+        sizing = (
+            "set --max-running-requests to the concurrency you want (the log then "
+            "reports the exact size), or try a larger --mamba-full-memory-ratio"
+        )
+    else:
+        sizing = (
+            f"try one of: --max-mamba-cache-size "
+            f"{target * slots_per_request * attn_dp_size}, a larger "
+            f"--mamba-full-memory-ratio"
+        )
     return ConcurrencyLimit(
         source="mamba_state_pool",
-        value=value,
+        value=per_shard_pool_size // slots_per_request,
         detail=f"max_mamba_cache_size={per_shard_pool_size} per shard / "
         f"{slots_per_request} slots per request",
-        remedy=f"try one of: --max-mamba-cache-size "
-        f"{target * slots_per_request * attn_dp_size}, a larger "
-        f"--mamba-full-memory-ratio, or --mamba-ssm-dtype bfloat16",
+        remedy=f"{sizing}, or --mamba-ssm-dtype bfloat16",
     )
 
 

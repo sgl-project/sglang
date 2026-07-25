@@ -103,9 +103,11 @@ class TestLimitConstructors(CustomTestCase):
         self.assertIn("--max-mamba-cache-size 1480", limit.remedy)
         self.assertIn("per shard", limit.detail)
 
-    def test_state_pool_remedy_defaults_to_one_more_request(self):
+    def test_state_pool_without_a_target_suggests_no_size(self):
+        # Any size we could invent is either +1 request or far past what fits.
         limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=1)
-        self.assertIn("--max-mamba-cache-size 135", limit.remedy)
+        self.assertNotIn("--max-mamba-cache-size", limit.remedy)
+        self.assertIn("--max-running-requests", limit.remedy)
 
     def test_state_pool_target_zero_is_not_treated_as_unset(self):
         limit = state_pool_limit(131, slots_per_request=5, attn_dp_size=1, target=0)
