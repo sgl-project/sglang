@@ -15,17 +15,15 @@ use crate::message::{EgressItem, EgressSink, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
-/// receiver. Rid policy by kind: generate health probes get the Python server's
-/// `HEALTH_CHECK_<uuid>` form (so scheduler logs and prefix-gated handling
-/// recognize them), a client-supplied generate rid (already fanned out per item
-/// by `split`) wins over minting, and control requests always get a rust-minted
-/// rid (their responses are routed by it, so no client-supplied form exists).
+/// receiver. Rid policy: a caller-supplied generate rid wins over minting (a
+/// client's, fanned out per item by `split`, or the `HEALTH_CHECK_<uuid>` form
+/// the health probe sets); control requests always get a rust-minted rid
+/// (their responses are routed by it, so no caller-supplied form exists).
 pub(super) async fn submit(
     state: &AppState,
     kind: RequestKind,
 ) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), Response> {
     let rid = match &kind {
-        RequestKind::Generate(g) if g.is_health_check => crate::ids::new_health_check_rid(),
         RequestKind::Generate(g) => g.rid.clone().unwrap_or_else(crate::ids::new_rid),
         RequestKind::Control(_) => crate::ids::new_rid(),
     };

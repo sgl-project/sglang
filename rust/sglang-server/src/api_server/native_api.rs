@@ -84,11 +84,11 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
         (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
     ]);
     let probe = GenerateRequest {
+        // The `HEALTH_CHECK_<uuid>` rid form
+        rid: Some(crate::ids::new_health_check_rid()),
         input_ids: Some(vec![0]),
         sampling_params: Some(sampling_params),
         stream: false,
-        // The scheduler skips this when busy so it never occupies a queue slot.
-        is_health_check: true,
         ..Default::default()
     };
     let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(probe)).await {
