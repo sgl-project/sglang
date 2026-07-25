@@ -30,7 +30,9 @@ class AscendLoRABackend(BaseLoRABackend):
 
         total_seq_len = input_ids.shape[0]
         if weights.numel() == 0:
-            return torch.zeros(total_seq_len, 0, device=input_ids.device, dtype=weights.dtype)
+            return torch.zeros(
+                total_seq_len, 0, device=input_ids.device, dtype=weights.dtype
+            )
 
         num_loras, max_rank, vocab_size_w = weights.shape
         clamped_ids = input_ids.clamp(0, vocab_size_w - 1).to(torch.int64)
