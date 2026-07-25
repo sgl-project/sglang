@@ -95,7 +95,7 @@ class PrefillDelayer:
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
-        # waiting_queue_len, queue_delay_timeout_expired.
+        # waiting_queue_len, queue_timeout_expired.
         self._global_info_buffer = torch.empty(
             (dp_size_dim, attn_tp_size, 6),
             dtype=torch.int64,
@@ -150,8 +150,6 @@ class PrefillDelayer:
             and (token_usage < x)
         )
 
-        # Gathering the timeout keeps rank-skewed clocks from splitting the
-        # batch decision at the max_delay_ms boundary.
         local_queue_timeout_expired = (
             self._queue_trigger_enabled
             and prev_state is not None
