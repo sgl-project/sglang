@@ -129,15 +129,26 @@ class TestK3ArFusionGate(CustomTestCase):
         SGLANG_K3_AR_FUSION=1 still force-attempts). DCP without symm-mem is
         inside the validated envelope and is NOT gated off (DCP8 GB300:
         GSM8K in-band, bs=1 +19%)."""
-        for symm, dcp in ((True, 1), (True, 8)):
+        for symm, dcp, a2a in (
+            (True, 1, "none"),
+            (True, 8, "none"),
+            # Bug regression (EP): under EP a2a (megamoe/deepep) the model's
+            # symm-pool allocation contract does not hold on every AR
+            # call-site -> the same _find_mc_ptr assertion killed an EP8
+            # megamoe launch at warmup on head 480fe4e76.
+            (False, 1, "megamoe"),
+            (False, 1, "deepep"),
+        ):
             mod = self._reset()
             with _cleared(envs.SGLANG_K3_AR_FUSION), patch(
                 "sglang.srt.utils.common.get_device_sm", return_value=103
             ), patch(
                 "sglang.srt.runtime_context.get_server_args",
-                return_value=SimpleNamespace(enable_symm_mem=symm, dcp_size=dcp),
+                return_value=SimpleNamespace(
+                    enable_symm_mem=symm, dcp_size=dcp, moe_a2a_backend=a2a
+                ),
             ):
-                self.assertFalse(mod.enabled(), f"symm={symm} dcp={dcp}")
+                self.assertFalse(mod.enabled(), f"symm={symm} dcp={dcp} a2a={a2a}")
 
 
 if __name__ == "__main__":
