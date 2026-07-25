@@ -1,8 +1,11 @@
-"""CUDA unit tests for the resumable insert walk, CI-active while the gated
-unified radix cache unittest module is deferred on trunk."""
+"""CUDA unit tests for the resumable insert walk and the returned-values drain
+contract, CI-active while the gated unified radix cache unittest module is
+deferred on trunk."""
 
+import sys
 import unittest
 from array import array
+from collections import defaultdict
 from unittest import mock
 
 import torch
@@ -14,12 +17,21 @@ from test_unified_radix_cache_unittest import (
 )
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    DecSwaLockOnlyResult,
+    DemoteResult,
+    DriveHostEvictionResult,
+    DropSubtreeNoHostResult,
+    EvictDeviceLeafResult,
+    EvictDeviceNextNodeResult,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -311,6 +323,26 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertIsNotNone(window_node.component_data[ComponentType.FULL].value)
         cache.sanity_check()
 
+    def test_dec_swa_lock_only_early_release_keeps_full_lock(self):
+        """The scheduler's early SWA release (decode past the window) drops
+        only the SWA lock; the Full path lock stays held until dec_lock_ref."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, self.cfg.sliding_window_size + 4)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = cache.resolve_node_handle(m.last_device_node)
+        swa_cd = node.component_data[ComponentType.SWA]
+        full_cd = node.component_data[ComponentType.FULL]
+
+        lock_result = cache.inc_lock_ref(node.id)
+        self.assertGreaterEqual(swa_cd.lock_ref, 1)
+        cache.dec_swa_lock_only(node.id, lock_result.swa_uuid_for_lock)
+        self.assertEqual(swa_cd.lock_ref, 0)
+        self.assertGreaterEqual(full_cd.lock_ref, 1)
+
+        cache.dec_lock_ref(node.id, DecLockRefParams(swa_uuid_for_lock=None))
+        cache.sanity_check()
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestResumableInsertWalkWriteBack(_InsertWalkSuite):
@@ -452,6 +484,183 @@ class TestResumableInsertWalkWriteBack(_InsertWalkSuite):
             result = cache.evict(EvictParams(num_tokens=len(p1) + len(p2)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(p1) + len(p2))
         self.assertTrue(leaf2.evicted and leaf2.backuped)
+        cache.sanity_check()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestReturnedValuesDrain(_InsertWalkSuite):
+    """Drain contract of the returned-values eviction API: every tree-core step
+    result is drained exactly once, in per-component insertion order."""
+
+    cfg = CacheConfig()
+
+    def test_each_eviction_step_result_is_drained(self):
+        """Every step wrapper hands its result's frees to _free_values and
+        passes the payload through; a wrapper that forgets strands pool slots."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        node = next(iter(cache.root_node.children.values()))
+        tracker = {ct: 0 for ct in cache.tree_components}
+        sentinel = torch.tensor([7], dtype=torch.int64)
+
+        def make(result_cls, **fields):
+            result = result_cls(**fields)
+            result.device_frees[ComponentType.FULL].append(sentinel)
+            result.host_frees[ComponentType.FULL].append(sentinel)
+            return result
+
+        cases = [
+            (
+                "evict_device_next_node",
+                lambda: make(EvictDeviceNextNodeResult, node_id=node.id),
+                lambda: cache._evict_device_next_node(ComponentType.FULL, tracker),
+                node.id,
+            ),
+            (
+                "evict_device_leaf",
+                lambda: make(EvictDeviceLeafResult),
+                lambda: cache._evict_device_leaf(node.id, tracker),
+                None,
+            ),
+            (
+                "demote",
+                lambda: make(DemoteResult),
+                lambda: cache._demote(node.id, tracker),
+                None,
+            ),
+            (
+                "drop_subtree_no_host",
+                lambda: make(DropSubtreeNoHostResult, is_dropped=True),
+                lambda: cache._drop_subtree_no_host(node.id, tracker),
+                True,
+            ),
+            (
+                "drive_host_eviction",
+                lambda: make(DriveHostEvictionResult),
+                lambda: cache.evict_host(4),
+                0,
+            ),
+            (
+                "dec_swa_lock_only",
+                lambda: make(DecSwaLockOnlyResult),
+                lambda: cache.dec_swa_lock_only(node.id),
+                None,
+            ),
+        ]
+        for name, make_result, call, expected in cases:
+            with self.subTest(step=name):
+                drained = []
+
+                def record(device_frees, host_frees):
+                    drained.append((dict(device_frees), dict(host_frees)))
+                    device_frees.clear()
+                    host_frees.clear()
+
+                with mock.patch.object(
+                    cache.tree_core, name, return_value=make_result()
+                ), mock.patch.object(cache, "_free_values", side_effect=record):
+                    returned = call()
+                self.assertEqual(returned, expected)
+                ((device_frees, host_frees),) = drained
+                self.assertIs(device_frees[ComponentType.FULL][0], sentinel)
+                self.assertIs(host_frees[ComponentType.FULL][0], sentinel)
+
+    def test_free_values_frees_in_component_insertion_order(self):
+        """Device frees apply before host frees, each in per-component
+        insertion order — the allocator free-list order the pre-split inline
+        frees produced."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        order = [ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA]
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        for ct in order:
+            device_frees[ct].append(torch.tensor([1]))
+            host_frees[ct].append(torch.tensor([2]))
+
+        freed = []
+        fake_components = {
+            ct: mock.MagicMock(
+                free_host_values=mock.MagicMock(
+                    side_effect=lambda values, ct=ct: freed.append(("host", ct))
+                )
+            )
+            for ct in order
+        }
+        with mock.patch.object(
+            cache,
+            "_apply_cache_action",
+            side_effect=lambda action: freed.append(("device", action.component_type)),
+        ), mock.patch.dict(cache.components, fake_components):
+            cache._free_values(device_frees, host_frees)
+
+        self.assertEqual(
+            freed, [("device", ct) for ct in order] + [("host", ct) for ct in order]
+        )
+        self.assertFalse(device_frees)
+        self.assertFalse(host_frees)
+
+    def test_free_values_mid_drain_failure_cannot_replay_freed_entries(self):
+        """A device free that raises must leave only un-attempted entries in
+        the dict (no replay of successes) while host frees still drain."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        order = [ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA]
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
+        for ct in order:
+            device_frees[ct].append(torch.tensor([1]))
+        host_frees[ComponentType.FULL].append(torch.tensor([2]))
+
+        def boom_on_swa(action):
+            if action.component_type is ComponentType.SWA:
+                raise RuntimeError("boom")
+
+        host_mock = mock.MagicMock()
+        with mock.patch.object(
+            cache, "_apply_cache_action", side_effect=boom_on_swa
+        ), mock.patch.dict(cache.components, {ComponentType.FULL: host_mock}):
+            with self.assertRaises(RuntimeError):
+                cache._free_values(device_frees, host_frees)
+
+        self.assertEqual(list(device_frees), [ComponentType.MAMBA])
+        self.assertFalse(host_frees)
+        host_mock.free_host_values.assert_called_once()
+
+    def test_undrained_result_trips_the_del_assert(self):
+        """Dropping a result without draining fires the __del__ tripwire (the
+        only forgotten-drain detection); a drained result stays silent."""
+        seen = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = lambda unraisable: seen.append(unraisable.exc_value)
+        try:
+            undrained = DemoteResult()
+            undrained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
+            del undrained
+
+            drained = DemoteResult()
+            drained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
+            drained.device_frees.clear()
+            del drained
+        finally:
+            sys.unraisablehook = old_hook
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], AssertionError)
+
+    def test_evict_host_drains_freed_host_values_to_the_pool(self):
+        """Host eviction's returned frees must reach the host pool in the same
+        call; a dropped drain leaves the pool permanently smaller."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        leaf = next(iter(cache.root_node.children.values()))
+        self.assertGreater(_write_backup(cache, leaf, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertTrue(leaf.evicted)
+
+        host_pool = cache.cache_controller.mem_pool_host
+        available_before = host_pool.available_size()
+        evicted = cache.evict_host(4)
+        self.assertGreater(evicted, 0)
+        self.assertGreater(host_pool.available_size(), available_before)
         cache.sanity_check()
 
 
