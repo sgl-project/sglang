@@ -36,7 +36,7 @@ token_equiv  =  state_bytes_per_slot / kv_bytes_per_token
      - `KV Cache is allocated. #tokens: M, KV size: Y GB` → `kv_bytes_per_token = Y / M`
    - **(b) derived** — model arch (linear-layer count + state dims `d_state/d_conv/heads/head_dim`; attention type + KV dims: MLA latent dim, or GQA `kv_heads·head_dim·layers`) **× the dtypes** below.
 3. **`S`** — from `--mamba-radix-cache-strategy` / scheduler (table below).
-4. **`D`** — `--speculative-num-draft-tokens` (0 if NOSPEC).
+4. **`D`** — `--speculative-num-draft-tokens` (0 if NOSPEC; **also 0 under `--enable-linear-replayssm-spec`** — see caveats).
 5. **`dcp_size`** — `--dcp-size` (1 if no DCP). If DCP **and** spec with a replicated draft KV, apply the draft caveat (below).
 6. **KV dtype** (bf16 / fp8) and **ssm dtype** (fp32 / bf16) — they set the two byte constants (see the `token_equiv` 2×2).
 7. *(only to also predict the clamp, not just `r`)* **`rest`** = per-GPU memory − weights at the chosen `--mem-fraction-static`. Read `avail mem` after `Load weight end`, or `Memory pool end. avail mem` + pool sizes, from the boot log.
@@ -106,6 +106,7 @@ Reference `r` for **this example model** (`token_equiv ≈ 4070`, i.e. fp32 ssm 
 ## Caveats
 
 - **DCP + spec**: a replicated (non-DCP-sharded) draft KV does **not** shard by `dcp_size`; at long `L` it dominates per-token cost, so the clean `×dcp_size` overstates DCP's advantage — fall back to a per-token direct-solve (KV term `/dcp` + an un-sharded draft-KV term) when spec is on. (NOSPEC → clean `×dcp_size` holds.)
+- **Spec + ReplaySSM → use `D=0`, not the draft-token count.** With `--enable-linear-replayssm-spec`, the `D` intermediate SSM states move off the per-request slot budget onto a **fixed ring** (a one-time deduction from `rest`, not a per-req term). So the mamba-slot cost per running request drops back to `S` (clamp = `mmcs / S`, not `/(S+D)`), and the balance ratio returns to the NOSPEC value (`r* ≈ S·token_equiv·dcp/L`). Measured example (TP8, D=8, L≈9K): applying `D=8` computes `r*≈2.6` but the true optimum is `r≈1.0` — `D=8` lands KV-bound at ~45% below the achievable peak concurrency. Plain spec (no replayssm) keeps `D` = the draft-token count.
 - **Under DCP the balance point sits beyond any realistic `L`** (the state pool binds first for almost everything), so the practical recommendation is to **pin `--max-mamba-cache-size = target_concurrency · S` directly** rather than dial a large `r`.
 - **`--max-mamba-cache-size` overrides `r`**; bytes beyond the `r` budget come out of the KV pool one-for-one.
 - **Precision changes are behind accuracy gates**: `--kv-cache-dtype fp8_e4m3` (doubles `token_equiv` → doubles `r`) and `--mamba-ssm-dtype bfloat16` (~halves `token_equiv`; also silently switches the linear-attention decode backend on SM100+ — pin `--linear-attn-decode-backend triton`) shift outputs; validate accuracy for the workload before production.
