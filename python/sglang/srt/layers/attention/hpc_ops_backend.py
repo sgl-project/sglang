@@ -11,7 +11,7 @@ token-major KV pool as a paged NHD cache ``(num_pages, page_size, num_kv_heads,
 head_dim)`` without any copy, so the only hard requirements are the kernel
 constraints:
 
-- NVIDIA Hopper or newer (sm90+)
+- NVIDIA Hopper (SM90 only; the kernels ship sm90a)
 - ``--page-size 64``
 - bf16 model dtype; bf16 or fp8_e4m3 KV cache (the FP8 path additionally
   requires the model to run the fused QKNorm+RoPE+quant+StoreKV op via
@@ -21,8 +21,8 @@ constraints:
   no logit cap, decoder-only attention
 
 Note that the HPC-Ops kernels are currently tuned primarily for H20: on other
-GPUs (H100/H200/B200, ...) the speedup over the default attention backend may
-be limited or absent.
+SM90 GPUs (H100/H200) the speedup over the default attention backend may be
+limited or absent.
 
 Enable it explicitly with ``--attention-backend hpc_ops``.
 """
@@ -130,6 +130,13 @@ class HPCOpsAttnBackend(AttentionBackend):
             raise ImportError(
                 "The hpc_ops attention backend requires the `hpc` package. "
                 "Install it from https://github.com/Tencent/hpc-ops"
+            )
+
+        major, minor = torch.cuda.get_device_capability()
+        if major != 9:
+            raise ValueError(
+                "The hpc_ops attention backend requires an SM90 (Hopper) GPU "
+                f"(the HPC-Ops kernels ship sm90a only), got sm{major}{minor}."
             )
 
         if model_runner.spec_algorithm.is_speculative():
