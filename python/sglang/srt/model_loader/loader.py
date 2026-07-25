@@ -2082,13 +2082,32 @@ class PreshardedModelLoader(DefaultModelLoader):
                 attn.bias = conv1d.bias
 
     def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
-        """Fail fast before an expensive source load if the dump root is RO."""
+        """Fail fast before an expensive source load if the dump root is RO.
+
+        Only rank 0 probes (unique file) so concurrent multi-rank open/unlink
+        cannot race; all ranks still makedirs then barrier so the leaf exists
+        for every process before the source load.
+        """
+        rank, _ = self._world_rank_and_size()
         try:
             os.makedirs(presharded_dir, exist_ok=True)
-            probe = os.path.join(presharded_dir, ".presharded_write_probe")
-            with open(probe, "w") as f:
-                f.write("ok")
-            os.unlink(probe)
+            if rank == 0:
+                probe = os.path.join(presharded_dir, ".presharded_write_probe")
+                # Retry: shared FS can lag briefly after makedirs.
+                last_err: Optional[OSError] = None
+                for _ in range(5):
+                    try:
+                        with open(probe, "w") as f:
+                            f.write("ok")
+                        os.unlink(probe)
+                        last_err = None
+                        break
+                    except OSError as e:
+                        last_err = e
+                        os.makedirs(presharded_dir, exist_ok=True)
+                        time.sleep(0.05)
+                if last_err is not None:
+                    raise last_err
         except OSError as e:
             raise RuntimeError(
                 f"Presharded dump directory is not writable: {presharded_dir}. "
@@ -2097,6 +2116,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                 "the draft model) to a writable shared filesystem path. "
                 f"Original error: {e}"
             ) from e
+        self._world_barrier()
 
     def _first_time_load_and_dump(
         self,

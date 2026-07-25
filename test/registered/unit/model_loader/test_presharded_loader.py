@@ -536,11 +536,26 @@ class TestBuildDumpPlan(unittest.TestCase):
         # read-only dump root (HF cache mounts). Mock OSError because root
         # can often still write to mode-0555 dirs under CAP_DAC_OVERRIDE.
         loader = object.__new__(PreshardedModelLoader)
-        with mock.patch("os.makedirs", side_effect=OSError("Read-only file system")):
+        with mock.patch.object(
+            loader, "_world_rank_and_size", return_value=(0, 1)
+        ), mock.patch.object(loader, "_world_barrier"), mock.patch(
+            "os.makedirs", side_effect=OSError("Read-only file system")
+        ):
             with self.assertRaises(RuntimeError) as ctx:
                 loader._ensure_presharded_dir_writable("/ro/presharded")
             self.assertIn("not writable", str(ctx.exception).lower())
             self.assertIn("presharded_path", str(ctx.exception))
+
+    def test_ensure_presharded_dir_writable_ok_rank0(self):
+        loader = object.__new__(PreshardedModelLoader)
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf = os.path.join(tmp, "TP-8-sig-test")
+            with mock.patch.object(
+                loader, "_world_rank_and_size", return_value=(0, 1)
+            ), mock.patch.object(loader, "_world_barrier") as barrier:
+                loader._ensure_presharded_dir_writable(leaf)
+            self.assertTrue(os.path.isdir(leaf))
+            barrier.assert_called_once()
 
 
 class TestStructuralSignature(unittest.TestCase):
