@@ -452,7 +452,6 @@ class MiniMaxM3MoE(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
         )
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
