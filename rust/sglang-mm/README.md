@@ -1,23 +1,53 @@
 # sglang-mm
 
 Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
-resize, patchify, normalize, and content hash — all parallel and GIL-released.
+fetch, resize, patchify, normalize, and content hash — all parallel and
+GIL-released. For the end-to-end server story (request flow, failure
+semantics, adding a model family) see [`rust/NATIVE_MM.md`](../NATIVE_MM.md).
 
-Compiled as `sglang.srt.multimodal._core` via setuptools-rust when installing sglang.
+Built two ways:
+
+- **PyO3 extension** `sglang.srt.multimodal._core` (feature `python`, default)
+  via setuptools-rust when installing sglang — used by Python processors and
+  parity tests.
+- **Pure-Rust `rlib`** (`default-features = false`) linked by `sglang-server`'s
+  native MM worker path — no pyo3 in that dependency graph.
 
 ## Architecture
 
 ```
 src/
-├── lib.rs                    # PyO3 module root (_core)
-├── registry.rs               # ImageProcessorSpec trait + ProcessorRegistry
+├── lib.rs                    # module root; PyO3 module (_core) feature-gated
+├── registry.rs               # ImageProcessorSpec registry (Python-facing)
+│                             # + VisionProcessor trait / pipeline_from_spec
+│                             #   (pure-Rust pipeline driven by sglang-server)
+├── driver.rs                 # model-independent request driver (fetch →
+│                             #   decode → preprocess → expand → M-RoPE)
 ├── common/
 │   ├── mod.rs                # thread pool, image decode, SHA256 hash, base64
-│   ├── resize.rs             # PIL-exact Lanczos resize
+│   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
+│   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
+│   ├── tokens.rs             # placeholder-id expansion + per-item offsets
 │   └── transforms.rs         # reusable primitives: normalize, pad, extract_patches
 └── <model>/
-    └── mod.rs                # model-specific processor
+    └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
+
+## Native server pipeline (`VisionProcessor`)
+
+`sglang-server`'s MM workers process image-only requests for supported model
+families entirely in Rust: `common::fetch` → decode → the family's
+`VisionProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
+placeholder expansion. The Python side selects the family by passing a spec
+JSON (`{"family": "qwen_vl", ...resolved processor params}`) to
+`registry::pipeline_from_spec`. Anything outside a family's scope
+(video/audio, precomputed features, unknown source shapes, placeholder
+mismatches) is rejected back to the client as a 400 — there is no Python
+fallback path.
+
+Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
+Adding one = a `VisionProcessor` impl in `src/<model>/mod.rs` plus a `family`
+arm in `pipeline_from_spec`.
 
 ## Python API
 
@@ -114,7 +144,13 @@ maturin develop --release
 ## Test
 
 ```bash
-python bench/generate_golden.py   # regenerate fixtures
-pytest bench/test_golden.py       # regression tests
+cd rust/sglang-mm
+cargo test --no-default-features  # pure-Rust unit tests (CI: pr-test-rust-exts)
+python tests/generate_golden.py   # regenerate fixtures
+pytest tests/test_golden.py       # regression tests
 python bench/bench_parity.py      # parity + benchmark
 ```
+
+Scheduler-boundary parity tests against the real HF processors live in
+`test/registered/unit/multimodal/rust/`; see `rust/NATIVE_MM.md` for the
+end-to-end picture.

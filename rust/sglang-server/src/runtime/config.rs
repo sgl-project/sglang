@@ -69,9 +69,6 @@ pub struct ServerArgs {
     /// in minimal standalone blobs — then boot requires `skip_tokenizer_init`.
     #[serde(default)]
     pub tokenizer_path: String,
-    /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
-    #[serde(default)]
-    pub revision: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     #[serde(default = "default_host")]
     pub host: String,
@@ -118,6 +115,10 @@ pub struct ModelConfig {
     /// they crash the scheduler's embedding lookup. `None` → unvalidated.
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding
+    /// branch in tm-ingress (`false` → mm fields silently ignored).
+    #[serde(default)]
+    pub is_multimodal: bool,
 }
 
 fn default_host() -> String {
@@ -148,6 +149,14 @@ impl ServerArgs {
             return Err("no resolvable context length (model_config.context_len)".into());
         }
         Ok(())
+    }
+
+    /// Whether the served model is multimodal (`model_config.is_multimodal`
+    /// from the scheduler's dump). Gates the MM Encoding branch: when false,
+    /// mm fields on a request are silently ignored, mirroring the Python
+    /// `TokenizerManager` (`mm_processor is None`).
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
     }
 
     /// Bind address `host:port`. `host` is expected to be an IP — the result is

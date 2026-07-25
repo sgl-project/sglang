@@ -15,9 +15,13 @@ pub use egress::{
     frame_egress_result,
 };
 pub use request::{
-    ControlRequest, GenerateBody, GenerateRequest, RequestKind, abort_req_msgpack,
+    ControlRequest, GenerateBody, GenerateRequest, MmRequest, RequestKind, abort_req_msgpack,
     control_req_msgpack,
 };
+// Only tests build an `MmData` directly; everything else receives it packed
+// inside a `GenerateRequest` by `split`.
+#[cfg(test)]
+pub use request::MmData;
 pub use sampling::normalize_sampling_params;
 
 use bytes::Bytes;
