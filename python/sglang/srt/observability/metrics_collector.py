@@ -1630,7 +1630,8 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
-            labelnames=labels.keys(),
+            # "stream" splits streaming vs non-streaming requests.
+            labelnames=[*labels.keys(), "stream"],
             buckets=bucket_time_to_first_token,
         )
 
@@ -1701,15 +1702,19 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             float(generation_tokens)
         )
 
-    def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
-        self.histogram_time_to_first_token.labels(**labels).observe(value)
+    def observe_time_to_first_token(
+        self, labels: Dict[str, str], value: float, *, stream: bool
+    ):
+        self.histogram_time_to_first_token.labels(
+            **labels, stream="true" if stream else "false"
+        ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         # Injected backends (e.g. Ray) route metrics out of process and can't
         # introspect prometheus_client buckets here.
         if self._histogram_cls is not None:
             return False
-        his = self.histogram_time_to_first_token.labels(**self.labels)
+        his = self.histogram_time_to_first_token.labels(**self.labels, stream="true")
         total_observations = sum(bucket._value for bucket in his._buckets)
         if total_observations < 100:
             return False

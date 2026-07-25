@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import ceil_align
 
 
