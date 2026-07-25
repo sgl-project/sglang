@@ -176,11 +176,18 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             bs, num_tokens, forward_mode, seq_lens, device
         )
         if get_parallel().dcp_enabled:
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.max_context_len
-                    + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
+            metadata = self.forward_decode_metadata
+            if metadata.global_seq_lens_k is None:
+                # Plain decode under DCP also keeps the int32 GLOBAL lens in a
+                # capture-stable buffer (super allocates it only for verify):
+                # the DCP kernel consumes both the rank-local and the global
+                # lens every MLA layer, so both are maintained once per step.
+                metadata.global_seq_lens_k = torch.zeros(
+                    (bs,), dtype=torch.int32, device=device
                 )
+            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                self.max_context_len
+                + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
             )
 
     def _apply_cuda_graph_metadata(
@@ -218,7 +225,13 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
         else:
             seq_lens = seq_lens[:bs]
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Hoist: refresh the int32 global + rank-local lens once per step
+            # into the capture-stable buffers; forward_decode reads them
+            # instead of recomputing get_dcp_lens + two int32 casts per MLA
+            # layer.
+            metadata.global_seq_lens_k.copy_(seq_lens)
+            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
+            local_seq_lens = metadata.seq_lens_k
 
         self._fill_dcp_block_kv_indices(
             metadata.block_kv_indices,
@@ -238,6 +251,19 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             )
         ):
             if forward_batch.forward_mode.is_target_verify():
+                metadata = self.forward_decode_metadata
+                metadata.global_seq_lens_k = metadata.seq_lens_k
+                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
+                    metadata.global_seq_lens_k
+                )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and self.forward_decode_metadata.seq_lens_k is not None
+            ):
+                # Same hoist as verify: the parent stored the int32 GLOBAL
+                # lens in seq_lens_k; keep it as global_seq_lens_k and derive
+                # the rank-local view once per step (forward_decode consumes
+                # both every MLA layer).
                 metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(
@@ -292,9 +318,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
             seq_lens=(
-                seq_lens
-                if seq_lens.dtype == torch.int32
-                else seq_lens.to(torch.int32)
+                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
             ),
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
@@ -400,8 +424,14 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
-        global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
-        local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
+        if metadata.seq_lens_k is not None and metadata.global_seq_lens_k is not None:
+            # Hoisted path: int32 rank-local + global lens maintained once per
+            # step by metadata init / graph replay-prep.
+            local_seq_lens = metadata.seq_lens_k[: forward_batch.batch_size]
+            global_seq_lens = metadata.global_seq_lens_k[: forward_batch.batch_size]
+        else:
+            global_seq_lens = forward_batch.seq_lens[: forward_batch.batch_size]
+            local_seq_lens = self._get_dcp_local_seq_lens(global_seq_lens)
         raw_out, lse = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
