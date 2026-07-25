@@ -885,6 +885,12 @@ class Scheduler(
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
 
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.ep_join_mode == "recover"
+        ):
+            model_runner.post_capture_elastic_ep_recover()
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -2247,7 +2253,9 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req, self.enable_overlap, self.spec_algorithm
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
