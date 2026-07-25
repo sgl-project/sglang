@@ -95,6 +95,8 @@ def _nixl_device_id(mem_kind: str, gpu_id: int) -> int:
 
 
 def _homogeneous_kv_mem_kind(kinds: List[str], context: str) -> str:
+    if not kinds:
+        return "VRAM"
     unique = set(kinds)
     if len(unique) != 1:
         raise NotImplementedError(
@@ -448,9 +450,10 @@ class NixlKVManager(CommonKVManager):
         self._num_slots_src: int = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._num_slots_src = (
-                self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
-            )
+            if self.kv_args.kv_item_lens:
+                self._num_slots_src = (
+                    self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
+                )
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
@@ -948,6 +951,8 @@ class NixlKVManager(CommonKVManager):
                 "NIXL PD transfer: decode registered fewer KV regions "
                 f"({n_dst}) than prefill ({n_src}); unexpected geometry"
             )
+        if n_src == 0:
+            return
         decode_only_spec_dec = n_dst > n_src
         if (
             self.is_mla_backend
@@ -1084,7 +1089,10 @@ class NixlKVManager(CommonKVManager):
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
                     # Aux data is still sent below when is_last_chunk=True.
-                    if len(kv_chunk.prefill_kv_indices) > 0:
+                    if (
+                        len(kv_chunk.prefill_kv_indices) > 0
+                        and self.kv_args.kv_data_ptrs
+                    ):
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
@@ -1203,7 +1211,10 @@ class NixlKVManager(CommonKVManager):
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
                         # A no-KV notification still identifies its PP source.
-                        if len(kv_chunk.prefill_kv_indices) == 0:
+                        if (
+                            len(kv_chunk.prefill_kv_indices) == 0
+                            or not self.kv_args.kv_data_ptrs
+                        ):
                             aux_notif = (
                                 f"{req.room}_aux_nokv_{self.transfer_source_rank}"
                             )
@@ -1292,8 +1303,6 @@ class NixlKVManager(CommonKVManager):
                     f"NIXL memory registration failed for {mem_kind} kv tensors"
                 )
             self.kv_descs.append(kv_descs)
-        if not self.kv_descs:
-            raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = []
         for aux_data_ptr, aux_data_len in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens

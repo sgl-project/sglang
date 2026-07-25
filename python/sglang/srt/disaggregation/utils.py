@@ -862,6 +862,8 @@ def build_state_entry_pairs(
     n_dst: int,
 ) -> List[Tuple[int, int]]:
     """Pair prefill-local transfer entries with decode entries by layer id."""
+    if n_src == 0:
+        return []
     if bool(src_layer_ids) != bool(dst_layer_ids):
         raise RuntimeError(
             "Layer metadata must be provided by both PD peers or neither"
