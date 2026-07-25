@@ -446,6 +446,14 @@ class MiniMaxM3MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+        enable_npu_dual_stream = (
+            _is_npu
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        )
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
@@ -470,7 +478,11 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.bf16_router_gemm and not _is_npu:
+        if self.bf16_router_gemm:
+            if _is_npu:
+                # NPU has no aten::mm.dtype; bf16 mm (fp32 cube accumulation)
+                # then cast back to fp32 keeps the same topk input semantics.
+                return torch.mm(hidden_states, self.gate.weight.t()).float()
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )

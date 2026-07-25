@@ -974,9 +974,6 @@ def flash_prefill_bnsd_indexer(
         req_to_token, req_pool_indices, block_size_q, block_size_k,
         sm_scale, score_type, qblock_mappings,
     )
-    # Fused TopK + local-append (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, no
-    # K-gate). When ON, the TopK + local-append run as one query-block-tiled
-    # triton kernel; when OFF, the legacy torch.topk + tiled append_local runs.
     if (
         per_query_seq_lens is not None
         and q.shape[1] == k_cache_bnsd.shape[2]
@@ -1032,7 +1029,6 @@ def flash_prefill_bnsd_with_topk_idx(
         req_to_token, req_pool_indices, block_size_q, block_size_k,
         sm_scale, score_type, qblock_mappings=qblock_mappings,
     )
-    # Fused TopK (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, no K-gate).
     if (
         per_query_seq_lens is not None
         and q.shape[1] == k_cache_bnsd.shape[2]

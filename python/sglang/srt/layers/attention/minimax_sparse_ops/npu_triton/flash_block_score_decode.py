@@ -674,6 +674,323 @@ def _merge_bnsd_score_topk_candidates_adaptive(
 
 
 # =============================================================================
+# Fused merge + causal-local-block append (decode/verify topk postprocess)
+# =============================================================================
+
+
+@triton.jit
+def _merge_topk_append_local_impl(
+    candidate_scores_ptr,  # [C, QH, B, topk]
+    candidate_indices_ptr,  # [C, QH, B, topk]
+    out_ptr,  # [QH, B, topk + 1]
+    seq_lens_ptr,  # per-query causal KV len (stride_sl_* indexing)
+    pid_b,
+    pid_h,
+    num_blocks,
+    block_size: tl.constexpr,
+    # strides
+    stride_sl_b,
+    stride_sl_h,
+    stride_cs_c,
+    stride_cs_h,
+    stride_cs_b,
+    stride_cs_t,
+    stride_ci_c,
+    stride_ci_h,
+    stride_ci_b,
+    stride_ci_t,
+    stride_out_h,
+    stride_out_b,
+    stride_out_t,
+    # meta
+    NUM_SCORE_CHUNKS: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_SIZE_CANDIDATES: tl.constexpr,
+):
+    """Global-TopK merge + causal-local-block append in ONE program.
+
+    Bit-exact with ``_merge_bnsd_score_topk_candidates_impl`` followed by
+    ``_append_local_block_to_topk_idx_kernel``: the same per-rank argmax over
+    the [C*topk] candidates (tie-break: lowest candidate position wins), each
+    selected index validated (``0 <= idx < num_blocks`` and
+    ``idx*block_size <= query_pos``) and stored at slot ``rank``; the causal
+    local block ``(seq_len-1)//block_size`` goes to slot ``topk`` (-1 when
+    already selected -- dedup). Keeping the selected indices in per-rank
+    scalars (instead of a global [QH,B,topk] round trip) drops one kernel
+    launch per layer.
+    """
+    seq_len = tl.load(
+        seq_lens_ptr + pid_b * stride_sl_b + pid_h * stride_sl_h
+    ).to(tl.int32)
+    query_pos = tl.maximum(seq_len - 1, 0)
+    local_blk = tl.minimum(query_pos // block_size, num_blocks - 1)
+
+    off_candidates = tl.arange(0, BLOCK_SIZE_CANDIDATES)
+    candidate_chunk = off_candidates // topk
+    candidate_rank = off_candidates - candidate_chunk * topk
+    valid_candidate = off_candidates < NUM_SCORE_CHUNKS * topk
+    candidate_scores = tl.load(
+        candidate_scores_ptr
+        + candidate_chunk * stride_cs_c
+        + pid_h * stride_cs_h
+        + pid_b * stride_cs_b
+        + candidate_rank * stride_cs_t,
+        mask=valid_candidate,
+        other=float("-inf"),
+    ).to(tl.float32)
+    candidate_indices = tl.load(
+        candidate_indices_ptr
+        + candidate_chunk * stride_ci_c
+        + pid_h * stride_ci_h
+        + pid_b * stride_ci_b
+        + candidate_rank * stride_ci_t,
+        mask=valid_candidate,
+        other=-1,
+    ).to(tl.int32)
+    candidate_scores = tl.where(
+        candidate_indices >= 0,
+        candidate_scores,
+        float("-inf"),
+    )
+
+    out_base = out_ptr + pid_h * stride_out_h + pid_b * stride_out_b
+    local_hit = 0
+    for rank in tl.static_range(0, topk):
+        best_score = tl.max(candidate_scores, axis=0)
+        best_positions = tl.where(
+            candidate_scores == best_score,
+            off_candidates,
+            tl.full((BLOCK_SIZE_CANDIDATES,), BLOCK_SIZE_CANDIDATES, tl.int32),
+        )
+        best_position = tl.min(best_positions, axis=0)
+        selected_index = tl.max(
+            tl.where(
+                off_candidates == best_position,
+                candidate_indices,
+                tl.full((BLOCK_SIZE_CANDIDATES,), -1, tl.int32),
+            ),
+            axis=0,
+        )
+        valid = (
+            (selected_index >= 0)
+            & (selected_index < num_blocks)
+            & (selected_index * block_size <= query_pos)
+        )
+        tl.store(
+            out_base + rank * stride_out_t,
+            tl.where(valid, selected_index, -1),
+        )
+        local_hit += (valid & (selected_index == local_blk)).to(tl.int32)
+        candidate_scores = tl.where(
+            off_candidates == best_position,
+            float("-inf"),
+            candidate_scores,
+        )
+    tl.store(
+        out_base + topk * stride_out_t,
+        tl.where(local_hit > 0, -1, local_blk),
+    )
+
+
+@triton.jit
+def _merge_topk_append_local_kernel(
+    candidate_scores_ptr,  # [C, QH, B, topk]
+    candidate_indices_ptr,  # [C, QH, B, topk]
+    out_ptr,  # [QH, B, topk + 1]
+    seq_lens_ptr,
+    num_blocks,
+    # strides / meta
+    block_size: tl.constexpr,
+    short_max_blocks: tl.constexpr,
+    stride_sl_b,
+    stride_sl_h,
+    stride_cs_c,
+    stride_cs_h,
+    stride_cs_b,
+    stride_cs_t,
+    stride_ci_c,
+    stride_ci_h,
+    stride_ci_b,
+    stride_ci_t,
+    stride_out_h,
+    stride_out_b,
+    stride_out_t,
+    NUM_SCORE_CHUNKS: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_SIZE_CANDIDATES: tl.constexpr,
+    GUARDED: tl.constexpr,
+    RUN_SHORT: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    if GUARDED:
+        seq_len = tl.load(seq_lens_ptr + pid_b * stride_sl_b + pid_h * stride_sl_h)
+        nb = tl.cdiv(seq_len, block_size)
+        if RUN_SHORT:
+            if nb > short_max_blocks:
+                return
+        else:
+            if nb <= short_max_blocks:
+                return
+    _merge_topk_append_local_impl(
+        candidate_scores_ptr,
+        candidate_indices_ptr,
+        out_ptr,
+        seq_lens_ptr,
+        pid_b,
+        pid_h,
+        num_blocks,
+        block_size,
+        stride_sl_b,
+        stride_sl_h,
+        stride_cs_c,
+        stride_cs_h,
+        stride_cs_b,
+        stride_cs_t,
+        stride_ci_c,
+        stride_ci_h,
+        stride_ci_b,
+        stride_ci_t,
+        stride_out_h,
+        stride_out_b,
+        stride_out_t,
+        NUM_SCORE_CHUNKS=NUM_SCORE_CHUNKS,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=BLOCK_SIZE_CANDIDATES,
+    )
+
+
+def _merge_topk_append_local(
+    candidate_scores: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    topk: int,
+    stride_sl_b: int,
+    stride_sl_h: int,
+    num_blocks: int,
+) -> torch.Tensor:
+    """Fused merge+append (single launch). Returns [QH, B, topk+1] int32."""
+    num_score_chunks, num_q_heads, batch_size, _ = candidate_scores.shape
+    out = torch.empty(
+        (num_q_heads, batch_size, topk + 1),
+        dtype=torch.int32,
+        device=candidate_scores.device,
+    )
+    _merge_topk_append_local_kernel[(batch_size, num_q_heads)](
+        candidate_scores,
+        candidate_indices,
+        out,
+        seq_lens,
+        num_blocks,
+        block_size=block_size,
+        short_max_blocks=0,
+        stride_sl_b=stride_sl_b,
+        stride_sl_h=stride_sl_h,
+        stride_cs_c=candidate_scores.stride(0),
+        stride_cs_h=candidate_scores.stride(1),
+        stride_cs_b=candidate_scores.stride(2),
+        stride_cs_t=candidate_scores.stride(3),
+        stride_ci_c=candidate_indices.stride(0),
+        stride_ci_h=candidate_indices.stride(1),
+        stride_ci_b=candidate_indices.stride(2),
+        stride_ci_t=candidate_indices.stride(3),
+        stride_out_h=out.stride(0),
+        stride_out_b=out.stride(1),
+        stride_out_t=out.stride(2),
+        NUM_SCORE_CHUNKS=num_score_chunks,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=_next_power_of_2(num_score_chunks * topk),
+        GUARDED=False,
+        RUN_SHORT=False,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+def _merge_topk_append_local_adaptive(
+    candidate_scores: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    topk: int,
+    stride_sl_b: int,
+    stride_sl_h: int,
+    num_blocks: int,
+    short_max_blocks: int,
+    short_chunks: int,
+) -> torch.Tensor:
+    """Adaptive (short/long guarded) fused merge+append. [QH, B, topk+1]."""
+    num_score_chunks, num_q_heads, batch_size, _ = candidate_scores.shape
+    assert 0 < short_chunks <= num_score_chunks
+    out = torch.empty(
+        (num_q_heads, batch_size, topk + 1),
+        dtype=torch.int32,
+        device=candidate_scores.device,
+    )
+    common_args = (
+        candidate_scores,
+        candidate_indices,
+        out,
+        seq_lens,
+        num_blocks,
+    )
+    grid = (batch_size, num_q_heads)
+    _merge_topk_append_local_kernel[grid](
+        *common_args,
+        block_size=block_size,
+        short_max_blocks=short_max_blocks,
+        stride_sl_b=stride_sl_b,
+        stride_sl_h=stride_sl_h,
+        stride_cs_c=candidate_scores.stride(0),
+        stride_cs_h=candidate_scores.stride(1),
+        stride_cs_b=candidate_scores.stride(2),
+        stride_cs_t=candidate_scores.stride(3),
+        stride_ci_c=candidate_indices.stride(0),
+        stride_ci_h=candidate_indices.stride(1),
+        stride_ci_b=candidate_indices.stride(2),
+        stride_ci_t=candidate_indices.stride(3),
+        stride_out_h=out.stride(0),
+        stride_out_b=out.stride(1),
+        stride_out_t=out.stride(2),
+        NUM_SCORE_CHUNKS=short_chunks,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=_next_power_of_2(short_chunks * topk),
+        GUARDED=True,
+        RUN_SHORT=True,
+        num_warps=1,
+        num_stages=1,
+    )
+    _merge_topk_append_local_kernel[grid](
+        *common_args,
+        block_size=block_size,
+        short_max_blocks=short_max_blocks,
+        stride_sl_b=stride_sl_b,
+        stride_sl_h=stride_sl_h,
+        stride_cs_c=candidate_scores.stride(0),
+        stride_cs_h=candidate_scores.stride(1),
+        stride_cs_b=candidate_scores.stride(2),
+        stride_cs_t=candidate_scores.stride(3),
+        stride_ci_c=candidate_indices.stride(0),
+        stride_ci_h=candidate_indices.stride(1),
+        stride_ci_b=candidate_indices.stride(2),
+        stride_ci_t=candidate_indices.stride(3),
+        stride_out_h=out.stride(0),
+        stride_out_b=out.stride(1),
+        stride_out_t=out.stride(2),
+        NUM_SCORE_CHUNKS=num_score_chunks,
+        topk=topk,
+        BLOCK_SIZE_CANDIDATES=_next_power_of_2(num_score_chunks * topk),
+        GUARDED=True,
+        RUN_SHORT=False,
+        num_warps=1,
+        num_stages=1,
+    )
+    return out
+
+
+# =============================================================================
 # BNSD Decode Score Kernel
 # =============================================================================
 
@@ -1699,6 +2016,12 @@ def flash_decode_bnsd_with_topk_idx(
     # static chunk count. Both values must be specified together.
     runtime_score_short_max_blocks: int = 0,
     runtime_score_short_chunks: int = 0,
+    # Fuse the candidate-merge + causal-local-block append into the merge
+    # launch(es) (drops the separate append kernel launch + the [QH,B,topk]
+    # intermediate round trip per layer; bit-exact). The output then has
+    # topk+1 slots (validated candidates + local block). Requires
+    # max_num_blocks as the candidate-validation bound.
+    fused_append_local: bool = False,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Decode attention with BNSD KV cache and block-level topk indices.
 
@@ -1855,7 +2178,33 @@ def flash_decode_bnsd_with_topk_idx(
             num_warps=_SCORE_CHUNK_NW,
             num_stages=_SCORE_CHUNK_NS,
         )
-        if use_runtime_adaptive_score_chunks:
+        if fused_append_local:
+            assert max_num_blocks is not None and max_num_blocks > 0
+            if use_runtime_adaptive_score_chunks:
+                topk_indices = _merge_topk_append_local_adaptive(
+                    candidate_scores,
+                    candidate_indices,
+                    seq_lens,
+                    block_size,
+                    topk,
+                    stride_sl_b,
+                    stride_sl_h,
+                    max_num_blocks,
+                    runtime_score_short_max_blocks,
+                    runtime_score_short_chunks,
+                )
+            else:
+                topk_indices = _merge_topk_append_local(
+                    candidate_scores,
+                    candidate_indices,
+                    seq_lens,
+                    block_size,
+                    topk,
+                    stride_sl_b,
+                    stride_sl_h,
+                    max_num_blocks,
+                )
+        elif use_runtime_adaptive_score_chunks:
             topk_indices = _merge_bnsd_score_topk_candidates_adaptive(
                 candidate_scores,
                 candidate_indices,

@@ -305,14 +305,6 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     HAS_SINK: tl.constexpr,
     USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
-    # Finite-floor online-softmax init (-1e30 vs -inf). When on, m_i/lse_i init
-    # to -1e30 (no-sink branch) so a sentinel/-1 topk slot or all-masked step has
-    # m_ij finite -> exp(-inf - finite) = 0 (p naturally 0) and exp(-1e30 - -1e30)
-    # = 1 (acc_o rescale a no-op) -- the per-step valid_block/has_valid guard wheres
-    # become unnecessary and are dropped (direct softmax path). Bit-exact vs the
-    # guarded -inf path (validated in bench_decode_ff.py). The sink branch already
-    # inits m_i/lse_i to the finite qsink, so it is unaffected.
-    FINITE_FLOOR: tl.constexpr,
 ):
     tl.static_assert(BLOCK_SIZE_N >= block_size)
 
@@ -367,7 +359,7 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         m_i = qsink
         lse_i = qsink
     else:
-        _neg = -1.0e30 if FINITE_FLOOR else float("-inf")
+        _neg = -1.0e30
         m_i = tl.full((BLOCK_SIZE_H,), _neg, dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_H,), _neg, dtype=tl.float32)
 
@@ -450,34 +442,14 @@ def _gqa_share_sparse_decode_bnsd_kernel(
         qk = tl.where(pos_mask[None, :], qk, float("-inf"))
 
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            if FINITE_FLOOR:
-                # Direct path (no valid_block guard): m_ij is finite (finite-floor
-                # init or qsink), so a sentinel slot's qk=-inf -> exp(-inf - m_ij)
-                # = 0 (p=0) and exp(m_i - m_ij)=1 (acc_o no-op) naturally.
-                p = tl.exp(qk - m_ij[:, None])
-                l_ij = tl.sum(p, axis=1)
-                acc_o = acc_o * tl.exp(m_i - m_ij)[:, None] + tl.dot(p.to(v.dtype), v)
-                lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
-                m_i = m_ij
-            else:
-                p = tl.where(
-                    valid_block,
-                    tl.exp(qk - m_ij[:, None]),
-                    tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
-                )
-                l_ij = tl.sum(p, axis=1)
-
-                acc_o_scale = tl.where(
-                    valid_block,
-                    tl.exp(m_i - m_ij),
-                    tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
-                )
-                acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
-                lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
-
-                acc_o = tl.where(valid_block, acc_o_new, acc_o)
-                m_i = tl.where(valid_block, m_ij, m_i)
-                lse_i = tl.where(valid_block, lse_i_new, lse_i)
+            # Direct path (no valid_block guard): m_ij is finite (finite-floor
+            # init or qsink), so a sentinel slot's qk=-inf -> exp(-inf - m_ij)
+            # = 0 (p=0) and exp(m_i - m_ij)=1 (acc_o no-op) naturally.
+            p = tl.exp(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
+            acc_o = acc_o * tl.exp(m_i - m_ij)[:, None] + tl.dot(p.to(v.dtype), v)
+            lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+            m_i = m_ij
     else:
         # Multi-block path: gather BLOCKS_PER_STEP selected blocks into one
         # [D, BPS*block_size] K tile / [BPS*block_size, D] V tile per step. All
@@ -549,20 +521,11 @@ def _gqa_share_sparse_decode_bnsd_kernel(
             # p=0); an all-invalid step must not touch the accumulator (it
             # would produce -inf - -inf = nan), mirroring valid_block above.
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            if FINITE_FLOOR:
-                # Direct path: m_ij finite (finite-floor init or qsink) -> an
-                # all-invalid step's qk=-inf yields exp(-inf - m_ij)=0 (p=0) and
-                # exp(m_i - m_ij)=1 (acc_o no-op) naturally; no has_valid guard.
-                p = tl.exp(qk - m_ij[:, None])
-                l_ij = tl.sum(p, axis=1)
-            else:
-                has_valid = tl.sum(valid_col.to(tl.int32), axis=0) > 0
-                p = tl.where(
-                    has_valid,
-                    tl.exp(qk - m_ij[:, None]),
-                    tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
-                )
-                l_ij = tl.sum(p, axis=1)
+            # Direct path: m_ij finite (finite-floor init or qsink) -> an
+            # all-invalid step's qk=-inf yields exp(-inf - m_ij)=0 (p=0) and
+            # exp(m_i - m_ij)=1 (acc_o no-op) naturally; no has_valid guard.
+            p = tl.exp(qk - m_ij[:, None])
+            l_ij = tl.sum(p, axis=1)
 
             # V load is sequenced AFTER the qk/p phase so its UB live range
             # starts as K's ends (K and V tiles together overflow the 192KB UB
@@ -579,22 +542,9 @@ def _gqa_share_sparse_decode_bnsd_kernel(
                 other=0.0,
             )
 
-            if FINITE_FLOOR:
-                acc_o = acc_o * tl.exp(m_i - m_ij)[:, None] + tl.dot(p.to(v.dtype), v)
-                lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
-                m_i = m_ij
-            else:
-                acc_o_scale = tl.where(
-                    has_valid,
-                    tl.exp(m_i - m_ij),
-                    tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
-                )
-                acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
-                lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
-
-                acc_o = tl.where(has_valid, acc_o_new, acc_o)
-                m_i = tl.where(has_valid, m_ij, m_i)
-                lse_i = tl.where(has_valid, lse_i_new, lse_i)
+            acc_o = acc_o * tl.exp(m_i - m_ij)[:, None] + tl.dot(p.to(v.dtype), v)
+            lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+            m_i = m_ij
 
     # Final scale.
     # Empty chunks keep lse_i=-inf and should output clean zeros.
@@ -734,10 +684,6 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     sanitize_page_ids: bool = False,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
-    # Finite-floor online-softmax init (see kernel FINITE_FLOOR). A/B knob;
-    # bit-exact vs the guarded -inf path. None -> env-driven default
-    # (SGLANG_MINIMAX_NPU_DECODE_FINITE_FLOOR, True once validated).
-    finite_floor: Optional[bool] = None,
 ) -> torch.Tensor:
     """Sparse decode attention using BNSD KV cache and precomputed topk blocks.
 
@@ -916,7 +862,6 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         HAS_SINK=sink is not None,
         USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
         SANITIZE_PAGE_IDS=sanitize_page_ids,
-        FINITE_FLOOR=False if finite_floor is None else finite_floor,
         num_warps=_SPARSE_DECODE_NW if num_warps is None else num_warps,
         num_stages=_SPARSE_DECODE_NS if num_stages is None else num_stages,
     )

@@ -1193,6 +1193,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
+        from sglang.srt.environ import envs
 
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
@@ -1308,6 +1309,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_index_value,
             runtime_fill_only=True,
             score_max_chunks=self._choose_decode_score_max_chunks(bs),
+            fused_append_local=True,
         )
 
         # 2) Reduce heads and append forced blocks. MiniMax-M3 TP=16 uses the
@@ -1369,6 +1371,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
+        from sglang.srt.environ import envs
 
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
@@ -1522,14 +1525,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             runtime_fill_only=pack_verify,
             runtime_score_short_max_blocks=256 if pack_verify else 0,
             runtime_score_short_chunks=16 if pack_verify else 0,
+            fused_append_local=True,
         )
         if pack_verify:
-            # [ndt*H, bs, topk] -> [H, bs*ndt, topk]: packed row m=j*H+h of
+            # [ndt*H, bs, K] -> [H, bs*ndt, K]: packed row m=j*H+h of
             # request b maps to flat query b*ndt+j, head h (request-major).
+            # K = topk (split path) or topk+1 (fused merge+append already
+            # appended the local block).
+            k_last = topk_idx.shape[-1]
             topk_idx = (
-                topk_idx.view(ndt, num_idx_heads, bs, self.topk_blocks)
+                topk_idx.view(ndt, num_idx_heads, bs, k_last)
                 .permute(1, 2, 0, 3)
-                .reshape(num_idx_heads, bs * ndt, self.topk_blocks)
+                .reshape(num_idx_heads, bs * ndt, k_last)
                 .contiguous()
             )
 
@@ -1635,6 +1642,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         return SimpleNamespace(
             per_query_req=per_query_req,
+            # Pre-cast int32 for the FIA prep kernel (layer-invariant; avoids a
+            # per-layer [total_q] cast in the FIA wrapper).
+            per_query_req_i32=per_query_req.to(torch.int32),
             per_query_seq_lens=per_query_seq_lens,
             max_seqlen=max_seqlen,
             max_blocks=max_blocks,
@@ -1828,21 +1838,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
         )
 
-        # Fused TopK + causal-local-block append (env SGLANG_MINIMAX_NPU_PREFILL_
-        # FUSE_TOPK, default ON, kill-switch =0). When on, pass per-query causal
-        # Fused TopK (env SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK, default OFF,
-        # kill-switch =0). When on, pass per-query causal seq_lens so the indexer
-        # fuses topk + local-append into one query-block-tiled kernel (BSQ=16,
-        # K-gated to max_seqblock_k<=256). The fused tensor has local already
-        # appended ([..., topk+1]); _prepare_npu_triton_topk_idx detects this
-        # (shape[2] == topk+1) and skips its own append.
-        from sglang.srt.environ import envs
-
-        topk_per_query_seq_lens = (
-            per_query_seq_lens
-            if envs.SGLANG_MINIMAX_NPU_PREFILL_FUSE_TOPK.get()
-            else None
-        )
+        # Fused TopK + causal-local-block append: per-query causal seq_lens are
+        # always passed so the indexer fuses topk + local-append into one
+        # query-block-tiled kernel (BSQ=16, K-gated to max_seqblock_k<=256).
+        # The fused tensor has local already appended ([..., topk+1]);
+        # _prepare_npu_triton_topk_idx detects this (shape[2] == topk+1) and
+        # skips its own append.
+        topk_per_query_seq_lens = per_query_seq_lens
 
         if disable_index_value:
             idx_o = None
@@ -1974,7 +1976,36 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 num_stages=blockq_ns,
             )
 
-        o = _blockq_main() if pack_q > 1 else _decode_main()
+        def _fia_main():
+            # A/B alternative to the triton blockq kernel: native Ascend FA (FIA) with
+            # a per-query custom block_table. ~2-3x faster (scalar/fixpipe-bound triton
+            # -> native cube). Single pass: own (causal) block reordered last + length-
+            # limited via actual_kvlen; past score blocks full (sparse_mode=0). Gated by
+            # SGLANG_MINIMAX_NPU_PREFILL_FIA; kvh>1 (non-MiniMax) falls back to triton.
+            from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.fia_sparse_blockq import (
+                flash_prefill_bnsd_blockq_sparse_fia,
+            )
+            return flash_prefill_bnsd_blockq_sparse_fia(
+                q=q,
+                k_cache_bnsd=k_bnsd,
+                v_cache_bnsd=v_bnsd,
+                topk_idx=topk_idx,
+                seq_lens=per_query_seq_lens,
+                per_query_req=meta.per_query_req_i32,
+                req_to_token=self.req_to_token,
+                block_size=page_size,
+                sm_scale=head_dim**-0.5,
+                num_pages=num_pages,
+                max_num_blocks=max_blocks,
+            )
+
+        from sglang.srt.environ import envs
+
+        use_fia = envs.SGLANG_MINIMAX_NPU_PREFILL_FIA.get() and num_kv_heads == 1
+        if use_fia:
+            o = _fia_main()
+        else:
+            o = _blockq_main() if pack_q > 1 else _decode_main()
 
         return idx_o, o
 
