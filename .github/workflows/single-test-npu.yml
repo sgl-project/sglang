@@ -15,9 +15,9 @@ concurrency:
 jobs:
   single-node-poc:
     name: single-node-poc
-    runs-on: linux-aarch64-a3-4
+    runs-on: linux-aarch64-a3-2
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-20260622
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
           npu-smi info
 
       - name: Run test
-        timeout-minutes: 1800
+        timeout-minutes: 120
         env:
           SGLANG_USE_MODELSCOPE: true
           HF_ENDPOINT: https://hf-mirror.com
@@ -40,8 +40,7 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            #"test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
-            "test/registered/ascend/basic_function/rl/test_npu_multi_instance_release_memory_occupation.py"
+            "test/registered/ascend/llm_models/test_npu_deepseek_v3_2_w8a8.py"
           )
 
           for test_case in "${test_cases[@]}"; do
@@ -75,8 +74,7 @@ jobs:
           # Set environment of cann
           source /usr/local/Ascend/cann/set_env.sh || true
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
-          pip install /root/.cache/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
-          
+
           current_date=$(date +%Y%m%d)
           log_path="/root/.cache/tests/logs/log/${current_date}/${HOSTNAME}"
           rm -rf ${log_path}
