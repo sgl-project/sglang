@@ -8,6 +8,7 @@ from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
+from sglang.kernels.ops.speculative.ngram_mask import build_ngram_full_tree_mask
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -328,25 +329,17 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK and not _is_cpu:
-            tree_mask = []
-            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
-            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
-                req_mask = torch.cat(
-                    (
-                        req_mask,
-                        torch.from_numpy(mask[i]).to(
-                            device=self.device, non_blocking=True
-                        ),
-                    ),
-                    dim=1,
-                ).to(torch.bool)
-                tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(tree_mask, dim=0)
+            draft_mask = (
+                torch.from_numpy(mask)
+                .to(device=self.device, dtype=torch.bool, non_blocking=True)
+                .reshape(bs, self.draft_token_num, self.draft_token_num)
+                .contiguous()
+            )
+            tree_mask = build_ngram_full_tree_mask(
+                draft_mask,
+                batch.seq_lens_cpu,
+                self.draft_token_num,
+            )
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
