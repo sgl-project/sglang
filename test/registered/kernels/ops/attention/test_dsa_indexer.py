@@ -428,9 +428,7 @@ class TestDSAIndexer(CustomTestCase):
             extend_seq_lens_cpu=[1, 3],
         )
 
-        (ks, ke), token_to_batch_idx = backend._cal_indexer_k_start_end(
-            forward_batch
-        )
+        (ks, ke), token_to_batch_idx = backend._cal_indexer_k_start_end(forward_batch)
 
         self.assertEqual(ks.tolist(), [0, 11, 11, 11])
         self.assertEqual(ke.tolist(), [11, 32, 33, 34])

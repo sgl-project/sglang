@@ -8,6 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import build_dflash_verify_target_probs
 from sglang.srt.speculative.dflash_worker_v2 import _copy_prefix_seq_lens_cpu
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
@@ -65,6 +66,33 @@ class _FakeTargetWorker:
 
 
 class TestDFlashDSparkVerifyLengths(CustomTestCase):
+    def test_sampling_probability_renorm_has_torch_fallback(self):
+        logits = torch.tensor([[4.0, 3.0, 2.0, 1.0], [1.0, 2.0, 3.0, 4.0]])
+        sampling_info = SimpleNamespace(
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            temperatures=torch.tensor([[1.0]]),
+            top_ks=torch.tensor([3]),
+            top_ps=torch.tensor([0.8]),
+        )
+
+        with patch(
+            "sglang.srt.speculative.dflash_utils.top_k_renorm_prob", None
+        ), patch("sglang.srt.speculative.dflash_utils.top_p_renorm_prob", None):
+            probs = build_dflash_verify_target_probs(
+                next_token_logits=logits,
+                sampling_info=sampling_info,
+                draft_token_num=2,
+                bs=1,
+                use_sparse_topk=False,
+            )
+
+        kept = torch.softmax(torch.tensor([4.0, 3.0]), dim=0)
+        expected = torch.tensor(
+            [[[kept[0], kept[1], 0.0, 0.0], [0.0, 0.0, kept[1], kept[0]]]]
+        )
+        torch.testing.assert_close(probs, expected)
+
     def test_prepare_for_decode_keeps_committed_and_reserved_lengths_separate(self):
         args = _spec_args(draft_tokens=4)
         set_global_server_args_for_scheduler(args)

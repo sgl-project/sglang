@@ -10,7 +10,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_p_normalize_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
@@ -53,6 +56,29 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _top_k_normalize_probs_torch(
+    probs: torch.Tensor, top_ks: torch.Tensor
+) -> torch.Tensor:
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    top_ks = top_ks.reshape(-1, 1).clamp(min=1, max=probs.shape[-1])
+    ranks = torch.arange(probs.shape[-1], device=probs.device).view(1, -1)
+    probs_sort.masked_fill_(ranks >= top_ks, 0.0)
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+
+def _top_k_renorm_probs(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    if top_k_renorm_prob is not None:
+        return top_k_renorm_prob(probs, top_ks)
+    return _top_k_normalize_probs_torch(probs, top_ks)
+
+
+def _top_p_renorm_probs(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    if top_p_renorm_prob is not None:
+        return top_p_renorm_prob(probs, top_ps)
+    return top_p_normalize_probs_torch(probs, top_ps)
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -798,7 +824,7 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _top_p_renorm_probs(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -807,12 +833,12 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _top_k_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
