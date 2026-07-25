@@ -477,6 +477,25 @@ class KimiK3MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        # SBO (single batch overlap): the shared experts read a fixed slab of
+        # weights the routed path never touches (bf16 — the checkpoint leaves
+        # shared_experts unquantized — and tp1-replicated under EP a2a, so
+        # ~264 MB per layer per rank), while the routed path is a2a-latency
+        # bound in decode with HBM mostly idle. Issue the shared experts on the
+        # side stream so the two run concurrently instead of back to back; the
+        # join happens right before the tail add. Measured on 2x4 GB300
+        # (TP8/EP8 MegaMoE + SP-MoE): +4~5% output tok/s and −5% ITL over
+        # bs 1–32, GSM8K unchanged — so it is on whenever the shape allows,
+        # no flag.
+        # EP a2a only: with plain-TP experts the fused front already lands both
+        # partial sums in one collective (_forward_fused), a strictly better
+        # overlap than two streams.
+        self._sbo_shared_overlap = (
+            self._ep_a2a
+            and self.shared_experts is not None
+            and self.alt_stream is not None
+        )
+
         # Latent MoE projections
         if self.use_latent_moe:
             self.routed_expert_down_proj = ReplicatedLinear(
@@ -681,10 +700,19 @@ class KimiK3MoE(nn.Module):
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
-        # Shared experts on original hidden_states
+        # Shared experts on original hidden_states — under SBO they go to the
+        # side stream and are joined at the tail (see _sbo_shared_overlap).
         shared_output = None
+        shared_event = None
         if self.shared_experts is not None and hidden_states.shape[0] > 0:
-            shared_output = self.shared_experts(hidden_states)
+            if self._sbo_shared_overlap:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self.shared_experts(hidden_states)
+                    shared_event = self.alt_stream.record_event()
+            else:
+                shared_output = self.shared_experts(hidden_states)
 
         # Gate + TopK (on original hidden_states for correct token count)
         # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
@@ -694,6 +722,8 @@ class KimiK3MoE(nn.Module):
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
+            if shared_event is not None:
+                torch.cuda.current_stream().wait_event(shared_event)
             if shared_output is not None:
                 expert_output = expert_output + shared_output
             if self.tp_size > 1:
@@ -718,6 +748,10 @@ class KimiK3MoE(nn.Module):
         latent = self._reduce_latent(expert_output)
         # up_proj is replicated, so the routed output is now fully reduced.
         out, _ = self.routed_expert_up_proj(latent)
+        if shared_event is not None:
+            # SBO join: as late as possible, so the side-stream shared experts
+            # get the whole routed a2a + latent tail to hide under.
+            torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
