@@ -34,9 +34,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -157,31 +155,6 @@ class BaseTpWorker(ABC):
                 recv_req.ports,
                 recv_req.group_name,
             )
-        )
-        return success, message
-
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = (
-            self.model_runner.weight_updater.update_weights_from_distributed(
-                recv_req.names,
-                recv_req.dtypes,
-                recv_req.shapes,
-                recv_req.group_name,
-                recv_req.load_format,
-            )
-        )
-        return success, message
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
-        monkey_patch_torch_reductions()
-        success, message = self.model_runner.weight_updater.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.ps.tp_rank]
-            ),
-            load_format=recv_req.load_format,
         )
         return success, message
 
@@ -488,6 +461,11 @@ class TpModelWorker(BaseTpWorker):
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
+
+    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs this worker owns for weight ops. The target worker
+        owns one runner and uses the empty role so its checksum keys stay unprefixed."""
+        return [("", self._model_runner)]
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter

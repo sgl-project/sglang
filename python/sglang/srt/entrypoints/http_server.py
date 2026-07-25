@@ -113,6 +113,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -120,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1350,6 +1352,36 @@ async def update_weights_from_tensor(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/begin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_weight_update(
+    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
+):
+    """Open a weight-update session so in-place-quantized weights become loadable."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/end_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_weight_update(
+    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
+):
+    """Close the weight-update session and finalize quantized weights."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
     )
 
 

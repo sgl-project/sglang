@@ -89,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -100,6 +101,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1366,6 +1368,14 @@ class Scheduler(
                 (
                     SendWeightsToRemoteInstanceReqInput,
                     self.send_weights_to_remote_instance,
+                ),
+                (
+                    BeginWeightUpdateReqInput,
+                    self.weight_updater.begin_weight_update,
+                ),
+                (
+                    EndWeightUpdateReqInput,
+                    self.weight_updater.end_weight_update,
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
