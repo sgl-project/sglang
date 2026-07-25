@@ -634,13 +634,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_single = get_server_args().speculative_accept_threshold_single
+        threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_acc = get_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
@@ -799,16 +799,5 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
 
     return None
