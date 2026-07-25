@@ -25,11 +25,13 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
+    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
+    ipc_export_mode,
     recv_msg,
     send_msg,
 )
@@ -134,12 +136,16 @@ class IpcModelLoader(BaseModelLoader):
             device_config,
             entries,
             quant_config,
+            export_mode=ipc_export_mode(quant_method, engine_quant_config),
         )
 
-        # Skip _post_load_weights: the daemon already ran
-        # process_weights_after_loading on the weights before exporting
-        # IPC handles. Running it again would double-process (e.g.,
-        # re-quantize already-quantized weights), corrupting tensor data.
+        # Note on post-processing:
+        #  - "postprocessed" mode: the daemon already ran
+        #    process_weights_after_loading before exporting IPC handles, so
+        #    _load_zero_copy_mode skips it (re-running would double-process).
+        #  - "raw_client_postprocess" mode (NVFP4): the daemon exported the raw
+        #    pre-post-process tensors and _load_zero_copy_mode ran
+        #    process_weights_after_loading locally.
 
         # Rebuild stale tensor views. Some modules store tensor views as
         # plain attributes (not parameters/buffers) during __init__. When
@@ -290,12 +296,18 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
+        export_mode: str,
     ) -> nn.Module:
         """Zero-copy load: map IPC tensors directly as param.data.
 
         The model is initialized on the meta device (no memory allocation),
         then each parameter's data is replaced with the IPC-mapped GPU tensor.
         The engine and daemon share the same physical GPU memory via CUDA IPC.
+
+        In "raw_client_postprocess" mode the daemon exported the raw
+        pre-post-process quantized tensors, so after mapping we run
+        process_weights_after_loading locally (producing the derived, swizzled
+        params) before the still-on-meta validation.
         """
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
@@ -376,6 +388,13 @@ class IpcModelLoader(BaseModelLoader):
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
 
+        # In raw_client_postprocess mode the daemon exported raw weights; run the
+        # model's own process_weights_after_loading now (creating the derived
+        # swizzled params + stamping layout attributes) before the meta check
+        # below validates that nothing is left uninitialized.
+        if export_mode == EXPORT_MODE_RAW_CLIENT_POSTPROCESS:
+            self._client_post_process(model, device_config, imported_refs)
+
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
         # hand the model uninitialized GPU memory — silently producing wrong
@@ -423,6 +442,65 @@ class IpcModelLoader(BaseModelLoader):
         )
 
         return model
+
+    def _client_post_process(self, model, device_config, imported_refs) -> None:
+        """Run process_weights_after_loading locally over the IPC-mapped model.
+
+        Used in raw_client_postprocess mode (NVFP4): the daemon exported the raw
+        pre-post-process quantized tensors, so we reproduce the post-processing
+        here using the model's own quant code path — creating the derived swizzled
+        params and stamping the layout attributes that raw-tensor IPC cannot carry.
+
+        The mapped raw tensors are the daemon's shared physical memory, so an
+        in-place write during post-processing would corrupt the daemon and every
+        peer engine. NVFP4 post-processing reads the raw weights and allocates new
+        tensors (it does not write back into them), but we do not take that on
+        faith: we snapshot sampled elements of each mapped tensor before
+        post-processing and assert them unchanged after, hard-erroring on any
+        violation instead of serving a corrupt daemon.
+        """
+        from sglang.srt.model_loader.loader import run_process_weights_after_loading
+
+        target_device = torch.device(device_config.device)
+        guard = self._snapshot_mutation_guard(imported_refs)
+
+        tic = time.perf_counter()
+        run_process_weights_after_loading(model, target_device)
+        self._assert_ipc_tensors_unmutated(guard)
+        logger.info(
+            f"[IpcModelLoader] Ran client-side process_weights_after_loading in "
+            f"{time.perf_counter() - tic:.2f}s"
+        )
+
+    @staticmethod
+    def _snapshot_mutation_guard(tensors, num_samples: int = 64):
+        """Clone a few sampled elements of each IPC-mapped tensor for later
+        comparison (cheap in-place-write detector for shared daemon memory)."""
+        guard = []
+        for tensor in tensors:
+            flat = tensor.detach().reshape(-1)
+            n = flat.numel()
+            if n == 0:
+                continue
+            idx = torch.linspace(
+                0, n - 1, steps=min(num_samples, n), device=flat.device
+            ).long()
+            guard.append((tensor, idx, flat[idx].clone()))
+        return guard
+
+    @staticmethod
+    def _assert_ipc_tensors_unmutated(guard) -> None:
+        for tensor, idx, sample in guard:
+            current = tensor.detach().reshape(-1)[idx]
+            if not torch.equal(current, sample):
+                raise RuntimeError(
+                    "[IpcModelLoader] client-side process_weights_after_loading "
+                    "mutated an IPC-mapped tensor in place. These tensors are the "
+                    "daemon's shared GPU memory, so an in-place write corrupts the "
+                    "daemon and every co-attached engine. This quant method's "
+                    "post-processing is not compatible with raw_client_postprocess "
+                    "mode — do not serve it via the weight cache."
+                )
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
@@ -505,6 +583,7 @@ class IpcModelLoader(BaseModelLoader):
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                ipc_export_mode=ipc_export_mode(quant_method, quant_config),
                 **compute_env_stamp(),
             )
 

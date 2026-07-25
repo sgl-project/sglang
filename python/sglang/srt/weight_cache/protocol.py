@@ -52,6 +52,18 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # IPC export mode (see ipc_export_mode): "postprocessed" (daemon runs
+    # process_weights_after_loading, client skips) or "raw_client_postprocess"
+    # (daemon exports raw pre-post-process weights, client runs post-processing).
+    # A daemon/client disagreement here must be a clean mismatch, never a silent
+    # wrong-numerics load.
+    ipc_export_mode: str
+    # Resolved FP4 GEMM backend (Fp4GemmRunnerBackend value, "" if N/A). NVFP4
+    # create_weights registers a backend-dependent raw param set (e.g.
+    # w13_blockscale_swizzled is None for TRTLLM but a Parameter otherwise), so a
+    # daemon and client that resolve different backends would produce
+    # incompatible raw param sets; comparing this turns that into a clean mismatch.
+    fp4_gemm_backend: str
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -155,12 +167,50 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
+def _nvfp4_shared_via_ipc(quant_config: Any) -> bool:
+    """NVFP4 (modelopt_fp4) is shared in raw_client_postprocess mode.
+
+    NVFP4's process_weights_after_loading repacks/swizzles weights, creates
+    derived params, and stamps Python-side layout attributes that raw-tensor IPC
+    cannot carry. Rather than share the post-processed state, the daemon exports
+    the raw pre-post-process quantized tensors and the client re-runs
+    process_weights_after_loading locally (see ipc_export_mode) -- so every
+    serialized NVFP4 variant round-trips by construction. Quantize-on-load
+    (nvfp4_online) reports a different quant_method name and is not in this
+    registry, so it stays excluded.
+    """
+    return True
+
+
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+    "modelopt_fp4": _nvfp4_shared_via_ipc,  # NVFP4, via raw_client_postprocess
 }
+
+# quant methods whose process_weights_after_loading is reproduced on the client
+# instead of shared: the daemon exports the raw (pre-post-process) quantized
+# tensors and the client runs process_weights_after_loading after IPC-mapping
+# them. Everything else is exported already post-processed and the client skips
+# post-processing. See ipc_export_mode.
+IPC_CLIENT_POSTPROCESS_QUANTS = {"modelopt_fp4"}
+
+EXPORT_MODE_POSTPROCESSED = "postprocessed"
+EXPORT_MODE_RAW_CLIENT_POSTPROCESS = "raw_client_postprocess"
+
+
+def ipc_export_mode(quant_method: str, quant_config: Any) -> str:
+    """Return the IPC export mode for a (supported) quant method.
+
+    Assumes the method already passed check_ipc_quant_support. Both the daemon
+    and the client call this so they always agree on the mode; the result is
+    also stamped into CacheConfig so a disagreement is a clean mismatch.
+    """
+    if quant_method in IPC_CLIENT_POSTPROCESS_QUANTS:
+        return EXPORT_MODE_RAW_CLIENT_POSTPROCESS
+    return EXPORT_MODE_POSTPROCESSED
 
 
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
@@ -240,15 +290,17 @@ def _recv_exact(sock, n: int) -> Optional[bytes]:
 def compute_env_stamp() -> Dict[str, str]:
     """Local environment fingerprint for the IPC weight cache.
 
-    Returns the device compute capability and torch version of the current
-    process. A daemon and a connecting client that differ on either may have run
-    different post-processing / kernel-selection branches, producing weights that
-    map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
-    that into a clean mismatch. Imported lazily so protocol.py stays cheap to
-    import and usable on CPU-only hosts (both fields degrade to "").
+    Returns the device compute capability, torch version, and resolved FP4 GEMM
+    backend of the current process. A daemon and a connecting client that differ
+    on any of these may have run different post-processing / kernel-selection
+    branches (or, for FP4, registered a different raw param set), producing
+    weights that map cleanly over IPC yet serve garbage; stamping these into
+    CacheConfig turns that into a clean mismatch. Imported lazily so protocol.py
+    stays cheap to import and usable on CPU-only hosts (all fields degrade to "").
     """
     device_capability = ""
     torch_version = ""
+    fp4_gemm_backend = ""
     try:
         import torch
 
@@ -263,7 +315,19 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+    try:
+        from sglang.srt.layers.quantization.fp4_utils import (
+            get_fp4_gemm_runner_backend,
+        )
+
+        fp4_gemm_backend = str(get_fp4_gemm_runner_backend().value)
+    except Exception:
+        pass
+    return {
+        "device_capability": device_capability,
+        "torch_version": torch_version,
+        "fp4_gemm_backend": fp4_gemm_backend,
+    }
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:

@@ -339,6 +339,24 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def run_process_weights_after_loading(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    """Run every quant method's process_weights_after_loading over the model.
+
+    Extracted so callers that load raw weights first (e.g. the weight cache
+    client, which IPC-maps the daemon's raw quantized tensors) can run the exact
+    same post-processing pass the normal loader runs. Quant methods expect their
+    params to be on the global target device, so we scope each module through
+    device_loading_context (matters for CPU offloading).
+    """
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -814,14 +832,19 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                skip_process_weights=self.load_config.skip_process_weights_after_loading,
             )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
+    def load_weights_and_postprocess(
+        model, weights, target_device, skip_process_weights: bool = False
+    ):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -877,16 +900,13 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        # The weight cache daemon loads raw weights and defers post-processing to
+        # the client (which reproduces it after IPC-mapping the raw tensors); skip
+        # the pass here so the daemon exports pre-post-process weights.
+        if skip_process_weights:
+            return
+
+        run_process_weights_after_loading(model, target_device)
 
 
 class LayeredModelLoader(DefaultModelLoader):

@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import publish
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
+    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     CacheConfig,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -60,6 +61,7 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    ipc_export_mode,
     recv_msg,
     send_msg,
 )
@@ -225,6 +227,18 @@ class WeightCacheDaemon:
         )
         publish(server_args, role="weight_cache_daemon")
 
+        # Resolve the FP4 GEMM backend exactly as the engine does
+        # (Scheduler.__init__ calls this unconditionally). It drives NVFP4
+        # create_weights layout decisions and is stamped into the fingerprint, so
+        # the daemon must resolve the same backend as the engine it serves --
+        # otherwise even non-FP4 fingerprints would drift ("auto" here vs the
+        # engine's resolved value).
+        from sglang.srt.layers.quantization.fp4_utils import (
+            initialize_fp4_gemm_config,
+        )
+
+        initialize_fp4_gemm_config(server_args)
+
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
@@ -249,6 +263,12 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
+        # Which export mode this quant method uses. In raw_client_postprocess mode
+        # (NVFP4) the daemon exports the raw pre-post-process weights and the
+        # client re-runs process_weights_after_loading; otherwise the daemon
+        # exports already-post-processed weights.
+        export_mode = ipc_export_mode(quant_method, quant_config)
+
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -266,31 +286,38 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
+            ipc_export_mode=export_mode,
             **compute_env_stamp(),
         )
 
-        # Refuse to serve quant methods not verified to round-trip through pure
-        # IPC tensor export. Checked before loading so an unsupported model
-        # fails fast instead of after minutes of disk I/O.
+        # Refuse to serve quant methods not verified for IPC sharing. Checked
+        # before loading so an unsupported model fails fast instead of after
+        # minutes of disk I/O.
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
-        # Build load config
+        # Build load config. In raw_client_postprocess mode, skip
+        # process_weights_after_loading so we export the raw quantized tensors;
+        # the client reproduces post-processing after IPC-mapping them.
         load_config = LoadConfig(
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             tp_rank=self.tp_rank,
+            skip_process_weights_after_loading=(
+                export_mode == EXPORT_MODE_RAW_CLIENT_POSTPROCESS
+            ),
         )
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Loading model from disk: {self.model_path}"
+            f"Loading model from disk: {self.model_path} (export_mode={export_mode})"
         )
         tic = time.perf_counter()
 
-        # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
+        # Load model. In postprocessed mode this includes TP sharding + quant
+        # post-process; in raw_client_postprocess mode post-processing is skipped.
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
             model_config=model_config,

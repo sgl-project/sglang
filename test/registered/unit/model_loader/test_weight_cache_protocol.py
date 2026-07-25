@@ -23,6 +23,8 @@ import struct
 import unittest
 
 from sglang.srt.weight_cache.protocol import (
+    EXPORT_MODE_POSTPROCESSED,
+    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
@@ -34,6 +36,7 @@ from sglang.srt.weight_cache.protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
+    ipc_export_mode,
     is_ipc_quant_supported,
     recv_msg,
     send_msg,
@@ -58,8 +61,10 @@ def _make_cache_config(**overrides) -> CacheConfig:
         quant_config_hash="",
         dtype="torch.float16",
         revision="",
+        ipc_export_mode="postprocessed",
         device_capability="8.0",
         torch_version="2.5.1",
+        fp4_gemm_backend="",
     )
     base.update(overrides)
     return CacheConfig(**base)
@@ -126,6 +131,11 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            # A daemon exporting raw NVFP4 must not be matched by a client
+            # expecting post-processed weights, nor across differing FP4 backends
+            # (which change the raw param set) -- these must be clean mismatches.
+            ("ipc_export_mode", "raw_client_postprocess"),
+            ("fp4_gemm_backend", "flashinfer_trtllm"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -224,9 +234,18 @@ class TestIpcQuantAllowlist(CustomTestCase):
         self.assertFalse(is_ipc_quant_supported("fp8", {}))
         self.assertFalse(is_ipc_quant_supported("fp8", None))
 
+    def test_nvfp4_supported(self):
+        # NVFP4 is shared in raw_client_postprocess mode: the client re-runs
+        # process_weights_after_loading, so every serialized variant is accepted.
+        self.assertTrue(is_ipc_quant_supported("modelopt_fp4", None))
+        self.assertTrue(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4"}))
+
     def test_unknown_method_rejected(self):
         self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))
         self.assertFalse(is_ipc_quant_supported("awq", None))
+        # Quantize-on-load NVFP4 reports a different method name and must NOT be
+        # picked up by the modelopt_fp4 (serialized) allowlist entry.
+        self.assertFalse(is_ipc_quant_supported("nvfp4_online", None))
 
     def test_check_raises_on_unsupported(self):
         with self.assertRaises(UnsupportedQuantForIPCError):
@@ -244,7 +263,21 @@ class TestIpcQuantAllowlist(CustomTestCase):
 
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
+        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8", "modelopt_fp4"})
+
+    def test_export_mode_dispatch(self):
+        # NVFP4 uses client-side post-processing; everything else is exported
+        # already post-processed. A daemon/client disagreement here is stamped
+        # into the fingerprint and becomes a clean mismatch.
+        self.assertEqual(
+            ipc_export_mode("modelopt_fp4", None),
+            EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
+        )
+        self.assertEqual(ipc_export_mode("", None), EXPORT_MODE_POSTPROCESSED)
+        self.assertEqual(
+            ipc_export_mode("fp8", {"weight_block_size": [128, 128]}),
+            EXPORT_MODE_POSTPROCESSED,
+        )
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):
