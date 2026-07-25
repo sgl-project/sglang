@@ -1498,6 +1498,12 @@ class ServerArgs:
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",
         NS("observability"),
     ] = 15
+    load_reporter_snapshot_stale_after_ms: A[
+        int, "Load reporter snapshot stale threshold in milliseconds."
+    ] = 3000
+    load_reporter_zone: A[
+        Optional[str], "Optional zone reported in Worker metadata."
+    ] = None
     tokenizer_metrics_custom_labels_header: A[
         str,
         "Specify the HTTP header for passing custom labels for tokenizer metrics.",
@@ -3414,6 +3420,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._validate_mamba_max_states_per_path()
+        self._handle_load_reporter_config()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -7794,6 +7801,22 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
+
+    def _handle_load_reporter_config(self):
+        """Validate load reporter configuration fields.
+
+        The snapshot stale threshold must be > 0. An empty or whitespace-only
+        zone is normalized to None. gRPC transport knobs (connect timeout,
+        reconnect backoff, keepalive, message size, shutdown timeout) are
+        reporter-internal constants and are not part of ServerArgs.
+        """
+        if self.load_reporter_snapshot_stale_after_ms <= 0:
+            raise ValueError(
+                f"--load-reporter-snapshot-stale-after-ms must be positive "
+                f"(got {self.load_reporter_snapshot_stale_after_ms})."
+            )
+        if self.load_reporter_zone is not None and not self.load_reporter_zone.strip():
+            self.load_reporter_zone = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
