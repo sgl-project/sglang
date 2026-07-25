@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Literal, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -32,6 +32,7 @@ from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
@@ -609,28 +610,23 @@ class GrammarTree:
         return self._host
 
 
-class GrammarMask(NamedTuple):
-    """A staged bitmask together with the backend that knows how to apply it."""
-
-    grammar: BaseGrammarObject
-    bitmask: torch.Tensor
-
-    def apply(self, logits: torch.Tensor) -> None:
-        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.bitmask)
-
-
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
     tree: GrammarTree,
     sampling_info: SamplingBatchInfo,
     device,
+    barrier: Optional[Callable[[], None]] = None,
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify launch: resolving the tree and traversing it are
-    both host work, so both overlap that forward.
+    Call it after the target verify launch: the barrier, resolving the tree and the
+    traversal are all host work, so they overlap that forward. ``barrier`` advances
+    the previous batch's FSM over its committed tokens and must run before the
+    traversal reads that state; overlap-capable workers get it from the scheduler.
     """
+    if barrier is not None:
+        barrier()
     vocab_mask, grammar = generate_token_bitmask(
         reqs,
         *tree.resolve(),
@@ -643,7 +639,7 @@ def build_grammar_vocab_mask(
     # order keeps the copy ahead of the sampler's apply_vocab_mask.
     vocab_mask = vocab_mask.to(device, non_blocking=True)
     # Otherwise the extend stage's leftover mask is applied instead.
-    sampling_info.vocab_mask = None
+    sampling_info.grammar_mask = None
     return GrammarMask(grammar, vocab_mask)
 
 

@@ -1690,16 +1690,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         grammar_mask = None
         if batch.has_grammar:
-            # Grammar barrier: advance the previous batch's FSM over its committed
-            # tokens before building this batch's bitmask. Runs after the target
-            # launch, so the advance and the traversal both overlap the forward.
-            if grammar_barrier is not None:
-                grammar_barrier()
             grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
                 tree=grammar_tree,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
             )
 
         if sampling_info is not None:

@@ -612,10 +612,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
         if batch.has_grammar:
-            # Both the FSM advance over the previous batch's committed tokens and
-            # the traversal below are host work, so they overlap the launch above.
-            if grammar_barrier is not None:
-                grammar_barrier()
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
             grammar_mask = build_grammar_vocab_mask(
@@ -623,6 +619,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tree=grammar_tree,
                 sampling_info=sampling_info,
                 device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)

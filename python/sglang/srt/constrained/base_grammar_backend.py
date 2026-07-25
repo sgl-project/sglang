@@ -17,7 +17,7 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -115,6 +115,20 @@ class BaseGrammarObject:
         Jump forward occurs, and update the grammar state if needed.
         """
         raise NotImplementedError()
+
+
+class GrammarMask(NamedTuple):
+    """A filled bitmask together with the backend that knows how to apply it.
+
+    The grammar is whichever request in the batch supplied one; it is only the
+    handle that applies the batch's whole bitmask, never per-request state.
+    """
+
+    grammar: BaseGrammarObject
+    bitmask: torch.Tensor
+
+    def apply(self, logits: torch.Tensor) -> None:
+        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.bitmask)
 
 
 class InvalidGrammarObject(BaseGrammarObject):

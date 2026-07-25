@@ -566,17 +566,12 @@ def run_eagle_verify(
     # Generate vocab mask for constrained decoding
     grammar_mask = None
     if batch.has_grammar:
-        # Grammar barrier: advance the previous batch's grammar FSM over its
-        # committed tokens before building this batch's bitmask. Runs after the
-        # target forward launch, so the FSM advance and the traversal below both
-        # overlap the target verify forward. No-op if there is nothing pending.
-        if grammar_barrier is not None:
-            grammar_barrier()
         grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
             tree=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
 
     # Sample
