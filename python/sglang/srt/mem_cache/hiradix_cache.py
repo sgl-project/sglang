@@ -86,7 +86,7 @@ class HiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                server_args.resolved_kv_hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
@@ -101,7 +101,7 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                server_args.resolved_kv_hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
