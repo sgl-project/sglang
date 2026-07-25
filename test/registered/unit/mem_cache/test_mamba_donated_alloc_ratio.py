@@ -15,10 +15,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, IncLockRefResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    IncLockRefResult,
+)
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -137,6 +140,59 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         self.assertEqual(
             r(extra_buffer=True, lazy=False, disable_overlap=False), 4
         )  # overlap
+
+
+class _RecordingComp:
+    """Fake tree component: records the dec params it is asked to release with."""
+
+    def __init__(self, component_type, priority):
+        self.component_type = component_type
+        self._priority = priority
+        self.released = []
+
+    def eviction_priority(self, is_leaf):
+        return self._priority
+
+    def release_component_lock(self, node, params):
+        self.released.append(params)
+
+    def release_window_lock(self, node, swa_uuid_for_lock):  # SWA only
+        pass
+
+
+class TestDecSwaLockSkip(unittest.TestCase):
+    """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
+    locks. On a full-only-locked node (decode skip) it must thread the skip set
+    into that lower-tier release, else it drops a mamba lock it never took --
+    another request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the
+    contract without booting a 3-component model."""
+
+    def test_threads_skip_ids_into_lower_tier_release(self):
+        # internal-node priority: full=2 > swa=1 > mamba=0
+        full = _RecordingComp(ComponentType.FULL, 2)
+        swa = _RecordingComp(ComponentType.SWA, 1)
+        mamba = _RecordingComp(ComponentType.MAMBA, 0)
+        cache = SimpleNamespace(
+            disable=False,
+            components={ComponentType.SWA: swa},
+            _components_tuple=(full, swa, mamba),
+        )
+        node = SimpleNamespace(id=7)
+
+        UnifiedRadixCache.dec_swa_lock_only(
+            cache,
+            node,
+            swa_uuid_for_lock=None,
+            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+        )
+
+        # mamba (below swa) is released, honoring the skip set
+        self.assertEqual(len(mamba.released), 1)
+        self.assertEqual(
+            mamba.released[0].skip_lock_node_ids.get(ComponentType.MAMBA), {7}
+        )
+        # full (above swa) is never touched
+        self.assertEqual(full.released, [])
 
 
 class TestMambaDonatedAllocRatio(unittest.TestCase):
