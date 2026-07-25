@@ -469,7 +469,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.11.post1"
+    MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
     # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
     # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
