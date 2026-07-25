@@ -627,8 +627,9 @@ class PrefillAdder:
         With chunked prefill + overlap scheduler, the peak SWA occupancy is:
           chunk N (running, not yet in tree) + sliding window (locked in tree)
           + chunk N+1 (new allocation)
-        chunk N and the locked window are already excluded from
-        swa_available + swa_evictable, so the budget only covers chunk N+1:
+        Since chunk N and locked tokens are already excluded from
+        swa_available + swa_evictable, the budget only needs to cover the
+        chunk N+1 allocation plus decode headroom:
 
           budget = max(alloc - window, 0) + min(extend + max_new_tokens, window) + page
 
@@ -650,16 +651,11 @@ class PrefillAdder:
         """SWA slots a request adds to its own sliding window + page slack + the
         load-back charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap.
 
-        A request's steady SWA footprint is one sliding window; the tokens it
-        newly contributes to that window are its extend + decode, and a cached
-        SWA prefix funds the rest, so the headroom is min(extend + decode,
-        window) — NOT a constant window. For extend + decode >= window this is
-        exactly the prior constant window, so the change is a no-op outside the
-        short-resume regime. Charging a full window regardless double-charged a
-        short cached-prefix resume (its window is already provided by the locked
-        prefix): at a ~2-window SWA pool admission rejected it forever while LPM
-        kept it at the queue head (idle GPU, 100% scheduler CPU). Including the
-        extend keeps the reservation at or above the immediate prefill
+        The headroom is min(extend + decode, window), not a constant window: a
+        request contributes only extend + decode fresh tokens to its window and
+        a cached SWA prefix funds the rest. Charging a full window double-counted
+        a short cached-prefix resume and livelocked admission at a ~2-window
+        pool; keeping extend in the min() holds the reservation >= the prefill
         allocation so an admitted request cannot OOM."""
         window = self.tree_cache.sliding_window_size
         headroom = min(extend_input_len + max_new_tokens, window)
@@ -669,11 +665,13 @@ class PrefillAdder:
         return reserved
 
     def _swa_new_tokens(self, req: Req) -> int:
-        """Tokens a request may still decode, for SWA headroom sizing."""
-        return max(
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            - len(req.output_ids),
-            0,
+        """Tokens a request may still decode, for SWA headroom sizing. Mirrors
+        the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
+        would zero out a request that has already generated >= CLIP tokens but
+        still has a long decode ahead, under-reserving its window."""
+        return min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
         )
 
     def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
