@@ -86,11 +86,16 @@ def _init_state() -> Optional[_State]:
 
         if get_device_sm() not in (100, 103):
             return None
-        if get_server_args().enable_symm_mem:
+        server_args = get_server_args()
+        if server_args.enable_symm_mem or server_args.moe_a2a_backend != "none":
             logger.info(
-                "K3 all-reduce fusion auto-probe: skipping under "
-                "--enable-symm-mem (allocator contexts conflict; set "
-                "SGLANG_K3_AR_FUSION=1 to force)."
+                "K3 all-reduce fusion auto-probe: skipping "
+                "(enable_symm_mem=%s, moe_a2a_backend=%s; under symm-mem the "
+                "allocator contexts conflict, and under EP a2a the model's "
+                "symm-pool allocation contract does not hold on every AR "
+                "call-site. Set SGLANG_K3_AR_FUSION=1 to force.)",
+                server_args.enable_symm_mem,
+                server_args.moe_a2a_backend,
             )
             return None
     from sglang.srt.distributed import get_tensor_model_parallel_world_size
