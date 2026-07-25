@@ -3624,7 +3624,7 @@ class ServerArgs:
                 # otherwise leaves BCG with no shapes to capture. Use the
                 # model's maximum request length as the safe default; callers
                 # can still raise it for larger aggregate prefill batches.
-                if self.cuda_graph_config.prefill.max_bs <= 0:
+                if (self.cuda_graph_config.prefill.max_bs or 0) <= 0:
                     self.cuda_graph_config.prefill.max_bs = model_config.context_len
                     self.cuda_graph_config.prefill.bs = (
                         self._generate_prefill_cuda_graph_batch_sizes(
