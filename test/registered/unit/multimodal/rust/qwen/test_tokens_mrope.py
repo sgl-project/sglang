@@ -1,4 +1,11 @@
-"""Qwen placeholder expansion, offsets, and M-RoPE parity."""
+"""Qwen placeholder expansion, offsets, and M-RoPE parity.
+
+Covers ``expand_placeholders`` in ``rust/sglang-mm/src/common/tokens.rs`` and
+``mrope_image_only`` in ``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
+``_core.qwen_vl.process_native_mm_payload`` and ``mrope_image_only_py``
+bindings), against ``BaseMultimodalProcessor`` expansion/offsets and
+``MRotaryEmbedding.get_rope_index``.
+"""
 
 import sys
 import unittest

@@ -1,4 +1,9 @@
-"""Model-independent parity tests for Rust multimodal source loading."""
+"""Model-independent parity tests for Rust multimodal source loading.
+
+Covers ``fetch_bytes`` in ``rust/sglang-mm/src/common/fetch.rs`` (via the
+``_core.common.fetch_bytes`` binding), against the Python reference
+``sglang.srt.utils.common.get_image_bytes``.
+"""
 
 import base64
 import http.server

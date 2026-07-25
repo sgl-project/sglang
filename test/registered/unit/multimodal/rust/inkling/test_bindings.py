@@ -1,5 +1,10 @@
 """Smoke coverage for the ``_core.inkling`` PyO3 bindings.
 
+Covers the ``#[pyfunction]``s in ``rust/sglang-mm/src/inkling/mod.rs``
+(``patchify_rgb`` / ``decode_patchify`` / ``decode_patchify_batch`` /
+``preprocess_images`` / ``rescale_patchify_hash``) plus
+``_core.common.data_hash``.
+
 The inkling bindings are otherwise exercised only by the GPU e2e model test;
 this pins the binding surface (signatures, dtypes, cross-binding consistency)
 in the CPU suite so a rework of the extension can't silently break them.

@@ -1,5 +1,9 @@
 """Native driver error paths: out-of-scope and malformed inputs are rejected.
 
+Covers ``process`` in ``rust/sglang-mm/src/driver.rs`` and payload parsing in
+``rust/sglang-mm/src/common/payload.rs`` (via the
+``_core.qwen_vl.process_native_mm_payload`` binding).
+
 There is no Python fallback path, so the server rejects every driver error
 back to the client as a 400; the message must say why (unsupported modality,
 placeholder mismatch, undecodable image, missing prompt). This pins that

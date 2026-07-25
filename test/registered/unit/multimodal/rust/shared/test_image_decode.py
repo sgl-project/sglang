@@ -1,4 +1,9 @@
-"""Model-independent image decode parity for native Rust MM."""
+"""Model-independent image decode parity for native Rust MM.
+
+Covers ``decode_rgb`` in ``rust/sglang-mm/src/common/mod.rs`` (via the
+``_core.common.image_decode_rgb`` binding), against PIL's
+``Image.open(...).convert("RGB")``.
+"""
 
 import io
 import sys

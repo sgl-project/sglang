@@ -1,4 +1,10 @@
-"""Qwen native image preprocessing parity against Transformers."""
+"""Qwen native image preprocessing parity against Transformers.
+
+Covers ``QwenVlProcessor::process_image`` and ``smart_resize`` in
+``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the ``_core.qwen_vl.preprocess``
+and ``smart_resize_py`` bindings), against the HF ``Qwen2VLImageProcessor``
+and the Python ``smart_resize``.
+"""
 
 import sys
 import unittest
