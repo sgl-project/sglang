@@ -1506,7 +1506,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # cores, so wrap its forward at the instance level; the module
             # itself (weights, reduce_results, loading path) is untouched.
             self._gate_hidden_states = None
-            # (gate, ready event) issued on the alt stream by forward();
+            # (gate, producer stream) issued on the alt stream by forward();
             # None when the lazy path computes the gate here instead.
             self._gate_precomputed = None
             self._gate_alt_stream = gate_alt_stream
@@ -1526,10 +1526,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 precomputed = self._gate_precomputed
                 self._gate_precomputed = None
                 if precomputed is not None:
-                    # Join the alt-stream GEMM unconditionally: graph capture
-                    # requires every side stream to rejoin the main stream,
-                    # even if the gate goes unused on this call.
-                    torch.cuda.current_stream().wait_event(precomputed[1])
+                    # Use wait_stream rather than an explicit event so the
+                    # breakable-CUDA-graph runner can track the side-stream
+                    # join across graph-segment boundaries.
+                    torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
                     gate = (
                         precomputed[0]
@@ -1564,7 +1564,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             alt.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(alt):
                 gate, _ = self.g_proj(hidden_states)
-            self._gate_precomputed = (gate, alt.record_event())
+            self._gate_precomputed = (gate, alt)
 
     def forward(
         self,

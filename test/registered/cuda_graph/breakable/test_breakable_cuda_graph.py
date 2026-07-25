@@ -168,6 +168,31 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
+    def test_side_stream_join_across_break(self):
+        """A side-stream producer may be joined after a graph break."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+        stream = torch.cuda.Stream(self.device)
+
+        @self.eager_on_graph(enable=True)
+        def identity(src):
+            return src
+
+        graph = self.BreakableCUDAGraph()
+        capture_stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=capture_stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                side_output = x + 1.0
+            identity(x)
+            torch.cuda.current_stream().wait_stream(stream)
+            y.copy_(side_output * 2.0)
+
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 12.0, device=self.device)))
+
     def test_eager_output_is_held_strongly_for_replay_bridge(self):
         """The replay closure must keep the eager output bridge buffer alive."""
         x = torch.zeros(4, device=self.device)
