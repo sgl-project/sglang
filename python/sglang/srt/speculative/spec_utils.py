@@ -667,10 +667,23 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     the mask also keeps a stale extend-time mask from triggering in-forward
     tracking during TARGET_VERIFY; tracking is done in
     commit_mamba_states_after_verify instead.
+
+    Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
+    inside forward isolation, so it must not mutate req/pool state.
     """
-    if not get_server_args().enable_mamba_extra_buffer():
+    server_args = get_server_args()
+    if not server_args.enable_mamba_extra_buffer():
         return
-    set_mamba_track_indices_from_reqs(batch)
+    track_positions = None
+    if server_args.enable_mamba_extra_buffer_lazy():
+        track_positions = batch.mamba_lazy_spec_track_positions_cpu
+        assert track_positions is not None and len(track_positions) == len(
+            batch.reqs
+        ), (
+            "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
+            "must run in prepare_for_decode for every spec decode iteration"
+        )
+    set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
 
@@ -833,6 +846,13 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
+    server_args = get_server_args()
+    if server_args.enable_mamba_extra_buffer_lazy():
+        # Scheduler phase (outside forward isolation).
+        batch.mamba_lazy_spec_prepare(
+            server_args.mamba_track_interval,
+            server_args.max_speculative_num_draft_tokens,
+        )
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     else:

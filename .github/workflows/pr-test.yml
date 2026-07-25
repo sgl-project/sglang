@@ -228,7 +228,7 @@ jobs:
   call-jit-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
-    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch jit_kernel/**.
+    # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
     if: |
       always() &&
