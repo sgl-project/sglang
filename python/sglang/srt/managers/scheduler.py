@@ -1672,14 +1672,12 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Spec algorithms that don't advance the grammar FSM inside verify() (see
-        # supports_grammar_overlap) still need overlap forced off for grammar decode
-        # batches, so the FSM is advanced before the next batch's bitmask.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
