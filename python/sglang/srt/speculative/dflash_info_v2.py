@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
@@ -55,6 +56,9 @@ class DFlashDraftInputV2(SpecInput):
     future_indices: Optional[torch.Tensor] = None
 
     verify_token_budget: Optional[int] = None
+
+    # Stamped by generate_token_bitmask during verify, read back to apply the mask.
+    grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
