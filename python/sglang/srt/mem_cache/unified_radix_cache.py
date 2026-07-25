@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import defaultdict
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, TypeVar
 

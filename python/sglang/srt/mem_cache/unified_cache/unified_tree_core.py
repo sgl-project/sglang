@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import sys
 from array import array
-from collections import defaultdict
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Sequence
 
@@ -59,7 +58,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     UnifiedTreeCoreInterface,
-    WithValuesToFree,
 )
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
