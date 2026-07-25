@@ -49,9 +49,12 @@ class FlashQLAGDNKernel(TritonGDNKernel):
     checkpoints from this backend; use the default no_buffer strategy.
     """
 
-    def __init__(self):
+    def __init__(self, min_total_tokens: int = _FLASHQLA_MIN_TOTAL_TOKENS):
         # Fail fast at dispatcher construction if flash_qla is not installed.
         _load_flash_qla()
+        # Packed-token count below which extend() defers to Triton. Injectable
+        # so tests can drive the flash_qla path on small ragged batches.
+        self.min_total_tokens = min_total_tokens
 
     def extend(
         self,
@@ -115,8 +118,7 @@ class FlashQLAGDNKernel(TritonGDNKernel):
         # h=None: same contract as the FlashInfer prefill kernel.
         return o, None, None
 
-    @staticmethod
-    def _should_fall_back(q: torch.Tensor) -> bool:
+    def _should_fall_back(self, q: torch.Tensor) -> bool:
         """Whether to use the Triton chunk path instead of flash_qla.
 
         Host-side checks only (no GPU sync). q is the packed prefill query
@@ -125,4 +127,4 @@ class FlashQLAGDNKernel(TritonGDNKernel):
         """
         if q.dtype not in (torch.bfloat16, torch.float16):
             return True
-        return q.shape[-3] < _FLASHQLA_MIN_TOTAL_TOKENS
+        return q.shape[-3] < self.min_total_tokens
