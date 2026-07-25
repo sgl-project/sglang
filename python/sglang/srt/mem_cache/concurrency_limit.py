@@ -78,22 +78,19 @@ def state_pool_limit(
     invent are either one request more than today or far past what fits.
     """
     if target is None:
-        sizing = (
-            "set --max-running-requests to the concurrency you want (the log then "
-            "reports the exact size), or try a larger --mamba-full-memory-ratio"
-        )
+        sizing = "--max-running-requests to state a target and get an exact size"
     else:
         sizing = (
-            f"try one of: --max-mamba-cache-size "
-            f"{target * slots_per_request * attn_dp_size}, a larger "
-            f"--mamba-full-memory-ratio"
+            f"--max-mamba-cache-size "
+            f"{target * slots_per_request * attn_dp_size} (memory permitting)"
         )
     return ConcurrencyLimit(
         source="mamba_state_pool",
         value=per_shard_pool_size // slots_per_request,
         detail=f"max_mamba_cache_size={per_shard_pool_size} per shard / "
         f"{slots_per_request} slots per request",
-        remedy=f"{sizing}, or --mamba-ssm-dtype bfloat16",
+        remedy=f"try one of: {sizing}, a larger --mamba-full-memory-ratio, "
+        f"or --mamba-ssm-dtype bfloat16",
     )
 
 
