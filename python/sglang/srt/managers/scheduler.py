@@ -1672,10 +1672,8 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Grammar decode without overlap support runs synchronously so the FSM
-        # advance lands before the next batch's bitmask. Permanent path for
-        # host-draft algorithms (see supports_grammar_overlap), not a pending
-        # migration.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
@@ -1686,8 +1684,8 @@ class Scheduler(
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
-        # whatever result is still pending in the queue -- including the
-        # extend->decode boundary -- so no grammar-specific overlap disable is needed.
+        # whatever result is still pending in the queue — including the
+        # extend->decode boundary — so no grammar-specific overlap disable is needed.
         return disable_overlap_for_batch or need_grammar_sync
 
     def _advance_pending_grammar(self):

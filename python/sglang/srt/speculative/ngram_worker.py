@@ -229,8 +229,7 @@ class NGRAMWorker(BaseSpecWorker):
         # round's accepted tokens are not yet in req.output_ids and must be
         # spliced in from spec_info. Sync mode and grammar batches process
         # results before the next draft prep, so output_ids is already
-        # complete and splicing would duplicate the tail. The host corpus lookup
-        # below is why grammar keeps NGRAM synchronous.
+        # complete and splicing would duplicate the tail.
         use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         i = 0
         for req in batch.reqs:
