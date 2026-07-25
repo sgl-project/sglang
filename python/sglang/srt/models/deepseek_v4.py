@@ -205,10 +205,12 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
-    # SM120 disables the standalone TileLang mhc_pre path because its split-K
-    # kernel is unsupported there. The fused post/pre kernel has a separate FMA
-    # implementation that is supported on SM120, so do not let the standalone
-    # pre-path override silently disable this explicit opt-in.
+    # SM120 post-processing clears SGLANG_OPT_USE_TILELANG_MHC_PRE and
+    # SGLANG_OPT_DEEPGEMM_HC_PRENORM. mhc_fused_post_pre selects its GEMM on
+    # SGLANG_OPT_DEEPGEMM_HC_PRENORM alone and never reads the pre flag, so with both
+    # clear it runs mhc_fused_post_pre_fma_tilelang (built with TL_DISABLE_TMA_LOWER
+    # and TL_DISABLE_WARP_SPECIALIZED). The pre flag must not veto this opt-in.
+    # Whether the standalone pre path runs stays a server_args decision.
     return (
         envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
         and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()

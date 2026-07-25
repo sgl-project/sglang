@@ -1,5 +1,6 @@
 """Unit tests for the DeepSeek-V4 fused-MHC enable policy."""
 
+import unittest
 from unittest.mock import patch
 
 import sglang.srt.models.deepseek_v4 as deepseek_v4
@@ -72,3 +73,7 @@ class TestDeepseekV4FusedMHCPolicy(CustomTestCase):
                 sm120=True,
             )
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
