@@ -67,6 +67,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_symm_mem",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
@@ -367,6 +368,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             [("_mimo_v2_overrides", {"enable_multi_layer_eagle": True})],
         )
+
+    def test_kimi_k3_dcp_disables_symm_mem_only_when_enabled(self):
+        def make_args(enable_symm_mem):
+            return SimpleNamespace(
+                dcp_size=8,
+                enable_symm_mem=enable_symm_mem,
+                speculative_algorithm=None,
+                prefill_attention_backend=None,
+                decode_attention_backend="tokenspeed_mla",
+                attention_backend=None,
+                kv_cache_dtype="fp8_e4m3",
+                dcp_replicate_q_proj=True,
+                dcp_comm_backend="a2a",
+            )
+
+        with (
+            patch.object(
+                overrides_module, "get_device_name", return_value="NVIDIA GB300"
+            ),
+            patch.object(overrides_module, "is_mnnvl_fabric_device", return_value=True),
+        ):
+            enabled = overrides_module._kimi_k3_overrides(make_args(True), None)
+            disabled = overrides_module._kimi_k3_overrides(make_args(False), None)
+
+        self.assertIs(enabled["enable_symm_mem"], False)
+        self.assertNotIn("enable_symm_mem", disabled)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.

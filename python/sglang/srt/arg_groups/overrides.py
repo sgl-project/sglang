@@ -340,6 +340,13 @@ def _dspark_verify_on_decode_backend(
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.dcp_size > 1:
         overrides = {}
+        if server_args.enable_symm_mem:
+            logger.warning(
+                "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
+                "graph correctness issues."
+            )
+            overrides["enable_symm_mem"] = False
+
         if server_args.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
