@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
-from sglang.srt.managers.utils import AsyncD2H, GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -23,6 +23,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
+    StagedGrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
@@ -531,7 +532,7 @@ def run_eagle_verify(
     # The draft tree lives on device, so stage it now: the copies run right after
     # the draft, and the host resolves them only past the target verify launch.
     grammar_tree = (
-        AsyncD2H(
+        StagedGrammarTree(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),

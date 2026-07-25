@@ -38,6 +38,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
@@ -551,6 +552,39 @@ def generate_token_bitmask(
     return allocate_token_bitmask
 
 
+class StagedGrammarTree:
+    """The verify tree copied to the host for the grammar bitmask traversal.
+
+    Stage it where the tree becomes available -- before the target verify forward
+    is launched, so the copies run right after the draft -- and resolve() it where
+    build_grammar_vocab_mask needs the values. Everything launched in between
+    overlaps the transfer. Algorithms whose tree is already on the host (NGRAM
+    builds it there) skip this and pass their arrays straight through.
+    """
+
+    def __init__(
+        self,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ):
+        self._host = tuple(
+            _async_d2h(t)
+            for t in (retrieve_next_token, retrieve_next_sibling, draft_token)
+        )
+        device = retrieve_next_token.device
+        self._done = (
+            torch.get_device_module(device).Event() if device.type != "cpu" else None
+        )
+        if self._done is not None:
+            self._done.record()
+
+    def resolve(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._done is not None:
+            self._done.synchronize()
+        return self._host
+
+
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
@@ -565,8 +599,8 @@ def build_grammar_vocab_mask(
 
     Call it after the target verify forward is launched: the traversal is pure host
     work over the already-known draft tree, so it overlaps that forward. The tree
-    arrays must be on the host by then -- see AsyncD2H for algorithms whose tree
-    lives on device.
+    arrays must be on the host by then -- see StagedGrammarTree for algorithms
+    whose tree lives on device.
     """
     vocab_mask = generate_token_bitmask(
         reqs,
