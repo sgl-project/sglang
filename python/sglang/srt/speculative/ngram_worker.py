@@ -230,7 +230,7 @@ class NGRAMWorker(BaseSpecWorker):
         # spliced in from spec_info. Sync mode and grammar batches process
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         i = 0
         for req in batch.reqs:
             prev_tokens = (
@@ -344,7 +344,7 @@ class NGRAMWorker(BaseSpecWorker):
         i, stride = 0, self.draft_token_num
         # Same splice condition as _prepare_draft_tokens: only overlap mode
         # has accepted tokens missing from req.output_ids.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
