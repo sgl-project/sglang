@@ -149,7 +149,6 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     ]
 
 
-# 精度失败，开发定位
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = GEMMA_3_4B_IT_WEIGHTS_PATH
     extra_args = [
