@@ -785,6 +785,10 @@ class VisionAscendAttention(nn.Module):
         if not _is_npu:
             raise Exception("VisionAscendAttention is only available for ascend npu")
         super().__init__()
+        # The Ascend fused attention path does not yet consume SGLang's
+        # SDPA-style additive masks. Keep masked callers correct while retaining
+        # the optimized Ascend path for the common unmasked vision workload.
+        self.sdpa_fallback = VisionSdpaAttention(**kwargs)
 
     def forward(
         self,
@@ -796,6 +800,7 @@ class VisionAscendAttention(nn.Module):
         seq_len: int,
         softmax_scale: Optional[float] = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -804,6 +809,19 @@ class VisionAscendAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if attention_mask is not None:
+            return self.sdpa_fallback(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens,
+                bsz=bsz,
+                seq_len=seq_len,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                **kwargs,
+            )
+
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
