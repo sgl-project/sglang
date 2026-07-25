@@ -633,6 +633,7 @@ class MooncakeKVManager(CommonKVManager):
                     dst_layer_ids,
                     len(src_data_ptrs),
                     len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
@@ -1205,6 +1206,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids or [],
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1274,6 +1276,7 @@ class MooncakeKVManager(CommonKVManager):
             dst_layer_ids or [],
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1435,7 +1438,11 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
+                        if (
+                            len(kv_chunk.prefill_kv_indices) == 0
+                            or not self.kv_args.kv_data_ptrs
+                            or skip_kv
+                        ):
                             ret = 0
                         elif (
                             self.is_mla_backend
@@ -1994,7 +2001,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+            kv_item_len = (
+                self.kv_mgr.kv_args.kv_item_lens[0]
+                if self.kv_mgr.kv_args.kv_item_lens
+                else 0
+            )
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")

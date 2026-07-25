@@ -860,14 +860,18 @@ def build_state_entry_pairs(
     dst_layer_ids: List[int],
     n_src: int,
     n_dst: int,
+    allow_positional_fallback: bool = False,
 ) -> List[Tuple[int, int]]:
     """Pair prefill-local transfer entries with decode entries by layer id."""
     if n_src == 0:
         return []
     if bool(src_layer_ids) != bool(dst_layer_ids):
-        raise RuntimeError(
-            "Layer metadata must be provided by both PD peers or neither"
-        )
+        if not allow_positional_fallback:
+            raise RuntimeError(
+                "Layer metadata must be provided by both PD peers or neither"
+            )
+        src_layer_ids = []
+        dst_layer_ids = []
     if src_layer_ids:
         if len(src_layer_ids) != n_src or len(dst_layer_ids) != n_dst:
             raise RuntimeError(
@@ -888,7 +892,7 @@ def build_state_entry_pairs(
                 )
             pairs.append((i, dst_pos[lid].popleft()))
         return pairs
-    if n_src != n_dst:
+    if n_dst < n_src or (n_src != n_dst and not allow_positional_fallback):
         # Without layer ids a positional pairing would silently transfer the
         # wrong layers (e.g. PP prefill peered with a stale decode server).
         raise RuntimeError(

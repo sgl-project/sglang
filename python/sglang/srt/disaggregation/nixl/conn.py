@@ -1000,16 +1000,14 @@ class NixlKVManager(CommonKVManager):
                 else self._num_slots_src
             )
 
-            if self.kv_args.kv_layer_ids or peer_info.dst_kv_layer_ids:
-                pairs = build_state_entry_pairs(
-                    self.kv_args.kv_layer_ids,
-                    peer_info.dst_kv_layer_ids,
-                    n_src,
-                    n_dst,
-                )
-                dst_indices = [j for _, j in pairs]
-            else:
-                dst_indices = list(range(n_src))
+            pairs = build_state_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            dst_indices = [j for _, j in pairs]
             dst_kv_ptrs = [peer_info.dst_kv_ptrs[j] for j in dst_indices]
             dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_kv_data_lens = [
@@ -1893,6 +1891,7 @@ class NixlKVManager(CommonKVManager):
             dst_layer_ids or [],
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1982,6 +1981,7 @@ class NixlKVManager(CommonKVManager):
             dst_layer_ids or [],
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -2803,10 +2803,14 @@ class NixlKVReceiver(CommonKVReceiver):
             else:
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
-            dst_num_slots = (
-                self.kv_mgr.kv_args.kv_data_lens[0]
-                // self.kv_mgr.kv_args.kv_item_lens[0]
-            )
+            if self.kv_mgr.kv_args.kv_item_lens:
+                dst_kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+                dst_num_slots = (
+                    self.kv_mgr.kv_args.kv_data_lens[0] // dst_kv_item_len
+                )
+            else:
+                dst_kv_item_len = 0
+                dst_num_slots = 0
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
@@ -2825,7 +2829,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                             str(self.kv_mgr.attn_tp_size).encode("ascii"),
                             str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                            str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                            str(dst_kv_item_len).encode("ascii"),
                             packed_state_item_lens,
                             packed_state_dim_per_tensor,
                             packed_staging_base_ptr,

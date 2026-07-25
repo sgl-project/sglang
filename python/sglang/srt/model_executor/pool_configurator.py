@@ -131,8 +131,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        has_kv_on_another_pp_stage = (
+            self._cell_size == 0
+            and mambaish is not None
+            and bool(mambaish.full_attention_layer_ids)
+            and kvc.ps.pp_size > 1
+        )
         self._zero_kv_max_tokens = (
-            kvc.server_args.max_total_tokens or kvc.model_config.context_len
+            torch.iinfo(torch.int64).max
+            if has_kv_on_another_pp_stage
+            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
