@@ -13,6 +13,7 @@ from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
@@ -380,13 +381,22 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
-            # Prepare grammar data on CPU if needed
+            # Prepare grammar data on CPU if needed. Async pinned D2H, waited on
+            # just before the bitmask traversal reads it, so the copies and the
+            # traversal both overlap the target verify forward.
+            grammar_copy_done = None
             if batch.has_grammar:
-                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = verify_input.draft_token.view(
-                    verify_input.retrieve_next_token.shape
-                ).cpu()
+                retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
+                retrieve_next_sibling_cpu = _async_d2h(
+                    verify_input.retrieve_next_sibling
+                )
+                draft_tokens_cpu = _async_d2h(
+                    verify_input.draft_token.view(
+                        verify_input.retrieve_next_token.shape
+                    )
+                )
+                grammar_copy_done = torch.get_device_module(self.device).Event()
+                grammar_copy_done.record()
 
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
@@ -400,6 +410,7 @@ class NGRAMWorker(BaseSpecWorker):
             verify_input: NgramVerifyInput = batch.spec_info
             vocab_mask = None
             if batch.has_grammar:
+                grammar_copy_done.synchronize()
                 # Generate the logit mask for structured output.
                 # Overlap the CPU operations for bitmask generation with the forward pass.
                 vocab_mask = generate_token_bitmask(
@@ -413,7 +424,11 @@ class NGRAMWorker(BaseSpecWorker):
 
                 if vocab_mask is not None:
                     assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                    # non_blocking is safe here: the bitmask source is pinned and
+                    # stream order keeps the copy ahead of apply_vocab_mask.
+                    vocab_mask = vocab_mask.to(
+                        verify_input.retrieve_next_token.device, non_blocking=True
+                    )
                     # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                     # and will be applied to produce wrong results
                     batch.sampling_info.vocab_mask = None
