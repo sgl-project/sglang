@@ -59,7 +59,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKOutputFormat,
+    build_precomputed_topk_output,
+    precomputed_topk_postprocess_is_noop,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
@@ -313,6 +318,10 @@ def _add3(
     return add3.add3(a, b, c, prefetch_bc=prefetch_bc)
 
 
+# One-shot log guard: proves the merged front is live (see _ep_front).
+_EP_FRONT_LOGGED = False
+
+
 class KimiK3MoE(nn.Module):
     def __init__(
         self,
@@ -339,6 +348,9 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
+        # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
+        # a2a pair) rather than the three-way fused-front weight.
+        self._front_is_ep_pair = False
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -561,19 +573,36 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if not (self.use_latent_moe and self.shared_experts is not None):
+        if not self.use_latent_moe:
             return
-        mods = [
-            self.shared_experts.gate_up_proj,
-            self.gate,
-            self.routed_expert_down_proj,
-        ]
+        if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+            mods = [
+                self.shared_experts.gate_up_proj,
+                self.gate,
+                self.routed_expert_down_proj,
+            ]
+        elif envs.SGLANG_K3_FUSED_FRONT.get():
+            # EP a2a: the shared experts are tp1-replicated and run on the side
+            # stream, so they stay out of the merge -- but the router gate and the
+            # latent down-proj still read the same hidden_states, and merging just
+            # those two is what lets one GEMM read the activations once. The gate
+            # GEMM alone is only 896 rows, which is too few to use the machine
+            # well; folded into the 3584-row down-proj it comes almost free.
+            mods = [self.gate, self.routed_expert_down_proj]
+        else:
+            return
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
-        # NOTE: invalidate the cached property
-        self.__dict__.pop("_eligible_for_fused_front", None)
+        self._front_is_ep_pair = len(mods) == 2
+        # NOTE: invalidate the cached properties
+        for prop in (
+            "_eligible_for_fused_front",
+            "_routing_contract_ok",
+            "_ep_front_eligible",
+        ):
+            self.__dict__.pop(prop, None)
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -590,6 +619,7 @@ class KimiK3MoE(nn.Module):
             self.use_latent_moe
             and self.shared_experts is not None
             and self._front_w is not None
+            and not self._front_is_ep_pair
             and get_moe_a2a_backend().is_none()
             and self.shared_experts.down_proj.weight.dtype
             in (torch.bfloat16, torch.float16)
@@ -688,6 +718,94 @@ class KimiK3MoE(nn.Module):
             return latent
         return self.routed_expert_norm(latent)
 
+    @cached_property
+    def _routing_contract_ok(self) -> bool:
+        """Whether a kernel may emit (weights, ids) itself and bypass
+        select_experts. Shared by the fused router and the merged front."""
+        if self._eligible_for_fused_front:
+            return False
+        cfg = self.topk.topk_config
+        if cfg.output_format is not TopKOutputFormat.STANDARD:
+            return False
+        # The kernel implements sigmoid scoring with bias-ranked ungrouped top-k.
+        # Do NOT test cfg.scoring_func: it defaults to "softmax" and TopK
+        # documents it as unused. What actually selects sigmoid is the
+        # grouped-topk-with-correction-bias route (DSv3 noaux_tc), which calls
+        # biased_grouped_topk and hardwires scoring_func="sigmoid".
+        if not (cfg.use_grouped_topk and cfg.correction_bias is not None):
+            return False
+        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
+            return False
+        # A waterfill balancer rewrites the routing after the top-k; leave it on
+        # the layer path that supports it.
+        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
+            return False
+        if self.gate.e_score_correction_bias is None:
+            return False
+        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
+        # select_experts' post-processing collapses to the capture hook and the
+        # recorder -- both of which build_precomputed_topk_output runs. Bail out
+        # if that ever stops holding rather than silently dropping the remap.
+        if not precomputed_topk_postprocess_is_noop(cfg):
+            return False
+        if get_server_args().enable_deterministic_inference:
+            return False
+        try:
+            from sglang.kernels.ops.moe import moe_front
+        except Exception:
+            return False
+        return moe_front.available()
+
+    @cached_property
+    def _ep_front_eligible(self) -> bool:
+        """Static eligibility for the merged EP front (gate + latent down-proj in
+        one GEMM). Requires the two-module merge from _merge_front_weights and the
+        same routing contract the single-kernel router needs."""
+        return (
+            envs.SGLANG_K3_FUSED_FRONT.get()
+            and self._front_w is not None
+            and self._front_is_ep_pair
+            and self.use_latent_moe
+            and self.routed_expert_down_proj is not None
+            and self._routing_contract_ok
+        )
+
+    def _ep_front(self, hidden_states: torch.Tensor):
+        """Merged front: returns ``(topk_output, routed_input)``, or None when the
+        shape is not covered and the caller should run the unmerged path."""
+        if not self._ep_front_eligible:
+            return None
+        from sglang.kernels.ops.moe import moe_front
+
+        cfg = self.topk.topk_config
+        bias = self.gate.e_score_correction_bias
+        if not moe_front.fused_front_covered(
+            hidden_states, self._front_w, bias, cfg.top_k, self.moe_hidden_size
+        ):
+            return None
+
+        w, i, routed = moe_front.fused_front(
+            hidden_states,
+            self._front_w,
+            bias,
+            latent=self.moe_hidden_size,
+            topk=cfg.top_k,
+            renormalize=cfg.renormalize,
+            routed_scaling_factor=cfg.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=cfg.apply_routed_scaling_factor_on_output,
+        )
+
+        global _EP_FRONT_LOGGED
+        if not _EP_FRONT_LOGGED:
+            # An absence of fallback warnings does not prove a fast path ran.
+            _EP_FRONT_LOGGED = True
+            logger.info(
+                "K3 merged MoE front active (layer %d, %d tokens)",
+                self.layer_idx,
+                hidden_states.shape[0],
+            )
+        return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
@@ -700,25 +818,46 @@ class KimiK3MoE(nn.Module):
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
-        # Shared experts on original hidden_states — under SBO they go to the
+        # Shared experts on original hidden_states. Under SBO they go to the
         # side stream and are joined at the tail (see _sbo_shared_overlap).
+        #
+        # Issued *after* the front, deliberately: alt_stream.wait_stream() makes
+        # the side stream wait for whatever the main stream has enqueued so far,
+        # so issuing here means the shared experts overlap the routed a2a rather
+        # than the front GEMMs. The shared branch is the shorter of the two and
+        # does not need a head start; running it against the front only takes
+        # bandwidth away from the critical path.
         shared_output = None
         shared_event = None
-        if self.shared_experts is not None and hidden_states.shape[0] > 0:
+
+        def issue_shared():
+            nonlocal shared_output, shared_event
+            if self.shared_experts is None or hidden_states.shape[0] == 0:
+                return
             if self._sbo_shared_overlap:
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(hidden_states)
                     shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self.shared_experts(hidden_states)
 
-        # Gate + TopK (on original hidden_states for correct token count)
-        # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-        # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16).
-        router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        # Front: gate + TopK (+ latent down-proj when the merged front covers it).
+        # The gate and the latent down-proj read the same hidden_states, so the
+        # merged-weight strategies compute both in one GEMM; see
+        # kernels/ops/moe/moe_front.py for the strategy table.
+        routed_input = self._ep_front(hidden_states)
+        topk_output = None
+        if routed_input is not None:
+            topk_output, routed_input = routed_input
+        else:
+            # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
+            # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
+            # fp32 logits reach the radix router from moe_fused_gate.
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+
+        issue_shared()
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
@@ -739,7 +878,8 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
-        routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        if routed_input is None:
+            routed_input, _ = self.routed_expert_down_proj(hidden_states)
         expert_output = (
             self._forward_mega_experts(routed_input, topk_output)
             if self._use_mega_moe
