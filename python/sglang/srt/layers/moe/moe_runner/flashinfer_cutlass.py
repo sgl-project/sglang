@@ -99,6 +99,39 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     padded_hidden: Optional[int] = None
 
 
+@dataclass
+class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
+    """Payload for the SM100 (Blackwell) trtllm-gen MXFP4 MoE path.
+
+    Consumes MXFP4 packed weights (e2m1 x 2) with block scales and runs
+    FlashInfer's ``trtllm_fp4_block_scale_moe``. Carries BYPASSED topk (the
+    kernel routes from ``router_logits`` internally) and the precision selector
+    for its own input quant (bf16 passthrough or mxfp8).
+    """
+
+    # Packed MXFP4 weights (uint8, e2m1 x 2) + block scales. Per-tensor scale
+    # packing is annotated at the trtllm_fp4_block_scale_moe call site below.
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
+
+    # Per-expert bias + SwiGLU scalars (fp32, per expert). GPT-OSS sets these.
+    w13_weight_bias: torch.Tensor
+    w2_weight_bias: torch.Tensor
+    gemm1_alpha: torch.Tensor
+    gemm1_beta: torch.Tensor
+    gemm1_clamp_limit: torch.Tensor
+
+    global_num_experts: int
+    local_expert_offset: int
+    local_num_experts: int
+    intermediate_size_per_partition: int
+
+    hidden_size: int
+    flashinfer_mxfp4_moe_precision: str
+
+
 def _flashinfer_cutlass_fused_moe():
     if not is_flashinfer_available():
         raise RuntimeError(
@@ -298,13 +331,31 @@ def fused_experts_none_to_flashinfer_mxfp4(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    """Run the FlashInfer CUTLASS MXFP4 fused experts."""
+    """Dispatch flashinfer_mxfp4 by quant-info type.
+
+    Both mxfp4 paths register under this single ``("none", "flashinfer_mxfp4")``
+    key but call different kernels, so the payload type selects between them.
+    """
+    if isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_sm90_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
+    if isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
+        return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+            dispatch_output, quant_info, runner_config
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    )
+
+
+def _fused_experts_flashinfer_mxfp4_sm90_cutlass(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-    assert isinstance(
-        quant_info, FlashInferCutlassMxfp4MoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
 
     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
@@ -393,3 +444,92 @@ def fused_experts_none_to_flashinfer_mxfp4(
         out = out[:, :origin_hidden].contiguous()
 
     return StandardCombineInput(hidden_states=out)
+
+
+def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """SM100 (Blackwell) trtllm-gen MXFP4 fused experts.
+
+    Consumes BYPASSED topk directly -- the kernel routes from ``router_logits``
+    internally, so there is no ``to_standard()`` conversion -- and quantizes the
+    input itself (bf16 passthrough or mxfp8).
+    """
+    from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
+
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+
+    # When bf16 mode is enabled we skip input quant; TRT-LLM quantizes inside the
+    # kernel and pipelines it with the GEMMs.
+    origin_hidden_states_dim = x.shape[-1]
+    if quant_info.flashinfer_mxfp4_moe_precision == "bf16":
+        assert x.dtype == torch.bfloat16
+        x_quant = x
+        x_scale = None
+        if quant_info.hidden_size != origin_hidden_states_dim:
+            x_quant = torch.nn.functional.pad(
+                x_quant,
+                (0, quant_info.hidden_size - origin_hidden_states_dim),
+                mode="constant",
+                value=0.0,
+            )
+    elif quant_info.flashinfer_mxfp4_moe_precision == "default":
+        x_quant, x_scale = mxfp8_quantize(x, False, alignment=quant_info.hidden_size)
+        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+    else:
+        raise NotImplementedError(
+            f"Unsupported flashinfer_mxfp4_moe_precision: "
+            f"{quant_info.flashinfer_mxfp4_moe_precision}"
+        )
+
+    assert x_quant.shape[-1] == quant_info.hidden_size
+    assert TopKOutputChecker.format_is_bypassed(topk_output)
+
+    top_k = topk_output.topk_config.top_k
+    router_logits = topk_output.router_logits
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        num_tokens = x_quant.shape[0]
+        symm_output = torch.empty(
+            num_tokens,
+            origin_hidden_states_dim,
+            dtype=torch.bfloat16,
+            device=x_quant.device,
+        )
+    trtllm_gen_output = trtllm_fp4_block_scale_moe(
+        router_logits.to(torch.bfloat16),
+        None,  # routing_bias
+        x_quant,
+        x_scale,
+        quant_info.w13_weight,  # uint8 (e2m1 x 2)
+        quant_info.w13_weight_scale,  # uint8 (e4m3 x 2)
+        quant_info.w13_weight_bias,  # fp32 per expert per channel
+        quant_info.gemm1_alpha,  # fp32 per expert
+        quant_info.gemm1_beta,  # fp32 per expert
+        quant_info.gemm1_clamp_limit,  # fp32 per expert
+        quant_info.w2_weight,  # uint8 (e2m1 x 2)
+        quant_info.w2_weight_scale,  # ue8m0
+        quant_info.w2_weight_bias,  # fp32 per expert per channel
+        None,  # output1_scale_scalar
+        None,  # output1_scale_gate_scalar
+        None,  # output2_scale_scalar
+        quant_info.global_num_experts,
+        top_k,
+        None,  # n_group      # TODO: support n_group
+        None,  # topk_group   # TODO: support topk_group
+        quant_info.intermediate_size_per_partition,  # padded to multiple of 256
+        quant_info.local_expert_offset,
+        quant_info.local_num_experts,
+        None,  # routed_scaling_factor
+        1,  # routing_method_type, renormalize
+        True,  # do finalize
+        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+        output=symm_output,
+    )[0]
+    return StandardCombineInput(hidden_states=trtllm_gen_output)
