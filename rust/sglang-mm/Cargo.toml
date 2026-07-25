@@ -18,14 +18,29 @@ debug = false
 # name comes from the `#[pymodule]` entry point and the setuptools-rust
 # `target` in python/pyproject.toml, which renames the built artifact.
 name = "sglang_mm_core"
-crate-type = ["cdylib"]
+# cdylib: the PyO3 module (`sglang.srt.multimodal._core`).
+# rlib:   pure-Rust core linked by sglang-server's native MM path.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `python` gates every PyO3 binding. sglang-server links the pure-Rust core
+# with `default-features = false` so pyo3's extension-module linker config
+# never leaks into the server's own dependency graph.
+default = ["python"]
+python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
-pyo3 = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+numpy = { version = "0.29", optional = true }
 
 base64 = "0.22"
 blake3 = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-numpy = "0.29"
 rayon = "1.10"
+rmpv = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Native media fetch (stage 1 of the server MM pipeline); rustls so the
+# extension never links the system OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
