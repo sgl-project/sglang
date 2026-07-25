@@ -620,7 +620,7 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
-        self, extend_input_len: int, swa_host_hit_length: int = 0
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
@@ -629,26 +629,48 @@ class PrefillAdder:
           + chunk N+1 (new allocation)
         Since chunk N and locked tokens are already excluded from
         swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation. We floor at sliding_window_size to reserve
-        room for the decode phase.
+        chunk N+1 allocation plus decode headroom (see _swa_reserved_tokens).
         """
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
         window = self.tree_cache.sliding_window_size
-        return max(alloc - window, 0) + self._swa_reserved_tokens(swa_host_hit_length)
+        return max(alloc - window, 0) + self._swa_reserved_tokens(
+            extend_input_len, max_new_tokens, swa_host_hit_length
+        )
 
-    def _swa_reserved_tokens(self, swa_host_hit_length: int = 0) -> int:
-        """SWA tokens a request needs regardless of extend length: the sliding
-        window (decode headroom) + allocator page slack + the load-back window
-        charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap."""
-        reserved = self.tree_cache.sliding_window_size + self.page_size
+    def _swa_reserved_tokens(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> int:
+        """SWA slots a request adds to its own sliding window + page slack + the
+        load-back charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap.
+
+        A request's steady SWA footprint is one sliding window; the tokens it
+        newly contributes to that window are its extend + decode, and a cached
+        SWA prefix funds the rest, so the headroom is min(extend + decode,
+        window) — NOT a constant window. Charging a full window regardless
+        double-charged a short cached-prefix resume (its window is already
+        provided by the locked prefix): at a ~2-window SWA pool admission
+        rejected it forever while LPM kept it at the queue head (idle GPU, 100%
+        scheduler CPU). Including the extend keeps the reservation at or above
+        the immediate prefill allocation so an admitted request cannot OOM."""
+        window = self.tree_cache.sliding_window_size
+        headroom = min(extend_input_len + max_new_tokens, window)
+        reserved = headroom + self.page_size
         if swa_host_hit_length > 0:
             reserved += self.ceil_paged_tokens(swa_host_hit_length)
         return reserved
 
-    def _swa_chunk_cap(self, swa_host_hit_length: int = 0) -> int:
+    def _swa_new_tokens(self, req: Req) -> int:
+        """Tokens a request may still decode, for SWA headroom sizing."""
+        return max(
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            - len(req.output_ids),
+            0,
+        )
+
+    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
         """Largest page-aligned extend chunk the SWA pool can admit right now,
         keeping a sliding window of headroom below rem_swa_tokens; 0 if not
         even one page fits. Only valid when is_hybrid_swa is True.
@@ -659,7 +681,11 @@ class PrefillAdder:
         forever (head-of-line livelock). Shrinking is sound because past a
         chunk boundary only the sliding window stays locked — the rest turns
         evictable — so each pass's transient footprint fits the pool."""
-        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(swa_host_hit_length)
+        # extend_input_len=0: this solves for the extend chunk itself, so the
+        # reserved headroom is the post-chunk decode window only.
+        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
+            0, max_new_tokens, swa_host_hit_length
+        )
         if cap <= 0:
             return 0
         return cap // self.page_size * self.page_size
@@ -735,7 +761,9 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += self._swa_budget_for_req(
+                extend_input_len, max_new_tokens
+            )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -906,7 +934,12 @@ class PrefillAdder:
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
-            if self._swa_budget_for_req(cand_extend_input_len) > self.rem_swa_tokens:
+            if (
+                self._swa_budget_for_req(
+                    cand_extend_input_len, self._swa_new_tokens(req)
+                )
+                > self.rem_swa_tokens
+            ):
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -1053,10 +1086,14 @@ class PrefillAdder:
             # driven only by the freshly-prefilled tail (the loaded window is
             # charged separately via swa_host_hit_length).
             swa_needed = self._swa_budget_for_req(
-                real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
+                real_input_tokens,
+                self._swa_new_tokens(req),
+                swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
-                swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                swa_cap = self._swa_chunk_cap(
+                    self._swa_new_tokens(req), req.swa_host_hit_length
+                )
                 if self.rem_chunk_tokens is None or swa_cap <= 0:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
@@ -1079,10 +1116,14 @@ class PrefillAdder:
             if self.is_hybrid_swa:
                 # self.rem_swa_tokens may decrease after the lock acquisition
                 swa_needed = self._swa_budget_for_req(
-                    real_input_tokens, swa_host_hit_length=req.swa_host_hit_length
+                    real_input_tokens,
+                    self._swa_new_tokens(req),
+                    swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
-                    swa_cap = self._swa_chunk_cap(req.swa_host_hit_length)
+                    swa_cap = self._swa_chunk_cap(
+                        self._swa_new_tokens(req), req.swa_host_hit_length
+                    )
                     if self.rem_chunk_tokens is None or swa_cap <= 0:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
