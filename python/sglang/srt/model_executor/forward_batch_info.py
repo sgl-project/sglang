@@ -794,9 +794,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         ret.num_token_non_padded_cpu = num_tokens
 
+        global_num_tokens_source = batch.global_num_tokens
+        global_num_tokens_for_logprob_source = batch.global_num_tokens_for_logprob
+        if model_runner.is_draft_worker and batch.draft_global_num_tokens is not None:
+            global_num_tokens_source = batch.draft_global_num_tokens
+            global_num_tokens_for_logprob_source = (
+                batch.draft_global_num_tokens_for_logprob
+            )
+
         # For MLP sync
-        if batch.global_num_tokens is not None:
-            assert batch.global_num_tokens_for_logprob is not None
+        if global_num_tokens_source is not None:
+            assert global_num_tokens_for_logprob_source is not None
 
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
@@ -807,15 +815,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens, global_num_tokens_for_logprob = (
                     spec_scale_global_num_tokens(
                         batch.spec_info,
-                        batch.global_num_tokens,
-                        batch.global_num_tokens_for_logprob,
+                        global_num_tokens_source,
+                        global_num_tokens_for_logprob_source,
                     )
                 )
             else:
-                global_num_tokens = batch.global_num_tokens
-                global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
+                global_num_tokens = global_num_tokens_source
+                global_num_tokens_for_logprob = global_num_tokens_for_logprob_source
 
-            ret.original_global_num_tokens_cpu = batch.global_num_tokens
+            ret.original_global_num_tokens_cpu = global_num_tokens_source
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
@@ -1533,6 +1541,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if self.forward_mode.is_idle():
+                    self.positions = self.positions[:bs]
+                    self.seq_lens = self.seq_lens[:bs]
+                    self.req_pool_indices = self.req_pool_indices[:bs]
+                    if self.seq_lens_cpu is not None:
+                        self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
