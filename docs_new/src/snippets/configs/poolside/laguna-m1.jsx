@@ -100,16 +100,14 @@ sgl-eval run gsm8k \\
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
-  // Pinned nightly with the Laguna-M.1 build (PR #28400 + #28604 + #28649; cu13 covers H200 + all Blackwell).
-  // dev-cu13-618-nightly was generated after the FP8 g_proj fix (#28649) landed, so it serves FP8 too.
-  // (Equivalent pip nightly: 0.5.14.dev20260618+g97e3b8998d.) Blackwell FP8 additionally needs the
-  // --fp8-gemm-backend triton flag (in those cells) until PR #28662 merges.
+  // lmsysorg/sglang:latest (cu13) covers H200 + all Blackwell and carries the
+  // Laguna-M.1 build (PR #28400 + #28604 + #28649, incl. the FP8 g_proj fix).
   dockerImages: {
-    h200:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    b200:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    b300:  "lmsysorg/sglang:dev-cu13-618-nightly",
-    gb200: "lmsysorg/sglang:dev-cu13-618-nightly",
-    gb300: "lmsysorg/sglang:dev-cu13-618-nightly",
+    h200:  "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb200: "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -232,7 +230,7 @@ sgl-eval run gsm8k \\
     },
     {
       // VERIFIED on 8xH200 (FP8, tp8): GSM8K 93.25%. FP8 needs the g_proj fix (PR #28649, MERGED) on
-      // top of #28400+#28604 — the pinned dev-cu13-618-nightly image has it. Hopper does NOT hit the
+      // top of #28400+#28604 — lmsysorg/sglang:latest has it. Hopper does NOT hit the
       // Blackwell DeepGEMM UE8M0 issue, so no --fp8-gemm-backend flag here.
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: true,

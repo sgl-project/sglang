@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
@@ -48,6 +49,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     FullComponent,
     LRURefreshPhase,
     MambaComponent,
+    PrepareLoadBackResult,
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
@@ -370,6 +372,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -540,8 +543,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             params,
             server_args,
             load_cache_event=self.load_cache_event,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
             storage_backend=storage_backend,
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
@@ -568,6 +569,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
+
+    def release_host_resources(self) -> None:
+        if self.host_pool_group is not None:
+            self.host_pool_group.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -611,6 +616,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self._insert_helper(self.root_node, key, value, params)
         return result
+
+    @property
+    def is_write_back(self) -> bool:
+        return (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -881,6 +893,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # The rematch acquired a new SWA prefix lock.
+        req.swa_prefix_lock_released = False
 
         # cleanup
         for comp in self._components_tuple:
@@ -1499,24 +1513,89 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
+                    if self._drop_subtree_no_host(node, tracker):
+                        logger.warning(
+                            "write_back: KV subtree dropped without backup "
+                            "due to host memory pressure, root node %d",
+                            node.id,
+                        )
+                    else:
+                        logger.warning(
+                            "write_back: backup failed under host memory "
+                            "pressure but subtree drop declined (node "
+                            "locked); root node %d stays device-resident "
+                            "until host space frees",
+                            node.id,
+                        )
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
-                self._record_remove_event(node, medium=StorageMedium.GPU)
-                for comp in self._components_tuple:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                parent = node.parent
-                self._remove_leaf_from_parent(node)
-                self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._delete_unbacked_device_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _drop_subtree_no_host(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """Write-back fallback when a D-leaf's D->H backup fails under host
+        memory pressure: drop the subtree rooted at the unbacked leaf so
+        device eviction keeps making progress instead of leaving its KV
+        unevictable until host space frees up."""
+
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        # A failed backup never issues the D->H copy, so the subtree root has
+        # no host state and no in-flight DMA reading its device slots.
+        assert not node.backuped and node.write_through_pending_id is None
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        descendants: list[UnifiedTreeNode] = []
+        stack = list(node.children.values())
+        while stack:
+            cur = stack.pop()
+            if any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
+            ):
+                return False
+            descendants.append(cur)
+            stack.extend(cur.children.values())
+        for desc in reversed(descendants):
+            # Host-only by construction: a device descendant would contradict
+            # this node being a D-leaf, and D-leaves evict before ancestors.
+            assert desc.evicted and desc.backuped, f"node {desc.id} not host-only"
+            assert desc.write_through_pending_id is None
+            self._release_all_component_layers(desc, StorageMedium.CPU, tracker)
+            self._remove_leaf_from_parent(desc)
+        self._delete_unbacked_device_leaf(node, tracker)
+        return True
+
+    def _release_all_component_layers(
+        self,
+        node: UnifiedTreeNode,
+        medium: StorageMedium,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Free every component layer on the node and detach it from the LRU
+        lists and evictable leaf sets."""
+        self._record_remove_event(node, medium=medium)
+        for comp in self._components_tuple:
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
+            )
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+
+    def _delete_unbacked_device_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Delete a device leaf that has no host backup, freeing all layers."""
+        self._release_all_component_layers(node, StorageMedium.GPU, tracker)
+        parent = node.parent
+        self._remove_leaf_from_parent(node)
+        self._update_evictable_leaf_sets(parent)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1677,8 +1756,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Lock path & pre-evict if device pool is insufficient
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
-        kv_tokens = len(kv_xfer.host_indices)
 
+        # Let each component pre-allocate per-request state for the load-back;
+        # the finally below lets components recover it unless the load succeeds.
+        preps: dict[ComponentType, PrepareLoadBackResult] = {
+            comp.component_type: comp.prepare_load_back(best_match_node, req=req)
+            for comp in self._components_tuple
+        }
+        success = False
+        try:
+            success = self._load_back_transfers(
+                best_match_node=best_match_node,
+                mem_quota=mem_quota,
+                req=req,
+                kv_xfer=kv_xfer,
+                result=result,
+                ancestor_lock_params=ancestor_lock_params,
+                host_anchor_params=host_anchor_params,
+            )
+            return success
+        finally:
+            for comp in self._components_tuple:
+                comp.finalize_load_back(req, preps[comp.component_type], success)
+
+    def _load_back_transfers(
+        self,
+        *,
+        best_match_node: UnifiedTreeNode,
+        mem_quota: Optional[int],
+        req,
+        kv_xfer: PoolTransfer,
+        result: IncLockRefResult,
+        ancestor_lock_params: Optional[DecLockRefParams],
+        host_anchor_params: Optional[DecLockRefParams],
+    ) -> bool:
+        kv_tokens = len(kv_xfer.host_indices)
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
@@ -2005,20 +2117,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        min_completed_tokens = completed_tokens
-        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
-            )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
-            min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+
+        min_completed_tokens = self._sync_and_check_hybrid_prefetch_result(
+            req_id,
+            operation,
+            completed_tokens,
+            hash_value,
+            host_indices,
+            last_host_node,
+            anchor_lock_params,
+            prefetch_key,
+        )
+        if min_completed_tokens is None:
+            # Hybrid all-or-nothing check failed; result already discarded.
+            return True
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2062,6 +2174,87 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
+
+    def _sync_and_check_hybrid_prefetch_result(
+        self,
+        req_id: str,
+        operation: PrefetchOperation,
+        completed_tokens: int,
+        hash_value: list[str],
+        host_indices: torch.Tensor,
+        last_host_node: UnifiedTreeNode,
+        anchor_lock_params: DecLockRefParams,
+        prefetch_key: RadixKey,
+    ) -> Optional[int]:
+        """Sync prefetch results across ATTN groups and decide the usable prefix.
+
+        Two strategies depending on the hybrid layout:
+
+        * DSA-style (Full attention + KV-derived ALL_PAGES sidecar such as the
+          DSA / MiniMax indexer): *clamp* to the minimum fetched prefix shared by
+          the Full KV pool and every sidecar. A partial prefix is still usable
+          because the sidecar is page-aligned with KV and required for every page.
+        * Everything else (SWA / Mamba components, mixed DeepSeekV4 stacks):
+          *all-or-nothing*. Their pools only cover a window / tail and cannot be
+          truncated page by page, so any shortfall discards the whole prefetch.
+
+        Returns the synced usable token count (possibly clamped, possibly 0), or
+        ``None`` when an all-or-nothing prefetch was discarded (the caller should
+        then treat the prefetch as finished).
+        """
+        # Sync completed tokens and per-pool hit pages across ATTN groups, taking
+        # the minimum so every rank agrees on the same usable prefix length.
+        pool_transfers = operation.pool_transfers or []
+        hit_pages = (
+            operation.pool_storage_result.extra_pool_hit_pages if pool_transfers else {}
+        )
+        pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
+        packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
+        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        min_completed_tokens = int(packed[0].item())
+        pool_hit_pages = list(map(int, packed[1:].tolist()))
+        for transfer, count in zip(pool_transfers, pool_hit_pages):
+            hit_pages[transfer.name] = count
+
+        # DSA-style clamp: every sidecar is KV-derived and required for the whole
+        # prefix (ALL_PAGES), so the usable length is simply the shared minimum of
+        # the Full KV completion and each sidecar hit.
+        clampable = bool(pool_transfers) and all(
+            t.hit_policy == PoolHitPolicy.ALL_PAGES
+            and t.indices_from_pool == PoolName.KV
+            for t in pool_transfers
+        )
+        if clampable:
+            usable_pages = min(min_completed_tokens // self.page_size, *pool_hit_pages)
+            return usable_pages * self.page_size
+
+        # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
+        # must cover the same fetched prefix. If any pool falls short the whole
+        # prefetch result is unusable, so discard it and release everything.
+        expected_tokens = len(hash_value) * self.page_size
+        all_succeeded = min_completed_tokens == expected_tokens and all(
+            transfer.keys is not None and count == len(transfer.keys)
+            for transfer, count in zip(pool_transfers, pool_hit_pages)
+        )
+        if pool_transfers and not all_succeeded:
+            # The controller's prefetch IO thread already releases the untransferred
+            # tail (host_indices[completed_tokens:])
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers,
+            )
+            self.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            logger.warning(
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                req_id,
+                completed_tokens,
+                expected_tokens,
+            )
+            return None
+        return min_completed_tokens
 
     def terminate_prefetch(self, req_id: str) -> None:
         if req_id not in self.ongoing_prefetch:

@@ -149,7 +149,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); H100 (TP=8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving on B200 / B300 / GB200 / GB300 / H200 (TP=4); RTX PRO 6000 (TP=2); H100 (TP=8)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
@@ -293,9 +293,8 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 
 **RTX PRO 6000 (SM120 / Blackwell Desktop) note**
 
-RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
-**low-latency / TP-only** recipe (TP=4, single node) with the **Marlin** W4A16 MoE runner and
-`--mem-fraction-static 0.70`; the Deploy panel greys out the other recipes for this card.
+RTX PRO 6000 (96 GB) runs **Flash only** with the FlashInfer MXFP4 MoE runner.
+V4-Pro doesn't fit on 8× 96 GB; the Deploy panel greys out unsupported recipes.
 HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 **AMD (MI300X / MI355X) note**

@@ -339,7 +339,7 @@ class TritonLoRABackend(BaseLoRABackend):
                     merged_segments = merge_and_chunk_segments(
                         seg_wi, seg_lens_list, chunk_size=pass_total
                     )
-                    self.lm_head_pass_batch_infos.append(
+                    lm_head_pass_batch_infos.append(
                         self._build_lm_head_batch_info(
                             merged_segments, batch_info, pass_total
                         )
