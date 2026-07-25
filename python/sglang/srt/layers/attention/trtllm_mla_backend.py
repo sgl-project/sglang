@@ -139,6 +139,13 @@ class TRTLLMMLAPrefillMetadata:
     fallback_to_flashinfer_impl: bool = False
 
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
+# Arm PDL on the trtllm-gen decode launch so its prolog overlaps the tail of
+# the query-prep kernels (which already trigger their PDL secondary).
+_ENABLE_PDL = is_arch_support_pdl()
+
+
 @dataclass
 class TRTLLMMLADecodeMetadata:
     """Metadata for TRTLLM MLA decode operations."""
@@ -443,6 +450,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
+        if metadata.seq_lens_k is None:
+            # Plain decode: static int32 seq_lens buffer, refreshed by the
+            # capture+replay body below (same pattern as target-verify).
+            metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
+
         # Capture with full width so future longer sequences are safe during replay.
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
@@ -481,6 +493,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+        elif metadata.seq_lens_k is not None:
+            # Plain decode: int64 -> int32 downcast copy into the static
+            # buffer (once per step, replacing the per-layer conversion).
+            metadata.seq_lens_k.copy_(seq_lens[:bs])
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[
@@ -648,6 +664,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.global_seq_lens_k = (
                     self.forward_decode_metadata.seq_lens_k
                 )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                # One int32 conversion per step; forward_decode reads it back
+                # so the per-layer .to(int32) in _run_decode_kernel stays a
+                # no-op (24 elementwise copies/step otherwise).
+                self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -784,6 +805,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
+            enable_pdl=_ENABLE_PDL,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -938,7 +960,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query=query,
             kv_cache=kv_cache,
             block_tables=metadata.block_kv_indices,
-            seq_lens=forward_batch.seq_lens,
+            seq_lens=(
+                metadata.seq_lens_k
+                if metadata.seq_lens_k is not None
+                else forward_batch.seq_lens
+            ),
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
         )
