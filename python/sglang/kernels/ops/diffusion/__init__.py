@@ -29,7 +29,7 @@ register_kernel(
         target="sglang.kernels.ops.diffusion.group_norm_silu:apply_group_norm_silu",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="fused GroupNorm + SiLU"),
-        description="Fused group-norm + SiLU (sglang.jit_kernel).",
+        description="Fused group-norm + SiLU (sglang.kernels.jit).",
     )
 )
 register_kernel(
@@ -39,7 +39,7 @@ register_kernel(
         target="sglang.kernels.ops.diffusion.residual_gate_add:residual_gate_add_cuda",
         capabilities=_CUDA,
         format_signature=FormatSignature(description="residual + gate * update"),
-        description="Fused residual gate-add (sglang.jit_kernel).",
+        description="Fused residual gate-add (sglang.kernels.jit).",
     )
 )
 register_kernel(
@@ -51,7 +51,7 @@ register_kernel(
         format_signature=FormatSignature(
             in_place=True, description="fused in-place QK-norm + RoPE"
         ),
-        description="Fused QK-norm + RoPE (sglang.jit_kernel).",
+        description="Fused QK-norm + RoPE (sglang.kernels.jit).",
     )
 )
 
