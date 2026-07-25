@@ -175,7 +175,7 @@ Some metrics are only created when the corresponding feature is turned on:
 | LoRA | LoRA serving enabled | `lora_pool_slots_used`, `lora_pool_slots_total`, `lora_pool_utilization` |
 | Hierarchical (Hi)Cache | `--enable-hierarchical-cache` | `hicache_host_used_tokens`, `hicache_host_total_tokens`, `evicted_tokens_total`, `eviction_duration_seconds`, `load_back_tokens_total`, `load_back_duration_seconds` |
 | L3 / storage tier | storage backend enabled | `prefetched_tokens_total`, `backuped_tokens_total`, `prefetch_pgs`, `backup_pgs`, `prefetch_bandwidth`, `backup_bandwidth` |
-| Prefill/Decode disaggregation | disaggregation mode enabled | queue-depth, `kv_transfer_*`, `num_bootstrap_failed_reqs_total`, `num_transfer_failed_reqs_total` |
+| Prefill/Decode disaggregation | disaggregation mode enabled | `num_prefill_bootstrap_queue_reqs`, `num_prefill_inflight_queue_reqs`, `num_decode_prealloc_queue_reqs`, `num_decode_transfer_queue_reqs`, `kv_transfer_*`, `num_bootstrap_failed_reqs_total`, `num_transfer_failed_reqs_total`, `num_prefill_retries_total` |
 | Per-device forward timing | `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1` | `forward_execution_seconds_total`, `dp_cooperation_forward_execution_seconds_total` |
 | Expert parallelism load balancing | `SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC=1` (MoE, `moe_ep_rank == 0`) | `eplb_balancedness` |
 | EPLB heatmap | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL > 0` | `eplb_gpu_physical_count` |
@@ -195,7 +195,6 @@ also marked with `†` in the tables below.
 | `sglang:max_running_requests_under_SLO` | Source value is never assigned anywhere, so the gauge is never emitted. |
 | `sglang:pending_prealloc_token_usage` | Backing `SchedulerStats` field is never populated; always `0`. |
 | `sglang:is_cuda_graph` | Backing `SchedulerStats` field is never populated; superseded by `cuda_graph_passes_total`. |
-| `sglang:num_prefill_retries_total` | `increment_prefill_retries()` has no callers. |
 | `sglang:num_grammar_total` | Populated only by `log_grammar_stats()`, which has no callers. |
 | `sglang:num_grammar_cache_hit_total` | Populated only by `log_grammar_stats()`, which has no callers. |
 | `sglang:num_grammar_aborted_total` | Populated only by `log_grammar_stats()`, which has no callers. |
@@ -226,9 +225,17 @@ also marked with `†` in the tables below.
 | `sglang:time_to_first_token_seconds` | Histogram | | Histogram of time to first token in seconds. |
 | `sglang:inter_token_latency_seconds` | Histogram | | Histogram of inter-token latency in seconds. |
 | `sglang:e2e_request_latency_seconds` | Histogram | | Histogram of end-to-end request latency in seconds. |
-| `sglang:per_stage_req_latency_seconds` | Histogram | `stage` | Latency of each stage of a request's lifecycle. |
-| `sglang:queue_time_seconds` | Histogram | | Histogram of queueing time in seconds. |
+| `sglang:per_stage_req_latency_seconds` ‡ | Histogram | `stage` | Latency of each stage of a request's lifecycle. |
+| `sglang:queue_time_seconds` ‡ | Histogram | | Histogram of queueing time in seconds. |
 | `sglang:get_loads_duration_seconds` | Histogram | | Time spent serving `/v1/loads` requests in seconds. |
+
+> ‡ Listed here because they describe the request lifecycle, but they are
+> registered on `SchedulerMetricsCollector`, not on the tokenizer collector.
+> They therefore carry the scheduler label set — `model_name`, `engine_type`,
+> `tp_rank`, `pp_rank`, `moe_ep_rank`, plus `dp_rank` when data parallelism is
+> enabled — rather than `model_name` alone, so queries must aggregate across
+> ranks:
+> `histogram_quantile(0.99, sum by (le) (rate(sglang:queue_time_seconds_bucket[5m])))`.
 
 ### Scheduler state
 
@@ -274,7 +281,7 @@ also marked with `†` in the tables below.
 | `sglang:num_retracted_requests_total` | Counter | | Total number of retracted requests. |
 | `sglang:num_retracted_input_tokens_total` | Counter | | Total number of retracted input tokens. |
 | `sglang:num_retracted_output_tokens_total` | Counter | | Total number of retracted output tokens. |
-| `sglang:num_prefill_retries_total` † | Counter | | Total number of prefill retries. |
+| `sglang:num_prefill_retries_total` | Counter | | Total number of prefill retries. Incremented from the prefill-disaggregation retry path, so it stays `0` unless disaggregation is enabled. |
 
 ### Speculative decoding
 
