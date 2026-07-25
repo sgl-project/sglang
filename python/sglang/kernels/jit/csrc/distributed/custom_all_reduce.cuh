@@ -532,8 +532,7 @@ struct AllReduceKernel {
   static constexpr auto kernel_pull =
       all_reduce_kernel<AllReducePullImpl<T, kWorldSize, kPullMode, kUsePDL>, kWorldSize, kShot>;
   template <int kShot>
-  static constexpr auto kernel_push =
-      all_reduce_kernel<AllReducePushImpl<T, kWorldSize, kUsePDL>, kWorldSize, kShot>;
+  static constexpr auto kernel_push = all_reduce_kernel<AllReducePushImpl<T, kWorldSize, kUsePDL>, kWorldSize, kShot>;
 
  public:
   static Tensor run(CommunicatorRef ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg) {
