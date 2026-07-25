@@ -28,6 +28,12 @@ pub fn expand_placeholders(
             counts.len()
         ));
     }
+    // A zero count would underflow the inclusive end offset below. No current
+    // family produces one (grids are at least one merged patch), so treat it
+    // as a malformed item rather than a supported shape.
+    if let Some(i) = counts.iter().position(|&n| n == 0) {
+        return Err(format!("media item {i} expands to zero tokens"));
+    }
     let total: usize = counts.iter().sum();
     let mut out = Vec::with_capacity(ids.len() - found + total);
     let mut offsets = Vec::with_capacity(counts.len());
@@ -65,6 +71,11 @@ mod tests {
     fn count_mismatch_errs() {
         assert!(expand_placeholders(&[7, 1, 9], 1, &[2, 3]).is_err());
         assert!(expand_placeholders(&[7, 1, 1, 9], 1, &[2]).is_err());
+    }
+
+    #[test]
+    fn zero_count_errs() {
+        assert!(expand_placeholders(&[7, 1, 9], 1, &[0]).is_err());
     }
 
     #[test]

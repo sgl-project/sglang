@@ -10,6 +10,10 @@ use crate::registry::{MropeItem, Pipeline, ProcessedImage};
 pub struct MmResult {
     pub features: Vec<f32>,
     pub grids: Vec<[u32; 3]>,
+    /// Content hash of each image's `pixel_values` bytes — same identity
+    /// domain as the Python path's `hash_feature`, but a different algorithm
+    /// (blake3 here vs SHA-256 there): hashes are consistent within the
+    /// native path, never comparable across the two paths.
     pub hashes: Vec<u64>,
     pub offsets: Vec<(u32, u32)>,
     pub mrope: Vec<i64>,
@@ -36,9 +40,9 @@ pub fn process(
             .images
             .par_iter()
             .map(|source| {
-                let bytes = match source {
-                    ImageSource::String(source) => fetch::fetch_bytes(source)?,
-                    ImageSource::Bytes(bytes) => bytes.clone(),
+                let bytes: std::borrow::Cow<'_, [u8]> = match source {
+                    ImageSource::String(source) => fetch::fetch_bytes(source)?.into(),
+                    ImageSource::Bytes(bytes) => bytes.as_slice().into(),
                 };
                 // The Python (PIL) path decodes more formats (GIF/WebP/BMP,
                 // 16-bit PNG); those error here and reject the request.

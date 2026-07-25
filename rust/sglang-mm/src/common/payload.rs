@@ -35,7 +35,12 @@ pub fn parse(payload: &[u8]) -> Result<Payload, String> {
 
     let text = match &fields[0] {
         Value::Nil => None,
-        Value::String(value) => value.as_str().map(str::to_owned),
+        Value::String(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| "mm payload: non-utf8 text".to_string())?
+                .to_owned(),
+        ),
         _ => return Err("mm payload: non-string text".into()),
     };
     let input_ids = match &fields[1] {
@@ -46,7 +51,7 @@ pub fn parse(payload: &[u8]) -> Result<Payload, String> {
                 .map(|value| {
                     value
                         .as_i64()
-                        .map(|id| id as i32)
+                        .and_then(|id| i32::try_from(id).ok())
                         .ok_or_else(|| "mm payload: non-int input id".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -189,13 +194,18 @@ mod tests {
 
     #[test]
     fn rejects_non_integer_input_ids() {
-        let payload = encode(vec![
-            Value::Nil,
-            Value::Array(vec![Value::from("not-an-id")]),
-            Value::from("a"),
-            Value::Nil,
-            Value::Nil,
-        ]);
-        assert!(parse(&payload).is_err());
+        for bad_id in [
+            Value::from("not-an-id"),
+            Value::from(i64::from(i32::MAX) + 1),
+        ] {
+            let payload = encode(vec![
+                Value::Nil,
+                Value::Array(vec![bad_id]),
+                Value::from("a"),
+                Value::Nil,
+                Value::Nil,
+            ]);
+            assert!(parse(&payload).is_err());
+        }
     }
 }

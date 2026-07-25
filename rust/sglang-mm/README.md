@@ -49,6 +49,11 @@ Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
 Adding one = a `VisionProcessor` impl in `src/<model>/mod.rs` plus a `family`
 arm in `pipeline_from_spec`.
 
+`common::fetch` matches the Python `get_image_bytes` semantics
+(`REQUEST_TIMEOUT` env, proxy env vars) with two deliberate differences:
+HTTP downloads are capped at 64 MiB, and `NO_PROXY` is not honored (ureq
+limitation).
+
 ## Python API
 
 ```python

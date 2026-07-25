@@ -4,9 +4,13 @@
 //! raw bytes, `http(s)://` (bounded download, `REQUEST_TIMEOUT` env like
 //! Python), `file://` / absolute path, `data:` URL, else bare base64.
 
+use std::io::Read;
+use std::sync::OnceLock;
+
 use base64::Engine;
 
-/// Cap on a fetched payload so a bad URL can't buffer unboundedly.
+/// Cap on a fetched payload so a bad URL can't buffer unboundedly (the Python
+/// path has no such cap; oversized responses reject the request here).
 const MAX_FETCH_BYTES: u64 = 64 << 20;
 
 /// Resolve one string-typed image source into raw encoded-image bytes.
@@ -34,9 +38,19 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
 }
 
 fn b64(encoded: &str) -> Result<Vec<u8>, String> {
+    // Slightly laxer than Python's `pybase64.b64decode(validate=True)`:
+    // surrounding whitespace (e.g. a trailing newline) is trimmed here.
     base64::engine::general_purpose::STANDARD
         .decode(encoded.trim().as_bytes())
         .map_err(|e| format!("media fetch: base64 decode: {e}"))
+}
+
+/// Shared pooled agent. Env proxy detection matches the Python `requests`
+/// session (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`; ureq has no `NO_PROXY`
+/// support — the one remaining divergence).
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().try_proxy_from_env(true).build())
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>, String> {
@@ -45,7 +59,8 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(3);
-    let resp = ureq::get(url)
+    let resp = http_agent()
+        .get(url)
         .timeout(std::time::Duration::from_secs(timeout))
         .call()
         .map_err(|e| format!("media fetch: GET {url}: {e}"))?;
@@ -61,8 +76,6 @@ fn http_get(url: &str) -> Result<Vec<u8>, String> {
     }
     Ok(buf)
 }
-
-use std::io::Read;
 
 #[cfg(test)]
 mod tests {
