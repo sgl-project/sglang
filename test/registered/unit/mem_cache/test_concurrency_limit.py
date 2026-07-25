@@ -47,7 +47,6 @@ class TestConcurrencyLimit(CustomTestCase):
         self.assertIn("reduced from the requested 74 to 26", message)
         self.assertIn("mamba_state_pool", message)
         self.assertIn("set --max-mamba-cache-size 370", message)
-        # The non-binding limits stay visible for context.
         self.assertIn("kv_capacity=400", message)
 
     def test_request_honored_is_not_a_downgrade(self):
@@ -60,7 +59,13 @@ class TestConcurrencyLimit(CustomTestCase):
             resolved, binding, limits, requested=32
         )
         self.assertFalse(is_downgrade)
-        self.assertIn("max_running_requests=32", message)
+        self.assertIn("bound by max_running_requests", message)
+
+    def test_sole_limit_omits_the_other_limits_clause(self):
+        limits = [_limit("kv_capacity", 400)]
+        resolved, binding = resolve_concurrency_limit(limits)
+        _, message = format_concurrency_report(resolved, binding, limits)
+        self.assertNotIn("other limits", message)
 
     def test_no_request_still_reports_the_binding_limit(self):
         limits = [_limit("kv_capacity", 400), _limit("estimate", 2048)]
@@ -79,9 +84,8 @@ class TestLimitConstructors(CustomTestCase):
         self.assertEqual(kv_capacity_limit(798208).value, 399104)
 
     def test_heuristic_is_clamped(self):
-        # 2M tokens / 1M context * 512 = 1024, raised to the 2048 floor.
+        # 2M / 1M * 512 = 1024 -> floor; 10M / 1K * 512 = 5M -> ceiling.
         self.assertEqual(heuristic_limit(2 * 1024**2, 1024**2).value, 2048)
-        # A short context would overshoot; capped at 4096.
         self.assertEqual(heuristic_limit(10**7, 1024).value, 4096)
 
     def test_state_pool_remedy_sizes_for_the_target(self):
