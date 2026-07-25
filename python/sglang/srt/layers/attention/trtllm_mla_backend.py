@@ -1058,7 +1058,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     needs_unpad = False
                 else:
                     if ragged_layout.bs != bs:
-                        ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
+                        # Capped variant: the dense [bs, draft_token_num] q
+                        # buffer below cannot take a row the full-coverage pad
+                        # may inflate past the verify window, and it keeps
+                        # qo_indptr consistent with the clamped lens (same
+                        # contract as the KDA dense path).
+                        ragged_layout = ragged_layout.padded_to_bucket(
+                            padded_bs=bs, cap=draft_token_num
+                        )
                     total_tokens = q.shape[0]
                     seq_lens_q = torch.clamp(
                         ragged_layout.verify_lens, max=draft_token_num
