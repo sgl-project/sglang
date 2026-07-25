@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
@@ -164,13 +165,13 @@ class TestApplyLogitsBias(CustomTestCase):
         self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
 
     def test_applies_vocab_mask(self):
-        """Test that vocab_mask triggers the apply_mask_func callback."""
+        """Test that a grammar_mask gets applied to the logits."""
         info = _make_info(batch_size=1)
-        info.vocab_mask = torch.ones(1, VOCAB_SIZE)
-        info.apply_mask_func = MagicMock()
+        grammar = MagicMock()
+        info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
-        info.apply_mask_func.assert_called_once()
+        grammar.apply_vocab_mask.assert_called_once()
 
     def test_applies_penalizer_orchestrator(self):
         """Test that a required orchestrator's apply() is called on logits."""
@@ -185,7 +186,7 @@ class TestApplyLogitsBias(CustomTestCase):
         info = _make_info(batch_size=1)
         info.acc_additive_penalties = None
         info.logit_bias = None
-        info.vocab_mask = None
+        info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
         original = logits.clone()
         info.apply_logits_bias(logits)
@@ -220,19 +221,18 @@ class TestUpdatePenalties(CustomTestCase):
 class TestUpdateRegexVocabMask(CustomTestCase):
 
     def test_no_grammars_clears_mask(self):
-        """Test that None grammars clears both vocab_mask and apply_mask_func."""
+        """Test that None grammars clears the grammar_mask."""
         info = _make_info(batch_size=1)
         info.grammars = None
         info.update_regex_vocab_mask()
-        self.assertIsNone(info.vocab_mask)
-        self.assertIsNone(info.apply_mask_func)
+        self.assertIsNone(info.grammar_mask)
 
     def test_empty_grammars_clears_mask(self):
-        """Test that empty grammars list clears vocab_mask."""
+        """Test that empty grammars list clears the grammar_mask."""
         info = _make_info(batch_size=1)
         info.grammars = []
         info.update_regex_vocab_mask()
-        self.assertIsNone(info.vocab_mask)
+        self.assertIsNone(info.grammar_mask)
 
     def test_with_grammars_allocates_and_fills(self):
         """Test that an active grammar gets allocate, fill, and move called."""
@@ -247,6 +247,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         grammar.allocate_vocab_mask.assert_called_once()
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
+        self.assertIs(info.grammar_mask.grammar, grammar)
 
     def test_mixed_grammars_only_active_fills(self):
         """Test that finished, terminated, and None grammars are skipped."""
