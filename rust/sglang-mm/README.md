@@ -2,8 +2,7 @@
 
 Rust-accelerated multimodal preprocessing for SGLang. Fused image decode,
 fetch, resize, patchify, normalize, and content hash — all parallel and
-GIL-released. For the end-to-end server story (request flow, failure
-semantics, adding a model family) see [`rust/NATIVE_MM.md`](../NATIVE_MM.md).
+GIL-released.
 
 Built two ways:
 
@@ -157,5 +156,4 @@ python bench/bench_parity.py      # parity + benchmark
 ```
 
 Scheduler-boundary parity tests against the real HF processors live in
-`test/registered/unit/multimodal/rust/`; see `rust/NATIVE_MM.md` for the
-end-to-end picture.
+`test/registered/unit/multimodal/rust/`.
