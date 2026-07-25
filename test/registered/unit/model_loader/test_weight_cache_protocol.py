@@ -23,8 +23,6 @@ import struct
 import unittest
 
 from sglang.srt.weight_cache.protocol import (
-    EXPORT_MODE_POSTPROCESSED,
-    IPC_CLIENT_POSTPROCESS_QUANTS,
     CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
@@ -35,7 +33,6 @@ from sglang.srt.weight_cache.protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
-    ipc_export_mode,
     ipc_postprocess_reshapes,
     is_ipc_quant_supported,
     recv_msg,
@@ -61,7 +58,6 @@ def _make_cache_config(**overrides) -> CacheConfig:
         quant_config_hash="",
         dtype="torch.float16",
         revision="",
-        ipc_export_mode="postprocessed",
         device_capability="8.0",
         torch_version="2.5.1",
         fp4_gemm_backend="",
@@ -131,10 +127,8 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
-            # A daemon exporting raw NVFP4 must not be matched by a client
-            # expecting post-processed weights, nor across differing FP4 backends
-            # (which change the raw param set) -- these must be clean mismatches.
-            ("ipc_export_mode", "raw_client_postprocess"),
+            # Differing FP4 backends change the exported param set, so this
+            # must be a clean mismatch rather than a silent wrong-layout load.
             ("fp4_gemm_backend", "flashinfer_trtllm"),
         ):
             self.assertFalse(
@@ -261,23 +255,6 @@ class TestIpcQuantAllowlist(CustomTestCase):
         check_ipc_quant_support(
             "fp8", {"weight_block_size": [128, 128]}, where="daemon"
         )
-
-    def test_export_mode_dispatch(self):
-        # Every supported method is exported already post-processed, NVFP4
-        # included: its post-processing writes in place into the params it is
-        # handed, which under IPC are the daemon's shared memory, so the client
-        # must not re-run it. A daemon/client disagreement on the mode is
-        # stamped into the fingerprint and becomes a clean mismatch.
-        self.assertEqual(
-            ipc_export_mode("modelopt_fp4", None), EXPORT_MODE_POSTPROCESSED
-        )
-        self.assertEqual(ipc_export_mode("", None), EXPORT_MODE_POSTPROCESSED)
-        self.assertEqual(
-            ipc_export_mode("fp8", {"weight_block_size": [128, 128]}),
-            EXPORT_MODE_POSTPROCESSED,
-        )
-        # The client-postprocess mechanism still exists but nothing opts into it.
-        self.assertEqual(IPC_CLIENT_POSTPROCESS_QUANTS, set())
 
     def test_only_reshaping_methods_relax_the_shape_check(self):
         self.assertTrue(ipc_postprocess_reshapes("modelopt_fp4"))

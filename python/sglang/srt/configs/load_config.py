@@ -110,12 +110,6 @@ class LoadConfig:
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
-    # Internal-only: when True, load_weights_and_postprocess loads the raw weights
-    # but skips the per-module process_weights_after_loading() pass, leaving it to
-    # the caller. Used by the weight cache daemon for quant methods whose
-    # post-processing is reproduced on the client side (e.g. NVFP4); see
-    # weight_cache.protocol.ipc_export_mode. Not a user-facing CLI flag.
-    skip_process_weights_after_loading: bool = False
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}

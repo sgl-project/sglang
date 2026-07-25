@@ -25,14 +25,12 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
-    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     CacheConfig,
     apply_module_attrs,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
     hash_quant_config,
-    ipc_export_mode,
     ipc_postprocess_reshapes,
     recv_msg,
     send_msg,
@@ -138,21 +136,10 @@ class IpcModelLoader(BaseModelLoader):
             device_config,
             entries,
             quant_config,
-            export_mode=ipc_export_mode(quant_method, engine_quant_config),
             quant_method=quant_method,
             module_attrs=cache_data.get("module_attrs") or {},
             daemon_moe_runner_backend=cache_data.get("moe_runner_backend", ""),
         )
-
-        # Note on post-processing:
-        #  - "postprocessed" mode (everything today, NVFP4 included): the daemon
-        #    already ran process_weights_after_loading before exporting IPC
-        #    handles, so _load_zero_copy_mode skips it (re-running would both
-        #    double-process and write into the daemon's shared memory) and
-        #    instead re-applies the non-tensor half of that pass.
-        #  - "raw_client_postprocess" mode: the daemon exported the raw
-        #    pre-post-process tensors and _load_zero_copy_mode ran
-        #    process_weights_after_loading locally. No quant method opts in.
 
         # Rebuild stale tensor views. Some modules store tensor views as
         # plain attributes (not parameters/buffers) during __init__. When
@@ -303,7 +290,6 @@ class IpcModelLoader(BaseModelLoader):
         device_config,
         entries,
         quant_config,
-        export_mode: str,
         quant_method: str = "",
         module_attrs: Optional[dict] = None,
         daemon_moe_runner_backend: str = "",
@@ -313,11 +299,6 @@ class IpcModelLoader(BaseModelLoader):
         The model is initialized on the meta device (no memory allocation),
         then each parameter's data is replaced with the IPC-mapped GPU tensor.
         The engine and daemon share the same physical GPU memory via CUDA IPC.
-
-        In "raw_client_postprocess" mode the daemon exported the raw
-        pre-post-process quantized tensors, so after mapping we run
-        process_weights_after_loading locally (producing the derived, swizzled
-        params) before the still-on-meta validation.
         """
         from sglang.srt.layers.moe import get_moe_runner_backend
         from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -357,10 +338,7 @@ class IpcModelLoader(BaseModelLoader):
         reshaped_count = 0
         map_tic = time.perf_counter()
 
-        postprocess_reshapes = (
-            export_mode != EXPORT_MODE_RAW_CLIENT_POSTPROCESS
-            and ipc_postprocess_reshapes(quant_method)
-        )
+        postprocess_reshapes = ipc_postprocess_reshapes(quant_method)
 
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
@@ -407,36 +385,28 @@ class IpcModelLoader(BaseModelLoader):
                 f"not merely uninitialized weights:\n" + "\n".join(mismatched)
             )
 
-        # In raw_client_postprocess mode the daemon exported raw weights; run the
-        # model's own process_weights_after_loading now (creating the derived
-        # swizzled params + stamping layout attributes) before the meta check
-        # below validates that nothing is left uninitialized.
-        if export_mode == EXPORT_MODE_RAW_CLIENT_POSTPROCESS:
-            self._client_post_process(model, device_config, imported_refs)
-        else:
-            client_moe_runner_backend = get_moe_runner_backend().value
-            if (
-                daemon_moe_runner_backend
-                and client_moe_runner_backend
-                and client_moe_runner_backend != daemon_moe_runner_backend
-            ):
-                raise RuntimeError(
-                    f"[IpcModelLoader] MoE runner backend mismatch: the daemon's "
-                    f"weights were post-processed for "
-                    f"'{daemon_moe_runner_backend}' but this engine resolved "
-                    f"'{client_moe_runner_backend}'. The expert weight layout is "
-                    f"backend-specific, so serving these weights would produce "
-                    f"wrong output. Launch both with the same "
-                    f"--moe-runner-backend."
-                )
+        client_moe_runner_backend = get_moe_runner_backend().value
+        if (
+            daemon_moe_runner_backend
+            and client_moe_runner_backend
+            and client_moe_runner_backend != daemon_moe_runner_backend
+        ):
+            raise RuntimeError(
+                f"[IpcModelLoader] MoE runner backend mismatch: the daemon's "
+                f"weights were post-processed for "
+                f"'{daemon_moe_runner_backend}' but this engine resolved "
+                f"'{client_moe_runner_backend}'. The expert weight layout is "
+                f"backend-specific, so serving these weights would produce "
+                f"wrong output. Launch both with the same --moe-runner-backend."
+            )
 
-            if module_attrs:
-                changed = apply_module_attrs(model, module_attrs)
-                logger.info(
-                    f"[IpcModelLoader] Applied daemon module attributes "
-                    f"({changed} changed across {len(module_attrs)} modules)"
-                )
-            self._rebind_quant_state_after_import(model)
+        if module_attrs:
+            changed = apply_module_attrs(model, module_attrs)
+            logger.info(
+                f"[IpcModelLoader] Applied daemon module attributes "
+                f"({changed} changed across {len(module_attrs)} modules)"
+            )
+        self._rebind_quant_state_after_import(model)
 
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
@@ -510,74 +480,6 @@ class IpcModelLoader(BaseModelLoader):
                 rebound += 1
         if rebound:
             logger.info(f"[IpcModelLoader] Rebound quant state on {rebound} module(s)")
-
-    def _client_post_process(self, model, device_config, imported_refs) -> None:
-        """Run process_weights_after_loading locally over the IPC-mapped model.
-
-        Used in raw_client_postprocess mode (NVFP4): the daemon exported the raw
-        pre-post-process quantized tensors, so we reproduce the post-processing
-        here using the model's own quant code path — creating the derived swizzled
-        params and stamping the layout attributes that raw-tensor IPC cannot carry.
-
-        The mapped raw tensors are the daemon's shared physical memory, so an
-        in-place write during post-processing would corrupt the daemon and every
-        peer engine. NVFP4 post-processing reads the raw weights and allocates new
-        tensors (it does not write back into them), but we do not take that on
-        faith: we snapshot sampled elements of each mapped tensor before
-        post-processing and assert them unchanged after, hard-erroring on any
-        violation instead of serving a corrupt daemon.
-        """
-        from sglang.srt.model_loader.loader import run_process_weights_after_loading
-
-        target_device = torch.device(device_config.device)
-        guard = self._snapshot_mutation_guard(imported_refs)
-
-        tic = time.perf_counter()
-        run_process_weights_after_loading(model, target_device)
-        self._assert_ipc_tensors_unmutated(guard)
-        logger.info(
-            f"[IpcModelLoader] Ran client-side process_weights_after_loading in "
-            f"{time.perf_counter() - tic:.2f}s"
-        )
-
-    @staticmethod
-    def _snapshot_mutation_guard(tensors, num_samples: int = 64):
-        """Clone a few sampled elements of each IPC-mapped tensor for later
-        comparison (cheap in-place-write detector for shared daemon memory)."""
-        guard = []
-        for name, tensor in tensors:
-            flat = tensor.detach().reshape(-1)
-            n = flat.numel()
-            if n == 0:
-                continue
-            steps = min(num_samples, n)
-            # Integer arithmetic on purpose: torch.linspace builds a float32
-            # tensor, which cannot represent every index past 2**24 and rounds
-            # the endpoint *up* past n - 1 for the large fused MoE weights,
-            # gathering out of bounds (device-side assert).
-            positions = torch.arange(steps, dtype=torch.int64, device=flat.device)
-            idx = positions * (n - 1) // (steps - 1) if steps > 1 else positions
-            guard.append((name, tensor, idx, flat[idx].clone()))
-        return guard
-
-    @staticmethod
-    def _assert_ipc_tensors_unmutated(guard) -> None:
-        mutated = [
-            name
-            for name, tensor, idx, sample in guard
-            if not torch.equal(tensor.detach().reshape(-1)[idx], sample)
-        ]
-        if mutated:
-            raise RuntimeError(
-                "[IpcModelLoader] client-side process_weights_after_loading "
-                "mutated an IPC-mapped tensor in place. These tensors are the "
-                "daemon's shared GPU memory, so an in-place write corrupts the "
-                "daemon and every co-attached engine. This quant method's "
-                "post-processing is not compatible with raw_client_postprocess "
-                f"mode — do not serve it via the weight cache. Mutated "
-                f"{len(mutated)} of {len(guard)} mapped tensors, e.g.: "
-                f"{mutated[:10]}"
-            )
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
@@ -660,7 +562,6 @@ class IpcModelLoader(BaseModelLoader):
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
-                ipc_export_mode=ipc_export_mode(quant_method, quant_config),
                 **compute_env_stamp(),
             )
 

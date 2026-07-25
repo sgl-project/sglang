@@ -50,7 +50,6 @@ from sglang.srt.runtime_context import publish
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
-    EXPORT_MODE_RAW_CLIENT_POSTPROCESS,
     CacheConfig,
     capture_module_attrs,
     check_ipc_quant_support,
@@ -62,7 +61,6 @@ from .protocol import (
     get_ready_path,
     get_socket_path,
     hash_quant_config,
-    ipc_export_mode,
     recv_msg,
     send_msg,
 )
@@ -275,12 +273,6 @@ class WeightCacheDaemon:
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
 
-        # Which export mode this quant method uses. In raw_client_postprocess mode
-        # (NVFP4) the daemon exports the raw pre-post-process weights and the
-        # client re-runs process_weights_after_loading; otherwise the daemon
-        # exports already-post-processed weights.
-        export_mode = ipc_export_mode(quant_method, quant_config)
-
         self.config = CacheConfig(
             model_path=self.model_path,
             model_arch=(
@@ -298,7 +290,6 @@ class WeightCacheDaemon:
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
-            ipc_export_mode=export_mode,
             **compute_env_stamp(),
         )
 
@@ -310,26 +301,21 @@ class WeightCacheDaemon:
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
-        # Build load config. In raw_client_postprocess mode, skip
-        # process_weights_after_loading so we export the raw quantized tensors;
-        # the client reproduces post-processing after IPC-mapping them.
         load_config = LoadConfig(
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
             tp_rank=self.tp_rank,
-            skip_process_weights_after_loading=(
-                export_mode == EXPORT_MODE_RAW_CLIENT_POSTPROCESS
-            ),
         )
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Loading model from disk: {self.model_path} (export_mode={export_mode})"
+            f"Loading model from disk: {self.model_path}"
         )
         tic = time.perf_counter()
 
-        # Load model. In postprocessed mode this includes TP sharding + quant
-        # post-process; in raw_client_postprocess mode post-processing is skipped.
+        # Load model: the full pipeline, including TP sharding and the quant
+        # methods' process_weights_after_loading. Clients map the result of that
+        # pass, so it always runs here and never on a client.
         loader = get_model_loader(load_config=load_config, model_config=model_config)
         self.model = loader.load_model(
             model_config=model_config,

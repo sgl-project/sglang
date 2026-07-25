@@ -52,12 +52,6 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
-    # IPC export mode (see ipc_export_mode): "postprocessed" (daemon runs
-    # process_weights_after_loading, client skips) or "raw_client_postprocess"
-    # (daemon exports raw pre-post-process weights, client runs post-processing).
-    # A daemon/client disagreement here must be a clean mismatch, never a silent
-    # wrong-numerics load.
-    ipc_export_mode: str
     # Resolved FP4 GEMM backend (Fp4GemmRunnerBackend value, "" if N/A). NVFP4
     # create_weights registers a backend-dependent raw param set (e.g.
     # w13_blockscale_swizzled is None for TRTLLM but a Parameter otherwise), so a
@@ -175,18 +169,6 @@ IPC_QUANT_ALLOWLIST = {
     "modelopt_fp4": lambda _quant_config: True,  # NVFP4
 }
 
-# quant methods whose process_weights_after_loading is reproduced on the client
-# instead of shared: the daemon exports the raw (pre-post-process) quantized
-# tensors and the client runs process_weights_after_loading after IPC-mapping
-# them. Everything else is exported already post-processed and the client skips
-# post-processing. See ipc_export_mode.
-#
-# Empty on purpose: a method only belongs here if its post-processing never
-# writes into the params it was handed (they are the daemon's shared memory).
-# NVFP4 was tried and fails that bar -- see _nvfp4_shared_via_ipc. The mode is
-# kept because the mechanism is generic, not because anything uses it today.
-IPC_CLIENT_POSTPROCESS_QUANTS = set()
-
 # quant methods whose post-processing changes tensor shapes (padding for kernel
 # alignment, swizzled scale layouts). Their exported tensors legitimately do not
 # match the shapes the client's create_weights registered, so the client rebinds
@@ -199,22 +181,6 @@ IPC_POSTPROCESS_RESHAPES_QUANTS = {"modelopt_fp4"}
 def ipc_postprocess_reshapes(quant_method: str) -> bool:
     """Whether this method's post-processing changes exported tensor shapes."""
     return quant_method in IPC_POSTPROCESS_RESHAPES_QUANTS
-
-
-EXPORT_MODE_POSTPROCESSED = "postprocessed"
-EXPORT_MODE_RAW_CLIENT_POSTPROCESS = "raw_client_postprocess"
-
-
-def ipc_export_mode(quant_method: str, quant_config: Any) -> str:
-    """Return the IPC export mode for a (supported) quant method.
-
-    Assumes the method already passed check_ipc_quant_support. Both the daemon
-    and the client call this so they always agree on the mode; the result is
-    also stamped into CacheConfig so a disagreement is a clean mismatch.
-    """
-    if quant_method in IPC_CLIENT_POSTPROCESS_QUANTS:
-        return EXPORT_MODE_RAW_CLIENT_POSTPROCESS
-    return EXPORT_MODE_POSTPROCESSED
 
 
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
