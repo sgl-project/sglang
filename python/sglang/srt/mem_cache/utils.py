@@ -63,10 +63,16 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(
+    eviction_policy: str,
+    low_values_first: bool = False,
+) -> EvictionStrategy:
     policy = eviction_policy.lower()
     try:
-        return _EVICTION_POLICY_FACTORIES[policy]()
+        factory = _EVICTION_POLICY_FACTORIES[policy]
+        if policy == "priority":
+            return factory(low_values_first=low_values_first)
+        return factory()
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
         raise ValueError(

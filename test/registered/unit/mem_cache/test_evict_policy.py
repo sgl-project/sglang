@@ -140,6 +140,35 @@ class TestPriorityStrategy(unittest.TestCase):
         )
 
 
+class TestPriorityStrategyLowValuesFirst(unittest.TestCase):
+    """Eviction direction when scheduler's ``--schedule-low-priority-values-first`` is on."""
+
+    def setUp(self):
+        self.strategy = PriorityStrategy(low_values_first=True)
+
+    def test_priority_is_negated_in_tuple(self):
+        node = _make_node(priority=2, last_access_time=4.0)
+        self.assertEqual(self.strategy.get_priority(node), (-2, 4.0))
+
+    def test_lower_priority_retained_longer(self):
+        """In low-values-first mode, priority 1 (more important) must
+        have a *higher* eviction key than priority 5 (less important)."""
+        important = _make_node(priority=1, last_access_time=10.0)
+        unimportant = _make_node(priority=5, last_access_time=1.0)
+        self.assertGreater(
+            self.strategy.get_priority(important),
+            self.strategy.get_priority(unimportant),
+        )
+
+    def test_same_priority_older_access_evicted_first(self):
+        """Within the same priority, LRU still applies."""
+        old = _make_node(priority=3, last_access_time=1.0)
+        new = _make_node(priority=3, last_access_time=10.0)
+        self.assertLess(
+            self.strategy.get_priority(old), self.strategy.get_priority(new)
+        )
+
+
 class TestSLRUStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = SLRUStrategy(protected_threshold=2)
