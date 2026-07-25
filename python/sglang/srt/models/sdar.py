@@ -47,6 +47,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_stream,
 )
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -207,7 +211,7 @@ class SDARAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if get_server_args().rl_on_policy_target is not None:
+        if should_force_bfloat16_dense_tensor_math():
             hidden_states = hidden_states.bfloat16()
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -235,7 +239,7 @@ class SDARAttention(nn.Module):
             ),
         )
 
-        if get_server_args().rl_on_policy_target is not None:
+        if should_force_bfloat16_dense_tensor_math():
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -263,15 +267,10 @@ class SDARBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
-            if get_server_args().rl_on_policy_target is not None
-            else {}
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+            fp32_residual=True,
         )
         self.input_layernorm = RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
@@ -388,15 +387,10 @@ class SDARModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
-                )
-                if get_server_args().rl_on_policy_target is not None
-                else {}
+            norm_kwargs = get_on_policy_rms_norm_kwargs(
+                weight_dtype=torch.float32,
+                override_orig_dtype=torch.float32,
+                fp32_residual=True,
             )
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs)
         else:
