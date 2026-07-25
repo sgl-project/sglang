@@ -39,6 +39,11 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.concurrency_limit import (
+    ConcurrencyLimit,
+    format_concurrency_report,
+    resolve_concurrency_limit,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -1622,40 +1627,75 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
+        limits = [
+            ConcurrencyLimit(
+                source="kv_capacity",
+                value=token_capacity // 2,
+                detail=f"max_total_num_tokens={token_capacity} / 2",
+                remedy="raise --mem-fraction-static or lower the context length",
+            )
+        ]
 
-        max_num_reqs = self.server_args.max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
+        requested_per_worker = None
+        if self.server_args.max_running_requests is not None:
+            requested_per_worker = (
+                self.server_args.max_running_requests // self.ps.attn_dp_size
+            )
+            limits.insert(
+                0,
+                ConcurrencyLimit(
+                    source="max_running_requests",
+                    value=requested_per_worker,
+                    detail=f"--max-running-requests={self.server_args.max_running_requests}",
+                ),
+            )
         else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
+            # Heuristic ceiling, only when the user did not ask for a value.
+            estimated = int(token_capacity / self.model_config.context_len * 512)
+            limits.append(
+                ConcurrencyLimit(
+                    source="estimate",
+                    value=max(min(estimated, 4096), 2048),
+                    detail="token_capacity / context_len * 512, clamped to [2048, 4096]",
+                    remedy="set --max-running-requests explicitly",
+                )
+            )
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            mamba_cap = self.server_args.max_mamba_cache_size // ratio
+            target = requested_per_worker or (mamba_cap + 1)
+            limits.append(
+                ConcurrencyLimit(
+                    source="mamba_state_pool",
+                    value=mamba_cap,
+                    detail=f"max_mamba_cache_size="
+                    f"{self.server_args.max_mamba_cache_size} / {ratio} slots per request",
+                    remedy=f"set --max-mamba-cache-size {target * ratio}, raise "
+                    f"--mamba-full-memory-ratio, or halve the state size with "
+                    f"--mamba-ssm-dtype bfloat16",
+                )
             )
 
-            if max_num_reqs <= 0:
-                raise RuntimeError(
-                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
-                    f"(2) increase --mem-fraction-static, or "
-                    f"(3) use GPUs with more memory."
-                )
-        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
-            logger.warning(
-                "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache capacity.",
-                requested_per_worker,
-                max_num_reqs,
+        max_num_reqs, binding = resolve_concurrency_limit(limits)
+
+        if self.mambaish_config is not None and max_num_reqs <= 0:
+            raise RuntimeError(
+                f"Hybrid (mamba/linear-attention) state cache is too small to serve "
+                f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                f"mamba_ratio={self._calculate_mamba_ratio()}, resulting max_num_reqs={max_num_reqs}. "
+                f"Try: (1) reduce --max-running-requests, "
+                f"(2) increase --mem-fraction-static, or "
+                f"(3) use GPUs with more memory."
             )
+
+        is_downgrade, message = format_concurrency_report(
+            max_num_reqs, binding, limits, requested_per_worker
+        )
+        if is_downgrade:
+            logger.warning(message)
+        else:
+            logger.info(message)
         return max_num_reqs
 
     def _resolve_memory_pool_config(
