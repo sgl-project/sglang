@@ -6,6 +6,7 @@ from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
@@ -165,6 +166,29 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestDeepSeekV4Detector(CustomTestCase):
+    def test_strict_thinking_excludes_deepseek_eos(self):
+        """Guards the empty-content incident: DeepSeek-V4 can sample its EOS
+        mid-thinking and finish with full reasoning_content but empty content.
+        The strict-thinking guard masks think_excluded_tokens during thinking,
+        so the deepseek-v4 detector must exclude the DeepSeek EOS. When
+        deepseek-v4 was mapped to the Qwen3-token detector, the exclusion table
+        held Qwen literals: the EOS stayed sampleable (guard was a silent no-op)
+        and the Qwen strings tokenized into DeepSeek fragments that were banned
+        instead."""
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+        self.assertEqual(detector.think_excluded_tokens, ["<｜end▁of▁sentence｜>"])
+
+    def test_thinking_stays_explicit_opt_in(self):
+        """deepseek-v4 previously inherited reasoning_default="explicit_thinking"
+        from the V3 detector; a remap must not silently flip thinking to
+        always-on or change the no-leading-<think> contract."""
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertEqual(detector.reasoning_default, "explicit_thinking")
+        self.assertTrue(detector.thinks_internally)
 
 
 class TestInklingDetector(CustomTestCase):
