@@ -618,17 +618,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                 grammar_barrier()
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
-            vocab_mask = build_grammar_vocab_mask(
+            grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                verify_input=draft_input,
                 tree=grammar_tree,
                 sampling_info=sampling_info,
                 device=logits_output.next_token_logits.device,
             )
-            if vocab_mask is not None:
-                draft_input.grammar.apply_vocab_mask(
-                    logits=logits_output.next_token_logits, vocab_mask=vocab_mask
-                )
+            if grammar_mask is not None:
+                grammar_mask.apply(logits_output.next_token_logits)
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph

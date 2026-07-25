@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_utils import GrammarMask
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -641,7 +642,7 @@ def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
-    vocab_mask: torch.Tensor = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -702,11 +703,8 @@ def eagle_sample(
         )
 
     # Apply grammar mask if provided
-    if vocab_mask is not None:
-        assert verify_input.grammar is not None
-        verify_input.grammar.apply_vocab_mask(
-            logits=next_token_logits, vocab_mask=vocab_mask
-        )
+    if grammar_mask is not None:
+        grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
