@@ -69,8 +69,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 if _is_cuda:
@@ -547,6 +549,44 @@ def generate_token_bitmask(
 
     verify_input.grammar = grammar
     return allocate_token_bitmask
+
+
+def build_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    verify_input: SpecInput,
+    retrieve_next_token_cpu: torch.Tensor,
+    retrieve_next_sibling_cpu: torch.Tensor,
+    draft_tokens_cpu: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    device,
+) -> Optional[torch.Tensor]:
+    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
+
+    Call it after the target verify forward is launched: the traversal is pure host
+    work over the already-known draft tree, so it overlaps that forward. The tree
+    arrays must be on the host by then -- see AsyncD2H for algorithms whose tree
+    lives on device.
+    """
+    vocab_mask = generate_token_bitmask(
+        reqs,
+        verify_input,
+        retrieve_next_token_cpu,
+        retrieve_next_sibling_cpu,
+        draft_tokens_cpu,
+        sampling_info.vocab_size,
+    )
+    if vocab_mask is None:
+        return None
+
+    assert verify_input.grammar is not None
+    # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
+    # order keeps the copy ahead of the sampler's apply_vocab_mask.
+    vocab_mask = vocab_mask.to(device, non_blocking=True)
+    # Otherwise the mask left over from the previous extend stage is applied instead,
+    # producing wrong results.
+    sampling_info.vocab_mask = None
+    return vocab_mask
 
 
 def load_token_map(token_map_path: str) -> List[int]:

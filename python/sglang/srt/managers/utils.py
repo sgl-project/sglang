@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -33,6 +33,30 @@ def _async_d2h(t: torch.Tensor) -> torch.Tensor:
     cpu_t.copy_(t, non_blocking=True)
     t.record_stream(torch.cuda.current_stream(t.device))
     return cpu_t
+
+
+class AsyncD2H:
+    """Async pinned D2H for a group of tensors, gated by one event.
+
+    Issue it before launching the device work that should hide the copies, then
+    call resolve() right where the host first reads them -- everything launched
+    in between overlaps the transfer instead of stalling on it.
+    """
+
+    def __init__(self, *tensors: torch.Tensor):
+        assert tensors, "AsyncD2H needs at least one tensor"
+        self._host = tuple(_async_d2h(t) for t in tensors)
+        device = tensors[0].device
+        self._done = (
+            torch.get_device_module(device).Event() if device.type != "cpu" else None
+        )
+        if self._done is not None:
+            self._done.record()
+
+    def resolve(self) -> Tuple[torch.Tensor, ...]:
+        if self._done is not None:
+            self._done.synchronize()
+        return self._host
 
 
 @dataclasses.dataclass
