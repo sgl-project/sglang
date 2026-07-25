@@ -38,6 +38,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
 )
@@ -69,8 +70,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 if _is_cuda:
@@ -547,6 +550,95 @@ def generate_token_bitmask(
 
     verify_input.grammar = grammar
     return allocate_token_bitmask
+
+
+class GrammarTree:
+    """The verify tree the grammar bitmask is built over, on the host.
+
+    ``from_device`` starts an async copy, so build it before the target verify
+    launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
+    """
+
+    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+        self._host = host
+        self._done = done_event
+
+    @classmethod
+    def from_device(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
+        host = tuple(_async_d2h(t) for t in tensors)
+        # Sources may be mixed -- an algorithm can synthesize part of the tree on
+        # the host -- so the event has to key off whichever one is on device.
+        device = next((t.device for t in tensors if t.device.type != "cpu"), None)
+        if device is None:
+            return cls(host, None)
+        done = torch.get_device_module(device).Event()
+        done.record()
+        return cls(host, done)
+
+    @classmethod
+    def from_host(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
+
+    @classmethod
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
+
+        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
+        token, so mask rows line up with the target's logits rows one-for-one.
+        Only the ids need a copy; the links are fixed by the shape.
+        """
+        bs, chain_len = verify_ids_2d.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+
+    def resolve(self) -> Tuple[torch.Tensor, ...]:
+        if self._done is not None:
+            self._done.synchronize()
+        return self._host
+
+
+def build_grammar_vocab_mask(
+    *,
+    reqs: List[Req],
+    verify_input: SpecInput,
+    tree: GrammarTree,
+    sampling_info: SamplingBatchInfo,
+    device,
+) -> Optional[torch.Tensor]:
+    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
+
+    Call it after the target verify launch: resolving the tree and traversing it are
+    both host work, so both overlap that forward.
+    """
+    vocab_mask = generate_token_bitmask(
+        reqs,
+        verify_input,
+        *tree.resolve(),
+        sampling_info.vocab_size,
+    )
+    if vocab_mask is None:
+        return None
+
+    assert verify_input.grammar is not None
+    # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
+    # order keeps the copy ahead of the sampler's apply_vocab_mask.
+    vocab_mask = vocab_mask.to(device, non_blocking=True)
+    # Otherwise the extend stage's leftover mask is applied instead.
+    sampling_info.vocab_mask = None
+    return vocab_mask
 
 
 def load_token_map(token_map_path: str) -> List[int]:

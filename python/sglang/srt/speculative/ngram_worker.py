@@ -21,8 +21,9 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
@@ -430,28 +431,17 @@ class NGRAMWorker(BaseSpecWorker):
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                draft_tokens_cpu = (
-                    torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1)
+                vocab_mask = build_grammar_vocab_mask(
+                    reqs=batch.reqs,
+                    verify_input=verify_input,
+                    tree=GrammarTree.from_host(
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
+                    ),
+                    sampling_info=batch.sampling_info,
+                    device=verify_input.retrieve_next_token.device,
                 )
-                vocab_mask = generate_token_bitmask(
-                    batch.reqs,
-                    verify_input,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu,
-                    draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
-                )
-
-                if vocab_mask is not None:
-                    assert verify_input.grammar is not None
-                    # non_blocking is safe: the bitmask source is pinned, and stream
-                    # order keeps the copy ahead of apply_vocab_mask.
-                    vocab_mask = vocab_mask.to(
-                        verify_input.retrieve_next_token.device, non_blocking=True
-                    )
-                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                    # and will be applied to produce wrong results
-                    batch.sampling_info.vocab_mask = None
 
             # Sample
             maybe_detect_nan(
