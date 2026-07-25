@@ -72,20 +72,26 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
 # USPAttention masked branch and fall back to SDPA.
 _VARLEN_FA_ENABLED = os.environ.get("SGLANG_VARLEN_FA", "1") != "0"
 
-# Quantization config class names that require the FlashAttention backend
-# (Ascend NPU MXFP8/MXFP4 dynamic quantization uses FA v2 ops).
-_MX_FA_QUANT_CONFIG_NAMES: set[str] = {"MXFP8Config"}
-
 
 def _resolve_quant_attn_backend(
     extra_impl_args: dict,
 ) -> AttentionBackendEnum | None:
-    """Return ``FA`` if *extra_impl_args* carries a quant config that needs it."""
+    """Return ``FA`` if *extra_impl_args* carries a quant config that needs it.
+
+    Delegates to :func:`ascend_fa.resolve_mx_fa_scheme` (single source of truth)
+    so online ``MXFP8Config`` and offline ``ModelSlimConfig`` route to the
+    Ascend FA backend when ``SGLANG_DIFFUSION_FA_MXFP8`` opts into FA MXFP8
+    quant. Imported lazily to avoid pulling the NPU backend (and ``torch_npu``)
+    into the attention layer module eagerly.
+    """
     quant_config = extra_impl_args.get("quant_config")
-    if (
-        quant_config is not None
-        and type(quant_config).__name__ in _MX_FA_QUANT_CONFIG_NAMES
-    ):
+    if quant_config is None:
+        return None
+    from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+        resolve_mx_fa_scheme,
+    )
+
+    if resolve_mx_fa_scheme(quant_config) is not None:
         return AttentionBackendEnum.FA
     return None
 

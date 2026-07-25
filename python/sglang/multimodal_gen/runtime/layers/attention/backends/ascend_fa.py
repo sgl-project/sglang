@@ -1,10 +1,10 @@
-import math
 import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -22,6 +22,36 @@ logger = init_logger(__name__)
 _is_npu = current_platform.is_npu()
 if _is_npu:
     import torch_npu
+
+
+def resolve_mx_fa_scheme(quant_config) -> str | None:
+    """Single source of truth for which quant configs activate MX FA quant.
+
+    Returns the MX FA scheme name (``"MXFP8"``, or ``"MXFP4"`` once wired up)
+    when *quant_config* should run the MX-quantized Flash Attention path, else
+    ``None`` (standard FA). Used both to select the FA backend (``layer.py``)
+    and to pick the forward path (``AscendFAImpl.forward``).
+
+    FA quant is orthogonal to the linear weight quant: any MXFP8 linear config
+    — online ``MXFP8Config`` or offline ``ModelSlimConfig`` (whose linear type
+    may be W8A8 / W4A4 / W8A8_MXFP8 / W4A4_MXFP4) — opts into FA MXFP8 via the
+    ``SGLANG_DIFFUSION_FA_MXFP8`` flag. Without it only the linear weights are
+    quantized; with it Q/K/V also run the MX FA path.
+
+    Extending to FA MXFP4: add a parallel ``SGLANG_DIFFUSION_FA_MXFP4`` flag
+    (or derive the scheme from the modelslim linear type) and return
+    ``"MXFP4"`` here, then dispatch to ``_forward_mx_mxfp4`` in
+    ``AscendFAImpl.forward``. The MXFP4 kernel differs fundamentally (see
+    MindIE-SD ``MXFP4QuantFA``), so it gets its own params + forward method.
+    """
+    if quant_config is None or not _is_npu:
+        return None
+    if not bool(envs.SGLANG_DIFFUSION_FA_MXFP8):
+        return None
+    name = type(quant_config).__name__
+    if name in ("MXFP8Config", "ModelSlimConfig"):
+        return "MXFP8"
+    return None
 
 
 @dataclass
@@ -67,35 +97,44 @@ class AscendFAImpl(AttentionImpl):
 
     Supports two paths:
     - Standard FA (default): BNSD layout, torch.ops.npu.npu_fused_infer_attention_score
-    - MX quantized FA: online rotation + dynamic MX quantization,
-      activated when a supported ``quant_config`` is passed via ``extra_impl_args``.
+    - MX quantized FA: online QR rotation + dynamic MX quantization of Q/K/V,
+      dispatched per scheme from :meth:`forward`.
 
-    Supported quant configs (checked by class name):
-    - ``MXFP8Config`` → MXFP8 (fp8_e4m3fn, quant_mode 6/6/8, TND layout)
-    - ``MXFP4Config`` (future) → MXFP4 (fp4_e2m1fn, quant_mode 3/3/3)
+    Activation (see :func:`resolve_mx_fa_scheme`): any MXFP8 linear config
+    (online ``MXFP8Config`` or offline ``ModelSlimConfig``) opts into FA MXFP8
+    via the ``SGLANG_DIFFUSION_FA_MXFP8`` flag. Without it, only the linear
+    weights are quantized; with it Q/K/V also run the MX FA path. Offline-ness
+    is confined to the linear weights (handled by the modelslim linear schemes).
 
-    To add a new MX quant scheme, add an entry to :attr:`_MX_QUANT_PARAMS`
-    and a corresponding ``_forward_mx_*`` method if the FA call differs
-    significantly from the default TND path.
+    Schemes are dispatched per-scheme in :meth:`forward`:
+    - ``MXFP8`` → :meth:`_forward_mx_mxfp8` (``npu_fused_infer_attention_score_v2``,
+      TND, params in :attr:`_MXFP8_FA_PARAMS`).
+    - ``MXFP4`` (future) → :meth:`_forward_mx_mxfp4`, a different kernel
+      (``torch.ops.mindiesd.quant_flash_attn``, fp4_e2m1fn_x2, seq padding +
+      seqused) — see MindIE-SD ``MXFP4QuantFA``. Not a param swap of MXFP8, so
+      it gets its own ``_MXFP4_FA_PARAMS`` + method.
     """
 
     # ------------------------------------------------------------------
-    # Per-scheme static quantization parameters.
-    # Key = QuantConfig class name.  Each value is a dict of kwargs
-    # forwarded to the MX quant + FA v2 calls in :meth:`_forward_mx_quant`.
+    # MXFP8 FA-v2 quantization parameters. Used only by
+    # :meth:`_forward_mx_mxfp8`, which calls ``npu_fused_infer_attention_score_v2``
+    # (TND layout, quant_mode 6/6/8).
+    #
+    # FA MXFP4 is NOT a param swap of this dict: it uses a different kernel
+    # (``torch.ops.mindiesd.quant_flash_attn``), ``float4_e2m1fn_x2`` dtype,
+    # sequence padding + ``seqused`` — see MindIE-SD ``MXFP4QuantFA``. When
+    # wiring it up, add a dedicated ``_MXFP4_FA_PARAMS`` + :meth:`_forward_mx_mxfp4`
+    # plus a ``"MXFP4"`` branch in :meth:`forward` and :func:`resolve_mx_fa_scheme`.
     # ------------------------------------------------------------------
-    _MX_QUANT_PARAMS: dict[str, dict] = {
-        "MXFP8Config": {
-            "quant_dtype": None,  # resolved at forward time → torch.float8_e4m3fn
-            "scale_dtype": None,  # resolved at forward time → torch_npu.float8_e8m0fnu
-            "q_quant_mode": 6,
-            "k_quant_mode": 6,
-            "v_quant_mode": 8,
-            "qk_quant_axis": -1,  # per-token along head_dim
-            "v_quant_axis": 0,  # per-channel along token dim (TND layout)
-            "layout": "TND",
-        },
-        # "MXFP4Config": { ... }  # add when MXFP4 FA support lands
+    _MXFP8_FA_PARAMS: dict = {
+        "quant_dtype": None,  # resolved at forward time → torch.float8_e4m3fn
+        "scale_dtype": None,  # resolved at forward time → torch_npu.float8_e8m0fnu
+        "q_quant_mode": 6,
+        "k_quant_mode": 6,
+        "v_quant_mode": 8,
+        "qk_quant_axis": -1,  # per-token along head_dim
+        "v_quant_axis": 0,  # per-channel along token dim (TND layout)
+        "layout": "TND",
     }
 
     # Cache of orthogonal rotation matrices keyed by head_dim.
@@ -125,25 +164,22 @@ class AscendFAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
 
         quant_config = extra_impl_args.get("quant_config")
-        self._quant_scheme = self._resolve_quant_scheme(quant_config)
+        self._quant_scheme = resolve_mx_fa_scheme(quant_config)
+
+        # Whether this layer is cross-attention. Propagated explicitly by the
+        # model (e.g. Wan's ``is_cross_attention``) via ``extra_impl_args`` so
+        # attention type is never inferred from tensor shapes — cross-attention
+        # can share seq len / head count with Q. MX FA quant applies only to
+        # self-attention; cross-attn always uses the standard path.
+        self._is_cross_attention = bool(
+            extra_impl_args.get("is_cross_attention", False)
+        )
 
         if self._quant_scheme is not None:
             self._head_dim = head_size
             self._ensure_rot_matrix(head_size)
             # Device-cached rotation matrix (lazily moved from CPU on first forward)
             self._rot_device: torch.Tensor | None = None
-
-    @staticmethod
-    def _resolve_quant_scheme(quant_config) -> str | None:
-        """Return the quant scheme name if *quant_config* is a supported MX FA config.
-
-        Returns ``None`` when *quant_config* is ``None``, not recognised,
-        or running on a non-NPU platform.
-        """
-        if quant_config is None or not _is_npu:
-            return None
-        name = type(quant_config).__name__
-        return name if name in AscendFAImpl._MX_QUANT_PARAMS else None
 
     # ------------------------------------------------------------------
     # Rotation matrix helpers
@@ -192,21 +228,51 @@ class AscendFAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        # MX quantization only applies to self-attention (Q and K/V share the
-        # same sequence length and head count).  Cross-attention and GQA fall
-        # back to the standard FA path.
-        if self._quant_scheme is not None:
-            if query.shape[1] == key.shape[1] and query.shape[2] == key.shape[2]:
-                return self._forward_mx_quant(
-                    query,
-                    key,
-                    value,
-                    attn_metadata,
-                    self._quant_scheme,
-                    return_softmax_lse,
-                )
+        # MX FA quant applies only to self-attention; attention type comes from
+        # the explicit ``is_cross_attention`` flag, NOT from tensor shapes
+        # (cross-attention can share seq len / head count with Q). A shape
+        # mismatch on a flagged self-attn layer falls back to standard FA.
+        is_self_attn = not self._is_cross_attention
+        shapes_compatible = (
+            query.shape[1] == key.shape[1] and query.shape[2] == key.shape[2]
+        )
+        if self._quant_scheme is not None and is_self_attn and shapes_compatible:
+            return self._dispatch_mx_forward(
+                self._quant_scheme,
+                query,
+                key,
+                value,
+                attn_metadata,
+                return_softmax_lse,
+            )
         return self._forward_standard(
             query, key, value, attn_metadata, return_softmax_lse
+        )
+
+    def _dispatch_mx_forward(
+        self,
+        scheme: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        return_softmax_lse: bool,
+    ) -> torch.Tensor:
+        """Route an MX FA scheme to its forward implementation.
+
+        Add new schemes (e.g. ``"MXFP4"``) here and provide a matching
+        ``_forward_mx_<scheme>`` method; the FA call may differ per scheme.
+        """
+        if scheme == "MXFP8":
+            return self._forward_mx_mxfp8(
+                query, key, value, attn_metadata, return_softmax_lse
+            )
+        # FA MXFP4 path: see MindIE-SD MXFP4QuantFA — different kernel
+        # (quant_flash_attn), fp4 dtype, seq padding + seqused. Implement
+        # _forward_mx_mxfp4 and add "MXFP4" to resolve_mx_fa_scheme when wiring.
+        raise NotImplementedError(
+            f"MX FA scheme '{scheme}' is not implemented. "
+            "FA MXFP4 is not wired up yet (see MindIE-SD MXFP4QuantFA)."
         )
 
     def _forward_standard(
@@ -244,19 +310,17 @@ class AscendFAImpl(AttentionImpl):
             return output, lse
         return output
 
-    def _forward_mx_quant(
+    def _forward_mx_mxfp8(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        scheme: str,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        """Generic MX-quantized attention path.
+        """MXFP8-quantized attention path (``npu_fused_infer_attention_score_v2``).
 
-        Looks up quantization parameters from :attr:`_MX_QUANT_PARAMS` for
-        *scheme*, then:
+        Uses params from :attr:`_MXFP8_FA_PARAMS`. Steps:
 
         1. Rotate Q/K with orthogonal matrices (smooths per-block distribution)
         2. Reshape BSND → TND (merge batch + seq dims)
@@ -266,17 +330,13 @@ class AscendFAImpl(AttentionImpl):
         6. Reshape TND → BSND
 
         Input / output: ``[B, S, N, D]`` (BSND, sglang convention).
-
-        To support a quant scheme that needs a different FA API or layout,
-        add a dedicated ``_forward_mx_{scheme}`` method and dispatch to it
-        from here.
         """
         if return_softmax_lse:
             raise NotImplementedError(
-                f"return_softmax_lse is not supported for {scheme} attention"
+                "return_softmax_lse is not supported for MXFP8 attention"
             )
 
-        params = self._MX_QUANT_PARAMS[scheme]
+        params = self._MXFP8_FA_PARAMS
         B, S_q, N, D = query.shape
         S_kv = key.shape[1]
         N_kv = key.shape[2]
@@ -360,7 +420,7 @@ class AscendFAImpl(AttentionImpl):
                     input_layout=layout,
                     num_query_heads=n_heads_chunk,
                     num_key_value_heads=n_kv_heads_chunk,
-                    softmax_scale=1.0 / math.sqrt(D),
+                    softmax_scale=self.softmax_scale,
                     dequant_scale_query=q_scale,
                     dequant_scale_key=k_scale,
                     dequant_scale_value=v_scale,
@@ -402,7 +462,7 @@ class AscendFAImpl(AttentionImpl):
                 input_layout=layout,
                 num_query_heads=N,
                 num_key_value_heads=N_kv,
-                softmax_scale=1.0 / math.sqrt(D),
+                softmax_scale=self.softmax_scale,
                 dequant_scale_query=q_scale,
                 dequant_scale_key=k_scale,
                 dequant_scale_value=v_scale,
