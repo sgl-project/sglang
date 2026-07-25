@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )

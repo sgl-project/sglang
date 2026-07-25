@@ -7,6 +7,9 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    SampleStepTokens,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -18,14 +21,12 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    SampleStepTokens,
-)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,13 @@ def sample_draft_block(
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             return torch.argmax(step_logits, dim=-1)
 
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
@@ -199,6 +202,11 @@ def sample_draft_block(
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
+                # All-NaN rows make multinomial raise; clamp to one-hot token 0.
+                degenerate_rows = torch.isnan(probs[:, :1])
+                one_hot_token0 = torch.zeros_like(probs)
+                one_hot_token0[:, 0] = 1.0
+                probs = torch.where(degenerate_rows, one_hot_token0, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
