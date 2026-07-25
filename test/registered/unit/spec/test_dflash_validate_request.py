@@ -1,13 +1,10 @@
-"""Unit tests for dflash_utils.validate_dflash_request grammar gating.
+"""Admission gating for grammar-constrained requests on the DFLASH family.
 
-The shared DFLASH/DSPARK admission check gates grammar-constrained decoding
-(json_schema / regex / ebnf / structural_tag). DSPARK enforces the grammar by
-masking the target verify logits along its linear verify chain, so those
-requests must be admitted; DFLASH has no such masking and must keep rejecting
-them. The guarded failure mode is a predicate that degrades to always-reject
-(DSPARK grammar silently 400s, losing the feature) or always-admit (DFLASH
-grammar slips through and returns unconstrained output). Real SamplingParams
-objects are used so the four grammar field names stay pinned to the request API.
+The gate must track supports_grammar_overlap() rather than a hardcoded algorithm
+list, so an algorithm that grows the verify-time bitmask does not need a second
+edit here -- and one that has not grown it cannot silently admit requests it
+would answer unconstrained. Real SamplingParams objects keep the four grammar
+field names pinned to the request API.
 """
 
 import unittest
@@ -28,8 +25,10 @@ _GRAMMAR_KINDS = (
     {"structural_tag": '{"type": "structural_tag"}'},
 )
 
-DFLASH = SpeculativeAlgorithm.from_string("DFLASH")
-DSPARK = SpeculativeAlgorithm.from_string("DSPARK")
+_ALGORITHMS = (
+    SpeculativeAlgorithm.from_string("DFLASH"),
+    SpeculativeAlgorithm.from_string("DSPARK"),
+)
 
 
 def _make_req(**sampling_kwargs) -> SimpleNamespace:
@@ -41,53 +40,46 @@ def _make_req(**sampling_kwargs) -> SimpleNamespace:
 
 
 class TestValidateDflashRequestGrammarGating(CustomTestCase):
-    def test_dspark_admits_every_grammar_kind(self):
-        for kind in _GRAMMAR_KINDS:
-            with self.subTest(grammar=next(iter(kind))):
-                req = _make_req(**kind)
-                self.assertIsNone(
-                    validate_dflash_request(
-                        req, enable_overlap=False, spec_algorithm=DSPARK
+    def test_grammar_admission_follows_capability(self):
+        for algo in _ALGORITHMS:
+            for kind in _GRAMMAR_KINDS:
+                with self.subTest(algo=algo.name, grammar=next(iter(kind))):
+                    error = validate_dflash_request(
+                        _make_req(**kind), enable_overlap=False, spec_algorithm=algo
                     )
-                )
+                    if algo.supports_grammar_overlap():
+                        self.assertIsNone(error)
+                    else:
+                        self.assertIn("grammar", error.lower())
 
-    def test_dflash_rejects_every_grammar_kind(self):
-        for kind in _GRAMMAR_KINDS:
-            with self.subTest(grammar=next(iter(kind))):
-                req = _make_req(**kind)
-                error = validate_dflash_request(
-                    req, enable_overlap=False, spec_algorithm=DFLASH
-                )
-                self.assertIsNotNone(error)
-                self.assertIn("grammar", error.lower())
-
-    def test_ungrammared_request_admitted_on_both(self):
-        for algo in (DFLASH, DSPARK):
-            with self.subTest(algo=algo):
+    def test_ungrammared_request_admitted(self):
+        for algo in _ALGORITHMS:
+            with self.subTest(algo=algo.name):
                 self.assertIsNone(
                     validate_dflash_request(
                         _make_req(), enable_overlap=False, spec_algorithm=algo
                     )
                 )
 
-    def test_non_grammar_rejections_survive_for_dspark(self):
-        # The grammar carve-out must not swallow the earlier guards: DSPARK still
-        # rejects return_logprob and (under overlap) return_hidden_states.
-        logprob_req = _make_req()
-        logprob_req.return_logprob = True
-        self.assertIsNotNone(
-            validate_dflash_request(
-                logprob_req, enable_overlap=False, spec_algorithm=DSPARK
-            )
-        )
+    def test_non_grammar_rejections_survive(self):
+        # The grammar carve-out must not swallow the earlier guards.
+        for algo in _ALGORITHMS:
+            with self.subTest(algo=algo.name):
+                logprob_req = _make_req()
+                logprob_req.return_logprob = True
+                self.assertIsNotNone(
+                    validate_dflash_request(
+                        logprob_req, enable_overlap=False, spec_algorithm=algo
+                    )
+                )
 
-        hidden_req = _make_req()
-        hidden_req.return_hidden_states = True
-        self.assertIsNotNone(
-            validate_dflash_request(
-                hidden_req, enable_overlap=True, spec_algorithm=DSPARK
-            )
-        )
+                hidden_req = _make_req()
+                hidden_req.return_hidden_states = True
+                self.assertIsNotNone(
+                    validate_dflash_request(
+                        hidden_req, enable_overlap=True, spec_algorithm=algo
+                    )
+                )
 
 
 if __name__ == "__main__":

@@ -57,9 +57,7 @@ class DFlashDraftInputV2(SpecInput):
 
     verify_token_budget: Optional[int] = None
 
-    # Grammar object for a constrained-decoding request in the batch. Set by
-    # generate_token_bitmask() during verify (mirrors EagleVerifyInput.grammar)
-    # and read back to apply the vocab mask to the target logits before accept.
+    # Stamped by generate_token_bitmask during verify, read back to apply the mask.
     grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):

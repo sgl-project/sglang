@@ -803,17 +803,16 @@ def validate_dflash_request(
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    # DSPARK supports grammar-constrained decoding: DSparkWorkerV2 masks the
-    # target verify logits to the grammar-allowed vocabulary along the linear
-    # verify chain before accept. DFLASH does not implement this yet.
-    if not spec_algorithm.is_dspark() and (
+    # Grammar support in this family is the verify-time bitmask plus the grammar
+    # barrier, so the capability that gates the barrier also gates admission.
+    if not spec_algorithm.supports_grammar_overlap() and (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
         or req.sampling_params.structural_tag is not None
     ):
         return (
-            "DFLASH speculative decoding does not support "
+            f"{spec_algorithm.name} speculative decoding does not support "
             "grammar-constrained decoding yet."
         )
 

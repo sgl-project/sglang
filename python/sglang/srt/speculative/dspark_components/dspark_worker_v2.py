@@ -1,13 +1,13 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -53,51 +53,14 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
-from sglang.srt.speculative.spec_utils import draft_tp_context, generate_token_bitmask
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
+    draft_tp_context,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
-
-
-def apply_grammar_vocab_mask(
-    reqs: List[Req],
-    draft_input: DFlashDraftInputV2,
-    verify_ids_2d: torch.Tensor,
-    next_token_logits: torch.Tensor,
-    vocab_size: int,
-) -> None:
-    """Mask the target verify logits to the grammar-allowed vocabulary in place.
-
-    DSPARK's verify chain is linear (a degenerate tree, where each position's
-    only child is the next one), so EAGLE's tree-based mask builder applies
-    directly with a straight-line ``retrieve_next_token`` and no siblings. The
-    mask is built over ``verify_ids_2d`` (the same ``(bs, block_size + 1)``
-    tensor that produced ``next_token_logits``), so mask rows and logit rows
-    line up one-for-one. ``generate_token_bitmask`` records the batch grammar on
-    ``draft_input.grammar``; when no request in the batch carries one it returns
-    ``None`` and the logits are left untouched.
-    """
-    bs, chain_len = verify_ids_2d.shape
-    retrieve_next_token_cpu = torch.full((bs, chain_len), -1, dtype=torch.int64)
-    if chain_len > 1:
-        retrieve_next_token_cpu[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
-    retrieve_next_sibling_cpu = torch.full((bs, chain_len), -1, dtype=torch.int64)
-    draft_tokens_cpu = verify_ids_2d.to(device="cpu", dtype=torch.int64)
-
-    vocab_mask = generate_token_bitmask(
-        reqs,
-        draft_input,
-        retrieve_next_token_cpu,
-        retrieve_next_sibling_cpu,
-        draft_tokens_cpu,
-        vocab_size,
-    )
-    if vocab_mask is None or draft_input.grammar is None:
-        return
-    vocab_mask = vocab_mask.to(next_token_logits.device)
-    draft_input.grammar.apply_vocab_mask(
-        logits=next_token_logits, vocab_mask=vocab_mask
-    )
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -399,6 +362,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        grammar_barrier=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -410,7 +374,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)
 
-        return self._forward_decode(batch, on_publish)
+        return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -516,7 +480,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -609,6 +573,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # Must stay ahead of the target verify launch below.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        )
+
         # A live grammar forces the eager path: the folded epilogue runs
         # accept/finalize inside the target-verify cuda graph off its own
         # buffers, so a vocab mask applied to next_token_logits below would be
@@ -645,13 +614,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
         if batch.has_grammar and logits_output.next_token_logits is not None:
-            apply_grammar_vocab_mask(
+            # Grammar barrier: advance the previous batch's FSM over its committed
+            # tokens before building this batch's bitmask. Runs after the target
+            # launch, so the advance and the traversal both overlap the forward.
+            if grammar_barrier is not None:
+                grammar_barrier()
+            # run_compact scatters its rows back to (bs * chain_len), so the mask
+            # lines up with the logits on both verify paths.
+            vocab_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                draft_input=draft_input,
-                verify_ids_2d=verify_ids_2d,
-                next_token_logits=logits_output.next_token_logits,
-                vocab_size=sampling_info.vocab_size,
+                verify_input=draft_input,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=logits_output.next_token_logits.device,
             )
+            # Constrain every chain position before accept picks from it.
+            if vocab_mask is not None:
+                draft_input.grammar.apply_vocab_mask(
+                    logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+                )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph

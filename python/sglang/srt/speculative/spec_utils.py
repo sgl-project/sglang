@@ -590,6 +590,20 @@ class GrammarTree:
     ) -> GrammarTree:
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
+    @classmethod
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
+
+        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
+        token, so mask rows line up with the target's logits rows one-for-one.
+        Only the ids need a copy; the links are fixed by the shape.
+        """
+        bs, chain_len = verify_ids_2d.shape
+        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
+        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
+        return cls.from_device(next_token, next_sibling, verify_ids_2d)
+
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
             self._done.synchronize()
