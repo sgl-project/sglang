@@ -266,8 +266,8 @@ class BaseTpWorker(ABC):
             self.model_runner,
             return_hidden_states_before_norm=False,
         )
-        output = self.model_runner.forward(forward_batch).logits_output
-        return output  # Returns EmbeddingPoolerOutput
+        output = self.model_runner.forward(forward_batch)
+        return output.logits_output, output.can_run_graph
 
 
 class TpModelWorker(BaseTpWorker):
