@@ -13,7 +13,6 @@ from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
@@ -37,6 +36,36 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+
+
+def _derive_tree_links(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrive_next_token, retrive_next_sibling), matching what
+    reconstruct_indices_from_tree_mask produces on device.
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate
+    parent is the largest such j < i. First child and next sibling then follow
+    from the parents alone: the first child of i is the smallest k > i parented
+    by i, and i's next sibling is the smallest k > i sharing i's parent.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -75,6 +104,8 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+        # Host draft tree staged for the grammar bitmask; see _prepare_for_speculative_decoding.
+        self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -281,6 +312,11 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
+        # Grammar walks this tree on the host to build its bitmask. Stash the host
+        # arrays it needs; the links are derived from them after the verify forward
+        # is launched, so no device round trip and nothing runs while the GPU idles.
+        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
             tree_mask,
@@ -381,23 +417,6 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
-            # Prepare grammar data on CPU if needed. Async pinned D2H, waited on
-            # just before the bitmask traversal reads it, so the copies and the
-            # traversal both overlap the target verify forward.
-            grammar_copy_done = None
-            if batch.has_grammar:
-                retrieve_next_token_cpu = _async_d2h(verify_input.retrieve_next_token)
-                retrieve_next_sibling_cpu = _async_d2h(
-                    verify_input.retrieve_next_sibling
-                )
-                draft_tokens_cpu = _async_d2h(
-                    verify_input.draft_token.view(
-                        verify_input.retrieve_next_token.shape
-                    )
-                )
-                grammar_copy_done = torch.get_device_module(self.device).Event()
-                grammar_copy_done.record()
-
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
@@ -410,9 +429,15 @@ class NGRAMWorker(BaseSpecWorker):
             verify_input: NgramVerifyInput = batch.spec_info
             vocab_mask = None
             if batch.has_grammar:
-                grammar_copy_done.synchronize()
-                # Generate the logit mask for structured output.
-                # Overlap the CPU operations for bitmask generation with the forward pass.
+                # Derived here, under the verify forward, from the host tree: no
+                # device round trip and nothing to wait on.
+                mask, req_drafts = self.grammar_tree_host
+                retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
+                    mask, bs, self.draft_token_num
+                )
+                draft_tokens_cpu = (
+                    torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1)
+                )
                 vocab_mask = generate_token_bitmask(
                     batch.reqs,
                     verify_input,
