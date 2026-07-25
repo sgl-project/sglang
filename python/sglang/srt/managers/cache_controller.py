@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
 )
 
 if TYPE_CHECKING:
@@ -96,9 +97,7 @@ class LayerDoneCounter:
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
+        assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
         return self.producer_index
@@ -117,7 +116,6 @@ class LayerDoneCounter:
 
 
 class CacheOperation:
-
     counter = 0
 
     def __init__(
@@ -175,6 +173,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -182,6 +181,8 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.pool_transfers = pool_transfers
+        self.pool_storage_result = PoolTransferResult.empty()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -197,6 +198,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
         self.request_id = request_id
 
@@ -205,7 +207,14 @@ class PrefetchOperation(StorageOperation):
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            None,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=pool_transfers,
+        )
+        self.pool_transfers_done = not bool(pool_transfers)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -223,7 +232,6 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -374,13 +382,31 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
-        self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
         self.prefetch_revoke_queue: Queue[str] = Queue()
+        self.ack_prefetch_queue: Queue[PrefetchOperation] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+        self._init_extra_host_mem_release_queues()
 
         self.prefetch_thread.start()
         self.backup_thread.start()
+
+    def _init_extra_host_mem_release_queues(self) -> None:
+        self.extra_host_mem_release_queues = {}
+        entries = getattr(self.mem_pool_host, "entries", None) or []
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        for entry in entries:
+            if entry is anchor_entry or entry.is_primary_index_anchor:
+                continue
+            self.extra_host_mem_release_queues[entry.name] = Queue()
+
+    def _append_host_mem_release_pages(
+        self, release_queue: Queue, host_indices: torch.Tensor, page_size: int
+    ) -> None:
+        if host_indices.numel() == 0:
+            return
+        for page in host_indices.split(page_size):
+            release_queue.put(page)
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -612,9 +638,9 @@ class HiCacheController:
         should_split_heads = False
 
         if tp_lcm_size:
-            assert (
-                tp_lcm_size % self.tp_size == 0
-            ), "tp_lcm_size must be divisible by tp_size."
+            assert tp_lcm_size % self.tp_size == 0, (
+                "tp_lcm_size must be divisible by tp_size."
+            )
             should_split_heads = (
                 not is_rank_replicated
                 and self.mem_pool_host.layout == "page_head"
@@ -653,9 +679,13 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
-            self.prefetch_hit_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
+            for release_queue in getattr(
+                self, "extra_host_mem_release_queues", {}
+            ).values():
+                release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
         self.storage_stop_event.clear()
@@ -903,12 +933,17 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys=prefix_keys,
+            pool_transfers=extra_pools,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -917,12 +952,33 @@ class HiCacheController:
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
-    def append_host_mem_release(self, host_indices: torch.Tensor):
-        if host_indices.numel() == 0:
-            return
-        pages = host_indices.split(self.mem_pool_host.page_size)
-        for page in pages:
-            self.host_mem_release_queue.put(page)
+    def append_host_mem_release(
+        self,
+        host_indices: Optional[torch.Tensor] = None,
+        extra_pools: Optional[list[PoolTransfer]] = None,
+    ):
+        if host_indices is not None:
+            self._append_host_mem_release_pages(
+                self.host_mem_release_queue,
+                host_indices,
+                self.mem_pool_host.page_size,
+            )
+        for transfer in extra_pools or []:
+            if transfer.host_indices is None or transfer.host_indices.numel() == 0:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if (
+                entry is None
+                or entry.is_primary_index_anchor
+                or transfer.indices_from_pool is not None
+            ):
+                continue
+            release_queue = self.extra_host_mem_release_queues.get(transfer.name)
+            if release_queue is None:
+                continue
+            self._append_host_mem_release_pages(
+                release_queue, transfer.host_indices, entry.host_pool.page_size
+            )
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
@@ -993,6 +1049,14 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        kv_completed_pages = operation.completed_tokens // self.page_size
+        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+            results = self.storage_backend.batch_get_v2(
+                operation.pool_transfers, HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            )
+            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        operation.pool_transfers_done = True
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -1004,9 +1068,10 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
+                if operation.host_indices is not None:
+                    self.append_host_mem_release(
+                        operation.host_indices[operation.completed_tokens :]
+                    )
             except Empty:
                 continue
 
@@ -1019,6 +1084,9 @@ class HiCacheController:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation):
+        self.prefetch_buffer.put(operation)
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
@@ -1034,7 +1102,18 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if operation.pool_transfers:
+                hit_result = self.storage_backend.batch_exists_v2(
+                    batch_hashes, operation.pool_transfers, extra_info
+                )
+                hit_page_num = hit_result.kv_hit_pages
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
+            operation.pool_storage_result.update_kv_hit_pages(
+                start + hit_page_num
+            )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1070,19 +1149,25 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
+                if (
+                    operation.is_terminated()
+                    or storage_hit_count < self.prefetch_threshold
+                ):
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
-                    # Record hit count, so the scheduler thread will know the exact memory to allocate
+                    # Record hit count, so the scheduler thread will know the exact memory to allocate.
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
                     operation.storage_hit_count = storage_hit_count
-                    self.prefetch_hit_queue.put(operation)
+                    logger.debug(
+                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                    )
+                    self.ack_prefetch_queue.put(operation)
 
             except Empty:
                 continue

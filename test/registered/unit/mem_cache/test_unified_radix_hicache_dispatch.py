@@ -1,7 +1,14 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
+from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+    SidecarPoolSpec,
+)
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _STRATEGIES,
@@ -30,6 +37,36 @@ def _mock_kvcache(cls):
 FULL = ComponentType.FULL
 SWA = ComponentType.SWA
 MAMBA = ComponentType.MAMBA
+
+
+class TestStorageHitQuery(unittest.TestCase):
+    def test_exists_result_does_not_mark_extra_pool_as_loaded(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.page_size = 2
+        controller.get_hash_str = MagicMock(return_value=["hash-0", "hash-1"])
+        controller.storage_backend = MagicMock()
+        controller.storage_backend.batch_exists_v2.return_value = PoolTransferResult(
+            kv_hit_pages=2,
+            extra_pool_hit_pages={PoolName.MAMBA: 1},
+        )
+        operation = PrefetchOperation(
+            "request-id",
+            [1, 2, 3, 4],
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["mamba-state"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+
+        hashes, hit_tokens = controller._storage_hit_query(operation)
+
+        self.assertEqual(hashes, ["hash-0", "hash-1"])
+        self.assertEqual(hit_tokens, 4)
+        self.assertEqual(operation.pool_storage_result.kv_hit_pages, 2)
+        self.assertEqual(operation.pool_storage_result.extra_pool_hit_pages, {})
 
 
 class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
