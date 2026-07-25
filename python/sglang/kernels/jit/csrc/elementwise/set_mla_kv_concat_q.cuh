@@ -31,6 +31,7 @@
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <cuda/ptx>
 #include <dlpack/dlpack.h>
@@ -64,39 +65,6 @@ struct SetMlaKVConcatQParams {
   int32_t qo_stride_1;
 };
 
-// Warp-cooperative gmem -> smem copy (same as set_mla_kv_buffer.cuh). Picks
-// the widest vec width dividing the byte total; the launcher enforces the
-// matching base/stride alignment on the host side.
-template <int64_t kBytes>
-SGL_DEVICE void fused_warp_g2s_copy(const void* __restrict__ src, void* __restrict__ dst) {
-  using namespace device;
-  constexpr int64_t kAlignment = (kBytes % (16 * kWarpThreads) == 0)  ? 16
-                                 : (kBytes % (8 * kWarpThreads) == 0) ? 8
-                                 : (kBytes % (4 * kWarpThreads) == 0) ? 4
-                                 : (kBytes % 4 == 0)                  ? 4
-                                                                      : 0;
-  static_assert(kAlignment > 0, "kBytes must be a multiple of 4");
-
-  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
-  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
-  constexpr auto kLoopCount = kBytes / kLoopBytes;
-  constexpr int64_t kTailVecs = (kBytes - kLoopCount * kLoopBytes) / sizeof(vec_t);
-
-  const auto gmem = tile::Memory<vec_t>::warp();
-
-#pragma unroll
-  for (int64_t i = 0; i < kLoopCount; ++i) {
-    const auto v = gmem.load(src, i);
-    gmem.store(dst, v, i);
-  }
-  if constexpr (kTailVecs > 0) {
-    if (gmem.in_bound(kLoopCount * kWarpThreads + kTailVecs, kLoopCount)) {
-      const auto v = gmem.load(src, kLoopCount);
-      gmem.store(dst, v, kLoopCount);
-    }
-  }
-}
-
 template <int64_t kNopeBytes, int64_t kRopeBytes, int kNumWarps, bool kUsePDL, typename TLoc>
 __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConcatQParams params) {
   using namespace device;
@@ -124,8 +92,8 @@ __global__ void set_mla_kv_concat_q_kernel(const __grid_constant__ SetMlaKVConca
     const auto rope_src = pointer::offset(params.k_rope, item_id * params.stride_rope_bytes);
     void* const gmem_dst = pointer::offset(params.kv_buffer, loc * params.stride_buffer_bytes);
 
-    fused_warp_g2s_copy<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
-    fused_warp_g2s_copy<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
+    warp::g2s_copy<kNopeBytes>(nope_src, &smem[warp_in_cta][0]);
+    warp::g2s_copy<kRopeBytes>(rope_src, &smem[warp_in_cta][kNopeBytes]);
 
     // TMA reads smem via the async proxy; fence so it can't observe stale sts.
     __syncwarp();

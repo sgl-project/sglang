@@ -1,9 +1,11 @@
 /// \file warp.cuh
-/// \brief Warp-level reduction primitives.
+/// \brief Warp-level reduction and cooperative-copy primitives.
 
 #pragma once
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <cstdint>
 #include <type_traits>
@@ -117,6 +119,41 @@ SGL_DEVICE T reduce_max(T value, mask_t active_mask = kFullMask) {
 template <uint32_t kNumThreads = kWarpThreads, bool kInner = true, typename T>
 SGL_DEVICE T reduce_min(T value, mask_t active_mask = kFullMask) {
   return reduce<ReductionOp::MIN, kNumThreads, kInner>(value, active_mask);
+}
+
+/// \brief Warp-cooperative gmem -> smem copy of a compile-time byte count.
+///
+/// Picks the widest vector width that divides both the per-thread share and
+/// the byte total. The caller guarantees ``src`` is aligned to the picked
+/// width (16B for kBytes % (16*32) == 0, else 8/4) and ``dst`` is the start
+/// of a 16B-aligned per-warp smem slot.
+template <int64_t kBytes>
+SGL_DEVICE void g2s_copy(const void* __restrict__ src, void* __restrict__ dst) {
+  constexpr int64_t kAlignment = (kBytes % (16 * kWarpThreads) == 0)  ? 16
+                                 : (kBytes % (8 * kWarpThreads) == 0) ? 8
+                                 : (kBytes % (4 * kWarpThreads) == 0) ? 4
+                                 : (kBytes % 4 == 0)                  ? 4
+                                                                      : 0;
+  static_assert(kAlignment > 0, "kBytes must be a multiple of 4");
+
+  using vec_t = AlignedStorage<uint32_t, kAlignment / 4>;
+  constexpr auto kLoopBytes = sizeof(vec_t) * kWarpThreads;
+  constexpr auto kLoopCount = kBytes / kLoopBytes;
+  constexpr int64_t kTailVecs = (kBytes - kLoopCount * kLoopBytes) / sizeof(vec_t);
+
+  const auto gmem = tile::Memory<vec_t>::warp();
+
+#pragma unroll
+  for (int64_t i = 0; i < kLoopCount; ++i) {
+    const auto v = gmem.load(src, i);
+    gmem.store(dst, v, i);
+  }
+  if constexpr (kTailVecs > 0) {
+    if (gmem.in_bound(kLoopCount * kWarpThreads + kTailVecs, kLoopCount)) {
+      const auto v = gmem.load(src, kLoopCount);
+      gmem.store(dst, v, kLoopCount);
+    }
+  }
 }
 
 }  // namespace device::warp
