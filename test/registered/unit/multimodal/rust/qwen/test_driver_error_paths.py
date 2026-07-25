@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
     PROCESSOR_CONFIGS,
+    VISION_END_ID,
     VISION_START_ID,
     image_bytes,
     load_core,
@@ -32,7 +33,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 SPEC = spec_json(PROCESSOR_CONFIGS["qwen2_5_vl"])
-IMAGE_IDS = [7, VISION_START_ID, IMAGE_TOKEN_ID, 902, 8]
+IMAGE_IDS = [7, VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8]
 
 
 def gif_bytes():

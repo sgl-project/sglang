@@ -45,7 +45,10 @@ class TestQwenImagePreprocess(CustomTestCase):
                         np.asarray(actual).reshape(expected.pixel_values.shape)
                         - expected.pixel_values.numpy()
                     )
-                    self.assertLess(diff.max(), 0.06)
+                    # The Rust resize is bit-exact vs PIL; this envelope only
+                    # absorbs HF-internal noise (≤2 u8 levels ≈ 0.030 after
+                    # normalize with the qwen2_vl std).
+                    self.assertLess(diff.max(), 0.035)
                     self.assertLess(diff.mean(), 1e-3)
 
     def test_smart_resize_matches_python(self):

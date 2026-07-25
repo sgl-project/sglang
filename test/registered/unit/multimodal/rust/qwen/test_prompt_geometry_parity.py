@@ -15,6 +15,7 @@ from _utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
     PROCESSOR_CONFIGS,
     VIDEO_TOKEN_ID,
+    VISION_END_ID,
     VISION_START_ID,
     image_bytes,
     load_core,
@@ -41,7 +42,7 @@ class TestQwenPromptGeometry(CustomTestCase):
         for image_count in (1, 2):
             ids = [7]
             for _ in range(image_count):
-                ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, 902, 8))
+                ids.extend((VISION_START_ID, IMAGE_TOKEN_ID, VISION_END_ID, 8))
             images = [image_bytes(96 + 8 * i, 80, i) for i in range(image_count)]
             with self.subTest(image_count=image_count):
                 actual_ids, _, grids, _, offsets, _, _ = (
@@ -73,7 +74,7 @@ class TestQwenPromptGeometry(CustomTestCase):
             start = len(ids) - 1
             ids.extend([IMAGE_TOKEN_ID] * (np.prod(grid) // 4 - 1))
             items.append((start, len(ids) - 1, *grid))
-            ids.extend((902, 11))
+            ids.extend((VISION_END_ID, 11))
 
         actual, delta = QWEN_CORE.mrope_image_only_py(len(ids), items, 2)
         actual = np.asarray(actual).reshape(3, -1)
