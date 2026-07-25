@@ -2207,7 +2207,7 @@ class Indexer(MultiPlatformOp):
 
             k_pe = k_pe.unsqueeze(1)
 
-            if layer_id == 0:
+            if layer_id == get_token_to_kv_pool().start_layer:
                 self.rotary_emb.sin_cos_cache = (
                     self.rotary_emb.cos_sin_cache.index_select(0, positions)
                 )
