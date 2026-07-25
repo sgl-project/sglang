@@ -409,6 +409,13 @@ class CustomAllReduceV2:
         self.close()
 
 
+def _is_vmm_backed_allocator(device: torch.device) -> bool:
+    """True iff the caching allocator is VMM-backed (expandable_segments). Uniform
+    launch, so the local probe reflects every rank."""
+    probe = torch.empty(1, dtype=torch.uint8, device=device)
+    return is_vmm_pointer(probe.data_ptr())
+
+
 def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
@@ -416,11 +423,11 @@ def can_use_custom_all_reduce_v2(
     supported = list(range(2, 17))
     if dist.get_world_size(group=group) not in supported:
         return False
-    # Multi-node is safe only when the whole TP group is a single NVLink clique
-    # (one NVL72 / MNNVL domain); v2's symm-mem storage then spans nodes over fabric
-    # peer VAs. Otherwise fall back to the intra-node nvlink/p2p check.
+    # Multi-node needs a single NVLink clique (one NVL72 / MNNVL domain) whose
+    # allocator is VMM-backed: graph inputs cross nodes via FABRIC / POSIX-fd VMM
+    # handles, not cudaIpc (intra-node only). Else use the intra-node nvlink check.
     if not all(in_the_same_node_as(group, source_rank=0)):
-        return is_one_nvlink_clique(group, device)
+        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
