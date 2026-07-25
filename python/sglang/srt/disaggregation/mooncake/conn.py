@@ -154,17 +154,17 @@ class KVArgsRegisterInfo:
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
             dst_kv_layer_ids=(
-                list(struct.unpack(f"{len(msg[14]) // 4}I", msg[14]))
-                if len(msg) > 14 and msg[14] != b""
+                list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
+                if len(msg) > 12 and msg[12] != b""
                 else []
             ),
             dst_state_layer_ids=(
-                unpack_int_lists(msg[15], "I")
-                if len(msg) > 15 and msg[15] != b""
+                unpack_int_lists(msg[13], "I")
+                if len(msg) > 13 and msg[13] != b""
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -627,6 +627,8 @@ class MooncakeKVManager(CommonKVManager):
 
         # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+            # Layer IDs map PP-local buffers to global decode entries.
+            # Registrations without them retain the existing PP mapping.
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
                     src_layer_ids,
@@ -2037,10 +2039,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             dst_kv_item_len,
                             packed_state_item_lens,
                             packed_state_dim_per_tensor,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
                             packed_kv_layer_ids,
                             packed_state_layer_ids,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
                         ]
                     )
             except zmq.ZMQError:
