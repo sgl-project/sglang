@@ -45,7 +45,7 @@ impl HarmonyResponseProcessor {
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<response_formatting::ChatCompletionResponseWithUsage, Response> {
         // Collect all completed responses (one per choice)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
@@ -136,14 +136,17 @@ impl HarmonyResponseProcessor {
         }
 
         // Final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
+
+        Ok(response_formatting::ChatCompletionResponseWithUsage::new(
+            response,
+            &all_responses,
+        ))
     }
 }
 

@@ -217,7 +217,8 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
-    ) -> Result<ChatCompletionResponse, axum::response::Response> {
+    ) -> Result<response_formatting::ChatCompletionResponseWithUsage, axum::response::Response>
+    {
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -290,14 +291,17 @@ impl ResponseProcessor {
         let usage = response_formatting::build_usage(&all_responses);
 
         // Build final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .build();
+
+        Ok(response_formatting::ChatCompletionResponseWithUsage::new(
+            response,
+            &all_responses,
+        ))
     }
 
     /// Parse tool calls using model-specific parser

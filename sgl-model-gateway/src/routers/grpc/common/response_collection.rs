@@ -48,6 +48,8 @@ pub(crate) async fn collect_responses(
             prefill.mark_completed();
             decode_stream.mark_completed();
 
+            merge_prefill_cached_tokens(&prefill_responses, &mut decode_responses);
+
             // Merge prefill input_logprobs if requested
             if merge_logprobs {
                 merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
@@ -94,5 +96,53 @@ fn merge_prefill_logprobs(
                 }
             }
         }
+    }
+}
+
+fn merge_prefill_cached_tokens(
+    prefill_responses: &[ProtoGenerateComplete],
+    decode_responses: &mut [ProtoGenerateComplete],
+) {
+    if let Some(cached_tokens) = prefill_responses.first().map(|r| r.cached_tokens()) {
+        for response in decode_responses {
+            if let ProtoGenerateComplete::Sglang(decode) = response {
+                decode.cached_tokens = decode.cached_tokens.saturating_add(cached_tokens);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::sglang_proto;
+
+    use super::*;
+
+    fn complete(cached_tokens: i32) -> ProtoGenerateComplete {
+        ProtoGenerateComplete::Sglang(sglang_proto::GenerateComplete {
+            cached_tokens,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn merges_prefill_cached_tokens_into_decode_responses() {
+        let prefill_responses = vec![complete(42)];
+        let mut decode_responses = vec![complete(0), complete(0)];
+
+        merge_prefill_cached_tokens(&prefill_responses, &mut decode_responses);
+
+        assert_eq!(decode_responses[0].cached_tokens(), 42);
+        assert_eq!(decode_responses[1].cached_tokens(), 42);
+    }
+
+    #[test]
+    fn preserves_decode_cached_tokens_when_merging_prefill() {
+        let prefill_responses = vec![complete(42)];
+        let mut decode_responses = vec![complete(8)];
+
+        merge_prefill_cached_tokens(&prefill_responses, &mut decode_responses);
+
+        assert_eq!(decode_responses[0].cached_tokens(), 50);
     }
 }

@@ -15,13 +15,14 @@ use super::{
 use crate::{
     core::{Worker, WorkerLoadGuard},
     protocols::{
-        chat::{ChatCompletionRequest, ChatCompletionResponse},
+        chat::ChatCompletionRequest,
         classify::{ClassifyRequest, ClassifyResponse},
         embedding::{EmbeddingRequest, EmbeddingResponse},
         generate::{GenerateRequest, GenerateResponse},
         responses::ResponsesRequest,
     },
     reasoning_parser::ParserFactory as ReasoningParserFactory,
+    routers::grpc::common::response_formatting::ChatCompletionResponseWithUsage,
     tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry},
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -476,7 +477,7 @@ pub(crate) enum ExecutionResult {
 /// Final processed response
 #[derive(Debug)]
 pub(crate) enum FinalResponse {
-    Chat(ChatCompletionResponse),
+    Chat(ChatCompletionResponseWithUsage),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
     /// Embedding response

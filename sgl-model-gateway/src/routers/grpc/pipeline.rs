@@ -709,7 +709,7 @@ impl RequestPipeline {
         }
 
         match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
+            Some(FinalResponse::Chat(response)) => Ok(response.into_inner()),
             Some(FinalResponse::Generate(_))
             | Some(FinalResponse::Embedding(_))
             | Some(FinalResponse::Classify(_)) => {
