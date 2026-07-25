@@ -7,8 +7,9 @@ buggy scheduler spins forever re-rejecting a feasible request (idle GPU, 100%
 scheduler CPU). The fix caps decode headroom at what the request actually adds
 to its window, so admission succeeds and phase 2 completes in seconds.
 
-Uses the small ``thinkingmachines/Inkling-NVFP4`` ``test`` revision (8-layer,
-sliding_window_size=512) on a single GPU.
+Uses the small ``thinkingmachines/Inkling`` ``test`` revision (8-layer,
+sliding_window_size=512) on a single GPU. The livelock is model-agnostic; the
+bf16 checkpoint is used because it loads without the NVFP4 fused-MoE path.
 """
 
 import os
@@ -22,9 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-large")
 
-_MODEL_PATH = os.environ.get(
-    "INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling-NVFP4"
-)
+_MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
 
 WINDOW = 512  # Inkling test-branch sliding_window_size
@@ -40,10 +39,7 @@ class TestSWAAdmissionLivelock(CustomTestCase):
             model_path=_MODEL_PATH,
             tp_size=1,
             trust_remote_code=True,
-            quantization="modelopt_fp4",
             attention_backend="fa4",
-            fp4_gemm_runner_backend="marlin",
-            moe_runner_backend="marlin",
             mamba_radix_cache_strategy="extra_buffer",
             # SWA pool ~= 2 sliding windows: the livelock boundary.
             max_total_tokens=1280,
