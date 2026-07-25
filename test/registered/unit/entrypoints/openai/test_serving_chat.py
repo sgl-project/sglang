@@ -24,6 +24,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
+    TOOL_ERROR_PREFIX,
     OpenAIServingChat,
     normalize_tool_content,
 )
@@ -2416,6 +2417,40 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
+
+    def test_is_error_marks_string_content(self):
+        """Chat templates render tool content verbatim, so without an inline
+        marker the model reads a failed call as a normal result."""
+        result = normalize_tool_content("tool", "boom", is_error=True)
+        self.assertTrue(result.startswith(TOOL_ERROR_PREFIX))
+        self.assertIn("boom", result)
+
+    def test_is_error_marks_flattened_parts(self):
+        result = normalize_tool_content(
+            "tool", [{"type": "text", "text": "boom"}], is_error=True
+        )
+        self.assertTrue(result.startswith(TOOL_ERROR_PREFIX))
+        self.assertIn("boom", result)
+
+    def test_is_error_marks_non_text_part_list(self):
+        """An image-bearing tool_result stays a list, so marking only the
+        string/flattened paths would silently drop the failure marker."""
+        content = [{"type": "image_url", "image_url": {"url": "x"}}]
+        result = normalize_tool_content("tool", content, is_error=True)
+        self.assertEqual(result[0]["text"], TOOL_ERROR_PREFIX.strip())
+        self.assertEqual(result[1:], content)
+
+    def test_is_error_default_leaves_content_untouched(self):
+        """A successful result must never carry the failure marker."""
+        self.assertEqual(normalize_tool_content("tool", "fine"), "fine")
+        self.assertEqual(
+            normalize_tool_content("tool", [{"type": "text", "text": "fine"}]), "fine"
+        )
+
+    def test_is_error_ignored_for_non_tool_role(self):
+        content = [{"type": "text", "text": "hi"}]
+        result = normalize_tool_content("user", content, is_error=True)
+        self.assertIs(result, content)
 
 
 class InklingReasoningEffortTest(unittest.TestCase):

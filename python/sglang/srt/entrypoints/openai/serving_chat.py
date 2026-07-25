@@ -78,7 +78,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def normalize_tool_content(role: str, content):
+TOOL_ERROR_PREFIX = "[Tool execution failed] "
+
+
+def normalize_tool_content(role: str, content, is_error: bool = False):
     """Normalize tool message content from OpenAI array format to plain string.
 
     OpenAI clients may send tool content as a list of content parts
@@ -86,8 +89,16 @@ def normalize_tool_content(role: str, content):
     a plain string for tool messages. Only flatten when ALL items are
     pure OpenAI text parts; preserve lists containing non-text-type items
     that some templates intentionally iterate over.
+
+    ``is_error`` has no OpenAI-side equivalent, so a failed tool call is
+    marked inline: chat templates render tool content verbatim and would
+    otherwise present the failure as a normal result.
     """
-    if role != "tool" or not isinstance(content, list):
+    if role != "tool":
+        return content
+    if not isinstance(content, list):
+        if is_error and isinstance(content, str):
+            return TOOL_ERROR_PREFIX + content
         return content
     parts = content
     is_openai_text_parts = all(
@@ -96,7 +107,12 @@ def normalize_tool_content(role: str, content):
     )
     if is_openai_text_parts:
         text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
-        return " ".join(text_parts)
+        flattened = " ".join(text_parts)
+        return TOOL_ERROR_PREFIX + flattened if is_error else flattened
+    if is_error:
+        # Kept as a list (some templates iterate it), so the marker has to ride
+        # along as an extra text part rather than prefixing a string.
+        return [{"type": "text", "text": TOOL_ERROR_PREFIX.strip()}] + parts
     return content
 
 
@@ -1006,8 +1022,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
                 processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
+                    processed_msg["role"],
+                    processed_msg.get("content"),
+                    is_error=bool(msg_dict.get("is_error")),
                 )
+                # Folded into the content above; chat templates never see it.
+                processed_msg.pop("is_error", None)
 
                 openai_compatible_messages.append(processed_msg)
 
