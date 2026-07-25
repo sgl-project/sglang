@@ -64,9 +64,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
-    RaggedVerifyMode,
     compute_target_verify_graph_key,
-    read_ragged_verify_mode,
     resolve_compact_verify_layout,
 )
 from sglang.srt.utils import (
@@ -802,6 +800,14 @@ class DeepseekSparseAttnBackend(
         )
         return extend_seq_lens_cpu, cu_seqlens_q, seqlens_expanded, page_table
 
+    def _stage_ragged_verify_layout(
+        self, verify_layout: RaggedVerifyLayout, *, bs: int
+    ) -> None:
+        """Copy this step's ragged layout into the static buffers the
+        graph-recorded prep reads (init_forward_metadata_in_graph)."""
+        self._ragged_verify_lens_buf[:bs].copy_(verify_layout.verify_lens)
+        self._ragged_qo_indptr_buf[: bs + 1].copy_(verify_layout.qo_indptr_device)
+
     def _capture_verify_widths(
         self,
         verify_layout: Optional[RaggedVerifyLayout],
@@ -819,9 +825,7 @@ class DeepseekSparseAttnBackend(
             capture_extend_lens = [int(v) for v in verify_lens_cpu]
             # Stage the capture lens so the warmup run of the graph-recorded
             # prep sees non-zero lengths.
-            self._ragged_verify_lens_buf[: len(capture_extend_lens)].copy_(
-                verify_layout.verify_lens
-            )
+            self._stage_ragged_verify_layout(verify_layout, bs=bs)
             cache_seqlens_int32 = (seq_lens + verify_layout.verify_lens).to(torch.int32)
             real_rows = int(verify_layout.graph_num_tokens)
         else:
@@ -1255,10 +1259,13 @@ class DeepseekSparseAttnBackend(
             and self.dsa_index_topk <= 2048
         )
 
-        # Staged per-step verify lens for the graph-recorded ragged verify
-        # prep (init_forward_metadata_in_graph).
+        # Staged per-step verify lens / row offsets for the graph-recorded ragged
+        # verify prep (init_forward_metadata_in_graph).
         self._ragged_verify_lens_buf = torch.zeros(
             max_bs, dtype=torch.int32, device=self.device
+        )
+        self._ragged_qo_indptr_buf = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
         )
         max_ctx_len = self.req_to_token.shape[1]
         self.decode_cuda_graph_metadata: Dict = {
@@ -1504,8 +1511,14 @@ class DeepseekSparseAttnBackend(
         """
         verify_layout = None
         if forward_mode.is_target_verify():
+            # max_row_len: the graph-recorded prep compiles its page-table write
+            # for at most next_n rows per request, so padding must not widen a
+            # row past that (see RaggedVerifyLayout.padded_to_bucket).
             verify_layout = resolve_compact_verify_layout(
-                spec_info, padded_bs=bs, backend_name="DSA"
+                spec_info,
+                padded_bs=bs,
+                backend_name="DSA",
+                max_row_len=self.speculative_num_draft_tokens,
             )
         graph_key = self._target_verify_graph_key(bs, verify_layout)
 
@@ -1584,7 +1597,7 @@ class DeepseekSparseAttnBackend(
             if verify_layout is not None and is_cuda() and not _is_hip:
                 # The ragged prep chain is recorded inside the verify graph
                 # (init_forward_metadata_in_graph); replay only stages the lens.
-                self._ragged_verify_lens_buf[:bs].copy_(verify_layout.verify_lens)
+                self._stage_ragged_verify_layout(verify_layout, bs=bs)
                 total_rows = int(verify_layout.graph_num_tokens)
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_rows]
@@ -1665,6 +1678,12 @@ class DeepseekSparseAttnBackend(
                     seqlens_expanded = (seq_lens[row_to_req] + pos_in_req + 1).to(
                         torch.int32
                     )
+                    # A width-capped layout can leave the tier's tail unclaimed;
+                    # zero those rows so they take the trivial path, matching the
+                    # fused kernel's `covered` handling.
+                    seqlens_expanded = torch.where(
+                        row_ids < qo_indptr[bs], seqlens_expanded, 0
+                    ).to(torch.int32)
                     metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
                     dsa_cache_seqlens = compute_dsa_seqlens(
                         seqlens_expanded, self.dsa_index_topk
@@ -1844,7 +1863,10 @@ class DeepseekSparseAttnBackend(
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
-        if self.dsa_decode_impl == "flashmla_kv":
+        # Ragged path fills dsa_cache_seqlens only via the in-graph fused rebuild,
+        # so its flashmla refresh is recorded in init_forward_metadata_in_graph
+        # instead -- computing it here would use stale seqlens.
+        if self.dsa_decode_impl == "flashmla_kv" and not prep_recorded_in_graph:
             flashmla_metadata = metadata.flashmla_metadata.slice(
                 slice(0, seqlens_expanded_size + 1)
             )
@@ -1866,10 +1888,14 @@ class DeepseekSparseAttnBackend(
             return
         if not is_cuda() or _is_hip:
             return
-        layout = getattr(forward_batch.spec_info, "ragged_verify_layout", None)
+        # Same gate as _apply_cuda_graph_metadata's prep_recorded_in_graph: if the
+        # two ever disagree this prep is silently skipped and the metadata stays
+        # stale, so both must resolve through the shared helper. padded_bs=None:
+        # only graph_num_tokens is read here, which padding does not change.
+        layout = resolve_compact_verify_layout(
+            forward_batch.spec_info, padded_bs=None, backend_name="DSA"
+        )
         if layout is None:
-            return
-        if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
             return
         from sglang.kernels.ops.attention.dsa_metadata import (
             fused_dsa_draft_extend_metadata,
@@ -1901,12 +1927,31 @@ class DeepseekSparseAttnBackend(
             max_extend_len=self.speculative_num_draft_tokens,
             max_total_len=total_rows,
             static_extend_len=False,
+            qo_indptr=self._ragged_qo_indptr_buf[: bs + 1],
         )
+        # The ragged schedule is per-token, so _build_paged_mqa_schedule_2d_ctx_lens
+        # returned a view of dsa_seqlens_expanded -- the fused rebuild above already
+        # refreshed it in place; copying it onto itself would just record a no-op.
         ctx_lens_2d = metadata.dsa_seqlens_expanded[:total_rows].view(-1, 1)
-        if metadata.paged_mqa_ctx_lens_2d is not None:
-            metadata.paged_mqa_ctx_lens_2d.copy_(ctx_lens_2d)
+        assert (
+            metadata.paged_mqa_ctx_lens_2d is None
+            or metadata.paged_mqa_ctx_lens_2d.data_ptr() == ctx_lens_2d.data_ptr()
+        )
         self._refresh_paged_mqa_schedule_metadata(metadata, ctx_lens_2d)
         self._refresh_topk_v2_plan(metadata)
+        if self.dsa_decode_impl == "flashmla_kv":
+            # Track the dsa_cache_seqlens the fused kernel just rebuilt; the
+            # out-graph refresh in _apply_cuda_graph_metadata is skipped for
+            # this path (prep_recorded_in_graph).
+            flashmla_metadata = metadata.flashmla_metadata.slice(
+                slice(0, total_rows + 1)
+            )
+            flashmla_metadata.copy_(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=metadata.dsa_cache_seqlens_int32[:total_rows],
+                    seq_len_q=1,
+                )
+            )
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -15,6 +17,7 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        max_row_len: Optional[int] = None,
     ) -> torch.Tensor:
         impl = cls.triton if verify_lens.is_cuda else cls.torch
         return impl(
@@ -22,6 +25,7 @@ class PaddedToBucket:
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            max_row_len=max_row_len,
         )
 
     @classmethod
@@ -32,12 +36,14 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        max_row_len: Optional[int] = None,
     ) -> torch.Tensor:
         return pad_verify_lens_to_bucket(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            max_row_len=max_row_len,
         )
 
     @classmethod
@@ -48,12 +54,14 @@ class PaddedToBucket:
         graph_num_tokens: int,
         bs: int,
         padded_bs: int,
+        max_row_len: Optional[int] = None,
     ) -> torch.Tensor:
         return pad_verify_lens_to_bucket_triton(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,
             bs=bs,
             padded_bs=padded_bs,
+            max_row_len=max_row_len,
         )
 
 
@@ -63,7 +71,18 @@ def pad_verify_lens_to_bucket(
     graph_num_tokens: int,
     bs: int,
     padded_bs: int,
+    max_row_len: Optional[int] = None,
 ) -> torch.Tensor:
+    """Grow the batch's verify lens to the captured tier's `padded_bs` slots.
+
+    `max_row_len` caps every padding row at that width and never touches a real
+    request's width. Any slack that does not fit stays UNCOVERED (row-sum <
+    graph_num_tokens): consumers that key metadata off a fixed per-request width
+    need this bound, and leaving tail rows unclaimed is cheaper than admitting a
+    row wider than the width their kernels were compiled for. Without it (the
+    legacy behaviour) all slack is absorbed -- padding rows first, then the last
+    real request -- so the row-sum always equals graph_num_tokens.
+    """
     assert padded_bs >= bs, (
         f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold this "
         "batch's requests"
@@ -78,10 +97,16 @@ def pad_verify_lens_to_bucket(
         pad_block = base + (
             torch.arange(num_pad_reqs, device=device, dtype=torch.int64) < rem
         )
+        if max_row_len is not None:
+            pad_block = pad_block.clamp(max=max_row_len)
         padded = torch.cat([padded, pad_block.to(torch.int32)])
-    else:
+    elif max_row_len is None:
         padded = padded.clone()
         padded[-1] = (padded[-1].to(torch.int64) + leftover).to(torch.int32)
+    else:
+        # No padding row to absorb the slack, and inflating the last real
+        # request past max_row_len is exactly what the cap forbids.
+        padded = padded.clone()
     return padded
 
 
@@ -92,6 +117,8 @@ def _padded_to_bucket_kernel(
     bs,
     padded_bs,
     graph_num_tokens,
+    max_row_len,
+    HAS_MAX_ROW_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     idx = tl.arange(0, BLOCK)
@@ -104,8 +131,14 @@ def _padded_to_bucket_kernel(
     base = leftover // num_pad_safe
     rem = leftover - base * num_pad_safe
     pad_len = base + tl.where((idx - bs) < rem, 1, 0)
-    final = tl.where(is_real, vl, pad_len)
-    final = final + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
+    if HAS_MAX_ROW_LEN:
+        # Cap padding rows and leave any residual slack uncovered; see
+        # pad_verify_lens_to_bucket for why real rows are never inflated.
+        pad_len = tl.minimum(pad_len, max_row_len)
+        final = tl.where(is_real, vl, pad_len)
+    else:
+        final = tl.where(is_real, vl, pad_len)
+        final = final + tl.where((num_pad == 0) & (idx == bs - 1), leftover, 0)
     tl.store(out_ptr + idx, final.to(tl.int32), mask=valid)
 
 
@@ -115,6 +148,7 @@ def pad_verify_lens_to_bucket_triton(
     graph_num_tokens: int,
     bs: int,
     padded_bs: int,
+    max_row_len: Optional[int] = None,
 ) -> torch.Tensor:
     assert padded_bs >= bs, (
         f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold this "
@@ -130,6 +164,8 @@ def pad_verify_lens_to_bucket_triton(
         bs,
         padded_bs,
         graph_num_tokens,
+        max_row_len if max_row_len is not None else 0,
+        HAS_MAX_ROW_LEN=max_row_len is not None,
         BLOCK=BLOCK,
     )
     return out

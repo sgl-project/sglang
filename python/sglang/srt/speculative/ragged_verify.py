@@ -154,7 +154,9 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             device=device,
         )
 
-    def padded_to_bucket(self, *, padded_bs: int) -> RaggedVerifyLayout:
+    def padded_to_bucket(
+        self, *, padded_bs: int, max_row_len: Optional[int] = None
+    ) -> RaggedVerifyLayout:
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
             PaddedToBucket,
         )
@@ -164,13 +166,29 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
             graph_num_tokens=self.graph_num_tokens,
             bs=self.bs,
             padded_bs=padded_bs,
+            max_row_len=max_row_len,
         )
 
         return RaggedVerifyLayout._assemble_device(
             verify_lens=padded,
             graph_num_tokens=self.graph_num_tokens,
-            total_verify_tokens=self.graph_num_tokens,
+            total_verify_tokens=self._padded_total_verify_tokens(
+                padded_bs=padded_bs, max_row_len=max_row_len
+            ),
         )
+
+    def _padded_total_verify_tokens(
+        self, *, padded_bs: int, max_row_len: Optional[int]
+    ) -> Optional[int]:
+        """Row-sum of the padded lens, derived host-side (no D2H sync), or None
+        when it cannot be. Uncapped padding always absorbs the whole tier; a
+        capped one absorbs at most max_row_len per padding row."""
+        if max_row_len is None:
+            return self.graph_num_tokens
+        if self.total_verify_tokens is None:
+            return None
+        absorbed = (padded_bs - self.bs) * max_row_len
+        return min(self.graph_num_tokens, self.total_verify_tokens + absorbed)
 
 
 def build_capture_verify_lens(
@@ -208,12 +226,15 @@ def resolve_compact_verify_layout(
     *,
     padded_bs: Optional[int],
     backend_name: str,
+    max_row_len: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     """None unless a layout is present and compact mode is on; CP is rejected.
     padded_bs=None keeps the raw layout (eager); otherwise pad to the captured
-    slot count so the tier's slack lands in the padding rows. Layout invariants
-    are enforced in __post_init__; don't re-check the device tensor here --
-    that would D2H-sync the host-free verify prep path.
+    slot count so the tier's slack lands in the padding rows. max_row_len bounds
+    every padded row (see RaggedVerifyLayout.padded_to_bucket) -- pass it when
+    the backend's graph metadata assumes a maximum per-request width. Layout
+    invariants are enforced in __post_init__; don't re-check the device tensor
+    here -- that would D2H-sync the host-free verify prep path.
     """
     from sglang.srt.runtime_context import get_parallel
 
@@ -229,7 +250,7 @@ def resolve_compact_verify_layout(
         )
     if padded_bs is None:
         return layout
-    return layout.padded_to_bucket(padded_bs=padded_bs)
+    return layout.padded_to_bucket(padded_bs=padded_bs, max_row_len=max_row_len)
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):

@@ -86,6 +86,68 @@ class TestResolveCompactVerifyLayout(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestPaddedRowWidthCap(CustomTestCase):
+    """DSA's graph-recorded prep compiles its page-table write for at most
+    next_n rows per request, so `max_row_len` must bound every padded row."""
+
+    MAX_ROW_LEN = 3
+
+    def _resolve_capped(self, layout, padded_bs):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"), _parallel():
+            return resolve_compact_verify_layout(
+                _spec_info(layout),
+                padded_bs=padded_bs,
+                backend_name="DSA",
+                max_row_len=self.MAX_ROW_LEN,
+            )
+
+    def test_padding_rows_are_capped(self):
+        # total 3 -> bucket 8; one padding row cannot legally absorb 5 tokens.
+        layout = _make_layout((1, 1, 1))
+        resolved = self._resolve_capped(layout, padded_bs=4)
+        lens = resolved.verify_lens.tolist()
+        self.assertEqual(len(lens), 4)
+        self.assertLessEqual(max(lens), self.MAX_ROW_LEN)
+        self.assertEqual(lens[:3], [1, 1, 1], "real rows must not be rewritten")
+        # Residual slack stays uncovered rather than widening a row.
+        self.assertLess(sum(lens), resolved.graph_num_tokens)
+        self.assertEqual(resolved.total_verify_tokens, sum(lens))
+
+    def test_no_padding_row_does_not_inflate_last_real_row(self):
+        # padded_bs == bs: the legacy path dumped all slack onto the last real
+        # row, which is exactly what overflows the compiled row block.
+        layout = _make_layout((2, 3, 1))  # total 6 -> bucket 8
+        resolved = self._resolve_capped(layout, padded_bs=3)
+        self.assertEqual(resolved.verify_lens.tolist(), [2, 3, 1])
+        self.assertEqual(resolved.total_verify_tokens, 6)
+        self.assertEqual(resolved.graph_num_tokens, 8)
+
+    def test_uncapped_resolve_keeps_absorbing_all_slack(self):
+        layout = _make_layout((2, 3, 1))
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"), _parallel():
+            resolved = _resolve(_spec_info(layout), padded_bs=3)
+        self.assertEqual(int(resolved.verify_lens.sum().item()), 8)
+        self.assertEqual(resolved.total_verify_tokens, 8)
+
+    def test_torch_and_triton_impls_agree(self):
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import PaddedToBucket
+
+        verify_lens = torch.tensor([1, 1, 1], dtype=torch.int32, device=DEVICE)
+        for padded_bs in (3, 4, 6):
+            for max_row_len in (None, self.MAX_ROW_LEN):
+                with self.subTest(padded_bs=padded_bs, max_row_len=max_row_len):
+                    kwargs = dict(
+                        graph_num_tokens=16,
+                        bs=3,
+                        padded_bs=padded_bs,
+                        max_row_len=max_row_len,
+                    )
+                    got = PaddedToBucket.triton(verify_lens=verify_lens, **kwargs)
+                    want = PaddedToBucket.torch(verify_lens=verify_lens.cpu(), **kwargs)
+                    self.assertEqual(got.cpu().tolist(), want.tolist())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestDsaTargetVerifyGraphKey(CustomTestCase):
     def _backend(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
