@@ -1894,7 +1894,8 @@ class FlashInferIndicesUpdaterPrefill:
                         prefix_lens, seq_lens, effective_start
                     )
                 else:
-                    # window attention use paged only
+                    # window attention use paged only; the trim below is
+                    # request-granular, exactness comes from plan-time window_left
                     paged_kernel_lens = torch.minimum(
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
@@ -1927,6 +1928,13 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                # paged-only SWA path only; ragged keeps its custom prefix
+                # mask, spec-verify keeps its tree mask
+                window_left=(
+                    sliding_window_size
+                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
+                    else -1
+                ),
             )
 
     def _build_swa_prefix_custom_mask(
@@ -2043,6 +2051,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        window_left: int = -1,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -2177,6 +2186,10 @@ class FlashInferIndicesUpdaterPrefill:
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
+
+        if window_left >= 0:
+            # selects the module with the per-element window mask compiled in
+            paged_plan_kwargs["window_left"] = window_left
 
         wrapper_paged.begin_forward(
             qo_indptr,

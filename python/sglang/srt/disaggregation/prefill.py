@@ -143,11 +143,34 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
-            raise RuntimeError(
-                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                "(e.g. GQA, MHA). MLA models should not set this flag."
-            )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            if self.is_mla_backend:
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                    "(e.g. GQA, MHA). MLA models should not set this flag."
+                )
+            server_args = self.scheduler.server_args
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            cps = server_args.chunked_prefill_size or 8192
+            # Staging slices each send into a fixed page-aligned grid, so an
+            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
+            if cps <= 0 or cps % page_size != 0:
+                raise RuntimeError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
+                    f"chunked_prefill_size that is a multiple of page_size "
+                    f"({page_size}); got {server_args.chunked_prefill_size}."
+                )
+            if self.pp_size > 1:
+                # Staging writer accounting has no pp dimension.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                )
+            if server_args.enable_prefill_context_parallel:
+                # CP rewrites index_slice per rank, breaking the chunk grid.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
+                    "prefill context parallelism."
+                )
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -554,8 +577,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -572,6 +593,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
