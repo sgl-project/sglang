@@ -843,6 +843,7 @@ class MambaPool:
         return (
             not _is_npu
             and len(convs) > 0
+            and convs[0].shape[0] > 0
             and convs[0].is_cuda
             and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
         )
