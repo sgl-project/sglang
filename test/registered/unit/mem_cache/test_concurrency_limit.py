@@ -42,7 +42,9 @@ class TestConcurrencyLimit(CustomTestCase):
             _limit("mamba_state_pool", 26, remedy="--max-mamba-cache-size 370"),
         ]
         binding = resolve_concurrency_limit(limits)
-        is_downgrade, message = format_concurrency_report(binding, limits, requested=74)
+        is_downgrade, message = format_concurrency_report(
+            binding, limits, requested=limits[0]
+        )
         self.assertTrue(is_downgrade)
         self.assertIn("reduced from the requested 74 to 26", message)
         self.assertIn("bound by mamba_state_pool", message)
@@ -55,7 +57,9 @@ class TestConcurrencyLimit(CustomTestCase):
             _limit("kv_capacity", 400),
         ]
         binding = resolve_concurrency_limit(limits)
-        is_downgrade, message = format_concurrency_report(binding, limits, requested=32)
+        is_downgrade, message = format_concurrency_report(
+            binding, limits, requested=limits[0]
+        )
         self.assertFalse(is_downgrade)
         self.assertIn("bound by max_running_requests", message)
         # The user's own request carries no remedy.
@@ -80,7 +84,24 @@ class TestConcurrencyLimit(CustomTestCase):
 
 class TestLimitConstructors(CustomTestCase):
     def test_user_request_is_per_dp_worker(self):
-        self.assertEqual(user_request_limit(128, attn_dp_size=4).value, 32)
+        limit = user_request_limit(128, attn_dp_size=4)
+        self.assertEqual(limit.value, 32)
+        self.assertIn("--max-running-requests=128 / 4 dp workers", limit.detail)
+
+    def test_user_request_detail_omits_the_dp_split_when_single(self):
+        self.assertEqual(
+            user_request_limit(128, attn_dp_size=1).detail,
+            "--max-running-requests=128",
+        )
+
+    def test_downgrade_keeps_the_global_request_visible(self):
+        requested = user_request_limit(296, attn_dp_size=4)
+        limits = [requested, _limit("mamba_state_pool", 26)]
+        _, message = format_concurrency_report(
+            resolve_concurrency_limit(limits), limits, requested
+        )
+        self.assertIn("reduced from the requested 74", message)
+        self.assertIn("--max-running-requests=296 / 4 dp workers", message)
 
     def test_kv_capacity_halves_the_token_pool(self):
         self.assertEqual(kv_capacity_limit(798208).value, 399104)

@@ -1633,13 +1633,14 @@ class KVCacheConfigurator:
         post-capture resize caller opts out because it logs its own summary."""
         # Order matters: ties are attributed to the first limit listed.
         limits = []
+        requested = None
         requested_per_worker = None
         if self.server_args.max_running_requests is not None:
             requested = user_request_limit(
                 self.server_args.max_running_requests, self.ps.attn_dp_size
             )
-            requested_per_worker = requested.value
             limits.append(requested)
+            requested_per_worker = requested.value
         limits.append(kv_capacity_limit(token_capacity))
         if requested_per_worker is None:
             limits.append(
@@ -1674,7 +1675,7 @@ class KVCacheConfigurator:
 
         if report:
             is_downgrade, message = format_concurrency_report(
-                binding, limits, requested_per_worker
+                binding, limits, requested
             )
             if is_downgrade:
                 logger.warning(message)

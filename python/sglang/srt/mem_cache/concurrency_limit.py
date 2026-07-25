@@ -35,10 +35,13 @@ class ConcurrencyLimit:
 def user_request_limit(
     max_running_requests: int, attn_dp_size: int
 ) -> ConcurrencyLimit:
+    detail = f"--max-running-requests={max_running_requests}"
+    if attn_dp_size > 1:
+        detail += f" / {attn_dp_size} dp workers"
     return ConcurrencyLimit(
         source="max_running_requests",
         value=max_running_requests // attn_dp_size,
-        detail=f"--max-running-requests={max_running_requests}",
+        detail=detail,
     )
 
 
@@ -47,7 +50,7 @@ def kv_capacity_limit(token_capacity: int) -> ConcurrencyLimit:
         source="kv_capacity",
         value=token_capacity // KV_TOKENS_PER_REQUEST,
         detail=f"max_total_num_tokens={token_capacity} / {KV_TOKENS_PER_REQUEST}",
-        remedy="raise --mem-fraction-static or lower the context length",
+        remedy="raise --mem-fraction-static or use GPUs with more memory",
     )
 
 
@@ -59,7 +62,7 @@ def heuristic_limit(token_capacity: int, context_len: int) -> ConcurrencyLimit:
         value=max(min(estimated, hi), lo),
         detail=f"token_capacity / context_len * {HEURISTIC_TOKENS_PER_REQUEST}, "
         f"clamped to [{lo}, {hi}]",
-        remedy="set --max-running-requests explicitly",
+        remedy="set --max-running-requests explicitly, or lower the context length",
     )
 
 
@@ -78,7 +81,7 @@ def state_pool_limit(
     invent are either one request more than today or far past what fits.
     """
     if target is None:
-        sizing = "--max-running-requests to state a target and get an exact size"
+        sizing = "--max-running-requests <target> (the log then reports the exact size)"
     else:
         sizing = (
             f"--max-mamba-cache-size "
@@ -104,7 +107,7 @@ def resolve_concurrency_limit(limits: List[ConcurrencyLimit]) -> ConcurrencyLimi
 def format_concurrency_report(
     binding: ConcurrencyLimit,
     limits: List[ConcurrencyLimit],
-    requested: Optional[int] = None,
+    requested: Optional[ConcurrencyLimit] = None,
 ) -> Tuple[bool, str]:
     """Render the resolution as (is_downgrade, message). A downgrade means the
     user asked for more than they got; log those at WARNING, the rest at INFO."""
@@ -114,11 +117,11 @@ def format_concurrency_report(
     others = f"; other limits: {others}" if others else ""
     remedy = f" To raise it: {binding.remedy}." if binding.remedy else ""
 
-    if requested is not None and binding.value < requested:
+    if requested is not None and binding.value < requested.value:
         return True, (
-            f"max_running_requests reduced from the requested {requested} to "
-            f"{binding.value} (per dp worker), bound by {binding.source} "
-            f"({binding.detail}){others}.{remedy}"
+            f"max_running_requests reduced from the requested {requested.value} to "
+            f"{binding.value} (per dp worker; {requested.detail}), bound by "
+            f"{binding.source} ({binding.detail}){others}.{remedy}"
         )
     return False, (
         f"max_running_requests={binding.value} (per dp worker), bound by "
