@@ -32,13 +32,21 @@ class _DoneEvent:
         pass
 
 
+class _LoadAck:
+    def __init__(self, node_ids):
+        self.finish_event = _DoneEvent()
+        self.node_ids = node_ids
+        self.num_tokens = 0
+        self.timing_enabled = False
+        self.start_event = None
+
+
 class TestHiRadixCacheLoadBackHostLocks(unittest.TestCase):
     def test_loading_check_releases_load_back_leaf_host_lock_on_ack(self):
         cache = object.__new__(HiRadixCache)
         cache.pp_rank = 0
-        cache.cache_controller = SimpleNamespace(
-            ack_load_queue=[(None, _DoneEvent(), [123])]
-        )
+        cache.cache_controller = SimpleNamespace(ack_load_queue=[_LoadAck([123])])
+        cache.metrics_collector = None
 
         def all_reduce_noop(tensor, op):
             return None
