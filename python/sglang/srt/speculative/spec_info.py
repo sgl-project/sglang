@@ -136,13 +136,12 @@ class SpeculativeAlgorithm(Enum):
     def supports_grammar_overlap(self) -> bool:
         """Whether spec + grammar decode keeps cross-batch overlap on, with the worker
         advancing the grammar FSM inside verify() via the scheduler's grammar barrier.
-        The negation drives ScheduleBatch.grammar_needs_sync.
 
         The precondition is a GPU draft phase: the grammar CPU work (FSM advance +
-        bitmask build) hides under the target-verify forward. NGRAM drafts from a
-        host n-gram corpus lookup, which has no such window and reads the previous
-        batch's committed tokens from CPU anyway, so it stays synchronous by design
-        rather than as a pending migration.
+        bitmask build) hides under the target-verify forward. NGRAM drafts from a host
+        n-gram corpus lookup, which has no such window and reads the previous batch's
+        committed tokens from CPU anyway, so it stays synchronous by design rather
+        than as a pending migration.
 
         STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         """

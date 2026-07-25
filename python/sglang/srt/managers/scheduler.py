@@ -1672,10 +1672,9 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Grammar decode on a spec algorithm without a GPU draft phase (see
-        # supports_grammar_overlap) runs synchronously: the FSM advance must land
-        # before the next batch's bitmask, with no target-verify forward to hide it
-        # under. Permanent path for host-draft algorithms (NGRAM), not a pending
+        # Grammar decode without overlap support runs synchronously so the FSM
+        # advance lands before the next batch's bitmask. Permanent path for
+        # host-draft algorithms (see supports_grammar_overlap), not a pending
         # migration.
         need_grammar_sync = (
             batch
