@@ -544,6 +544,10 @@ class TestPrefillAdder(CustomTestCase):
             (10, 20, None, 512, 8, 30 + 8, "short_resume_tiny_budget"),
             (300, 512, None, 128, 16, 300 + 16, "big_extend_over_window"),
             (200, 512, 50, 64, 8, 64 + 8, "chunk_capped_alloc_hits_floor"),
+            # Multi-chunk: alloc = rem_chunk (1024) caps a huge extend, and the
+            # chunk itself exceeds the window, so term1 = alloc - window is driven
+            # by the chunk, not the full extend -> budget = chunk + page.
+            (2000, 256, 1024, 512, 16, 1024 + 16, "multichunk_alloc_over_window"),
             (0, 512, None, 128, 16, 128 + 16, "extend_zero_long_decode"),
             (0, 40, None, 128, 16, 40 + 16, "extend_zero_short_decode"),
         ]
