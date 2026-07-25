@@ -1,21 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
-
-"""Mixture-of-Experts FFN for the LingBot-Video MoE DiT.
-
-This is the first MoE layer in the diffusion runtime (``multimodal_gen``). It ports
-the upstream DeepSeek-V3-style grouped MoE (128 routed experts, top-8, group-limited
-routing, sigmoid + ``e_score_correction_bias``, 1 shared expert) and reuses SGLang's
-LLM-runtime fused-MoE Triton kernel (``sglang.srt.layers.moe...fused_experts``) for
-the expert GEMMs, exactly as the upstream ``sglang_moe_shim`` does.
-
-The expert weights are plain ``nn.Parameter`` tensors with the upstream layout
-(``w1/w3`` ``[E, I, H]``, ``w2`` ``[E, H, I]``) so they load from the diffusers
-checkpoint by name match with an identity ``param_names_mapping``.
-
-MVP: the ``sglang_triton`` backend only (no ``grouped_mm``/reorder/restore/fp8 paths).
-"""
+#
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -24,86 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 
-# Minimal server args for the SGLang MoE runtime: ``fused_experts``'s Triton
-# config selection reads ``get_global_server_args()``. The multimodal_gen server
-# doesn't always set the srt global server args, so we set a minimal one (mirrors
-# the upstream ``sglang_moe_shim.ensure_sglang_moe_ready``).
-class _MoeServerArgs:
-    """Minimal server args for the SRT MoE runtime.
-
-    Defaults any missing attr to ``False`` so the srt ``fused_experts`` path's
-    server_args checks all read ``False`` (disabled paths) — robust against the
-    srt runtime reading attrs (``enable_symm_mem``, ``enable_fused_moe_sum_all_reduce``,
-    ...) that the multimodal_gen server doesn't set on the srt global server args.
-    """
-
-    enable_deterministic_inference = False
-    enable_fused_moe_sum_all_reduce = False
-    enable_symm_mem = False
-
-    def __getattr__(self, name: str) -> bool:
-        return False
-
-
-_SGLANG_MOE_SERVER_ARGS = _MoeServerArgs()
-_moe_server_args_ready = False
-
-
-def _ensure_moe_server_args() -> None:
-    global _moe_server_args_ready
-    if _moe_server_args_ready:
-        return
-    from sglang.srt.server_args import (
-        get_global_server_args,
-        set_global_server_args_for_scheduler,
-    )
-
-    try:
-        server_args = get_global_server_args()
-    except Exception:  # noqa: BLE001
-        server_args = None
-    if server_args is None:
-        server_args = _SGLANG_MOE_SERVER_ARGS
-        set_global_server_args_for_scheduler(server_args)
-    if not hasattr(server_args, "enable_deterministic_inference"):
-        server_args.enable_deterministic_inference = False
-    if not hasattr(server_args, "enable_fused_moe_sum_all_reduce"):
-        server_args.enable_fused_moe_sum_all_reduce = False
-    _moe_server_args_ready = True
-
-
-def _ensure_srt_distributed() -> None:
-    """Init the SRT tensor-model-parallel group for single-GPU.
-
-    SGLang's ``fused_experts`` (srt) uses ``srt.distributed.get_tp_group`` for the
-    outplace symmetric-memory allocation path. The multimodal_gen server has its
-    own ``parallel_state`` but does not init the srt one, so we lazily init a
-    single-process TP group here (a no-op group) on first use.
-    """
-    from sglang.srt.distributed import parallel_state
-
-    try:
-        parallel_state.get_tp_group()
-        return
-    except Exception:  # noqa: BLE001, S110
-        pass
-    import torch.distributed as dist
-
-    if not dist.is_initialized():
-        import os
-
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29512")
-        dist.init_process_group(backend="gloo", world_size=1, rank=0)
-    parallel_state.init_distributed_environment(
-        world_size=1, rank=0, local_rank=0, backend="gloo"
-    )
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
-
-
 class LingBotVideoMLP(nn.Module):
-    """SwiGLU MLP used for the shared expert (and the dense-MLP fallback)."""
-
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -115,13 +21,6 @@ class LingBotVideoMLP(nn.Module):
 
 
 class LingBotVideoRouter(nn.Module):
-    """Token-choice top-k router (inference path; no capacity/jitter/load stats).
-
-    The asymmetry must be preserved for parity: expert *selection* uses the
-    bias-added score, while the gating *weights* gather the bias-free score.
-    The router runs in fp32 (autocast disabled) — this is parity-critical.
-    """
-
     def __init__(
         self,
         hidden_size: int,
@@ -163,6 +62,7 @@ class LingBotVideoRouter(nn.Module):
         return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
 
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # selection uses bias-added score, weights gather the bias-free score; fp32.
         with torch.amp.autocast(tokens.device.type, enabled=False):
             logits = F.linear(tokens.float(), self.weight.float())
         if self.score_func == "softmax":
@@ -184,12 +84,6 @@ class LingBotVideoRouter(nn.Module):
 
 
 class LingBotVideoGroupedExperts(nn.Module):
-    """Routed-expert weights in the GroupedExperts layout.
-
-    ``w1``/``w3`` are ``[E, I, H]`` (gate/up), ``w2`` is ``[E, H, I]`` (down).
-    Kept as plain ``nn.Parameter`` so the diffusers checkpoint loads by name.
-    """
-
     def __init__(
         self, num_experts: int, hidden_size: int, intermediate_size: int
     ) -> None:
@@ -201,14 +95,6 @@ class LingBotVideoGroupedExperts(nn.Module):
 
 
 class LingBotVideoSparseMoeBlock(nn.Module):
-    """DeepSeek-V3-style sparse MoE FFN block (routed experts + shared expert).
-
-    Expert GEMMs reuse SGLang's ``fused_experts`` Triton kernel (the same path the
-    upstream ``sglang_moe_shim`` uses): ``w13 = cat(w1, w3, dim=1)`` ``[E, 2I, H]``
-    (non-interleaved gate|up), ``w2`` ``[E, H, I]``. The router already applies
-    ``routed_scaling_factor``, so it is passed as ``None`` to avoid double-scaling.
-    """
-
     def __init__(
         self,
         hidden_size: int,
@@ -252,31 +138,19 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         top_scores: torch.Tensor,
         top_indices: torch.Tensor,
     ) -> torch.Tensor:
-        # Lazy import: keeps the diffusion runtime importable without pulling the
-        # SGLang MoE runtime until the MoE is actually used.
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts,
         )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-        # fused_experts' Triton config selection reads get_global_server_args();
-        # the multimodal_gen server may not have set it, so ensure a minimal one.
-        _ensure_moe_server_args()
-        # fused_experts' outplace path calls srt get_tp_group (symmetric memory);
-        # init a single-process SRT TP group (the multimodal_gen doesn't).
-        _ensure_srt_distributed()
-
         topk_output = StandardTopKOutput(
             topk_weights=top_scores.float(),
             topk_ids=top_indices.to(torch.int32),
             router_logits=torch.empty(0, device=tokens.device),
         )
-        # CRITICAL parity fields: inplace=False (outplace, the router already scaled
-        # the weights) and gate_up_interleaved=False (w13 = cat(gate, up) is a
-        # contiguous gate|up split, NOT interleaved — the MoeRunnerConfig default
-        # True would misread the layout and produce garbage). routed_scaling_factor
-        # is None here because the upstream router applies route_scale itself.
+        # inplace=False (router pre-scales weights); gate_up_interleaved=False
+        # (w13 = cat(gate, up), contiguous not interleaved).
         runner_config = MoeRunnerConfig(
             num_experts=self.num_experts,
             num_local_experts=self.num_experts,
@@ -301,7 +175,6 @@ class LingBotVideoSparseMoeBlock(nn.Module):
         ).type_as(tokens)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: (B, S, H); MVP is B=1 with an already-trimmed mask.
         b = hidden_states.shape[0]
         tokens = hidden_states.reshape(-1, self.hidden_size)
         top_indices, top_scores = self.router(tokens)

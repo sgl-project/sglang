@@ -216,6 +216,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dist_timeout=self.server_args.dist_timeout,
         )
 
+        from sglang.srt.runtime_context import get_context
+
+        if get_context()._server_args is None:
+            get_context().set_server_args(self.server_args)
+
         # set proc title
         if model_parallel_is_initialized():
             suffix = ""

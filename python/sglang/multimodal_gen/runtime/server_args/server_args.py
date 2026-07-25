@@ -299,6 +299,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # ``None`` resolves to DEFAULT_BCG_TEXT_BUCKETS.
     bcg_text_buckets: list[int] = None
 
+    enable_deterministic_inference: bool = False
+    enable_fused_moe_sum_all_reduce: bool = False
+    enable_symm_mem: bool = False
+
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
@@ -470,6 +474,10 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
+        self._adjust_srt_moe_args()
+
+    def _adjust_srt_moe_args(self):
+        """Hook for future MoE server-args adjustment."""
 
     def _adjust_disagg_parallelism_aliases(self):
         if self.decoder_tp is None:

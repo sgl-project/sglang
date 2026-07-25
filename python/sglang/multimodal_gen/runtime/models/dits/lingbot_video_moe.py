@@ -1,22 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the SGLang project.
-# Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
-
-"""SGLang-native LingBot-Video MoE 30B DiT (text-to-video, Phase-1 single-GPU MVP).
-
-Ports the upstream ``LingBotVideoTransformer3DModel`` math **verbatim** (parity-critical):
-fp32-sensitive boundaries (``LINGBOT_VIDEO_FP32_MODULES``), complex64 RoPE
-(``torch.polar``/``view_as_complex``), the patchify permute ``(0,2,4,6,3,5,7,1)``
-and unpatchify permute ``(0,7,1,4,2,5,3,6)``, and the DeepSeek-V3-style MoE FFN.
-
-The MoE layer (``LingBotVideoSparseMoeBlock`` etc.) is imported from
-``runtime.layers.moe`` and is NOT redefined here.
-
-MVP scope: single-GPU, B=1, structured-JSON captions. The packed-B>1,
-context-parallel (``cp_*``), ``packed_indices``/``flash_attn_varlen`` and
-``parallel_config`` paths are dropped. Attention uses
-``F.scaled_dot_product_attention`` (B=1, no padding -> ``attention_mask=None``).
-"""
 
 from __future__ import annotations
 
@@ -29,6 +11,12 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoMLP,
     LingBotVideoSparseMoeBlock,
@@ -36,17 +24,20 @@ from sglang.multimodal_gen.runtime.layers.moe import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    NDRotaryEmbedding,
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.srt.utils import add_prefix
 from torch import nn
-
-# ---------------------------------------------------------------------------
-# fp32 boundaries (parity-critical: router / norms / scale_shift_table / time
-# embedder must stay fp32; cast to the bulk compute dtype only at Linear
-# boundaries). Ported verbatim from the upstream module.
-# ---------------------------------------------------------------------------
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -72,8 +63,6 @@ def should_keep_in_fp32(name: str) -> bool:
 
 
 class LingBotVideoRMSNorm(nn.Module):
-    """RMSNorm with fp32 accumulation."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -87,72 +76,9 @@ class LingBotVideoRMSNorm(nn.Module):
         return (self.weight * hidden_states).to(input_dtype)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply complex RoPE to ``(B, S, H, D)`` attention tensors."""
-    with torch.amp.autocast("cuda", enabled=False):
-        x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        out = torch.view_as_real(x_c * freqs_cis.unsqueeze(2)).flatten(3)
-        return out.type_as(x)
-
-
-class LingBotVideoRotaryEmbedding(nn.Module):
-    """Complex64 RoPE table indexed by position ids."""
-
-    def __init__(
-        self, axes_dims: tuple[int, ...], axes_lens: tuple[int, ...], theta: float
-    ):
-        super().__init__()
-        self.axes_dims = tuple(axes_dims)
-        self.axes_lens = list(axes_lens)
-        self.theta = theta
-        self.freqs_cis = None
-
-    @staticmethod
-    def precompute_freqs_cis(dim: tuple[int, ...], end: tuple[int, ...], theta: float):
-        freqs_cis = []
-        for d, e in zip(dim, end):
-            freqs = 1.0 / (
-                theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d)
-            )
-            timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
-            freqs = torch.outer(timestep, freqs).float()
-            freqs_cis.append(
-                torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)
-            )
-        return freqs_cis
-
-    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-        # position_ids: (S, 3) int -> (S, head_dim/2) complex64
-        device = position_ids.device
-        max_vals = position_ids.max(dim=0).values.tolist()
-        needs_rebuild = self.freqs_cis is None or any(
-            m >= l for m, l in zip(max_vals, self.axes_lens)
-        )
-        if needs_rebuild:
-            for i in range(len(self.axes_lens)):
-                if max_vals[i] >= self.axes_lens[i]:
-                    self.axes_lens[i] = int(max_vals[i] * 1.5) + 1
-            self.freqs_cis = self.precompute_freqs_cis(
-                self.axes_dims, tuple(self.axes_lens), theta=self.theta
-            )
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
-        elif self.freqs_cis[0].device != device:
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
-
-        return torch.cat(
-            [self.freqs_cis[i][position_ids[:, i]] for i in range(len(self.axes_dims))],
-            dim=-1,
-        )
-
-
 def make_joint_position_ids(
     text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device
 ) -> torch.Tensor:
-    """3D positions in [video; text] order. Text t-axis is 1..text_len; video t-axis starts at text_len+1.
-
-    Matches patchify_and_embed: cap start (1,0,0); vision start (cap_len+1,0,0);
-    freqs ordered with x first and cap second (same order as cat_interleave).
-    """
     tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
     hh = torch.arange(grid_h, device=device, dtype=torch.int32)
     ww = torch.arange(grid_w, device=device, dtype=torch.int32)
@@ -165,8 +91,6 @@ def make_joint_position_ids(
 
 
 class LingBotVideoTextEmbedder(nn.Module):
-    """Matches CondProjection: RMSNorm(text_dim, eps=1e-6 fixed) -> Linear-SiLU-Linear."""
-
     def __init__(self, text_dim: int, hidden_size: int):
         super().__init__()
         self.norm = LingBotVideoRMSNorm(text_dim, eps=1e-6)
@@ -179,38 +103,101 @@ class LingBotVideoTextEmbedder(nn.Module):
 
 
 class LingBotVideoAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, norm_eps, qkv_bias, out_bias):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        norm_eps: float,
+        qkv_bias: bool,
+        out_bias: bool,
+        prefix: str = "",
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.to_q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.to_k = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.to_v = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        tp_size = get_tp_world_size()
+        self.local_num_heads = divide(num_heads, tp_size)
+
+        self.to_q = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
+        )
+        self.to_k = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
+        )
+        self.to_v = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=qkv_bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
+        )
         self.norm_q = LingBotVideoRMSNorm(self.head_dim, norm_eps)
         self.norm_k = LingBotVideoRMSNorm(self.head_dim, norm_eps)
-        self.to_out = nn.Linear(hidden_size, hidden_size, bias=out_bias)
+        self.to_out = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=out_bias,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out", prefix),
+        )
+        self.attn = USPAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+            skip_sequence_parallel=False,
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
         x: torch.Tensor,
-        rotary_emb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        _, _, _ = x.shape
-        q = self.to_q(x).unflatten(2, (self.num_heads, self.head_dim))
-        k = self.to_k(x).unflatten(2, (self.num_heads, self.head_dim))
-        v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
-        q = apply_rotary_emb(self.norm_q(q), rotary_emb)
-        k = apply_rotary_emb(self.norm_k(k), rotary_emb)
-        # SDPA expects (B, H, S, D); the upstream tensors are (B, S, H, D).
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_mask=attention_mask,
-        )
-        out = out.transpose(1, 2)  # (B, S, H, D)
-        return self.to_out(out.flatten(2, 3).type_as(x))
+        cos, sin = freqs_cis
+        q, _ = self.to_q(x)
+        k, _ = self.to_k(x)
+        v, _ = self.to_v(x)
+        # norm_q/k are per-head_dim: apply after unflattening to (B, S, H, D).
+        q = self.norm_q(q.unflatten(2, (self.local_num_heads, self.head_dim)))
+        k = self.norm_k(k.unflatten(2, (self.local_num_heads, self.head_dim)))
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+
+        # B>1: flatten batch into the token axis (Triton RoPE indexes cos per token).
+        B, S, H, D = q.shape
+        if B > 1:
+            q = q.reshape(1, B * S, H, D)
+            k = k.reshape(1, B * S, H, D)
+            v = v.reshape(1, B * S, H, D)
+            if attention_mask is not None:
+                attention_mask = attention_mask.reshape(1, 1, 1, B * S)
+
+        q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+        k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+
+        out = self.attn(q, k, v, attn_mask=attention_mask)
+        if B > 1:
+            out = out.reshape(B, S, H, D)
+        out = out.flatten(2)
+        out, _ = self.to_out(out)
+        return out
 
 
 class LingBotVideoBlock(nn.Module):
@@ -234,6 +221,9 @@ class LingBotVideoBlock(nn.Module):
         topk_group,
         routed_scaling_factor,
         layer_idx: int,
+        prefix: str = "",
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -241,11 +231,17 @@ class LingBotVideoBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
         self.norm1 = LingBotVideoRMSNorm(h, norm_eps)
         self.attn = LingBotVideoAttention(
-            h, num_attention_heads, norm_eps, qkv_bias, out_bias
+            h,
+            num_attention_heads,
+            norm_eps,
+            qkv_bias,
+            out_bias,
+            prefix=add_prefix("attn", prefix),
+            supported_attention_backends=supported_attention_backends,
+            quant_config=quant_config,
         )
         self.norm_post_attn = LingBotVideoRMSNorm(h, norm_eps)
         self.norm2 = LingBotVideoRMSNorm(h, norm_eps)
-        # Sparsity decision matches MoEBlock: mlp_only_layers + decoder_sparse_step + num_experts
         if layer_idx not in mlp_only_layers and (
             num_experts > 0 and (layer_idx + 1) % decoder_sparse_step == 0
         ):
@@ -269,7 +265,7 @@ class LingBotVideoBlock(nn.Module):
         self,
         x: torch.Tensor,
         temb6: torch.Tensor,
-        rotary_emb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         expected_tokens = x.shape[0] * x.shape[1]
@@ -278,8 +274,6 @@ class LingBotVideoBlock(nn.Module):
                 "LingBotVideoBlock expects token-level temb6 with shape "
                 f"(B*S, 6D); got {tuple(temb6.shape)} for hidden states {tuple(x.shape)}."
             )
-        # AdaLN mod: dense and MoE both keep scale_shift_table fp32 (master
-        # moe/models.py:80 dropped the accidental `.to(dtype=c.dtype)` cast).
         mod = temb6.view(x.shape[0], x.shape[1], -1) + self.scale_shift_table.unsqueeze(
             0
         )
@@ -289,14 +283,11 @@ class LingBotVideoBlock(nn.Module):
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
         scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
-        # AdaLN modulation / norms run in fp32 (sensitive path); cast to the bulk
-        # compute dtype only at the bf16 Linear boundary. This replaces the old
-        # ambient autocast, which rounded Linear inputs to bf16 at the same point.
         bulk_dtype = self.attn.to_q.weight.dtype
         attn_in = (self.norm1(x) * scale_msa + shift_msa).to(bulk_dtype)
         attn_out = self.attn(
             attn_in,
-            rotary_emb,
+            freqs_cis,
             attention_mask,
         )
         x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
@@ -392,8 +383,14 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size)
         )
         self.text_embedder = LingBotVideoTextEmbedder(config.text_dim, hidden_size)
-        self.rope = LingBotVideoRotaryEmbedding(
-            config.axes_dims, config.axes_lens, config.rope_theta
+        self.rotary_emb = NDRotaryEmbedding(
+            rope_dim_list=list(config.axes_dims),
+            rope_theta=config.rope_theta,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
         )
         self.blocks = nn.ModuleList(
             [
@@ -416,6 +413,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     topk_group=config.topk_group,
                     routed_scaling_factor=config.routed_scaling_factor,
                     layer_idx=i,
+                    prefix=f"blocks.{i}",
+                    supported_attention_backends=self._supported_attention_backends,
+                    quant_config=quant_config,
                 )
                 for i in range(config.depth)
             ]
@@ -453,7 +453,6 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             text_lens = torch.full((B,), L, dtype=torch.long, device=device)
         text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
 
-        # patchify: token order (f h w), feature order (pf ph pw c) -- matches patchify_and_embed
         patch_tokens = hidden_states.reshape(B, C, gt, pF, gh, pH, gw, pW)
         patch_tokens = patch_tokens.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(
             B,
@@ -466,15 +465,16 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        # Per-sample RoPE: video t-axis start = real text length of this sample + 1
         rotary_parts = [
-            self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device))
+            self.rotary_emb.forward_uncached(
+                make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)
+            )
             for i in range(B)
         ]
-        rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
+        cos = torch.cat([c for c, _ in rotary_parts], dim=0)  # (B*S, head_dim//2)
+        sin = torch.cat([s for _, s in rotary_parts], dim=0)
+        freqs_cis = (cos.float(), sin.float())
 
-        # Attention mask: only materialize when there is padding (B=1, no padding
-        # -> None, matching the upstream default path).
         attention_mask = None
         has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
         if has_padding:
@@ -485,7 +485,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 ],
                 dim=1,
             )
-            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) -> SDPA broadcast
+            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) mask broadcast
 
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)
@@ -499,7 +499,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             joint = block(
                 joint,
                 temb6,
-                rotary,
+                freqs_cis,
                 attention_mask,
             )
 
@@ -513,7 +513,6 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         projected = self.proj_out(final_hidden.to(self.proj_out.weight.dtype))
         x = projected[:, :n_video]
 
-        # unpatchify (matches the rearrange in postprocess)
         Cout = self.out_channels
         x = x.reshape(B, gt, gh, gw, pF, pH, pW, Cout)
         x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).reshape(B, Cout, T, H, W)

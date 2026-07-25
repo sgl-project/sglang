@@ -154,6 +154,20 @@ def _clear_srt_world_group() -> None:
         srt_parallel_state._WORLD = None
 
 
+def _sync_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is None:
+        srt_parallel_state._TP = _TP
+
+
+def _clear_srt_tp_group() -> None:
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    if srt_parallel_state._TP is _TP:
+        srt_parallel_state._TP = None
+
+
 def init_parallel_group_coordinator(
     group_ranks: List[List[int]],
     local_rank: int,
@@ -466,6 +480,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+    _sync_srt_tp_group()
 
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
@@ -900,6 +915,8 @@ def init_vae_group(
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE
+
+    _clear_srt_tp_group()
 
     for group in (_TP, _SP, _DP, _CFG, _PP, _VAE_DECODE):
         if group is not None:
