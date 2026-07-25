@@ -16,6 +16,12 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -183,6 +189,91 @@ def _layer_norm_fwd_1pass_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.jit
+def _rms_norm_gated_fp8_quant_kernel(
+    X,
+    Z,
+    W,
+    Y,
+    S,
+    stride_x_row,
+    stride_z_row,
+    stride_y_row,
+    stride_s_token,
+    stride_s_group,
+    M,
+    N: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    eps,
+    quant_eps,
+    BLOCK_N: tl.constexpr,
+    ROWS_PER_BLOCK: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+
+    x = tl.load(
+        X + rows[:, None] * stride_x_row + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    z = tl.load(
+        Z + rows[:, None] * stride_z_row + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
+
+    variance = tl.sum(tl.where(mask, x * x, 0.0), axis=1) / N
+    y = x * tl.rsqrt(variance + eps)[:, None] * w[None, :]
+    if ACTIVATION == "swish" or ACTIVATION == "silu":
+        y *= z * tl.sigmoid(z)
+    elif ACTIVATION == "sigmoid":
+        y *= tl.sigmoid(z)
+
+    # The unfused path materializes BF16 before quantization; preserve that boundary.
+    y = y.to(tl.bfloat16).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(y), axis=1), quant_eps)
+    scale = absmax / FP8_MAX
+    if SCALE_UE8M0:
+        exponent = tl.ceil(tl.log2(tl.abs(scale)))
+        scale = tl.exp2(exponent)
+    quantized = tl.clamp(y / scale[:, None], FP8_MIN, FP8_MAX)
+
+    tl.store(
+        Y + rows[:, None] * stride_y_row + cols[None, :],
+        quantized,
+        mask=mask,
+    )
+    if SCALE_UE8M0:
+        shifts = tl.arange(0, ROWS_PER_BLOCK) * 8
+        packed = tl.sum((exponent.to(tl.int32) + 127) << shifts, axis=0)
+        token = row_start // NUM_GROUPS
+        group = (row_start % NUM_GROUPS) // 4
+        tl.store(S + token * stride_s_token + group * stride_s_group, packed)
+    else:
+        token = rows // NUM_GROUPS
+        group = rows % NUM_GROUPS
+        tl.store(
+            S + token * stride_s_token + group * stride_s_group,
+            scale,
+            mask=rows < M,
+        )
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @lru_cache
 def _get_sm_count(device: torch.device) -> int:
     """Get and cache the SM count for a given device."""
@@ -342,6 +433,78 @@ def rms_norm_gated(
         activation=activation,
     )
     return y.reshape(x_shape_og)
+
+
+def rms_norm_gated_fp8_quant(
+    *,
+    x,
+    weight,
+    z,
+    eps,
+    num_groups,
+    activation: str = "swish",
+    scale_ue8m0: bool = False,
+):
+    x_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    z = z.reshape(-1, z.shape[-1])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z.stride(-1) != 1:
+        z = z.contiguous()
+    weight = weight.contiguous()
+
+    M, N = x.shape
+    assert x.shape == z.shape
+    assert x.dtype == torch.bfloat16
+    assert z.dtype == torch.bfloat16
+    assert weight.shape == (N,)
+    assert M % num_groups == 0
+    assert not scale_ue8m0 or num_groups % 4 == 0
+
+    quantized = torch.empty_like(x, dtype=fp8_dtype)
+    scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=(M // num_groups, N * num_groups),
+        device=x.device,
+        group_size=N,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=scale_ue8m0,
+    )
+    if M == 0:
+        return quantized.reshape(x_shape), scale
+
+    block_n = triton.next_power_of_2(N)
+    rows_per_block = 4 if scale_ue8m0 else calc_rows_per_block(M, x.device)
+    grid = (cdiv(M, rows_per_block),)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    with device_context(x.device):
+        _rms_norm_gated_fp8_quant_kernel[grid](
+            x,
+            z,
+            weight,
+            quantized,
+            scale,
+            x.stride(0),
+            z.stride(0),
+            quantized.stride(0),
+            scale.stride(0),
+            scale.stride(1),
+            M,
+            N,
+            num_groups,
+            eps,
+            1e-10,
+            BLOCK_N=block_n,
+            ROWS_PER_BLOCK=rows_per_block,
+            ACTIVATION=activation,
+            FP8_MIN=fp8_min,
+            FP8_MAX=fp8_max,
+            SCALE_UE8M0=scale_ue8m0,
+            num_warps=min(max(block_n // 256, 1), 8),
+            **pdl_kwargs,
+        )
+    return quantized.reshape(x_shape), scale
 
 
 class LayerNormFn(torch.autograd.Function):
