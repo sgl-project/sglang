@@ -19,6 +19,15 @@ from sglang.kernels.ops.attention.pad import (
 from sglang.kernels.ops.attention.pad import (
     unpad_draft_extend_output as unpad_draft_extend_output_triton,
 )
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    can_use_set_mla_kv_concat_q,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    covered as set_mla_kv_concat_q_covered,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    set_mla_kv_concat_q,
+)
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
@@ -278,6 +287,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # write translates through the pool's _full_translate hook instead).
         self._decode_dense_loc: Optional[torch.Tensor] = None
         self.cuda_graph_out_cache_loc_dense: Optional[torch.Tensor] = None
+        # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
+        # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
+        # async asserts: the fused path writes the pool directly and would
+        # skip the pool's OOB probe.
+        self._fused_set_kv_concat_q = (
+            self.data_type == torch.bfloat16
+            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+            and can_use_set_mla_kv_concat_q(
+                self.kv_lora_rank * 2, self.qk_rope_head_dim * 2
+            )
+        )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -863,6 +883,53 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
 
+    def _set_kv_and_concat_q_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Decode: scatter the KV row at ``loc`` (already physical — the
+        dense-loc buffer on the unified pool, or out_cache_loc on the static
+        pool where ``_full_translate`` is identity) and build the
+        [q_nope | q_rope] fmha query in one kernel launch (saves one launch
+        per MLA layer and keeps the PDL chain intact).
+
+        Returns the concatenated query, or None when the fused kernel does
+        not cover the inputs (caller falls back to the two-kernel path).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # Same raw per-layer buffer the decode kernel reads below (bf16-only
+        # gate means store_dtype == dtype, so no view); get_key_buffer applies
+        # the hybrid pool's full-attention layer-id mapping.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        return set_mla_kv_concat_q(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -900,6 +967,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             merge_query = False
 
         # Save KV cache if requested
+        query = None
         if save_kv_cache:
             assert (
                 k is not None and k_rope is not None
@@ -907,26 +975,56 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if self._decode_dense_loc is not None:
                 # cuda-graph path: dense write loc precomputed out-of-graph, so
                 # the in-graph write captures no translate allocation.
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
-                )
+                if merge_query and self._fused_set_kv_concat_q:
+                    # Fused: KV scatter + [q_nope | q_rope] concat in one
+                    # launch; None when the inputs are not covered.
+                    query = self._set_kv_and_concat_q_fused(
+                        layer=layer,
+                        loc=self._decode_dense_loc,
+                        k=k,
+                        k_rope=k_rope,
+                        q=q,
+                        q_rope=q_rope,
+                    )
+                if query is None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, self._decode_dense_loc, k, k_rope, loc_is_dense=True
+                    )
             else:
                 # eager (or static pool): the pool's _full_translate handles it.
-                self.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, k_rope
-                )
+                if (
+                    merge_query
+                    and self._fused_set_kv_concat_q
+                    and not self._unified_mla
+                ):
+                    # Static pool: _full_translate is identity, so
+                    # out_cache_loc is already the physical write loc.
+                    query = self._set_kv_and_concat_q_fused(
+                        layer=layer,
+                        loc=forward_batch.out_cache_loc,
+                        k=k,
+                        k_rope=k_rope,
+                        q=q,
+                        q_rope=q_rope,
+                    )
+                if query is None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, k_rope
+                    )
 
-        # Prepare query tensor inline
-        if merge_query:
-            # For FP16 path, we merge the query and rope parts into a single tensor
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-            )
-            query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
-        else:
-            # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
-            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        # Prepare query tensor inline (already built when the fused save-KV
+        # path ran)
+        if query is None:
+            if merge_query:
+                # For FP16 path, we merge the query and rope parts into a single tensor
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope_reshaped = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+                query = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            else:
+                # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
+                query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
