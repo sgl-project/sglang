@@ -1,11 +1,13 @@
 """CPU regression tests for ModelSlim / online MXFP4 W4A4 MoE support."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP4W4A4MoEMethod,
+    NPUMXFP4W4A8MoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
     NPUMXFP4W4A4FusedMoEMethod,
@@ -101,6 +103,30 @@ class TestModelSlimMXFP4W4A4MoE(CustomTestCase):
                 weight_prefix="w13",
                 group_list_type=1,
             )
+
+    def test_process_weights_keeps_packed_fp4_in_nd_format(self):
+        layer = torch.nn.Module()
+        weight = torch.arange(24, dtype=torch.uint8).reshape(2, 4, 3)
+        scale = torch.arange(32, dtype=torch.uint8).reshape(2, 4, 4)
+        layer.register_parameter(
+            "w2_weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_weight_scale", torch.nn.Parameter(scale, requires_grad=False)
+        )
+
+        kernel = NPUMXFP4W4A4MoEMethod("w2")
+        with patch.object(
+            NPUMXFP4W4A8MoEMethod,
+            "_process_weight_fp4",
+            side_effect=AssertionError("W4A4 grouped matmul must not cast weight to NZ"),
+        ):
+            kernel.process_weights_after_loading(layer, "w2")
+
+        expected = weight.transpose(1, 2)
+        self.assertTrue(torch.equal(layer.w2_weight, expected))
+        self.assertEqual(layer.w2_weight.stride(), expected.stride())
+        self.assertFalse(layer.w2_weight.is_contiguous())
 
 
 if __name__ == "__main__":

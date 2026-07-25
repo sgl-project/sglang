@@ -1135,9 +1135,9 @@ class NPUMXFP4W4A4MoEMethod(_NPUMoEMethodBase):
     packed); the two are told apart by weight dtype in
     ``process_weights_after_loading``.
 
-    The **weight** format is byte-identical to W4A8 MXFP (both are MXFP4), so the
-    packed-fp4 layout helpers on :class:`NPUMXFP4W4A8MoEMethod` are reused. The
-    difference from W4A8 is entirely on the activation side:
+    The packed payload and scale encoding are byte-identical to W4A8 MXFP, but
+    the grouped-matmul layout is not: W4A4 keeps a transposed ND view while the
+    W4A8 path casts the weight to FRACTAL_NZ. The activation side also differs:
 
     * gmm1 **fuses** gate/up + swiglu + fp4 requant into one kernel
       (``npu_grouped_matmul_swiglu_quant_v2`` with ``quant_dtype=fp4``), the same
@@ -1191,14 +1191,14 @@ class NPUMXFP4W4A4MoEMethod(_NPUMoEMethodBase):
                 weight, weight_prefix
             )
 
-        # Packed-fp4 weight/scale layout is identical to W4A8 MXFP (FRACTAL_NZ +
-        # transpose); reuse those helpers rather than duplicate them.
+        # The W4A4 grouped-matmul kernels require ND (or standard FRACTAL_NZ),
+        # while the W4A8 helper's packed-FP4 format cast produces the internal
+        # FRACTAL_NZ_C0_32 format rejected by npu_grouped_matmul. Match
+        # vllm-ascend: preserve ND and use the transpose stride as logical K.
         setattr(
             layer,
             f"{weight_prefix}_weight",
-            Parameter(
-                NPUMXFP4W4A8MoEMethod._process_weight_fp4(weight), requires_grad=False
-            ),
+            Parameter(weight.transpose(1, 2), requires_grad=False),
         )
         setattr(
             layer,
