@@ -15,7 +15,6 @@
 
 import json
 import logging
-import os
 from functools import cache
 from typing import Iterable, List, NamedTuple, Optional, Tuple, Union
 
@@ -38,9 +37,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     register_vocab_mask_buffer,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
-_LLGUIDANCE_LOG_LEVEL = int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1"))
+_LLGUIDANCE_LOG_LEVEL = get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1)
 
 
 class GrammarDraftRow(NamedTuple):
