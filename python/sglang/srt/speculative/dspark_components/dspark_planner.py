@@ -454,12 +454,10 @@ class DSparkVerifyPlanner:
     @property
     def needs_confidence_publication(self) -> bool:
         """Whether overlap scheduling can consume a relayed confidence block."""
-        if not self.schedules_verify_budget:
-            return False
-        return not (
-            getattr(self, "_is_verify_all", False)
-            and getattr(self._budget_planner, "forced_budget_frac", None) is None
-        )
+        # Keep the relay warm even while the current policy verifies all tokens.
+        # A live forced-budget update can then consume an already-published block
+        # instead of waiting for the relay ring to fill from cold.
+        return self.schedules_verify_budget
 
     def _budget_from_resolved(
         self,
@@ -583,6 +581,15 @@ class DSparkVerifyPlanner:
             graph_num_tokens = round_up_grid(graph_num_tokens_floor, capture_num_tokens)
             return RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens, graph_num_tokens=graph_num_tokens
+            )
+        if not is_dp_attention_enabled():
+            # Cap-accept verifies the full target block, while compact eager uses
+            # this as a conservative packing capacity. Both can keep the exact
+            # per-request lengths device-resident; the full-block capacity avoids
+            # a D2H reduction solely to discover the exact token count.
+            return RaggedVerifyLayout.from_verify_lens_device(
+                verify_lens=verify_lens,
+                graph_num_tokens=bs * self.verify_num_draft_tokens,
             )
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
