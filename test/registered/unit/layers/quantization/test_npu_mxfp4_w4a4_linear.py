@@ -36,6 +36,9 @@ class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):
         layer.input_size = input_size
         return layer
 
+    def test_online_config_is_not_static(self):
+        self.assertFalse(Mxfp4W4A4Config().is_static_cfg())
+
     def test_skips_group_unaligned_linear(self):
         # K=4304 is not a multiple of 32 -> must fall back to BF16, not the
         # dual-level FP4 method (whose block scales cannot tile K=4304).

@@ -88,6 +88,9 @@ class Mxfp4W4A4Config(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return []
 
+    def is_static_cfg(self) -> bool:
+        return False
+
     @classmethod
     def from_config(cls, config: Dict) -> Mxfp4W4A4Config:
         ignored_layers = cls.get_from_keys_or(
