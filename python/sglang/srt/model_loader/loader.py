@@ -1654,6 +1654,10 @@ class PreshardedModelLoader(DefaultModelLoader):
     Target and draft must not share a leaf directory. When only
     ``presharded_path`` is set, the draft still uses
     ``<draft_model_path>/presharded/`` (not the target override).
+
+    The dump directory must be on a filesystem shared by all ranks (and all
+    nodes in multi-node jobs): rank 0 aggregates per-rank manifests and every
+    rank reads common/rank safetensors from the same path on reload.
     """
 
     DEFAULT_SUBDIR = "presharded"
@@ -2077,6 +2081,23 @@ class PreshardedModelLoader(DefaultModelLoader):
             if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
                 attn.bias = conv1d.bias
 
+    def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
+        """Fail fast before an expensive source load if the dump root is RO."""
+        try:
+            os.makedirs(presharded_dir, exist_ok=True)
+            probe = os.path.join(presharded_dir, ".presharded_write_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.unlink(probe)
+        except OSError as e:
+            raise RuntimeError(
+                f"Presharded dump directory is not writable: {presharded_dir}. "
+                "Set model_loader_extra_config "
+                '\'{"presharded_path": "..."}\' (or draft_presharded_path for '
+                "the draft model) to a writable shared filesystem path. "
+                f"Original error: {e}"
+            ) from e
+
     def _first_time_load_and_dump(
         self,
         model_config: ModelConfig,
@@ -2085,18 +2106,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         shard_config: Dict[str, Any],
     ) -> nn.Module:
         # Dump post-process state (after load_weights + process_weights_after_loading).
+        # Probe early so a read-only model_path fails before the full source load.
+        self._ensure_presharded_dir_writable(presharded_dir)
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(self._get_all_weights(model_config, model))
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            # Share DefaultModelLoader's path (nvfp4-online env, mem logging).
+            self.load_weights_and_postprocess(
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+            )
 
             # Full state_dict so shared Parameter aliases all get filled on reload.
             state_dict = dict(model.state_dict())
@@ -2105,7 +2127,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             del state_dict
             del extras
             gc.collect()
-            torch.cuda.empty_cache()
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -2201,8 +2222,17 @@ class PreshardedModelLoader(DefaultModelLoader):
     ) -> Dict[str, Any]:
         rank_to_manifest: Dict[int, Dict[str, Dict[str, Any]]] = {}
         for r in range(world_size):
-            with open(os.path.join(tmp_dir, f"manifest_{r:05d}.json")) as f:
-                rank_to_manifest[r] = json.load(f)
+            manifest_path = os.path.join(tmp_dir, f"manifest_{r:05d}.json")
+            try:
+                with open(manifest_path) as f:
+                    rank_to_manifest[r] = json.load(f)
+            except FileNotFoundError as e:
+                raise FileNotFoundError(
+                    f"Rank {r} did not write {manifest_path}. The presharded "
+                    "dump directory must be on a filesystem shared by all "
+                    "ranks/nodes (set presharded_path / draft_presharded_path "
+                    "to a shared path if model_path is node-local)."
+                ) from e
 
         checksum_to_entries: Dict[str, List[Tuple[int, str, Dict[str, Any]]]] = (
             collections.defaultdict(list)
@@ -2416,15 +2446,17 @@ class PreshardedModelLoader(DefaultModelLoader):
                 continue
             param_data = state_dict[r["name"]].data
             param_shape = state_dict[r["name"]].shape
+            # Allow smaller dumped tensors to fill a prefix (e.g. vocab padding).
             for dim, size in enumerate(tensor.shape):
                 if size < param_shape[dim]:
                     param_data = param_data.narrow(dim, 0, size)
-            if tensor.shape != param_shape:
-                logger.warning(
-                    "loading tensor of shape %s into parameter '%s' of shape %s",
-                    tensor.shape,
-                    r["name"],
-                    param_shape,
+            if tensor.shape != param_data.shape:
+                raise ValueError(
+                    f"Presharded tensor shape mismatch for '{r['name']}': "
+                    f"dumped {tuple(tensor.shape)} vs parameter slice "
+                    f"{tuple(param_data.shape)} (full param {tuple(param_shape)}). "
+                    "Re-dump with matching quant/parallel config, or set "
+                    "verify_on_load and check process_weights_after_loading."
                 )
             param_data.copy_(tensor)
             loaded_param_keys.add(r["name"])
@@ -2486,7 +2518,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-                torch.cuda.empty_cache()
 
             # Shared Parameter storages: loading one name covers tied aliases.
             loaded_storages: set = set()
@@ -2514,6 +2545,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
+        self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
 

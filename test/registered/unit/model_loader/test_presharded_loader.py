@@ -496,6 +496,52 @@ class TestBuildDumpPlan(unittest.TestCase):
                 ),
             )
 
+    def test_apply_shape_mismatch_raises(self):
+        # Reload must not silently copy_ into a wrong layout when process
+        # shapes and dumped tensors disagree (previously only warned).
+        # Use a *larger* dumped tensor so prefix-narrow does not paper over it.
+        loader = object.__new__(PreshardedModelLoader)
+        loader._verify_on_load = False
+        param = torch.nn.Parameter(torch.zeros(2, 2))
+        state_dict = {"w": param}
+        items = [{"name": "w", "stored_key": "w", "is_extra": False}]
+        cached = {"w": torch.ones(4, 4)}
+        loaded: set = set()
+        with self.assertRaises(ValueError) as ctx:
+            loader._apply_presharded_file(
+                items=items,
+                cached=cached,
+                model=torch.nn.Module(),
+                state_dict=state_dict,
+                target_device=torch.device("cpu"),
+                loaded_param_keys=loaded,
+                verify_hashes=[],
+            )
+        self.assertIn("shape mismatch", str(ctx.exception).lower())
+
+    def test_build_dump_plan_missing_manifest_mentions_shared_fs(self):
+        # Multi-node without a shared dump dir fails at plan build with a
+        # clear message (not a bare FileNotFoundError path).
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError) as ctx:
+                PreshardedModelLoader._build_dump_plan(
+                    world_size=2, tmp_dir=tmp, max_file_bytes=1024
+                )
+            msg = str(ctx.exception)
+            self.assertIn("Rank 0", msg)
+            self.assertIn("shared", msg.lower())
+
+    def test_ensure_presharded_dir_writable_rejects_readonly(self):
+        # Guard against spending a full source load before discovering a
+        # read-only dump root (HF cache mounts). Mock OSError because root
+        # can often still write to mode-0555 dirs under CAP_DAC_OVERRIDE.
+        loader = object.__new__(PreshardedModelLoader)
+        with mock.patch("os.makedirs", side_effect=OSError("Read-only file system")):
+            with self.assertRaises(RuntimeError) as ctx:
+                loader._ensure_presharded_dir_writable("/ro/presharded")
+            self.assertIn("not writable", str(ctx.exception).lower())
+            self.assertIn("presharded_path", str(ctx.exception))
+
 
 class TestStructuralSignature(unittest.TestCase):
     """The structural signature is the long-term fix for the underlying

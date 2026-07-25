@@ -522,10 +522,12 @@ class ServerArgs:
             "Subsequent runs with the same parallelism+quantization config "
             "load directly from this presharded checkpoint and skip "
             "re-quantization. "
-            "Optional model_loader_extra_config roots: presharded_path "
-            "(target) and draft_presharded_path (speculative draft); each "
-            "replaces <model_path>/presharded and still gets a config "
-            "subfolder appended.",
+            "The dump directory must be on a shared filesystem across all "
+            "ranks/nodes. Optional model_loader_extra_config roots: "
+            "presharded_path (target) and draft_presharded_path (speculative "
+            "draft); each replaces <model_path>/presharded and still gets a "
+            "config subfolder appended. Use a writable path when model_path "
+            "is read-only (e.g. HF cache mounts).",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
