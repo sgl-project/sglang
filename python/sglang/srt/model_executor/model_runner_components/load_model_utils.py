@@ -172,6 +172,8 @@ def build_load_config(
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
+    weight_cache_mode: str,
+    weight_cache_socket: Optional[str],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -199,7 +201,43 @@ def build_load_config(
         modelopt_config=modelopt_config,
         rl_quant_profile=server_args.rl_quant_profile,
         draft_model_idx=draft_model_idx,
+        weight_cache_mode=weight_cache_mode,
+        weight_cache_socket=weight_cache_socket,
     )
+
+
+def maybe_enable_ipc_weight_cache(
+    *,
+    load_config: LoadConfig,
+    server_args: ServerArgs,
+    tp_size: int,
+    pp_rank: int,
+    tp_rank: int,
+) -> None:
+    """Switch ``load_config`` onto the IPC weight-cache path, in place.
+
+    Overrides the load format to ``IPC_CACHE`` (remembering the original as the
+    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
+    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
+    weight reload) can't overwrite the captured fallback format.
+    """
+    if server_args.weight_cache_mode == "off":
+        return
+
+    if load_config.load_format != LoadFormat.IPC_CACHE:
+        load_config.fallback_load_format = load_config.load_format
+        load_config.load_format = LoadFormat.IPC_CACHE
+
+    # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
+    # each daemon has a unique socket even across PP stages and nodes.
+    if load_config.weight_cache_socket is None:
+        from sglang.srt.weight_cache.protocol import (
+            compute_global_rank,
+            get_socket_path,
+        )
+
+        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
 
 
 def load_model_with_memory_saver(
@@ -218,6 +256,17 @@ def load_model_with_memory_saver(
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
+
+    # In zero-copy IPC mode, the weights are shared with the daemon via
+    # CUDA IPC and must not be offloaded/reloaded by the memory saver.
+    is_ipc_zero_copy = server_args.weight_cache_mode != "off"
+    if is_ipc_zero_copy and enable_cpu_backup:
+        logger.warning(
+            "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
+            "IPC-mapped weights cannot be offloaded to CPU."
+        )
+        enable_cpu_backup = False
+
     remote_instance_weight_info = None
     with memory_saver_adapter.region(
         GPU_MEMORY_TYPE_WEIGHTS,
