@@ -113,6 +113,7 @@ LOAD_FORMAT_CHOICES = [
     "npcache",
     "dummy",
     "sharded_state",
+    "presharded",
     "gguf",
     "bitsandbytes",
     "mistral",
@@ -517,14 +518,31 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"presharded" performs a normal first-time load (with quantization), '
+            "then dumps a per-rank/per-tensor sharded checkpoint with content "
+            "deduplication into "
+            "<model_path>/presharded/<parallelism+quant subfolder>/. "
+            "Subsequent runs with the same parallelism+quantization config "
+            "load directly from this presharded checkpoint and skip "
+            "re-quantization. "
+            "The dump directory must be on a shared filesystem across all "
+            "ranks/nodes. Optional model_loader_extra_config roots: "
+            "presharded_path (target) and draft_presharded_path (speculative "
+            "draft); each replaces <model_path>/presharded and still gets a "
+            "config subfolder appended. Use a writable path when model_path "
+            "is read-only (e.g. HF cache mounts).",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
     model_loader_extra_config: A[
         str,
-        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+        "Extra config for model loader. This will be passed to the model loader "
+        "corresponding to the chosen load_format. For load_format=presharded, "
+        "JSON may include presharded_path (target cache root), "
+        "draft_presharded_path (draft cache root), max_file_bytes, "
+        "hash_num_threads, and verify_on_load.",
         NS("model"),
     ] = "{}"
     trust_remote_code: A[
