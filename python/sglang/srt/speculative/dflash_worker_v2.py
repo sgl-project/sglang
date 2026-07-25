@@ -1638,19 +1638,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        grammar_tree = None
-        if batch.has_grammar:
-            # A linear verify chain is a degenerate tree: node i's only child is
-            # i + 1, and column 0 is the already-committed token, so the mask rows
-            # line up with the target's logits rows. Only the ids need a copy, and
-            # it must stay ahead of the target verify launch below.
-            chain_len = draft_tokens.shape[1]
-            next_token = torch.full(draft_tokens.shape, -1, dtype=torch.int64)
-            next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
-            next_sibling = torch.full(draft_tokens.shape, -1, dtype=torch.int64)
-            grammar_tree = GrammarTree.from_device(
-                next_token, next_sibling, draft_tokens
-            )
+        # Must stay ahead of the target verify launch below.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+        )
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
