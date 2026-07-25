@@ -23,7 +23,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    FreeDeviceKV,
+    ReplaceWriteThroughOnNodeSplit,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -33,6 +36,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    _OngoingWriteThrough,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -662,6 +669,113 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         self.assertGreater(evicted, 0)
         self.assertGreater(host_pool.available_size(), available_before)
         cache.sanity_check()
+
+
+class TestCacheActionFifo(CustomTestCase):
+    """FIFO cache-action execution and the prefetch commit's action ordering
+    (mock-based active copies of the gated suite's contract cases)."""
+
+    def test_apply_cache_actions_applies_each_in_order(self):
+        cache = mock.MagicMock()
+        first = ReplaceWriteThroughOnNodeSplit(
+            ack_id=1, old_node_id=1, new_node_id=2, new_child_node_id=1
+        )
+        second = ReplaceWriteThroughOnNodeSplit(
+            ack_id=2, old_node_id=3, new_node_id=4, new_child_node_id=3
+        )
+        UnifiedRadixCache._apply_cache_actions(cache, [first, second])
+        cache._apply_cache_action.assert_has_calls(
+            [mock.call(first), mock.call(second)]
+        )
+
+    def test_chained_replace_write_through_requires_list_order(self):
+        # A pending node split twice in one walk emits two chained Replaces:
+        # the second one's old_node_id only enters the publish list when the
+        # first is applied, so list order is a hard contract.
+        def make_cache():
+            cache = mock.MagicMock()
+            cache.ongoing_write_through = {7: _OngoingWriteThrough(10, None, [5, 10])}
+            return cache
+
+        def apply(cache, action):
+            UnifiedRadixCache._replace_pending_write_through_node(
+                cache,
+                action.ack_id,
+                action.old_node_id,
+                [action.new_node_id, action.new_child_node_id],
+            )
+
+        # split X(10) -> [A(11), X(10)], then fragment A(11) -> [B(12), A(11)]
+        first = ReplaceWriteThroughOnNodeSplit(
+            ack_id=7, old_node_id=10, new_node_id=11, new_child_node_id=10
+        )
+        second = ReplaceWriteThroughOnNodeSplit(
+            ack_id=7, old_node_id=11, new_node_id=12, new_child_node_id=11
+        )
+
+        # in list order, the publish list threads through both replaces
+        cache = make_cache()
+        apply(cache, first)
+        apply(cache, second)
+        self.assertEqual(
+            cache.ongoing_write_through[7].publish_node_ids, [5, 12, 11, 10]
+        )
+
+        # reversed order silently drops the second fragment - documents why
+        # emission order must be preserved end to end
+        cache = make_cache()
+        apply(cache, second)
+        apply(cache, first)
+        self.assertEqual(cache.ongoing_write_through[7].publish_node_ids, [5, 11, 10])
+
+    def test_prefetch_commit_applies_host_insert_actions_before_transfers(self):
+        """The prefetch commit applies the host-insert walk's actions before
+        commit_hicache_transfers, whose emissions ride a fresh list."""
+        cache = mock.MagicMock()
+        cache.page_size = 1
+        cache.enable_storage_metrics = False
+        walk_action = object()
+        insert_result = mock.MagicMock()
+        insert_result.cache_actions = [walk_action]
+        insert_result.prefix_len = 4
+        cache.tree_core.insert_host.return_value = insert_result
+        cache.ongoing_prefetch = {
+            "req": (
+                7,
+                list(range(8)),
+                list(range(100, 108)),
+                mock.MagicMock(),
+                None,
+                {},
+            )
+        }
+        cache.cache_controller.terminate_prefetch.return_value = (
+            8,
+            [f"h{i}" for i in range(8)],
+        )
+        cache._sync_and_check_hybrid_prefetch_result.return_value = 8
+        cache.cache_controller.prefetch_tokens_occupied = 100
+        cache.prefetch_loaded_tokens_by_reqid = {}
+
+        order = mock.MagicMock()
+        applied = []
+
+        def record_apply(actions):
+            applied.append(list(actions))
+            actions.clear()
+
+        order.apply.side_effect = record_apply
+        cache._apply_cache_actions = order.apply
+        cache.tree_core.commit_hicache_transfers = order.commit
+
+        self.assertTrue(UnifiedRadixCache.check_prefetch_progress(cache, "req"))
+
+        self.assertEqual([c[0] for c in order.mock_calls], ["apply", "commit", "apply"])
+        self.assertEqual(applied[0], [walk_action])
+        self.assertIsNot(
+            order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
+        )
+        self.assertEqual(cache.ongoing_prefetch, {})
 
 
 if __name__ == "__main__":
