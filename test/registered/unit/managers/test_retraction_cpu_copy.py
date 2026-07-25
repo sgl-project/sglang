@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -47,7 +48,7 @@ def _batch(cpu_copy_supported: bool, req_count: int = 2):
     return batch
 
 
-class TestKVCacheCPUCopyCapability(unittest.TestCase):
+class TestKVCacheCPUCopyCapability(CustomTestCase):
     def test_mha_support_depends_on_layout(self):
         pool = object.__new__(MHATokenToKVPool)
         pool.kv_cache_layout = "nhd"
@@ -88,7 +89,7 @@ class TestKVCacheCPUCopyCapability(unittest.TestCase):
         self.assertFalse(pool.supports_cpu_copy())
 
 
-class TestPDDecodeRetractionCPUCopy(unittest.TestCase):
+class TestPDDecodeRetractionCPUCopy(CustomTestCase):
     @patch(
         "sglang.srt.managers.schedule_batch."
         "NewTokenRatioTracker.estimate_new_token_ratio_after_retract",
