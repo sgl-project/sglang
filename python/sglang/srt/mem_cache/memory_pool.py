@@ -1786,8 +1786,8 @@ class MHATokenToKVPool(KVCache):
         # per-token scale buffers.
         return (
             self.kv_cache_layout == "nhd"
-            and getattr(self, "k_scale_buffer", None) is None
-            and getattr(self, "v_scale_buffer", None) is None
+            and self.k_scale_buffer is None
+            and self.v_scale_buffer is None
         )
 
     def _init_kv_copy_and_warmup(self):
