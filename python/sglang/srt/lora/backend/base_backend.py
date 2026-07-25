@@ -27,12 +27,13 @@ def get_gathered_moe_num_tokens(forward_batch: ForwardBatch, num_tokens: int) ->
     global_num_tokens = getattr(forward_batch, "global_num_tokens_cpu", None)
     if not global_num_tokens:
         return num_tokens
-    from sglang.srt.layers.dp_attention import get_attention_tp_size
+    # Local import: a module-level cp import here is circular (see forward_batch_info).
+    # v0.5.16 moved this helper layers.utils.cp_utils -> layers.cp.padding.
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.runtime_context import get_parallel
 
-    # Local import: a module-level cp_utils import here is circular (see forward_batch_info).
-    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
-
-    attn_tp_size = get_attention_tp_size()
+    # v0.5.16 retired dp_attention.get_attention_tp_size(); it lives on ParallelState now.
+    attn_tp_size = get_parallel().attn_tp_size
     cp_align_size = get_cp_padding_align_size()
     upper = max(
         ceil_align(ceil_align(t, attn_tp_size), cp_align_size)
