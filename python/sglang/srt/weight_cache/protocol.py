@@ -52,11 +52,6 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
-    # Resolved FP4 GEMM backend (Fp4GemmRunnerBackend value, "" if N/A). NVFP4
-    # create_weights registers a backend-dependent raw param set (e.g.
-    # w13_blockscale_swizzled is None for TRTLLM but a Parameter otherwise), so a
-    # daemon and client that resolve different backends would produce
-    # incompatible raw param sets; comparing this turns that into a clean mismatch.
     fp4_gemm_backend: str
 
     def matches(self, other: "CacheConfig") -> bool:

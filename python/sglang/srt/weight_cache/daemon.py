@@ -233,20 +233,12 @@ class WeightCacheDaemon:
         )
         publish(server_args, role="weight_cache_daemon")
 
-        # Resolve the FP4 GEMM backend exactly as the engine does
-        # (Scheduler.__init__ calls this unconditionally). It drives NVFP4
-        # create_weights layout decisions and is stamped into the fingerprint, so
-        # the daemon must resolve the same backend as the engine it serves --
-        # otherwise even non-FP4 fingerprints would drift ("auto" here vs the
-        # engine's resolved value).
+        from sglang.srt.layers.moe import get_moe_runner_backend, initialize_moe_config
         from sglang.srt.layers.quantization.fp4_utils import (
             initialize_fp4_gemm_config,
         )
 
         initialize_fp4_gemm_config(server_args)
-
-        from sglang.srt.layers.moe import get_moe_runner_backend, initialize_moe_config
-
         initialize_moe_config(server_args)
 
         # Initialize distributed backend for model loading
