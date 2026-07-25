@@ -1,4 +1,3 @@
-import json
 import unittest
 
 import openai
@@ -7,11 +6,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import (
     gen_radix_tree,
     run_radix_attention_test,
 )
+from sglang.test.kits.spec_server_kits import SpecGrammarKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -21,11 +22,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=302, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
+class TestDFlashServerBase(
+    CustomTestCase,
+    MatchedStopMixin,
+    GSM8KMixin,
+    JSONConstrainedMixin,
+    SpecGrammarKit,
+):
     max_running_requests = 64
     attention_backend = "triton" if is_hip() else "flashinfer"
     page_size = 1
@@ -125,46 +132,9 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         self.assertEqual(outputs[0], outputs[1])
         assert self.process.poll() is None
 
-    def _constrained(self, **kwargs):
-        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "user", "content": "What is the capital of France?"},
-            ],
-            **kwargs,
-        )
-        return response.choices[0].message.content
-
-    def test_grammar_constrained_decoding(self):
-        # These requests used to be rejected at admission with HTTP 400. The mask
-        # is built over the whole verify chain, so a grammar violation anywhere in
-        # the block -- not just at the bonus token -- must be impossible.
-        schema = {
-            "type": "object",
-            "properties": {"capital": {"type": "string"}},
-            "required": ["capital"],
-            "additionalProperties": False,
-        }
-        content = self._constrained(
-            max_tokens=128,
-            temperature=0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "capital_answer", "schema": schema},
-            },
-        )
-        parsed = json.loads(content)
-        self.assertIsInstance(parsed["capital"], str)
-
-        # Sampling verify takes a different accept path than greedy; both must read
-        # the masked logits.
-        content = self._constrained(
-            max_tokens=8, temperature=0.8, extra_body={"regex": r"(Paris|Lyon)"}
-        )
-        self.assertRegex(content.strip(), r"^(Paris|Lyon)$")
-
-        assert self.process.poll() is None
+    @unittest.skip("DFLASH rejects return_logprob at admission")
+    def test_grammar_logprob_count_matches_completion_tokens(self):
+        pass
 
 
 class TestDFlashServerPage256(TestDFlashServerBase):
