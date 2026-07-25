@@ -154,8 +154,7 @@ impl GenerateBody {
             }
         };
 
-        // The scalar logprob/hidden opts broadcast to every item. `is_health_check`
-        // is never client-set (only the internal `/health_generate` probe sets it).
+        // The scalar logprob/hidden opts broadcast to every item.
         let requests = (0..n)
             .map(|i| GenerateRequest {
                 rid: rids[i].take(),
@@ -163,7 +162,6 @@ impl GenerateBody {
                 input_ids: id_lists[i].take(),
                 sampling_params: sps[i].take(),
                 stream,
-                is_health_check: false,
                 return_logprob,
                 logprob_start_len,
                 top_logprobs_num,
@@ -205,11 +203,6 @@ pub struct GenerateRequest {
     pub sampling_params: Option<rmpv::Value>,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
-    /// Internal `/health_generate` probe. Not a wire field — the probe is
-    /// recognized (and skipped when busy) by its `HEALTH_CHECK_` rid prefix,
-    /// mirroring Python `constants.HEALTH_CHECK_RID_PREFIX`; here it only
-    /// drives that rid minting. Never set from the client wire.
-    pub is_health_check: bool,
     /// Logprob / hidden-state options. This path bypasses the Python
     /// `TokenizerManager`, so the ingress replicates its scalar normalization
     /// (defaults applied in `to_header_msgpack`) before the scheduler sees them.
