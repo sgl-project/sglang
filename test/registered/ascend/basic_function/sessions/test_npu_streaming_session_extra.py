@@ -24,10 +24,10 @@ Tests:
 """
 
 import os
-import unittest
 
 import threading
 import time
+import unittest
 
 import requests
 
