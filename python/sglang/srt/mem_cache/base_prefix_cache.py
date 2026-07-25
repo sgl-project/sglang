@@ -283,6 +283,22 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         the root's NodeId for UnifiedRadixCache."""
         return self.root_node
 
+    def is_backuped(self, node: Any) -> bool:
+        """Whether the node's Full KV is present on host."""
+        return node.backuped
+
+    def is_root(self, node: Any) -> bool:
+        """Whether the node is a tree root."""
+        return node is self.root_node
+
+    def get_last_hash_value(self, node: Any) -> Optional[str]:
+        """The node's last page hash, or None when it was never hashed."""
+        return node.get_last_hash_value()
+
+    def get_prefix_hash_values(self, node: Any) -> list[str]:
+        """The hash chain of the node's ancestors, in root-to-parent order."""
+        return node.get_prefix_hash_values(node.parent)
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass

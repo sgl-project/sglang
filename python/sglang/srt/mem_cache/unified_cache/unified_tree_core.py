@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
     InsertStepResult,
     NodeId,
+    RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.unified_cache_components import (
@@ -412,6 +413,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
+
+    def is_root(self, node_id: NodeId) -> bool:
+        """Whether the node is the tree root."""
+        return self.node_by_id(node_id) is self.root_node
+
+    def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
+        """The node's last page hash, or None when it was never hashed."""
+        return self.node_by_id(node_id).get_last_hash_value()
+
+    def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash chain of the node's ancestors, in root-to-parent order."""
+        node = self.node_by_id(node_id)
+        return node.get_prefix_hash_values(node.parent)
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
@@ -2041,6 +2055,52 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             for child in node.children.values():
                 stack.append(child)
         return total_size, total_aux_size
+
+    def walk_for_kv_canary(
+        self, unlocked_only: bool, swa_resident_only: bool
+    ) -> RadixCacheWalkResult:
+        """Flatten every FULL device slot into (slot, position, prev-slot) rows for the KV-canary sweep."""
+        slots: list[int] = []
+        positions: list[int] = []
+        prev_slots: list[int] = []
+        swa_filter = swa_resident_only and ComponentType.SWA in self.components_by_type
+
+        def _dfs(node: UnifiedTreeNode, depth: int, parent_last_slot: int) -> None:
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            node_slots = value.tolist() if isinstance(value, torch.Tensor) else []
+
+            emit = node is not self.root_node
+            if unlocked_only:
+                # Unified SWA owns an independent component lock. A node can still
+                # hold Full KV for a running request while its SWA slots are unused.
+                lock_ct = ComponentType.SWA if swa_filter else BASE_COMPONENT_TYPE
+                emit = emit and node.component_data[lock_ct].lock_ref == 0
+            if swa_filter:
+                emit = emit and node.component_data[ComponentType.SWA].value is not None
+
+            # Skipped nodes still advance the chain/depth so descendants stay consistent.
+            chain_last_slot = parent_last_slot
+            for j, slot in enumerate(node_slots):
+                if emit:
+                    slots.append(slot)
+                    positions.append(depth + j)
+                    prev_slots.append(parent_last_slot if j == 0 else node_slots[j - 1])
+                chain_last_slot = slot
+
+            # Device-evicted nodes hold no slots but still span their key length.
+            if node is self.root_node or node.key is None:
+                child_depth = depth + len(node_slots)
+            else:
+                child_depth = depth + len(node.key)
+            for child in node.children.values():
+                _dfs(child, child_depth, chain_last_slot)
+
+        _dfs(self.root_node, 0, -1)
+        return RadixCacheWalkResult(
+            slot_indices=torch.tensor(slots, dtype=torch.int64),
+            positions=torch.tensor(positions, dtype=torch.int64),
+            prev_slot_indices=torch.tensor(prev_slots, dtype=torch.int64),
+        )
 
     def all_values_flatten(self) -> torch.Tensor:
         values = []

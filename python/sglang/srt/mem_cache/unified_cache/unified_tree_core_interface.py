@@ -66,6 +66,14 @@ class DecSwaLockOnlyResult(BaseEvictionResult):
     pass
 
 
+class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
+    """Flat (slot, position, prev-slot) rows emitted by the KV-canary walk."""
+
+    slot_indices: torch.Tensor
+    positions: torch.Tensor
+    prev_slot_indices: torch.Tensor
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -139,6 +147,21 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     @abstractmethod
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
+        ...
+
+    @abstractmethod
+    def is_root(self, node_id: NodeId) -> bool:
+        """Whether the node is the tree root."""
+        ...
+
+    @abstractmethod
+    def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
+        """The node's last page hash, or None when it was never hashed."""
+        ...
+
+    @abstractmethod
+    def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash chain of the node's ancestors, in root-to-parent order."""
         ...
 
     @abstractmethod
@@ -256,6 +279,14 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def all_mamba_values_flatten(self) -> torch.Tensor: ...
+
+    @abstractmethod
+    def walk_for_kv_canary(
+        self, unlocked_only: bool, swa_resident_only: bool
+    ) -> RadixCacheWalkResult:
+        """Flatten every FULL device slot into (slot, position, prev-slot) rows
+        for the KV-canary sweep."""
+        ...
 
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:

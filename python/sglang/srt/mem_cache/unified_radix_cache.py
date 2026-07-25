@@ -1096,6 +1096,18 @@ class UnifiedRadixCache(BasePrefixCache):
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
 
+    def is_backuped(self, node_id: NodeId) -> bool:
+        return self.tree_core.is_backuped(node_id)
+
+    def is_root(self, node_id: NodeId) -> bool:
+        return self.tree_core.is_root(node_id)
+
+    def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
+        return self.tree_core.get_last_hash_value(node_id)
+
+    def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
+        return self.tree_core.get_prefix_hash_values(node_id)
+
     def prefetch_from_storage(
         self,
         req_id: str,
