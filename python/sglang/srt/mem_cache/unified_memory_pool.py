@@ -183,6 +183,7 @@ class MambaSubPoolSpec(SubPoolSpec):
     conv_dtype: torch.dtype
     temporal_state_shape: Tuple[int, ...]
     temporal_dtype: torch.dtype
+    conv_slice_axis: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -665,9 +666,9 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
         src_pages = src_loc.view(-1, ps)[:, 0] // ps
         with record_function("UnifiedMLA.move_kv_cache"):
-            env = self._unified_buffer._raw[
-                : self._num_pages * self._page_bytes
-            ].view(self._num_pages, self._page_bytes)
+            env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
+                self._num_pages, self._page_bytes
+            )
             env[tgt_pages] = env[src_pages]
 
 
@@ -691,6 +692,8 @@ class UnifiedMambaPool(MambaPool):
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
+        # PP disagg state transfer maps entries by global layer id.
+        self.mamba_layer_ids = list(mamba_layer_ids)
         conv_views, temporal_view = unified_buffer.mamba_views_for(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
 
@@ -719,6 +722,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_is_flush = None
         self.debug_memory_pool = False
         self.conv_shard_groups = None
+        self.conv_slice_axis = spec.conv_slice_axis
 
         assert (
             conv_views[0].shape[0] == self.num_mamba_layers
@@ -1074,6 +1078,7 @@ def init_unified_mamba_pools(
         conv_dtype=cp.dtype.conv,
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
+        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
     total_bytes = (
@@ -1082,9 +1087,7 @@ def init_unified_mamba_pools(
     )
     # Dense MLA views are per-layer shifted, so the last layer's view reaches one
     # page envelope past the final page — allocation-only tail pad (~page bytes).
-    view_tail_pad_bytes = (
-        page_size * full_spec.entry_bytes() if use_mla_backend else 0
-    )
+    view_tail_pad_bytes = page_size * full_spec.entry_bytes() if use_mla_backend else 0
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],

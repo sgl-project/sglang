@@ -4047,6 +4047,8 @@ async def handle_encode_request(request: dict):
         else:
             # Non-batched requests still own their collective dispatch order
             # directly; batched requests take this lock in _dispatch_group.
+            # Locking direct dispatch together with the rank0 await keeps its
+            # NCCL launch order matching the ZMQ dispatch order rank>0 sees.
             async with encoder.encode_dispatch_lock:
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))

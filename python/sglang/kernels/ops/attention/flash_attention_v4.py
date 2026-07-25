@@ -38,6 +38,7 @@ def flash_attn_varlen_func(
     v: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
@@ -79,7 +80,7 @@ def flash_attn_varlen_func(
             "vendored FA4 package is importable."
         ) from _flash_attn_import_error
 
-    q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
+    q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
     cu_seqlens_q, cu_seqlens_k = [
         _maybe_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k)
     ]
@@ -122,6 +123,7 @@ def flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
+        qv=qv,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
@@ -193,7 +195,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     **_: object,
 ):
-    if k is not None or v is not None or qv is not None:
+    if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
         raise NotImplementedError("FA4 path does not support rotary embedding.")
@@ -210,6 +212,7 @@ def flash_attn_with_kvcache(
         q=q,
         k=k_cache,
         v=v_cache,
+        qv=qv,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=cache_seqlens,
         max_seqlen_q=max_seqlen_q,

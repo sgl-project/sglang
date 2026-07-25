@@ -55,6 +55,8 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
@@ -379,6 +381,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        grammar_barrier=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -390,7 +393,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish)
 
-        return self._forward_decode(batch, on_publish)
+        return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish
@@ -499,7 +502,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -592,6 +595,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # Must stay ahead of the target verify launch below.
+        grammar_tree = (
+            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        )
+
+        # A live grammar forces the eager path: the folded epilogue accepts inside
+        # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
@@ -601,6 +611,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+            and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
@@ -626,6 +637,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
+        if batch.has_grammar:
+            # Both the FSM advance over the previous batch's committed tokens and
+            # the traversal below are host work, so they overlap the launch above.
+            if grammar_barrier is not None:
+                grammar_barrier()
+            # run_compact scatters its rows back to (bs * chain_len), so the mask
+            # lines up with the logits on both verify paths.
+            vocab_mask = build_grammar_vocab_mask(
+                reqs=batch.reqs,
+                verify_input=draft_input,
+                tree=grammar_tree,
+                sampling_info=sampling_info,
+                device=logits_output.next_token_logits.device,
+            )
+            if vocab_mask is not None:
+                draft_input.grammar.apply_vocab_mask(
+                    logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+                )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
