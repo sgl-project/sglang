@@ -333,6 +333,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_storage = False
         self.write_through_threshold = 256
         self.is_write_back = False
+        self.has_swa_host_pool = False
         self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
 
         # ``device`` is derived from the construction-time allocator; the

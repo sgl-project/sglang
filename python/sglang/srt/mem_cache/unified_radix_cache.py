@@ -344,6 +344,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
+            if self.supports_swa():
+                swa = self.components[ComponentType.SWA]
+                self.tree_core.has_swa_host_pool = swa._swa_kv_pool_host is not None
 
         # State initialization
         self.write_through_threshold = (
@@ -1858,7 +1861,7 @@ class UnifiedRadixCache(BasePrefixCache):
         unified_compress_only_hicache = (
             self.cache_controller is not None
             and swa is not None
-            and swa._swa_kv_pool_host is None
+            and not self.tree_core.has_swa_host_pool
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
 

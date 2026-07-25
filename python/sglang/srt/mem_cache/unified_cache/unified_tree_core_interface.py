@@ -126,6 +126,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     enable_storage: bool
     write_through_threshold: int
     is_write_back: bool
+    has_swa_host_pool: bool
 
     # ==== Tree API ====
 
