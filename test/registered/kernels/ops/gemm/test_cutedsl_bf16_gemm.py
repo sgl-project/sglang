@@ -17,7 +17,11 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm  # noqa: E402
+from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (  # noqa: E402
+    _K3_TGV_WIN_SHAPES,
+    cutedsl_bf16_gemm,
+    use_cutedsl_bf16_gemm,
+)
 
 N_VALUES = [1024, 2624, 6144]
 K_VALUES = [2048, 6144]
@@ -46,6 +50,32 @@ def test_cutedsl_bf16_gemm(num_tokens, k, n, has_bias):
     if bias is not None:
         ref = ref + bias.float()
     torch.testing.assert_close(out, ref.bfloat16(), rtol=2e-2, atol=2.5)
+
+
+@pytest.mark.parametrize("n, k", sorted(_K3_TGV_WIN_SHAPES) + [(1024, 2048)])
+def test_empty_batch_not_tgv_eligible(n, k):
+    """DP-attention idle groups run a 0-token dummy forward to keep the
+    mlp-sync lockstep; every m == 0 shape must route to cuBLAS."""
+    assert not use_cutedsl_bf16_gemm(0, n, k)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_cutedsl_bf16_gemm_empty_batch(has_bias):
+    """Empty input must yield the empty [0, N] output, mirroring F.linear —
+    launching TGV with a 0-CTA grid fails with CUDA_ERROR_INVALID_VALUE."""
+    if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        pytest.skip("SM100/SM103 required")
+
+    n, k = 6144, 2048
+    x = torch.empty(0, k, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
+
+    out = cutedsl_bf16_gemm(x, weight, bias)
+    torch.cuda.synchronize()
+    assert out.shape == (0, n)
+    assert out.dtype == torch.bfloat16
 
 
 if __name__ == "__main__":

@@ -1318,6 +1318,11 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
     back to cuBLAS."""
+    if m <= 0:
+        # Empty batch: DP-attention idle groups run a 0-token dummy forward to
+        # keep the mlp-sync lockstep. A 0-CTA TGV grid is a driver-level
+        # CUDA_ERROR_INVALID_VALUE, so leave empty inputs to cuBLAS.
+        return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
@@ -1355,6 +1360,10 @@ def _tgv_bf16_gemm_run(
     out = torch.empty(
         (x.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x.device
     )
+    if x.shape[0] == 0:
+        # Match cuBLAS/F.linear semantics for empty batches; a 0-CTA launch
+        # would fail with CUDA_ERROR_INVALID_VALUE.
+        return out
     return _run_tgv(
         x,
         weight.t(),
