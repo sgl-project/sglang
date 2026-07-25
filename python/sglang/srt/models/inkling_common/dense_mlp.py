@@ -304,6 +304,18 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         )
 
         S = SharedExpertFp4Strategy
+        _em = getattr(quant_config, "exclude_modules", None)
+        print(
+            "DBG_FP4 qc=",
+            type(quant_config).__name__,
+            "prefix=",
+            prefix,
+            "n_exclude=",
+            (len(_em) if _em is not None else None),
+            "sample=",
+            (list(_em)[:3] if _em else _em),
+            flush=True,
+        )
         # Plain bf16 models, and EP-replicated shared experts (no TP), serve bf16.
         if not isinstance(quant_config, InklingModelOptNvfp4Config):
             return S.BF16
