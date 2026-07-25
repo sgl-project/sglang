@@ -88,6 +88,80 @@ class _SimplePageAllocator:
         return len(self._free)
 
 
+class HiSparseV2AdmitBudget:
+    """Scheduler-side admission budget for one PrefillAdder round.
+
+    Snapshots the coordinator quotas (see make_admit_budget) and PREDICTS
+    admission outcomes so the PrefillAdder can pick each candidate's
+    device reservation; the REAL accounting lives in the coordinator and
+    is re-snapshotted into every new adder. Within one round the
+    quotas act as shadow copies, depleted on commit.
+    """
+
+    def __init__(
+        self,
+        page_size: int,
+        temp_slot_tokens: int,
+        expanded_pages_left: int,
+        host_tokens_left: int,
+        device_pool_tokens: int,
+    ):
+        self._page_size = page_size
+        self.temp_slot_tokens = temp_slot_tokens
+        self._expanded_left = expanded_pages_left
+        self._host_left = host_tokens_left
+        self._device_pool_tokens = device_pool_tokens
+
+    def _infeasible(self, total_seq_len: int, max_new: int) -> bool:
+        """The candidate's V2 reservation cannot fit the device pool even
+        at full idle → budget it as standard. The entry-side max_new clamp
+        only guarantees the STANDARD budget fits the pool; reserving the
+        temp device buffer on top could push add_one_req's total past
+        rem_total_tokens forever (NO_TOKEN livelock on an idle system).
+        Note the coordinator may still V2-admit such a request when the
+        pool has room at admission time — that is strictly better than
+        standard (the prefix becomes evictable), and the reservation here
+        stays the conservative standard one."""
+        return (
+            total_seq_len + self.temp_slot_tokens + max_new + self._page_size
+            >= self._device_pool_tokens
+        )
+
+    def future_tokens(self, total_seq_len: int, max_new: int, commit: bool) -> int:
+        """Device-pool future-token reservation for a candidate.
+
+        Predicted-admission success → ``temp_slot_tokens + max_new`` (the
+        temp device buffer is allocated from the regular pool at admission
+        and held for the request lifetime); predicted failure → the
+        standard ``max_new``."""
+        num_pages = total_seq_len // self._page_size
+        tree_len = num_pages * self._page_size
+        if (
+            num_pages <= 0
+            or num_pages > self._expanded_left
+            or tree_len > self._host_left
+            or self._infeasible(total_seq_len, max_new)
+        ):
+            return max_new
+        if commit:
+            self._expanded_left -= num_pages
+            self._host_left -= tree_len
+        return self.temp_slot_tokens + max_new
+
+    def admission_exhausted(self, total_seq_len: int, max_new: int) -> bool:
+        """True when a candidate is only blocked by quota exhaustion
+        (expanded pages / host tokens) — the add_one_req gate keeps such
+        candidates queued. Short prompts (< 1 page) and pool-infeasible
+        reservations legitimately run as standard: nothing exhausted."""
+        num_pages = total_seq_len // self._page_size
+        if num_pages <= 0 or self._infeasible(total_seq_len, max_new):
+            return False
+        return (
+            num_pages > self._expanded_left
+            or num_pages * self._page_size > self._host_left
+        )
+
+
 class HiSparseV2Coordinator:
     def __init__(
         self,
@@ -548,6 +622,16 @@ class HiSparseV2Coordinator:
         if self._host_capacity_tokens <= 0:
             return 1 << 60
         return self._host_capacity_tokens - self._reserved_host_tokens
+
+    def make_admit_budget(self, device_pool_tokens: int) -> HiSparseV2AdmitBudget:
+        """Snapshot the admission quotas for one PrefillAdder round."""
+        return HiSparseV2AdmitBudget(
+            page_size=self.page_size,
+            temp_slot_tokens=self.temp_slot_tokens,
+            expanded_pages_left=self._indexer_page_allocator.available(),
+            host_tokens_left=self.host_reservable_left(),
+            device_pool_tokens=device_pool_tokens,
+        )
 
     def _node_backs_active_request(self, node) -> bool:
         """Whether *node*'s device KV backs any active V2 request's prefix.

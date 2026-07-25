@@ -172,7 +172,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    HiSparseV2AdmitProbe,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -2970,13 +2969,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
-            hisparse_v2_config=(
-                HiSparseV2AdmitProbe(
-                    temp_slot_tokens=self.hisparse_coordinator.temp_slot_tokens,
-                    expanded_pages_left=self.hisparse_coordinator._indexer_page_allocator.available(),
-                    host_tokens_left=self.hisparse_coordinator.host_reservable_left(),
-                    device_pool_tokens=self.max_total_num_tokens,
-                )
+            hisparse_v2_budget=(
+                self.hisparse_coordinator.make_admit_budget(self.max_total_num_tokens)
                 if self.enable_hisparse_v2 and self.hisparse_coordinator is not None
                 else None
             ),

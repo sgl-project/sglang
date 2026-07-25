@@ -30,7 +30,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
@@ -60,6 +60,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_v2_coordinator import HiSparseV2AdmitBudget
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -438,22 +439,6 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class HiSparseV2AdmitProbe(NamedTuple):
-    """Snapshot of the HiSparse V2 admission quotas taken by the scheduler
-    when constructing a PrefillAdder (None ⟺ V2 disabled).
-
-    The quotas only PREDICT the coordinator's admission outcome to pick
-    the device reservation; the REAL accounting lives in the coordinator
-    and is re-snapshotted into every new adder. Within one adder round
-    they act as shadow copies, depleted on commit (see
-    _hisparse_v2_future_tokens)."""
-
-    temp_slot_tokens: int  # per-request temp device buffer (lifetime floor)
-    expanded_pages_left: int  # expanded indexer page allocator balance
-    host_tokens_left: int  # host-capacity gate balance
-    device_pool_tokens: int  # total device pool (feasibility check)
-
-
 class PrefillAdder:
     def __init__(
         self,
@@ -472,22 +457,17 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
-        hisparse_v2_config: Optional[HiSparseV2AdmitProbe] = None,
+        hisparse_v2_budget: Optional[HiSparseV2AdmitBudget] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        # HiSparse V2 admission-aware budgeting (same rem_* idiom as the
-        # SWA/Mamba budgets below): shadow quota balances, depleted on
-        # commit so later candidates this round predict against the
-        # reduced amount. None ⟺ V2 disabled.
-        self.enable_hisparse_v2 = hisparse_v2_config is not None
-        self._hisparse_v2 = hisparse_v2_config
-        if hisparse_v2_config is not None:
-            self.rem_hisparse_v2_pages = hisparse_v2_config.expanded_pages_left
-            self.rem_hisparse_v2_host_tokens = hisparse_v2_config.host_tokens_left
+        # HiSparse V2 admission-aware budgeting: a per-round quota snapshot
+        # built by the coordinator (make_admit_budget); all V2 budget
+        # logic lives there. None ⟺ V2 disabled.
+        self._hisparse_v2_budget = hisparse_v2_budget
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -580,9 +560,6 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # HiSparse V2 note: even though an admitted prefix is evictable, the
-        # remaining decode tail is request-owned and non-evictable — it must
-        # stay reserved here like any standard request (else retract/OOM).
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -647,62 +624,6 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
-
-    def _hisparse_v2_infeasible(self, total_seq_len: int, max_new: int) -> bool:
-        """The candidate's V2 reservation cannot fit the device pool even
-        at full idle → budget it as standard. The entry-side max_new clamp
-        only guarantees the STANDARD budget fits the pool; reserving the
-        temp device buffer on top could push add_one_req's total past
-        rem_total_tokens forever (NO_TOKEN livelock on an idle system).
-        Note the coordinator may still V2-admit such a request when the
-        pool has room at admission time — that is strictly better than
-        standard (the prefix becomes evictable), and the reservation here
-        stays the conservative standard one."""
-        cfg = self._hisparse_v2
-        return (
-            total_seq_len + cfg.temp_slot_tokens + max_new + self.page_size
-            >= cfg.device_pool_tokens
-        )
-
-    def _hisparse_v2_future_tokens(
-        self, total_seq_len: int, max_new: int, commit: bool
-    ) -> int:
-        """Device-pool future-token reservation for a candidate.
-
-        HiSparse V2 predicted-admission success → ``temp_slot_tokens +
-        max_new`` (the temp device buffer is allocated from the regular
-        pool at admission and held for the request lifetime); predicted
-        failure → the standard ``max_new``. Only called when
-        enable_hisparse_v2 (callers gate explicitly)."""
-        num_pages = total_seq_len // self.page_size
-        tree_len = num_pages * self.page_size
-        if (
-            num_pages <= 0
-            or num_pages > self.rem_hisparse_v2_pages
-            or tree_len > self.rem_hisparse_v2_host_tokens
-            or self._hisparse_v2_infeasible(total_seq_len, max_new)
-        ):
-            return max_new
-        if commit:
-            self.rem_hisparse_v2_pages -= num_pages
-            self.rem_hisparse_v2_host_tokens -= tree_len
-        return self._hisparse_v2.temp_slot_tokens + max_new
-
-    def _hisparse_v2_admission_exhausted(
-        self, total_seq_len: int, max_new: int
-    ) -> bool:
-        """True when a V2 candidate is only blocked by quota exhaustion
-        (expanded pages / host tokens) — the add_one_req gate keeps such
-        candidates queued. Short prompts (< 1 page) and pool-infeasible
-        reservations legitimately run as standard: nothing exhausted.
-        Only called when enable_hisparse_v2 (callers gate explicitly)."""
-        num_pages = total_seq_len // self.page_size
-        if num_pages <= 0 or self._hisparse_v2_infeasible(total_seq_len, max_new):
-            return False
-        return (
-            num_pages > self.rem_hisparse_v2_pages
-            or num_pages * self.page_size > self.rem_hisparse_v2_host_tokens
-        )
 
     def _swa_budget_for_req(
         self, extend_input_len: int, swa_host_hit_length: int = 0
@@ -950,10 +871,10 @@ class PrefillAdder:
         self.can_run_list.append(req)
         if truncated:
             future_reserve = 0
-        elif self.enable_hisparse_v2:
+        elif self._hisparse_v2_budget is not None:
             # Final chunk: same probe/commit as the non-chunked path,
             # so shadow quotas stay accurate for later candidates.
-            future_reserve = self._hisparse_v2_future_tokens(
+            future_reserve = self._hisparse_v2_budget.future_tokens(
                 len(req.full_untruncated_fill_ids),
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 commit=True,
@@ -1130,10 +1051,10 @@ class PrefillAdder:
             req.prefix_indices
         )
         cand_future = (
-            self._hisparse_v2_future_tokens(
+            self._hisparse_v2_budget.future_tokens(
                 len(req.full_untruncated_fill_ids), max_new, commit=False
             )
-            if self.enable_hisparse_v2
+            if self._hisparse_v2_budget is not None
             else max_new
         )
         # HiSparse V2: a candidate that cannot be V2-admitted (expanded
@@ -1145,8 +1066,8 @@ class PrefillAdder:
         # run standard is the progress guarantee (e.g. a request larger
         # than the whole expanded pool).
         if (
-            self.enable_hisparse_v2
-            and self._hisparse_v2_admission_exhausted(
+            self._hisparse_v2_budget is not None
+            and self._hisparse_v2_budget.admission_exhausted(
                 len(req.full_untruncated_fill_ids), max_new
             )
             and (
@@ -1272,8 +1193,8 @@ class PrefillAdder:
                 future_reserve = min(
                     req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                 )
-                if self.enable_hisparse_v2:
-                    future_reserve = self._hisparse_v2_future_tokens(
+                if self._hisparse_v2_budget is not None:
+                    future_reserve = self._hisparse_v2_budget.future_tokens(
                         len(req.full_untruncated_fill_ids),
                         future_reserve,
                         commit=True,
