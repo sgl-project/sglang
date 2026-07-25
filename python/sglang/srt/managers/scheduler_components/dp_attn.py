@@ -214,6 +214,7 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
+    draft_require_mlp_tp_gather: Optional[bool],
     skip_all_gather=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
@@ -225,6 +226,19 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    # Reuse the same all-gather result for a draft model whose A2A backend
+    # requires a different local/full token-count representation.
+    if draft_require_mlp_tp_gather is not None:
+        if draft_require_mlp_tp_gather:
+            batch.draft_global_num_tokens = mlp_sync_info.global_num_tokens
+            batch.draft_global_num_tokens_for_logprob = (
+                mlp_sync_info.global_num_tokens_for_logprob
+            )
+        else:
+            batch.draft_global_num_tokens = [mlp_sync_info.num_tokens]
+            batch.draft_global_num_tokens_for_logprob = [
+                mlp_sync_info.num_tokens_for_logprob
+            ]
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -247,6 +261,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
@@ -386,7 +401,11 @@ def prepare_mlp_sync_batch_raw(
 
     if batch_to_gather is not None:
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather,
+            mlp_sync_info,
+            require_mlp_tp_gather,
+            draft_require_mlp_tp_gather,
+            skip_all_gather,
         )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
@@ -420,6 +439,16 @@ class SchedulerDPAttnAdapter:
     get_require_mlp_sync: Callable[[], bool]
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        draft_require_mlp_tp_gather = None
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            draft_moe_a2a_backend = self.server_args.speculative_moe_a2a_backend
+            if draft_moe_a2a_backend is None:
+                draft_moe_a2a_backend = self.server_args.moe_a2a_backend
+            draft_require_mlp_tp_gather = require_mlp_tp_gather(
+                self.server_args,
+                moe_a2a_backend=draft_moe_a2a_backend,
+            )
+
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -430,6 +459,7 @@ class SchedulerDPAttnAdapter:
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            draft_require_mlp_tp_gather=draft_require_mlp_tp_gather,
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
