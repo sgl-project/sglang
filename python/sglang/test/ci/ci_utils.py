@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import os
@@ -111,45 +112,126 @@ def write_github_step_summary(content: str):
             f.write(content)
 
 
+def _module_roots_for_path_conversion() -> List[str]:
+    """Roots tried when mapping a file path to an importable module.
+
+    CI runs ``run_suite.py`` with cwd=``test/`` (see
+    ``.github/workflows/_pr-test-stage.yml``). Registered tests therefore
+    map relative to cwd (``registered.foo.test_x``). JIT kernel tests are
+    globbed from ``repo_root/python/sglang/jit_kernel/...`` and must map
+    relative to that ``python/`` tree (``sglang.jit_kernel.tests...``),
+    not via ``../python/...`` which is not a valid module path.
+    """
+    roots = [os.getcwd()]
+    parent = os.path.dirname(os.getcwd())
+    python_root = os.path.join(parent, "python")
+    if os.path.isdir(python_root):
+        roots.append(python_root)
+    return roots
+
+
+def _relpath_to_module(rel: str) -> Optional[str]:
+    """Turn a root-relative path into a dotted module, or None if invalid."""
+    if rel.startswith("..") or rel in (".", ""):
+        return None
+    # Defensive: reject any path that still walks up.
+    parts_path = rel.replace("\\", "/").split("/")
+    if any(p in ("..", "") for p in parts_path):
+        return None
+    if rel.endswith(".py"):
+        rel = rel[:-3]
+    module = rel.replace(os.sep, ".").replace("/", ".")
+    parts = module.split(".")
+    if not parts or any(not p.isidentifier() for p in parts):
+        return None
+    return module
+
+
 def _filename_to_module(filename: str) -> str:
     """Convert a test path to a dotted module name importable by
     ``python3 -m unittest``.
 
-    ``run_unittest_files`` is invoked from cwd=``test/`` (see
-    ``.github/workflows/_pr-test-stage.yml:157`` and
-    ``test/run_suite.py``). ``CIRegistry.filename`` is sometimes
-    test-relative (legacy ``TestFile`` shape) and sometimes absolute
-    (``run_suite.py`` builds the glob from ``os.path.join(script_dir,
-    'registered', '**', '*.py')`` so every path is absolute under the
-    repo). We normalize against cwd before stripping ``.py`` and
-    converting separators, so ``/.../test/registered/foo/test_x.py``
-    → ``registered.foo.test_x``.
+    Tries each root from ``_module_roots_for_path_conversion`` and returns
+    the first valid module path:
+      - ``.../test/registered/foo/test_x.py`` → ``registered.foo.test_x``
+      - ``.../python/sglang/jit_kernel/tests/test_x.py`` →
+        ``sglang.jit_kernel.tests.test_x``
 
-    Raises ``ValueError`` if any path segment is not a valid Python
-    identifier (e.g. a directory named ``4-gpu-models``), so a mistaken
+    Raises ``ValueError`` if no root yields a valid identifier path
+    (e.g. a directory named ``4-gpu-models``), so a mistaken
     ``in_process_group`` opt-in fails with a clear pre-flight error
     rather than an opaque unittest import failure that blames the whole
     bundle.
     """
-    if os.path.isabs(filename):
+    abs_path = filename if os.path.isabs(filename) else os.path.abspath(filename)
+    tried = []
+    for root in _module_roots_for_path_conversion():
         try:
-            filename = os.path.relpath(filename, os.getcwd())
+            rel = os.path.relpath(abs_path, root)
         except ValueError:
-            # Different drive on Windows or similar; leave as-is and
-            # let unittest report the import failure.
-            pass
-    if filename.endswith(".py"):
-        filename = filename[:-3]
-    module = filename.replace(os.sep, ".").replace("/", ".")
-    bad = [part for part in module.split(".") if part and not part.isidentifier()]
-    if bad:
-        raise ValueError(
-            f"cannot map {filename!r} to a unittest module path: "
-            f"non-identifier segment(s) {bad!r}. Files under such paths "
-            f"cannot use in_process_group; run them as per-file "
-            f"`python3 file.py -f` instead."
-        )
-    return module
+            continue
+        tried.append(f"{root!r} -> {rel!r}")
+        module = _relpath_to_module(rel)
+        if module is not None:
+            return module
+
+    raise ValueError(
+        f"cannot map {filename!r} to a unittest module path under "
+        f"roots {_module_roots_for_path_conversion()!r} (tried: {tried}). "
+        f"Files under non-importable paths cannot use in_process_group; "
+        f"run them as per-file `python3 file.py -f` instead."
+    )
+
+
+def _ast_base_name(base: ast.AST) -> str:
+    """Best-effort name of a class base node (Name / Attribute)."""
+    if isinstance(base, ast.Name):
+        return base.id
+    if isinstance(base, ast.Attribute):
+        return base.attr
+    return ""
+
+
+def _file_has_unittest_testcase(filename: str) -> bool:
+    """True if ``unittest`` would load at least one TestCase from the file.
+
+    ``python3 -m unittest`` only discovers ``unittest.TestCase`` subclasses;
+    bare pytest functions and ``pytest.main()`` in ``__main__`` are ignored,
+    so a pure-pytest module can exit 0 with zero tests run. Bundle members
+    must be unittest-loadable.
+    """
+    try:
+        with open(filename, "r") as f:
+            source = f.read()
+    except OSError:
+        return False
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            name = _ast_base_name(base)
+            # CustomTestCase and other *TestCase bases count.
+            if name == "TestCase" or name.endswith("TestCase"):
+                return True
+    return False
+
+
+def _assert_bundle_members_unittest_loadable(members: List[CIRegistry]) -> None:
+    """Fail fast if any member would be silently skipped by unittest."""
+    bad = [m.filename for m in members if not _file_has_unittest_testcase(m.filename)]
+    if not bad:
+        return
+    raise ValueError(
+        "in_process_group bundles run via `python3 -m unittest` and only "
+        "execute unittest.TestCase subclasses. These member(s) have no "
+        "TestCase classes and would be silently skipped (pytest-style "
+        f"function tests / pytest.main only): {bad}. Drop in_process_group "
+        "for those files so they keep running as `python3 file.py -f`."
+    )
 
 
 def _run_one_bundle(
@@ -178,6 +260,9 @@ def _run_one_bundle(
     future bin-packing. Member files don't get individual elapsed entries
     in v1 — unittest's default runner doesn't surface per-module wall time.
     """
+    # Pre-flight: refuse pytest-only modules (would exit 0 with 0 tests)
+    # and produce importable dotted names (including JIT paths under python/).
+    _assert_bundle_members_unittest_loadable(bundle.members)
     dotted_modules = [_filename_to_module(m.filename) for m in bundle.members]
     cmd = ["python3", "-m", "unittest", "-f", *dotted_modules]
     # Allow generous slack: the bundle's est_time already accounts for

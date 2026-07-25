@@ -57,13 +57,16 @@ class CIRegistry:
     # Files sharing the same `in_process_group` value run in a single
     # `python3 -m unittest <mod1> <mod2> ...` invocation (per partition
     # when partitioned; still one process on full-suite runs), amortizing
-    # the ~10s `import sglang` startup cost. Members must be safe to share
-    # a Python interpreter (no global monkey-patching, no env-var mutation
-    # that other members depend on, etc.) and must live on importable
-    # module paths (every path segment a Python identifier). Files without
-    # this set keep the existing per-file `python3 file.py -f` behavior.
-    # Group identity is per-suite — `bundle_in_process_groups` validates
-    # uniformity across members before bundling.
+    # the ~10s `import sglang` startup cost. Members must:
+    #   - be safe to share a Python interpreter (no global monkey-patching,
+    #     no env-var mutation other members depend on, etc.)
+    #   - live on importable module paths (every path segment a Python
+    #     identifier; JIT paths under python/ map to sglang.*)
+    #   - define unittest.TestCase subclasses (pytest function tests are
+    #     rejected at bundle run time — unittest would skip them silently)
+    # Files without this set keep the existing per-file `python3 file.py -f`
+    # behavior. Group identity is per-suite — `bundle_in_process_groups`
+    # validates uniformity across members before bundling.
     in_process_group: Optional[str] = None
 
     @property

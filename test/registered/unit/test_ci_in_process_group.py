@@ -24,7 +24,11 @@ from sglang.test.ci.ci_register import (
     bundle_in_process_groups,
     register_cpu_ci,
 )
-from sglang.test.ci.ci_utils import _filename_to_module
+from sglang.test.ci.ci_utils import (
+    _assert_bundle_members_unittest_loadable,
+    _file_has_unittest_testcase,
+    _filename_to_module,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -149,8 +153,65 @@ class TestFilenameToModule(CustomTestCase):
         """Paths like 4-gpu-models cannot be unittest module paths."""
         with self.assertRaises(ValueError) as ctx:
             _filename_to_module("registered/4-gpu-models/test_x.py")
-        self.assertIn("non-identifier", str(ctx.exception))
+        self.assertIn("cannot map", str(ctx.exception))
         self.assertIn("4-gpu-models", str(ctx.exception))
+
+    def test_jit_path_maps_under_python_package_root(self):
+        """JIT files live under repo/python/; cwd is test/ in CI.
+
+        Naive relpath-to-cwd produces `../python/sglang/...` which is not
+        importable. Mapping must yield `sglang.jit_kernel...`.
+        """
+        jit_abs = os.path.join(
+            str(_REPO_ROOT),
+            "python",
+            "sglang",
+            "jit_kernel",
+            "tests",
+            "test_add_constant.py",
+        )
+        # Unit tests may run from repo root or test/; normalize like CI.
+        prev = os.getcwd()
+        try:
+            os.chdir(str(_REPO_ROOT / "test"))
+            self.assertEqual(
+                _filename_to_module(jit_abs),
+                "sglang.jit_kernel.tests.test_add_constant",
+            )
+        finally:
+            os.chdir(prev)
+
+
+class TestBundleUnittestLoadable(CustomTestCase):
+    def test_this_file_is_unittest_loadable(self):
+        self.assertTrue(_file_has_unittest_testcase(__file__))
+
+    def test_pytest_style_file_rejected(self):
+        """Pure pytest modules would exit 0 with zero tests under unittest."""
+        jit = (
+            _REPO_ROOT
+            / "python"
+            / "sglang"
+            / "jit_kernel"
+            / "tests"
+            / "test_add_constant.py"
+        )
+        if not jit.is_file():
+            self.skipTest("jit test fixture not present on this checkout")
+        self.assertFalse(_file_has_unittest_testcase(str(jit)))
+        members = [
+            CIRegistry(
+                backend=HWBackend.CUDA,
+                filename=str(jit),
+                est_time=5.0,
+                suite="base-b-kernel-unit-1-gpu-large",
+                in_process_group="jit",
+            )
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            _assert_bundle_members_unittest_loadable(members)
+        self.assertIn("silently skipped", str(ctx.exception))
+        self.assertIn(str(jit), str(ctx.exception))
 
 
 def _load_run_suite_module():
