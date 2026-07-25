@@ -115,6 +115,9 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             num_layers=self.layer_num,
         )
 
+    def supports_cpu_copy(self) -> bool:
+        return False
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 

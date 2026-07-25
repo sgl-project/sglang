@@ -2632,7 +2632,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
+        decode_retract_must_abort = (
+            server_args.disaggregation_mode == "decode"
+            and not self.token_to_kv_pool_allocator.supports_cpu_copy()
+        )
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2644,11 +2649,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            self.release_req(
+                idx,
+                len(sorted_indices),
+                server_args,
+                offload_kv=not decode_retract_must_abort,
+            )
+            if decode_retract_must_abort:
+                req.to_finish = FINISH_ABORT(
+                    "Request was retracted due to out-of-memory and cannot be "
+                    "resumed because this KV cache does not support synchronous "
+                    "CPU save and restore.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s (KV cache does not "
+                    "support synchronous CPU save and restore)",
+                    req.rid,
+                )
+            else:
+                retracted_reqs.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2662,7 +2685,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2717,7 +2740,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+    ):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2726,6 +2755,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=offload_kv,
         )
 
     def prepare_encoder_info_decode(self):
