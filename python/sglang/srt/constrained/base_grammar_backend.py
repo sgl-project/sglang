@@ -118,10 +118,9 @@ class BaseGrammarObject:
 
 
 class GrammarMask(NamedTuple):
-    """A filled bitmask together with the backend that knows how to apply it.
+    """A filled bitmask plus the backend that applies it.
 
-    The grammar is whichever request in the batch supplied one; it is only the
-    handle that applies the batch's whole bitmask, never per-request state.
+    The grammar is any one of the batch's -- a handle, not per-request state.
     """
 
     grammar: BaseGrammarObject

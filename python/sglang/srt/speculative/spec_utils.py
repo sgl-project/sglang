@@ -512,9 +512,6 @@ def generate_token_bitmask(
     We need to perform DFS to
     1. figure out which tokens are accepted by the grammar.
     2. if so, what is the corresponding logit mask.
-
-    The returned grammar is whichever request in the batch supplied one; callers use
-    it only as the handle that applies the batch's whole bitmask.
     """
 
     num_draft_tokens = draft_tokens_cpu.shape[-1]
@@ -620,10 +617,9 @@ def build_grammar_vocab_mask(
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify launch: the barrier, resolving the tree and the
-    traversal are all host work, so they overlap that forward. ``barrier`` advances
-    the previous batch's FSM over its committed tokens and must run before the
-    traversal reads that state; overlap-capable workers get it from the scheduler.
+    Call it after the target verify launch -- every step here is host work, so it all
+    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
+    committed tokens, which the traversal then reads, so it has to run first.
     """
     if barrier is not None:
         barrier()
