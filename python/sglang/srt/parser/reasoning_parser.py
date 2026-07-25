@@ -2,9 +2,12 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    eos_token as dsv4_eos_token,
     thinking_end_token as dsv4_thinking_end_token,
+)
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -903,20 +906,6 @@ class _DeepSeekV3Detector(Qwen3Detector):
 
 
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
-    """
-    Detector for DeepSeek-V4 models.
-    Assumes reasoning format:
-      (<think>)*(.*)</think>
-
-    The prompt ends with a primed ``<think>`` (see encoding_dsv4), so the output
-    carries no leading think token; thinking requires explicit thinking=True.
-
-    Unlike Qwen3-token models, DeepSeek-V4 must exclude its own EOS
-    (``<｜end▁of▁sentence｜>``) during thinking: with strict thinking enabled this
-    masks the EOS logit until ``</think>``, so a request can never finish with
-    reasoning but empty content. Tool calls use DSML tags, not ``<tool_call>``.
-    """
-
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -928,7 +917,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         super().__init__(
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
-            think_excluded_tokens=[dsv4_eos_token],
+            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
