@@ -3,7 +3,7 @@
 //! Two registries live here:
 //! * [`ImageProcessorSpec`] / [`ProcessorRegistry`] — the Python-facing batch
 //!   preprocess interface (e.g. Inkling), looked up by name at init time.
-//! * [`VisionProcessor`] / [`pipeline_from_spec`] — the pure-Rust request
+//! * [`MmFamilyProcessor`] / [`pipeline_from_spec`] — the pure-Rust request
 //!   pipeline `sglang-server`'s MM workers drive. Each model family
 //!   implements the trait in `src/<model>/mod.rs`; the Python side selects one
 //!   by serializing a spec (`{"family": ..., resolved processor params}`).
@@ -85,7 +85,7 @@ pub struct MropeItem {
 /// The per-model-family stages of the server pipeline (preprocess + token
 /// geometry). Adding a family = implementing this in `src/<model>/mod.rs` and
 /// adding its `family` arm to [`pipeline_from_spec`].
-pub trait VisionProcessor: Send + Sync {
+pub trait MmFamilyProcessor: Send + Sync {
     /// Decode-agnostic preprocess of one RGB image (HWC u8): resize,
     /// normalize, patchify — the model's HF image-processor equivalent.
     fn process_image(&self, rgb: &[u8], h: usize, w: usize) -> Result<ProcessedImage, String>;
@@ -106,7 +106,7 @@ pub trait VisionProcessor: Send + Sync {
 /// server needs for placeholder expansion.
 pub struct Pipeline {
     pub image_token_id: i32,
-    pub processor: Box<dyn VisionProcessor>,
+    pub processor: Box<dyn MmFamilyProcessor>,
 }
 
 /// Build a pipeline from the Python-side spec JSON. `Err` on an unknown
@@ -118,7 +118,7 @@ pub fn pipeline_from_spec(json: &str) -> Result<Pipeline, String> {
         image_token_id: i32,
     }
     let header: Header = serde_json::from_str(json).map_err(|e| format!("mm spec: {e}"))?;
-    let processor: Box<dyn VisionProcessor> = match header.family.as_str() {
+    let processor: Box<dyn MmFamilyProcessor> = match header.family.as_str() {
         "qwen_vl" => Box::new(crate::qwen_vl::QwenVlProcessor::from_spec_json(json)?),
         other => return Err(format!("unknown mm family: {other}")),
     };

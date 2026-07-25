@@ -19,7 +19,7 @@ Built two ways:
 src/
 ├── lib.rs                    # module root; PyO3 module (_core) feature-gated
 ├── registry.rs               # ImageProcessorSpec registry (Python-facing)
-│                             # + VisionProcessor trait / pipeline_from_spec
+│                             # + MmFamilyProcessor trait / pipeline_from_spec
 │                             #   (pure-Rust pipeline driven by sglang-server)
 ├── driver.rs                 # model-independent request driver (fetch →
 │                             #   decode → preprocess → expand → M-RoPE)
@@ -33,11 +33,11 @@ src/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
 
-## Native server pipeline (`VisionProcessor`)
+## Native server pipeline (`MmFamilyProcessor`)
 
 `sglang-server`'s MM workers process image-only requests for supported model
 families entirely in Rust: `common::fetch` → decode → the family's
-`VisionProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
+`MmFamilyProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
 placeholder expansion. The Python side selects the family by passing a spec
 JSON (`{"family": "qwen_vl", ...resolved processor params}`) to
 `registry::pipeline_from_spec`. Anything outside a family's scope
@@ -46,7 +46,7 @@ mismatches) is rejected back to the client as a 400 — there is no Python
 fallback path.
 
 Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
-Adding one = a `VisionProcessor` impl in `src/<model>/mod.rs` plus a `family`
+Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a `family`
 arm in `pipeline_from_spec`.
 
 `common::fetch` matches the Python `get_image_bytes` semantics

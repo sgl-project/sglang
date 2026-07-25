@@ -10,7 +10,7 @@
 use rayon::prelude::*;
 
 use crate::common::{self, resize};
-use crate::registry::{MropeItem, ProcessedImage, VisionProcessor};
+use crate::registry::{MmFamilyProcessor, MropeItem, ProcessedImage};
 
 const MAX_RATIO: f64 = 200.0;
 
@@ -103,7 +103,7 @@ impl QwenVlProcessor {
     }
 }
 
-impl VisionProcessor for QwenVlProcessor {
+impl MmFamilyProcessor for QwenVlProcessor {
     fn process_image(&self, rgb: &[u8], h: usize, w: usize) -> Result<ProcessedImage, String> {
         let (th, tw) = smart_resize(
             h,
@@ -252,7 +252,7 @@ mod python {
     use pyo3::prelude::*;
 
     use super::*;
-    use crate::registry::VisionProcessor;
+    use crate::registry::MmFamilyProcessor;
 
     /// `(pixel_values flat f32, (t, h, w))` for one preprocessed image.
     type PyProcessedImage<'py> = (Bound<'py, PyArray1<f32>>, (u32, u32, u32));
