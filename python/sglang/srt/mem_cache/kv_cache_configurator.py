@@ -1654,7 +1654,7 @@ class KVCacheConfigurator:
                     self.server_args.max_mamba_cache_size,
                     ratio,
                     self.ps.attn_dp_size,
-                    requested.value if requested else None,
+                    requested.value if requested is not None else None,
                 )
             )
 
