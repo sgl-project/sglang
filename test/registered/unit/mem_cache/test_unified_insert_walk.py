@@ -652,6 +652,31 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         self.assertEqual(len(seen), 1)
         self.assertIsInstance(seen[0], AssertionError)
 
+    def test_node_info_facades_forward_to_the_tree(self):
+        """The scheduler's storage-prefetch facades (is_backuped / is_root /
+        get_last_hash_value / get_prefix_hash_values) resolve NodeIds tree-side
+        with node-level semantics."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
+        parent = next(iter(cache.root_node.children.values()))
+        (child,) = parent.children.values()
+
+        self.assertTrue(cache.is_root(cache.root_node_handle()))
+        self.assertFalse(cache.is_root(child.id))
+        self.assertFalse(cache.is_backuped(parent.id))
+        self.assertIsNone(cache.get_last_hash_value(parent.id))
+
+        self.assertGreater(_write_backup(cache, parent, write_back=True), 0)
+        cache.writing_check(write_back=True)
+        self.assertTrue(cache.is_backuped(parent.id))
+
+        parent.hash_value = ["h1", "h2"]
+        self.assertEqual(cache.get_last_hash_value(parent.id), "h2")
+        # The prefix chain carries the ancestors' hashes, not the node's own.
+        self.assertEqual(cache.get_prefix_hash_values(parent.id), [])
+        self.assertEqual(cache.get_prefix_hash_values(child.id), ["h1", "h2"])
+
     def test_evict_host_drains_freed_host_values_to_the_pool(self):
         """Host eviction's returned frees must reach the host pool in the same
         call; a dropped drain leaves the pool permanently smaller."""

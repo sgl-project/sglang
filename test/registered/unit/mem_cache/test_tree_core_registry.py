@@ -3,6 +3,7 @@
 import unittest
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -119,6 +120,13 @@ class TreeCoreRegistryTest(CustomTestCase):
 
 
 class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
+    def setUp(self):
+        self._registry_snapshot = dict(_TREE_CORE_REGISTRY)
+
+    def tearDown(self):
+        _TREE_CORE_REGISTRY.clear()
+        _TREE_CORE_REGISTRY.update(self._registry_snapshot)
+
     def _cache_params(
         self,
         tree_components=(ComponentType.FULL,),
@@ -162,6 +170,19 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
         self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
         component = cache.components[ComponentType.FULL]
         self.assertIs(component.tree_core, cache.tree_core)
+
+    def test_env_var_routes_construction_to_the_selected_backend(self):
+        """SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND selects the registered factory
+        the cache constructs its tree through."""
+        core = mock.MagicMock()
+        factory = mock.MagicMock(return_value=core)
+        register_tree_core_backend("custom_env_backend", factory)
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("custom_env_backend"):
+            cache = UnifiedRadixCache(params=self._cache_params())
+        factory.assert_called_once()
+        self.assertIs(cache.tree_core, core)
+        component = cache.components[ComponentType.FULL]
+        self.assertIs(component.tree_core, core)
 
 
 if __name__ == "__main__":
