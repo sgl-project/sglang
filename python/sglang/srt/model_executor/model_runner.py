@@ -1589,7 +1589,7 @@ class ModelRunner:
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
-        # Release the bitmask GPU tensor immediately after it has been applied
+        # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
         # grammar_mask) can be kept alive by the delay_sample_func closure and
         # batch_record_buf until the next iteration, causing a steady VRAM leak
