@@ -726,7 +726,9 @@ class Envs:
     # small messages and in-place NVLS 2shot on symmetric-memory tensors for
     # large ones, with an optional fused residual add. Covers the KDA o_proj
     # output and the latent|shared MoE reduce; everything else falls back to
-    # the regular all-reduce path. See srt/layers/k3_ar_fusion.py.
+    # the regular all-reduce path. Auto-enabled on SM100/SM103 when
+    # CustomAllReduceV2 with multicast is available; set 0/1 to override in
+    # either direction. See srt/layers/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(False)
     # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
     # kernel computes the TP-local o_proj partial and the cross-rank sum over
@@ -770,11 +772,13 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
-    # Experimental: allow CustomAllReduceV2 on a process group that spans
-    # nodes (MNNVL fabric). Requires torch symmetric memory to rendezvous
-    # across nodes (fabric handles + IMEX). Graph zero-copy input
-    # registration is not supported in this mode and is disabled; all-reduce
-    # inside CUDA graphs falls back to eager pull from the symm workspace.
+    # Allow CustomAllReduceV2 on a process group that spans nodes (MNNVL
+    # fabric). Requires torch symmetric memory to rendezvous across nodes
+    # (fabric handles + IMEX). Graph zero-copy input registration is not
+    # supported in this mode and is disabled; all-reduce inside CUDA graphs
+    # falls back to eager pull from the symm workspace. Auto-enabled on
+    # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
+    # override in either direction.
     SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
