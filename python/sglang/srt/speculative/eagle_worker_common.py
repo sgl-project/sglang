@@ -529,7 +529,7 @@ def run_eagle_verify(
             ),
         )
 
-    # Must stay ahead of the target verify launch below; resolved past it.
+    # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
             verify_input.retrieve_next_token,

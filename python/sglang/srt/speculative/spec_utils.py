@@ -556,8 +556,7 @@ class GrammarTree:
     """The verify tree the grammar bitmask is built over, on the host.
 
     ``from_device`` starts an async copy, so build it before the target verify
-    launch; build_grammar_vocab_mask waits on it past the launch, which is what
-    makes the copies and the traversal overlap that forward.
+    launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
     """
 
     def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
@@ -589,7 +588,6 @@ class GrammarTree:
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
     ) -> GrammarTree:
-        """For algorithms that build the tree on the host (NGRAM): nothing to wait on."""
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
@@ -608,8 +606,8 @@ def build_grammar_vocab_mask(
 ) -> Optional[torch.Tensor]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
-    Call it after the target verify launch: the traversal is pure host work, so it
-    overlaps that forward, and resolving the tree here keeps any wait past the launch.
+    Call it after the target verify launch: resolving the tree and traversing it are
+    both host work, so both overlap that forward.
     """
     vocab_mask = generate_token_bitmask(
         reqs,
