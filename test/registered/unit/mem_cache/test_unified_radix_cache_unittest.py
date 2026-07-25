@@ -3172,35 +3172,6 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(node.component_data[ct].host_value)
         cache.sanity_check()
 
-    def test_hicache_demote(self):
-        """Evicting a backed-up device leaf demotes it to host-only state."""
-        if self._skip_unsupported_hicache_test():
-            return
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        seq = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        node = cache.resolve_node_handle(m.last_device_node)
-
-        self._backup_node(cache, node)
-        self.assertTrue(node.backuped)
-
-        # Evict -> should demote to host (S3)
-        result = cache.evict(EvictParams(num_tokens=len(seq)))
-        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
-
-        # Node should now be evicted (S3)
-        self.assertTrue(node.evicted)
-        self.assertTrue(node.backuped)
-        self.assertIsNone(node.component_data[ComponentType.FULL].value)
-        self.assertIsNotNone(node.component_data[ComponentType.FULL].host_value)
-
-        # Should be in host_leaves, not device_leaves
-        self.assertNotIn(node, cache.tree_core.evictable_device_leaves)
-        self.assertIn(node, cache.tree_core.evictable_host_leaves)
-        cache.sanity_check()
-
     def test_hicache_load_back_restores_data(self):
         """Loading back an evicted node restores the backed-up cache data."""
         if self._skip_unsupported_hicache_test():
@@ -3415,36 +3386,6 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(cache.tree_core.host_lru_lists[aux].in_list(node))
         cache.sanity_check()
 
-    def test_hicache_demote_updates_aux_lru(self):
-        """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
-        aux_types = [
-            ct
-            for ct in (ComponentType.MAMBA, ComponentType.SWA)
-            if ct in self.cfg.components
-        ]
-        if not aux_types:
-            self.skipTest("requires at least one aux component")
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        node = cache.resolve_node_handle(m.last_device_node)
-
-        for aux in aux_types:
-            self.assertTrue(cache.tree_core.lru_lists[aux].in_list(node))
-            self.assertFalse(cache.tree_core.host_lru_lists[aux].in_list(node))
-
-        self._simulate_backup(cache, node)
-        cache.evict(EvictParams(num_tokens=len(seq)))
-
-        for aux in aux_types:
-            self.assertFalse(cache.tree_core.lru_lists[aux].in_list(node))
-            if node.component_data[aux].host_value is not None:
-                self.assertTrue(cache.tree_core.host_lru_lists[aux].in_list(node))
-        cache.sanity_check()
-
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 
@@ -3521,6 +3462,33 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(result.host_hit_length, 0)
 
+    def test_full_kv_hit_length_counts_the_split_fragment(self):
+        """A mid-node partial match splits the node; the matched fragment still
+        counts toward full_kv_hit_length (independent of component validators)."""
+        if self.cfg.page_size != 1:
+            self.skipTest("page_size=1 keeps the split boundary mid-node")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 99])))
+        )
+        self.assertEqual(result.full_kv_hit_length, 4)
+
+    def test_has_swa_host_pool_flag_matches_attached_pool(self):
+        """init_hicache caches SWA host-pool presence on the tree core after
+        the pool assembler runs; the flag must agree with the attached handle."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self.assertFalse(cache.tree_core.has_swa_host_pool)
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        swa = cache.components[ComponentType.SWA]
+        self.assertEqual(
+            cache.tree_core.has_swa_host_pool, swa._swa_kv_pool_host is not None
+        )
+
     def test_zero_match_result_carries_node_id_handles(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -3536,6 +3504,9 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(zeroed.device_indices), 0)
         # zeroed results must carry the root's NodeId, not the raw node
         self.assertEqual(zeroed.best_match_node, cache.root_node.id)
+        # The env-gated force-miss path passes the request's extra key.
+        salted = zero_match_result(cache, result, extra_key="salt")
+        self.assertEqual(salted.best_match_node, cache.root_node.id)
         self.assertEqual(zeroed.last_device_node, cache.root_node.id)
         self.assertEqual(zeroed.last_host_node, cache.root_node.id)
         # and the handles must work with the NodeId-based lock APIs

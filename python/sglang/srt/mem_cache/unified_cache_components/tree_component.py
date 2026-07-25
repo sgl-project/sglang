@@ -274,6 +274,9 @@ class TreeComponent(ABC):
           - ALL:    free both device and host memory.
                     No tombstone — caller will delete the node.
 
+        Freed indices are collected into *device_frees*/*host_frees* for the
+        Controller to drain, never freed inline.
+
         Returns (device_freed, host_freed) token counts."""
         ...
 
@@ -436,7 +439,7 @@ class TreeComponent(ABC):
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         """Free evicted host-tier values back to this component's host pool."""
-        ...
+        raise NotImplementedError(f"{self.component_type} must free its host values")
 
     # ---- HiCache Hooks ----
 
@@ -500,11 +503,14 @@ class TreeComponent(ABC):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Evict from this component's host-side resources.
+        """Evict from this component's host-side resources, collecting freed
+        values into *device_frees*/*host_frees* for the Controller to drain.
         Called by HostPoolGroup when the host pool is full.
         Default no-op for components without host storage."""
         pass
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""
-        ...
+        raise NotImplementedError(
+            f"{self.component_type} cannot apply {type(action).__name__}"
+        )

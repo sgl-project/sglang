@@ -155,7 +155,7 @@ Free cached tokens to reclaim memory.
 | **Complexity** | **O(E·H + L)** — E = nodes evicted, H = tombstone chain height, L = locked nodes skipped in LRU scan. |
 
 **Algorithm detail:**
-1. Calls `drive_eviction()` for each component:
+1. Drives each component's walk via `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()`:
    - Full: drives eviction from `evictable_device_leaves` using `last_access_time`; only device leaves are evicted atomically
    - SWA: scans SWA LRU from tail; **internal** nodes are tombstoned (evict SWA data, keep node), **leaf** nodes are fully deleted; both trigger cascade
    - Mamba: scans Mamba LRU from tail; **internal** nodes are tombstoned, **leaf** nodes are fully deleted; both trigger cascade
@@ -289,8 +289,8 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 |------|---------|-----------|----------|
 | `evict_component(target=EvictLayer.DEVICE)` | Free this component's device, host, or both resources on a node being evicted. Internal device eviction tombstones (`value = None`); host eviction clears `host_value`. Returns `(device_freed, host_freed)`. | `_evict_component_and_detach_lru` | *abstract* |
 | `eviction_priority()` | Return cascade eviction priority (higher = evicted later). Leaf: all 0. Internal: Full(2) > SWA(1) > Mamba(0). When evicting, all components with ≤ priority on the same node are cascade-evicted. | `_cascade_evict` | `0` |
-| `drive_eviction()` | Drive device eviction until the target amount is freed. Full: leaf-set heap. SWA/Mamba: component LRUs with internal tombstones and atomic leaf deletion. | `evict` | *abstract* |
-| `drive_host_eviction()` | Drive host eviction for this component. Full uses host leaves; SWA/Mamba use host LRUs. | `evict_host` | no-op |
+| `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()` | Step-wise device eviction walk the Controller drives: build the cursor/heap, return the next evictable leaf (freed values collected for the Controller to drain), clear the walk. Full: leaf-set heap. SWA/Mamba: component LRUs with internal tombstones and atomic leaf deletion. | `UnifiedRadixCache._evict_components` | *abstract* |
+| `drive_host_eviction()` | Drive host eviction for this component, collecting freed values for the Controller to drain. Full uses host leaves; SWA/Mamba use host LRUs. | `evict_host` | no-op |
 
 ### Lock Phase
 
