@@ -551,7 +551,7 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
-        elif tp_tier_num_tokens is not None:
+        elif tp_tier_num_tokens is not None and not is_dp_attention_enabled():
             tier_num_tokens = (
                 int(tp_tier_num_tokens) if int(tp_tier_num_tokens) >= 0 else None
             )
@@ -589,10 +589,19 @@ class DSparkVerifyPlanner:
             # this as a conservative packing capacity. Both can keep the exact
             # per-request lengths device-resident; the full-block capacity avoids
             # a D2H reduction solely to discover the exact token count.
-            return RaggedVerifyLayout.from_verify_lens_device(
+            graph_num_tokens = bs * self.verify_num_draft_tokens
+            layout = RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=verify_lens,
-                graph_num_tokens=bs * self.verify_num_draft_tokens,
+                graph_num_tokens=graph_num_tokens,
             )
+            if self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+                # Eager compact consumers allocate metadata from this field. The
+                # exact total is device-only, so advertise the conservative packing
+                # capacity instead of synchronizing to materialize it on the host.
+                return msgspec.structs.replace(
+                    layout, total_verify_tokens=graph_num_tokens
+                )
+            return layout
         verify_lens_cpu = verify_lens.to("cpu").tolist()
         grid = verify_layout_grid(
             verify_lens_cpu=verify_lens_cpu,
