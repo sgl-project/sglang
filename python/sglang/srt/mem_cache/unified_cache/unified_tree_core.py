@@ -770,8 +770,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             else:
                 raise AssertionError(f"unsupported insert phase: {state.phase}")
             new_actions = state.pending_actions[flushed_len:]
-            # Suspend only at true barriers: any action whose execution the
-            # remaining walk depends on; fire-and-forget actions keep batching.
+            # Suspend only when a step emitted a non-deferrable action.
             if new_actions and not all(map(self._is_deferrable_action, new_actions)):
                 flushed = state.pending_actions
                 state.pending_actions = []
@@ -858,6 +857,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
+        # All hooks run before their emitted actions execute; an action failure
+        # fail-stops the process, so partial-commit state is never observed.
         state.result = InsertResult(prefix_len=state.total_prefix_length)
         for component in self.components:
             component.commit_insert_component_data(

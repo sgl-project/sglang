@@ -390,8 +390,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return InsertResult(prefix_len=0)
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
-        # Pump the resumable insert: execute each barrier's actions at the
-        # tree's pause point so I/O lands where the pre-split code ran inline.
+        # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
             while True:
@@ -436,8 +435,7 @@ class UnifiedRadixCache(BasePrefixCache):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Free a tree-side step's returned values right away, matching the
-        pre-split inline frees (keeps pool space current)."""
+        """Free a tree-side step's returned device and host values right away."""
         # Both drains must run even if one raises.
         try:
             self._drain_device_frees(device_frees)
@@ -744,10 +742,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def _apply_cache_actions(
         self, actions: list[CacheAction | ComponentAction]
     ) -> None:
-        # Apply and consume: a spent list cannot be double-applied (double free).
-        for action in actions:
-            self._apply_cache_action(action)
-        actions.clear()
+        # Apply and consume one at a time: a spent list cannot be double-applied.
+        actions.reverse()
+        try:
+            while actions:
+                self._apply_cache_action(actions.pop())
+        finally:
+            actions.reverse()
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         # Component actions route to their component class; the rest are
@@ -771,20 +772,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
-        # Free per component device slots, consuming the dict.
-        for ct, indices in device_frees.items():
+        # Free per component device slots, consuming each entry as it frees.
+        for ct in list(device_frees):
             self._apply_cache_action(
-                FreeComponentDeviceSlot(indices, component_type=ct)
+                FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
             )
-        device_frees.clear()
 
     def _drain_host_frees(
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
-        # Free per component host-pool slots, consuming the dict.
-        for ct, host_values in host_frees.items():
-            self.components[ct].free_host_values(host_values)
-        host_frees.clear()
+        # Free per component host-pool slots, consuming each entry as it frees.
+        for ct in list(host_frees):
+            self.components[ct].free_host_values(host_frees.pop(ct))
 
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
