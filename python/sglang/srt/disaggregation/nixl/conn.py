@@ -210,7 +210,7 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     dst_kv_item_len: int
     dst_kv_item_lens: list[int]
-    dst_kv_layer_ids: list[int]
+    dst_kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
