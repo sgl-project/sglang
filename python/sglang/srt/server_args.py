@@ -1027,14 +1027,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_size: A[
-        int,
-        Arg(
-            help="The decode context parallelism size.",
-            aliases=["--decode-context-parallel-size"],
-        ),
-        NS("parallel"),
-    ] = 1
     dcp_comm_backend: A[
         str,
         Arg(
@@ -1046,6 +1038,7 @@ class ServerArgs:
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
+        NS("parallel"),
     ] = "ag_rs"
     dcp_replicate_q_proj: A[
         Optional[bool],
@@ -1059,6 +1052,7 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             resolvable=True,
         ),
+        NS("parallel"),
     ] = None
     dwdp_size: A[
         int,
@@ -1069,29 +1063,6 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    dcp_comm_backend: A[
-        str,
-        Arg(
-            help="Communication backend for the decode context-parallel (DCP) "
-            "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "SM90+ and MNNVL fabric memory, e.g. GB200 NVL72).",
-            choices=["ag_rs", "a2a", "fi_a2a"],
-        ),
-        NS("parallel"),
-    ] = "ag_rs"
-    dcp_replicate_q_proj: A[
-        bool,
-        Arg(
-            help="For MLA decode context parallelism with the a2a/fi_a2a "
-            "backend: replicate the Q projection so each DCP rank computes the "
-            "full-head query locally (redundant projection compute), eliminating "
-            "the per-layer head-dim all-gather of Q. Trades a small amount of "
-            "extra GEMM for one fewer collective per layer.",
-        ),
-        NS("parallel"),
-    ] = False
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -3683,20 +3654,24 @@ class ServerArgs:
                 # Kimi K3 shares Kimi Linear's DCP + DSPARK-static path (same
                 # deepseek_common MLA target-verify + LSE-merge, same aux hidden
                 # capture); both hybrid archs on tokenspeed_mla are validated.
+                # cutedsl_mla routes the same DCP contract through the flashinfer
+                # cute-dsl MLA kernel; it is newly integrated and admitted here so
+                # it can be exercised, but is NOT yet real-weight validated.
                 kimi_hybrid_dspark = (
                     self.speculative_algorithm == "DSPARK"
                     and (
                         "KimiLinearForCausalLM" in model_arches
                         or "KimiK3ForConditionalGeneration" in model_arches
                     )
-                    and decode_backend == "tokenspeed_mla"
+                    and decode_backend in ("tokenspeed_mla", "cutedsl_mla")
                 )
                 if not kimi_hybrid_dspark:
                     raise ValueError(
                         "Decode context parallel (--dcp-size / "
                         "--decode-context-parallel-size > 1) with speculative "
                         "decoding on CUDA is only validated for Kimi Linear / "
-                        "Kimi K3 + DSPARK + tokenspeed_mla, but got "
+                        "Kimi K3 + DSPARK + tokenspeed_mla (cutedsl_mla is newly "
+                        "integrated, pending validation), but got "
                         f"architectures={model_arches}, "
                         f"speculative_algorithm={self.speculative_algorithm!r}, "
                         f"decode_attention_backend={decode_backend!r}."

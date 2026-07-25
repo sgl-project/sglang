@@ -353,25 +353,43 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
+            # DSPARK target-verify + draft-extend must run on the decode
+            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
+            # signature (causal_seqs / cp_world / cp_rank). The default
+            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
+            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
+            overrides["speculative_attention_mode"] = "decode"
+
         prefill_backend, decode_backend = attention_backends_of(server_args)
-        if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
+        if decode_backend == "cutedsl_mla" or decode_backend is None:
+            logger.info(
+                "Kimi-K3 DCP keeps decode attention backend 'cutedsl_mla' "
+                f"(prefill={prefill_backend!r} -> 'trtllm_mla')."
+            )
+            overrides.update(
+                prefill_attention_backend="trtllm_mla",
+                decode_attention_backend="cutedsl_mla",
+            )
+        elif decode_backend == "tokenspeed_mla":
             logger.info(
                 "Kimi-K3 DCP overrides attention backends: "
                 f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
                 "'tokenspeed_mla'."
             )
-            overrides.update(
-                attention_backend="tokenspeed_mla",
-                prefill_attention_backend="tokenspeed_mla",
-                decode_attention_backend="tokenspeed_mla",
-            )
-
-        if server_args.kv_cache_dtype in (None, "auto", "bf16", "bfloat16"):
             logger.info(
-                "Kimi-K3 DCP overrides KV cache dtype: "
+                "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
                 f"{server_args.kv_cache_dtype!r} -> 'fp8_e4m3'."
             )
             overrides["kv_cache_dtype"] = "fp8_e4m3"
+            overrides.update(
+                prefill_attention_backend="tokenspeed_mla",
+                decode_attention_backend="tokenspeed_mla",
+                kv_cache_dtype="fp8_e4m3",
+            )
+        else:
+            raise AssertionError(
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'tokenspeed_mla', got {decode_backend!r}."
+            )
 
         if server_args.dcp_replicate_q_proj is None:
             logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
