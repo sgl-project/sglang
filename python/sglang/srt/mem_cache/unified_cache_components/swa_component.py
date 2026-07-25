@@ -158,13 +158,9 @@ class SWAComponent(TreeComponent):
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
-                # TODO(hzh): load_back may currently restore a full host-tombstone
-                # segment whose length exceeds sliding_window_size. Once
-                # load_back is constrained to fetch only one sliding window
-                # worth of pages, cap swa_host_hit at sliding_window_size
-                # here so the scheduler budget matches the actual device-pool
-                # consumption.
-                swa_host_hit += len(cd.host_value)
+                swa_host_hit += min(
+                    len(cd.host_value), self.sliding_window_size - n_swa
+                )
                 n_swa += len(cd.host_value)
             else:
                 break
@@ -644,9 +640,19 @@ class SWAComponent(TreeComponent):
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
-            while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+            swa_window_size = (
+                (self.sliding_window_size + self.cache.page_size - 1)
+                // self.cache.page_size
+                * self.cache.page_size
+            )
+            while cur is not self.cache.root_node and n_swa < swa_window_size:
                 cd = cur.component_data[ct]
                 assert cd.host_value is not None or cd.value is not None
+                value = cd.value if cd.value is not None else cd.host_value
+                remaining = swa_window_size - n_swa
+                if len(value) > remaining:
+                    self.cache._split_node(cur.key, cur, len(cur.key) - remaining)
+                    cd = cur.component_data[ct]
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)
