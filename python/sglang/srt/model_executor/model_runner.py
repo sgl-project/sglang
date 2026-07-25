@@ -128,6 +128,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
+    maybe_enable_ipc_weight_cache,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
@@ -398,39 +399,27 @@ class ModelRunner:
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
             self.server_args.elastic_ep_backend is not None
-            and self.server_args.is_ep_joiner
+            and self.server_args.is_ep_scale_joiner
         ):
             return
 
-        is_scale_join = self.server_args.ep_join_mode == "scale"
-        if is_scale_join:
-            join_effective_ep_size = (
-                self.server_args.ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = self.server_args.ep_join_rank_offset + self.ps.tp_size
+        dist.barrier(group=self.tp_group.cpu_group)
+        if self.ps.tp_rank == 0:
+            register_scale_cohort(
+                self.server_args.ep_join_rank_offset,
+                join_effective_ep_size,
             )
-            dist.barrier(group=self.tp_group.cpu_group)
-            if self.ps.tp_rank == 0:
-                register_scale_cohort(
-                    self.server_args.ep_join_rank_offset,
-                    join_effective_ep_size,
-                )
-            join_scale_process_group()
-            self.server_args.override(
-                "elastic_ep.scale_join", ep_size=join_effective_ep_size
-            )
-        else:
-            join_process_groups()
+        join_scale_process_group()
+        self.server_args.override(
+            "elastic_ep.scale_join", ep_size=join_effective_ep_size
+        )
 
         global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
-            src_rank=(
-                0
-                if is_scale_join
-                else get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            ),
+            src_rank=0,
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
@@ -439,10 +428,6 @@ class ModelRunner:
                 rank=global_ep_rank,
             )
         )
-
-        if not is_scale_join:
-            ElasticEPStateManager.instance().reset()
-            return
 
         from sglang.srt.layers.dp_attention import (
             enable_joiner_all_gather,
@@ -838,6 +823,27 @@ class ModelRunner:
                     resize.capped_max_running_requests
                 )
 
+    def post_capture_elastic_ep_recover(self):
+        join_process_groups()
+
+        global_ep_rank = self.ps.tp_rank + self.server_args.ep_join_rank_offset
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=global_ep_rank,
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=True
+            ),
+        )
+        set_global_expert_distribution_recorder(
+            ExpertDistributionRecorder.init_new(
+                self.server_args,
+                get_global_expert_location_metadata(),
+                rank=global_ep_rank,
+            )
+        )
+
+        ElasticEPStateManager.instance().reset()
+
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
@@ -987,6 +993,18 @@ class ModelRunner:
             remote_instance_weight_transporter_engine=self.remote_instance_weight_transporter.engine,
             remote_instance_weight_transporter_session_id=self.remote_instance_weight_transporter.session_id,
             draft_model_idx=self.draft_model_idx,
+            weight_cache_mode=self.server_args.weight_cache_mode,
+            weight_cache_socket=self.server_args.weight_cache_socket,
+        )
+
+        # If the weight cache is enabled, override the load format to IPC_CACHE
+        # and derive the per-rank daemon socket. Idempotent across reloads.
+        maybe_enable_ipc_weight_cache(
+            load_config=self.load_config,
+            server_args=self.server_args,
+            tp_size=self.ps.tp_size,
+            pp_rank=self.ps.pp_rank,
+            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1076,7 +1094,7 @@ class ModelRunner:
         dist_barrier_after_load(
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
-            is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
+            is_ep_joiner=self.server_args.is_ep_joiner,
         )
 
     def maybe_init_dwdp(self):
@@ -1573,10 +1591,10 @@ class ModelRunner:
 
         # Release the vocab_mask GPU tensor immediately after it has been applied
         # to the logits. In overlap scheduling, the sampling_info (and its
-        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # grammar_mask) can be kept alive by the delay_sample_func closure and
         # batch_record_buf until the next iteration, causing a steady VRAM leak
         # when structured output (grammar) is used.
-        sampling_info.vocab_mask = None
+        sampling_info.grammar_mask = None
 
     def sample(
         self,
@@ -1809,7 +1827,8 @@ class ModelRunner:
             recovered = maybe_recover_ep_ranks(
                 tp_group=self.tp_group,
                 eplb_manager=self.eplb_manager,
-                random_seed=self.server_args.random_seed,
+                model_config=self.model_config,
+                moe_ep_rank=self._elastic_global_rank(),
             )
             if recovered:
                 self.forward_pass_id = 0
