@@ -46,7 +46,7 @@ struct LargeRouterRadixTrait {
 };
 
 struct RouteRadixParams {
-  const bf16_t* __restrict__ scores;
+  const void* __restrict__ scores;  // bf16 or fp32, typed by the kernel template
   const fp32_t* __restrict__ bias;
   fp32_t* __restrict__ out_w;
   int32_t* __restrict__ out_i;
@@ -105,7 +105,7 @@ SGL_DEVICE uint32_t block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t
   return base + inc - cnt;
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, typename TScore>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     void route_radix_kernel(const __grid_constant__ RouteRadixParams params) {
   using namespace device;
@@ -126,9 +126,11 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   uint32_t keys[kVecSize];
   float act[kVecSize];  // raw sigmoid (weight source) — never NaN-sanitized
   {
-    const auto scores = &params.scores[bx * params.scores_stride];
+    const auto scores = static_cast<const TScore*>(params.scores) + bx * params.scores_stride;
     AlignedVector<fp32x2_t, kVecSize / 2> bias_vec;
-    AlignedVector<bf16x2_t, kVecSize / 2> scores_vec;
+    // bf16: 2x bf16x2 (8B row loads); fp32: 2x fp32x2 (16B row loads). The
+    // radix math below is fp32 either way — only the load width differs.
+    AlignedVector<packed_t<TScore>, kVecSize / 2> scores_vec;
 
     // prefetch bias (frozen weight) before the PDL wait
     bias_vec.load(params.bias, tx);
@@ -137,7 +139,13 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
 
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const auto [x, y] = cast<fp32x2_t>(scores_vec[i]);
+      fp32x2_t xy;
+      if constexpr (std::is_same_v<TScore, fp32_t>) {
+        xy = scores_vec[i];
+      } else {
+        xy = cast<fp32x2_t>(scores_vec[i]);
+      }
+      const auto [x, y] = xy;
       const auto sx = sigmoid_match(x), sy = sigmoid_match(y);
       keys[2 * i + 0] = biased_to_key(nan_floor(sx + bias_vec[i].x));
       keys[2 * i + 1] = biased_to_key(nan_floor(sy + bias_vec[i].y));
@@ -321,7 +329,12 @@ struct RouteRadixKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M_, N_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(scores);
+    auto score_dtype = SymbolicDType{};
+    TensorMatcher({M_, N_})
+        .with_dtype<bf16_t, fp32_t>(score_dtype)
+        .with_device(device)
+        .with_strides({-1, 1})
+        .verify(scores);
     TensorMatcher({N_}).with_dtype<fp32_t>().with_device(device).verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
@@ -329,14 +342,15 @@ struct RouteRadixKernel {
     RuntimeCheck(
         N_.unwrap() == sglang::kNumExperts_ && K_.unwrap() == sglang::kTopK_ && topk == sglang::kTopK_,
         "route_radix is specialized for N=896, K=16");
-    // 8-byte vectorized row loads need 8B-aligned row starts.
+    // Vectorized row loads (8B for bf16, 16B for fp32) need aligned row
+    // starts; stride % 4 elements covers both (4 x 2B = 8B / 4 x 4B = 16B).
     RuntimeCheck(scores.stride(0) % 4 == 0, "route_radix: scores row stride must be a multiple of 4");
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
 
     const auto params = sglang::RouteRadixParams{
-        static_cast<const bf16_t*>(scores.data_ptr()),
+        scores.data_ptr(),
         static_cast<const fp32_t*>(bias.data_ptr()),
         static_cast<fp32_t*>(out_w.data_ptr()),
         static_cast<int32_t*>(out_i.data_ptr()),
@@ -349,7 +363,12 @@ struct RouteRadixKernel {
         apply_scale ? 1 : 0,
         sorted ? 1 : 0};
 
-    LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
-        .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL>, params);
+    if (score_dtype.is_type<fp32_t>()) {
+      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, fp32_t>, params);
+    } else {
+      LaunchKernel(M, sglang::LargeRouterRadixTrait::kBlockSize, device.unwrap())
+          .enable_pdl(kUsePDL)(sglang::route_radix_kernel<kUsePDL, bf16_t>, params);
+    }
   }
 };
