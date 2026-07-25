@@ -27,6 +27,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
     InvalidGrammarObject,
+    truncate_grammar_for_log,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
@@ -151,7 +152,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
-            logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            logger.error(
+                f"Hit invalid regex schema: regex={truncate_grammar_for_log(regex)!r}, {e=}"
+            )
             return InvalidGrammarObject(str(e))
 
         jump_forward_map = None
@@ -170,7 +173,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 whitespace_pattern=self.whitespace_pattern,
             )
         except (NotImplementedError, json.decoder.JSONDecodeError, ValueError) as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={truncate_grammar_for_log(key_string)!r}, {e=}"
+            )
             return InvalidGrammarObject(str(e))
         return self._compile_regex(regex)
 
