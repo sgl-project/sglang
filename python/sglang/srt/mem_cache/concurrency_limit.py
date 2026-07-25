@@ -111,8 +111,12 @@ def format_concurrency_report(
 ) -> Tuple[bool, str]:
     """Render the resolution as (is_downgrade, message). A downgrade means the
     user asked for more than they got; log those at WARNING, the rest at INFO."""
+    # The binding limit and the user's request are both spelled out above, so
+    # "other limits" lists only the bounds not mentioned yet.
     others = ", ".join(
-        f"{limit.source}={limit.value}" for limit in limits if limit is not binding
+        f"{limit.source}={limit.value}"
+        for limit in limits
+        if limit is not binding and limit is not requested
     )
     others = f"; other limits: {others}" if others else ""
     remedy = f" To raise it: {binding.remedy}." if binding.remedy else ""

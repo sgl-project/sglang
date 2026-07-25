@@ -1634,15 +1634,13 @@ class KVCacheConfigurator:
         # Order matters: ties are attributed to the first limit listed.
         limits = []
         requested = None
-        requested_per_worker = None
         if self.server_args.max_running_requests is not None:
             requested = user_request_limit(
                 self.server_args.max_running_requests, self.ps.attn_dp_size
             )
             limits.append(requested)
-            requested_per_worker = requested.value
         limits.append(kv_capacity_limit(token_capacity))
-        if requested_per_worker is None:
+        if requested is None:
             limits.append(
                 heuristic_limit(token_capacity, self.model_config.context_len)
             )
@@ -1656,7 +1654,7 @@ class KVCacheConfigurator:
                     self.server_args.max_mamba_cache_size,
                     ratio,
                     self.ps.attn_dp_size,
-                    requested_per_worker,
+                    requested.value if requested else None,
                 )
             )
 

@@ -65,6 +65,15 @@ class TestConcurrencyLimit(CustomTestCase):
         # The user's own request carries no remedy.
         self.assertNotIn("To raise it", message)
 
+    def test_downgrade_keeps_the_global_request_visible(self):
+        requested = user_request_limit(296, attn_dp_size=4)
+        limits = [requested, _limit("mamba_state_pool", 26)]
+        _, message = format_concurrency_report(
+            resolve_concurrency_limit(limits), limits, requested
+        )
+        self.assertIn("reduced from the requested 74", message)
+        self.assertIn("--max-running-requests=296 / 4 dp workers", message)
+
     def test_sole_limit_omits_the_other_limits_clause(self):
         limits = [_limit("kv_capacity", 400)]
         _, message = format_concurrency_report(
@@ -93,15 +102,6 @@ class TestLimitConstructors(CustomTestCase):
             user_request_limit(128, attn_dp_size=1).detail,
             "--max-running-requests=128",
         )
-
-    def test_downgrade_keeps_the_global_request_visible(self):
-        requested = user_request_limit(296, attn_dp_size=4)
-        limits = [requested, _limit("mamba_state_pool", 26)]
-        _, message = format_concurrency_report(
-            resolve_concurrency_limit(limits), limits, requested
-        )
-        self.assertIn("reduced from the requested 74", message)
-        self.assertIn("--max-running-requests=296 / 4 dp workers", message)
 
     def test_kv_capacity_halves_the_token_pool(self):
         self.assertEqual(kv_capacity_limit(798208).value, 399104)

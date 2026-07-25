@@ -763,8 +763,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 self.requested_max_running_requests_per_worker
             )
 
-        # Same bounds resolve_max_num_reqs applies; the pool is not sized yet,
-        # so only the capacity-independent ones are known here.
+        # Mirrors the no-request branch of resolve_max_num_reqs; token_capacity
+        # is still provisional here.
         binding = resolve_concurrency_limit(
             [
                 kv_capacity_limit(token_capacity),
