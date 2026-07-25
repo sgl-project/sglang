@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative.spec_utils import traverse_tree
+from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -40,6 +40,11 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         grammar.rollback.return_value = None
         return grammar, accept_calls, fill_calls
 
+    def _chain(self, verify_ids_2d):
+        """Row 0 of the links chain-verify algorithms actually feed traverse_tree."""
+        links = GrammarTree.from_linear_chain(verify_ids_2d).resolve()
+        return tuple(t[0] for t in links)
+
     def test_branching_tree_passes_ints(self):
         # Binary tree exercises both child recursion and sibling recursion:
         #   0 ─┬─ 1
@@ -67,26 +72,15 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
             self.assertIsInstance(idx, int)
 
     def test_linear_chain_visits_all_positions_in_order(self):
-        # DFLASH verify is a *linear chain* (block_size draft tokens, no branching),
-        # which is a degenerate tree that DFlashWorkerV2 feeds to generate_token_bitmask
-        # by building retrieve_next_token = [1, 2, ..., -1] and retrieve_next_sibling
-        # = [-1, ...]. This checks that traverse_tree walks the whole chain in order:
-        #   0 ── 1 ── 2 ── 3
-        block_size = 4
-        retrieve_next_token = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
-        retrieve_next_sibling = torch.full((block_size,), -1, dtype=torch.int32)
-        # column 0 is the current (already-committed) token; 1: are draft proposals
-        draft_tokens = torch.tensor([100, 11, 22, 33], dtype=torch.int64)
-        bitmask = torch.full((block_size, 4), -1, dtype=torch.int32)  # all allowed
+        # Chain-verify algorithms (DFLASH/DSPARK) have no branching, so their tree
+        # degenerates to 0 -- 1 -- 2 -- 3 with column 0 the already-committed token.
+        rnt, rns, draft_tokens = self._chain(torch.tensor([[100, 11, 22, 33]]))
+        self.assertEqual(rnt.tolist(), [1, 2, 3, -1])
+        self.assertEqual(rns.tolist(), [-1, -1, -1, -1])
+        bitmask = torch.full((4, 4), -1, dtype=torch.int32)  # all allowed
 
         grammar, accept_calls, fill_calls = self._record_grammar()
-        traverse_tree(
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-            grammar,
-            bitmask,
-        )
+        traverse_tree(rnt, rns, draft_tokens, grammar, bitmask)
 
         # Root (col 0) is never accepted; every draft token is, in chain order.
         self.assertEqual(accept_calls, [11, 22, 33])
@@ -97,25 +91,16 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
             self.assertIsInstance(idx, int)
 
     def test_linear_chain_stops_at_grammar_reject(self):
-        # If a draft token in the chain is not allowed by the grammar, traversal
-        # must stop descending there: no accept/fill for that node or anything
-        # after it. Chain: 0 ── 1 ── 2 ── 3, with token at position 2 disallowed.
-        block_size = 4
-        retrieve_next_token = torch.tensor([1, 2, 3, -1], dtype=torch.int32)
-        retrieve_next_sibling = torch.full((block_size,), -1, dtype=torch.int32)
-        draft_tokens = torch.tensor([100, 5, 7, 9], dtype=torch.int64)
-        bitmask = torch.full((block_size, 4), -1, dtype=torch.int32)  # all allowed
+        # A draft token the grammar disallows must stop the descent: no accept/fill
+        # for that node or anything after it, so the mask rows past it stay unfilled
+        # and only the already-filled prefix can be committed.
+        rnt, rns, draft_tokens = self._chain(torch.tensor([[100, 5, 7, 9]]))
+        bitmask = torch.full((4, 4), -1, dtype=torch.int32)  # all allowed
         # Disallow token id 7 (draft_tokens[2]) in node 1's mask (its parent).
         bitmask[1, 7 // 32] &= ~(1 << (7 % 32))
 
         grammar, accept_calls, fill_calls = self._record_grammar()
-        traverse_tree(
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-            grammar,
-            bitmask,
-        )
+        traverse_tree(rnt, rns, draft_tokens, grammar, bitmask)
 
         # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
         self.assertEqual(accept_calls, [5])

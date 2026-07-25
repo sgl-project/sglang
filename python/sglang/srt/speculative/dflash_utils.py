@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -793,19 +794,26 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, spec_algorithm: SpeculativeAlgorithm
+) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    # Grammar-constrained decoding (json_schema / regex / ebnf / structural_tag,
-    # i.e. tool_choice=required, named tool_choice, response_format=json_*) is
-    # supported: the DFLASH verify path applies the grammar vocab mask to the
-    # target logits along the linear draft chain before accept (see
-    # DFlashWorkerV2 verify block), mirroring EAGLE's grammar-aware verify.
-    # Grammar FSM advancement over committed tokens is handled generically for
-    # spec-v2 in SchedulerOutputProcessorMixin._resolve_spec_v2_tokens.
+    # Grammar support in this family is the verify-time bitmask plus the grammar
+    # barrier, so the capability that gates the barrier also gates admission.
+    if not spec_algorithm.supports_grammar_overlap() and (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            f"{spec_algorithm.name} speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
 
     return None
