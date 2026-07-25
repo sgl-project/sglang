@@ -336,7 +336,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        self._verify_planner.reset_runtime_state()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -553,6 +553,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
+        tp_tier_num_tokens = (
+            int(batch.spec_verify_tier_num_tokens)
+            if not self.server_args.disable_overlap_schedule
+            else None
+        )
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -561,6 +566,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            tp_tier_num_tokens=tp_tier_num_tokens,
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
@@ -613,7 +619,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if on_publish is not None:
-            if confidence is not None:
+            if self._should_publish_confidence(confidence):
                 on_publish(accept.new_seq_lens, confidence=confidence)
             else:
                 on_publish(accept.new_seq_lens)
@@ -671,6 +677,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _should_publish_confidence(
+        self, confidence: Optional[torch.Tensor]
+    ) -> bool:
+        return confidence is not None and (
+            self._verify_planner.needs_confidence_publication
+            or self._observers.needs_budget_telemetry
         )
 
     def get_confidence_budget_prepare(self):

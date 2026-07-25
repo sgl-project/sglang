@@ -300,27 +300,79 @@ class DSparkVerifyPlanner:
             return
         if draft_input is None:
             local_tier_num_tokens = 0 if batch.batch_size() == 0 else -1
-            self._maybe_gather_dp_verify_tier(
+            self._coordinate_verify_tier(
                 batch=batch, local_tier_num_tokens=local_tier_num_tokens
             )
             return
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._budget_planner.note_non_decode_step()
-            self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
+            self._coordinate_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
-        batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
+        local_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             min_verify_len=self._schedule_cfg.min_verify_len,
         )
-        self._maybe_gather_dp_verify_tier(
-            batch=batch, local_tier_num_tokens=batch.spec_verify_tier_num_tokens
+        self._coordinate_verify_tier(
+            batch=batch, local_tier_num_tokens=local_tier_num_tokens
         )
+
+    def _coordinate_verify_tier(
+        self, *, batch: ScheduleBatch, local_tier_num_tokens: int
+    ) -> None:
+        broadcast_group, broadcast_group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
+        needs_tp_coordination = (
+            not getattr(self, "_is_verify_all", False)
+            or getattr(self._budget_planner, "forced_budget_frac", None) is not None
+        )
+        if broadcast_group_size > 1 and needs_tp_coordination:
+            if not is_dp_attention_enabled():
+                local_tier_num_tokens = self._conservative_tp_verify_tier(
+                    batch=batch,
+                    local_tier_num_tokens=local_tier_num_tokens,
+                )
+            else:
+                tier_tensor = torch.tensor(
+                    [
+                        int(local_tier_num_tokens)
+                        if broadcast_group.rank_in_group == 0
+                        else -1
+                    ],
+                    dtype=torch.int64,
+                )
+                torch.distributed.broadcast(
+                    tier_tensor,
+                    src=broadcast_group.ranks[0],
+                    group=broadcast_group.cpu_group,
+                )
+                local_tier_num_tokens = int(tier_tensor[0])
+        batch.spec_verify_tier_num_tokens = int(local_tier_num_tokens)
+        self._maybe_gather_dp_verify_tier(
+            batch=batch,
+            local_tier_num_tokens=batch.spec_verify_tier_num_tokens,
+        )
+
+    def _conservative_tp_verify_tier(
+        self, *, batch: ScheduleBatch, local_tier_num_tokens: int
+    ) -> int:
+        """Choose a TP-consistent graph tier without a host collective.
+
+        The exact non-uniform verify lengths are still broadcast on the device
+        during target verify.  Graph selection is host-side, so pure TP uses the
+        deterministic full-width tier and accepts padding instead of rendezvousing
+        scheduler ranks through Gloo on every decode step.
+        """
+        batch_size = int(batch.batch_size())
+        if local_tier_num_tokens == 0 or batch_size == 0:
+            return 0
+        return batch_size * int(self.verify_num_draft_tokens)
 
     def _maybe_gather_dp_verify_tier(
         self, *, batch: ScheduleBatch, local_tier_num_tokens: int
@@ -347,6 +399,10 @@ class DSparkVerifyPlanner:
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
+
+    def reset_runtime_state(self) -> None:
+        if self._budget_planner is not None:
+            self._budget_planner.reset_runtime_state()
 
     def compute_budget_sync(
         self,
@@ -395,6 +451,16 @@ class DSparkVerifyPlanner:
             return None
         return self.prepare_verify_budget
 
+    @property
+    def needs_confidence_publication(self) -> bool:
+        """Whether overlap scheduling can consume a relayed confidence block."""
+        if not self.schedules_verify_budget:
+            return False
+        return not (
+            getattr(self, "_is_verify_all", False)
+            and getattr(self._budget_planner, "forced_budget_frac", None) is None
+        )
+
     def _budget_from_resolved(
         self,
         *,
@@ -426,6 +492,7 @@ class DSparkVerifyPlanner:
         budget: Optional[int],
         global_num_reqs: Optional[int] = None,
         dp_tier_num_tokens: Optional[int] = None,
+        tp_tier_num_tokens: Optional[int] = None,
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
@@ -444,6 +511,9 @@ class DSparkVerifyPlanner:
                     tier_num_reqs=global_num_reqs,
                 )
             return self._uniform_layout_cache[key]
+        broadcast_group, broadcast_group_size = verify_lens_broadcast_group(
+            tp_size=self.server_args.tp_size
+        )
         verify_lens = self._schedule_verify_lens(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -455,6 +525,8 @@ class DSparkVerifyPlanner:
                 global_num_reqs=global_num_reqs,
                 dp_tier_num_tokens=dp_tier_num_tokens,
             ),
+            broadcast_group=broadcast_group,
+            broadcast_group_size=broadcast_group_size,
         )
         if verify_lens is None:
             assert dp_tier_num_tokens is None, (
@@ -479,6 +551,10 @@ class DSparkVerifyPlanner:
                 "keying the tier off the local bs diverges across ranks"
             )
             tier_num_tokens = dp_tier_num_tokens
+        elif tp_tier_num_tokens is not None:
+            tier_num_tokens = (
+                int(tp_tier_num_tokens) if int(tp_tier_num_tokens) >= 0 else None
+            )
         elif self._dynamic_graph_tier and budget is not None:
             tier_num_tokens = local_verify_tier_num_tokens(
                 bs=tier_num_reqs,
@@ -582,16 +658,35 @@ class DSparkVerifyPlanner:
         device: torch.device,
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
+        broadcast_group=None,
+        broadcast_group_size: int = 1,
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        ready = (
+            self._budget_planner is not None
+            and confidence is not None
+            and budget is not None
+        )
+        is_source = (
+            broadcast_group_size == 1 or broadcast_group.rank_in_group == 0
+        )
+        if broadcast_group_size == 1 and not ready:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=confidence,
-            budget=budget,
-            cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
 
-        if resolve_level() >= InvariantCheckLevel.WARN:
+        if is_source and ready:
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                confidence=confidence,
+                budget=budget,
+                cfg=self._schedule_cfg,
+            ).to(device=device, dtype=torch.int32)
+        else:
+            verify_lens = torch.full(
+                (int(req_pool_indices.shape[0]),),
+                self.verify_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        if is_source and ready and resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
             effective_floor = max(self._schedule_cfg.min_verify_len, 1)
             expect(
@@ -600,7 +695,11 @@ class DSparkVerifyPlanner:
                 msg=f"budget={budget}",
             )
 
-        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+        if (
+            is_source
+            and ready
+            and envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        ):
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=prefix_lens,
@@ -609,10 +708,7 @@ class DSparkVerifyPlanner:
                 verify_lens=verify_lens,
             )
 
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=self.server_args.tp_size
-        )
-        if group_size > 1:
+        if broadcast_group_size > 1:
             broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
@@ -1042,6 +1138,12 @@ class HostConfidenceBudgetPlanner:
         self.carry_steps = max(self.lag_steps - int(relay_lag_steps), 0)
         self._carry_confidence: Optional[torch.Tensor] = None
         self._carry_generation: Optional[torch.Tensor] = None
+        self._carry_pos = 0
+
+    def reset_runtime_state(self) -> None:
+        self.last_decision = None
+        self._carry_confidence = None
+        self._carry_generation = None
         self._carry_pos = 0
 
     def compute_budget(

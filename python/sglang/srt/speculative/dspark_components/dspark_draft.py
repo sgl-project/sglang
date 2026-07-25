@@ -389,11 +389,12 @@ class DraftBlockProposer:
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + gamma
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
         else:
-            raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
+            # Backends that opted out of host lengths consume the exact prefix
+            # directly from the device tensor. Reserved host lengths are only
+            # allocation bounds and must not replace the accepted lengths.
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
 
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,

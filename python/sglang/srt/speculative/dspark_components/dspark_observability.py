@@ -750,8 +750,9 @@ class DsparkStepObservers:
             verify_num_draft_tokens=verify_num_draft_tokens,
             tp_rank=tp_rank,
         )
+        self._info_components = resolve_enabled_components()
         self._info_dumper = DsparkInfoDumper(
-            components=resolve_enabled_components(),
+            components=self._info_components,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             attn_tp_rank=get_parallel().attn_tp_rank,
@@ -770,6 +771,14 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+
+    @property
+    def needs_budget_telemetry(self) -> bool:
+        return (
+            bool(self._info_components)
+            or envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get() > 0
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        )
 
     # --- step lifecycle -------------------------------------------------
 
