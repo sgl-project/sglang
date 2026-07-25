@@ -20,6 +20,7 @@ This file uses multiple processes to handle requests and tokenization, reducing 
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing as multiprocessing
 import os
@@ -36,7 +37,21 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+
+# IPC/exception types are lightweight and safe to import at module load time;
+# the gRPC-backed runtime and sampler remain lazy to preserve the optional
+# dependency boundary.
+from sglang.srt.load_reporter.ipc import (
+    LoadReporterDependencyUnavailableError,
+    LoadReporterInternalError,
+    LoadReporterUnavailableError,
+)
+from sglang.srt.load_reporter.registration import (
+    RuntimeClosingError,
+    StartReportingRequest,
+    WorkerIdentityConflict,
+)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -45,7 +60,13 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
+    ElasticScaleUpdateReq,
     FreezeGCReq,
+    LoadReporterIpcCode,
+    LoadReporterRefreshIpcReq,
+    LoadReporterStartIpcReqInput,
+    LoadReporterStartIpcReqOutput,
+    LoadReporterStateBroadcastReq,
     PauseContinueBroadcastReq,
     PauseGenerationReqInput,
     TokenizerWorkerRegistrationReq,
@@ -442,17 +463,10 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
 
-        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
-        # bind the zmq PULL socket used for load snapshots, so the single
-        # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
-        # read SHM only. Drain it event-driven via the socket's fd instead of
-        # polling on a timer.
-        self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
-            self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="MultiTokenizerRouter"
-            )
-            self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
+        # The reporter-owning router always needs a reader. In ZMQ mode the N
+        # TokenizerWorkers cannot all bind the PULL socket, so this single
+        # process also owns the ZMQ-to-SHM drain and registers it event-driven.
+        self._initialize_load_snapshot_reader(port_args)
 
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
@@ -461,8 +475,29 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
+        # Load reporter runtime (lazy-created on first start request)
+        self._load_reporter_runtime: Optional[Any] = None
+        self._load_reporter_active: bool = False
+
     def _run_loop(self):
         self._loop.run_forever()
+
+    def _initialize_load_snapshot_reader(self, port_args: PortArgs) -> None:
+        """Create the router's SHM reader and register ZMQ draining when owned.
+
+        Args:
+            port_args: IPC endpoints and instance identity for the engine.
+
+        Returns:
+            None.
+        """
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            self.server_args,
+            port_args,
+            caller="MultiTokenizerRouter",
+        )
+        if zmq_reader_owner(self.server_args, "MultiTokenizerRouter"):
+            self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
     def _register_load_snapshot_reader(self):
         """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
@@ -478,6 +513,203 @@ class MultiTokenizerRouter:
         # Drain anything already queued before the fd was registered.
         self.load_snapshot_reader.poll()
 
+    # ------------------------------------------------------------------
+    # Load reporter ownership (router is the sole owner in multi-tokenizer mode)
+    # ------------------------------------------------------------------
+
+    async def _handle_load_reporter_start(
+        self, request: LoadReporterStartIpcReqInput
+    ) -> None:
+        """Handle start_reporting request from worker, send IPC response.
+
+        Lazy-creates the LoadReporterRuntime on first call. Maps all exceptions
+        to stable LoadReporterIpcCode values. Always sends a response back to
+        http_worker_ipc (if present).
+        """
+        # Lazy-create runtime on first start request (singleton)
+        if self._load_reporter_runtime is None:
+            try:
+                from sglang.srt.load_reporter import (
+                    describe_optional_dependency_error,
+                )
+                from sglang.srt.load_reporter.runtime import LoadReporterRuntime
+                from sglang.srt.load_reporter.sampler import RouterLoadSnapshotSource
+
+                source = RouterLoadSnapshotSource(
+                    self.load_snapshot_reader,
+                    range(self.server_args.dp_size),
+                )
+                self._load_reporter_runtime = LoadReporterRuntime(
+                    source,
+                    self.server_args,
+                    active_changed=self._broadcast_load_reporter_state,
+                )
+            except (ModuleNotFoundError, RuntimeError) as exc:
+                dependency_error = describe_optional_dependency_error(exc)
+                if dependency_error is None:
+                    raise
+                self._send_load_reporter_start_response(
+                    request,
+                    LoadReporterStartIpcReqOutput(
+                        request_id=request.request_id,
+                        code=LoadReporterIpcCode.DEPENDENCY_UNAVAILABLE,
+                        message=dependency_error,
+                    ),
+                )
+                return
+
+        # Reconstruct StartReportingRequest from IPC input
+        payload = StartReportingRequest(
+            ip=request.router_host,
+            port=request.router_port,
+            report_interval_ms=request.report_interval_ms,
+            lease_ttl_ms=request.lease_ttl_ms,
+        )
+
+        response: LoadReporterStartIpcReqOutput
+        try:
+            result = await self._load_reporter_runtime.start_reporting(
+                payload, request.worker_addr
+            )
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.OK,
+                status=result.status,
+                lease_ttl_ms=result.lease_ttl_ms,
+                renew_after_ms=result.renew_after_ms,
+            )
+        except WorkerIdentityConflict as exc:
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.CONFLICT,
+                message=str(exc),
+            )
+        except RuntimeClosingError as exc:
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.CLOSING,
+                message=str(exc),
+            )
+        except LoadReporterUnavailableError as exc:
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.UNAVAILABLE,
+                message=str(exc),
+            )
+        except LoadReporterDependencyUnavailableError as exc:
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.DEPENDENCY_UNAVAILABLE,
+                message=str(exc),
+            )
+        except LoadReporterInternalError as exc:
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.INTERNAL,
+                message=str(exc),
+            )
+        except Exception as exc:
+            logger.exception("Load reporter start_reporting internal error")
+            response = LoadReporterStartIpcReqOutput(
+                request_id=request.request_id,
+                code=LoadReporterIpcCode.INTERNAL,
+                message=f"internal error: {type(exc).__name__}",
+            )
+
+        self._send_load_reporter_start_response(request, response)
+
+    def _send_load_reporter_start_response(
+        self,
+        request: LoadReporterStartIpcReqInput,
+        response: LoadReporterStartIpcReqOutput,
+    ) -> None:
+        """Return one load-reporter control response to its HTTP worker.
+
+        Args:
+            request: Original IPC request containing the reply address.
+            response: Correlated response to send.
+
+        Returns:
+            None.
+        """
+        if request.http_worker_ipc:
+            self.socket_mapping.send_output(
+                request.http_worker_ipc, response, is_tokenizer=True
+            )
+        else:
+            logger.error("LoadReporterStartIpcReqInput missing http_worker_ipc")
+
+    def _handle_load_reporter_refresh(self, request: LoadReporterRefreshIpcReq) -> None:
+        """Handle refresh hint from worker.
+
+        If runtime not yet created, log and return (no-op). Otherwise, notify
+        the runtime to trigger a sampler refresh.
+        """
+        if self._load_reporter_runtime is None:
+            logger.debug("Received refresh hint but runtime not yet created")
+            return
+        self._load_reporter_runtime.notify_refresh()
+
+    def _broadcast_load_reporter_state(self, active: bool) -> None:
+        """Broadcast active-state change to all registered workers.
+
+        Called by LoadReporterRuntime when the active state changes (monitor
+        count goes 0→1 or 1→0). Workers need this to enable/disable their
+        refresh notifiers.
+        """
+        self._load_reporter_active = active
+        broadcast = LoadReporterStateBroadcastReq(
+            active=active,
+            coalesce_window_ms=50,
+        )
+        for ipc_name in self.all_worker_ipcs:
+            self.socket_mapping.send_output(ipc_name, broadcast, is_tokenizer=True)
+
+    def _update_load_reporter_expected_ranks(self, effective_ep_size: int) -> None:
+        """Update expected_dp_ranks after elastic scale change.
+
+        Called when dp_size changes (elastic scale up/down). If the source
+        reports that ranks changed, notify the runtime to trigger a refresh.
+        """
+        if self._load_reporter_runtime is None:
+            return
+        self._load_reporter_runtime.update_expected_dp_ranks(range(effective_ep_size))
+
+    async def _close_load_reporter_owner(self) -> None:
+        """Close the load reporter runtime if it was created.
+
+        Called on the router event loop by the parent shutdown hook. Awaits
+        runtime.close() so all monitors and tasks are cleanly shut down.
+        """
+        runtime = self._load_reporter_runtime
+        if runtime is not None:
+            self._load_reporter_runtime = None
+            await runtime.close()
+
+    def _close_load_snapshot_reader(self) -> None:
+        """Close the Router-owned snapshot reader on the Router event loop.
+
+        Returns:
+            None.
+        """
+        reader = self.load_snapshot_reader
+        if reader is None:
+            return
+        self.load_snapshot_reader = None
+        fileno = getattr(reader, "fileno", None)
+        if callable(fileno):
+            self._loop.remove_reader(fileno())
+        reader.close()
+
+    async def _close_router_owned_resources(self) -> None:
+        """Close reporter tasks before their underlying snapshot reader.
+
+        Returns:
+            None.
+        """
+        await self._close_load_reporter_owner()
+        self._close_load_snapshot_reader()
+
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
@@ -490,6 +722,24 @@ class MultiTokenizerRouter:
                         f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
                         f"(total: {len(self.all_worker_ipcs)})"
                     )
+                    # Send current load-reporter state to newly-registered worker
+                    if self._load_reporter_runtime is not None:
+                        broadcast = LoadReporterStateBroadcastReq(
+                            active=self._load_reporter_active,
+                            coalesce_window_ms=50,
+                        )
+                        self.socket_mapping.send_output(
+                            recv_obj.worker_ipc_name, broadcast, is_tokenizer=True
+                        )
+                continue
+
+            # Intercept load-reporter control requests (do NOT forward to scheduler)
+            if isinstance(recv_obj, LoadReporterStartIpcReqInput):
+                await self._handle_load_reporter_start(recv_obj)
+                continue
+
+            if isinstance(recv_obj, LoadReporterRefreshIpcReq):
+                self._handle_load_reporter_refresh(recv_obj)
                 continue
 
             if isinstance(
@@ -518,6 +768,16 @@ class MultiTokenizerRouter:
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
+        """Route one scheduler result and update Router-owned scale state.
+
+        Args:
+            recv_obj: Scheduler or detokenizer result carrying worker IPC metadata.
+
+        Returns:
+            None.
+        """
+        if isinstance(recv_obj, ElasticScaleUpdateReq) and recv_obj.success:
+            self._update_load_reporter_expected_ranks(recv_obj.effective_ep_size)
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
@@ -528,6 +788,31 @@ class MultiTokenizerRouter:
         for i, ipc_name in enumerate(ipc_names):
             new_recv_obj = _handle_output_by_index(recv_obj, i)
             self.socket_mapping.send_output(ipc_name, new_recv_obj)
+
+    def close(self, timeout_seconds: float = 7.0) -> None:
+        """Close the router-owned load reporter from the parent HTTP thread.
+
+        Args:
+            timeout_seconds: Maximum time to wait for async reporter shutdown.
+
+        Returns:
+            None.
+        """
+        if self._load_reporter_runtime is None and self.load_snapshot_reader is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_router_owned_resources(), self._loop
+        )
+        try:
+            future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            logger.warning(
+                "Timed out after %.1fs while closing router-owned load reporter",
+                timeout_seconds,
+            )
+        except Exception:
+            logger.exception("Failed to close router-owned load reporter")
 
 
 class MultiDetokenizerRouter:
