@@ -3,7 +3,11 @@ import unittest
 from sglang.srt.mem_cache.concurrency_limit import (
     ConcurrencyLimit,
     format_concurrency_report,
+    heuristic_limit,
+    kv_capacity_limit,
     resolve_concurrency_limit,
+    state_pool_limit,
+    user_request_limit,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,6 +69,29 @@ class TestConcurrencyLimit(CustomTestCase):
         self.assertFalse(is_downgrade)
         self.assertEqual(resolved, 400)
         self.assertIn("bound by kv_capacity", message)
+
+
+class TestLimitConstructors(CustomTestCase):
+    def test_user_request_is_per_dp_worker(self):
+        self.assertEqual(user_request_limit(128, attn_dp_size=4).value, 32)
+
+    def test_kv_capacity_halves_the_token_pool(self):
+        self.assertEqual(kv_capacity_limit(798208).value, 399104)
+
+    def test_heuristic_is_clamped(self):
+        # 2M tokens / 1M context * 512 = 1024, raised to the 2048 floor.
+        self.assertEqual(heuristic_limit(2 * 1024**2, 1024**2).value, 2048)
+        # A short context would overshoot; capped at 4096.
+        self.assertEqual(heuristic_limit(10**7, 1024).value, 4096)
+
+    def test_state_pool_remedy_sizes_for_the_target(self):
+        limit = state_pool_limit(131, slots_per_request=5, target=74)
+        self.assertEqual(limit.value, 26)
+        self.assertIn("--max-mamba-cache-size 370", limit.remedy)
+
+    def test_state_pool_remedy_defaults_to_one_more_request(self):
+        limit = state_pool_limit(131, slots_per_request=5)
+        self.assertIn("--max-mamba-cache-size 135", limit.remedy)
 
 
 if __name__ == "__main__":

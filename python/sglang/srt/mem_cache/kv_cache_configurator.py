@@ -40,9 +40,12 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.concurrency_limit import (
-    ConcurrencyLimit,
     format_concurrency_report,
+    heuristic_limit,
+    kv_capacity_limit,
     resolve_concurrency_limit,
+    state_pool_limit,
+    user_request_limit,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -1627,53 +1630,26 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
-        limits = [
-            ConcurrencyLimit(
-                source="kv_capacity",
-                value=token_capacity // 2,
-                detail=f"max_total_num_tokens={token_capacity} / 2",
-                remedy="raise --mem-fraction-static or lower the context length",
-            )
-        ]
+        limits = [kv_capacity_limit(token_capacity)]
 
         requested_per_worker = None
         if self.server_args.max_running_requests is not None:
-            requested_per_worker = (
-                self.server_args.max_running_requests // self.ps.attn_dp_size
+            requested = user_request_limit(
+                self.server_args.max_running_requests, self.ps.attn_dp_size
             )
-            limits.insert(
-                0,
-                ConcurrencyLimit(
-                    source="max_running_requests",
-                    value=requested_per_worker,
-                    detail=f"--max-running-requests={self.server_args.max_running_requests}",
-                ),
-            )
+            requested_per_worker = requested.value
+            limits.insert(0, requested)
         else:
-            # Heuristic ceiling, only when the user did not ask for a value.
-            estimated = int(token_capacity / self.model_config.context_len * 512)
             limits.append(
-                ConcurrencyLimit(
-                    source="estimate",
-                    value=max(min(estimated, 4096), 2048),
-                    detail="token_capacity / context_len * 512, clamped to [2048, 4096]",
-                    remedy="set --max-running-requests explicitly",
-                )
+                heuristic_limit(token_capacity, self.model_config.context_len)
             )
 
         if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            mamba_cap = self.server_args.max_mamba_cache_size // ratio
-            target = requested_per_worker or (mamba_cap + 1)
             limits.append(
-                ConcurrencyLimit(
-                    source="mamba_state_pool",
-                    value=mamba_cap,
-                    detail=f"max_mamba_cache_size="
-                    f"{self.server_args.max_mamba_cache_size} / {ratio} slots per request",
-                    remedy=f"set --max-mamba-cache-size {target * ratio}, raise "
-                    f"--mamba-full-memory-ratio, or halve the state size with "
-                    f"--mamba-ssm-dtype bfloat16",
+                state_pool_limit(
+                    self.server_args.max_mamba_cache_size,
+                    self._calculate_mamba_ratio(),
+                    requested_per_worker,
                 )
             )
 

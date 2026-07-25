@@ -11,6 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+# Each running request is assumed to need at least this many KV tokens.
+KV_TOKENS_PER_REQUEST = 2
+# Heuristic ceiling used when the user did not ask for a specific value.
+HEURISTIC_TOKENS_PER_REQUEST = 512
+HEURISTIC_BOUNDS = (2048, 4096)
+
 
 @dataclass(frozen=True)
 class ConcurrencyLimit:
@@ -22,6 +28,58 @@ class ConcurrencyLimit:
     detail: str
     # Flags that raise this bound; None for the user's own request.
     remedy: Optional[str] = None
+
+
+def user_request_limit(
+    max_running_requests: int, attn_dp_size: int
+) -> ConcurrencyLimit:
+    return ConcurrencyLimit(
+        source="max_running_requests",
+        value=max_running_requests // attn_dp_size,
+        detail=f"--max-running-requests={max_running_requests}",
+    )
+
+
+def kv_capacity_limit(token_capacity: int) -> ConcurrencyLimit:
+    return ConcurrencyLimit(
+        source="kv_capacity",
+        value=token_capacity // KV_TOKENS_PER_REQUEST,
+        detail=f"max_total_num_tokens={token_capacity} / {KV_TOKENS_PER_REQUEST}",
+        remedy="raise --mem-fraction-static or lower the context length",
+    )
+
+
+def heuristic_limit(token_capacity: int, context_len: int) -> ConcurrencyLimit:
+    lo, hi = HEURISTIC_BOUNDS
+    estimated = int(token_capacity / context_len * HEURISTIC_TOKENS_PER_REQUEST)
+    return ConcurrencyLimit(
+        source="estimate",
+        value=max(min(estimated, hi), lo),
+        detail=f"token_capacity / context_len * {HEURISTIC_TOKENS_PER_REQUEST}, "
+        f"clamped to [{lo}, {hi}]",
+        remedy="set --max-running-requests explicitly",
+    )
+
+
+def state_pool_limit(
+    max_mamba_cache_size: int, slots_per_request: int, target: Optional[int] = None
+) -> ConcurrencyLimit:
+    """Hybrid (mamba / linear-attention) state pool bound.
+
+    `target` is the concurrency the remedy should size for; defaults to one
+    more than the pool currently allows.
+    """
+    value = max_mamba_cache_size // slots_per_request
+    target = target or (value + 1)
+    return ConcurrencyLimit(
+        source="mamba_state_pool",
+        value=value,
+        detail=f"max_mamba_cache_size={max_mamba_cache_size} / "
+        f"{slots_per_request} slots per request",
+        remedy=f"set --max-mamba-cache-size {target * slots_per_request}, raise "
+        f"--mamba-full-memory-ratio, or halve the state size with "
+        f"--mamba-ssm-dtype bfloat16",
+    )
 
 
 def resolve_concurrency_limit(
