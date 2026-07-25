@@ -328,6 +328,9 @@ class MockModelRunner(ModelRunner):
         self.pp_size = 1
         self.ps = ParallelState.trivial()
         self.is_draft_worker = False
+        # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
+        # this dense mock declares none.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         # The runner lifecycle warms up kernels in capture() / first execute()
         # via BaseRunner.warmup(); this mock never calls init_backends and has no
