@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
+
 #########################
 # Constants & Enums
 #########################
@@ -857,7 +862,7 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if is_npu() and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         # Pool ships each sub-pool as its own page-indexed component (fixed order
         # so prefill and decode register identically); skips get_state_buf_infos.
         for (

@@ -19,7 +19,9 @@ class Dsv4NpuRoPE:
     # id(freqs_cis) -> instance. freqs_cis is a module buffer, lives with the model.
     _instances: dict[int, "Dsv4NpuRoPE"] = {}
 
-    def __init__(self, freqs_cis: torch.Tensor, rotary_emb: Optional[object] = None) -> None:
+    def __init__(
+        self, freqs_cis: torch.Tensor, rotary_emb: Optional[object] = None
+    ) -> None:
         self.freqs_cis = freqs_cis
         # cos/sin registered as buffers on this module (None -> fall back to _tables).
         self.rotary_emb = rotary_emb
@@ -27,10 +29,14 @@ class Dsv4NpuRoPE:
         # .real/.imag are strided views, materialize once to avoid per-call
         # StridedSlice from aclnnIndex over the strided views.
         self._real_imag: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-        self._tables: dict[tuple[torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._tables: dict[
+            tuple[torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     @classmethod
-    def for_freqs(cls, freqs_cis: torch.Tensor, rotary_emb: Optional[object] = None) -> "Dsv4NpuRoPE":
+    def for_freqs(
+        cls, freqs_cis: torch.Tensor, rotary_emb: Optional[object] = None
+    ) -> "Dsv4NpuRoPE":
         # rotary_emb is only used at creation; callers sharing a warmed-up freqs_cis may omit it.
         inst = cls._instances.get(id(freqs_cis))
         if inst is None or inst.freqs_cis is not freqs_cis:
@@ -40,13 +46,19 @@ class Dsv4NpuRoPE:
 
     def _contig_real_imag(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._real_imag is None:
-            self._real_imag = (self.freqs_cis.real.contiguous(), self.freqs_cis.imag.contiguous())
+            self._real_imag = (
+                self.freqs_cis.real.contiguous(),
+                self.freqs_cis.imag.contiguous(),
+            )
         return self._real_imag
 
     @staticmethod
     def _buffer_names(dtype: torch.dtype) -> tuple[str, str]:
         suffix = str(dtype).replace("torch.", "").replace(".", "_")
-        return f"_npu_interleaved_rope_cos_cache_{suffix}", f"_npu_interleaved_rope_sin_cache_{suffix}"
+        return (
+            f"_npu_interleaved_rope_cos_cache_{suffix}",
+            f"_npu_interleaved_rope_sin_cache_{suffix}",
+        )
 
     def _register_or_set_buffer(self, name: str, tensor: torch.Tensor) -> None:
         owner = self.rotary_emb
@@ -58,7 +70,9 @@ class Dsv4NpuRoPE:
         else:
             setattr(owner, name, tensor)
 
-    def ensure_tables(self, dtype: torch.dtype, *, allow_build: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    def ensure_tables(
+        self, dtype: torch.dtype, *, allow_build: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Returns [max_pos, rope_dim] tables. Call once at init (allow_build=True);
         # decode uses allow_build=False (no repeat_interleave inside the captured graph).
         expected_shape = (self.freqs_cis.shape[0], self.freqs_cis.shape[1] * 2)
@@ -82,7 +96,10 @@ class Dsv4NpuRoPE:
             cached = self._tables.get((dtype, self.freqs_cis.device))
             if cached is not None:
                 cos, sin = cached
-                if tuple(cos.shape) == expected_shape and tuple(sin.shape) == expected_shape:
+                if (
+                    tuple(cos.shape) == expected_shape
+                    and tuple(sin.shape) == expected_shape
+                ):
                     return cached
 
         if not allow_build:
