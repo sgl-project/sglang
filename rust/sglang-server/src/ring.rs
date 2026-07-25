@@ -9,6 +9,7 @@
 //! `try_push` methods while holding the GIL, and the Rust worker threads only
 //! ever push/drain raw `Bytes` — neither side touches a `PyObject` off-thread,
 //! so the producer threads never need the GIL.
+#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 use std::sync::Mutex;
 use std::time::Duration;

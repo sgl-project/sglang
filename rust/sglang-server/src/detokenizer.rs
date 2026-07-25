@@ -14,6 +14,7 @@
 //! Per-chunk egress flow (no FSM state change inside Streaming):
 //!   ChunkEvent{finish:None}  -> step ids -> delta -> Server frame
 //!   ChunkEvent{finish:Some}  -> step ids -> delta -> final frame
+#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 use std::collections::HashMap;
 

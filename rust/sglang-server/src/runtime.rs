@@ -13,7 +13,11 @@
 //! axum's worker threads.
 #![allow(dead_code)] // TODO: remove when the consumer PR lands
 
+mod config;
 mod runnable;
+mod threads;
+
+pub use config::RuntimeConfig;
 
 // Re-export so stages keep importing `crate::runtime::Runnable`.
 pub use runnable::Runnable;
