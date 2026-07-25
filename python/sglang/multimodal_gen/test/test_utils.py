@@ -34,14 +34,21 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "320949ecc2587474a2f535229ffc8f47ed16ee51"
+# GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
+# committed to, so REPO and REVISION must be bumped together. All GT (CUDA and
+# NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
+# publish.
+SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
+SGL_TEST_FILES_CI_DATA_REVISION = "6d689f4833e8c106ff0d853865f50496d1f2b453"
 
+# The NPU pin is kept as a separate branch so ascend GT can be bumped independently
+# when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
+    SGL_TEST_FILES_CI_DATA_REVISION = "6d689f4833e8c106ff0d853865f50496d1f2b453"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
-    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (

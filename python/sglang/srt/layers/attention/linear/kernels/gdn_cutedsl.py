@@ -12,7 +12,9 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
+from sglang.kernels.ops.attention.cutedsl_gdn import (
+    cutedsl_fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
