@@ -21,12 +21,17 @@ from sglang.kernels.ops.attention.pad import (
 )
 from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
     can_use_set_mla_kv_concat_q,
+    can_use_set_mla_kv_concat_q_fp8,
 )
 from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
     covered as set_mla_kv_concat_q_covered,
 )
 from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
+    covered_fp8 as set_mla_kv_concat_q_fp8_covered,
+)
+from sglang.kernels.ops.attention.set_mla_kv_concat_q import (
     set_mla_kv_concat_q,
+    set_mla_kv_concat_q_fp8,
 )
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
@@ -297,6 +302,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and can_use_set_mla_kv_concat_q(
                 self.kv_lora_rank * 2, self.qk_rope_head_dim * 2
             )
+        )
+        # fp8 sibling: quantize + KV scatter + q concat in one launch
+        # (replaces mla_quantize_without_rope_for_fp8's concat + three aten
+        # casts plus the KV-row write on the fp8 decode path).
+        self._fused_set_kv_concat_q_fp8 = (
+            self.data_type == torch.float8_e4m3fn
+            and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and can_use_set_mla_kv_concat_q_fp8()
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
@@ -930,6 +945,54 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q_rope=q_rope_3d,
         )
 
+    def _set_kv_and_concat_q_fp8_fused(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """fp8-KV decode: quantize + scatter the KV row at ``loc`` (already
+        physical) and build the fp8 [q_nope | q_rope] query in one launch.
+
+        Returns the fp8 query, or None when the fused kernel does not cover
+        the inputs (caller falls back to the aten quantize chain).
+        """
+        k_nope_2d = k.view(k.shape[0], -1)
+        k_rope_2d = k_rope.view(k_rope.shape[0], -1)
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        q_rope_3d = q_rope.view(
+            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        )
+        # fp8 view of the pool's uint8 store; same buffer the decode kernel
+        # reads below.
+        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
+        if not set_mla_kv_concat_q_fp8_covered(
+            kv_buffer=kv_2d,
+            loc=loc,
+            k_nope=k_nope_2d,
+            k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+        ):
+            return None
+        parallel = get_parallel()
+        return set_mla_kv_concat_q_fp8(
+            kv_buffer=kv_2d,
+            loc=loc,
+            cache_k_nope=k_nope_2d,
+            cache_k_rope=k_rope_2d,
+            q_nope=q_nope,
+            q_rope=q_rope_3d,
+            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
+            # (identity when attn_dcp_size == 1).
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -946,12 +1009,33 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = (
+                        self._decode_dense_loc
+                        if self._decode_dense_loc is not None
+                        else (
+                            None if self._unified_mla else forward_batch.out_cache_loc
+                        )
+                    )
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -966,9 +1050,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        query = None
-        if save_kv_cache:
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        query = fused_fp8_query
+        if query is None and save_kv_cache:
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
