@@ -869,6 +869,7 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        future_reserve = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         if truncated:
             future_reserve = 0
         elif self._hisparse_v2_budget is not None:
@@ -876,12 +877,8 @@ class PrefillAdder:
             # so shadow quotas stay accurate for later candidates.
             future_reserve = self._hisparse_v2_budget.future_tokens(
                 len(req.full_untruncated_fill_ids),
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                future_reserve,
                 commit=True,
-            )
-        else:
-            future_reserve = min(
-                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
             )
         self._update_prefill_budget(
             0,
