@@ -40,7 +40,7 @@ jobs:
 
           # Test cases - 使用时替换为实际的测试用例路径
           test_cases=(
-            "test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
+            #"test/registered/ascend/basic_function/sessions/test_npu_streaming_session_extra.py"
             "test/registered/ascend/basic_function/rl/test_npu_multi_instance_release_memory_occupation.py"
           )
 
@@ -75,7 +75,7 @@ jobs:
           # Set environment of cann
           source /usr/local/Ascend/cann/set_env.sh || true
           source /usr/local/Ascend/nnal/atb/set_env.sh || true
-          pip install torch_memory_saver
+          pip install /root/.cache/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
           
           current_date=$(date +%Y%m%d)
           log_path="/root/.cache/tests/logs/log/${current_date}/${HOSTNAME}"
