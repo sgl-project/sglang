@@ -451,6 +451,51 @@ class TestBuildDumpPlan(unittest.TestCase):
                 f.write("{}")
             self.assertTrue(PreshardedModelLoader._presharded_ready(tmp))
 
+    def test_separate_presharded_path_overrides_for_target_and_draft(self):
+        # Target and draft get distinct roots via presharded_path vs
+        # draft_presharded_path. Failure mode if this regresses: draft
+        # re-dump collides with / wipes target READY under a shared path.
+        loader = object.__new__(PreshardedModelLoader)
+        with tempfile.TemporaryDirectory() as tmp:
+            target_root = os.path.join(tmp, "target_cache")
+            draft_root = os.path.join(tmp, "draft_cache")
+            loader._presharded_path_override = target_root
+            loader._draft_presharded_path_override = draft_root
+            cfg = {"tp": 8, "structural_signature": "same_sig"}
+            sub = loader._build_subfolder_name(cfg)
+            target_mc = SimpleNamespace(model_path="/models/dsv3", is_draft_model=False)
+            draft_mc = SimpleNamespace(model_path="/models/dsv3", is_draft_model=True)
+            target_dir = loader._presharded_dir(target_mc, cfg)
+            draft_dir = loader._presharded_dir(draft_mc, cfg)
+            self.assertEqual(target_dir, os.path.join(target_root, sub))
+            self.assertEqual(draft_dir, os.path.join(draft_root, sub))
+            self.assertNotEqual(target_dir, draft_dir)
+
+            # Target-only override: draft must not fall back into the target
+            # root (same model_path is common for DeepSeek MTP).
+            loader._draft_presharded_path_override = None
+            draft_fallback = loader._presharded_dir(draft_mc, cfg)
+            self.assertEqual(
+                draft_fallback,
+                os.path.join(
+                    "/models/dsv3",
+                    PreshardedModelLoader.DEFAULT_SUBDIR,
+                    sub,
+                ),
+            )
+            self.assertFalse(draft_fallback.startswith(target_root))
+
+            # No overrides: both use model_path/presharded/<subfolder>.
+            loader._presharded_path_override = None
+            self.assertEqual(
+                loader._presharded_dir(target_mc, cfg),
+                os.path.join(
+                    "/models/dsv3",
+                    PreshardedModelLoader.DEFAULT_SUBDIR,
+                    sub,
+                ),
+            )
+
 
 class TestStructuralSignature(unittest.TestCase):
     """The structural signature is the long-term fix for the underlying

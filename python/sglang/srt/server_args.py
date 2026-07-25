@@ -521,14 +521,22 @@ class ServerArgs:
             "<model_path>/presharded/<parallelism+quant subfolder>/. "
             "Subsequent runs with the same parallelism+quantization config "
             "load directly from this presharded checkpoint and skip "
-            "re-quantization.",
+            "re-quantization. "
+            "Optional model_loader_extra_config roots: presharded_path "
+            "(target) and draft_presharded_path (speculative draft); each "
+            "replaces <model_path>/presharded and still gets a config "
+            "subfolder appended.",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
     model_loader_extra_config: A[
         str,
-        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+        "Extra config for model loader. This will be passed to the model loader "
+        "corresponding to the chosen load_format. For load_format=presharded, "
+        "JSON may include presharded_path (target cache root), "
+        "draft_presharded_path (draft cache root), max_file_bytes, "
+        "hash_num_threads, and verify_on_load.",
         NS("model"),
     ] = "{}"
     trust_remote_code: A[

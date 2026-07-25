@@ -1644,6 +1644,16 @@ class ShardedStateLoader(BaseModelLoader):
 class PreshardedModelLoader(DefaultModelLoader):
     """Dump/reload per-rank post-process weights under
     ``<model_path>/presharded/<config_subdir>/``.
+
+    Optional ``model_loader_extra_config`` roots (config subfolder always
+    appended)::
+
+        "presharded_path":       # target model cache root
+        "draft_presharded_path": # speculative draft cache root
+
+    Target and draft must not share a leaf directory. When only
+    ``presharded_path`` is set, the draft still uses
+    ``<draft_model_path>/presharded/`` (not the target override).
     """
 
     DEFAULT_SUBDIR = "presharded"
@@ -1662,6 +1672,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             else dict(load_config.model_loader_extra_config)
         )
         self._presharded_path_override = extra.pop("presharded_path", None)
+        self._draft_presharded_path_override = extra.pop("draft_presharded_path", None)
         self._max_file_bytes = int(extra.pop("max_file_bytes", self.MAX_FILE_BYTES))
         self._hash_num_threads = int(
             extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
@@ -1710,15 +1721,26 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         shard_config: Optional[Dict[str, Any]] = None,
     ) -> str:
-        if self._presharded_path_override is not None:
-            return self._presharded_path_override
+        """Resolve the dump/reload leaf directory for this model.
+
+        Layout: ``<root>/<config_subdir>/`` where ``root`` is, in order:
+
+        - draft: ``draft_presharded_path``, else ``<model_path>/presharded``
+        - target: ``presharded_path``, else ``<model_path>/presharded``
+
+        Draft never falls back to ``presharded_path`` so a target-only
+        override cannot be overwritten by the draft dump (DeepSeek MTP).
+        """
         if shard_config is None:
             shard_config = self._collect_shard_config(model_config)
-        return os.path.join(
-            model_config.model_path,
-            self.DEFAULT_SUBDIR,
-            self._build_subfolder_name(shard_config),
-        )
+        subfolder = self._build_subfolder_name(shard_config)
+        if model_config.is_draft_model:
+            root = self._draft_presharded_path_override
+        else:
+            root = self._presharded_path_override
+        if root is None:
+            root = os.path.join(model_config.model_path, self.DEFAULT_SUBDIR)
+        return os.path.join(root, subfolder)
 
     def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
         """Cache-key fields: world sizes, layout/dtype knobs, EPLB, structural signature.
