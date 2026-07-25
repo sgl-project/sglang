@@ -1273,6 +1273,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
             "cutlass_sm90",
             "cutlass_sm120",
+            "trtllm_sm100",
         ):
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
@@ -1280,9 +1281,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # Legacy bypass path (e.g. SM100 trtllm-gen under flashinfer_mxfp4)
-            # routes through `apply` without a MoeRunner. TODO(cwan): migrate.
-            pass
+            raise NotImplementedError(
+                f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
+                f"/ _fi_kernel={self._fi_kernel}."
+            )
 
     def _apply_sm90_cutlass(self, layer, dispatch_output):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
