@@ -30,7 +30,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Set, Union
 
 import torch
 
@@ -438,99 +438,20 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class _StandardFutureTokenPolicy:
-    """Default reservation: a candidate's future device cost is its
-    remaining ``max_new`` tokens."""
+class HiSparseV2AdmitProbe(NamedTuple):
+    """Snapshot of the HiSparse V2 admission quotas taken by the scheduler
+    when constructing a PrefillAdder (None ⟺ V2 disabled).
 
-    def future_tokens(self, total_seq_len: int, max_new: int, commit: bool) -> int:
-        return max_new
+    The quotas only PREDICT the coordinator's admission outcome to pick
+    the device reservation; the REAL accounting lives in the coordinator
+    and is re-snapshotted into every new adder. Within one adder round
+    they act as shadow copies, depleted on commit (see
+    _hisparse_v2_future_tokens)."""
 
-    def admission_exhausted(self, total_seq_len: int, max_new: int) -> bool:
-        return False
-
-
-class _HiSparseV2FutureTokenPolicy:
-    """HiSparse V2 replacement for the standard policy above.
-
-    Returns the DEVICE-pool future-token reservation for a HiSparse V2
-    candidate
-    (fed into _update_prefill_budget against rem_total_tokens = device
-    available + evictable).
-
-    Predicted admission success → reserve ``temp_slot_tokens + max_new``
-    (the temp device buffer held for the request lifetime, allocated from the
-    regular device pool at admission, plus the request-owned decode
-    tail); predicted failure → the standard ``max_new``.
-
-    The expanded-page and host quotas consulted here are NOT what is
-    being reserved — they only PREDICT the coordinator's admission
-    outcome (indexer page allocator and host-capacity gate) to pick
-    between the two device reservations. They are same-round shadow
-    copies: ``commit=True`` depletes them so later candidates in this
-    round predict against the reduced balance; the REAL accounting
-    lives in the coordinator (page allocator, _reserved_host_tokens)
-    and is re-snapshotted into the next adder via
-    hisparse_v2_admit_probe. Gates use commit=False (read-only).
-    """
-
-    def __init__(
-        self,
-        page_size: int,
-        temp_slot_tokens: int,
-        expanded_pages_left: int,
-        host_tokens_left: int,
-        device_pool_tokens: int,
-    ):
-        self._page_size = page_size
-        self._temp_slot_tokens = temp_slot_tokens
-        self._expanded_left = expanded_pages_left
-        self._host_left = host_tokens_left
-        self._device_pool_tokens = device_pool_tokens
-
-    def _v2_infeasible(self, total_seq_len: int, max_new: int) -> bool:
-        """The candidate's V2 reservation cannot fit the device pool even
-        at full idle → it must be treated as standard.
-
-        The entry-side max_new clamp (init_req_max_new_tokens) only
-        guarantees the STANDARD budget fits the pool; reserving the extra
-        temp device buffer on top can push add_one_req's total past
-        rem_total_tokens forever (NO_TOKEN livelock on an idle system).
-        This mirrors runtime behavior: admit_request's temp-slot alloc
-        needs top_k free tokens while the request's prefix is still
-        locked, so such a request falls back to standard there anyway.
-        """
-        return (
-            total_seq_len + self._temp_slot_tokens + max_new + self._page_size
-            >= self._device_pool_tokens
-        )
-
-    def future_tokens(self, total_seq_len: int, max_new: int, commit: bool) -> int:
-        num_pages = total_seq_len // self._page_size
-        tree_len = num_pages * self._page_size
-        if (
-            num_pages <= 0
-            or num_pages > self._expanded_left
-            or tree_len > self._host_left
-            or self._v2_infeasible(total_seq_len, max_new)
-        ):
-            return max_new
-        if commit:
-            self._expanded_left -= num_pages
-            self._host_left -= tree_len
-        return self._temp_slot_tokens + max_new
-
-    def admission_exhausted(self, total_seq_len: int, max_new: int) -> bool:
-        num_pages = total_seq_len // self._page_size
-        if num_pages <= 0 or self._v2_infeasible(total_seq_len, max_new):
-            # Short prompt (< 1 page) or a pool-infeasible reservation:
-            # legitimately runs as a standard request, nothing exhausted —
-            # gating it on quotas would queue it for a wait that cannot
-            # help.
-            return False
-        return (
-            num_pages > self._expanded_left
-            or num_pages * self._page_size > self._host_left
-        )
+    temp_slot_tokens: int  # per-request temp device buffer (lifetime floor)
+    expanded_pages_left: int  # expanded indexer page allocator balance
+    host_tokens_left: int  # host-capacity gate balance
+    device_pool_tokens: int  # total device pool (feasibility check)
 
 
 class PrefillAdder:
@@ -551,34 +472,22 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
-        enable_hisparse_v2: bool = False,
-        hisparse_v2_admit_probe: Optional[Tuple[int, int, int, int]] = None,
+        hisparse_v2_config: Optional[HiSparseV2AdmitProbe] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        # Future-token reservation policy: HiSparse V2 predicts admission outcomes
-        # from the (temp_slot_tokens, expanded_pages, host_tokens) probe
-        # snapshot; everything else reserves the plain remaining max_new.
-        # All V2 budget specifics live in _HiSparseV2FutureTokenPolicy.
-        if enable_hisparse_v2 and hisparse_v2_admit_probe is not None:
-            (
-                temp_slot_tokens,
-                expanded_pages_left,
-                host_tokens_left,
-                device_pool_tokens,
-            ) = hisparse_v2_admit_probe
-            self._future_token_policy = _HiSparseV2FutureTokenPolicy(
-                page_size,
-                temp_slot_tokens,
-                expanded_pages_left,
-                host_tokens_left,
-                device_pool_tokens,
-            )
-        else:
-            self._future_token_policy = _StandardFutureTokenPolicy()
+        # HiSparse V2 admission-aware budgeting (same rem_* idiom as the
+        # SWA/Mamba budgets below): shadow quota balances, depleted on
+        # commit so later candidates this round predict against the
+        # reduced amount. None ⟺ V2 disabled.
+        self.enable_hisparse_v2 = hisparse_v2_config is not None
+        self._hisparse_v2 = hisparse_v2_config
+        if hisparse_v2_config is not None:
+            self.rem_hisparse_v2_pages = hisparse_v2_config.expanded_pages_left
+            self.rem_hisparse_v2_host_tokens = hisparse_v2_config.host_tokens_left
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -738,6 +647,62 @@ class PrefillAdder:
             )
 
         return available_and_evictable - self.cur_rem_token_offset
+
+    def _hisparse_v2_infeasible(self, total_seq_len: int, max_new: int) -> bool:
+        """The candidate's V2 reservation cannot fit the device pool even
+        at full idle → budget it as standard. The entry-side max_new clamp
+        only guarantees the STANDARD budget fits the pool; reserving the
+        temp device buffer on top could push add_one_req's total past
+        rem_total_tokens forever (NO_TOKEN livelock on an idle system).
+        Note the coordinator may still V2-admit such a request when the
+        pool has room at admission time — that is strictly better than
+        standard (the prefix becomes evictable), and the reservation here
+        stays the conservative standard one."""
+        cfg = self._hisparse_v2
+        return (
+            total_seq_len + cfg.temp_slot_tokens + max_new + self.page_size
+            >= cfg.device_pool_tokens
+        )
+
+    def _hisparse_v2_future_tokens(
+        self, total_seq_len: int, max_new: int, commit: bool
+    ) -> int:
+        """Device-pool future-token reservation for a candidate.
+
+        HiSparse V2 predicted-admission success → ``temp_slot_tokens +
+        max_new`` (the temp device buffer is allocated from the regular
+        pool at admission and held for the request lifetime); predicted
+        failure → the standard ``max_new``. Only called when
+        enable_hisparse_v2 (callers gate explicitly)."""
+        num_pages = total_seq_len // self.page_size
+        tree_len = num_pages * self.page_size
+        if (
+            num_pages <= 0
+            or num_pages > self.rem_hisparse_v2_pages
+            or tree_len > self.rem_hisparse_v2_host_tokens
+            or self._hisparse_v2_infeasible(total_seq_len, max_new)
+        ):
+            return max_new
+        if commit:
+            self.rem_hisparse_v2_pages -= num_pages
+            self.rem_hisparse_v2_host_tokens -= tree_len
+        return self._hisparse_v2.temp_slot_tokens + max_new
+
+    def _hisparse_v2_admission_exhausted(
+        self, total_seq_len: int, max_new: int
+    ) -> bool:
+        """True when a V2 candidate is only blocked by quota exhaustion
+        (expanded pages / host tokens) — the add_one_req gate keeps such
+        candidates queued. Short prompts (< 1 page) and pool-infeasible
+        reservations legitimately run as standard: nothing exhausted.
+        Only called when enable_hisparse_v2 (callers gate explicitly)."""
+        num_pages = total_seq_len // self.page_size
+        if num_pages <= 0 or self._hisparse_v2_infeasible(total_seq_len, max_new):
+            return False
+        return (
+            num_pages > self.rem_hisparse_v2_pages
+            or num_pages * self.page_size > self.rem_hisparse_v2_host_tokens
+        )
 
     def _swa_budget_for_req(
         self, extend_input_len: int, swa_host_hit_length: int = 0
@@ -983,20 +948,24 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        if truncated:
+            future_reserve = 0
+        elif self.enable_hisparse_v2:
+            # Final chunk: same probe/commit as the non-chunked path,
+            # so shadow quotas stay accurate for later candidates.
+            future_reserve = self._hisparse_v2_future_tokens(
+                len(req.full_untruncated_fill_ids),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                commit=True,
+            )
+        else:
+            future_reserve = min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+            )
         self._update_prefill_budget(
             0,
             req.extend_range.length,
-            (
-                # Final chunk: same probe/commit as the non-chunked path,
-                # so shadow quotas stay accurate for later candidates.
-                self._future_token_policy.future_tokens(
-                    len(req.full_untruncated_fill_ids),
-                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
-                    commit=True,
-                )
-                if not truncated
-                else 0
-            ),
+            future_reserve,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
@@ -1160,8 +1129,12 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        cand_future = self._future_token_policy.future_tokens(
-            len(req.full_untruncated_fill_ids), max_new, commit=False
+        cand_future = (
+            self._hisparse_v2_future_tokens(
+                len(req.full_untruncated_fill_ids), max_new, commit=False
+            )
+            if self.enable_hisparse_v2
+            else max_new
         )
         # HiSparse V2: a candidate that cannot be V2-admitted (expanded
         # pages / host quota exhausted) would run as a standard fallback,
@@ -1171,11 +1144,18 @@ class PrefillAdder:
         # retried) — unless the system is otherwise idle, where letting it
         # run standard is the progress guarantee (e.g. a request larger
         # than the whole expanded pool).
-        if self._future_token_policy.admission_exhausted(
-            len(req.full_untruncated_fill_ids), max_new
-        ) and (
-            len(self.can_run_list) > 0
-            or (self.running_batch is not None and self.running_batch.batch_size() > 0)
+        if (
+            self.enable_hisparse_v2
+            and self._hisparse_v2_admission_exhausted(
+                len(req.full_untruncated_fill_ids), max_new
+            )
+            and (
+                len(self.can_run_list) > 0
+                or (
+                    self.running_batch is not None
+                    and self.running_batch.batch_size() > 0
+                )
+            )
         ):
             return AddReqResult.OTHER
         total_tokens = cand_extend_input_len + cand_future + self.page_size
@@ -1289,17 +1269,19 @@ class PrefillAdder:
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                future_reserve = min(
+                    req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
+                )
+                if self.enable_hisparse_v2:
+                    future_reserve = self._hisparse_v2_future_tokens(
+                        len(req.full_untruncated_fill_ids),
+                        future_reserve,
+                        commit=True,
+                    )
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    self._future_token_policy.future_tokens(
-                        len(req.full_untruncated_fill_ids),
-                        min(
-                            req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKENS,
-                        ),
-                        commit=True,
-                    ),
+                    future_reserve,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
