@@ -189,7 +189,7 @@ class BaseTpWorker(ABC):
         # consumer means the CUDA-IPC ref counter on the producer's
         # bucket drops cleanly each cycle.
         monkey_patch_torch_reductions()
-        serialized = recv_req.serialized_named_tensors[self.tp_rank]
+        serialized = recv_req.serialized_named_tensors[self.ps.tp_rank]
         if recv_req.load_format == "flattened_bucket":
             flattened_data = MultiprocessingSerializer.deserialize(serialized)
             bucket = FlattenedTensorBucket(
@@ -223,12 +223,12 @@ class BaseTpWorker(ABC):
             extra = [n for n in tensors if n not in exp]
             if mismatch or missing or extra:
                 raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
                     f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
                     f"{len(extra)} extra {extra[:5]}"
                 )
             logger.info(
-                f"[LORA-CHECK] rank{self.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
