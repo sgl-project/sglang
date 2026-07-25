@@ -333,6 +333,107 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def _maybe_dump_weight_fingerprints(model: nn.Module, tag: str) -> None:
+    """Debug helper: set SGLANG_PRESHARDED_FP_DIR to dump rank0 tensor fingerprints."""
+    out_dir = os.environ.get("SGLANG_PRESHARDED_FP_DIR")
+    if not out_dir:
+        return
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
+    try:
+        import hashlib
+
+        # Broad sample: all layernorm/rms scales + a few large projections.
+        def _want(name: str) -> bool:
+            n = name.lower()
+            if "layernorm" in n or n.endswith("norm.weight"):
+                return True
+            for s in (
+                "embed_tokens.weight",
+                "lm_head.weight",
+                "layers.0.self_attn.kv_b_proj.weight",
+                "layers.0.self_attn.w_kc",
+                "layers.0.self_attn.w_vc",
+                "layers.3.mlp.experts.w13_weight",
+            ):
+                if s in name:
+                    return True
+            return False
+
+        tensors: Dict[str, Any] = {}
+        bag: Dict[str, torch.Tensor] = dict(model.state_dict())
+        for mod_name, mod in model.named_modules():
+            prefix = f"{mod_name}." if mod_name else ""
+            for attr_name, val in list(vars(mod).items()):
+                if attr_name.startswith("_"):
+                    continue
+                if isinstance(val, torch.Tensor) and not isinstance(
+                    val, torch.nn.Parameter
+                ):
+                    bag.setdefault(f"{prefix}{attr_name}", val)
+        for name, t in bag.items():
+            if not _want(name):
+                continue
+            # Always hash on CPU; fp8/int8 GPU .float() can device-assert.
+            cpu = t.detach().to(device="cpu", copy=True).contiguous()
+            flat = cpu.reshape(-1)
+            n = flat.numel()
+            if n == 0:
+                tensors[name] = {
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "sha1": "empty",
+                }
+                continue
+            # Byte-stable hash of raw storage (works for fp8/bf16/float)
+            raw = flat.view(torch.uint8).numpy().tobytes()
+            h = hashlib.sha1()
+            h.update(str(tuple(t.shape)).encode())
+            h.update(str(t.dtype).encode())
+            if n <= 4_000_000:
+                h.update(raw)
+            else:
+                # Strided sample of raw bytes
+                step = max(1, len(raw) // 800_000)
+                h.update(raw[::step])
+            # Soft stats only for float-like dtypes
+            stats = {}
+            if cpu.dtype in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+                torch.float64,
+            ):
+                f = cpu.float().reshape(-1)
+                stats = {
+                    "mean": float(f.mean()),
+                    "first": float(f[0]),
+                }
+            tensors[name] = {
+                "shape": list(t.shape),
+                "dtype": str(t.dtype),
+                "sha1": h.hexdigest()[:20],
+                **stats,
+            }
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"fp_{tag}_rank{rank}.json")
+        with open(path, "w") as f:
+            json.dump(
+                {"tag": tag, "rank": rank, "n": len(tensors), "tensors": tensors},
+                f,
+                indent=2,
+            )
+        logger.info("Wrote weight fingerprints to %s (%d tensors)", path, len(tensors))
+    except Exception as e:
+        logger.warning("Failed to dump weight fingerprints: %s", e)
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -801,6 +902,7 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+        _maybe_dump_weight_fingerprints(model, tag="auto_or_default")
         return model.eval()
 
     @staticmethod
@@ -1927,7 +2029,12 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _hash_tensor(tensor: torch.Tensor) -> str:
-        """xxh3-128 over (shape, dtype, raw bytes); CUDA via streamed D2H."""
+        """xxh3-128 over (shape, dtype, raw bytes).
+
+        Always hashes a CPU copy. Concurrent multi-thread CUDA D2H hashing was
+        observed to produce false content collisions (distinct RMSNorm weights
+        merged across ranks), which corrupts reload accuracy.
+        """
         t = tensor.detach()
         prefix = str(tuple(t.shape)).encode() + str(t.dtype).encode()
         h = PreshardedModelLoader._new_content_hasher()
@@ -1936,47 +2043,11 @@ class PreshardedModelLoader(DefaultModelLoader):
         if t.numel() == 0:
             return h.hexdigest()
 
-        cont = t.contiguous()
-        flat_u8 = cont.reshape(-1).view(torch.uint8)
-        if cont.is_cuda:
-            return PreshardedModelLoader._hash_tensor_cuda_streamed(h, flat_u8)
-
-        cpu = flat_u8.to(device="cpu", copy=False).contiguous()
-        h.update(memoryview(cpu.numpy()))
+        # Contiguous CPU copy: safe under ThreadPoolExecutor during dump.
+        cpu = t.contiguous().to(device="cpu", copy=True).contiguous()
+        flat_u8 = cpu.reshape(-1).view(torch.uint8)
+        h.update(memoryview(flat_u8.numpy()))
         return h.hexdigest()
-
-    @staticmethod
-    def _hash_tensor_cuda_streamed(hasher, flat_u8: torch.Tensor) -> str:
-        nbytes = int(flat_u8.numel())
-        chunk = PreshardedModelLoader._HASH_STREAM_CHUNK_BYTES
-        pins = [
-            torch.empty(chunk, dtype=torch.uint8, pin_memory=True),
-            torch.empty(chunk, dtype=torch.uint8, pin_memory=True),
-        ]
-        copy_stream = torch.cuda.Stream()
-        prev_event = None
-        prev_n = 0
-        prev_idx = 0
-        off = 0
-        i = 0
-        while off < nbytes or prev_event is not None:
-            if off < nbytes:
-                n = min(chunk, nbytes - off)
-                idx = i & 1
-                with torch.cuda.stream(copy_stream):
-                    pins[idx][:n].copy_(flat_u8[off : off + n], non_blocking=True)
-                    ev = copy_stream.record_event()
-                if prev_event is not None:
-                    prev_event.synchronize()
-                    hasher.update(memoryview(pins[prev_idx][:prev_n].numpy()))
-                prev_event, prev_n, prev_idx = ev, n, idx
-                off += n
-                i += 1
-            else:
-                prev_event.synchronize()
-                hasher.update(memoryview(pins[prev_idx][:prev_n].numpy()))
-                prev_event = None
-        return hasher.hexdigest()
 
     def _verify_rank_checksum(
         self,
@@ -2149,6 +2220,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             gc.collect()
 
         self.counter_after_loading_weights = time.perf_counter()
+        _maybe_dump_weight_fingerprints(model, tag="presharded_dump")
         return model.eval()
 
     def _dump_state_to_disk(
@@ -2566,6 +2638,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
         self.counter_after_loading_weights = time.perf_counter()
+        _maybe_dump_weight_fingerprints(model, tag="presharded_reload")
         return model.eval()
 
 
