@@ -21,6 +21,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
@@ -433,11 +434,11 @@ class NGRAMWorker(BaseSpecWorker):
                 vocab_mask = build_grammar_vocab_mask(
                     reqs=batch.reqs,
                     verify_input=verify_input,
-                    retrieve_next_token_cpu=retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu=retrieve_next_sibling_cpu,
-                    draft_tokens_cpu=torch.from_numpy(req_drafts)
-                    .to(torch.int64)
-                    .view(bs, -1),
+                    tree=GrammarTree.from_host(
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
+                    ),
                     sampling_info=batch.sampling_info,
                     device=verify_input.retrieve_next_token.device,
                 )

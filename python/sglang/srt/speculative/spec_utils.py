@@ -552,31 +552,47 @@ def generate_token_bitmask(
     return allocate_token_bitmask
 
 
-class StagedGrammarTree:
-    """The verify tree copied to the host for the grammar bitmask traversal.
+class GrammarTree:
+    """The verify tree the grammar bitmask is built over, on the host.
 
-    Stage before the target verify launch and resolve() after it, so the copies
-    run behind the draft and everything launched in between overlaps them.
+    ``from_device`` starts an async copy, so build it before the target verify
+    launch; build_grammar_vocab_mask waits on it past the launch, which is what
+    makes the copies and the traversal overlap that forward.
     """
 
-    def __init__(
-        self,
+    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
+        self._host = host
+        self._done = done_event
+
+    @classmethod
+    def from_device(
+        cls,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
-    ):
-        self._host = tuple(
+    ) -> GrammarTree:
+        host = tuple(
             _async_d2h(t)
             for t in (retrieve_next_token, retrieve_next_sibling, draft_token)
         )
         device = retrieve_next_token.device
-        self._done = (
-            torch.get_device_module(device).Event() if device.type != "cpu" else None
-        )
-        if self._done is not None:
-            self._done.record()
+        if device.type == "cpu":
+            return cls(host, None)
+        done = torch.get_device_module(device).Event()
+        done.record()
+        return cls(host, done)
 
-    def resolve(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    @classmethod
+    def from_host(
+        cls,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        draft_token: torch.Tensor,
+    ) -> GrammarTree:
+        """For algorithms that build the tree on the host (NGRAM): nothing to wait on."""
+        return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
+
+    def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
             self._done.synchronize()
         return self._host
@@ -586,24 +602,19 @@ def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
     verify_input: SpecInput,
-    retrieve_next_token_cpu: torch.Tensor,
-    retrieve_next_sibling_cpu: torch.Tensor,
-    draft_tokens_cpu: torch.Tensor,
+    tree: GrammarTree,
     sampling_info: SamplingBatchInfo,
     device,
 ) -> Optional[torch.Tensor]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
     Call it after the target verify launch: the traversal is pure host work, so it
-    overlaps that forward. The tree arrays must be on the host by then -- see
-    StagedGrammarTree for algorithms whose tree lives on device.
+    overlaps that forward, and resolving the tree here keeps any wait past the launch.
     """
     vocab_mask = generate_token_bitmask(
         reqs,
         verify_input,
-        retrieve_next_token_cpu,
-        retrieve_next_sibling_cpu,
-        draft_tokens_cpu,
+        *tree.resolve(),
         sampling_info.vocab_size,
     )
     if vocab_mask is None:

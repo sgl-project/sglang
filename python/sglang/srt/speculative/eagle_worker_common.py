@@ -23,7 +23,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
-    StagedGrammarTree,
+    GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
@@ -531,7 +531,7 @@ def run_eagle_verify(
 
     # Must stay ahead of the target verify launch below; resolved past it.
     grammar_tree = (
-        StagedGrammarTree(
+        GrammarTree.from_device(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
@@ -572,15 +572,10 @@ def run_eagle_verify(
         # overlap the target verify forward. No-op if there is nothing pending.
         if grammar_barrier is not None:
             grammar_barrier()
-        retrieve_next_token_cpu, retrieve_next_sibling_cpu, draft_tokens_cpu = (
-            grammar_tree.resolve()
-        )
         vocab_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
             verify_input=verify_input,
-            retrieve_next_token_cpu=retrieve_next_token_cpu,
-            retrieve_next_sibling_cpu=retrieve_next_sibling_cpu,
-            draft_tokens_cpu=draft_tokens_cpu,
+            tree=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
         )
