@@ -10,15 +10,14 @@ from sglang.srt.utils.common import (
 
 
 def _stamp_backend_name(backend, backend_type: str) -> None:
-    """Record the resolved backend name so model dispatch reads it off the object.
+    """Record the resolved name so model dispatch reads it off the object.
 
-    Draft backends are built here, not by build_attention_backends, so without
-    this their per-mode name stays unset and consumers fall back to re-deriving
-    it from the target's server_args -- which is a different backend whenever
+    Draft backends are built here, not by attention_backend_setup, so without
+    this their name stays unset and dispatch has nothing to key on -- the draft
+    backend differs from the target's whenever
     --speculative-draft-attention-backend is in play.
     """
-    backend.prefill_attention_backend_str = backend_type
-    backend.decode_attention_backend_str = backend_type
+    backend.backend_name = backend_type
 
 
 class DraftBackendFactory:
@@ -88,7 +87,7 @@ class DraftBackendFactory:
         # forward context's backend, so the children are what model dispatch
         # actually reads. Every multi-step draft backend exposes attn_backends.
         for child in backend.attn_backends:
-            _stamp_backend_name(child, backend.decode_attention_backend_str)
+            _stamp_backend_name(child, backend.backend_name)
         return backend
 
     def create_draft_extend_backend(self):

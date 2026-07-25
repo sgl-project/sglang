@@ -840,6 +840,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def data_type(self):
         return self.full_attn_backend.data_type
 
+    def resolved_backend_name(self, forward_mode: ForwardMode) -> Optional[str]:
+        # Model dispatch asks about the full-attention side; the linear sidecar
+        # is picked per layer, not per forward mode.
+        return self.full_attn_backend.resolved_backend_name(forward_mode)
+
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:

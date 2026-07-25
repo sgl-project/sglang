@@ -5,7 +5,7 @@ from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -38,6 +38,11 @@ class TboAttnBackend(AttentionBackend):
         is unaffected; only the *_graph paths are gated.
         """
         return getattr(self.primary, "tbo_supports_cuda_graph", True)
+
+    def resolved_backend_name(self, forward_mode: "ForwardMode"):
+        # __getattr__ cannot cover this: the base class defines the method, so
+        # normal lookup succeeds on the wrapper and never delegates.
+        return self.primary.resolved_backend_name(forward_mode)
 
     def init_forward_metadata_out_graph(
         self,

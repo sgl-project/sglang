@@ -854,8 +854,6 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.prefill_attention_backend_str = backends.prefill_attention_backend_str
-        self.decode_attention_backend_str = backends.decode_attention_backend_str
 
         if self.server_args.dcp_size > 1 and self.server_args.dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()

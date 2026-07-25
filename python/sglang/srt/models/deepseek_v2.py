@@ -1834,27 +1834,12 @@ class DeepseekV2AttentionMLA(
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
-        # Per-mode backend names are stamped on the backend at construction, by
-        # attention_backend_setup for the target runner and by
-        # DraftBackendFactory for the draft one. Re-deriving them from
-        # server_args here would read the target's knobs on the draft runner.
-        backend = get_attn_backend()
-        server_args = get_server_args()
-        prefill_backend_str = backend.prefill_attention_backend_str
-        decode_backend_str = backend.decode_attention_backend_str
-        if forward_batch.forward_mode.is_decode_or_idle():
-            attention_backend = decode_backend_str
-        elif (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            # Use the specified backend for speculative operations (both verify and draft extend)
-            if server_args.speculative_attention_mode == "decode":
-                attention_backend = decode_backend_str
-            else:  # default to prefill
-                attention_backend = prefill_backend_str
-        else:
-            attention_backend = prefill_backend_str
+        # The backend knows which of its own kernels serves this forward; asking
+        # it keeps that routing rule in one place instead of re-deriving it here
+        # from server_args, which describes the target runner's knobs.
+        attention_backend = get_attn_backend().resolved_backend_name(
+            forward_batch.forward_mode
+        )
         self.current_attention_backend = attention_backend
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)

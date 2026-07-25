@@ -63,6 +63,9 @@ class HybridAttnBackend(AttentionBackend):
         else:
             return self.prefill_backend
 
+    def resolved_backend_name(self, forward_mode: ForwardMode) -> Optional[str]:
+        return self._select_backend(forward_mode).resolved_backend_name(forward_mode)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,

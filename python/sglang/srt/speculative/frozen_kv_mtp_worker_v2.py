@@ -254,8 +254,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
         # Only non-factory draft backend construction; stamp it like
         # DraftBackendFactory does so model dispatch reads the name off it.
-        backend.prefill_attention_backend_str = "triton"
-        backend.decode_attention_backend_str = "triton"
+        backend.backend_name = "triton"
         return backend
 
     def _bind_kv_context(self) -> None:
