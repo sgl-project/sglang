@@ -1,9 +1,10 @@
 """Per-commit end-to-end server test for Inkling (hybrid SWA/sconv attention + MoE + multimodal towers).
 
-Boots a small ``thinkingmachines/Inkling`` checkpoint (the ``test`` revision, a
-full-architecture but shrunken model) via ``popen_launch_server`` and exercises
-the Inkling code paths on every PR: generation, the multimodal (vision) path,
-the ``inkling`` reasoning parser, and UnifiedRadixTree cache consistency.
+Boots a small ``thinkingmachines/Inkling-NVFP4`` checkpoint (a full-architecture
+but shrunken model) via ``popen_launch_server`` and exercises the Inkling code
+paths on every PR: generation, the multimodal (vision) path, the ``inkling``
+reasoning parser, and UnifiedRadixTree cache consistency. NVFP4 is the deployed
+quantization, so this guards the modelopt_fp4 weight-loading + MoE path too.
 
 The checkpoint is undertrained, so these guard that the code paths boot and stay
 numerically correct -- not answer quality; there is no accuracy gate (full-model
@@ -33,10 +34,16 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
 
-# Defaults to the HF `test` revision; override MODEL/REVISION to point at a
-# local checkpoint. Empty REVISION drops the flag (for local paths).
-_MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
-_MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
+# Pin an immutable commit SHA, not the mutable `test` branch: a bad re-export on
+# `test` once shipped bf16-unpacked MoE weights that broke nvfp4 loading in CI.
+# Override MODEL/REVISION to point at a local checkpoint; empty REVISION drops
+# the flag (for local paths).
+_MODEL_PATH = os.environ.get(
+    "INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling-NVFP4"
+)
+_MODEL_REVISION = os.environ.get(
+    "INKLING_TEST_MODEL_REVISION", "7c85eea52d0ba5d2db2e1ec7648d62f27914b13a"
+)
 
 
 def _small_image_data_uri():
@@ -59,6 +66,12 @@ class TestInklingServer(CustomTestCase):
         # size follows mem_fraction_static, so it scales down on smaller GPUs.
         other_args = [
             "--trust-remote-code",
+            "--quantization",
+            "modelopt_fp4",
+            "--fp4-gemm-backend",
+            "marlin",
+            "--moe-runner-backend",
+            "marlin",
             "--attention-backend",
             "fa4",
             "--page-size",
