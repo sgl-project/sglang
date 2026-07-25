@@ -1535,7 +1535,10 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver == 3, "Only FA3 support here"
+                # FA4 absorbed MLA is shared by extend and decode: once qv is
+                # threaded through the wrappers, decode's flash_attn_with_kvcache
+                # call takes the same qv/ver arguments as this extend path.
+                assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                     q.dtype
