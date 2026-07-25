@@ -38,7 +38,6 @@ blake3 = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rayon = "1.10"
-rmpv = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the

@@ -1,7 +1,6 @@
 import io
 import json
 
-import msgspec
 import numpy as np
 from PIL import Image
 
@@ -83,7 +82,3 @@ def image_bytes(width, height, seed=0):
 
 def spec_json(config, image_token_id=IMAGE_TOKEN_ID):
     return json.dumps({"family": "qwen_vl", "image_token_id": image_token_id, **config})
-
-
-def request_payload(input_ids, images, video=None, audio=None):
-    return msgspec.msgpack.encode([None, input_ids, images, video, audio])

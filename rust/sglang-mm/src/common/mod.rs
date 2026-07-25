@@ -1,5 +1,4 @@
 pub mod fetch;
-pub mod payload;
 pub mod resize;
 pub mod tokens;
 pub mod transforms;

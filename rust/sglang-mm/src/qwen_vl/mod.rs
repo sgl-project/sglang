@@ -321,17 +321,40 @@ mod python {
         Ok((pos.into_pyarray(py), delta))
     }
 
-    /// Drive the same native Qwen request pipeline used by `sglang-server`.
+    /// One image source: a `str` (data:/base64/file/http, resolved by
+    /// `common::fetch`) or raw encoded `bytes`.
+    #[derive(FromPyObject)]
+    enum PyImageSource {
+        Str(String),
+        Bytes(Vec<u8>),
+    }
+
+    /// Drive the same typed native Qwen request pipeline used by
+    /// `sglang-server` (whose message layer owns the wire-payload parsing).
     #[pyfunction]
-    fn process_native_mm_payload<'py>(
+    #[pyo3(signature = (input_ids, images, spec_json))]
+    fn process_native_mm<'py>(
         py: Python<'py>,
-        payload: Vec<u8>,
+        input_ids: Option<Vec<i32>>,
+        images: Vec<PyImageSource>,
         spec_json: String,
     ) -> PyResult<PyNativeOutput<'py>> {
+        let images = images
+            .into_iter()
+            .map(|source| match source {
+                PyImageSource::Str(s) => crate::driver::ImageSource::String(s),
+                PyImageSource::Bytes(b) => crate::driver::ImageSource::Bytes(b),
+            })
+            .collect();
+        let input = crate::driver::MmInput {
+            text: None,
+            input_ids,
+            images,
+        };
         let output = py
             .detach(move || {
                 let pipeline = crate::registry::pipeline_from_spec(&spec_json)?;
-                crate::driver::process(&pipeline, &payload, |_| {
+                crate::driver::process(&pipeline, input, |_| {
                     Err("native parity API requires input_ids".into())
                 })
             })
@@ -353,7 +376,7 @@ mod python {
         m.add_function(wrap_pyfunction!(preprocess, &m)?)?;
         m.add_function(wrap_pyfunction!(smart_resize_py, &m)?)?;
         m.add_function(wrap_pyfunction!(mrope_image_only_py, &m)?)?;
-        m.add_function(wrap_pyfunction!(process_native_mm_payload, &m)?)?;
+        m.add_function(wrap_pyfunction!(process_native_mm, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
     }
