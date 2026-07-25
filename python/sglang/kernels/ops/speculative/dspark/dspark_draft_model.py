@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.speculative.dspark_components.kernels.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 
 _BLOCK_V = 1024
 _IDX_SENTINEL = tl.constexpr(2147483647)
@@ -143,7 +143,11 @@ def _online_combine_kernel(
     rescaled = tl.where(mask, rescaled, -1.0)
     best = tl.max(rescaled, axis=0)
     cand = tl.where(rescaled == best, idxs, _IDX_SENTINEL)
-    tl.store(next_tokens_ptr + row, tl.min(cand, axis=0).to(tl.int64))
+    next_token = tl.min(cand, axis=0)
+    # Degenerate rows (e.g. all -inf logits) leave cand all-sentinel; clamp to 0
+    # so a valid token id is emitted instead of an out-of-range 2147483647.
+    next_token = tl.where(next_token == _IDX_SENTINEL, 0, next_token)
+    tl.store(next_tokens_ptr + row, next_token.to(tl.int64))
 
 
 def sample_step_tokens_triton(
