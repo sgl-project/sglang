@@ -336,9 +336,10 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+# The prefill staging buffer is auto-sized to one chunk (chunked_prefill_size);
+# the decode ring is sized manually.
 STAGING_ENV = {
     "SGLANG_DISAGG_STAGING_BUFFER": "1",
-    "SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB": "64",
     "SGLANG_DISAGG_STAGING_POOL_SIZE_MB": "1024",
 }
 
