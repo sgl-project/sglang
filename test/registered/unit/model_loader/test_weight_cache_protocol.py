@@ -229,11 +229,33 @@ class TestIpcQuantAllowlist(CustomTestCase):
         self.assertFalse(is_ipc_quant_supported("fp8", None))
 
     def test_nvfp4_supported(self):
-        # NVFP4 is shared post-processed: the daemon runs
-        # process_weights_after_loading and the client maps the result, so every
-        # serialized variant is accepted.
-        self.assertTrue(is_ipc_quant_supported("modelopt_fp4", None))
+        # Accepted in both config layouts: quant_algo at the top level
+        # (config.json's quantization_config) and nested under "quantization"
+        # (hf_quant_config.json). ModelOptFp4Config reads both, so both must
+        # resolve here or a valid checkpoint is refused the zero-copy path.
         self.assertTrue(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4"}))
+        self.assertTrue(
+            is_ipc_quant_supported(
+                "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4"}}
+            )
+        )
+
+    def test_non_nvfp4_modelopt_variants_rejected(self):
+        # "modelopt_fp4" is a method name, not a format: ModelOptFp4Config also
+        # accepts FP8 (not the packed NVFP4 layout the daemon exports) and
+        # NVFP4_AWQ (pre-quant scales, own post-processing). Neither was
+        # verified over IPC, so the method name alone must not admit them.
+        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "FP8"}))
+        self.assertFalse(
+            is_ipc_quant_supported("modelopt_fp4", {"quant_algo": "NVFP4_AWQ"})
+        )
+        self.assertFalse(
+            is_ipc_quant_supported(
+                "modelopt_fp4", {"quantization": {"quant_algo": "NVFP4_AWQ"}}
+            )
+        )
+        # No quantization_config at all: nothing states the checkpoint is NVFP4.
+        self.assertFalse(is_ipc_quant_supported("modelopt_fp4", None))
 
     def test_unknown_method_rejected(self):
         self.assertFalse(is_ipc_quant_supported("gptq_marlin", None))

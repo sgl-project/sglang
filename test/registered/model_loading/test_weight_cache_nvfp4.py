@@ -20,7 +20,6 @@ from sglang.test.test_utils import (
 )
 
 MOE_MODEL = DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4
-TP_SIZE = 1
 
 # The first prompt doubles as the output sanity check: greedy decoding of a fact
 # this small must contain the answer, so grossly wrong weights show up as a
@@ -34,9 +33,9 @@ PROMPTS = [
     "Water is made of hydrogen and",
 ]
 
-# Two model loads: the daemon's disk load plus a client's IPC map (the client's
-# is ~0.3s). Was 600 when a disk-load baseline made it three.
-register_cuda_ci(est_time=350, stage="base-c", runner_config="4-gpu-b200")
+# Two classes (TP=1, TP=2), each costing a daemon disk load plus a client IPC
+# map (the map itself is ~0.3s). The TP=2 class self-skips below 2 GPUs.
+register_cuda_ci(est_time=700, stage="base-c", runner_config="4-gpu-b200")
 
 
 def _greedy_outputs(base_url, model):
@@ -66,6 +65,7 @@ class NvFp4WeightCacheBase:
     """
 
     model_path: str = None
+    tp_size: int = 1
     # A second client (from the same daemon) costs another server launch, so it
     # is opt-in per class.
     check_no_corruption: bool = False
@@ -81,12 +81,12 @@ class NvFp4WeightCacheBase:
 
         common_args = ["--trust-remote-code", "--quantization", "modelopt_fp4"]
 
-        cleanup_daemon_files(TP_SIZE)
+        cleanup_daemon_files(cls.tp_size)
 
         cls.daemon_process = launch_weight_cache_daemon(
-            cls.model, TP_SIZE, extra_args=common_args
+            cls.model, cls.tp_size, extra_args=common_args
         )
-        wait_for_daemon_ready(cls.daemon_process, TP_SIZE)
+        wait_for_daemon_ready(cls.daemon_process, cls.tp_size)
 
         cls.client_outputs, cls.client_log_text = cls._run_client(common_args)
 
@@ -118,7 +118,7 @@ class NvFp4WeightCacheBase:
             other_args=[
                 *common_args,
                 "--tp",
-                str(TP_SIZE),
+                str(cls.tp_size),
                 "--weight-cache-mode",
                 "client",
             ],
@@ -140,7 +140,7 @@ class NvFp4WeightCacheBase:
     def tearDownClass(cls):
         if getattr(cls, "daemon_process", None) is not None:
             kill_process_tree(cls.daemon_process.pid)
-        cleanup_daemon_files(TP_SIZE)
+        cleanup_daemon_files(cls.tp_size)
         for log_path, log in getattr(cls, "_client_logs", []):
             try:
                 log.close()
@@ -188,7 +188,9 @@ class NvFp4WeightCacheBase:
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 requires CUDA SM 100 or higher")
 class TestNvFp4WeightCacheMoE(NvFp4WeightCacheBase, CustomTestCase):
     model_path = MOE_MODEL
-    # Enable 2nd client leads to longer test duration
+
+    # Enable tp_size > 1 or second client leads to longer test duration
+    tp_size = 1
     check_no_corruption = False
 
 

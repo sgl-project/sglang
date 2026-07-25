@@ -156,12 +156,22 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
+def _nvfp4_round_trips_via_ipc(quant_config: Any) -> bool:
+    """Only plain serialized NVFP4 is verified."""
+    quant_algo = _get_quant_field(quant_config, "quant_algo")
+    if quant_algo is None:
+        quantization_section = _get_quant_field(quant_config, "quantization")
+        if isinstance(quantization_section, dict):
+            quant_algo = quantization_section.get("quant_algo", None)
+    return quant_algo == "NVFP4"
+
+
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
-    "modelopt_fp4": lambda _quant_config: True,  # NVFP4
+    "modelopt_fp4": _nvfp4_round_trips_via_ipc,  # NVFP4
 }
 
 # quant methods whose post-processing changes tensor shapes (padding for kernel
