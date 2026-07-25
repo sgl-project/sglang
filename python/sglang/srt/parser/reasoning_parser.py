@@ -225,13 +225,9 @@ class BaseReasoningFormatDetector:
         return text
 
     def finish(self) -> StreamingParseResult:
-        """
-        Called once when the stream ends mid-reasoning. With stream_reasoning=False
-        the whole thinking block is buffered and only emitted on the end token, so a
-        stream cut short (e.g. max_tokens) leaves the trace stuck in _buffer; flush it
-        here instead of dropping it. force_nonempty_content reclassifies that trace as
-        normal text; otherwise it stays reasoning.
-        """
+        """Flush reasoning buffered under stream_reasoning=False when the stream ends
+        before the end token (e.g. max_tokens cut it short), instead of dropping it.
+        force_nonempty_content emits it as normal_text, else as reasoning_text."""
         if not self._in_reasoning:
             return StreamingParseResult()
 
@@ -1384,9 +1380,8 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         return StreamingParseResult()
 
     def finish(self) -> StreamingParseResult:
-        # This detector keeps _in_reasoning pinned True and tracks phase via
-        # _reasoning_done, so the base finish() (keyed on _in_reasoning) would
-        # misfile a truncated answer tail as reasoning. Flush by phase instead.
+        # _in_reasoning stays pinned True here (phase tracked via _reasoning_done), so
+        # the base finish() would misfile a truncated answer tail as reasoning.
         buffer = self._buffer
         self._buffer = ""
         if not self._reasoning_done:
