@@ -12,24 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Inference-only pure-text (non-VL) Qwen3.5 and Qwen3.5-MoE causal LM.
-
-The transformer bodies (embeddings + hybrid GDN/attention decoder layers + final
-norm) already live in ``qwen3_5.py`` under the ``*ForCausalLM`` names, where they
-are used as the ``language_model`` component of the VL wrappers. Those classes
-return plain hidden states and have no ``lm_head``.
-
-This module adds the top-level *servable* classes for the plain-text checkpoints
-whose HuggingFace ``architectures`` are ``Qwen3_5ForCausalLM`` /
-``Qwen3_5MoeForCausalLM`` (``model_type`` ``qwen3_5_text`` / ``qwen3_5_moe_text``).
-Each wraps the matching body with an ``lm_head`` + ``LogitsProcessor``, following
-the same structure as ``qwen3_next.py::Qwen3NextForCausalLM``.
-
-The servable class names intentionally match the identically named transformer
-bodies in ``qwen3_5``; the two never collide because the model registry keys on
-``EntryClass`` names only (the bodies are not entry classes) and the bodies are
-always referenced here module-qualified as ``qwen3_5.<name>``.
-"""
 
 import logging
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -56,13 +38,6 @@ _MODEL_PREFIX = "model."
 
 
 class Qwen3_5ForCausalLM(nn.Module):
-    """Servable pure-text Qwen3.5 (dense) causal LM.
-
-    Also serves as the base for the MoE variant; subclasses override
-    ``body_cls`` with the matching transformer body from ``qwen3_5``.
-    """
-
-    # Transformer body class (embeddings + decoder layers + final norm).
     body_cls = qwen3_5.Qwen3_5ForCausalLM
 
     packed_modules_mapping = qwen3_5.Qwen3_5ForCausalLM.packed_modules_mapping
@@ -105,16 +80,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
-        # Qwen3.5 checkpoints carry an ``mrope_section`` (multimodal RoPE). For
-        # text-only inputs the runtime builds ``[3, seq]`` positions whose three
-        # rows are identical, which is equivalent to standard 1-D RoPE, so we
-        # feed ``forward_batch.mrope_positions`` like the VL wrapper does.
+        # Text-only checkpoints retain mrope_section, but identical position rows
+        # make its rotary embedding equivalent to 1-D RoPE.
         rope_config = getattr(config, "rope_parameters", None) or getattr(
             config, "rope_scaling", None
         )
         self.is_mrope_enabled = bool(rope_config) and "mrope_section" in rope_config
 
-        # For EAGLE3 / aux hidden state capture.
         self.capture_aux_hidden_states = False
 
     @property
@@ -160,7 +132,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Intermediate PP ranks return proxy tensors for the next stage.
         if not self.pp_group.is_last_rank:
             return hidden_states
 
@@ -173,16 +144,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        """Load a plain-text checkpoint.
-
-        The body's ``load_weights`` (in ``qwen3_5``) handles all stacked / GDN /
-        MoE-fused / shared-expert remapping, but operates on body-relative names
-        (``embed_tokens.*``, ``layers.*``, ``norm.*``). Checkpoint keys are
-        prefixed with ``model.``, so we strip that prefix before delegating and
-        re-add it for the returned set. ``lm_head`` is loaded here; ``mtp.*`` and
-        other non-``model.`` tensors are ignored (the MTP draft model loads those
-        separately).
-        """
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -192,7 +153,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 body_weights.append((name[len(_MODEL_PREFIX) :], loaded_weight))
             elif name == "lm_head.weight":
                 if self.config.tie_word_embeddings:
-                    # Tied to embed_tokens; loaded via the body below.
                     continue
                 if "lm_head.weight" not in params_dict:
                     continue
@@ -200,7 +160,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add("lm_head.weight")
-            # else: mtp.* / rotary inv_freq / etc. -> skip
 
         body_loaded = self.model.load_weights(body_weights)
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
@@ -212,8 +171,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
-    """Servable pure-text Qwen3.5-MoE causal LM."""
-
     body_cls = qwen3_5.Qwen3_5MoeForCausalLM
 
     packed_modules_mapping = qwen3_5.Qwen3_5MoeForCausalLM.packed_modules_mapping
@@ -227,7 +184,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        # Expose routed-expert weights for EPLB, mirroring qwen3_next.
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
