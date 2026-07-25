@@ -1834,15 +1834,14 @@ class DeepseekV2AttentionMLA(
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
-        # Determine attention backend name for current forward batch: prefer the
-        # name stamped per-runner on the backend object, else resolve from server args.
+        # Per-mode backend names are stamped on the backend at construction, by
+        # attention_backend_setup for the target runner and by
+        # DraftBackendFactory for the draft one. Re-deriving them from
+        # server_args here would read the target's knobs on the draft runner.
         backend = get_attn_backend()
         server_args = get_server_args()
-        default_prefill_str, default_decode_str = server_args.get_attention_backends()
-        prefill_backend_str = (
-            backend.prefill_attention_backend_str or default_prefill_str
-        )
-        decode_backend_str = backend.decode_attention_backend_str or default_decode_str
+        prefill_backend_str = backend.prefill_attention_backend_str
+        decode_backend_str = backend.decode_attention_backend_str
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = decode_backend_str
         elif (

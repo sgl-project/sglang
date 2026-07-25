@@ -156,17 +156,31 @@ for backend in CONCAT_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_concat_rope_backend)
 
 
-def get_attn_forward_method(server_args, forward_batch) -> AttnForwardMethod:
-    is_decode = forward_batch.forward_mode.is_decode_or_idle()
-    if is_decode:
-        backend = server_args.decode_attention_backend or server_args.attention_backend
-    else:
-        backend = server_args.prefill_attention_backend or server_args.attention_backend
-        if (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and backend == "fa3"
-        ):
-            return AttnForwardMethod.MHA_PREFILL
+def _current_backend_str(forward_batch: ForwardBatch) -> str:
+    """Backend name for this forward, read off the stamp the runner set.
+
+    Reading server_args instead would miss both the draft-worker override and
+    the speculative-attention-mode branch.
+    """
+    backend = get_attn_backend()
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return backend.decode_attention_backend_str
+    if (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    ):
+        return (
+            backend.decode_attention_backend_str
+            if get_server_args().speculative_attention_mode == "decode"
+            else backend.prefill_attention_backend_str
+        )
+    return backend.prefill_attention_backend_str
+
+
+def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
+    backend = _current_backend_str(forward_batch)
+    if forward_batch.forward_mode.is_extend_without_speculative() and backend == "fa3":
+        return AttnForwardMethod.MHA_PREFILL
     return AttentionBackendRegistry.get_forward_method(backend, None, forward_batch)
 
 
@@ -610,16 +624,7 @@ class SarvamMoEMLAAttention(nn.Module):
     def _set_current_attention_backend(self, forward_batch: ForwardBatch) -> None:
         if self._server_args is None:
             self._server_args = get_server_args()
-        if forward_batch.forward_mode.is_decode_or_idle():
-            self.current_attention_backend = (
-                self._server_args.decode_attention_backend
-                or self._server_args.attention_backend
-            )
-        else:
-            self.current_attention_backend = (
-                self._server_args.prefill_attention_backend
-                or self._server_args.attention_backend
-            )
+        self.current_attention_backend = _current_backend_str(forward_batch)
 
     def _maybe_fp8_bmm(
         self,
@@ -768,7 +773,7 @@ class SarvamMoEMLAAttention(nn.Module):
             self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             return self._run_mha_prefill(
@@ -881,7 +886,7 @@ class SarvamMoEMLAAttention(nn.Module):
         if self._server_args is None:
             self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             output = self._run_mha_prefill(
@@ -940,7 +945,7 @@ class SarvamMoEMLAAttention(nn.Module):
             self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
             attn_output = self.attn_mqa(

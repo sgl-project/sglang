@@ -9,6 +9,18 @@ from sglang.srt.utils.common import (
 )
 
 
+def _stamp_backend_name(backend, backend_type: str) -> None:
+    """Record the resolved backend name so model dispatch reads it off the object.
+
+    Draft backends are built here, not by build_attention_backends, so without
+    this their per-mode name stays unset and consumers fall back to re-deriving
+    it from the target's server_args -- which is a different backend whenever
+    --speculative-draft-attention-backend is in play.
+    """
+    backend.prefill_attention_backend_str = backend_type
+    backend.decode_attention_backend_str = backend_type
+
+
 class DraftBackendFactory:
     def __init__(
         self,
@@ -39,7 +51,9 @@ class DraftBackendFactory:
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 
-        return backend_map[backend_type]()
+        backend = backend_map[backend_type]()
+        _stamp_backend_name(backend, backend_type)
+        return backend
 
     def create_decode_backend(self):
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
@@ -65,11 +79,17 @@ class DraftBackendFactory:
             "dsv4": self._create_dsv4_decode_backend,
         }
 
-        return self._create_backend(
+        backend = self._create_backend(
             "decode_attention_backend",
             backend_map,
             "EAGLE is not supported in decode attention backend {backend_type}",
         )
+        # draft_forward publishes the per-step child (not this wrapper) as the
+        # forward context's backend, so the children are what model dispatch
+        # actually reads. Every multi-step draft backend exposes attn_backends.
+        for child in backend.attn_backends:
+            _stamp_backend_name(child, backend.decode_attention_backend_str)
+        return backend
 
     def create_draft_extend_backend(self):
         backend_map = {

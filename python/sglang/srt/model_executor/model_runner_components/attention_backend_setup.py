@@ -123,7 +123,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             get_world_group().cpu_group,
         )
 
-    # Record resolved per-mode backends on the backend for model dispatch.
+    # TboAttnBackend is built around _build_resolved_backend rather than by it,
+    # and it subclasses AttentionBackend, so the class-attribute default shadows
+    # its __getattr__ delegation -- stamp the wrapper itself too.
     attn_backend.prefill_attention_backend_str = resolved.prefill
     attn_backend.decode_attention_backend_str = resolved.decode
 
@@ -221,6 +223,13 @@ def _build_resolved_backend(
             backend_str=model_runner.server_args.attention_backend,
             init_new_workspace=init_new_workspace,
         )
+    # Stamp here rather than at the caller so every construction path carries the
+    # name: the pdmux per-stream group, the TBO children, and
+    # get_attention_backend() for the spec target runner all land in this
+    # function.  Model dispatch reads these off the backend instead of
+    # re-deriving them from server_args.
+    attn_backend.prefill_attention_backend_str = resolved.prefill
+    attn_backend.decode_attention_backend_str = resolved.decode
     return attn_backend
 
 

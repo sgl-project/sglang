@@ -247,11 +247,16 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         kv_indptr_buf = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=self.draft_model_runner.device
         )
-        return TritonAttnBackend(
+        backend = TritonAttnBackend(
             self.draft_model_runner,
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
+        # Only non-factory draft backend construction; stamp it like
+        # DraftBackendFactory does so model dispatch reads the name off it.
+        backend.prefill_attention_backend_str = "triton"
+        backend.decode_attention_backend_str = "triton"
+        return backend
 
     def _bind_kv_context(self) -> None:
         draft_model = self.draft_model_runner.model

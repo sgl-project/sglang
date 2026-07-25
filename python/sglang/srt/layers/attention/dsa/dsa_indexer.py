@@ -145,13 +145,8 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
     server_args = get_server_args()
-    prefill_backend, decode_backend = server_args.get_attention_backends()
-    prefill_backend = (
-        getattr(attn_backend, "prefill_attention_backend_str", None) or prefill_backend
-    )
-    decode_backend = (
-        getattr(attn_backend, "decode_attention_backend_str", None) or decode_backend
-    )
+    prefill_backend = attn_backend.prefill_attention_backend_str
+    decode_backend = attn_backend.decode_attention_backend_str
 
     if forward_batch.forward_mode.is_decode_or_idle():
         backend_name = decode_backend
