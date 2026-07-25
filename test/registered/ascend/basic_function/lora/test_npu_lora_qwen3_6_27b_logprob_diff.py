@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """
+GPU test is test_lora_qwen3_5_4b_logprob_diff
 NPU regression test for Qwen3.5-4B LoRA logprob accuracy.
 
 Compares SGLang LoRA logprobs against reference training logprobs from a
