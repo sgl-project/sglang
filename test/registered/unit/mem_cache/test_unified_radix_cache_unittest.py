@@ -3794,16 +3794,18 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
         parent = leaf.parent
         leaf.component_data[ComponentType.MAMBA].value = None
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
-        self.assertIs(result.best_match_node, parent)
-        self.assertIs(result.last_device_node, parent)
+        self.assertIs(cache.resolve_node_handle(result.best_match_node), parent)
+        self.assertIs(cache.resolve_node_handle(result.last_device_node), parent)
         self.assertEqual(len(result.device_indices), chunk_size)
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.full_kv_hit_length, len(tokens))
@@ -3819,31 +3821,36 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
 
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        ).last_device_node
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
         parent = leaf.parent
         self._backup_node(cache, leaf)
-        lock_result = cache.inc_lock_ref(parent)
+        lock_result = cache.inc_lock_ref(parent.id)
         try:
             cache.evict(EvictParams(num_tokens=len(leaf.key)))
         finally:
             cache.dec_lock_ref(
-                parent,
+                parent.id,
                 DecLockRefParams(
                     swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
                 ),
             )
         self.assertTrue(leaf.evicted)
         self.assertTrue(leaf.backuped)
+        device_frees = defaultdict(list)
+        host_frees = defaultdict(list)
         cache.components[ComponentType.MAMBA].evict_component(
-            leaf, target=EvictLayer.HOST
+            leaf, device_frees, host_frees, target=EvictLayer.HOST
         )
+        cache._free_values(device_frees, host_frees)
 
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
-        self.assertIs(result.best_match_node, parent)
-        self.assertIs(result.last_device_node, parent)
+        self.assertIs(cache.resolve_node_handle(result.best_match_node), parent)
+        self.assertIs(cache.resolve_node_handle(result.last_device_node), parent)
         self.assertEqual(len(result.device_indices), chunk_size)
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.full_kv_hit_length, len(tokens))

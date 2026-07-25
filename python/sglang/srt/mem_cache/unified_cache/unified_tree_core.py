@@ -520,6 +520,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
             action,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
@@ -528,6 +529,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
             action,
         )
 
@@ -535,6 +537,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
+        int,
         int,
         Optional[CacheAction | ComponentAction],
     ]:
@@ -548,6 +551,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         if separate_device_match:
@@ -591,6 +595,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -611,6 +616,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
             action,
         )
 
@@ -621,6 +627,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
     ) -> MatchResult:
         node_update = best_match_node
@@ -653,6 +660,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
         for component in self.components:

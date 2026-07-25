@@ -66,6 +66,7 @@ class MambaComponent(TreeComponent):
                 params.page_size == 1
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
         super().__init__(cache, params)
+        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
         self.mamba_max_states_per_path = get_server_args().mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
@@ -116,16 +117,17 @@ class MambaComponent(TreeComponent):
     ) -> MatchResult:
         last_node = result.best_match_node
 
-        # HiCache can still use prefix matches and load back host-backed Mamba
-        # states, so branching-state fill is skipped while HiCache is enabled.
-        if not self.tree_core.enable_hicache and len(value_chunks) > best_value_len:
-            chunk_size = get_server_args().mamba_cache_chunk_size
-            aligned_seqlen = (
-                sum(len(v) for v in value_chunks) // chunk_size
-            ) * chunk_size
-            branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
-        else:
-            branching_seqlen = None
+        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+
+        # Full KV may extend beyond the latest reusable Mamba state. The branching
+        # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
+        # that lies beyond the current Mamba boundary.
+        aligned_seqlen = (
+            result.full_kv_hit_length // self.mamba_cache_chunk_size
+        ) * self.mamba_cache_chunk_size
+        branching_seqlen = (
+            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
+        )
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.
