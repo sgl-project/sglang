@@ -378,7 +378,7 @@ class TestNPUStreamingSessionEagle(
         "512",
         *_EAGLE3_SPEC_ARGS,
         "--page-size",
-        "4",
+        "128",
     ]
     env_overrides = [("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True)]
 
@@ -400,7 +400,7 @@ class TestNPUStreamingSessionEagleV2(
         "512",
         *_EAGLE3_SPEC_ARGS,
         "--page-size",
-        "4",
+        "128",
     ]
     env_overrides = [("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True)]
 
