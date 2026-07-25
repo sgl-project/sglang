@@ -309,10 +309,10 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      - name: Rust cache (sglang-grpc)
+      - name: Rust cache (rust/ workspace)
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/sglang-grpc
+          workspaces: rust
           shared-key: "sglang-grpc-cpu"
           save-if: ${{ matrix.partition == 0 }}
 
