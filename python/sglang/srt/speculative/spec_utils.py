@@ -570,12 +570,12 @@ class GrammarTree:
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
     ) -> GrammarTree:
-        host = tuple(
-            _async_d2h(t)
-            for t in (retrieve_next_token, retrieve_next_sibling, draft_token)
-        )
-        device = retrieve_next_token.device
-        if device.type == "cpu":
+        tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
+        host = tuple(_async_d2h(t) for t in tensors)
+        # Sources may be mixed -- an algorithm can synthesize part of the tree on
+        # the host -- so the event has to key off whichever one is on device.
+        device = next((t.device for t in tensors if t.device.type != "cpu"), None)
+        if device is None:
             return cls(host, None)
         done = torch.get_device_module(device).Event()
         done.record()
