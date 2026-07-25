@@ -903,7 +903,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         assert (
             not swizzle
         ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-        down_input_scale = torch.empty(
+        down_input_scale = torch.zeros(
             (E, N, G),
             device=hidden_states_device,
             dtype=torch.float32,
