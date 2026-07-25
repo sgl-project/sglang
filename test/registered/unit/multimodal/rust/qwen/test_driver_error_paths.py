@@ -1,10 +1,9 @@
-"""Native driver error classification: out-of-scope vs hard failure.
+"""Native driver error paths: out-of-scope and malformed inputs are rejected.
 
-``fallback:`` marks requests outside the native pipeline's scope (video/
-audio, precomputed inputs, undecodable images); ``failed:`` marks hard
-errors. With no Python fallback path the server rejects both classes as a
-400 — the classification is kept for diagnostics (and future fallback
-consumers), and this pins the contract.
+There is no Python fallback path, so the server rejects every driver error
+back to the client as a 400; the message must say why (unsupported modality,
+placeholder mismatch, undecodable image, missing prompt). This pins that
+contract for each rejection class.
 """
 
 import io
@@ -47,24 +46,24 @@ def gif_bytes():
     "sglang-mm native Qwen driver not built",
 )
 class TestNativeDriverErrorPaths(CustomTestCase):
-    def assert_outcome(self, payload, pattern):
+    def assert_rejected(self, payload, pattern):
         with self.assertRaisesRegex(ValueError, pattern):
             QWEN_CORE.process_native_mm_payload(payload, SPEC)
 
-    def test_video_or_audio_falls_back(self):
+    def test_video_or_audio_rejected(self):
         for field in ("video", "audio"):
             with self.subTest(field=field):
                 payload = request_payload(
                     IMAGE_IDS, [image_bytes(80, 80)], **{field: "media.mp4"}
                 )
-                self.assert_outcome(payload, "fallback.*video/audio")
+                self.assert_rejected(payload, "video/audio")
 
     def test_empty_video_audio_lists_process_natively(self):
         payload = request_payload(IMAGE_IDS, [image_bytes(80, 80)], video=[], audio=[])
         ids = QWEN_CORE.process_native_mm_payload(payload, SPEC)[0]
         self.assertGreater(len(ids), len(IMAGE_IDS))
 
-    def test_placeholder_count_mismatches_fall_back(self):
+    def test_placeholder_count_mismatches_rejected(self):
         cases = {
             "no placeholder": ([7, 8], [image_bytes(80, 80)]),
             "more images": (IMAGE_IDS, [image_bytes(80, 80), image_bytes(88, 80, 1)]),
@@ -72,22 +71,18 @@ class TestNativeDriverErrorPaths(CustomTestCase):
         }
         for name, (ids, images) in cases.items():
             with self.subTest(case=name):
-                self.assert_outcome(
-                    request_payload(ids, images), "fallback.*placeholder"
-                )
+                self.assert_rejected(request_payload(ids, images), "placeholder")
 
-    def test_undecodable_images_fall_back(self):
-        # PIL-only formats (and corrupt bytes) are classified `fallback:` —
-        # outside the native decoder's scope; the server rejects them as 400.
+    def test_undecodable_images_rejected(self):
+        # PIL-only formats (and corrupt bytes) are outside the native
+        # decoder's scope; the server rejects them as a 400.
         for name, data in {"gif": gif_bytes(), "corrupt": b"junk"}.items():
             with self.subTest(image=name):
-                self.assert_outcome(
-                    request_payload(IMAGE_IDS, [data]), "fallback.*decode"
-                )
+                self.assert_rejected(request_payload(IMAGE_IDS, [data]), "decode")
 
-    def test_missing_text_and_input_ids_fails(self):
+    def test_missing_text_and_input_ids_rejected(self):
         payload = request_payload(None, [image_bytes(80, 80)])
-        self.assert_outcome(payload, "failed.*without text or input_ids")
+        self.assert_rejected(payload, "without text or input_ids")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,14 @@
 //! Multimodal worker pool.
 //!
 //! Rust-owned threads drain requests parked in the `Encoding` stage and run
-//! the native pipeline ([`native`]) for the model family whose spec was
-//! registered via `Server.start_mm_workers`: fetch → decode → preprocess →
-//! placeholder expansion → M-RoPE, entirely in Rust (GIL-free). The worker
-//! stores the result in the rid-keyed [`NativeSidecar`] and returns the
-//! expanded ids; the Python side attaches the buffers at drain time
-//! (`Server.take_native_mm`). Requests the pipeline cannot serve
-//! (video/audio, precomputed inputs, undecodable images) are rejected back to
-//! the client — there is no Python fallback path.
+//! the `sglang-mm` pipeline for the model family whose spec was registered
+//! via `Server.start_mm_workers`: fetch → decode → preprocess → placeholder
+//! expansion → M-RoPE, entirely in Rust (GIL-free). The worker stores the
+//! result in the rid-keyed [`Sidecar`] and returns the expanded ids; the
+//! Python side attaches the buffers at drain time (`Server.take_mm`).
+//! Requests the pipeline cannot serve (video/audio, precomputed inputs,
+//! undecodable images) are rejected back to the client — there is no Python
+//! fallback path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,37 +17,53 @@ use crate::message::MmRequest;
 use crate::tokenizer::TextTokenizer;
 use crate::tokenizer_manager::TmEvent;
 
-pub mod native;
-
-/// One native result: everything the drain-time Python adapter needs.
-pub type NativeMmResult = sglang_mm::native_driver::NativeMmResult;
+/// One mm result: everything the drain-time Python adapter needs.
+pub type MmResult = sglang_mm::driver::MmResult;
 
 /// Results parked between a worker's `MmEncoded` and the scheduler's drain.
 /// An entry is stored strictly before `MmEncoded` is emitted and popped by
-/// `Server.take_native_mm`; late results for rejected requests are purged by
-/// the ingress.
-pub type NativeSidecar = Arc<Mutex<HashMap<String, NativeMmResult>>>;
+/// `Server.take_mm`; late results for rejected requests are purged by the
+/// ingress.
+pub type Sidecar = Arc<Mutex<HashMap<String, MmResult>>>;
 
-/// Shared state of the native path, built once at `start_mm_workers`.
-pub struct NativeContext {
-    pub pipeline: sglang_mm::registry::NativePipeline,
+/// Shared state of the mm path, built once at `start_mm_workers`.
+pub struct Context {
+    pub pipeline: sglang_mm::registry::Pipeline,
     /// `None` under `skip_tokenizer_init` (requests must carry `input_ids`).
     pub tokenizer: Option<Arc<dyn TextTokenizer>>,
-    pub sidecar: NativeSidecar,
+    pub sidecar: Sidecar,
 }
 
-impl NativeContext {
+impl Context {
     pub fn new(
         spec_json: &str,
         tokenizer: Option<Arc<dyn TextTokenizer>>,
-        sidecar: NativeSidecar,
+        sidecar: Sidecar,
     ) -> Result<Self, String> {
         Ok(Self {
-            pipeline: sglang_mm::registry::native_pipeline_from_spec(spec_json)?,
+            pipeline: sglang_mm::registry::pipeline_from_spec(spec_json)?,
             tokenizer,
             sidecar,
         })
     }
+}
+
+/// Run the pipeline for one request. `Ok` returns the final
+/// placeholder-expanded ids (the mm buffers are parked in the sidecar
+/// strictly before returning); `Err` rejects the request back to the client.
+fn process(ctx: &Context, req: &MmRequest) -> Result<Vec<i32>, String> {
+    let output = sglang_mm::driver::process(&ctx.pipeline, &req.payload, |text| {
+        let tokenizer = ctx.tokenizer.as_ref().ok_or_else(|| {
+            "skip_tokenizer_init is set: multimodal text prompts require input_ids".to_string()
+        })?;
+        tokenizer.encode(text).map_err(|error| error.to_string())
+    })?;
+    let input_ids = output.input_ids;
+    ctx.sidecar
+        .lock()
+        .unwrap()
+        .insert(req.rid.clone(), output.mm);
+    Ok(input_ids)
 }
 
 /// Spawn `workers` `mm-worker-{i}` threads and return their join handles for
@@ -59,14 +75,14 @@ pub fn spawn_workers(
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
     workers: usize,
-    native: Arc<NativeContext>,
+    ctx: Arc<Context>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..workers.max(1))
         .map(|i| {
             let worker = MmWorker {
                 rx: rx.clone(),
                 tm: tm.clone(),
-                native: native.clone(),
+                ctx: ctx.clone(),
             };
             std::thread::Builder::new()
                 .name(format!("mm-worker-{i}"))
@@ -79,7 +95,7 @@ pub fn spawn_workers(
 struct MmWorker {
     rx: flume::Receiver<MmRequest>,
     tm: flume::Sender<TmEvent>,
-    native: Arc<NativeContext>,
+    ctx: Arc<Context>,
 }
 
 impl MmWorker {
@@ -91,9 +107,9 @@ impl MmWorker {
     fn run(self) {
         while let Ok(req) = self.rx.recv() {
             let rid = req.rid.clone();
-            let event = match native::process(&self.native, &req) {
+            let event = match process(&self.ctx, &req) {
                 Ok(input_ids) => {
-                    tracing::debug!(%rid, tokens = input_ids.len(), "native mm: processed");
+                    tracing::debug!(%rid, tokens = input_ids.len(), "mm: processed");
                     TmEvent::MmEncoded { rid, input_ids }
                 }
                 Err(message) => {

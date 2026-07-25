@@ -7,8 +7,8 @@
 //!   native MM worker path — no pyo3 in that dependency graph.
 
 pub mod common;
+pub mod driver;
 pub mod inkling;
-pub mod native_driver;
 pub mod qwen_vl;
 pub mod registry;
 

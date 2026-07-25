@@ -1,12 +1,13 @@
-//! Shared native multimodal request driver.
+//! Shared multimodal request driver for the server (pure-Rust) pipeline.
 
 use rayon::prelude::*;
 
-use crate::common::payload::{ImageSource, NativeError};
+use crate::common::payload::ImageSource;
 use crate::common::{self, fetch, payload, tokens};
-use crate::registry::{MropeItem, NativePipeline, ProcessedImage};
+use crate::registry::{MropeItem, Pipeline, ProcessedImage};
 
-pub struct NativeMmResult {
+/// The per-request mm buffers parked for the scheduler drain.
+pub struct MmResult {
     pub features: Vec<f32>,
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -15,16 +16,20 @@ pub struct NativeMmResult {
     pub mrope_delta: i64,
 }
 
-pub struct NativeDriverOutput {
+pub struct Output {
     pub input_ids: Vec<i32>,
-    pub mm: NativeMmResult,
+    pub mm: MmResult,
 }
 
+/// Run one request through the pipeline. Any `Err` rejects the request back
+/// to the client — including inputs merely outside the pipeline's scope
+/// (video/audio, precomputed features, undecodable images), since there is
+/// no Python fallback path.
 pub fn process(
-    pipeline: &NativePipeline,
+    pipeline: &Pipeline,
     payload_bytes: &[u8],
     tokenize: impl FnOnce(&str) -> Result<Vec<i32>, String>,
-) -> Result<NativeDriverOutput, NativeError> {
+) -> Result<Output, String> {
     let payload = payload::parse(payload_bytes)?;
     let processed: Vec<(ProcessedImage, u64)> = common::pool().install(|| {
         payload
@@ -32,46 +37,34 @@ pub fn process(
             .par_iter()
             .map(|source| {
                 let bytes = match source {
-                    ImageSource::String(source) => {
-                        fetch::fetch_bytes(source).map_err(|error| match error {
-                            fetch::FetchError::Unsupported(message) => {
-                                NativeError::Fallback(message)
-                            }
-                            fetch::FetchError::Failed(message) => NativeError::Failed(message),
-                        })?
-                    }
+                    ImageSource::String(source) => fetch::fetch_bytes(source)?,
                     ImageSource::Bytes(bytes) => bytes.clone(),
                 };
-                // Decode failure falls back rather than failing: the Python
-                // path decodes more formats (GIF/WebP/BMP, 16-bit PNG) via
-                // PIL, and it returns the 400 itself for truly corrupt bytes.
-                let (rgb, height, width) =
-                    common::decode_rgb(&bytes).map_err(NativeError::Fallback)?;
-                let image = pipeline
-                    .processor
-                    .process_image(&rgb, height, width)
-                    .map_err(NativeError::Failed)?;
+                // The Python (PIL) path decodes more formats (GIF/WebP/BMP,
+                // 16-bit PNG); those error here and reject the request.
+                let (rgb, height, width) = common::decode_rgb(&bytes)?;
+                let image = pipeline.processor.process_image(&rgb, height, width)?;
                 let hash = common::sha256_u64(f32_bytes(&image.pixel_values));
                 Ok((image, hash))
             })
-            .collect::<Result<Vec<_>, NativeError>>()
+            .collect::<Result<Vec<_>, String>>()
     })?;
 
     let input_ids = match payload.input_ids {
         Some(input_ids) if !input_ids.is_empty() => input_ids,
         _ => {
-            let text = payload.text.as_deref().ok_or_else(|| {
-                NativeError::Failed("multimodal request without text or input_ids".into())
-            })?;
-            tokenize(text).map_err(NativeError::Failed)?
+            let text = payload
+                .text
+                .as_deref()
+                .ok_or("multimodal request without text or input_ids")?;
+            tokenize(text)?
         }
     };
     let counts = processed
         .iter()
         .map(|(image, _)| pipeline.processor.tokens_per_image(&image.grid_thw))
         .collect::<Vec<_>>();
-    let expanded = tokens::expand_placeholders(&input_ids, pipeline.image_token_id, &counts)
-        .map_err(NativeError::Fallback)?;
+    let expanded = tokens::expand_placeholders(&input_ids, pipeline.image_token_id, &counts)?;
     let mrope_items = expanded
         .offsets
         .iter()
@@ -84,8 +77,7 @@ pub fn process(
         .collect::<Vec<_>>();
     let (mrope, mrope_delta) = pipeline
         .processor
-        .mrope_image_only(expanded.input_ids.len(), &mrope_items)
-        .map_err(NativeError::Failed)?;
+        .mrope_image_only(expanded.input_ids.len(), &mrope_items)?;
 
     let mut features = Vec::with_capacity(
         processed
@@ -100,9 +92,9 @@ pub fn process(
         grids.push(image.grid_thw);
         hashes.push(hash);
     }
-    Ok(NativeDriverOutput {
+    Ok(Output {
         input_ids: expanded.input_ids,
-        mm: NativeMmResult {
+        mm: MmResult {
             features,
             grids,
             hashes,

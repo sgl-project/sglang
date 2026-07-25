@@ -273,15 +273,11 @@ pub struct MmRequest {
 
 /// Rust mirror of Python `has_valid_data` for an opaque mm field: `null` and
 /// (recursively) empty / all-null lists don't count as multimodal input.
+/// Delegates to the same `value_present` the MM worker's payload parser uses,
+/// so routing and parsing can never disagree on what counts as present.
 fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    fn valid(v: &rmpv::Value) -> bool {
-        match v {
-            rmpv::Value::Nil => false,
-            rmpv::Value::Array(items) => items.iter().any(valid),
-            _ => true,
-        }
-    }
-    v.as_ref().is_some_and(valid)
+    v.as_ref()
+        .is_some_and(sglang_mm::common::payload::value_present)
 }
 
 /// Request variant — selects the ingress branch, scheduler wire message, and

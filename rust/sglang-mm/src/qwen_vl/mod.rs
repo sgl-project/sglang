@@ -132,10 +132,6 @@ impl VisionProcessor for QwenVlProcessor {
             / (self.spec.merge_size * self.spec.merge_size)
     }
 
-    fn feature_dim(&self) -> usize {
-        3 * self.spec.temporal_patch_size * self.spec.patch_size * self.spec.patch_size
-    }
-
     fn mrope_image_only(
         &self,
         input_len: usize,
@@ -334,11 +330,10 @@ mod python {
     ) -> PyResult<PyNativeOutput<'py>> {
         let output = py
             .detach(move || {
-                let pipeline = crate::registry::native_pipeline_from_spec(&spec_json)?;
-                crate::native_driver::process(&pipeline, &payload, |_| {
+                let pipeline = crate::registry::pipeline_from_spec(&spec_json)?;
+                crate::driver::process(&pipeline, &payload, |_| {
                     Err("native parity API requires input_ids".into())
                 })
-                .map_err(|error| error.to_string())
             })
             .map_err(PyValueError::new_err)?;
         let mm = output.mm;
@@ -427,7 +422,7 @@ mod tests {
         }
         let proc = QwenVlProcessor::new(spec()).unwrap();
         let pv = proc.patchify(&rgb, h, w);
-        let dim = proc.feature_dim();
+        let dim = 24; // 3 * tps * ps * ps
         assert_eq!(pv.len(), 2 * 4 * dim);
 
         // Patch order (gh/m=1, gw/m=2, m, m): patch 0 = block(0,0) offset (0,0),

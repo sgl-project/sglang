@@ -44,13 +44,13 @@ pub struct Runtime {
     /// Back-channel for the MM workers' results (`MmEncoded` / `MmFailed`)
     /// into the tm-ingress loop.
     pub tm: flume::Sender<TmEvent>,
-    /// The loaded tokenizer, shared with the native MM path (`None` under
+    /// The loaded tokenizer, shared with the MM worker path (`None` under
     /// `skip_tokenizer_init`).
     pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
-    /// Native MM results parked between a worker's `MmEncoded` and the
-    /// scheduler drain (`Server.take_native_mm`); empty unless a native MM
+    /// MM results parked between a worker's `MmEncoded` and the
+    /// scheduler drain (`Server.take_mm`); empty unless an MM
     /// pipeline is registered.
-    pub mm_native: crate::mm::NativeSidecar,
+    pub mm_sidecar: crate::mm::Sidecar,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -63,7 +63,7 @@ const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 impl Runtime {
     /// Adopt late-spawned worker threads (the MM pool, spawned once the Python
-    /// side has built the native spec) into the shutdown join set.
+    /// side has built the mm spec) into the shutdown join set.
     pub fn adopt_threads(&self, handles: Vec<JoinHandle<()>>) {
         self.threads.lock().unwrap().extend(handles);
     }
@@ -167,14 +167,14 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         skip_tokenizer_init,
     )?;
     // The `TextTokenizer` view of it, shared by the tokenizer pool and the
-    // native MM path (which encodes the placeholder-expanded prompt itself).
+    // MM worker path (which encodes the placeholder-expanded prompt itself).
     let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
-    // Sidecar for native MM results (shared: MM workers insert, the Python
+    // Sidecar for MM results (shared: MM workers insert, the Python
     // drain pops, tm-ingress purges late entries).
-    let mm_native: crate::mm::NativeSidecar = Default::default();
+    let mm_sidecar: crate::mm::Sidecar = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -255,7 +255,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let mm_enabled = cfg.server_args.model_is_multimodal();
         let mut parts = Some((tm_rx, ingress_tx, mm_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
-        let mm_native = mm_native.clone();
+        let mm_sidecar = mm_sidecar.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx, mm_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
@@ -266,7 +266,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 cfg.server_args.model_config.vocab_size,
                 mm_enabled,
                 mm_tx,
-                mm_native.clone(),
+                mm_sidecar.clone(),
                 shutdown_rx.clone(),
             )
         });
@@ -316,7 +316,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         mm: mm_rx,
         tm: tm_tx,
         tokenizer: text_tokenizer,
-        mm_native,
+        mm_sidecar,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

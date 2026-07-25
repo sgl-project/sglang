@@ -1,7 +1,7 @@
 """E2E: Rust tokenizer-manager native multimodal path (``SGLANG_RUST_SERVER=1``).
 
 Covers what the CPU parity units structurally cannot: the sidecar handoff
-(``take_native_mm`` wrapping Rust-owned buffers), the drain ordering, the
+(``take_mm`` wrapping Rust-owned buffers), the drain ordering, the
 Rust-side text tokenization of multimodal prompts, and the rejection of
 inputs outside the native pipeline's scope (there is no Python fallback).
 """
@@ -99,7 +99,7 @@ class TestRustServerNativeMm(CustomTestCase):
 
     def test_unsupported_format_is_rejected(self):
         # GIF is not decodable natively and there is no Python fallback: the
-        # request must be rejected (fallback:* -> 4xx/500), not crash the server.
+        # request must be rejected (4xx/500), not crash the server.
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
             json={

@@ -20,18 +20,18 @@ tm-ingress FSM: Received → … → Normalizing
   │  audio] msgpack payload goes down a bounded channel
   ▼
 MM worker pool (sglang-server/src/mm.rs, N plain threads)
-  │  sglang-mm native_driver::process (rayon-parallel per image):
+  │  sglang-mm driver::process (rayon-parallel per image):
   │    fetch (data:/base64/file/http) → decode → smart_resize →
   │    bicubic resample → normalize (u8→f32 LUT) → patchify →
   │    feature hash; then placeholder expansion + image-only M-RoPE
-  │  result buffers parked in the rid-keyed NativeSidecar
+  │  result buffers parked in the rid-keyed mm sidecar
   ▼
 TmEvent::MmEncoded { rid, input_ids }   (final placeholder-expanded ids)
   │  ingress resumes the parked request: Encoding → Queued
   │  (skips the tokenizer pool — the ids are already final)
   ▼
 ingress ring → Python scheduler
-  │  RustServer.drain: take_native_mm(rid) pops the sidecar entry and
+  │  RustServer.drain: take_mm(rid) pops the sidecar entry and
   │  wraps it zero-copy (numpy owns the Rust buffers, torch.from_numpy
   │  wraps them; hashes are worker-precomputed) into
   │  MultimodalProcessorOutput → obj.mm_inputs
@@ -46,15 +46,14 @@ tensor wrapping; both are off the per-image hot path.
 ## Failure semantics (no Python fallback)
 
 - **Unsupported model family**: a multimodal model whose
-  `NativeMmHost.native_spec()` resolves to `None` (not in the family
+  `NativeMmHost.resolve_native_spec()` resolves to `None` (not in the family
   allowlist, unexpected processor class, unrecognized `--mm-process-config`
   overrides) **fails at launch** with a `RuntimeError`. Serve such models
   without `SGLANG_RUST_SERVER`.
-- **Per-request out-of-scope input** (`fallback:` classification —
-  video/audio, precomputed features, undecodable/PIL-only images) and **hard
-  errors** (`failed:` — bad URL, oversized fetch, preprocess error) are both
-  rejected back to the client (400/500). The `fallback:`/`failed:` message
-  prefixes from `sglang-mm` are kept as diagnostics.
+- **Per-request errors** — out-of-scope input (video/audio, precomputed
+  features, undecodable/PIL-only images) and hard failures (bad URL,
+  oversized fetch, preprocess error) alike — are rejected back to the client
+  (400/500) with a message saying why.
 - **Late results** for rejected/aborted requests are purged from the sidecar
   by the ingress.
 
@@ -62,14 +61,14 @@ tensor wrapping; both are off the per-image hot path.
 
 | Layer | Location | What lives there |
 |---|---|---|
-| Pipeline core | `rust/sglang-mm/src/native_driver.rs` | model-independent driver: fetch → decode → preprocess → hash → expand → M-RoPE (rayon) |
-| | `rust/sglang-mm/src/common/{fetch,payload,tokens,resize,transforms}.rs` | media fetch; msgpack payload decode + `fallback:`/`failed:` classification; placeholder expansion; PIL-exact Lanczos/Bicubic resize |
+| Pipeline core | `rust/sglang-mm/src/driver.rs` | model-independent driver: fetch → decode → preprocess → hash → expand → M-RoPE (rayon) |
+| | `rust/sglang-mm/src/common/{fetch,payload,tokens,resize,transforms}.rs` | media fetch; msgpack payload decode; placeholder expansion; PIL-exact Lanczos/Bicubic resize |
 | | `rust/sglang-mm/src/qwen_vl/mod.rs` | `QwenVlProcessor` (`VisionProcessor` impl) + feature-gated parity bindings |
-| | `rust/sglang-mm/src/registry.rs` | `VisionProcessor` trait, `NativePipeline`, `native_pipeline_from_spec` (family dispatch) |
-| Server integration | `rust/sglang-server/src/mm.rs`, `mm/native.rs` | worker pool + sidecar; drives the sglang-mm driver with the server tokenizer |
+| | `rust/sglang-mm/src/registry.rs` | `VisionProcessor` trait, `Pipeline`, `pipeline_from_spec` (family dispatch) |
+| Server integration | `rust/sglang-server/src/mm.rs` | worker pool + sidecar; drives the sglang-mm driver with the server tokenizer |
 | | `rust/sglang-server/src/message/request.rs` | mm fields on the wire body, per-item fan-out, mm payload encoding |
 | | `rust/sglang-server/src/tokenizer_manager/ingress.rs`, `fsm.rs` | `Encoding` stage: park/dispatch/resume/reject |
-| | `rust/sglang-server/src/lib.rs` | pyo3 surface: `start_mm_workers(spec_json, workers)`, `take_native_mm(rid)` |
+| | `rust/sglang-server/src/lib.rs` | pyo3 surface: `start_mm_workers(spec_json, workers)`, `take_mm(rid)` |
 | Python side | `python/sglang/srt/managers/rust_server.py` | `NativeMmHost` (spec build + launch gate), drain-time zero-copy adapter |
 
 The `sglang-mm` crate builds two ways: the pyo3 extension
@@ -93,7 +92,7 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 }
 ```
 
-`registry::native_pipeline_from_spec` deserializes it and dispatches on
+`registry::pipeline_from_spec` deserializes it and dispatches on
 `family`. `--mm-process-config {"image": {...}}` overrides are honored for
 `min_pixels`/`max_pixels` only.
 
@@ -103,7 +102,7 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 |---|---|---|
 | Pure-Rust unit tests (fetch, payload, tokens, qwen_vl geometry) | `#[cfg(test)]` in `rust/sglang-mm/src/**` | `cd rust/sglang-mm && cargo test --no-default-features` (CI: `pr-test-rust-exts.yml`) |
 | Server framework tests (mm fan-out, ingress Encoding arms, msgpack shapes) | `#[cfg(test)]` in `rust/sglang-server/src/**` | `cd rust && cargo test -p sglang-server` |
-| CPU parity suite vs real HF processors (preprocess, prompt geometry, scheduler-boundary output, drain adapter, error classification) | `test/registered/unit/multimodal/rust/{qwen,shared}/` | `python3 <file>` directly, or CI suite `base-a-test-cpu` (`_core` is built by `pip install -e python`) |
+| CPU parity suite vs real HF processors (preprocess, prompt geometry, scheduler-boundary output, drain adapter, error paths) | `test/registered/unit/multimodal/rust/{qwen,shared}/` | `python3 <file>` directly, or CI suite `base-a-test-cpu` (`_core` is built by `pip install -e python`) |
 | GPU e2e smoke (live sidecar handoff, multi-image, rejection paths) | `test/registered/vlm/test_rust_native_mm.py` | 1 GPU; CI stage `base-b` |
 | GPU quality gate (MMMU ≥ 0.30 through the native path, asserts the "native MM pipeline enabled" launch log) | `test/registered/vlm/test_rust_native_mm_mmmu.py` | 1 GPU; CI stage `base-b` |
 
@@ -111,23 +110,24 @@ unrecognized knob returns `None` and the launch gate fails. For `qwen_vl`:
 
 1. **Implement `VisionProcessor`** in `rust/sglang-mm/src/<family>/mod.rs`:
    `process_image` (HWC u8 → model-ready features + patch grid),
-   `tokens_per_image`, `feature_dim`, and `mrope_image_only` (or the model's
-   position scheme). Parse the family's spec struct from the spec JSON
+   `tokens_per_image`, and `mrope_image_only` (or the model's position
+   scheme). Parse the family's spec struct from the spec JSON
    (`from_spec_json`). Add `#[cfg(test)]` geometry tests. Reuse
    `common::{resize, transforms, tokens}` where the model matches PIL/HF
    semantics.
 2. **Register the family**: add a match arm in
-   `registry::native_pipeline_from_spec` (`rust/sglang-mm/src/registry.rs`)
+   `registry::pipeline_from_spec` (`rust/sglang-mm/src/registry.rs`)
    and `pub mod <family>;` in `rust/sglang-mm/src/lib.rs`. If you add parity
    bindings (recommended), feature-gate them like `qwen_vl::python` and
    register the submodule in the `_core` pymodule.
 3. **Extend the Python gate**: in
    `python/sglang/srt/managers/rust_server.py`, teach
-   `NativeMmHost.native_spec()` to recognize the model (processor class +
-   `model_type` allowlist) and emit the family's spec from the *resolved*
-   processor attributes. Stay conservative: return `None` for anything the
-   Rust pipeline does not mirror exactly. Extend `_build_native_mm` if the
-   scheduler needs different `model_specific_data`.
+   `NativeMmHost.resolve_native_spec()` to recognize the model (processor
+   class + `model_type` allowlist) and emit the family's spec from the
+   *resolved* processor attributes. Stay conservative: return `None` for
+   anything the Rust pipeline does not mirror exactly. Extend
+   `NativeMmHost.build_native_mm` if the scheduler needs different
+   `model_specific_data`.
 4. **Add the parity tests**: copy the qwen pattern under
    `test/registered/unit/multimodal/rust/<family>/` — a `_fixtures.py`
    building the real HF processor, then image-preprocess parity,

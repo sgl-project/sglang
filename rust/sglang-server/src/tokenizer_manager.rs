@@ -44,7 +44,7 @@ pub enum TmEvent {
     /// An MM worker finished a request parked in `Encoding`: `input_ids` are
     /// the final (placeholder-expanded) prompt ids from the native pipeline.
     /// The mm buffers ride the Rust sidecar (rid-keyed, popped by
-    /// `RustServer.drain` via `Server.take_native_mm`), not this event.
+    /// `RustServer.drain` via `Server.take_mm`), not this event.
     MmEncoded { rid: String, input_ids: Vec<i32> },
     /// An MM worker rejected a request parked in `Encoding` (bad media URL,
     /// unsupported modality, preprocess error, …) — reject it back to the

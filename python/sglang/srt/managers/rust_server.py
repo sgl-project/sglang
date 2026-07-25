@@ -42,67 +42,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _build_native_mm(*, native: Dict[str, Any], entry: tuple):
-    """Drain-time adapter: wrap the Rust-produced buffers into the scheduler's
-    ``MultimodalProcessorOutput``. Only tensor wrapping happens here — all
-    processing (load, resize, patchify, token expansion, M-RoPE) already ran
-    in Rust. This runs on the scheduler loop, so it must stay copy-free AND
-    hash-free: the numpy arrays from ``take_native_mm`` own the Rust buffers
-    (zero copy), ``torch.from_numpy`` only wraps them, and each item's
-    ``hash`` is the worker-precomputed feature hash so the scheduler's
-    ``set_pad_value`` skips ``hash_feature``. Any per-byte work here (memcpy,
-    sha256 — tens of MB per image-heavy request) measurably stalls every
-    running request's inter-token latency."""
-    import torch
-
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalProcessorOutput,
-    )
-
-    features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
-    features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
-    items = []
-    row = 0
-    for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
-        n = t * h * w
-        items.append(
-            MultimodalDataItem(
-                modality=Modality.IMAGE,
-                feature=features[row : row + n],
-                hash=item_hash,
-                offsets=[tuple(offset)],
-                model_specific_data={
-                    "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-                },
-            )
-        )
-        row += n
-    if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
-        for item in items:
-            item.set_pad_value()
-    mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
-    return MultimodalProcessorOutput(
-        mm_items=items,
-        im_token_id=native["image_token_id"],
-        im_start_id=native["vision_start_token_id"],
-        im_end_id=native["vision_end_token_id"],
-        video_token_id=native["video_token_id"],
-        mrope_positions=mrope_positions,
-        mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
-    )
-
-
 class NativeMmHost:
     """Builds and validates the native Rust MM pipeline for one model.
 
     Construction loads the same model-specific ``mm_processor`` stack the
     Python TokenizerManager would build — not to process requests (the Rust
     worker pool does that natively, GIL-free), but as the source of truth
-    :meth:`native_spec` validates and resolves the pipeline parameters from.
-    At drain time :meth:`build_native_mm` wraps the Rust-produced buffers into
-    the scheduler's ``MultimodalProcessorOutput``.
+    :meth:`resolve_native_spec` validates and resolves the pipeline parameters
+    from. At drain time :meth:`build_native_mm` wraps the Rust-produced
+    buffers into the scheduler's ``MultimodalProcessorOutput``.
 
     There is no Python fallback: a model without a native spec fails at
     launch, and per-request inputs outside the pipeline's scope (video/audio,
@@ -151,8 +99,8 @@ class NativeMmHost:
             model_config=self.model_config,
         )
         self._processor = _processor
-        # Set by native_spec() when the model family has a pure-Rust pipeline;
-        # consumed by build_native_mm (the drain-time adapter).
+        # Set by resolve_native_spec() when the model family has a pure-Rust
+        # pipeline; consumed by build_native_mm (the drain-time adapter).
         self._native: Optional[Dict[str, Any]] = None
 
     # Model types whose image-only M-RoPE matches the native fast path.
@@ -160,7 +108,7 @@ class NativeMmHost:
         ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
     )
 
-    def native_spec(self) -> Optional[str]:
+    def resolve_native_spec(self) -> Optional[str]:
         """JSON spec for the Rust-native MM pipeline, or ``None`` when the
         model has no native pipeline (the launch gate turns that into a hard
         error). Only resolved settings are carried (patch geometry, pixel
@@ -228,8 +176,56 @@ class NativeMmHost:
         return json.dumps(spec)
 
     def build_native_mm(self, entry: tuple):
-        """Drain-time adapter — see :func:`_build_native_mm`."""
-        return _build_native_mm(native=self._native, entry=entry)
+        """Drain-time adapter: wrap the Rust-produced buffers into the
+        scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
+        here — all processing (load, resize, patchify, token expansion, M-RoPE)
+        already ran in Rust. This runs on the scheduler loop, so it must stay
+        copy-free AND hash-free: the numpy arrays from ``take_mm`` own the Rust
+        buffers (zero copy), ``torch.from_numpy`` only wraps them, and each
+        item's ``hash`` is the worker-precomputed feature hash so the
+        scheduler's ``set_pad_value`` skips ``hash_feature``. Any per-byte work
+        here (memcpy, sha256 — tens of MB per image-heavy request) measurably
+        stalls every running request's inter-token latency."""
+        import torch
+
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+
+        native = self._native
+        features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
+        features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
+        items = []
+        row = 0
+        for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
+            n = t * h * w
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=features[row : row + n],
+                    hash=item_hash,
+                    offsets=[tuple(offset)],
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+                    },
+                )
+            )
+            row += n
+        if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+            for item in items:
+                item.set_pad_value()
+        mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
+        return MultimodalProcessorOutput(
+            mm_items=items,
+            im_token_id=native["image_token_id"],
+            im_start_id=native["vision_start_token_id"],
+            im_end_id=native["vision_end_token_id"],
+            video_token_id=native["video_token_id"],
+            mrope_positions=mrope_positions,
+            mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
+        )
 
 
 class RustServer:
@@ -297,7 +293,7 @@ class RustServer:
                 model_config=scheduler.model_config,
                 processor=scheduler.processor,
             )
-            spec = mm_host.native_spec()
+            spec = mm_host.resolve_native_spec()
             if spec is None:
                 raise RuntimeError(
                     "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
@@ -376,7 +372,7 @@ class RustServer:
                 # strictly before the ring push); wrap them into tensors here —
                 # the only Python step of the native path. `None` for text-only
                 # requests on a multimodal model.
-                native = self.server.take_native_mm(obj.rid)
+                native = self.server.take_mm(obj.rid)
                 if native is not None:
                     obj.mm_inputs = self.mm_host.build_native_mm(native)
             out.append(obj)

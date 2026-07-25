@@ -1,21 +1,10 @@
-//! Native multimodal request payload parsing.
+//! Server multimodal request payload parsing.
+//!
+//! Every `Err` rejects the request back to the client (there is no Python
+//! fallback path); the message says whether the input is malformed or merely
+//! outside the pipeline's scope (video/audio, precomputed features, ...).
 
 use rmpv::Value;
-
-#[derive(Debug)]
-pub enum NativeError {
-    Fallback(String),
-    Failed(String),
-}
-
-impl std::fmt::Display for NativeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Fallback(message) => write!(f, "fallback: {message}"),
-            Self::Failed(message) => write!(f, "failed: {message}"),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum ImageSource {
@@ -23,30 +12,31 @@ pub enum ImageSource {
     Bytes(Vec<u8>),
 }
 
-pub struct NativePayload {
+#[derive(Debug)]
+pub struct Payload {
     pub text: Option<String>,
     pub input_ids: Option<Vec<i32>>,
     pub images: Vec<ImageSource>,
 }
 
 /// Decode `[text, input_ids, image_data, video_data, audio_data]`.
-pub fn parse(payload: &[u8]) -> Result<NativePayload, NativeError> {
+pub fn parse(payload: &[u8]) -> Result<Payload, String> {
     let value = rmpv::decode::read_value(&mut &payload[..])
-        .map_err(|e| NativeError::Failed(format!("mm payload decode: {e}")))?;
+        .map_err(|e| format!("mm payload decode: {e}"))?;
     let Value::Array(fields) = value else {
-        return Err(NativeError::Failed("mm payload is not an array".into()));
+        return Err("mm payload is not an array".into());
     };
     if fields.len() != 5 {
-        return Err(NativeError::Failed("mm payload arity mismatch".into()));
+        return Err("mm payload arity mismatch".into());
     }
     if value_present(&fields[3]) || value_present(&fields[4]) {
-        return Err(NativeError::Fallback("video/audio input".into()));
+        return Err("unsupported modality: video/audio input".into());
     }
 
     let text = match &fields[0] {
         Value::Nil => None,
         Value::String(value) => value.as_str().map(str::to_owned),
-        _ => return Err(NativeError::Failed("mm payload: non-string text".into())),
+        _ => return Err("mm payload: non-string text".into()),
     };
     let input_ids = match &fields[1] {
         Value::Nil => None,
@@ -57,32 +47,32 @@ pub fn parse(payload: &[u8]) -> Result<NativePayload, NativeError> {
                     value
                         .as_i64()
                         .map(|id| id as i32)
-                        .ok_or_else(|| NativeError::Failed("mm payload: non-int input id".into()))
+                        .ok_or_else(|| "mm payload: non-int input id".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        _ => return Err(NativeError::Failed("mm payload: bad input_ids".into())),
+        _ => return Err("mm payload: bad input_ids".into()),
     };
 
     let mut images = Vec::new();
     collect_images(&fields[2], &mut images)?;
     if images.is_empty() {
-        return Err(NativeError::Fallback("no raw image sources".into()));
+        return Err("no raw image sources in mm payload".into());
     }
-    Ok(NativePayload {
+    Ok(Payload {
         text,
         input_ids,
         images,
     })
 }
 
-fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), NativeError> {
+fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), String> {
     match value {
         Value::Nil => Ok(()),
         Value::String(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| NativeError::Failed("non-utf8 image source".into()))?;
+                .ok_or_else(|| "non-utf8 image source".to_string())?;
             out.push(ImageSource::String(value.to_owned()));
             Ok(())
         }
@@ -95,19 +85,20 @@ fn collect_images(value: &Value, out: &mut Vec<ImageSource>) -> Result<(), Nativ
                 match value {
                     Value::String(_) | Value::Binary(_) | Value::Nil => collect_images(value, out)?,
                     _ => {
-                        return Err(NativeError::Fallback(
-                            "nested/typed image_data shape".into(),
-                        ));
+                        return Err("unsupported image_data shape: nested/typed item".into());
                     }
                 }
             }
             Ok(())
         }
-        _ => Err(NativeError::Fallback("unsupported image_data shape".into())),
+        _ => Err("unsupported image_data shape".into()),
     }
 }
 
-fn value_present(value: &Value) -> bool {
+/// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty /
+/// all-nil lists don't count as multimodal input. Shared with the server's
+/// `has_multimodal` routing check so the two can never drift.
+pub fn value_present(value: &Value) -> bool {
     match value {
         Value::Nil => false,
         Value::Array(values) => values.iter().any(value_present),
@@ -148,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_modalities_and_shapes_fall_back() {
+    fn unsupported_modalities_and_shapes_rejected() {
         let video = encode(vec![
             Value::from("prompt"),
             Value::Nil,
@@ -156,25 +147,26 @@ mod tests {
             Value::from("video.mp4"),
             Value::Nil,
         ]);
-        assert!(matches!(parse(&video), Err(NativeError::Fallback(_))));
+        assert!(parse(&video).unwrap_err().contains("video/audio"));
 
         let dict = Value::Map(vec![(Value::from("format"), Value::from("x"))]);
-        assert!(matches!(
-            parse(&image_payload(Value::Array(vec![dict]))),
-            Err(NativeError::Fallback(_))
-        ));
+        assert!(
+            parse(&image_payload(Value::Array(vec![dict])))
+                .unwrap_err()
+                .contains("image_data shape")
+        );
     }
 
     #[test]
     fn malformed_payloads_fail() {
         // Truncated msgpack (array header, no elements) and wrong arity.
-        assert!(matches!(parse(b"\x91"), Err(NativeError::Failed(_))));
+        assert!(parse(b"\x91").is_err());
         let three = encode(vec![Value::Nil, Value::Nil, Value::from("a")]);
-        assert!(matches!(parse(&three), Err(NativeError::Failed(_))));
+        assert!(parse(&three).is_err());
     }
 
     #[test]
-    fn empty_video_audio_lists_do_not_fall_back() {
+    fn empty_video_audio_lists_are_not_modalities() {
         // Mirrors Python `has_valid_data`: nil / empty lists don't count.
         let payload = encode(vec![
             Value::Nil,
@@ -187,11 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn image_free_payload_falls_back() {
-        assert!(matches!(
-            parse(&image_payload(Value::Nil)),
-            Err(NativeError::Fallback(_))
-        ));
+    fn image_free_payload_rejected() {
+        assert!(
+            parse(&image_payload(Value::Nil))
+                .unwrap_err()
+                .contains("no raw image sources")
+        );
     }
 
     #[test]
@@ -203,6 +196,6 @@ mod tests {
             Value::Nil,
             Value::Nil,
         ]);
-        assert!(matches!(parse(&payload), Err(NativeError::Failed(_))));
+        assert!(parse(&payload).is_err());
     }
 }

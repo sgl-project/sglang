@@ -45,7 +45,7 @@ class TestQwenSchedulerInputParity(CustomTestCase):
         self.processor.cpu_executor.shutdown()
 
     def make_host(self):
-        """A drain-adapter host whose spec comes from ``native_spec()`` — the
+        """A drain-adapter host whose spec comes from ``resolve_native_spec()`` — the
         production extraction path — rather than a hand-built dict."""
         host = NativeMmHost.__new__(NativeMmHost)
         host.model_config = SimpleNamespace(hf_config=self.processor.hf_config)
@@ -53,11 +53,13 @@ class TestQwenSchedulerInputParity(CustomTestCase):
         host._processor = self.processor._processor
         host.server_args = self.processor.server_args
         host._native = None
-        return host, host.native_spec()
+        return host, host.resolve_native_spec()
 
     def compare(self, sources):
         host, spec = self.make_host()
-        self.assertIsNotNone(spec, "native_spec() rejected the fixture processor")
+        self.assertIsNotNone(
+            spec, "resolve_native_spec() rejected the fixture processor"
+        )
 
         input_ids = []
         for _ in sources:

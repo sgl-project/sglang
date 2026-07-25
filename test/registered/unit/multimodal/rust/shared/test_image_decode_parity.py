@@ -70,8 +70,8 @@ class TestRustImageDecode(CustomTestCase):
         gray16 = Image.fromarray(np.zeros((9, 9), dtype=np.uint16))
         cases = {
             "corrupt": b"not an image",
-            # PIL-only formats and bit depths must error (the request driver
-            # then falls back to the Python path) — never silently diverge.
+            # PIL-only formats and bit depths must error (the request is then
+            # rejected — there is no Python fallback) — never silently diverge.
             "gif": encode(rgb, "GIF"),
             "webp": encode(rgb, "WEBP"),
             "png16": encode(gray16, "PNG"),
