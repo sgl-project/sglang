@@ -10,8 +10,12 @@ mod egress;
 mod request;
 mod sampling;
 
-pub use egress::{ChunkEvent, EgressSink};
-pub use request::RequestKind;
+pub use egress::{
+    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, EgressItem, EgressSink,
+    SinkError, for_each_chunk,
+};
+pub use request::{RequestKind, abort_req_msgpack, control_req_msgpack};
+pub use sampling::normalize_sampling_params;
 
 use bytes::Bytes;
 

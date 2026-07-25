@@ -11,6 +11,7 @@
 //! All are non-blocking, so the GIL is never held across a wait.
 #![allow(dead_code)] // TODO: remove when the consumer PR lands
 
+mod detokenizer;
 mod environ;
 mod error;
 mod fsm;
@@ -18,6 +19,7 @@ mod ids;
 mod message;
 mod ring;
 mod runtime;
+mod tokenizer;
 mod tokenizer_manager;
 
 use pyo3::prelude::*;

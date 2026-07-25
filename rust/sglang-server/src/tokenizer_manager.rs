@@ -11,6 +11,9 @@
 //! ingress loop, [`Senders`] fanning out to the pools.
 #![allow(dead_code)] // TODO: remove when the consumer PR lands
 
+mod egress;
+mod ingress;
+
 use crate::ids::RidHash;
 use crate::message::{DetokMsg, Request};
 
