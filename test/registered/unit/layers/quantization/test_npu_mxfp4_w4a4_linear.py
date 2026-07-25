@@ -4,6 +4,9 @@ import unittest
 
 import torch
 
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    _prepare_dual_level_weight_l0_scale,
+)
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import (
     MXFP4_W4A4_GROUP_SIZE,
@@ -15,6 +18,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestNPUDualLevelMXFP4Linear(CustomTestCase):
+    def test_preserves_single_l0_scale_block(self):
+        weight_l0_scale = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+
+        prepared_scale = _prepare_dual_level_weight_l0_scale(weight_l0_scale)
+
+        self.assertEqual(prepared_scale.shape, (1, 4))
+        self.assertTrue(torch.equal(prepared_scale, weight_l0_scale.transpose(0, 1)))
 
 
 class TestMxfp4W4A4ConfigGroupAlignment(CustomTestCase):

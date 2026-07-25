@@ -67,6 +67,17 @@ def _prepare_mxfp4_w4a8_bias(
     return bias
 
 
+def _prepare_dual_level_weight_l0_scale(
+    weight_l0_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Transpose an online-quantized weight L0 scale for matmul."""
+    return (
+        weight_l0_scale.reshape(weight_l0_scale.shape[0], -1)
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+
 class _NPULinearMethodBase(LinearMethodBase):
 
     def __init__(
@@ -857,8 +868,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
             customize_dtype=torch.int8,
         )
 
-        # L0 scale -> [in//l0_block, out] (op returns [out, in//l0_block, 1]).
-        w_l0_scale = w_l0_scale.squeeze(-1).transpose(0, 1).contiguous()
+        # L0 scale -> [in//l0_block, out] (op returns [out, in//l0_block]).
+        w_l0_scale = _prepare_dual_level_weight_l0_scale(w_l0_scale)
 
         layer.weight = Parameter(qw_nz, requires_grad=False)
         layer.weight_l0_scale = Parameter(w_l0_scale, requires_grad=False)
