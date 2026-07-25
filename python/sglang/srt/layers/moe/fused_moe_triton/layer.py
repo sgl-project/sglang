@@ -630,6 +630,17 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        print(
+            "DBG_W13",
+            "sid",
+            shard_id,
+            "exp",
+            tuple(expert_data.shape),
+            "ld",
+            tuple(loaded_weight.shape),
+            loaded_weight.dtype,
+            flush=True,
+        )
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
