@@ -333,107 +333,6 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
-def _maybe_dump_weight_fingerprints(model: nn.Module, tag: str) -> None:
-    """Debug helper: set SGLANG_PRESHARDED_FP_DIR to dump rank0 tensor fingerprints."""
-    out_dir = os.environ.get("SGLANG_PRESHARDED_FP_DIR")
-    if not out_dir:
-        return
-    try:
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-        rank = get_tensor_model_parallel_rank()
-    except Exception:
-        rank = int(os.environ.get("RANK", "0"))
-    if rank != 0:
-        return
-    try:
-        import hashlib
-
-        # Broad sample: all layernorm/rms scales + a few large projections.
-        def _want(name: str) -> bool:
-            n = name.lower()
-            if "layernorm" in n or n.endswith("norm.weight"):
-                return True
-            for s in (
-                "embed_tokens.weight",
-                "lm_head.weight",
-                "layers.0.self_attn.kv_b_proj.weight",
-                "layers.0.self_attn.w_kc",
-                "layers.0.self_attn.w_vc",
-                "layers.3.mlp.experts.w13_weight",
-            ):
-                if s in name:
-                    return True
-            return False
-
-        tensors: Dict[str, Any] = {}
-        bag: Dict[str, torch.Tensor] = dict(model.state_dict())
-        for mod_name, mod in model.named_modules():
-            prefix = f"{mod_name}." if mod_name else ""
-            for attr_name, val in list(vars(mod).items()):
-                if attr_name.startswith("_"):
-                    continue
-                if isinstance(val, torch.Tensor) and not isinstance(
-                    val, torch.nn.Parameter
-                ):
-                    bag.setdefault(f"{prefix}{attr_name}", val)
-        for name, t in bag.items():
-            if not _want(name):
-                continue
-            # Always hash on CPU; fp8/int8 GPU .float() can device-assert.
-            cpu = t.detach().to(device="cpu", copy=True).contiguous()
-            flat = cpu.reshape(-1)
-            n = flat.numel()
-            if n == 0:
-                tensors[name] = {
-                    "shape": list(t.shape),
-                    "dtype": str(t.dtype),
-                    "sha1": "empty",
-                }
-                continue
-            # Byte-stable hash of raw storage (works for fp8/bf16/float)
-            raw = flat.view(torch.uint8).numpy().tobytes()
-            h = hashlib.sha1()
-            h.update(str(tuple(t.shape)).encode())
-            h.update(str(t.dtype).encode())
-            if n <= 4_000_000:
-                h.update(raw)
-            else:
-                # Strided sample of raw bytes
-                step = max(1, len(raw) // 800_000)
-                h.update(raw[::step])
-            # Soft stats only for float-like dtypes
-            stats = {}
-            if cpu.dtype in (
-                torch.float16,
-                torch.bfloat16,
-                torch.float32,
-                torch.float64,
-            ):
-                f = cpu.float().reshape(-1)
-                stats = {
-                    "mean": float(f.mean()),
-                    "first": float(f[0]),
-                }
-            tensors[name] = {
-                "shape": list(t.shape),
-                "dtype": str(t.dtype),
-                "sha1": h.hexdigest()[:20],
-                **stats,
-            }
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"fp_{tag}_rank{rank}.json")
-        with open(path, "w") as f:
-            json.dump(
-                {"tag": tag, "rank": rank, "n": len(tensors), "tensors": tensors},
-                f,
-                indent=2,
-            )
-        logger.info("Wrote weight fingerprints to %s (%d tensors)", path, len(tensors))
-    except Exception as e:
-        logger.warning("Failed to dump weight fingerprints: %s", e)
-
-
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -902,7 +801,6 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
-        _maybe_dump_weight_fingerprints(model, tag="auto_or_default")
         return model.eval()
 
     @staticmethod
@@ -1744,22 +1642,11 @@ class ShardedStateLoader(BaseModelLoader):
 
 
 class PreshardedModelLoader(DefaultModelLoader):
-    """Dump/reload per-rank post-process weights under
-    ``<model_path>/presharded/<config_subdir>/``.
+    """Dump/reload post-process weights under ``<model_path>/presharded/<subdir>/``.
 
-    Optional ``model_loader_extra_config`` roots (config subfolder always
-    appended)::
-
-        "presharded_path":       # target model cache root
-        "draft_presharded_path": # speculative draft cache root
-
-    Target and draft must not share a leaf directory. When only
-    ``presharded_path`` is set, the draft still uses
-    ``<draft_model_path>/presharded/`` (not the target override).
-
-    The dump directory must be on a filesystem shared by all ranks (and all
-    nodes in multi-node jobs): rank 0 aggregates per-rank manifests and every
-    rank reads common/rank safetensors from the same path on reload.
+    Optional roots in ``model_loader_extra_config`` (subdir still appended):
+    ``presharded_path`` (target), ``draft_presharded_path`` (speculative draft).
+    Dump dir must be shared across ranks/nodes.
     """
 
     DEFAULT_SUBDIR = "presharded"
@@ -1769,7 +1656,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     TMP_SUBDIR = "_tmp_presharding"
     PLAN_VERSION = 1
     DEFAULT_HASH_NUM_THREADS = 8
-    _CONTENT_HASH_HEX_LEN = 32  # xxh3_128 hex digest length
+    _CONTENT_HASH_HEX_LEN = 32
 
     def __init__(self, load_config: LoadConfig):
         extra = (
@@ -1785,7 +1672,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         )
         self._verify_on_load = bool(extra.pop("verify_on_load", False))
         load_config.model_loader_extra_config = extra
-        # DefaultModelLoader discovers source weights under AUTO.
         load_config.load_format = LoadFormat.AUTO
         super().__init__(load_config)
 
@@ -1819,7 +1705,6 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @classmethod
     def _presharded_ready(cls, presharded_dir: str) -> bool:
-        """True only after dump writes READY last (checksum.json alone is insufficient)."""
         return os.path.isfile(os.path.join(presharded_dir, cls.READY_FILENAME))
 
     def _presharded_dir(
@@ -1827,16 +1712,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         shard_config: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Resolve the dump/reload leaf directory for this model.
-
-        Layout: ``<root>/<config_subdir>/`` where ``root`` is, in order:
-
-        - draft: ``draft_presharded_path``, else ``<model_path>/presharded``
-        - target: ``presharded_path``, else ``<model_path>/presharded``
-
-        Draft never falls back to ``presharded_path`` so a target-only
-        override cannot be overwritten by the draft dump (DeepSeek MTP).
-        """
         if shard_config is None:
             shard_config = self._collect_shard_config(model_config)
         subfolder = self._build_subfolder_name(shard_config)
@@ -1849,30 +1724,19 @@ class PreshardedModelLoader(DefaultModelLoader):
         return os.path.join(root, subfolder)
 
     def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
-        """Cache-key fields: world sizes, layout/dtype knobs, EPLB, structural signature.
-
-        Content-only knobs (e.g. EPLB expert maps) must be listed explicitly;
-        shape changes are also covered by ``structural_signature``.
-        """
-        from sglang.srt.distributed import (
-            get_moe_data_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_pipeline_model_parallel_world_size,
-            get_tensor_model_parallel_world_size,
-        )
-
         def _safe(fn) -> int:
             try:
                 return fn()
             except (AssertionError, AttributeError, RuntimeError):
                 return 1
 
+        parallel = get_parallel()
         server_args = get_server_args()
         return {
-            "tp": _safe(get_tensor_model_parallel_world_size),
-            "dp": _safe(get_moe_data_parallel_world_size),
-            "ep": _safe(get_moe_expert_parallel_world_size),
-            "pp": _safe(get_pipeline_model_parallel_world_size),
+            "tp": _safe(lambda: parallel.tp_size),
+            "dp": _safe(lambda: parallel.moe_dp_size),
+            "ep": _safe(lambda: parallel.moe_ep_size),
+            "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": server_args.moe_dense_tp_size,
             "moe_dp_size": server_args.moe_dp_size,
             "enable_dp_lm_head": server_args.enable_dp_lm_head,
@@ -1889,7 +1753,6 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
-        """Hash file-backed expert maps so path reuse cannot hit a stale cache."""
         if value is None or value == "trivial":
             return value
         if value.endswith((".json", ".pt")) and os.path.isfile(value):
@@ -1937,7 +1800,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
 
         def _clear_meta_rope_cache() -> None:
-            # _ROPE_DICT is not keyed by device; drop meta entries before real init.
             meta_keys = [
                 k
                 for k, v in _ROPE_DICT.items()
@@ -1978,7 +1840,6 @@ class PreshardedModelLoader(DefaultModelLoader):
     def _make_rank_invariant_structural_signature(
         cls, local_sig: Optional[str]
     ) -> Optional[str]:
-        """All-gather local shape digests so PP ranks share one cache subfolder."""
         try:
             from sglang.srt.distributed import get_world_group
 
@@ -2027,12 +1888,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _hash_tensor(tensor: torch.Tensor) -> str:
-        """xxh3-128 over (shape, dtype, raw bytes).
-
-        Always hashes a CPU copy. Concurrent multi-thread CUDA D2H hashing was
-        observed to produce false content collisions (distinct RMSNorm weights
-        merged across ranks), which corrupts reload accuracy.
-        """
+        # CPU copy so concurrent dump workers cannot race CUDA D2H hashing.
         t = tensor.detach()
         prefix = str(tuple(t.shape)).encode() + str(t.dtype).encode()
         h = PreshardedModelLoader._new_content_hasher()
@@ -2041,7 +1897,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         if t.numel() == 0:
             return h.hexdigest()
 
-        # Contiguous CPU copy: safe under ThreadPoolExecutor during dump.
         cpu = t.contiguous().to(device="cpu", copy=True).contiguous()
         flat_u8 = cpu.reshape(-1).view(torch.uint8)
         h.update(memoryview(flat_u8.numpy()))
@@ -2086,7 +1941,6 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _collect_extra_tensors(model: nn.Module) -> Dict[str, torch.Tensor]:
-        """Tensor attrs not in state_dict (e.g. DeepSeek ``w_kc``); skip Parameter views."""
         seen: set = set()
         param_storages: set = set()
         for name, tensor in model.state_dict().items():
@@ -2118,7 +1972,6 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     @staticmethod
     def _rebind_parameter_aliases(model: nn.Module) -> None:
-        """Refresh GemmaRMSNorm.gemma_weight and GDN linear-attn Parameter aliases."""
         for _, module in model.named_modules():
             gemma_w = getattr(module, "gemma_weight", None)
             weight = getattr(module, "weight", None)
@@ -2151,18 +2004,11 @@ class PreshardedModelLoader(DefaultModelLoader):
                 attn.bias = conv1d.bias
 
     def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
-        """Fail fast before an expensive source load if the dump root is RO.
-
-        Only rank 0 probes (unique file) so concurrent multi-rank open/unlink
-        cannot race; all ranks still makedirs then barrier so the leaf exists
-        for every process before the source load.
-        """
         rank, _ = self._world_rank_and_size()
         try:
             os.makedirs(presharded_dir, exist_ok=True)
             if rank == 0:
                 probe = os.path.join(presharded_dir, ".presharded_write_probe")
-                # Retry: shared FS can lag briefly after makedirs.
                 last_err: Optional[OSError] = None
                 for _ in range(5):
                     try:
@@ -2194,22 +2040,18 @@ class PreshardedModelLoader(DefaultModelLoader):
         presharded_dir: str,
         shard_config: Dict[str, Any],
     ) -> nn.Module:
-        # Dump post-process state (after load_weights + process_weights_after_loading).
-        # Probe early so a read-only model_path fails before the full source load.
         self._ensure_presharded_dir_writable(presharded_dir)
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            # Share DefaultModelLoader's path (nvfp4-online env, mem logging).
             self.load_weights_and_postprocess(
                 model,
                 self._get_all_weights(model_config, model),
                 target_device,
             )
 
-            # Full state_dict so shared Parameter aliases all get filled on reload.
             state_dict = dict(model.state_dict())
             extras = self._collect_extra_tensors(model)
             self._dump_state_to_disk(state_dict, extras, presharded_dir, shard_config)
@@ -2218,7 +2060,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             gc.collect()
 
         self.counter_after_loading_weights = time.perf_counter()
-        _maybe_dump_weight_fingerprints(model, tag="presharded_dump")
         return model.eval()
 
     def _dump_state_to_disk(
@@ -2231,7 +2072,6 @@ class PreshardedModelLoader(DefaultModelLoader):
         rank, world_size = self._world_rank_and_size()
         tmp_dir = os.path.join(presharded_dir, self.TMP_SUBDIR)
         if rank == 0:
-            # Drop READY before rewrite so readers never see a partial dump.
             ready_path = os.path.join(presharded_dir, self.READY_FILENAME)
             if os.path.isfile(ready_path):
                 os.unlink(ready_path)
@@ -2343,7 +2183,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 )
             size = next(iter(sizes))
             ranks = sorted({r for r, _, _ in entries})
-            # One rank can map multiple names to the same content (e.g. k/v scale).
             rank_to_names: Dict[str, List[str]] = collections.defaultdict(list)
             for r, n, _ in entries:
                 rank_to_names[str(r)].append(n)
@@ -2435,7 +2274,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                             }
                         )
 
-        # Per-rank aggregate: sum-mod-2^64 of fold(name, content_hash)[:8] (order-independent).
         rank_checksums: Dict[str, str] = {}
         for r in range(world_size):
             total = 0
@@ -2536,7 +2374,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 continue
             param_data = state_dict[r["name"]].data
             param_shape = state_dict[r["name"]].shape
-            # Allow smaller dumped tensors to fill a prefix (e.g. vocab padding).
             for dim, size in enumerate(tensor.shape):
                 if size < param_shape[dim]:
                     param_data = param_data.narrow(dim, 0, size)
@@ -2567,7 +2404,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
-            # Shape-only: materialize post-process layout before copying dumped values.
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -2609,7 +2445,6 @@ class PreshardedModelLoader(DefaultModelLoader):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
-            # Shared Parameter storages: loading one name covers tied aliases.
             loaded_storages: set = set()
             for k in loaded_param_keys:
                 t = state_dict[k]
@@ -2636,7 +2471,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
         self.counter_after_loading_weights = time.perf_counter()
-        _maybe_dump_weight_fingerprints(model, tag="presharded_reload")
         return model.eval()
 
 

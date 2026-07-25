@@ -812,26 +812,22 @@ class TestShardConfig(unittest.TestCase):
             "init_expert_location",
             "structural_signature",
         }
+        parallel = SimpleNamespace(tp_size=8, moe_dp_size=2, moe_ep_size=4, pp_size=1)
         with mock.patch(
             "sglang.srt.model_loader.loader.get_server_args",
             return_value=server_args,
         ), mock.patch(
-            "sglang.srt.distributed.get_tensor_model_parallel_world_size",
-            return_value=8,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_data_parallel_world_size",
-            return_value=2,
-        ), mock.patch(
-            "sglang.srt.distributed.get_moe_expert_parallel_world_size",
-            return_value=4,
-        ), mock.patch(
-            "sglang.srt.distributed.get_pipeline_model_parallel_world_size",
-            return_value=1,
+            "sglang.srt.model_loader.loader.get_parallel",
+            return_value=parallel,
         ), mock.patch.object(
             loader, "_compute_structural_signature", return_value="sig16"
         ):
             cfg = loader._collect_shard_config(model_config)
         self.assertEqual(required, set(cfg.keys()))
+        self.assertEqual(cfg["tp"], 8)
+        self.assertEqual(cfg["dp"], 2)
+        self.assertEqual(cfg["ep"], 4)
+        self.assertEqual(cfg["pp"], 1)
         self.assertEqual(cfg["moe_dense_tp_size"], 1)
         self.assertEqual(cfg["moe_dp_size"], 2)
         self.assertTrue(cfg["enable_dp_lm_head"])
