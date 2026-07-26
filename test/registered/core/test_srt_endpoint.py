@@ -6,7 +6,6 @@ python3 -m unittest test_srt_endpoint.TestRustServerEndpoint
 python3 -m unittest test_srt_endpoint.TestRustServerLogprob
 """
 
-import importlib.util
 import json
 import random
 import time
@@ -27,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
     run_logprob_check,
 )
@@ -858,8 +858,8 @@ class TestTokenizeDetokenize(CustomTestCase):
 # `BatchHeader`/`decode_batch_frame` -> detok reshape) end to end. Suite
 # surface the rust server does not implement yet is skipped explicitly below.
 # ---------------------------------------------------------------------------
-@unittest.skipIf(
-    importlib.util.find_spec("sglang.srt.server._core") is None,
+@unittest.skipUnless(
+    is_rust_server_built(),
     "embedded rust server extension not built (e.g. AMD suite)",
 )
 class TestRustServerEndpoint(TestSRTEndpoint):

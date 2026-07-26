@@ -23,8 +23,8 @@
 //!     *size* (capped at the output length), so an over-estimate matches the same
 //!     stops — only an under-estimate misses. Python encodes each stop with the
 //!     tokenizer for the exact count; the byte bound avoids needing it here.
-//!   * `n > 1` (parallel sampling) is rejected, mirroring the `/generate` body
-//!     check — the rust egress maps one rid to one response.
+//!   * `n > 1` (parallel sampling) is rejected — the rust egress maps one rid to
+//!     one response, so every sample past the first would be dropped.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -303,12 +303,13 @@ impl SamplingParams {
             .unwrap_or(0);
         // Finite bound per regex (bounded → its real max length; unbounded →
         // MAX_LEN), matching Python's `max(get_max_seq_length(r) for r in …)`.
-        self.stop_regex_max_len = self
-            .stop_regex_strs
-            .iter()
-            .map(|r| regex_max_seq_length(r))
-            .max()
-            .unwrap_or(0);
+        // A malformed pattern is a 400 here, as `sre_parse.parse` raising is
+        // there — the scheduler `re.search`es these every decode step.
+        let mut stop_regex_max_len = 0;
+        for pattern in &self.stop_regex_strs {
+            stop_regex_max_len = stop_regex_max_len.max(regex_max_seq_length(pattern)?);
+        }
+        self.stop_regex_max_len = stop_regex_max_len;
 
         // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
         // `eos_token_id`, which `skip_tokenizer_init` does not have.
@@ -401,14 +402,19 @@ impl SamplingParams {
                 )));
             }
         }
-        // An out-of-vocabulary bias key would index past the logits row in the
-        // scheduler, so bound it here (`None` = vocab unknown, skip).
-        if let (Some(logit_bias), Some(vocab_size)) = (&self.logit_bias, vocab_size) {
+        // A non-numeric bias key raises in the scheduler's `int(key)`, and an
+        // out-of-vocabulary one would index past the logits row, so both are
+        // rejected here (Python `verify` does the same, in that order). Only the
+        // *range* check needs the vocab size (`None` = unknown, skip it); the key
+        // format is checked either way, since `int(key)` runs regardless.
+        if let Some(logit_bias) = &self.logit_bias {
             for key in logit_bias.keys() {
                 let token_id: u64 = key
                     .parse()
                     .map_err(|_| bad(format!("logit_bias keys must be token ids, got {key:?}")))?;
-                if token_id >= vocab_size {
+                if let Some(vocab_size) = vocab_size
+                    && token_id >= vocab_size
+                {
                     return Err(bad(format!(
                         "logit_bias must have keys in [0, {}], got {token_id}",
                         vocab_size - 1
@@ -427,8 +433,9 @@ impl SamplingParams {
             ));
         }
         // Not a Python restriction: the rust egress maps one rid to one response,
-        // so parallel sampling would drop all but the first sample (the
-        // `/generate` body enforces the same on its own `n`).
+        // so parallel sampling would drop all but the first sample. This is the
+        // only place it is rejected — `n` lives in `sampling_params`, where
+        // Python reads it, and the `/generate` body has no `n` of its own.
         if self.n != 1 {
             return Err(bad(format!(
                 "parallel sampling (n > 1) is not supported, got {}",
@@ -454,14 +461,55 @@ fn take_one_or_many(v: &Option<OneOrMany<String>>) -> Vec<String> {
 
 /// Strict upper bound on the characters a `stop_regex` can match — the Rust port
 /// of Python's `get_max_seq_length` (`sampling_params.py`). Bounded expressions
-/// get their finite length; unbounded quantifiers, or anything the regex parser
-/// rejects (e.g. backreferences), fall back to [`STOP_REGEX_MAX_LEN`] — always an
-/// over-estimate, so the scheduler never under-buffers and misses a stop.
-fn regex_max_seq_length(pattern: &str) -> i64 {
+/// get their finite length; unbounded quantifiers, or a pattern `regex-syntax`
+/// rejects only because it is *stricter* than Python's `re`, fall back to
+/// [`STOP_REGEX_MAX_LEN`] — always an over-estimate, so the scheduler never
+/// under-buffers and misses a stop. A pattern Python would reject too is a 400.
+fn regex_max_seq_length(pattern: &str) -> Result<i64, Error> {
     match regex_syntax::parse(pattern) {
-        Ok(hir) => hir_max_len(&hir),
-        Err(_) => STOP_REGEX_MAX_LEN,
+        Ok(hir) => Ok(hir_max_len(&hir)),
+        Err(e) => match malformed_regex_reason(&e) {
+            Some(reason) => Err(bad(format!(
+                "stop_regex {pattern:?} is not a valid regular expression: {reason}"
+            ))),
+            None => Ok(STOP_REGEX_MAX_LEN),
+        },
     }
+}
+
+/// Why `pattern` is malformed, or `None` if `regex-syntax` rejected it for a
+/// reason Python's `re` would not.
+///
+/// A parse failure alone is not evidence of a bad pattern: `regex-syntax` is the
+/// stricter dialect and rejects plenty that `sre_parse` accepts (backreferences,
+/// look-around, `\Z`, `(?#…)`, `a{2`). Those must keep falling back to
+/// [`STOP_REGEX_MAX_LEN`], because the scheduler runs them through Python's `re`,
+/// where they work. But an *unbalanced* pattern (`"("`, `"[z-a]"`) reaches
+/// `re.search` in `_check_str_based_finish` on the decode hot path, where the
+/// resulting `re.error` is uncaught and takes the scheduler down — so the error
+/// kinds below, all of which `sre_parse.parse` also raises on, are rejected at
+/// ingress instead, exactly as Python's `normalize()` would.
+///
+/// The classification is one-directional and cannot be exhaustive (a pattern only
+/// *Python* rejects, e.g. `(?<n>a)`, still gets through). Widening the reject set
+/// risks 400ing valid patterns, so it stays conservative.
+fn malformed_regex_reason(err: &regex_syntax::Error) -> Option<String> {
+    use regex_syntax::ast::ErrorKind;
+
+    let regex_syntax::Error::Parse(err) = err else {
+        return None;
+    };
+    matches!(
+        err.kind(),
+        ErrorKind::GroupUnclosed          // "("
+            | ErrorKind::GroupUnopened    // ")"
+            | ErrorKind::ClassUnclosed    // "[", "[]"
+            | ErrorKind::ClassRangeInvalid // "[z-a]"
+            | ErrorKind::EscapeUnexpectedEof // trailing "\"
+            | ErrorKind::RepetitionMissing // "*a"
+            | ErrorKind::RepetitionCountInvalid // "a{2,1}"
+    )
+    .then(|| err.kind().to_string())
 }
 
 fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
@@ -684,23 +732,78 @@ mod tests {
         assert!(sp.normalize(false, Some(1000)).is_ok());
     }
 
+    /// The key *format* check must not hang off the vocab bound: the scheduler
+    /// does `logit_bias[i, int(key)]` unconditionally, so a non-numeric (or
+    /// negative, which would index from the end of the row) key has to be a 400
+    /// even when the vocab size is unknown.
+    #[test]
+    fn logit_bias_keys_are_token_ids_without_vocab_size() {
+        for json in [
+            r#"{"logit_bias": {"abc": 1.0}}"#,
+            r#"{"logit_bias": {"-1": 1.0}}"#,
+            r#"{"logit_bias": {"1.5": 1.0}}"#,
+            r#"{"logit_bias": {"": 1.0}}"#,
+        ] {
+            let _ = norm_err(json); // norm_err passes vocab_size = None
+        }
+        assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
+    }
+
     /// Bounded regexes get their finite length; unbounded / unparsable ones fall
     /// back to the full-scan `MAX_LEN`. Mirrors Python `get_max_seq_length`.
     #[test]
     fn regex_bound_is_finite_when_bounded() {
+        let len = |p: &str| regex_max_seq_length(p).expect("valid pattern");
         // Bounded: exact length (the reviewer's six-digit example → 6, not 1<<30).
-        assert_eq!(regex_max_seq_length(r"\d{6}"), 6);
-        assert_eq!(regex_max_seq_length("abc"), 3);
-        assert_eq!(regex_max_seq_length(r"^abc$"), 3); // anchors are zero-width
-        assert_eq!(regex_max_seq_length("a|bbb"), 3); // alternation → max branch
-        assert_eq!(regex_max_seq_length(r"(ab){3}"), 6); // group * repeat
-        assert_eq!(regex_max_seq_length(r"a\d{2,5}"), 6); // 1 + 5
+        assert_eq!(len(r"\d{6}"), 6);
+        assert_eq!(len("abc"), 3);
+        assert_eq!(len(r"^abc$"), 3); // anchors are zero-width
+        assert_eq!(len("a|bbb"), 3); // alternation → max branch
+        assert_eq!(len(r"(ab){3}"), 6); // group * repeat
+        assert_eq!(len(r"a\d{2,5}"), 6); // 1 + 5
         // Unbounded → MAX_LEN.
-        assert_eq!(regex_max_seq_length(r"\d+"), STOP_REGEX_MAX_LEN);
-        assert_eq!(regex_max_seq_length(".*"), STOP_REGEX_MAX_LEN);
-        assert_eq!(regex_max_seq_length(r"a{3,}"), STOP_REGEX_MAX_LEN);
-        // Unparsable (backreference — regex-syntax rejects it) → MAX_LEN, not a panic.
-        assert_eq!(regex_max_seq_length(r"(a)\1"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
+    }
+
+    /// Patterns `regex-syntax` rejects but Python's `re` accepts must NOT 400 —
+    /// the scheduler matches them with Python's engine, where they work. They
+    /// only lose their static bound and fall back to the full-scan sentinel.
+    #[test]
+    fn stricter_than_python_patterns_fall_back_to_max_len() {
+        for pattern in [
+            r"(a)\1",     // backreference
+            r"(?=x)y",    // look-around
+            r"\Z",        // python-only anchor spelling
+            r"(?#note)a", // inline comment group
+            "a{2",        // python reads this as the literal "a{2"
+            r"[\b]",      // backspace inside a class
+        ] {
+            assert_eq!(
+                regex_max_seq_length(pattern).expect("must not be rejected"),
+                STOP_REGEX_MAX_LEN,
+                "{pattern} must fall back, not 400"
+            );
+        }
+    }
+
+    /// A malformed `stop_regex` is a 400 at ingress, mirroring Python's
+    /// `sre_parse.parse` raising inside `normalize()`. Without this the pattern
+    /// rides to the scheduler, where `re.search` raises `re.error` uncaught on
+    /// the decode hot path — i.e. any client could kill the scheduler.
+    /// Every pattern here also raises in `sre_parse.parse`.
+    #[test]
+    fn malformed_stop_regex_is_rejected() {
+        for pattern in ["(", ")", "[", "[]", "\\", "*a", "a{2,1}", "[z-a]"] {
+            assert!(
+                regex_max_seq_length(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+        // End to end, through the same path `/generate` takes.
+        let _ = norm_err(r#"{"stop_regex": "("}"#);
+        let _ = norm_err(r#"{"stop_regex": ["\\d{6}", "("]}"#);
     }
 
     /// End-to-end: a bounded `stop_regex` normalizes to its finite length, not the

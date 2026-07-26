@@ -55,31 +55,6 @@ async fn await_control_result(
     }
 }
 
-/// Generic control endpoint: the scheduler's response straight to JSON (`tag` =
-/// request-struct name). For control endpoints whose response needs no shaping.
-#[allow(dead_code)] // first non-/server_info control endpoint will use this
-async fn control(State(state): State<AppState>, control: ControlRequest) -> Response {
-    match await_control_result(&state, control).await {
-        Ok(bytes) => match msgpack_to_json(&bytes) {
-            Ok(json) => {
-                (StatusCode::OK, [("content-type", "application/json")], json).into_response()
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "control: msgpack→json failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "bad control response").into_response()
-            }
-        },
-        Err(resp) => resp,
-    }
-}
-
-/// Convert a msgpack control response (the scheduler's native ring format) into
-/// JSON bytes for the HTTP client.
-fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let val = rmpv::decode::read_value(&mut &*bytes).map_err(|e| e.to_string())?;
-    serde_json::to_vec(&val).map_err(|e| e.to_string())
-}
-
 /// `GET /get_model_info` (+ `/model_info` alias) — static model metadata from
 /// `server_args` (no scheduler round-trip); `is_generation` always true.
 async fn model_info(State(state): State<AppState>) -> Response {
