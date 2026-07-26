@@ -15,17 +15,18 @@ use crate::message::{EgressItem, EgressSink, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
-/// receiver. Rid policy: a caller-supplied generate rid wins over minting (a
-/// client's, fanned out per item by `split`, or the `HEALTH_CHECK_<uuid>` form
-/// the health probe sets); control requests always get a rust-minted rid
-/// (their responses are routed by it, so no caller-supplied form exists).
+/// receiver. Every request arrives with its final rid — a generate request from
+/// `into_requests` (or the `HEALTH_CHECK_<uuid>` the health probe sets), a
+/// control request from its constructor — so this only echoes it back.
 pub(super) async fn submit(
     state: &AppState,
     kind: RequestKind,
 ) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), Response> {
     let rid = match &kind {
-        RequestKind::Generate(g) => g.rid.clone().unwrap_or_else(crate::ids::new_rid),
-        RequestKind::Control(_) => crate::ids::new_rid(),
+        // Generate rids are already final: `GenerateBody::into_requests` normalized the
+        // client's, or minted one. Control requests have no client-facing rid.
+        RequestKind::Generate(g) => g.rid.clone(),
+        RequestKind::Control(c) => c.rid().to_string(),
     };
     let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking

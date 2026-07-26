@@ -7,6 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use super::TokenIds;
 use crate::error::Error;
 use crate::ids::RidHash;
 
@@ -404,7 +405,7 @@ pub struct ChunkEvent {
     /// `RidHash` digest of the rid — the shard routing key; `Copy`, no clone.
     pub rid_hash: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
-    pub token_ids: Vec<i32>,
+    pub token_ids: TokenIds,
     /// `None` while streaming, the full finish-reason dict on the final chunk.
     pub finish_reason: Option<serde_json::Value>,
     /// Prompt token count for this request (constant across its chunks).
