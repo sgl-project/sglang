@@ -16,6 +16,7 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -94,6 +95,10 @@ class SchedulerMlxOverlapMixin:
         # forward_ct, so `--profile-steps` (and the server /start_profile
         # num_steps path) only takes effect once the counter moves here.
         self.forward_ct += 1
+        # forward_iter mirrors run_batch's assignment; the metrics reporter and
+        # SWA maintenance key off it and treat None as "skip this batch".
+        pending.batch_copy.forward_iter = self.forward_ct
+        pending.schedule_batch.forward_iter = self.forward_ct
         self.profiler_manager._profile_batch_predicate(pending.schedule_batch)
 
         result = self.tp_worker.finalize_mlx_result(
@@ -160,6 +165,12 @@ class SchedulerMlxOverlapMixin:
             # loop must do it too, otherwise async_forward_batch_generation_mlx
             # dereferences a None input_ids.
             resolve_forward_inputs(batch, self.future_map)
+            # run_batch stamps launch_ts on every scheduler-built forward; the
+            # MLX overlap loop bypasses run_batch, and process_batch_result ->
+            # _record_step_counters subtracts launch_ts unconditionally for
+            # prefill/decode batches. Stamp before batch.copy() so the copy
+            # handed to process_batch_result carries it too.
+            batch.launch_ts = time.monotonic()
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_forward_batch_generation_mlx(batch)
             )
@@ -182,13 +193,17 @@ class SchedulerMlxOverlapMixin:
             # Composition is identical to prev: reuse a fresh batch copy
             # of the same underlying ScheduleBatch so process_batch_result
             # updates the same req objects with the new token.
+            batch_copy = prev.batch_copy.copy()
+            # Each chained step is its own launch for _record_step_counters'
+            # decode inter-step timing; don't reuse prev's stamp.
+            batch_copy.launch_ts = time.monotonic()
             return MlxPendingJob(
                 lazy_tokens=lazy_tokens,
                 prefills=prefills,
                 extends=extends,
                 decode=decode,
                 mode=mode,
-                batch_copy=prev.batch_copy.copy(),
+                batch_copy=batch_copy,
                 schedule_batch=prev.schedule_batch,
                 reqs=prev.reqs,
             )
