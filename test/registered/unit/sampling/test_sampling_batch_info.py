@@ -43,6 +43,11 @@ def _make_info(batch_size=2, **overrides):
     return SamplingBatchInfo(**defaults)
 
 
+def _serial_batched_fill(entries, vocab_mask):
+    for entry in entries:
+        entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
+
+
 class TestMergeBiasTensor(CustomTestCase):
 
     def test_both_none_returns_none(self):
@@ -239,12 +244,14 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         grammar = MagicMock()
         grammar.finished = False
         grammar.is_terminated.return_value = False
+        grammar.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         grammar.allocate_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         grammar.move_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         info = _make_info(batch_size=1)
         info.grammars = [grammar]
         info.update_regex_vocab_mask()
         grammar.allocate_vocab_mask.assert_called_once()
+        grammar.fill_vocab_mask_batched.assert_called_once()
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
         self.assertIs(info.grammar_mask.grammar, grammar)
@@ -254,6 +261,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         active = MagicMock()
         active.finished = False
         active.is_terminated.return_value = False
+        active.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         active.allocate_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
         active.move_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
 
@@ -268,9 +276,33 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         info.grammars = [active, finished, terminated]
         info.update_regex_vocab_mask()
 
+        active.fill_vocab_mask_batched.assert_called_once()
         active.fill_vocab_mask.assert_called_once()
         finished.fill_vocab_mask.assert_not_called()
         terminated.fill_vocab_mask.assert_not_called()
+
+    def test_batched_fill_skips_serial_loop(self):
+        """A backend with a batched kernel must not also run the serial fill."""
+        active = MagicMock()
+        active.finished = False
+        active.is_terminated.return_value = False
+        active.allocate_vocab_mask.return_value = torch.zeros(2, VOCAB_SIZE)
+        active.move_vocab_mask.return_value = torch.zeros(2, VOCAB_SIZE)
+
+        other = MagicMock()
+        other.finished = False
+        other.is_terminated.return_value = False
+
+        info = _make_info(batch_size=2)
+        info.grammars = [active, other]
+        info.update_regex_vocab_mask()
+
+        # The batched call happened with both active rows; serial fill skipped.
+        active.fill_vocab_mask_batched.assert_called_once()
+        entries, _mask = active.fill_vocab_mask_batched.call_args.args
+        self.assertEqual([e.row for e in entries], [0, 1])
+        active.fill_vocab_mask.assert_not_called()
+        other.fill_vocab_mask.assert_not_called()
 
 
 # filter_batch
