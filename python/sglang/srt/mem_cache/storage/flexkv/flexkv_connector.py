@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.storage.flexkv.flexkv_comm import (
     CMD_STORE_COMPLETE,
     FlexKVComm,
     FlexKVLayerDoneCounter,
+    FlexKVScatterChannel,
     send_fds,
 )
 
@@ -445,7 +446,8 @@ class FlexKVConnector:
                 {
                     "task_id": fkv_task_id,
                     "hit": hit_length,
-                }
+                },
+                channel=FlexKVScatterChannel.LOOKUP,
             )
             fkv_task_id = payload["task_id"]
             hit_length = payload["hit"]
@@ -657,7 +659,10 @@ class FlexKVConnector:
             "error": selection_error,
         }
         if self._sync_ctx.needs_sync:
-            manifest = self._sync_ctx.scatter(manifest)
+            manifest = self._sync_ctx.scatter(
+                manifest,
+                channel=FlexKVScatterChannel.LAYERWISE_MANIFEST,
+            )
 
         local_ok = 1
         local_error = None
@@ -1125,7 +1130,10 @@ class FlexKVConnector:
                         getattr(self, "_inflight_store_contexts", {}).pop(rid, None)
 
         if self._sync_ctx.needs_sync:
-            completed_rids = self._sync_ctx.scatter(completed_rids)
+            completed_rids = self._sync_ctx.scatter(
+                completed_rids,
+                channel=FlexKVScatterChannel.STORE_COMPLETION,
+            )
         return completed_rids
 
     def wait_store(self, rid: str, timeout: float = 30.0) -> bool:
@@ -1185,7 +1193,10 @@ class FlexKVConnector:
                 prefetch_error = exc
                 task_id = -1
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"task_id": task_id})
+            payload = self._sync_ctx.scatter(
+                {"task_id": task_id},
+                channel=FlexKVScatterChannel.PREFETCH_START,
+            )
             task_id = payload["task_id"]
         if task_id >= 0:
             context.task_id = task_id
@@ -1234,7 +1245,10 @@ class FlexKVConnector:
                 status = _status_value(completed[task_id])
                 done = _is_terminal_status(status)
         if self._sync_ctx.needs_sync:
-            payload = self._sync_ctx.scatter({"done": done, "status": status})
+            payload = self._sync_ctx.scatter(
+                {"done": done, "status": status},
+                channel=FlexKVScatterChannel.PREFETCH_PROGRESS,
+            )
             done = payload["done"]
             status = payload["status"]
         if done:
@@ -1339,7 +1353,11 @@ class FlexKVConnector:
                         "error": f"waiting for layerwise loads during reset failed: {exc}",
                     }
         if self._sync_ctx.needs_sync:
-            load_reset_status = self._sync_ctx.scatter(load_reset_status, blocking=True)
+            load_reset_status = self._sync_ctx.scatter(
+                load_reset_status,
+                channel=FlexKVScatterChannel.RESET,
+                blocking=True,
+            )
         if not load_reset_status["ok"]:
             raise RuntimeError(f"[FlexKV] {load_reset_status['error']}")
 
@@ -1778,9 +1796,9 @@ class FlexKVConnector:
         if self._is_dsv4:
             self._register_dsv4_to_server(kv_caches)
             return
-        assert kv_caches[0].ndim == 3, (
-            f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
-        )
+        assert (
+            kv_caches[0].ndim == 3
+        ), f"Expected 3D KV cache tensor, got shape={kv_caches[0].shape}"
 
         is_mla = self.model_config.use_mla
         num_blocks, num_kv_heads, head_size = kv_caches[0].shape

@@ -32,6 +32,7 @@ import socket
 import struct
 import time
 from datetime import timedelta
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -46,6 +47,35 @@ logger = logging.getLogger(__name__)
 CMD_PUT_META = 2
 CMD_LAYERWISE = 3
 CMD_STORE_COMPLETE = 5
+
+
+class FlexKVScatterChannel(str, Enum):
+    """Logical channels multiplexed over the hierarchical P2P fan-out."""
+
+    LOOKUP = "lookup"
+    LAYERWISE_MANIFEST = "layerwise_manifest"
+    STORE_COMPLETION = "store_completion"
+    PREFETCH_START = "prefetch_start"
+    PREFETCH_PROGRESS = "prefetch_progress"
+    RESET = "reset"
+
+
+_SCATTER_CHANNEL_OFFSETS = {
+    FlexKVScatterChannel.LOOKUP: 1,
+    FlexKVScatterChannel.LAYERWISE_MANIFEST: 2,
+    FlexKVScatterChannel.STORE_COMPLETION: 3,
+    FlexKVScatterChannel.PREFETCH_START: 4,
+    FlexKVScatterChannel.PREFETCH_PROGRESS: 5,
+    FlexKVScatterChannel.RESET: 6,
+}
+_SCATTER_CHANNEL_TYPES = {
+    FlexKVScatterChannel.LOOKUP: dict,
+    FlexKVScatterChannel.LAYERWISE_MANIFEST: dict,
+    FlexKVScatterChannel.STORE_COMPLETION: list,
+    FlexKVScatterChannel.PREFETCH_START: dict,
+    FlexKVScatterChannel.PREFETCH_PROGRESS: dict,
+    FlexKVScatterChannel.RESET: dict,
+}
 
 
 class FlexKVComm:
@@ -210,20 +240,34 @@ class FlexKVComm:
     # Public collectives
     # ------------------------------------------------------------------
 
-    def scatter(self, data: Any, blocking: bool = False) -> Any:
+    def scatter(
+        self,
+        data: Any,
+        *,
+        channel: FlexKVScatterChannel,
+        blocking: bool = False,
+    ) -> Any:
         """Hierarchical fan-out: sync_leader → PP stage leaders →
         CP leaders → TP ranks. Returns the leader's payload on every rank.
+
+        Logical operations use distinct P2P tags. Scheduler ticks are not a
+        collective clock: for example, one CP rank can poll store completion
+        before another rank enters prefix lookup. Sharing one tag for both
+        operations lets the lookup receive a pending completion list instead
+        of its task-id dictionary.
 
         ``blocking=False`` queues isends and reaps later — fine for the
         hot path; ``True`` blocks until the leader's sends drain (used
         on shutdown / barriers).
         """
+        channel = self._normalize_scatter_channel(channel)
+        self._validate_scatter_payload(data, channel, source="local")
         if self.pp_size > 1 and self.is_pp_stage_leader:
             data = self._scatter_group(
                 data,
                 self._pp_stage_leader_ranks,
                 self.is_pp_leader,
-                self._TAG_PP,
+                self._scatter_tag(self._TAG_PP, channel),
                 blocking,
             )
         if self._cp_leader_ranks:
@@ -231,7 +275,7 @@ class FlexKVComm:
                 data,
                 self._cp_leader_ranks,
                 self.is_cp_leader,
-                self._TAG_CP,
+                self._scatter_tag(self._TAG_CP, channel),
                 blocking,
             )
         if self._tp_group_ranks:
@@ -239,10 +283,41 @@ class FlexKVComm:
                 data,
                 self._tp_group_ranks,
                 self.is_tp_leader,
-                self._TAG_TP,
+                self._scatter_tag(self._TAG_TP, channel),
                 blocking,
             )
+        self._validate_scatter_payload(data, channel, source="received")
         return data
+
+    @staticmethod
+    def _normalize_scatter_channel(channel: Any) -> FlexKVScatterChannel:
+        try:
+            return FlexKVScatterChannel(channel)
+        except (TypeError, ValueError) as exc:
+            valid = ", ".join(item.value for item in FlexKVScatterChannel)
+            raise ValueError(
+                f"Unknown FlexKV scatter channel {channel!r}; expected one of {valid}"
+            ) from exc
+
+    @staticmethod
+    def _scatter_tag(base_tag: int, channel: FlexKVScatterChannel) -> int:
+        return base_tag + _SCATTER_CHANNEL_OFFSETS[channel]
+
+    def _validate_scatter_payload(
+        self,
+        data: Any,
+        channel: FlexKVScatterChannel,
+        *,
+        source: str,
+    ) -> None:
+        expected_type = _SCATTER_CHANNEL_TYPES[channel]
+        if isinstance(data, expected_type):
+            return
+        raise TypeError(
+            "[FlexKV] scatter protocol mismatch: "
+            f"rank={self.world_rank} channel={channel.value} source={source} "
+            f"expected={expected_type.__name__} got={type(data).__name__}"
+        )
 
     def scatter_pp(self, data: Any) -> Any:
         """PP-only fan-out across PP stages (only stage leaders participate)."""
@@ -384,8 +459,11 @@ class FlexKVComm:
         t_size = torch.tensor([0], dtype=torch.long)
         dist.irecv(t_size, src=src, tag=tag, group=group).wait()
         size = int(t_size.item())
-        if size == 0:
-            return []
+        if size <= 0:
+            raise RuntimeError(
+                "[FlexKV] received invalid serialized payload size: "
+                f"rank={self.world_rank} src={src} tag={tag} size={size}"
+            )
         t_data = torch.empty(size, dtype=torch.uint8)
         dist.irecv(t_data, src=src, tag=tag, group=group).wait()
         return pickle.loads(t_data.numpy().tobytes())
@@ -763,9 +841,9 @@ class FlexKVLayerDoneCounter:
                 return self.consumer_index
 
         self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[self.producer_index]._finished, (
-            "Producer event should be finished before reuse"
-        )
+        assert self.events[
+            self.producer_index
+        ]._finished, "Producer event should be finished before reuse"
         self.events[self.producer_index].reset_for_new_transfer()
         return self.producer_index
 

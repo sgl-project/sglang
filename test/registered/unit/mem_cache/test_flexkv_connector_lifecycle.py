@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +21,15 @@ class _KVResponseStatus(Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+class _FlexKVScatterChannel(str, Enum):
+    LOOKUP = "lookup"
+    LAYERWISE_MANIFEST = "layerwise_manifest"
+    STORE_COMPLETION = "store_completion"
+    PREFETCH_START = "prefetch_start"
+    PREFETCH_PROGRESS = "prefetch_progress"
+    RESET = "reset"
 
 
 def _module(name: str, **attrs):
@@ -40,6 +50,7 @@ def _load_connector_class():
             CMD_STORE_COMPLETE=5,
             FlexKVComm=object,
             FlexKVLayerDoneCounter=object,
+            FlexKVScatterChannel=_FlexKVScatterChannel,
             send_fds=lambda *args, **kwargs: None,
         ),
         "flexkv": _module("flexkv"),
@@ -91,7 +102,7 @@ def _load_connector_class():
 FlexKVConnector = _load_connector_class()
 
 
-def _load_layer_done_counter_class():
+def _load_flexkv_comm_module():
     module_name = "_flexkv_comm_lifecycle_under_test"
     parallel_state_name = "sglang.srt.distributed.parallel_state"
     parallel_state_stub = _module(
@@ -114,10 +125,61 @@ def _load_layer_done_counter_class():
             spec.loader.exec_module(module)
     finally:
         sys.modules.pop(module_name, None)
-    return module.FlexKVLayerDoneCounter
+    return module
 
 
-FlexKVLayerDoneCounter = _load_layer_done_counter_class()
+_flexkv_comm_module = _load_flexkv_comm_module()
+FlexKVComm = _flexkv_comm_module.FlexKVComm
+FlexKVLayerDoneCounter = _flexkv_comm_module.FlexKVLayerDoneCounter
+FlexKVScatterChannel = _flexkv_comm_module.FlexKVScatterChannel
+
+
+def _cp_leader_comm():
+    comm = FlexKVComm.__new__(FlexKVComm)
+    comm.world_rank = 0
+    comm.pp_size = 1
+    comm.is_pp_stage_leader = True
+    comm._pp_stage_leader_ranks = []
+    comm.is_pp_leader = True
+    comm._cp_leader_ranks = [0, 1]
+    comm.is_cp_leader = True
+    comm._tp_group_ranks = []
+    comm.is_tp_leader = True
+    comm._scatter_group = MagicMock(side_effect=lambda data, *_args: data)
+    return comm
+
+
+def test_scatter_uses_distinct_tags_for_lookup_and_store_completion():
+    comm = _cp_leader_comm()
+
+    lookup = comm.scatter(
+        {"task_id": 17, "hit": 0},
+        channel=FlexKVScatterChannel.LOOKUP,
+    )
+    completed = comm.scatter(
+        [],
+        channel=FlexKVScatterChannel.STORE_COMPLETION,
+    )
+
+    lookup_tag = comm._scatter_group.call_args_list[0].args[3]
+    completion_tag = comm._scatter_group.call_args_list[1].args[3]
+    assert lookup == {"task_id": 17, "hit": 0}
+    assert completed == []
+    assert lookup_tag != completion_tag
+
+
+def test_scatter_reports_channel_payload_mismatch_before_dict_indexing():
+    comm = _cp_leader_comm()
+    comm._scatter_group.side_effect = lambda _data, *_args: []
+
+    with pytest.raises(
+        TypeError,
+        match=r"channel=lookup source=received expected=dict got=list",
+    ):
+        comm.scatter(
+            {"task_id": 17, "hit": 0},
+            channel=FlexKVScatterChannel.LOOKUP,
+        )
 
 
 class _FakeLayerLoadingEvent:
