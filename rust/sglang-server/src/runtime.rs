@@ -229,8 +229,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 tm_rx,
                 senders.clone(),
                 ingress_tx,
-                skip_tokenizer_init,
-                cfg.server_args.model_config.vocab_size,
+                tokenizer_manager::Limits::from_server_args(&cfg.server_args),
                 shutdown_rx.clone(),
             )
         });
