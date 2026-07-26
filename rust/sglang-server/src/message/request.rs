@@ -428,8 +428,11 @@ mod tests {
             serde_json::from_str::<GenerateBody>(r#"{"text": "hi", "bogus": 1}"#).is_err(),
             "GenerateBody must deny unknown fields"
         );
-        // Python has no top-level `n` (parallel sampling reads
-        // `sampling_params.n`), so it is an unknown field here too.
+        // Python's `GenerateReqInput` has no top-level `n` either (parallel
+        // sampling reads `sampling_params.n`) — but FastAPI builds it from a
+        // pydantic dataclass, which *ignores* the extra key, where
+        // `deny_unknown_fields` makes it a 400. Deliberately stricter: a
+        // top-level `n` is a client bug that Python swallows silently.
         assert!(serde_json::from_str::<GenerateBody>(r#"{"text": "a", "n": 1}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
         // at normalization (the ingress step), not here.
