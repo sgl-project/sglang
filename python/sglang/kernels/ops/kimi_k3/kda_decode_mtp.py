@@ -206,6 +206,12 @@ def kda_decode_mtp_kernel(
 
     bos = cu_seqlens[i_n]
     eos = cu_seqlens[i_n + 1]
+    # The DSpARK dense contract gives every request exactly T_loop tokens,
+    # so n_tok == T_loop on every supported path and these guards are
+    # always taken. They exist so a violated contract (a ragged layout
+    # reaching here, or a padding scheme that emits empty requests)
+    # cannot read or write outside this request's token range.
+    n_tok = eos - bos
     scratch_row = intermediate_state_indices[i_n]
     r_exp_A = cutlass.Float32(0.0)
 
@@ -231,26 +237,21 @@ def kda_decode_mtp_kernel(
         # Warp starting at token p1_par needs its window advanced that
         # many steps; the g path is pointwise and needs none.
         if p1_job == 0:
-            _pi = 0
-            while _pi < p1_par:
+            for _pi in cutlass.range(cutlass.min(p1_par, n_tok)):
                 for i in range(vec_size):
                     _xn = cutlass.Float32(x_q[0, bos + _pi, i_hv, i * 32 + in_warp_tid])
                     r_state[0 * vec_size + i] = r_state[1 * vec_size + i]
                     r_state[1 * vec_size + i] = r_state[2 * vec_size + i]
                     r_state[2 * vec_size + i] = _xn
-                _pi = _pi + 1
         elif p1_job == 1:
-            _pi = 0
-            while _pi < p1_par:
+            for _pi in cutlass.range(cutlass.min(p1_par, n_tok)):
                 for i in range(vec_size):
                     _xn = cutlass.Float32(x_k[0, bos + _pi, i_hv, i * 32 + in_warp_tid])
                     r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i]
                     r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i]
                     r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i] = _xn
-                _pi = _pi + 1
-        i_t = p1_par
-        while i_t < T_loop:
-            token = bos + i_t
+        for i_t in cutlass.range(p1_par, T_loop, P1_JOB_WARPS):
+            token = bos + cutlass.min(i_t, n_tok - 1)
             if p1_job == 0:
                 for i_pair in range(vec_size // 2):
                     i0 = i_pair * 2
@@ -402,7 +403,6 @@ def kda_decode_mtp_kernel(
                         r_state[(KERNEL_WIDTH - 1) * vec_size + 0 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i]
                         r_state[(KERNEL_WIDTH - 1) * vec_size + 1 * vec_size + i] = r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i]
                         r_state[(KERNEL_WIDTH - 1) * vec_size + 2 * vec_size + i] = _xn
-            i_t = i_t + P1_JOB_WARPS
     else:
         for _c in range(V_CH_PER_THREAD):
             _v_idx = (tidx - P1_QKG_WARPS * 32) + _c * (V // V_CH_PER_THREAD)
@@ -413,7 +413,11 @@ def kda_decode_mtp_kernel(
             # Sliding conv window, oldest -> newest.
             _win = [_csv0, _csv1, _csv2]
             for _t in cutlass.range_constexpr(T_loop):
-                _win.append(cutlass.Float32(x_v[0, bos + _t, i_hv, _v_idx]))
+                _win.append(
+                    cutlass.Float32(
+                        x_v[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
+                    )
+                )
             for _t in cutlass.range_constexpr(T_loop):
                 _vconv = _win[_t] * _wv[0]
                 for _w in cutlass.range_constexpr(1, KERNEL_WIDTH):
@@ -429,24 +433,14 @@ def kda_decode_mtp_kernel(
                     intermediate_conv_v[scratch_row, _t, hv_off + _v_idx, _w] = (
                         cutlass.BFloat16(_win[_t + 1 + _w])
                     )
-    # Queue the second serial V tile behind the first. Waiting for one
-    # outstanding group below makes tile 0 visible while tile 1 continues
-    # loading during tile-0 recurrence.
-    gStateNext = gStateTiles[(None, None, 1)]
-    sStateNext = sState[(None, None, 1)]
-    cute.copy(
-        state_g2s_copy,
-        thr_state_copy.partition_S(gStateNext),
-        thr_state_copy.partition_D(sStateNext),
-    )
-    cute.arch.cp_async_commit_group()
-
-    # Publishes the whole conv precompute (sQ/sK/sG/sBeta/sVall) to the
-    # recurrence below, which reads all of it from every warp.
-    cute.arch.barrier()
     # Tokens outer, v-tiles inner: the two v-tiles are independent recurrence
     # chains, so interleaving them exposes 2x the ILP on a chain that is serial
     # in t, and each token's operands are loaded once instead of once per tile.
+    #
+    # One barrier covers both hazards: it publishes the conv precompute
+    # (sQ/sK/sG/sBeta/sVall) to every warp, and it makes every thread's
+    # cp.async state visible -- cp_async_wait_group only retires the calling
+    # thread's own copies.
     cute.arch.cp_async_wait_group(0)
     cute.arch.barrier()
 
@@ -470,8 +464,7 @@ def kda_decode_mtp_kernel(
     # this block has consumed every outstanding cp.async read.
     cute.arch.griddepcontrol_launch_dependents()
 
-    i_t = 0
-    while i_t < T_loop:
+    for i_t in cutlass.range(T_loop):
         r_beta_val = sBeta[i_t]
         for jp in range(P2_VEC // 2):
             j0 = jp * 2
@@ -536,7 +529,7 @@ def kda_decode_mtp_kernel(
                     shq += cute.arch.shuffle_sync_bfly(
                         shq, offset=offset, mask=-1, mask_and_clamp=31
                     )
-                if k_grp == 0:
+                if k_grp == 0 and i_t < n_tok:
                     if cutlass.const_expr(APPLY_ONORM):
                         sOall[i_t * V + v_base + v_row] = shq
                     else:
@@ -554,7 +547,6 @@ def kda_decode_mtp_kernel(
                             i_v * TILE_V + v_row,
                             j * P2_LANES_K + k_grp,
                         ] = r_state[_st + j]
-        i_t = i_t + 1
 
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
@@ -563,8 +555,7 @@ def kda_decode_mtp_kernel(
         # token to a warp: one butterfly, no cross-warp reduction, and no
         # barrier between tokens. The previous form walked tokens serially with
         # three barriers each and routed every reduction through smem.
-        i_t = warp_idx
-        while i_t < T_loop:
+        for i_t in cutlass.range(warp_idx, T_loop, NUM_WARPS):
             sumsq = cutlass.Float32(0.0)
             for i in range(V // 32):
                 _o = sOall[i_t * V + i * 32 + in_warp_tid]
@@ -579,14 +570,15 @@ def kda_decode_mtp_kernel(
             for i in range(V // 32):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * V + v_idx]
-                gate_raw = cutlass.Float32(onorm_g[0, bos + i_t, i_hv, v_idx])
+                _tok = bos + cutlass.min(i_t, n_tok - 1)
+                gate_raw = cutlass.Float32(onorm_g[0, _tok, i_hv, v_idx])
                 gate = cute.arch.rcp_approx(
                     cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                 )
-                o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
-                    raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
-                )
-            i_t = i_t + NUM_WARPS
+                if i_t < n_tok:
+                    o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
+                        raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
+                    )
 
 
 @cute.jit
