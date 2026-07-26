@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, abort_status, cumulative_frame_string, error_value, sglang_frame_value,
+    OutputAccumulator, cumulative_frame_string, error_value, sglang_frame_value,
     stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
@@ -206,10 +206,14 @@ async fn drain_unary(
                 acc.fold(&out);
                 let final_out = acc.into_output();
                 // A validation abort carries its own HTTP status + diagnostic.
-                if let Some((code, message)) = abort_status(&final_out.finish_reason) {
+                if let Some((code, message)) = final_out
+                    .finish_reason
+                    .as_ref()
+                    .and_then(|f| f.abort_status())
+                {
                     let status =
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return (status, error_value(code, &message), true);
+                    return (status, error_value(code, message), true);
                 }
                 return (
                     StatusCode::OK,
@@ -364,8 +368,8 @@ fn generation_event_stream(
             } else if let Some(out) = terminal {
                 // A validation abort → an error object, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
-                yield match abort_status(&out.finish_reason) {
-                    Some((code, message)) => tag_value(error_value(code, &message), idx(i)),
+                yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
+                    Some((code, message)) => tag_value(error_value(code, message), idx(i)),
                     None => stream_frame_string(out, &accs[i], incremental, &rid_strs[i], idx(i)),
                 };
                 guard.disarm(rids[i]); // terminal → not re-pushed
@@ -407,7 +411,11 @@ mod tests {
             rid_hash: rid,
             text: text.into(),
             completion_tokens: 1,
-            finish_reason: Some(serde_json::json!({ "type": "length" })),
+            // Parsed from the wire map Python emits, not a hand-built enum.
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({"type": "length", "length": 1}))
+                    .expect("finish reason must parse"),
+            ),
             ..Default::default()
         })
     }

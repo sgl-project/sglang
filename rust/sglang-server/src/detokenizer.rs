@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RidHash;
 use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError, TokenIds};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
 
@@ -251,7 +251,7 @@ fn handle_chunk(
     // reason names the stop it matched — a stop STRING or a stop TOKEN id. By
     // default that stop is removed from the output; `no_stop_trim` keeps it.
     let matched = finished
-        .then(|| ev.finish_reason.as_ref().and_then(|fr| fr.get("matched")))
+        .then(|| ev.finish_reason.as_ref().and_then(|fr| fr.matched()))
         .flatten()
         .cloned();
     // Count generated tokens (incl. a matched stop token) *before* trimming.
@@ -278,7 +278,7 @@ fn handle_chunk(
         None => String::new(),
     };
     // Stop STRING: trim it (and anything after) from the decoded delta's tail.
-    if let Some(serde_json::Value::String(stop)) = &matched {
+    if let Some(Matched::Str(stop)) = &matched {
         trim_stop_str(&mut delta_text, stop, no_stop_trim);
     }
 
@@ -344,12 +344,8 @@ fn handle_chunk(
 
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(
-    token_ids: &mut TokenIds,
-    matched: &Option<serde_json::Value>,
-    no_stop_trim: bool,
-) {
-    if !no_stop_trim && matches!(matched, Some(serde_json::Value::Number(_))) {
+fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
+    if !no_stop_trim && matches!(matched, Some(Matched::Token(_))) {
         token_ids.pop();
     }
 }
@@ -463,7 +459,11 @@ mod tests {
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: ids,
-            finish_reason: Some(finish_reason),
+            // Parsed from the wire map, so the trim paths are driven by the same
+            // shape Python emits rather than a hand-built enum.
+            finish_reason: Some(
+                serde_json::from_value(finish_reason).expect("finish reason must parse"),
+            ),
             ..Default::default()
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
