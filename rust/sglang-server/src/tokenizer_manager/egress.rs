@@ -80,7 +80,21 @@ impl Runnable for Egress {
                     // logprobs — the corruption the decoder's bounds checks exist to
                     // prevent. Better a lost frame than a silently wrong one.
                     if !ok {
-                        tracing::warn!("egress: bad batch frame; dropping it whole");
+                        // Dropping the frame keeps wrong data off the wire, but a
+                        // request whose chunk was in it would otherwise wait forever:
+                        // mid-stream it gets a hole, and if its FINAL chunk was here
+                        // it never sees `Done` and the connection hangs — there is no
+                        // server-side timeout. The rids are already bucketed, so fail
+                        // each one explicitly.
+                        tracing::warn!("egress: bad batch frame; failing its requests");
+                        for (i, b) in buckets.iter_mut().enumerate() {
+                            for ev in b.drain(..) {
+                                let _ = self.senders.detok[i].send(DetokMsg::Fail {
+                                    rid_hash: RidHash(ev.rid_hash),
+                                    message: "malformed scheduler output frame".into(),
+                                });
+                            }
+                        }
                         continue;
                     }
                     for (i, b) in buckets.iter_mut().enumerate() {
