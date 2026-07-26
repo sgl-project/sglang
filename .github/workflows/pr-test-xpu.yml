@@ -136,6 +136,19 @@ jobs:
             .pytest_cache || true
           find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
           find . -type f -name "*.pyc" -delete || true
+          # SIGTERM sglang and drain GPU context before `docker rm -f`;
+          # SIGKILL leaves the xe/GuC exec queue registered and triggers a
+          # GT reset (+ devcoredump) on B580.
+          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
+            docker exec ci_sglang_xpu bash -c '
+              pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
+                sleep 1
+              done
+              pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
+            ' || true
+          fi
           docker rm -f ci_sglang_xpu || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
@@ -212,6 +225,19 @@ jobs:
             .pytest_cache || true
           find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
           find . -type f -name "*.pyc" -delete || true
+          # SIGTERM sglang and drain GPU context before `docker rm -f`;
+          # SIGKILL leaves the xe/GuC exec queue registered and triggers a
+          # GT reset (+ devcoredump) on B580.
+          if docker ps --format '{{.Names}}' | grep -qx ci_sglang_xpu; then
+            docker exec ci_sglang_xpu bash -c '
+              pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
+                sleep 1
+              done
+              pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
+            ' || true
+          fi
           docker rm -f ci_sglang_xpu || true
           if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
