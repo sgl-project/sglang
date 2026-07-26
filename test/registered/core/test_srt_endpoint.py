@@ -859,8 +859,8 @@ class TestTokenizeDetokenize(CustomTestCase):
 # surface the rust server does not implement yet is skipped explicitly below.
 # ---------------------------------------------------------------------------
 @unittest.skipIf(
-    importlib.util.find_spec("sglang_server") is None,
-    "sglang_server wheel not installed (e.g. AMD suite)",
+    importlib.util.find_spec("sglang.srt.server._core") is None,
+    "embedded rust server extension not built (e.g. AMD suite)",
 )
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}

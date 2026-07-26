@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RidHash;
 use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError, TokenIds};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
 
@@ -238,7 +238,7 @@ fn handle_chunk(
         // Late chunk after completion/abort — drop.
         return;
     };
-    let decode_lp_text = st.decode_logprob_text;
+    let decode_logprob_text = st.decode_logprob_text;
     let no_stop_trim = st.no_stop_trim;
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
@@ -289,7 +289,7 @@ fn handle_chunk(
     // CPU-bound shard) rather than on the api-server I/O threads. Flat text columns
     // stay parallel to the `idx` buffers, so `sglang_frame` just reads them. Only the
     // logprob-carrying frames have an `extras` box; a plain token frame skips this.
-    if decode_lp_text && let Some(ex) = ev.extras.as_deref_mut() {
+    if decode_logprob_text && let Some(ex) = ev.extras.as_deref_mut() {
         ex.out_lp_txt = backend.decode_logprob_texts(&ex.out_lp_idx);
         ex.in_lp_txt = backend.decode_logprob_texts(&ex.in_lp_idx);
         ex.out_top_txt = backend.decode_logprob_texts(&ex.out_top_idx);
@@ -345,7 +345,7 @@ fn handle_chunk(
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
 fn trim_stop_token(
-    token_ids: &mut Vec<i32>,
+    token_ids: &mut TokenIds,
     matched: &Option<serde_json::Value>,
     no_stop_trim: bool,
 ) {

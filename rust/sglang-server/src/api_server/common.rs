@@ -15,7 +15,7 @@ use axum::{
 
 use super::AppState;
 use super::submit::submit;
-use crate::message::{ControlRequest, EgressItem, RequestKind};
+use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
 use crate::runtime::ServerArgs;
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -30,14 +30,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/model_info", get(model_info))
 }
 
-/// Submit a `Control(tag)` through the ingress FSM (no tokenization) and await the
+/// Submit a control request through the ingress FSM (no tokenization) and await the
 /// scheduler's single msgpack result (a `structs.asdict` named map). Returns the
 /// raw bytes, or an error `Response` to return as-is.
 async fn await_control_result(
     state: &AppState,
-    tag: &'static str,
+    control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
-    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(ControlRequest { tag })).await?;
+    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(Box::new(control))).await?;
     match rx.recv().await {
         Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
@@ -58,8 +58,8 @@ async fn await_control_result(
 /// Generic control endpoint: the scheduler's response straight to JSON (`tag` =
 /// request-struct name). For control endpoints whose response needs no shaping.
 #[allow(dead_code)] // first non-/server_info control endpoint will use this
-async fn control(State(state): State<AppState>, tag: &'static str) -> Response {
-    match await_control_result(&state, tag).await {
+async fn control(State(state): State<AppState>, control: ControlRequest) -> Response {
+    match await_control_result(&state, control).await {
         Ok(bytes) => match msgpack_to_json(&bytes) {
             Ok(json) => {
                 (StatusCode::OK, [("content-type", "application/json")], json).into_response()
@@ -105,7 +105,12 @@ async fn model_info(State(state): State<AppState>) -> Response {
 ///
 /// TODO(server_info): Python also includes `kv_events`; add once plumbed.
 async fn server_info(State(state): State<AppState>) -> Response {
-    let bytes = match await_control_result(&state, "GetInternalStateReq").await {
+    let bytes = match await_control_result(
+        &state,
+        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(crate::ids::new_rid())),
+    )
+    .await
+    {
         Ok(b) => b,
         Err(resp) => return resp,
     };

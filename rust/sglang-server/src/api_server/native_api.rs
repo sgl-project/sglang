@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use axum::{
     Json, Router,
     extract::State,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -30,7 +31,7 @@ use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::environ::env_bool;
 use crate::ids::RidHash;
-use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind};
+use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -79,19 +80,20 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
-    let sampling_params = rmpv::Value::Map(vec![
-        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(1)),
-        (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
-    ]);
     let probe = GenerateRequest {
         // The `HEALTH_CHECK_<uuid>` rid form
-        rid: Some(crate::ids::new_health_check_rid()),
+        rid: crate::ids::new_health_check_rid(),
         input_ids: Some(vec![0]),
-        sampling_params: Some(sampling_params),
+        // One greedy token: the cheapest round-trip that still produces a frame.
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        },
         stream: false,
         ..Default::default()
     };
-    let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(probe)).await {
+    let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(Box::new(probe))).await {
         // Hold the receiver so the probe's sink stays open until it completes.
         Ok((id, rid, rx)) => (id, rid, rx),
         Err(resp) => return resp,
@@ -121,20 +123,35 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// into per-request payloads (a scalar body → one, a list body → a batch) and
 /// dispatches to the single or batch path; a malformed body is a 400 before
 /// anything reaches the scheduler.
-async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>) -> Response {
+///
+/// The body is extracted as a `Result` so a deserialization failure is answered
+/// with **400** (Python's status for a bad request) carrying serde's field-level
+/// message, instead of axum's default 422.
+async fn generate(
+    State(state): State<AppState>,
+    body: Result<Json<GenerateBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return (StatusCode::BAD_REQUEST, rejection.body_text()).into_response(),
+    };
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.split() {
+    let (payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        // The error carries its own status (a bad batch is `Validation` → 400).
+        Err(e) => {
+            let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+            return (code, e.to_string()).into_response();
+        }
     };
     if !is_batch {
-        // `split` guarantees exactly one payload for a non-batch body.
+        // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
             .into_iter()
             .next()
-            .expect("split yields >=1 payload");
+            .expect("into_requests yields >=1 payload");
         generate_single(&state, payload, stream).await
     } else {
         generate_batch(&state, payloads, stream).await
@@ -146,7 +163,7 @@ async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>)
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(req)).await {
+    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req))).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -231,7 +248,7 @@ async fn generate_batch(
     let mut guard = AbortGuard::new_empty(state.senders.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
-        match submit(state, RequestKind::Generate(req)).await {
+        match submit(state, RequestKind::Generate(Box::new(req))).await {
             Ok((id, rid, rx)) => {
                 guard.arm(id, rid.clone());
                 receivers.push((id, rid, rx));
