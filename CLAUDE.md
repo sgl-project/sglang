@@ -2,43 +2,43 @@
 
 ## Git workflow
 
-- `k3-track`（tracking branch）：直接 commit & push，不开 PR。
-- `kimi-k3`（主 dev 分支）：默认走 PR —— 改动在单独 worktree 的 feature branch 上做，开 PR 合入，不直接 push 到 `kimi-k3`。
+- `k3-track` (tracking branch): commit and push directly, no PR.
+- `kimi-k3` (main dev branch): PR by default — make changes on a feature branch in a separate worktree and land them through a PR, never push directly to `kimi-k3`.
 
-## Secrets — 严禁入库
+## Secrets — never commit
 
-任何 key / token / 密钥等敏感信息（HF token `hf_*`、GitHub token `ghp_*` / `github_pat_*`、cloud key、SSH private key、kubeconfig 凭据、API key、密码）**严禁**写入：
+Any key / token / credential (HF token `hf_*`, GitHub token `ghp_*` / `github_pat_*`, cloud key, SSH private key, kubeconfig credential, API key, password) is **forbidden** from:
 
-- 本 repo 任何分支（代码分支、`k3-track` 的 README / journals / repro.md）、commit message、PR
-- 共享存储（`/cluster-storage`、共享 devbox 落盘的脚本 / 配置）及任何会被上传、同步的文件
+- any branch of this repo (code branches, `k3-track`'s README / journals / repro.md), commit messages, PRs
+- shared storage (`/cluster-storage`, scripts and configs written to a shared devbox) and any file that gets uploaded or synced
 
-要求：
+Requirements:
 
-- 秘密只走瞬态通道：交互 login（如 `hf auth login`）、运行时 env var（不落文件）、本地未跟踪配置
-- 文档 / journal 需要提及 token 时一律用占位符（`hf_xxxxxxxx...`）并注明获取方式
-- `git add` 前 grep 改动中的 token pattern（`hf_[A-Za-z0-9]{20,}`、`ghp_`、`github_pat_`、`AKIA`、`BEGIN.*PRIVATE KEY`、`sk-`），命中即停
-- 一旦 secret 已进 commit / push：按**已泄露**处理 —— 立即告知并 rotate；仅删文件或改历史不算修复
+- Secrets travel through transient channels only: interactive login (e.g. `hf auth login`), runtime env vars (never written to a file), local untracked config
+- When docs or journals need to mention a token, always use a placeholder (`hf_xxxxxxxx...`) and state how to obtain the real one
+- Before `git add`, grep the change for token patterns (`hf_[A-Za-z0-9]{20,}`, `ghp_`, `github_pat_`, `AKIA`, `BEGIN.*PRIVATE KEY`, `sk-`); stop on any hit
+- Once a secret has been committed or pushed, treat it as **leaked**: report it immediately and rotate. Deleting the file or rewriting history is not a fix.
 
 ## K3 Track — plans & progress tracking
 
-Kimi K3 的计划、进度、实验记录不在代码分支里，而在本 repo 的独立 orphan branch `k3-track`：
+Kimi K3's plans, progress, and experiment records do not live on the code branches. They live on this repo's separate orphan branch `k3-track`:
 
-- 线上浏览: https://github.com/DarkSharpness/sglang-kimi/tree/k3-track
-- 本地 worktree（**强制**）: `git worktree add ../sglang-kimi-k3-track k3-track`（已存在则直接 cd 过去）。一切 tracking 读写只在该 worktree 进行 —— 不要在代码 worktree checkout `k3-track`，也不要把 tracking 文件写进代码分支。
+- Browse online: https://github.com/DarkSharpness/sglang-kimi/tree/k3-track
+- Local worktree (**required**): `git worktree add ../sglang-kimi-k3-track k3-track` (if it already exists, just cd into it). All tracking reads and writes happen in that worktree only — do not check out `k3-track` in a code worktree, and do not write tracking files into a code branch.
 
-### Journals — 操作流水账（供 agents retrieve context）
+### Journals — operation log (so agents can retrieve context)
 
-任何有意义的操作（实验跑完、debug 结论、设计定论、PR 开/合、状态变化等）都可以在 `k3-track` 分支的 `journals/` 目录下新增一个文件并直接 commit & push，纯流水账地讲一下做了什么：
+Any meaningful operation (an experiment finished, a debugging conclusion, a settled design decision, a PR opened or merged, a status change) can get a new file under `journals/` on the `k3-track` branch, committed and pushed directly, plainly describing what was done:
 
-- 文件名：`<date>-<time>-<author>-<commit>-<descript>.md`，例：`2026-07-18-1954-lsyin-1ccf020d-kda-fused-decode.md`（commit 为相关 code commit 短 sha）
-- 内容不要求结构化模板，讲清做了什么即可
-- 只新增文件，不改旧 journal；一个操作一个文件（天然无 merge 冲突）
-- journals 是轻量通道，不受下面「更新模式」的人工审核约束，agent 可直接落
+- Filename: `<date>-<time>-<author>-<commit>-<descript>.md`, e.g. `2026-07-18-1954-lsyin-1ccf020d-kda-fused-decode.md` (commit is the short sha of the related code commit)
+- No structured template required — just make it clear what was done
+- Only add new files, never edit an old journal; one operation per file (naturally free of merge conflicts)
+- Journals are a lightweight channel and are not subject to the review workflow below; an agent may write them directly
 
-### 更新模式（AI 必须遵守）
+### Update workflow (AI must follow)
 
-1. **AI 检测 + 主动提醒**：在代码 worktree 陪 human 工作时，如果发现 tracking 可能需要更新（实验出了结果、todo 完成、新方向确定、状态变化），主动提醒 human，但不要自行更新。
-2. **人提供 prompt**：human 明确说了要更新什么，AI 才去动 k3-track worktree。
-3. **AI 更新，人审核**：AI 按 k3-track 根目录 `CLAUDE.md` 的路由与格式写好，交 human 审核，审核通过后才 commit / push。
+1. **AI detects and reminds**: while working alongside a human in a code worktree, if you notice that tracking may need an update (an experiment produced results, a todo completed, a new direction settled, a status changed), remind the human proactively, but do not update it yourself.
+2. **Human provides the prompt**: only once the human states explicitly what to update does the AI touch the k3-track worktree.
+3. **AI updates, human reviews**: the AI writes it following the routing and format in the `CLAUDE.md` at the root of k3-track, then hands it to the human for review; commit and push only after approval.
 
-benchmark 数字必须绑定 code commit（`data@YYYY-MM-DD-<sha8>` round），没有 binding 的数字不落库。
+Benchmark numbers must be bound to a code commit (`data@YYYY-MM-DD-<sha8>` round). Numbers without that binding are not recorded.
