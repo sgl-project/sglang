@@ -109,7 +109,13 @@ impl Runnable for Ingress {
 impl Ingress {
     /// Reject a request: → `Failed`, notify the client, deregister (unconditional
     /// — a no-op when nothing was registered).
-    fn fail(&self, req: &mut Request, err: Error) {
+    /// `registered` says whether this request ever reached `register_detok`. It
+    /// must: `Deregister`'s handler is a bare `table.remove(&rid_hash)`, so a
+    /// request rejected BEFORE registering would evict whatever entry currently
+    /// holds that key — a concurrent request's sink — leaving that client with no
+    /// terminal frame and a hung connection. Python cannot hit this because it
+    /// validates before `rid_to_state[obj.rid] = state`.
+    fn fail(&self, req: &mut Request, err: Error, registered: bool) {
         let id = req.rid_hash;
         // Log only server faults (500); 4xx/499/503 are expected and would spam.
         if err.http_status() == 500 {
@@ -117,10 +123,12 @@ impl Ingress {
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
-        let _ = self
-            .senders
-            .detok_for(id)
-            .send(DetokMsg::Deregister { rid_hash: id });
+        if registered {
+            let _ = self
+                .senders
+                .detok_for(id)
+                .send(DetokMsg::Deregister { rid_hash: id });
+        }
     }
 
     /// Drive a request through its ingress states until it terminates (failed or
@@ -129,6 +137,9 @@ impl Ingress {
     /// re-dispatches. The arms are the design table's states, `Failed` the single
     /// reject path.
     fn drive(&self, mut req: Request) {
+        // Flipped once `register_detok` succeeds; `fail` must not deregister before
+        // that (see `fail`). A pool return re-enters `drive` already registered.
+        let mut registered = !matches!(req.state, RequestState::Received);
         loop {
             match req.state.clone() {
                 // Validate, then register the sink before the request leaves Rust.
@@ -144,6 +155,7 @@ impl Ingress {
                             .apply(Event::Error(Error::Internal("detok shard gone".into())));
                         continue;
                     }
+                    registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
                 // Control skips normalization (no sampling params) straight to the
@@ -168,6 +180,7 @@ impl Ingress {
                             self.fail(
                                 &mut req,
                                 Error::Internal("non-generate request in Normalizing".into()),
+                                registered,
                             );
                             return;
                         };
@@ -200,7 +213,12 @@ impl Ingress {
                     if let Err(err) = self.senders.tok.send(req) {
                         // Pool gone (workers exited); flume hands the request back.
                         let mut req = err.into_inner();
-                        self.fail(&mut req, Error::Internal("tokenizer pool gone".into()));
+                        // Past `Received`, so registration happened.
+                        self.fail(
+                            &mut req,
+                            Error::Internal("tokenizer pool gone".into()),
+                            true,
+                        );
                     }
                     return;
                 }
@@ -231,7 +249,7 @@ impl Ingress {
                 }
                 // The single reject path for every post-register failure.
                 RequestState::Failed(e) => {
-                    self.fail(&mut req, e);
+                    self.fail(&mut req, e, registered);
                     return;
                 }
                 // Unreachable (egress states never reach here). Reject via `fail`/
@@ -240,6 +258,7 @@ impl Ingress {
                     self.fail(
                         &mut req,
                         Error::Internal(format!("unexpected ingress state: {other:?}")),
+                        registered,
                     );
                     return;
                 }
@@ -285,7 +304,7 @@ impl Ingress {
         let header = match encode {
             Ok(b) => b,
             Err(e) => {
-                self.fail(&mut req, e);
+                self.fail(&mut req, e, true); // on the push path: registered
                 return;
             }
         };
@@ -294,7 +313,7 @@ impl Ingress {
             header,
             ids: Bytes::new(),
         }) {
-            self.fail(&mut req, Error::QueueFull);
+            self.fail(&mut req, Error::QueueFull, true); // registered
         }
     }
 
@@ -339,13 +358,13 @@ impl Ingress {
         let (header, ids) = match serialized {
             Ok(v) => v,
             Err(e) => {
-                self.fail(&mut req, e);
+                self.fail(&mut req, e, true); // on the push path: registered
                 return;
             }
         };
 
         if !self.ingress.try_push(IngressMsg { header, ids }) {
-            self.fail(&mut req, Error::QueueFull);
+            self.fail(&mut req, Error::QueueFull, true); // registered
         }
         // On success the scheduler owns the request (egress arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
@@ -767,6 +786,41 @@ mod tests {
             consumer.drain(16).headers.is_empty(),
             "must not reach the scheduler"
         );
+    }
+
+    /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
+    /// handler is a bare `table.remove(&rid_hash)`, so it would evict whatever entry
+    /// holds that key — a concurrent request's sink — leaving that client hung with
+    /// no terminal frame. Python validates before it inserts, so it cannot hit this.
+    #[test]
+    fn pre_registration_failure_does_not_deregister() {
+        // Rejected inside `validate` (out-of-vocab id), which runs before registration.
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let mut req = generate_req(41, SamplingParams::default());
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![2_000_000_000]);
+        }
+        ingress.drive(req);
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "a pre-registration reject must send NOTHING to the shard — a Deregister \
+             here removes a live request's sink"
+        );
+
+        // A post-registration reject still deregisters (the leak fix stays fixed).
+        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        ingress.drive(generate_req(
+            42,
+            SamplingParams {
+                top_p: 2.0, // rejected by `normalize`, after registration
+                ..Default::default()
+            },
+        ));
+        assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+        assert!(matches!(
+            detok_rx.try_recv(),
+            Ok(DetokMsg::Deregister { .. })
+        ));
     }
 
     /// A request rejected at normalization (post-register) must not leak: the shard
