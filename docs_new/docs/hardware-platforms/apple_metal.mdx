@@ -60,8 +60,25 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 2. `--disable-cuda-graph` - Disables usage of CUDA graph, which is not relevant for Apple Metal.
 3. `--disable-overlap-schedule` - Disables overlap scheduling (enabled/not present by default) achieved using MLX's `async_eval()`
 4. `SGLANG_MLX_USE_CUSTOM_ROPE=1` - Enables the optional custom Metal RoPE kernel. It is disabled by default, so the MLX backend uses the standard RoPE path unless you opt in for A/B testing.
-5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
-6. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
+5. `SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION=1` - Enables the experimental Metal block-table paged-attention decode path and block KV pool. It is disabled by default, so MLX uses the legacy flat/contiguous KV cache with padded SDPA unless you opt in.
+6. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
+7. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
+
+### Metal block paged attention
+
+Metal block-table paged attention is experimental and disabled by default. To
+enable the block KV pool and block-table decode kernel, set
+`SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION=1`. Unsupported cases fall back to padded
+SDPA.
+
+```bash
+SGLANG_USE_MLX=1 \
+SGLANG_MLX_USE_BLOCK_PAGED_ATTENTION=1 \
+python -m sglang.launch_server \
+  --model-path <MODEL_ID_OR_PATH> \
+  --host 0.0.0.0 \
+  --port 30000
+```
 
 ## Quantization
 

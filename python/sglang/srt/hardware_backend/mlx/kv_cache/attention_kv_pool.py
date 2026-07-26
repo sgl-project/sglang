@@ -84,3 +84,135 @@ class MlxAttentionKVPool:
         for i in range(self.num_layers):
             self.k_buffer[i] = mx.zeros(shape, dtype=self.dtype)
             self.v_buffer[i] = mx.zeros(shape, dtype=self.dtype)
+
+
+class MlxBlockAttentionKVPool:
+    """Pre-allocated block-table attention KV pool.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        num_layers: int,
+        n_kv_heads: int,
+        head_dim: int,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        # Block 0 is reserved for padding/invalid use. Allocated request blocks start
+        # at physical block 1.
+        if num_blocks <= 0:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}")
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive, got {block_size}")
+
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self._free_blocks: list[int] = list(range(1, num_blocks))
+        self._req_block_tables: dict[str, list[int]] = {}
+
+        shape = (num_blocks, block_size, n_kv_heads, head_dim)
+        self.k_buffer: list[mx.array] = [
+            mx.zeros(shape, dtype=dtype) for _ in range(num_layers)
+        ]
+        self.v_buffer: list[mx.array] = [
+            mx.zeros(shape, dtype=dtype) for _ in range(num_layers)
+        ]
+
+        mem_mb = (
+            num_blocks
+            * block_size
+            * n_kv_heads
+            * head_dim
+            * 2
+            * num_layers
+            * dtype.size
+        ) / (1024 * 1024)
+        logger.info(
+            f"MlxBlockAttentionKVPool: {num_blocks} blocks x block_size={block_size} "
+            f"x {num_layers} layers x {n_kv_heads} heads x {head_dim} dim, "
+            f"dtype={dtype}, ~{mem_mb:.1f} MB"
+        )
+
+    def alloc_blocks(self, req_id: str, num_blocks: int) -> list[int] | None:
+        """Allocate physical blocks for a request, or return None if full."""
+        if num_blocks < 0:
+            raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
+        if req_id in self._req_block_tables:
+            raise ValueError(f"request {req_id!r} already has allocated blocks")
+        if num_blocks > len(self._free_blocks):
+            return None
+        blocks = self._free_blocks[:num_blocks]
+        del self._free_blocks[:num_blocks]
+        self._req_block_tables[req_id] = blocks
+        return list(blocks)
+
+    def ensure_blocks(self, req_id: str, num_blocks: int) -> list[int] | None:
+        """Ensure a request owns at least ``num_blocks`` physical blocks."""
+        if num_blocks < 0:
+            raise ValueError(f"num_blocks must be non-negative, got {num_blocks}")
+        existing = self._req_block_tables.setdefault(req_id, [])
+        needed = num_blocks - len(existing)
+        if needed <= 0:
+            return list(existing)
+        if needed > len(self._free_blocks):
+            return None
+        new_blocks = self._free_blocks[:needed]
+        del self._free_blocks[:needed]
+        existing.extend(new_blocks)
+        return list(existing)
+
+    def block_table(self, req_id: str) -> list[int]:
+        """Return the physical block table for a request."""
+        return list(self._req_block_tables[req_id])
+
+    def free_request(self, req_id: str) -> None:
+        """Release a request's blocks back to the free list."""
+        blocks = self._req_block_tables.pop(req_id, None)
+        if not blocks:
+            return
+        self._free_blocks = sorted(blocks + self._free_blocks)
+
+    def set_kv(
+        self,
+        layer_id: int,
+        block_ids: mx.array,
+        block_offsets: mx.array,
+        k: mx.array,
+        v: mx.array,
+    ) -> None:
+        """Scatter K/V into ``[block_id, block_offset]`` locations."""
+        if block_ids.ndim != 1 or block_offsets.ndim != 1:
+            raise ValueError("block_ids and block_offsets must be 1-D")
+        if tuple(block_ids.shape) != tuple(block_offsets.shape):
+            raise ValueError("block_ids and block_offsets must have matching shape")
+        if tuple(k.shape) != (block_ids.shape[0], self.n_kv_heads, self.head_dim):
+            raise ValueError(
+                "k must have shape [num_tokens, n_kv_heads, head_dim], "
+                f"got {k.shape}"
+            )
+        if tuple(v.shape) != tuple(k.shape):
+            raise ValueError(f"v shape must match k shape, got {v.shape} vs {k.shape}")
+        self.k_buffer[layer_id][block_ids, block_offsets] = k
+        self.v_buffer[layer_id][block_ids, block_offsets] = v
+
+    def get_kv(self, layer_id: int) -> tuple[mx.array, mx.array]:
+        """Return full block K/V buffers for one layer."""
+        return self.k_buffer[layer_id], self.v_buffer[layer_id]
+
+    def all_buffers(self) -> list[mx.array]:
+        """Return all buffer arrays (for ``mx.eval``)."""
+        return self.k_buffer + self.v_buffer
+
+    def clear(self) -> None:
+        """Zero all buffers and clear request ownership."""
+        shape = (self.num_blocks, self.block_size, self.n_kv_heads, self.head_dim)
+        for i in range(self.num_layers):
+            self.k_buffer[i] = mx.zeros(shape, dtype=self.dtype)
+            self.v_buffer[i] = mx.zeros(shape, dtype=self.dtype)
+        self._free_blocks = list(range(1, self.num_blocks))
+        self._req_block_tables.clear()

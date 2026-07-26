@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_cache import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_kv_pool import (
     MlxAttentionKVPool,
+    MlxBlockAttentionKVPool,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_wrapper import (
     BatchedDecodeContext,
@@ -26,6 +27,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateComponent,
     MlxAuxiliaryStatePool,
     MlxAuxiliaryStateReqToTokenPool,
+)
+from sglang.srt.hardware_backend.mlx.kv_cache.block_metadata import (
+    MLXBlockPagedAttentionMetadata,
+    build_decode_block_metadata,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.layout import MlxModelCacheLayout
 from sglang.srt.hardware_backend.mlx.kv_cache.model_patching import (
@@ -47,13 +52,16 @@ __all__ = [
     "get_num_kv_heads",
     "is_attention_module",
     "MLXAttentionWrapper",
+    "MLXBlockPagedAttentionMetadata",
     "MlxAttentionKVPool",
     "MlxAuxiliaryStateComponent",
     "MlxAuxiliaryStatePool",
     "MlxAuxiliaryStateReqToTokenPool",
+    "MlxBlockAttentionKVPool",
     "MlxModelCacheLayout",
     "patch_model_attention",
     "PoolBackedAttentionKVCache",
+    "build_decode_block_metadata",
     "set_context",
     "uses_sliding_window_attention",
 ]
