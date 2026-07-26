@@ -34,18 +34,17 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# This PyTorch 2.13 upgrade branch intentionally uses GT regenerated for its
-# dependency stack. These commits predate the migration to
-# sgl-project/ci-data-diffusion, so keep the repository and revisions together
-# when merging from main. New GT is published to ci-data-diffusion; when these
-# revisions are next regenerated, switch SGL_TEST_FILES_CI_DATA_REPO to
-# "sgl-project/ci-data-diffusion" and update the revisions in the same change.
-SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data"
-SGL_TEST_FILES_CI_DATA_REVISION = "24e7ed4125e0a2ecb21b84e3d3756647afe31610"
+# GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
+# committed to, so REPO and REVISION must be bumped together. All GT (CUDA and
+# NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
+# publish.
+SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
+SGL_TEST_FILES_CI_DATA_REVISION = "c4bb51b47662a93019e15692397388c35efb1f93"
 
-# The NPU pin is regenerated independently on its own cadence.
+# The NPU pin is kept as a separate branch so ascend GT can be bumped independently
+# when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
+    SGL_TEST_FILES_CI_DATA_REVISION = "6d689f4833e8c106ff0d853865f50496d1f2b453"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
