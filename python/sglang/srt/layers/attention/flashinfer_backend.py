@@ -206,8 +206,8 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
 ) -> None:
-    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for CUDA graph
-    replay (FlashInfer fa2 only).
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for EAGLE-style
+    draft-extend and DFlash target-verify CUDA graph replay (FlashInfer fa2 only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
