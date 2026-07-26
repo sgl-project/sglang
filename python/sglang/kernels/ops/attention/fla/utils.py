@@ -12,7 +12,12 @@ from functools import lru_cache
 from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import torch
-import triton
+from sglang.srt.utils.common import HAS_TRITON
+
+if HAS_TRITON:
+    import triton
+else:
+    triton = None
 from packaging import version
 
 from sglang.srt.utils.common import torch_release

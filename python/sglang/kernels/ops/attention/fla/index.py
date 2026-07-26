@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import torch
-import triton
+from sglang.srt.utils.common import HAS_TRITON
+
+if HAS_TRITON:
+    import triton
+else:
+    triton = None
 
 from sglang.kernels.ops.attention.fla.utils import tensor_cache
 
