@@ -690,19 +690,13 @@ export const config = {
     // DSpark (speculative decoding) — separate draft checkpoint
     // (RadixArk/Inkling-DSpark-Preview, served unquantized) instead of Inkling's
     // own MTP head, so it needs a build carrying DSpark support: the
-    // `dev-cu13-inkling-dspark` image (see `hints` + the dockerImages key).
+    // `dev-cu13-inkling-dspark` image (see the dockerImages key above).
     // The draft weights sit outside the FP4 target, hence mem-fraction 0.68.
-    // The verified recipe omits `--enable-multimodal`; add it if you need
-    // image/audio input on this tier (that combination isn't verified).
     // B200 verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
       verified: true,
-      hints: [
-        "Requires an SGLang build with DSpark support:",
-        "  docker pull lmsysorg/sglang:dev-cu13-inkling-dspark",
-      ],
       env: [
         "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],

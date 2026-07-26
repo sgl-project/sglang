@@ -1247,11 +1247,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`, then
-      // `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
-        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1276,13 +1274,6 @@ export const Playground = ({ config }) => {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
       cmd = `${hint}\n${cmd}`;
-    }
-    // Per-cell hints (matches _deployment.jsx) — carried into the playground so
-    // an untouched base renders identically on both panels.
-    if (cell && cell.hints && cell.hints.length) {
-      const cellHint = cell.hints
-        .map((line) => (line.length ? "# " + line : "#")).join("\n");
-      cmd = `${cellHint}\n${cmd}`;
     }
     cmd = interpolate(cmd, envValues, modelName);
     if (multinode) {

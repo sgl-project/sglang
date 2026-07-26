@@ -11,11 +11,9 @@
 //                      (so a model-specific GPU never needs an engine-catalog edit)
 //   variants/quantizations/strategies/nodesOptions  the 5-dim option lists
 //                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
-//   cells              {match, verified?, hints?, env, flags}[] — one per
+//   cells              {match, verified?, env, flags}[] — one per
 //                      (hw × variant × quant × strategy × nodes); env/flags are
-//                      flat literals, only {{PLACEHOLDER}} subst applied;
-//                      hints are prepended as `# ...` comment lines (e.g. a
-//                      recipe that needs a specific dev build)
+//                      flat literals, only {{PLACEHOLDER}} subst applied
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
@@ -563,12 +561,6 @@ export const Deployment = ({ config, benchmarks }) => {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
       cmd = `${hint}\n${cmd}`;
-    }
-    // Per-cell hints sit above everything the cell renders (prerequisites first).
-    if (cell.hints && cell.hints.length) {
-      const cellHint = cell.hints
-        .map((line) => (line.length ? "# " + line : "#")).join("\n");
-      cmd = `${cellHint}\n${cmd}`;
     }
     cmd = interpolate(cmd, envValues, modelName);
     if (multinode) {

@@ -307,4 +307,4 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-DSpark-Preview` — served unquantized alongside the NVFP4 target.
 
-It needs an SGLang build with DSpark support (`lmsysorg/sglang:dev-cu13-inkling-dspark`); the `inkling-cu13` / `inkling-cu12` images don't carry it yet, so the generated command states that prerequisite in its first comment line. The recipe is text-only (no `--enable-multimodal`). Verified end-to-end on B200 (TP=8, NVFP4).
+It needs an SGLang build with DSpark support — `lmsysorg/sglang:dev-cu13-inkling-dspark`, which the Deploy panel's **Docker** command uses for this tier; the `inkling-cu13` / `inkling-cu12` images don't carry DSpark yet. Verified end-to-end on B200 (TP=8, NVFP4).
