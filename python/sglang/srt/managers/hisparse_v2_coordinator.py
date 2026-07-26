@@ -119,9 +119,10 @@ class HiSparseV2AdmitBudget:
         temp device buffer on top could push add_one_req's total past
         rem_total_tokens forever (NO_TOKEN livelock on an idle system).
         Note the coordinator may still V2-admit such a request when the
-        pool has room at admission time — that is strictly better than
-        standard (the prefix becomes evictable), and the reservation here
-        stays the conservative standard one."""
+        pool has room at admission time; with the tree_len >=
+        temp_slot_tokens admission guard, doing so never exceeds the
+        standard reservation made here (footprint delta = temp - tree_len
+        <= 0), so the conservative reservation stays sound."""
         return (
             total_seq_len + self.temp_slot_tokens + max_new + self._page_size
             >= self._device_pool_tokens
@@ -138,6 +139,7 @@ class HiSparseV2AdmitBudget:
         tree_len = num_pages * self._page_size
         if (
             num_pages <= 0
+            or tree_len < self.temp_slot_tokens
             or num_pages > self._expanded_left
             or tree_len > self._host_left
             or self._infeasible(total_seq_len, max_new)
@@ -154,7 +156,12 @@ class HiSparseV2AdmitBudget:
         candidates queued. Short prompts (< 1 page) and pool-infeasible
         reservations legitimately run as standard: nothing exhausted."""
         num_pages = total_seq_len // self._page_size
-        if num_pages <= 0 or self._infeasible(total_seq_len, max_new):
+        tree_len = num_pages * self._page_size
+        if (
+            num_pages <= 0
+            or tree_len < self.temp_slot_tokens
+            or self._infeasible(total_seq_len, max_new)
+        ):
             return False
         return (
             num_pages > self._expanded_left
@@ -374,6 +381,14 @@ class HiSparseV2Coordinator:
         num_pages = tree_len // self.page_size
         if num_pages == 0:
             # Nothing evictable — run as a standard request.
+            return False
+        if tree_len < self.temp_slot_tokens:
+            # V2's device footprint vs standard is temp_slot_tokens (pinned
+            # for the request lifetime) minus tree_len (turned evictable):
+            # a prefix smaller than the temp buffer makes V2 a net capacity
+            # LOSS, exceeding the scheduler's standard-path reservation
+            # (retract/OOM on long outputs). Such short prefixes gain
+            # nothing from eviction anyway — run standard.
             return False
 
         # Host-capacity gate: every admitted prefix must be evictable to
