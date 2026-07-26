@@ -63,14 +63,12 @@ from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
+    fill_draft_extend_prepare_buffers_triton as fill_draft_extend_prepare_buffers,
+)
+from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
     wide_row_softmax_triton,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import fill_draft_extend_prepare_buffers_triton as fill_draft_extend_prepare_buffers
-if is_npu():
-    from sglang.srt.speculative.multi_layer_eagle_utils import fill_draft_extend_prepare_buffers_native
-    fill_draft_extend_prepare_buffers = fill_draft_extend_prepare_buffers_native
-
 from sglang.srt.speculative.spec_utils import (
     fast_sample,
     fast_topk,
@@ -84,6 +82,13 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+
+if is_npu():
+    from sglang.srt.speculative.multi_layer_eagle_utils import (
+        fill_draft_extend_prepare_buffers_native,
+    )
+
+    fill_draft_extend_prepare_buffers = fill_draft_extend_prepare_buffers_native
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
