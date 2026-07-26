@@ -1349,7 +1349,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
     def _apply_sm100_trtllm_gen(self, layer, dispatch_output):
-        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmGenMxfp4MoeQuantInfo,
         )
 

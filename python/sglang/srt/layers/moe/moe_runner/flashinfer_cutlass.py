@@ -1,9 +1,9 @@
 """FlashInfer CUTLASS MoE fused funcs.
 
 This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
-unquantized, ModelOpt FP8, ModelOpt NVFP4, and MXFP4 MoE paths.
-Quantization methods prepare a small quant_info payload and route through
-``MoeRunner``.
+unquantized, ModelOpt FP8, ModelOpt NVFP4, and CUTLASS MXFP4 MoE paths, plus
+the shared ``flashinfer_mxfp4`` dispatcher. Quantization methods prepare a
+small quant_info payload and route through ``MoeRunner``.
 """
 
 from __future__ import annotations
@@ -97,32 +97,6 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
     padded_hidden: Optional[int] = None
-
-
-@dataclass
-class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
-    """Payload for the SM100 (Blackwell) trtllm-gen MXFP4 MoE path."""
-
-    # Packed MXFP4 weights: uint8, e2m1 x 2.
-    w13_weight: torch.Tensor
-    w2_weight: torch.Tensor
-    w13_weight_scale: torch.Tensor
-    w2_weight_scale: torch.Tensor
-
-    # fp32 per expert. GPT-OSS sets these.
-    w13_weight_bias: torch.Tensor
-    w2_weight_bias: torch.Tensor
-    gemm1_alpha: torch.Tensor
-    gemm1_beta: torch.Tensor
-    gemm1_clamp_limit: torch.Tensor
-
-    global_num_experts: int
-    local_expert_offset: int
-    local_num_experts: int
-    intermediate_size_per_partition: int
-
-    hidden_size: int
-    flashinfer_mxfp4_moe_precision: str
 
 
 def _flashinfer_cutlass_fused_moe():
@@ -333,6 +307,14 @@ def fused_experts_none_to_flashinfer_mxfp4(
         return _fused_experts_flashinfer_mxfp4_sm90_cutlass(
             dispatch_output, quant_info, runner_config
         )
+
+    # Keep one fused-op registration for the shared backend while loading the
+    # TRT-LLM implementation only when its quant-info type is dispatched.
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmGenMxfp4MoeQuantInfo,
+        _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen,
+    )
+
     if isinstance(quant_info, FlashInferTrtllmGenMxfp4MoeQuantInfo):
         return _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             dispatch_output, quant_info, runner_config
@@ -437,91 +419,3 @@ def _fused_experts_flashinfer_mxfp4_sm90_cutlass(
         out = out[:, :origin_hidden].contiguous()
 
     return StandardCombineInput(hidden_states=out)
-
-
-def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    """SM100 (Blackwell) trtllm-gen MXFP4 fused experts.
-
-    Consumes BYPASSED topk directly: the kernel routes from ``router_logits``
-    internally. Quantizes the input itself (bf16 passthrough or mxfp8).
-    """
-    from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
-
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-    x = dispatch_output.hidden_states
-    topk_output = dispatch_output.topk_output
-
-    # When bf16 mode is enabled we skip input quant; TRT-LLM quantizes inside the
-    # kernel and pipelines it with the GEMMs.
-    origin_hidden_states_dim = x.shape[-1]
-    if quant_info.flashinfer_mxfp4_moe_precision == "bf16":
-        assert x.dtype == torch.bfloat16
-        x_quant = x
-        x_scale = None
-        if quant_info.hidden_size != origin_hidden_states_dim:
-            x_quant = torch.nn.functional.pad(
-                x_quant,
-                (0, quant_info.hidden_size - origin_hidden_states_dim),
-                mode="constant",
-                value=0.0,
-            )
-    elif quant_info.flashinfer_mxfp4_moe_precision == "default":
-        x_quant, x_scale = mxfp8_quantize(x, False, alignment=quant_info.hidden_size)
-        x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
-    else:
-        raise NotImplementedError(
-            f"Unsupported flashinfer_mxfp4_moe_precision: "
-            f"{quant_info.flashinfer_mxfp4_moe_precision}"
-        )
-
-    assert x_quant.shape[-1] == quant_info.hidden_size
-    assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-    top_k = topk_output.topk_config.top_k
-    router_logits = topk_output.router_logits
-
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        num_tokens = x_quant.shape[0]
-        symm_output = torch.empty(
-            num_tokens,
-            origin_hidden_states_dim,
-            dtype=torch.bfloat16,
-            device=x_quant.device,
-        )
-    trtllm_gen_output = trtllm_fp4_block_scale_moe(
-        router_logits.to(torch.bfloat16),
-        None,  # routing_bias
-        x_quant,
-        x_scale,
-        quant_info.w13_weight,  # uint8 (e2m1 x 2)
-        quant_info.w13_weight_scale,  # uint8 (e4m3 x 2)
-        quant_info.w13_weight_bias,  # fp32 per expert per channel
-        quant_info.gemm1_alpha,  # fp32 per expert
-        quant_info.gemm1_beta,  # fp32 per expert
-        quant_info.gemm1_clamp_limit,  # fp32 per expert
-        quant_info.w2_weight,  # uint8 (e2m1 x 2)
-        quant_info.w2_weight_scale,  # ue8m0
-        quant_info.w2_weight_bias,  # fp32 per expert per channel
-        None,  # output1_scale_scalar
-        None,  # output1_scale_gate_scalar
-        None,  # output2_scale_scalar
-        quant_info.global_num_experts,
-        top_k,
-        None,  # n_group      # TODO: support n_group
-        None,  # topk_group   # TODO: support topk_group
-        quant_info.intermediate_size_per_partition,  # padded to multiple of 256
-        quant_info.local_expert_offset,
-        quant_info.local_num_experts,
-        None,  # routed_scaling_factor
-        1,  # routing_method_type, renormalize
-        True,  # do finalize
-        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-        output=symm_output,
-    )[0]
-    return StandardCombineInput(hidden_states=trtllm_gen_output)
