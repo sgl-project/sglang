@@ -885,6 +885,12 @@ class Scheduler(
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
 
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.ep_join_mode == "recover"
+        ):
+            model_runner.post_capture_elastic_ep_recover()
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -1672,14 +1678,12 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Spec algorithms that don't advance the grammar FSM inside verify() (see
-        # supports_grammar_overlap) still need overlap forced off for grammar decode
-        # batches, so the FSM is advanced before the next batch's bitmask.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
@@ -2414,25 +2418,25 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
+            tree_cache = self.tree_cache
+            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
+                req.last_host_node
+            ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    tree_cache.get_prefix_hash_values(req.last_host_node)
+                    if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                tree_cache.prefetch_from_storage(
                     req.rid,
-                    last_host_node,
+                    req.last_host_node,
                     new_input_tokens,
-                    last_hash,
+                    tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
 
