@@ -171,47 +171,6 @@ def fused_front_covered(
     )
 
 
-def fused_front_epilogue_only(
-    merged: torch.Tensor,
-    correction_bias: torch.Tensor,
-    latent: int,
-    topk: int = TOPK,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 1.0,
-    apply_routed_scaling_factor_on_output: bool = False,
-    config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The epilogue alone, over an already-computed merged GEMM output.
-
-    Exists so the kernel can be tuned without the cuBLAS GEMM dominating the
-    measurement; :func:`fused_front` is the production entry point.
-    """
-    M = merged.shape[0]
-    device = merged.device
-    if config is None:
-        config = get_config("epilogue", M, device, DEFAULT_EPILOGUE_CONFIG)
-
-    weights = torch.empty((M, topk), dtype=torch.float32, device=device)
-    ids = torch.empty((M, topk), dtype=torch.int32, device=device)
-    routed = torch.empty((M, latent), dtype=torch.bfloat16, device=device)
-
-    _jit_module().front_epilogue(
-        merged,
-        correction_bias,
-        weights,
-        ids,
-        routed,
-        topk,
-        float(routed_scaling_factor if routed_scaling_factor is not None else 1.0),
-        bool(renormalize),
-        bool(apply_routed_scaling_factor_on_output),
-        int(config["block_size"]),
-        int(config["cast_vec"]),
-        bool(config["cast_first"]),
-    )
-    return weights, ids, routed
-
-
 def fused_front(
     hidden_states: torch.Tensor,
     merged_weight: torch.Tensor,

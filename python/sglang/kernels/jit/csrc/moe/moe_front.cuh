@@ -60,13 +60,6 @@ inline constexpr uint32_t kFGTTopK = 16;
 // 7 warps: 896 experts / 224 threads = 4 experts per thread in the epilogue, and
 // one expert per warp per pass in phase 1.  Keeping the block at route_radix's
 // shape lets the epilogue reuse its radix-select verbatim.
-// Default block size when no tuned config is supplied: 896 / 224 = 4 experts
-// per thread, the shape route_radix.cuh uses.
-inline constexpr uint32_t kFGTBlockSize = 224;
-// Largest batch the fused kernel serves; above this the gate GEMM is already
-// near the memory-read floor and cuBLAS + route_radix_fp32 wins.
-inline constexpr uint32_t kFGTMaxTokens = 16;
-
 /// Block size is a tunable: it sets how many experts each thread owns in the
 /// radix select (kNumExperts / kBlockSize).  It must be at least kRadixSize/2 =
 /// 128 threads (the split-bin search puts 2 bins per thread) and must divide the

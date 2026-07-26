@@ -1898,8 +1898,6 @@ class KimiK3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp_res_proj",
             )
 
-        self._forward_attn_residual = self._forward_attn_residual_clean
-
         if self._sp_moe:
             # o_proj emits TP-partial sums; _finish_attn_reduce completes the
             # reduction (RS on the clean attn-res path, AR on fallbacks).
@@ -2040,7 +2038,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual
 
-    def _forward_attn_residual_clean(
+    def _forward_attn_residual(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -2949,14 +2947,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # even though it discards every language-model tensor.
             for _ in stream_language_weights():
                 pass
-
-    @property
-    def stacked_params_mapping(self):
-        return getattr(self.language_model, "stacked_params_mapping", [])
-
-    @property
-    def expert_params_mapping(self):
-        return getattr(self.language_model, "expert_params_mapping", [])
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

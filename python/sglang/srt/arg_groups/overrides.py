@@ -388,7 +388,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
                 f"{server_args.kv_cache_dtype!r} -> 'fp8_e4m3'."
             )
-            overrides["kv_cache_dtype"] = "fp8_e4m3"
             overrides.update(
                 prefill_attention_backend="tokenspeed_mla",
                 decode_attention_backend="tokenspeed_mla",

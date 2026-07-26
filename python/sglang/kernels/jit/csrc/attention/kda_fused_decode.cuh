@@ -81,37 +81,6 @@ SGL_DEVICE void store_state_float4(float* ptr, float4 value) {
   }
 }
 
-SGL_DEVICE void cp_async_wait_oldest(int outstanding_groups) {
-  if (outstanding_groups >= 3) {
-    ptx::cp_async_wait_group<2>();
-  } else if (outstanding_groups == 2) {
-    ptx::cp_async_wait_group<1>();
-  } else {
-    ptx::cp_async_wait_group<0>();
-  }
-}
-
-template <int kStageChunkV>
-SGL_DEVICE void cp_async_state_chunk_stage(
-    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage) {
-  constexpr int kFloat4PerChunk = kStageChunkV * kDimK / 4;
-  const int tid = threadIdx.x;
-  const int v_base = chunk * kStageChunkV;
-  // Slot stride is the (possibly envelope) pitch supplied by the host, not
-  // HV*V*K; the intra-slot offset i_hv*V*K + ... stays contiguous. int64
-  // because slot*state_slot_stride overflows int32 on strided pools.
-  const int64_t slot_base = static_cast<int64_t>(slot) * state_slot_stride;
-  for (int linear4 = tid; linear4 < kFloat4PerChunk; linear4 += kThreads) {
-    const int elem = linear4 * 4;
-    const int row = elem / kDimK;
-    const int k = elem - row * kDimK;
-    float* dst = s_state + (stage * kStageChunkV + row) * kDimK + k;
-    const float* src = state + slot_base + ((i_hv * kDimV + v_base + row) * kDimK + k);
-    ptx::cp_async_cg_16b(dst, src);
-  }
-  ptx::cp_async_commit_group();
-}
-
 template <int kCopyThreads>
 SGL_DEVICE void
 cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
@@ -200,21 +169,6 @@ struct Sum2 {
 
 SGL_DEVICE Sum2 warp_reduce_sum_pair(float x, float y) {
   return {device::warp::reduce_sum(x), device::warp::reduce_sum(y)};
-}
-
-struct Sum4 {
-  float a;
-  float b;
-  float c;
-  float d;
-};
-
-SGL_DEVICE Sum4 warp_reduce_sum4(float a, float b, float c, float d) {
-  return {
-      device::warp::reduce_sum(a),
-      device::warp::reduce_sum(b),
-      device::warp::reduce_sum(c),
-      device::warp::reduce_sum(d)};
 }
 
 template <int kReduceWarps>
