@@ -463,21 +463,44 @@ class IpcModelLoader(BaseModelLoader):
 
     @staticmethod
     def _rebind_quant_state_after_import(model) -> None:
-        """Let quant methods re-establish state that depends on tensor identity.
+        """Re-establish quant state that depends on tensor identity.
 
-        The daemon's post-processing also wired up Python objects that hold
-        references to its tensors (e.g. NVFP4 MoE hands its input global scale to
-        the token dispatcher). Those references are the daemon's objects, so the
-        client re-runs just that wiring against its own IPC-mapped tensors.
-        Quant methods without identity-dependent state need no hook.
+        Post-processing also wires up Python objects holding references to the
+        tensors it produced -- NVFP4 MoE hands its input global scale to the
+        token dispatcher. Those are the daemon's objects, so the client redoes
+        just that wiring against its own IPC-mapped tensors.
+
+        Kept here rather than as a hook on the quant method so the weight cache
+        stays self-contained. The cost is that the expression below duplicates
+        the dispatcher call at the end of
+        ModelOptNvFp4FusedMoEMethod.process_weights_after_loading; if that call
+        changes, this must change with it, and only end-to-end output parity
+        would notice.
         """
+        from sglang.srt.layers.moe.utils import (
+            should_use_flashinfer_cutlass_moe_fp4_allgather,
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            MOE_NVFP4_DISPATCH,
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
         rebound = 0
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            hook = getattr(quant_method, "rebind_after_ipc_import", None)
-            if hook is not None:
-                hook(module)
-                rebound += 1
+            if not isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+                continue
+            module.dispatcher.set_quant_config(
+                {
+                    "input_global_scale": (
+                        module.w13_input_scale_quant
+                        if MOE_NVFP4_DISPATCH
+                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                        else None
+                    )
+                }
+            )
+            rebound += 1
         if rebound:
             logger.info(f"[IpcModelLoader] Rebound quant state on {rebound} module(s)")
 
