@@ -81,6 +81,22 @@ _TMA_BEST_CONFIG: dict[int, tuple[int, int, int]] = {
     8: (5, 1, 200),
 }
 
+
+def _tuning(nvb: int, num_tokens: int) -> tuple[int, int, int]:
+    """(chunk_rows, occupancy, consumer_regs) for this aggregation point.
+
+    Shared by all three entry points below: they run the same kernel template
+    and differ only in the collective fused onto it."""
+    if not 1 <= nvb <= _MAX_BANK_ROWS:
+        raise ValueError(f"attn_res: nvb must be in [1, {_MAX_BANK_ROWS}], got {nvb}")
+    best = _TMA_BEST_CONFIG[nvb]
+    if best[1] > 1 and num_tokens < 128:
+        # occupancy=2 only pays off once there are enough tokens to fill both
+        # CTAs per SM; below that its tighter register budget just costs ~10%.
+        best = (4, 1, 200)
+    return best
+
+
 _COMM_MAP: dict[int, Communicator] = {}
 _PULL_SEM_MC_MAP: dict[int, int] = {}
 
@@ -135,9 +151,6 @@ def attn_res_fused_tma(
     eps: float,
     *,
     write_prefix: bool = False,
-    chunk_rows: int | None = None,
-    occupancy: int | None = None,
-    consumer_regs: int | None = None,
 ) -> None:
     """Warp-specialized TMA aggregation (score -> online softmax -> weighted
     combine -> fused output RMSNorm), one persistent CTA per SM: a producer
@@ -146,10 +159,9 @@ def attn_res_fused_tma(
     slots); the 8 consumer warps score and fold one chunk per rendezvous,
     with cw / ow staged in TMEM.
 
-    Restrictions: H == 7168, nvb in [1, 8], SM100a+. Knobs left as None take
-    the per-nvb benchmarked best from _TMA_BEST_CONFIG (each combination
-    compiles its own module; occupancy > 1 requires the smem ring to fit
-    that many copies per SM).
+    Restrictions: H == 7168, nvb in [1, 8], SM100a+. The launch config comes
+    from _TMA_BEST_CONFIG via _tuning() (each combination compiles its own
+    module).
 
     Parameters
     ----------
@@ -164,21 +176,7 @@ def attn_res_fused_tma(
                  (bit-exact copy, fused into the score pass which already
                  has the row in registers); requires NB > nvb
     """
-    if not 1 <= nvb <= _MAX_BANK_ROWS:
-        raise ValueError(
-            f"attn_res_fused_tma: nvb must be in [1, {_MAX_BANK_ROWS}], got {nvb}"
-        )
-    best = _TMA_BEST_CONFIG[nvb]
-    if best[1] > 1 and prefix_sum.shape[0] < 128:
-        # occupancy=2 only pays off once there are enough tokens to fill both
-        # CTAs per SM; below that its tighter register budget just costs ~10%.
-        best = (4, 1, 200)
-    config = (
-        chunk_rows if chunk_rows is not None else best[0],
-        occupancy if occupancy is not None else best[1],
-        consumer_regs if consumer_regs is not None else best[2],
-    )
-    _jit_fused_tma_module(*config).run(
+    _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
         prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
     )
 
@@ -229,9 +227,6 @@ def attn_res_fused_direct_ag(
     output_mc_ptr: int,
     max_blocks: int = 128,
     write_prefix: bool = False,
-    chunk_rows: int | None = None,
-    occupancy: int | None = None,
-    consumer_regs: int | None = None,
 ) -> torch.Tensor:
     """Fuse local attention-residual aggregation with direct multicast AG.
 
@@ -239,19 +234,6 @@ def attn_res_fused_direct_ag(
     aggregates its local token shard and multicast-stores normalized vectors
     directly from consumer registers into that rank's slice on every peer.
     """
-    if not 1 <= nvb <= _MAX_BANK_ROWS:
-        raise ValueError(
-            f"attn_res_fused_direct_ag: nvb must be in [1, {_MAX_BANK_ROWS}], "
-            f"got {nvb}"
-        )
-    best = _TMA_BEST_CONFIG[nvb]
-    if best[1] > 1 and prefix_sum.shape[0] < 128:
-        best = (4, 1, 200)
-    config = (
-        chunk_rows if chunk_rows is not None else best[0],
-        occupancy if occupancy is not None else best[1],
-        consumer_regs if consumer_regs is not None else best[2],
-    )
     _attn_res_fused_direct_ag_op(
         world_size,
         prefix_sum,
@@ -264,7 +246,7 @@ def attn_res_fused_direct_ag(
         output_mc_ptr,
         max_blocks,
         write_prefix,
-        *config,
+        *_tuning(nvb, prefix_sum.shape[0]),
     )
     return out
 
@@ -283,9 +265,6 @@ def attn_res_fused_pull_rs(
     *,
     input_mc_ptr: int,
     max_blocks: int = 128,
-    chunk_rows: int | None = None,
-    occupancy: int | None = None,
-    consumer_regs: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused NVLS pull RS + local residual + TMA attention aggregation.
 
@@ -294,19 +273,6 @@ def attn_res_fused_pull_rs(
     adds its already-local residual, materializes that prefix in `prefix_out`,
     and feeds it directly to the fused attention-residual aggregation/norm.
     """
-    if not 1 <= nvb <= _MAX_BANK_ROWS:
-        raise ValueError(
-            f"attn_res_fused_pull_rs: nvb must be in [1, {_MAX_BANK_ROWS}], "
-            f"got {nvb}"
-        )
-    best = _TMA_BEST_CONFIG[nvb]
-    if best[1] > 1 and prefix_out.shape[0] < 128:
-        best = (4, 1, 200)
-    config = (
-        chunk_rows if chunk_rows is not None else best[0],
-        occupancy if occupancy is not None else best[1],
-        consumer_regs if consumer_regs is not None else best[2],
-    )
     _attn_res_fused_pull_rs_op(
         world_size,
         input,
@@ -320,6 +286,7 @@ def attn_res_fused_pull_rs(
         eps,
         input_mc_ptr,
         max_blocks,
-        *config,
+        # prefix_out, not input: the shard this rank actually aggregates.
+        *_tuning(nvb, prefix_out.shape[0]),
     )
     return out, prefix_out

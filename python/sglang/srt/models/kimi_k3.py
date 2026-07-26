@@ -36,12 +36,7 @@ from sglang.srt.layers import (
     zero_copy_context,
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import (
-    AttnResidual,
-    BaseAttnResidual,
-    aggregate_stream,
-    get_cw,
-)
+from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -1947,7 +1942,6 @@ class KimiK3DecoderLayer(nn.Module):
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
             self.is_block_write_layer = layer_idx % self.attn_res_block_size == 0
-            self.block_write_idx = layer_idx // self.attn_res_block_size
             self.prev_valid_blocks = _cdiv(layer_idx, self.attn_res_block_size)
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -2116,7 +2110,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        attn_res: Optional[BaseAttnResidual],
+        attn_res: Optional[AttnResidual],
         zero_allocator: BumpAllocator,
         input_sharded: bool = False,
         keep_sharded: bool = False,
@@ -2159,7 +2153,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         prefix_sum: Optional[torch.Tensor],
-        attn_res: BaseAttnResidual,
+        attn_res: AttnResidual,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         input_sharded: bool,
@@ -2415,7 +2409,6 @@ class KimiK3LinearModel(nn.Module):
             attn_res = AttnResidual(
                 hidden_states,
                 attn_res_block_num,
-                self.config.attn_res_block_size,
                 block_residual=residual,
             )
             residual = None
@@ -2515,7 +2508,7 @@ class KimiK3LinearModel(nn.Module):
         layer_idx: int,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-        attn_res: Optional[BaseAttnResidual],
+        attn_res: Optional[AttnResidual],
     ) -> torch.Tensor:
         """Stream value after `layer_idx`: the pre-norm mixture its next
         consumer would compute (next layer's attention side; output side
@@ -2845,7 +2838,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
-            if getattr(layer, "use_attn_residuals", False):
+            if layer.use_attn_residuals:
                 _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
         if hasattr(self.model, "output_attn_res_proj"):
