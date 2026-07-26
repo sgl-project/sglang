@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import unittest
 import warnings
@@ -15,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
     check_evaluation_test_results,
+    is_rust_server_built,
     parse_models,
     popen_launch_server,
     write_results_to_json,
@@ -139,8 +139,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         )
 
 
-@unittest.skipIf(
-    importlib.util.find_spec("sglang.srt.server._core") is None,
+@unittest.skipUnless(
+    is_rust_server_built(),
     "embedded rust server extension not built",
 )
 class TestNightlyGsm8KEvalWithRustServer(TestNightlyGsm8KEval):
