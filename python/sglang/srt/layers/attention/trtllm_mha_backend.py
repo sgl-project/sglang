@@ -1257,8 +1257,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 if is_sm120_supported():
                     window_left = layer.sliding_window_size
-                    combined_kv_cache = (
-                        self.token_to_kv_pool.get_combined_kv_buffer(layer.layer_id)
+                    combined_kv_cache = self.token_to_kv_pool.get_combined_kv_buffer(
+                        layer.layer_id
                     )
                     if combined_kv_cache is None:
                         raise RuntimeError(
