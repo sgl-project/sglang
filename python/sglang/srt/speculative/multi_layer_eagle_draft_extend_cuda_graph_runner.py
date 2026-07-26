@@ -63,10 +63,14 @@ from sglang.srt.runtime_context import get_flags
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
-    fill_draft_extend_prepare_buffers_triton,
     rotate_input_ids,
     wide_row_softmax_triton,
 )
+from sglang.srt.speculative.multi_layer_eagle_utils import fill_draft_extend_prepare_buffers_triton as fill_draft_extend_prepare_buffers
+if is_npu():
+    from sglang.srt.speculative.multi_layer_eagle_utils import fill_draft_extend_prepare_buffers_native
+    fill_draft_extend_prepare_buffers = fill_draft_extend_prepare_buffers_native
+
 from sglang.srt.speculative.spec_utils import (
     fast_sample,
     fast_topk,
@@ -74,6 +78,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -713,7 +718,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         else:
             bs = self.get_runner(0)._pad_to_bucket(raw_bs, self.capture_bs)
 
-        fill_draft_extend_prepare_buffers_triton(
+        fill_draft_extend_prepare_buffers(
             buffers.input_ids,
             buffers.positions,
             buffers.out_cache_loc,
