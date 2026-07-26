@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::TokenIds;
+use super::finish_reason::FinishReason;
 use crate::error::Error;
 use crate::ids::RidHash;
 
@@ -121,7 +122,7 @@ pub struct BatchHeader {
     /// (`RidHash::from_rid`), mirroring the control path. The wire has no
     /// rid-shape coupling; any string is a valid rid.
     pub rids: Vec<String>,
-    pub finish_reasons: Vec<Option<serde_json::Value>>,
+    pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
     #[serde(default)]
@@ -428,8 +429,8 @@ pub struct ChunkEvent {
     pub rid_hash: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
     pub token_ids: TokenIds,
-    /// `None` while streaming, the full finish-reason dict on the final chunk.
-    pub finish_reason: Option<serde_json::Value>,
+    /// `None` while streaming, the [`FinishReason`] on the final chunk.
+    pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
@@ -502,6 +503,7 @@ impl ChunkExtras {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::finish_reason::{FinishKind, Matched};
 
     /// Concatenating N data columns produces the exact same frame as one joined
     /// buffer (the `b"".join` the Python side used to do), with the layout
@@ -568,10 +570,15 @@ mod tests {
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid_hash, RidHash::from_rid("2").0);
         assert!(events[1].token_ids.is_empty());
-        // The whole dict survives (type + matched), not just the type.
+        // The whole reason survives msgpack (type + matched), not just the type.
         assert_eq!(
             events[1].finish_reason,
-            Some(serde_json::json!({ "type": "stop", "matched": 5 }))
+            Some(
+                FinishKind::Stop {
+                    matched: Some(Matched::Token(5))
+                }
+                .into()
+            )
         );
         assert_eq!(events[2].rid_hash, RidHash::from_rid("3").0);
         assert_eq!(events[2].token_ids, vec![12]);
