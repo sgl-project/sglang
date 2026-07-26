@@ -181,7 +181,6 @@ class TestMultimodalFeatureTransportRuntime(unittest.TestCase):
     def _server_args(mm_feature_transport):
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
-            keep_mm_feature_on_device=False,
             disable_fast_image_processor=False,
             skip_tokenizer_init=False,
             mm_process_config={},
@@ -246,7 +245,6 @@ class TestPrecomputeHashBeforeCpuTransfer(unittest.TestCase):
         ), patch.object(BaseMultimodalProcessor, "__init__", lambda self: None):
             processor = BaseMultimodalProcessor()
         processor.precompute_hash_before_cpu_transfer = enabled
-        processor.keep_mm_feature_on_device = False
         processor.use_cuda_ipc = False
         return processor
 
@@ -383,7 +381,6 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
         server_args.skip_tokenizer_init = False
 
         mock_processor = MagicMock()
@@ -402,7 +399,6 @@ class TestProcessMmDataKwargs(unittest.TestCase):
                 proc = BaseMultimodalProcessor()
 
         proc.server_args = server_args
-        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         proc.mm_feature_transport = server_args.mm_feature_transport
         proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
@@ -489,7 +485,6 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         server_args.mm_process_config = mm_process_config
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = False
         server_args.skip_tokenizer_init = False
 
         mock_hf_processor = MagicMock()
@@ -502,7 +497,6 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
             proc = processor_cls()
 
         proc.server_args = server_args
-        proc.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         proc.mm_feature_transport = server_args.mm_feature_transport
         proc.use_cuda_ipc = False
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
@@ -594,7 +588,6 @@ class TestDoubleBosGuard(unittest.TestCase):
         server_args.mm_io_worker_num = 0
         server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
-        server_args.keep_mm_feature_on_device = True
 
         mock_hf_processor = MagicMock()
         mock_hf_processor.__class__.__name__ = "TestProcessor"

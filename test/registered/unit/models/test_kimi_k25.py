@@ -166,7 +166,6 @@ def test_kimi_normalize_and_patchify_matches_reference_on_cpu():
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
-        keep_mm_feature_on_device=True,
         mm_feature_transport="cpu",
         disable_fast_image_processor=False,
         skip_tokenizer_init=False,

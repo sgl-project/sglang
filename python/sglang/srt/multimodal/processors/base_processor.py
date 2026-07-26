@@ -195,7 +195,6 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        self.keep_mm_feature_on_device = server_args.keep_mm_feature_on_device
         configured_mm_feature_transport = getattr(
             server_args, "mm_feature_transport", "cpu"
         )
@@ -570,16 +569,13 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        if not self.keep_mm_feature_on_device and not defer_feature_cpu_transfer:
+        if not self.use_cuda_ipc and not defer_feature_cpu_transfer:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
-                if self.use_cuda_ipc:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+                if feature_name in result and isinstance(
+                    result[feature_name], torch.Tensor
+                ):
+                    result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -1358,8 +1354,6 @@ class BaseMultimodalProcessor(ABC):
                 pool_byte_offset=byte_offset,
                 pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
             )
-        if self.keep_mm_feature_on_device:
-            return tensor
         return tensor.cpu()
 
     @staticmethod
@@ -1380,7 +1374,7 @@ class BaseMultimodalProcessor(ABC):
 
         for item in mm_items:
             item.set_pad_value()
-            if not self.keep_mm_feature_on_device and not self.use_cuda_ipc:
+            if not self.use_cuda_ipc:
                 item.feature = self._move_feature_to_cpu(item.feature)
                 item.precomputed_embeddings = self._move_feature_to_cpu(
                     item.precomputed_embeddings
@@ -1606,14 +1600,7 @@ class BaseMultimodalProcessor(ABC):
 
         self._precompute_hashes_before_cpu_transfer(all_collected_items)
 
-        """
-        solution for cuda-ipc memory-leak:
-        1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
-        2. if can not get a slice , transport normal tensor
-        3. copy tensor in scheduler and release it (use position mark)
-        4. copy
-        """
-
+        # Wrap GPU features in the bounded IPC pool; pool misses fall back to CPU.
         if self.use_cuda_ipc:
             # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
