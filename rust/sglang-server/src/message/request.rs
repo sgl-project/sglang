@@ -182,9 +182,9 @@ impl GenerateBody {
             }
         };
 
-        // token_ids_logprob fans out exactly like the scalar options: one list
-        // broadcasts, a list of lists is per item (Python `_normalize_batch`'s
-        // nested-structure branch).
+        // Fans out exactly like the scalar options: one list broadcasts, a list of
+        // lists is per item (Python `_normalize_batch`'s nested branch). Empties
+        // are collapsed per item below, not here.
         let tid_logprobs = fan_out(token_ids_logprob, n, "token_ids_logprob")?;
 
         // Each logprob/hidden opt: absent → None for every item, a scalar
@@ -228,7 +228,9 @@ impl GenerateBody {
                 return_logprob,
                 logprob_start_len,
                 top_logprobs_num,
-                token_ids_logprob,
+                // `Some` here means "these ids were requested", so an empty list
+                // collapses to None.
+                token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
                 return_hidden_states,
                 return_text_in_logprobs,
             },
@@ -501,6 +503,36 @@ mod tests {
 
         let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
         assert_eq!(ps[0].token_ids_logprob, None);
+    }
+
+    /// An empty `token_ids_logprob` means "none requested" and must reach the
+    /// scheduler as None, whose guards are `x is not None` — `Some([])` enters the
+    /// token-ids-logprob path and computes nothing. The collapse is per item, so it
+    /// covers every shape: Python only collapses the outer value
+    /// (`if not self.token_ids_logprob`, io_struct.py:439,612) and passes inner
+    /// empties through its nested branch verbatim.
+    #[test]
+    fn empty_token_ids_logprob_collapses_to_none() {
+        let (ps, _) = requests(r#"{"text": "a", "token_ids_logprob": []}"#).unwrap();
+        assert_eq!(ps[0].token_ids_logprob, None);
+
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "token_ids_logprob": []}"#).unwrap();
+        assert!(ps.iter().all(|p| p.token_ids_logprob.is_none()));
+
+        // Nested, every item empty — Python would ship four `[]`s here.
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b", "c", "d"], "token_ids_logprob": [[], [], [], []]}"#)
+                .unwrap();
+        assert!(ps.iter().all(|p| p.token_ids_logprob.is_none()));
+
+        // Nested and mixed: only the empty cell collapses.
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "token_ids_logprob": [[], [7]]}"#).unwrap();
+        assert_eq!(ps[0].token_ids_logprob, None);
+        assert_eq!(ps[1].token_ids_logprob, Some(vec![7]));
+
+        // A non-empty list is untouched.
+        let (ps, _) = requests(r#"{"text": "a", "token_ids_logprob": [7]}"#).unwrap();
+        assert_eq!(ps[0].token_ids_logprob, Some(vec![7]));
     }
 
     /// The logprob/hidden options take Python's batch form too
