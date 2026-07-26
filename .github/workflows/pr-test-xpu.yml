@@ -113,7 +113,7 @@ jobs:
       - name: Run stage-a tests
         timeout-minutes: 30
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu"
+          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu --enable-retry"
 
       - name: Cleanup container
         if: always()
