@@ -30,7 +30,17 @@ from sglang.srt.layers.clippable_linear import (
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_device_capability, is_cuda, is_hip
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_device_capability,
+    is_cpu,
+    is_cuda,
+    is_hip,
+)
+
+_is_cpu = is_cpu()
+_cpu_has_amx_support = _is_cpu and cpu_has_amx_support()
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -199,6 +209,8 @@ class Gemma4VisionAttention(nn.Module):
             # ROCm: use triton_attn to avoid SDPA flatten_batch issues
             # with multi-image/video inputs
             return "triton_attn"
+        if is_cpu():
+            return "amx_attn"
         return "sdpa"
 
     def forward(
@@ -220,10 +232,15 @@ class Gemma4VisionAttention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k.shape)
         v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(v.shape)
 
-        cos_flat = cos.reshape(bsz * seq_len, 1, self.head_dim)
-        sin_flat = sin.reshape(bsz * seq_len, 1, self.head_dim)
-        q = _apply_multidimensional_rope(q, cos_flat, sin_flat)
-        k = _apply_multidimensional_rope(k, cos_flat, sin_flat)
+        if _is_cpu and _cpu_has_amx_support:
+            cos = cos.reshape(bsz * seq_len, self.head_dim)
+            sin = sin.reshape(bsz * seq_len, self.head_dim)
+            q, k = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(q, k, cos, sin)
+        else:
+            cos_flat = cos.reshape(bsz * seq_len, 1, self.head_dim)
+            sin_flat = sin.reshape(bsz * seq_len, 1, self.head_dim)
+            q = _apply_multidimensional_rope(q, cos_flat, sin_flat)
+            k = _apply_multidimensional_rope(k, cos_flat, sin_flat)
 
         if attention_mask is not None:
             attn_mask_4d = (

@@ -355,6 +355,9 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
+            assert (
+                self.moe_runner_config.activation == "silu"
+            ), f"activation = {self.moe_runner_config.activation} is not supported for INT8 W8A8."
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
@@ -380,6 +383,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                self.moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 

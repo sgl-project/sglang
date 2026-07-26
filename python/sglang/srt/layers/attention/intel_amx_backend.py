@@ -215,6 +215,12 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
+
+        # Gemma4 KV-shared layers pass k=v=None: they read KV from an earlier
+        # layer's cache and must not write new extend K/V. extend_attention_cpu
+        # only skips the k/v-extend requirement for is_cross_attn=True, so we
+        # reuse that path here - this is NOT encoder cross-attention.
+        is_extend_cache_read_only = layer.is_cross_attention or k is None or v is None
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -230,13 +236,13 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            layer.is_cross_attention,
+            is_extend_cache_read_only,
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
             tree_mask,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -248,7 +254,20 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        attn_logits, _ = self.forward_metadata
+        if layer.v_head_dim == self.v_head_dim and layer.tp_q_head_num == self.num_head:
+            attn_logits, _ = self.forward_metadata
+        else:
+            bs = forward_batch.batch_size
+            attn_logits = torch.zeros(
+                (
+                    bs,
+                    layer.tp_q_head_num,
+                    self.num_kv_splits,
+                    layer.v_head_dim + 1,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         if self.draft_decode_metadata is not None:
             req_to_token, seq_lens, req_pool_indices = self.draft_decode_metadata
@@ -290,7 +309,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def support_triton(self):
         return False
