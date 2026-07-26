@@ -162,9 +162,23 @@ fn take_flat(
     Some((take_f32(data, cv, l)?, take_i32(data, ci, l)?))
 }
 
+/// Read `np` per-position lengths from `poslens` at `*pcur`, advancing it. `None`
+/// when the range runs past the column — the header's `reqlens` promised more
+/// positions than `poslens` carries, so this request's lengths are unknowable.
+/// Clamping instead would return a short `lens`, and since `lens` also drives how
+/// far the val/idx cursors advance, every later request in that column would read
+/// from the wrong offset: silently wrong logprobs rather than a rejected frame.
+fn take_poslens(poslens: &[u32], pcur: &mut usize, np: usize) -> Option<Vec<u32>> {
+    let start = *pcur;
+    let end = start.checked_add(np)?;
+    let lens = poslens.get(start..end)?.to_vec();
+    *pcur = end;
+    Some(lens)
+}
+
 /// Read a request's ragged logprob column (`np` positions): its per-position `lens`
 /// from `poslens` (advancing `pcur`), then that many val/idx from `cv`/`ci`. `None`
-/// if the val/idx read runs past the buffer (see [`take_f32`]).
+/// if either read runs past its buffer (see [`take_poslens`], [`take_f32`]).
 fn take_ragged(
     data: &[u8],
     cv: &mut usize,
@@ -173,15 +187,14 @@ fn take_ragged(
     pcur: &mut usize,
     np: usize,
 ) -> Option<(Vec<f32>, Vec<i32>, Vec<u32>)> {
-    let pe = (*pcur + np).min(poslens.len());
-    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
-    *pcur = pe;
+    let lens = take_poslens(poslens, pcur, np)?;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
     Some((take_f32(data, cv, nv)?, take_i32(data, ci, nv)?, lens))
 }
 
 /// Like [`take_ragged`] but for hidden states — a val column + row `poslens`, no
-/// idx column. `None` if the val read runs past the buffer (see [`take_f32`]).
+/// idx column. `None` if either read runs past its buffer (see [`take_poslens`],
+/// [`take_f32`]).
 fn take_hidden(
     data: &[u8],
     cv: &mut usize,
@@ -189,16 +202,21 @@ fn take_hidden(
     pcur: &mut usize,
     nr: usize,
 ) -> Option<(Vec<f32>, Vec<u32>)> {
-    let pe = (*pcur + nr).min(poslens.len());
-    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
-    *pcur = pe;
+    let lens = take_poslens(poslens, pcur, nr)?;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
     Some((take_f32(data, cv, nv)?, lens))
 }
 
 /// Decode a batch egress frame (tag stripped), calling `route` with each request's
 /// [`ChunkEvent`] as it's decoded — one pass, no intermediate `Vec`, peak memory
-/// one request. `false` on a malformed frame. Column order matches `push_generation`.
+/// one request. Column order matches `push_generation`.
+///
+/// `false` means the frame was rejected, but says nothing about how much of it was
+/// routed: the header/length checks below run before any `route` call, while a
+/// per-request decode failure can only be detected after earlier requests have
+/// already been handed out. The caller keeps whatever it was given (it logs and
+/// still forwards; see `tokenizer_manager::egress`), so treat `false` as "this
+/// frame is untrustworthy", not "nothing was delivered".
 pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     if body.len() < 4 {
         return false;
@@ -247,8 +265,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let mut c_id_i = col(n_id);
     let mut c_h_v = col(n_h);
 
-    // `col` summed every column's span into `base`. Reject a malformed frame whole,
-    // *before* routing any request: a partial fan-out would deliver garbage.
+    // `col` summed every column's span into `base`, so a truncated frame is caught
+    // here — the one rejection that is genuinely whole-frame, since it precedes the
+    // routing loop. Past this point a failure can only be partial.
     if base > data.len() {
         return false;
     }
@@ -269,8 +288,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
 
     // Decode one request's slice of every column, advancing the cursors. `None` if a
-    // read overruns `data` (belt-and-suspenders past the upfront check) — the caller
-    // then rejects the frame instead of slicing out of bounds.
+    // read overruns `data` (belt-and-suspenders past the upfront check, which already
+    // covers every column's span — so this is unreachable today). It stops the loop
+    // before slicing out of bounds, but requests decoded earlier in the frame are
+    // already routed; making that abort atomic would mean buffering the whole frame,
+    // which is exactly what the streaming decode avoids.
     let mut decode_one = |i: usize| -> Option<ChunkEvent> {
         let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
 
@@ -588,6 +610,77 @@ mod tests {
         let ok = for_each_chunk(&framed[1..], |_| routed += 1);
         assert!(!ok, "malformed frame must be rejected, not decoded");
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
+    }
+
+    /// A header whose `reqlens` claim more positions than `poslens` carries is
+    /// rejected, not truncated. This drift passes the upfront `base > data.len()`
+    /// check — the data columns are exactly as long as `poslens` says — so only the
+    /// per-column bound catches it. Clamping (the old behavior) handed req0 a short
+    /// `lens`, which also under-advanced the val/idx cursors, so req1 read from the
+    /// wrong offset: a frame that decodes "successfully" into wrong logprobs.
+    #[test]
+    fn rejects_poslens_shorter_than_reqlens_claims() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        let rids = Value::Array(vec![Value::from("1"), Value::from("2")]);
+        let finish = Value::Array(vec![Value::Nil, Value::Nil]);
+
+        // Ragged column: reqs claim 2 + 1 = 3 positions, `out_top_poslens` has 2.
+        let header_arr = Value::Array(vec![
+            rids.clone(),
+            finish.clone(),
+            arr_u(&[0, 0]), // prompt
+            arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // out_lp_lens
+            arr_u(&[0, 0]), // in_lp_lens
+            arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
+            arr_u(&[2, 2]), // out_top_poslens — only 2 supplied
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let mut data = Vec::new();
+        data.extend(i(&[10, 20])); // token_ids
+        data.extend(f(&[-0.1, -0.2, -0.3, -0.4])); // out_top_val (sum of poslens = 4)
+        data.extend(i(&[1, 2, 3, 4])); // out_top_idx
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        assert!(
+            !for_each_chunk(&framed[1..], |_| routed += 1),
+            "ragged poslens drift must be rejected, not truncated"
+        );
+
+        // Same drift in the hidden column, which has no idx pair: 2 rows claimed, 1 supplied.
+        let header_arr = Value::Array(vec![
+            rids,
+            finish,
+            arr_u(&[0, 0]), // prompt
+            arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // out_lp_lens
+            arr_u(&[0, 0]), // in_lp_lens
+            arr_u(&[0, 0]), // out_top_reqlens
+            arr_u(&[]),     // out_top_poslens
+            arr_u(&[0, 0]), // in_top_reqlens
+            arr_u(&[]),     // in_top_poslens
+            arr_u(&[0, 0]), // out_tid_reqlens
+            arr_u(&[]),     // out_tid_poslens
+            arr_u(&[0, 0]), // in_tid_reqlens
+            arr_u(&[]),     // in_tid_poslens
+            arr_u(&[2, 0]), // hidden_reqlens — 2 rows claimed
+            arr_u(&[3]),    // hidden_poslens — only 1 supplied
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let mut data = Vec::new();
+        data.extend(i(&[10, 20])); // token_ids
+        data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (sum of poslens = 3)
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        assert!(
+            !for_each_chunk(&framed[1..], |_| routed += 1),
+            "hidden poslens drift must be rejected, not truncated"
+        );
     }
 
     /// Ingress/egress rid agreement: the routing key decoded from a uuid-rid
