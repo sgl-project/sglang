@@ -15,7 +15,6 @@
 
 import logging
 import math
-import re
 from typing import Dict, List, Optional, Set, Union
 
 import msgspec
@@ -274,40 +273,6 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
-
-    def recompute_stop_regex_max_len(self):
-        """Recompute ``stop_regex_max_len`` with *this* interpreter's regex parser.
-
-        Params normalized outside Python arrive with ``is_normalized=True``, so
-        ``normalize()`` early-returns and the bound was computed by a different
-        regex dialect (the embedded Rust server uses ``regex-syntax``, which
-        accepts patterns ``re`` rejects and vice versa). Re-deriving it with
-        ``get_max_seq_length`` — which parses via ``sre_parse``, the same parser
-        ``re.compile`` uses — both corrects the bound and surfaces a pattern this
-        process cannot compile, instead of letting the first ``re.search`` in the
-        decode loop raise uncaught and take the scheduler down.
-
-        No-op when no stop regex is set (the common case).
-
-        Raises:
-            re.error: if any stop regex is invalid for this interpreter.
-            RecursionError: if it nests deeper than the parser's stack allows.
-        """
-        if not self.stop_regex_strs:
-            return
-        patterns = (
-            [self.stop_regex_strs]
-            if isinstance(self.stop_regex_strs, str)
-            else self.stop_regex_strs
-        )
-        # `re.compile`, not just `sre_parse.parse`: the parser accepts patterns
-        # the compiler rejects (a variable-width look-behind such as `(?<=a*)b`
-        # parses fine and then fails to compile), and it is `re.search` in the
-        # decode loop that would raise. Compiling here also warms `re`'s cache for
-        # that loop.
-        for p in patterns:
-            re.compile(p)
-        self.stop_regex_max_len = max(get_max_seq_length(p) for p in patterns)
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

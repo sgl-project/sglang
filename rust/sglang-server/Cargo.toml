@@ -38,3 +38,4 @@ itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+regex-syntax = "0.8"

@@ -380,37 +380,6 @@ def msgpack_decode_explained(data: bytes) -> Any:
         raise MsgpackDecodeError(rid, msg) from e
 
 
-def recompute_stop_regex_max_len(obj: Any) -> None:
-    """Re-derive ``stop_regex_max_len`` for a request the Rust server normalized.
-
-    That server sets ``is_normalized=True``, so ``SamplingParams.normalize`` will
-    early-return here and the bound it shipped came from ``regex-syntax`` — a
-    different dialect from ``re``, accepting patterns this interpreter rejects
-    (``\\p{L}``, ``(?<n>a)``) and vice versa (``\\Z``). Recomputing with
-    ``sre_parse`` corrects the bound and rejects an uncompilable pattern here,
-    where the caller answers the client, instead of letting the first
-    ``re.search`` of the decode loop raise ``re.error`` and take the scheduler
-    down.
-
-    Raises:
-        MsgpackDecodeError: so the caller's existing reject path returns a 400.
-    """
-    if (
-        not isinstance(obj, io_struct.TokenizedGenerateReqInput)
-        or obj.sampling_params is None
-    ):
-        return
-    try:
-        obj.sampling_params.recompute_stop_regex_max_len()
-    except (re.error, RecursionError) as e:
-        # RecursionError, not just re.error: both the compile and the length walk
-        # recurse per nesting level, so a deeply nested pattern (`"("*2000 + "a" +
-        # `")"*2000`, ~4 KB) blows the stack instead of raising a regex error. It
-        # is not an `re.error`, so it would escape this guard, unwind out of
-        # `RustServer.drain`, and take down the scheduler's receive loop.
-        raise MsgpackDecodeError(obj.rid, f"invalid stop_regex: {e!r}") from e
-
-
 def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
     """Output token slots reserved per request, on top of its input.
 
