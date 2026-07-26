@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from abc import ABC
 from collections import deque
@@ -50,99 +51,6 @@ class ExpertDistributionMetrics:
 
     def copy_to_cpu(self):
         self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
-
-
-@dataclass
-class _Record:
-    buffer: "RecordBuffer"
-    offset: int
-    length: int
-    shape: tuple
-    dtype: torch.dtype
-
-    def __reduce_ex__(self, protocol: int):
-        tensor = self.buffer.get(self).clone()
-        return tensor.__reduce_ex__(protocol)
-
-
-class RecordBuffer:
-    def __init__(self, buffer_size_mb: int):
-        self._buffer_stream = torch.cuda.Stream()
-        self._buffer_ready = torch.cuda.Event()
-        self._buffer_size = buffer_size_mb * 1024 * 1024
-        self._buffer = torch.as_tensor(
-            torch.UntypedStorage(self._buffer_size, device=torch.device("cpu")),
-            dtype=torch.uint8,
-        ).pin_memory()
-        self._head = 0
-        self._is_full = False
-
-    def store(self, tensor: torch.Tensor) -> Optional[_Record]:
-        assert tensor.is_cuda, "Input tensor must be on CUDA device"
-
-        if self._is_full:
-            return None
-        if tensor.numel() == 0:
-            return _Record(
-                self,
-                offset=self._head,
-                length=0,
-                shape=tuple(tensor.shape),
-                dtype=tensor.dtype,
-            )
-
-        # Ensure tensor is contiguous and in uint8 format for storage
-        t = (
-            tensor.clone(memory_format=torch.contiguous_format)
-            .view(-1)
-            .view(torch.uint8)
-        )
-        # Keep tensor alive until buffer stream finishes
-        t.record_stream(self._buffer_stream)
-
-        # Ensure the tensor is ready before copying to the pinned buffer
-        self._buffer_ready.record()
-
-        nbytes = t.numel()
-        start = self._head
-        end = start + nbytes
-        if end >= self._buffer_size:
-            self._is_full = True
-            logger.info(
-                "ExpertRecorder's buffer is full. Further records will be dropped."
-            )
-            return None
-
-        # Asynchronously copy tensor data to the pinned buffer
-        with torch.cuda.stream(self._buffer_stream):
-            self._buffer_ready.wait(self._buffer_stream)
-            self._buffer[start:end].copy_(t, non_blocking=True)
-
-        # Advance head pointer
-        self._head = end
-
-        return _Record(
-            self,
-            offset=start,
-            length=nbytes,
-            shape=tuple(tensor.shape),
-            dtype=tensor.dtype,
-        )
-
-    def get(self, record: _Record) -> torch.Tensor:
-        raw = self._buffer[record.offset : record.offset + record.length]
-        return raw.view(record.dtype).reshape(record.shape)
-
-    def synchronize(self):
-        self._buffer_stream.synchronize()
-
-    def reset(self):
-        self._head = 0
-        self._is_full = False
-
-    @property
-    def is_full(self) -> bool:
-        return self._is_full
 
 
 class ExpertDistributionRecorder(ABC):
@@ -513,9 +421,9 @@ class _BufferedDetailSinglePassGatherer(_SinglePassGatherer):
         self._misc_objects.append(
             dict(
                 layer_id=layer_idx,
-                num_tokens_per_rank=num_tokens_per_rank,
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
+                num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
+                num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
             )
         )
 
@@ -964,11 +872,13 @@ class _DequeCollection:
 class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._records = []
-        buffer_size_mb = self._server_args.expert_distribution_recorder_buffer_size
-        if buffer_size_mb is None or buffer_size_mb <= 0:
-            buffer_size_mb = 1024  # default to 1GB
-        self._buffer = RecordBuffer(buffer_size_mb)
+        self._lock = threading.Lock()
+        self._record_batches = self._init_record_batches()
+        self._current_batch = self._record_batches[0]
+
+    # ------------------------------------------------------------------
+    # Accumulator API
+    # ------------------------------------------------------------------
 
     def get_single_pass_gatherer_keys(self):
         if False:  # TODO `server_args.enable_two_batch_overlap`
@@ -987,48 +897,61 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
         outputs: Dict[str, Any],
     ):
-        # Buffer is full, skip recording to avoid OOM.
-        if self._buffer.is_full:
-            return
-
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
 
-        def _process_object(obj):
-            if isinstance(obj, torch.Tensor):
-                return self._buffer.store(obj)
-            return obj
-
-        single_pass_data_processed = {
-            k: _process_object(v) for k, v in single_pass_data.items()
-        }
-
-        self._records.append(
-            dict(
-                forward_pass_id=forward_pass_id,
-                rank=self._rank,
-                gatherer_key=gatherer_key,
-                **single_pass_data_processed,
+        with self._lock:
+            self._current_batch = self._current_batch.append(
+                dict(
+                    forward_pass_id=forward_pass_id,
+                    rank=self._rank,
+                    gatherer_key=gatherer_key,
+                    **single_pass_data,
+                )
             )
-        )
 
     def reset(self):
         super().reset()
-        self._records.clear()
-        self._buffer.reset()
+        with self._lock:
+            for batch in self._record_batches:
+                batch.reset()
 
     def dump(self, output_mode: _OutputMode):
         assert output_mode == "file"
 
-        # ensure D2H copies are completed
-        self._buffer.synchronize()
+        with self._lock:
+            records = []
+            batch = self._current_batch.get_next()
+            for _ in range(len(self._record_batches)):
+                records.extend(batch.get_records())
+                batch = batch.get_next()
+
         output = dict(
-            records=self._records,
+            records=records,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         _dump_to_file(
             f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
         )
+
+    def _init_record_batches(self) -> List[_RecordBatch]:
+        max_records = self._server_args.expert_distribution_recorder_buffer_size
+
+        # Split capacity into batches: ≤16 records/batch, ≥4 batches, ≥2 records/batch
+        num_batches = max(4, math.ceil(max_records / 16))
+        records_per_batch = max(2, math.ceil(max_records / num_batches))
+
+        # Per-record byte estimate mirrors _BufferedDetailSinglePassGatherer tensor shapes:
+        #   topk_ids:   layers × (P*8) × 8 × 4
+        #   metadata:   (P*8) × 2 × 4
+        P8 = self._server_args.chunked_prefill_size * 8
+        bytes_per_record = 4 * P8 * (self._expert_location_metadata.num_layers * 8 + 2)
+
+        buffer_size = records_per_batch * bytes_per_record
+        batches = [_RecordBatch(buffer_size) for _ in range(num_batches)]
+        for i in range(num_batches):
+            batches[i].set_next(batches[(i + 1) % num_batches])
+        return batches
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -1184,6 +1107,110 @@ def _dump_to_file(name, data):
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
+
+
+@dataclass
+class _RecordLoc:
+    segment: torch.Tensor
+    offset: int
+    length: int
+
+    def get(self) -> torch.Tensor:
+        return self.segment[self.offset : self.offset + self.length]
+
+
+@dataclass
+class _Record:
+    loc: _RecordLoc
+    shape: tuple
+    dtype: torch.dtype
+
+    def __reduce_ex__(self, protocol: int):
+        t = self.loc.get().view(self.dtype).reshape(self.shape).clone()
+        return t.__reduce_ex__(protocol)
+
+
+class _RecordBatch:
+    def __init__(self, size_bytes: int):
+        self._segment_size = size_bytes
+        self._segment_head = 0
+        self._segment = torch.as_tensor(
+            torch.UntypedStorage(size_bytes, device=torch.device("cpu")),
+            dtype=torch.uint8,
+        ).pin_memory()
+
+        self._stream = torch.cuda.Stream()
+        self._event = torch.cuda.Event()
+
+        self._records: List[Dict[str, Any]] = []
+        self._next: Optional["_RecordBatch"] = None
+
+    def append(self, record: Dict[str, Any], evict: bool = False) -> _RecordBatch:
+        if not evict and not self._segment_fits(record):
+            return self._next.append(record, True)
+
+        # Eviction (TODO: lock check here)
+        if evict and len(self._records) > 0:
+            self._evict_all()
+
+        # Store each tensor sequentially into the underlying segment
+        processed: Dict[str, Any] = {}
+        for k, v in record.items():
+            if not isinstance(v, torch.Tensor):
+                processed[k] = v
+            else:
+                t = (
+                    v.clone(memory_format=torch.contiguous_format)
+                    .view(-1)
+                    .view(torch.uint8)
+                )
+                processed[k] = _Record(
+                    loc=self._segment_append(t),
+                    shape=tuple(v.shape),
+                    dtype=v.dtype,
+                )
+
+        self._records.append(processed)
+        return self
+
+    def get_records(self):
+        # TODO: invoked by dump, need to lock check
+        if len(self._records) > 0:
+            self._stream.synchronize()
+        return self._records
+
+    def reset(self):
+        self._evict_all()
+
+    def set_next(self, next_batch: _RecordBatch):
+        self._next = next_batch
+
+    def get_next(self) -> _RecordBatch:
+        return self._next
+
+    def _evict_all(self):
+        self._records.clear()
+        self._segment_head = 0
+
+    def _segment_fits(self, record: Dict[str, Any]):
+        total_bytes = 0
+        for v in record.values():
+            if isinstance(v, torch.Tensor) and v.numel() > 0:
+                total_bytes += v.numel() * v.element_size()
+        return self._segment_head + total_bytes < self._segment_size
+
+    def _segment_append(self, t: torch.Tensor) -> _RecordLoc:
+        start = self._segment_head
+        nbytes = t.numel()
+        end = start + nbytes
+
+        t.record_stream(self._stream)
+        self._event.record()
+        with torch.cuda.stream(self._stream):
+            self._event.wait(self._stream)
+            self._segment[start:end].copy_(t, non_blocking=True)
+        self._segment_head = end
+        return _RecordLoc(self._segment, start, nbytes)
 
 
 class _Buffer:
