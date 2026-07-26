@@ -93,24 +93,18 @@ except ImportError:
     from sglang.srt.utils.dummy_triton import TritonPlaceholder
     
     _triton_mock = TritonPlaceholder()
-    _triton_lang = _triton_mock.language
-    _triton_backends = TritonPlaceholder()
-    _triton_compiler = TritonPlaceholder()
 
-    # Wire attributes directly on the parent objects so that
-    # `triton.backends.compiler` and `triton.compiler.compiler`
-    # work without raising AttributeError
-    _triton_mock.backends = _triton_backends
-    _triton_mock.compiler = _triton_compiler
-
+    # Register in sys.modules so that any `import triton.something` resolves
+    # to our mock. TritonPlaceholder.__getattr__ handles arbitrary attribute
+    # chains (e.g. triton.backends.compiler.AttrsDescriptor) automatically.
     sys.modules["triton"] = _triton_mock
-    sys.modules["triton.language"] = _triton_lang
-    sys.modules["triton.language.extra"] = _triton_lang
-    sys.modules["triton.language.extra.libdevice"] = _triton_lang
-    sys.modules["triton.backends"] = _triton_backends
-    sys.modules["triton.backends.compiler"] = TritonPlaceholder()
-    sys.modules["triton.compiler"] = _triton_compiler
-    sys.modules["triton.compiler.compiler"] = TritonPlaceholder()
+    sys.modules["triton.language"] = _triton_mock.language
+    sys.modules["triton.language.extra"] = _triton_mock.language
+    sys.modules["triton.language.extra.libdevice"] = _triton_mock.language
+    sys.modules["triton.backends"] = _triton_mock.backends
+    sys.modules["triton.backends.compiler"] = _triton_mock.backends.compiler
+    sys.modules["triton.compiler"] = _triton_mock.compiler
+    sys.modules["triton.compiler.compiler"] = _triton_mock.compiler.compiler
 
     triton = _triton_mock
 from packaging import version as pkg_version
