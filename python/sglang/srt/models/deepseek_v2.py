@@ -185,6 +185,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_forward,
     get_model,
@@ -1762,6 +1763,11 @@ class DeepseekV2AttentionMLA(
         self.w_vc = None
         self.w_scale = 1.0
 
+        # Full-head Q/absorb weights for --dcp-replicate-q-proj, gathered once
+        # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
+        self.w_kc_qrep = None
+        self.q_b_proj_qrep_weight = None
+
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
@@ -1779,6 +1785,7 @@ class DeepseekV2AttentionMLA(
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
+            and not get_exec().deterministic.enable_deterministic_inference
             and not self.is_packed_weight
             and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
         )
@@ -2884,10 +2891,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # Minor fix for multi-modal model: input_ids is None
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        # Multi-modal: input_ids may be None (use input_embeds).
+        # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        else:
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch
