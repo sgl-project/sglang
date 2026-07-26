@@ -11,9 +11,11 @@
 //                      (so a model-specific GPU never needs an engine-catalog edit)
 //   variants/quantizations/strategies/nodesOptions  the 5-dim option lists
 //                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
-//   cells              {match, verified?, env, flags}[] — one per
+//   cells              {match, verified?, hints?, env, flags}[] — one per
 //                      (hw × variant × quant × strategy × nodes); env/flags are
-//                      flat literals, only {{PLACEHOLDER}} subst applied
+//                      flat literals, only {{PLACEHOLDER}} subst applied;
+//                      hints are prepended as `# ...` comment lines (e.g. a
+//                      recipe that needs a specific dev build)
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
@@ -29,8 +31,9 @@
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
-//                      then `hw`; falls back to `lmsysorg/sglang:dev`
+//   dockerImages       optional — `docker run` image, keyed by
+//                      `hw|quant|strategy` then `hw|quant` then `hw`;
+//                      falls back to `lmsysorg/sglang:dev`
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -506,9 +509,12 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      // Image keyed by `hw|quant|strategy` (most specific), then `hw|quant`,
+      // then `hw`; `:dev` if unmapped. The strategy key covers a tier that
+      // needs its own build (e.g. a spec-decoding preview image).
       const di = config.dockerImages || {};
-      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
+      const image = di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
+        || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
@@ -557,6 +563,12 @@ export const Deployment = ({ config, benchmarks }) => {
       const hint = config.multiNodeHints[sel.hw]
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
       cmd = `${hint}\n${cmd}`;
+    }
+    // Per-cell hints sit above everything the cell renders (prerequisites first).
+    if (cell.hints && cell.hints.length) {
+      const cellHint = cell.hints
+        .map((line) => (line.length ? "# " + line : "#")).join("\n");
+      cmd = `${cellHint}\n${cmd}`;
     }
     cmd = interpolate(cmd, envValues, modelName);
     if (multinode) {
