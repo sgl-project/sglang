@@ -98,6 +98,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+helion = ["helion==1.2.0"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",
@@ -177,6 +178,7 @@ test = [
   "pytest-cov",
   "sentence_transformers",
   "sglang[fastokens]",
+  "sglang[helion]",
   "tabulate",
 ]
 
@@ -184,6 +186,7 @@ dev = ["sglang[test]"]
 
 all = [
   "sglang[diffusion]",
+  "sglang[helion]",
   "sglang[http2]",
   "sglang[tracing]",
 ]

@@ -404,6 +404,24 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 - **Other CUDA (Hopper, Ampere, etc.)**: auto-selection works; no special constraints.
 </Warning>
 
+### KDA Helion backend
+
+Kimi Delta Attention (KDA) models can use the optional Helion backend for packed decode and prefill/extend on NVIDIA CUDA GPUs. Install the extra before selecting it:
+
+```bash
+pip install "sglang[helion]"
+```
+
+Use Helion for both phases with `--linear-attn-backend helion`. To test one phase independently, use the phase-specific flags, for example:
+
+```bash
+sglang serve MODEL_PATH \
+  --linear-attn-decode-backend helion \
+  --linear-attn-prefill-backend triton
+```
+
+The Helion backend keeps KDA speculative target verification, ReplaySSM decode, and generic non-packed decode on Triton. You can select Helion for prefill only by swapping the two phase-specific backend values.
+
 ### DSA Attention Backend
 
 DSA (DeepSeek Sparse Attention) is a native sparse attention mechanism used by [DeepSeek V3.2](https://lmsys.org/blog/2025-09-29-deepseek-V32/). It is activated automatically when the model architecture requires it and is selected via `--attention-backend dsa` (deprecated alias: `nsa`).
