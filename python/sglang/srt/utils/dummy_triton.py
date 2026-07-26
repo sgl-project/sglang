@@ -4,6 +4,7 @@ class TritonPlaceholder(types.ModuleType):
     def __init__(self):
         super().__init__("triton")
         self.__version__ = "3.2.0"
+        self.__path__ = []
         self.jit = self._dummy_decorator("jit")
         self.autotune = self._dummy_decorator("autotune")
         self.heuristics = self._dummy_decorator("heuristics")
