@@ -291,6 +291,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self._ragged_graph_size = 0
+        # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
+        # baked into the captured graphs and refreshed in place each replay.
+        self._captured_ragged_layouts: dict[int, object] = {}
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.server_args.enable_lora
@@ -496,11 +499,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             num_slots=self._ragged_capture_slots(num_tokens),
             num_draft_tokens=self.captured_req_width,
         )
-        return RaggedVerifyLayout.from_verify_lens(
+        layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=verify_lens_cpu,
             device=self.device,
             grid=self.capture_num_tokens,
         )
+        self._captured_ragged_layouts[num_tokens] = layout
+        return layout
+
+    def _stage_ragged_verify_layout(self, ragged_layout, graph_size_key: int) -> None:
+        # Without this refresh every replay reuses the capture-time synthetic
+        # verify_lens / qo_indptr and mis-slices the packed q rows.
+        cap_layout = self._captured_ragged_layouts.get(graph_size_key)
+        if cap_layout is None:
+            return
+        live = ragged_layout
+        if live.bs != cap_layout.bs or live.cap is None:
+            live = live.padded_to_bucket(
+                padded_bs=cap_layout.bs, cap=self.captured_req_width
+            )
+        cap_layout.verify_lens.copy_(live.verify_lens)
+        cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -1091,6 +1110,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
+                self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1127,6 +1147,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"{raw_bs}; the planner must reject this batch before replay"
             )
             padded_num_tokens = graph_size_key
+            self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
