@@ -612,6 +612,18 @@ mod tests {
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
         assert_eq!(events.len(), 1);
+        // The equality below reuses `from_rid`, so on its own it would hold for
+        // any decoder that hashed *something*. These pin the two failure modes it
+        // is meant to catch: a decoder that parsed the rid as an integer (a uuid
+        // is not numeric, so it would fall back to 0), and one that keyed off the
+        // request's position in the batch rather than its rid.
+        assert_ne!(events[0].rid_hash, 0, "uuid rid must not degrade to 0");
+        assert_ne!(events[0].rid_hash, RidHash::from_rid("0").0);
+        assert_ne!(
+            events[0].rid_hash,
+            RidHash::from_rid("another-rid").0,
+            "distinct rids must not collide on the routing key"
+        );
         assert_eq!(events[0].rid_hash, RidHash::from_rid(rid).0);
     }
 

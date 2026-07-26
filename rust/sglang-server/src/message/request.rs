@@ -182,21 +182,10 @@ impl GenerateBody {
             }
         };
 
-        // token_ids_logprob: one list broadcasts; a list of lists is per item
-        // (Python `_normalize_batch`'s nested-structure branch).
-        let tid_logprobs: Vec<Option<TokenIds>> = match token_ids_logprob {
-            None => vec![None; n],
-            Some(OneOrMany::One(ids)) => vec![Some(ids); n],
-            Some(OneOrMany::Many(v)) => {
-                if v.len() != n {
-                    return Err(Error::Validation(format!(
-                        "token_ids_logprob list length {} does not match batch size {n}",
-                        v.len()
-                    )));
-                }
-                v.into_iter().map(Some).collect()
-            }
-        };
+        // token_ids_logprob fans out exactly like the scalar options: one list
+        // broadcasts, a list of lists is per item (Python `_normalize_batch`'s
+        // nested-structure branch).
+        let tid_logprobs = fan_out(token_ids_logprob, n, "token_ids_logprob")?;
 
         // Each logprob/hidden opt: absent → None for every item, a scalar
         // broadcasts, a list is per-item (Python `normalize_param`, plus a length
@@ -442,8 +431,8 @@ mod tests {
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
     /// single string passes through for a single request, fans out as
-    /// `{rid}_{i}` for a batch, a list must match the batch length, and absent
-    /// rid leaves every slot `None` (server mints uuids at submit).
+    /// `{rid}_{i}` for a batch, and a list must match the batch length. An
+    /// absent rid is minted here, one uuid per item.
     #[test]
     fn split_rid_matches_python_normalize() {
         let (ps, _) = requests(r#"{"text": "a", "rid": "r"}"#).unwrap();
