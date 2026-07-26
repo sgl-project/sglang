@@ -444,10 +444,10 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
-                # Hack for FusedMoE layer
-                if isinstance(module, FusedMoEWithLoRA) and all(
-                    x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-                ):
+                # Hack for FusedMoE layer. A FusedMoEWithLoRA only exists when
+                # init_lora_modules found both expert projections targeted, so no
+                # target-module re-check is needed here.
+                if isinstance(module, FusedMoEWithLoRA):
                     gate_up_key = (
                         "gate_up_proj_moe"
                         if "gate_up_proj_moe" in self.memory_pool.A_buffer
@@ -917,6 +917,8 @@ class LoRAManager:
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
+        # One MoE layer's worth of warning is enough; the condition is model-wide.
+        warned_one_sided_moe_targets = False
 
         # When tie_word_embeddings=True, lm_head is the same Python object as
         # embed_tokens. PyTorch's named_modules() deduplicates by object identity,
@@ -1006,9 +1008,36 @@ class LoRAManager:
                 )
                 continue
 
-            if isinstance(module, FusedMoE) and all(
-                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
-            ):
+            if isinstance(module, FusedMoE):
+                expert_projections = ("gate_up_proj", "down_proj")
+                missing = [
+                    x for x in expert_projections if x not in self.target_modules
+                ]
+                if len(missing) == 1 and not warned_one_sided_moe_targets:
+                    warned_one_sided_moe_targets = True
+                    # The MoE-LoRA hooks inject a delta after gate_up and after
+                    # down together, so wrapping for only one of them is not
+                    # implemented and the layer stays unwrapped. Adapters that only
+                    # train the dense/shared MLP still work, but one that carries
+                    # expert weights for the targeted projection has them loaded
+                    # into the pool and never applied. Warn once — silently
+                    # dropping part of an adapter reads as a serving/training
+                    # mismatch with no symptom.
+                    present = next(x for x in expert_projections if x != missing[0])
+                    logger.warning(
+                        "LoRA target modules include %r but not %r, so MoE expert layers "
+                        "(e.g. %s) get no adapter at all: expert LoRA needs both projections. "
+                        "Any %r expert weights in a loaded adapter will be ignored. Add %r to "
+                        "the target modules to enable expert LoRA — an adapter that does not "
+                        "train it keeps zero-filled buffers and contributes no delta.",
+                        present,
+                        missing[0],
+                        module_name,
+                        present,
+                        missing[0],
+                    )
+                if missing:
+                    continue
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     # FusedMoE submodules outside the decoder layer hierarchy
