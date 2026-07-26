@@ -225,7 +225,9 @@ def _fused_q_indexer_rope_hadamard_quant_triton(
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if q_input.shape[-1] != 128:
-        raise ValueError(f"DSV4 indexer head dimension must be 128, got {q_input.shape[-1]}")
+        raise ValueError(
+            f"DSV4 indexer head dimension must be 128, got {q_input.shape[-1]}"
+        )
     if freqs_cis.shape[-1] != 32:
         raise ValueError(
             "DSV4 indexer expects 64 rotary dimensions "
