@@ -248,11 +248,13 @@ paths:
               $ref: '#/components/schemas/RerankRequest'
       responses:
         '200':
-          description: Reranking relevance scores.
+          description: List of rerank scoring objects containing score, index, document, and meta_info.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RerankResponse'
+                type: array
+                items:
+                  $ref: '#/components/schemas/RerankResponseItem'
 
   /v1/responses:
     post:
@@ -266,16 +268,7 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                model:
-                  type: string
-                input:
-                  type: array
-                  items:
-                    type: object
-                instructions:
-                  type: string
+              $ref: '#/components/schemas/ResponsesRequest'
       responses:
         '200':
           description: Created response object.
@@ -569,7 +562,7 @@ paths:
               $ref: '#/components/schemas/OpenSessionReqInput'
       responses:
         '200':
-          description: Created session ID.
+          description: Created session ID and success status.
 
   /close_session:
     post:
@@ -694,13 +687,37 @@ paths:
         - Management & Diagnostics
       summary: Get server load metrics
       description: Returns queue lengths, active request counts, KV cache usage percentages, and processing throughput.
+      parameters:
+        - name: dp_rank
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Filter metrics to a specific Data Parallelism (DP) rank.
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated sections to include (core, memory, spec, lora, disagg, queues, all).
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, prometheus]
+          description: Response exposition format ('json' or 'prometheus').
       responses:
         '200':
-          description: Server loads snapshot.
+          description: Server loads snapshot object.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoadsResponse'
+            text/plain:
+              schema:
+                type: string
+                description: Prometheus exposition format.
 
   /flush_cache:
     post:
@@ -793,10 +810,16 @@ paths:
       tags:
         - Management & Diagnostics
       summary: Update HiCache storage backend
-      description: Configures or updates HiCache L3 storage backend settings.
+      description: Attaches and configures HiCache L3 storage backend settings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachHiCacheStorageReqInput'
       responses:
         '200':
-          description: Backend updated status.
+          description: Backend attached status.
     delete:
       tags:
         - Management & Diagnostics
@@ -812,6 +835,12 @@ paths:
         - Management & Diagnostics
       summary: Scale Elastic Expert Parallelism
       description: Dynamically scales Expert Parallelism world size and worker instances.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScaleElasticEPReqInput'
       responses:
         '200':
           description: EP scaling initiated status.
@@ -909,8 +938,43 @@ components:
             $ref: '#/components/schemas/ModelCard'
 
     # -------------------------------------------------------------------------
-    # OpenAI Chat Completion Schemas
+    # OpenAI Chat & Responses Schemas
     # -------------------------------------------------------------------------
+    ResponsesRequest:
+      type: object
+      required:
+        - input
+      properties:
+        input:
+          oneOf:
+            - type: string
+              description: Single prompt input string.
+            - type: array
+              items:
+                type: object
+              description: Array of input item objects or dicts.
+        model:
+          type: string
+          nullable: true
+        instructions:
+          type: string
+          nullable: true
+        background:
+          type: boolean
+          default: false
+        max_output_tokens:
+          type: integer
+          nullable: true
+        max_tool_calls:
+          type: integer
+          nullable: true
+        parallel_tool_calls:
+          type: boolean
+          default: true
+        metadata:
+          type: object
+          nullable: true
+
     ChatCompletionRequest:
       type: object
       required:
@@ -1086,7 +1150,7 @@ components:
                 enum: [stop, length, tool_calls, content_filter, abort]
 
     # -------------------------------------------------------------------------
-    # Completion & Embedding Schemas
+    # Completion, Embedding & Rerank Schemas
     # -------------------------------------------------------------------------
     CompletionRequest:
       type: object
@@ -1215,23 +1279,25 @@ components:
           type: integer
           nullable: true
 
-    RerankResponse:
+    RerankResponseItem:
       type: object
       required:
-        - results
+        - score
+        - index
       properties:
-        results:
-          type: array
-          items:
-            type: object
-            required:
-              - index
-              - relevance_score
-            properties:
-              index:
-                type: integer
-              relevance_score:
-                type: number
+        score:
+          type: number
+          description: Rerank relevance score.
+        index:
+          type: integer
+          description: Index of candidate document.
+        document:
+          type: string
+          nullable: true
+          description: Candidate document text if requested.
+        meta_info:
+          type: object
+          nullable: true
 
     # -------------------------------------------------------------------------
     # Anthropic Messages Schemas
@@ -1459,14 +1525,23 @@ components:
     OpenSessionReqInput:
       type: object
       required:
-        - capacity
+        - capacity_of_str_len
       properties:
-        capacity:
+        capacity_of_str_len:
           type: integer
-          description: Maximum number of tokens reserved in KV cache session tree.
+          description: Maximum capacity of string length reserved for session context tree.
         session_id:
           type: string
           nullable: true
+          description: Optional custom session identifier string.
+        streaming:
+          type: boolean
+          nullable: true
+          description: Optional streaming flag for session multi-turn responses.
+        timeout:
+          type: number
+          nullable: true
+          description: Session idle timeout in seconds.
 
     CloseSessionReqInput:
       type: object
@@ -1514,15 +1589,62 @@ components:
         lora_name:
           type: string
 
+    AttachHiCacheStorageReqInput:
+      type: object
+      required:
+        - hicache_storage_backend
+      properties:
+        hicache_storage_backend:
+          type: string
+          description: Type of storage backend to attach (e.g., 'filesystem', 'nvme').
+        hicache_storage_backend_extra_config_json:
+          type: string
+          nullable: true
+          description: Additional backend configuration in JSON string format.
+        hicache_storage_prefetch_policy:
+          type: string
+          nullable: true
+          description: Prefetch policy configuration.
+        hicache_write_policy:
+          type: string
+          nullable: true
+          description: Write policy ('write_through' or 'write_back').
+
+    ScaleElasticEPReqInput:
+      type: object
+      required:
+        - new_ep_size
+      properties:
+        new_ep_size:
+          type: integer
+          minimum: 1
+          description: Target positive integer world size for Expert Parallelism scaling.
+
     LoadsResponse:
       type: object
+      required:
+        - timestamp
+        - version
+        - loads
       properties:
-        num_running_reqs:
-          type: integer
-        num_queue_reqs:
-          type: integer
-        token_usage:
-          type: number
+        timestamp:
+          type: string
+          format: date-time
+          description: ISO timestamp of metric collection.
+        version:
+          type: string
+          description: Active SGLang version string.
+        loads:
+          type: array
+          description: Array of per-DP-rank load metric dictionaries.
+          items:
+            type: object
+            required:
+              - dp_rank
+            properties:
+              dp_rank:
+                type: integer
+                description: Data Parallelism rank index.
 
     ServerInfoResponse:
       type: object
