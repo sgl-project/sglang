@@ -58,6 +58,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.entrypoints.openai import reasoning_request
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -799,43 +800,7 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
-        r = values.get("reasoning")
-
-        if r is not None and isinstance(r, dict):
-            effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
-                values["reasoning_effort"] = effort
-
-            enabled = (
-                r.get("enabled")
-                if r.get("enabled") is not None
-                else r.get("enable", False)
-            )
-            if isinstance(enabled, str):
-                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
-            if enabled:
-                ctk = values.get("chat_template_kwargs")
-                if not isinstance(ctk, dict):
-                    ctk = {}
-                # different models check different keys:
-                # - "thinking" for deepseek-v3, kimi_k2
-                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
-                ctk.setdefault("thinking", True)
-                ctk.setdefault("enable_thinking", True)
-                values["chat_template_kwargs"] = ctk
-
-        if values.get("reasoning_effort") == "none":
-            ctk = values.get("chat_template_kwargs")
-            if not isinstance(ctk, dict):
-                ctk = {}
-            # different models check different keys:
-            # - "thinking" for deepseek-v3, kimi_k2
-            # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
-            values["chat_template_kwargs"] = ctk
-
-        return values
+        return reasoning_request.normalize_reasoning_inputs(values)
 
     @model_validator(mode="before")
     @classmethod

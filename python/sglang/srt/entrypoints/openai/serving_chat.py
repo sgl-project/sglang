@@ -46,6 +46,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
+from sglang.srt.entrypoints.openai.reasoning_request import (
+    pop_reasoning_effort_kwarg,
+    resolve_v4_reasoning_effort,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -538,11 +542,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
+        reasoning_effort = pop_reasoning_effort_kwarg(request.chat_template_kwargs)
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -787,17 +787,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
-                # V4 encoder only accepts "max" / "high" / None.
-                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
                 # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
                 effort_source = request.reasoning_effort
                 if effort_source is None:
                     env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
-                v4_reasoning_effort = (
-                    effort_source if effort_source in ("max", "high") else None
-                )
+                v4_reasoning_effort = resolve_v4_reasoning_effort(effort_source)
                 if request.task is not None:
                     encoding_dsv4.attach_task_to_last_user_message(
                         messages, request.task
