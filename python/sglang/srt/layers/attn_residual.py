@@ -377,7 +377,7 @@ class BaseAttnResidual(Protocol):
     # legacy kernel path.
     block_residual: torch.Tensor
 
-    def write(self, prefix_sum: torch.Tensor) -> None: ...
+    def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None: ...
 
     def forward(
         self,
@@ -389,6 +389,27 @@ class BaseAttnResidual(Protocol):
         rows: Optional[slice] = None,
         write: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def forward_sp_all_gather(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        rows: slice,
+        write: bool = False,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]: ...
+
+    def forward_sp_reduce_scatter(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        rows: slice,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]: ...
 
 
 class AttnResidual:
@@ -411,9 +432,14 @@ class AttnResidual:
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
 
-    def write(self, prefix_sum: torch.Tensor) -> None:
-        """Snapshot the pre-attention prefix into the next bank row."""
-        self.block_residual[:, self.num_valid_blocks, :].copy_(prefix_sum)
+    def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None:
+        """Snapshot the pre-attention prefix into the next bank row.
+
+        Under SP attention-residual carry each rank owns a disjoint token
+        slice, so only that slice is written and subsequently read locally.
+        """
+        bank = self.block_residual if rows is None else self.block_residual[rows]
+        bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
         self.num_valid_blocks += 1
 
     def forward(
@@ -435,12 +461,8 @@ class AttnResidual:
         if nvb == 0:
             assert prefix_sum is None
             if write:
-                self.write(hidden_states)
+                self.write(hidden_states, rows)
             return out_norm(hidden_states), hidden_states
-
-        # The bank write targets the full-batch row (agg1 runs before the
-        # SP-MoE reduce-scatter); a sharded write would corrupt the bank.
-        assert not (write and rows is not None)
 
         # SP-MoE: the caller holds only its token shard; align the banked
         # residual rows to it (dim-0 slice of a contiguous buffer stays
@@ -478,5 +500,74 @@ class AttnResidual:
         if fused_write:
             self.num_valid_blocks += 1  # row nvb written in-kernel
         elif write:
-            self.write(prefix)
+            self.write(prefix, rows)
         return normed, prefix
+
+    def forward_sp_all_gather(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        rows: slice,
+        write: bool = False,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Fuse a local aggregation point and the following row all-gather."""
+        nvb = self.num_valid_blocks
+        if nvb == 0:
+            return None
+        if prefix_sum is not None and prefix_sum.shape != hidden_states.shape:
+            prefix_sum = prefix_sum[rows]
+        prefix = hidden_states if prefix_sum is None else prefix_sum.add(hidden_states)
+        bank = self.block_residual[rows]
+        cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
+        assert score_norm.variance_epsilon == out_norm.variance_epsilon
+        from sglang.srt.layers import k3_sp_collective
+
+        normed = k3_sp_collective.attn_res_all_gather(
+            prefix,
+            bank,
+            cw,
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            write_prefix=write,
+        )
+        if normed is None:
+            return None
+        if write:
+            self.num_valid_blocks += 1
+        return normed, prefix
+
+    def forward_sp_reduce_scatter(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+        rows: slice,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Fuse o_proj RS, the pending local prefix add, and aggregation."""
+        nvb = self.num_valid_blocks
+        if nvb == 0:
+            return None
+        local_tokens = rows.stop - rows.start
+        residual = prefix_sum
+        if residual is not None and residual.shape[0] != local_tokens:
+            residual = residual[rows]
+        bank = self.block_residual[rows]
+        cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
+        assert score_norm.variance_epsilon == out_norm.variance_epsilon
+        from sglang.srt.layers import k3_sp_collective
+
+        return k3_sp_collective.reduce_scatter_attn_res(
+            hidden_states,
+            residual,
+            bank,
+            cw,
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+        )

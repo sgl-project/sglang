@@ -1374,6 +1374,33 @@ def _tgv_bf16_gemm_run(
     )
 
 
+def _tgv_bf16_gemm_out_run(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    if get_device_sm() not in (100, 103):
+        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    assert out.dtype == torch.bfloat16 and out.device == x.device
+    assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
+    assert x.stride(-1) == 1, "x must be K-major [M, K]"
+    assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
+    assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
+    if x.shape[0] == 0:
+        return None
+    _run_tgv(
+        x,
+        weight.t(),
+        bias,
+        out,
+        pdl=True,
+        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+    )
+    return None
+
+
 def _tgv_bf16_gemm_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1382,11 +1409,27 @@ def _tgv_bf16_gemm_fake(
     return x.new_empty((x.shape[0], weight.shape[0]))
 
 
+def _tgv_bf16_gemm_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> None:
+    return None
+
+
 direct_register_custom_op(
     op_name="cutedsl_tgv_bf16_gemm",
     op_func=_tgv_bf16_gemm_run,
     mutates_args=[],
     fake_impl=_tgv_bf16_gemm_fake,
+)
+
+direct_register_custom_op(
+    op_name="cutedsl_tgv_bf16_gemm_out",
+    op_func=_tgv_bf16_gemm_out_run,
+    mutates_args=["out"],
+    fake_impl=_tgv_bf16_gemm_out_fake,
 )
 
 
@@ -1398,3 +1441,15 @@ def cutedsl_bf16_gemm(
 ) -> torch.Tensor:
     """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
     return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+
+
+@debug_kernel_api
+def cutedsl_bf16_gemm_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Write the BF16 GEMM directly into a caller-owned contiguous tensor."""
+    torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    return out

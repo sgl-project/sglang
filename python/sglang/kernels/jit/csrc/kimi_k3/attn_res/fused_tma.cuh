@@ -16,6 +16,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "../../distributed/custom_all_reduce.cuh"
 #include <algorithm>
 #include <array>
 #include <cfloat>
@@ -34,6 +35,17 @@ struct AttnResTMAParams {
   // row snapshot, bank row nvb (strided by stride_bm like the read rows).
   // The kernel never reads row nvb, so the write races with nothing.
   bf16_t* __restrict__ prefix_dst;
+  // Optional fused NVLS reduce-scatter source. When input_mc is non-null,
+  // the producer warp materializes this rank's reduced token shard plus the
+  // local residual into prefix_sum/prefix_out before TMA consumes it.
+  const uint8_t* input_mc;
+  const bf16_t* residual;
+  bf16_t* prefix_out;
+  device::distributed::Semaphore* sem_local;
+  uint8_t* sem_mc;
+  uint8_t* output_mc;
+  uint32_t world_size;
+  uint32_t rank;
   int64_t stride_bm;  // bank stride along T (in elements)
   float eps;
   uint32_t num_tokens;
@@ -393,7 +405,14 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           const auto scaled = mul_f32x2(acc[si * (kVecElems / 2) + j], scale2);
           out_vec[j] = cast<bf16x2_t>(mul_f32x2(scaled, q2[j]));
         }
-        out_vec.store(out_ptr, tile * (kTile / kVecElems) + tid_in_group);
+        const auto row_vid = tile * (kTile / kVecElems) + tid_in_group;
+        if (params.output_mc != nullptr) {
+          const auto global_token = static_cast<int64_t>(params.rank) * params.num_tokens + token;
+          const auto global_vid = global_token * (kDim / kVecElems) + row_vid;
+          st_multimem_16B(out_vec, params.output_mc, global_vid);
+        } else {
+          out_vec.store(out_ptr, row_vid);
+        }
       }
     }
     ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
@@ -412,9 +431,120 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
   Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
 }
 
+SGL_DEVICE uint32_t* attn_res_sem_mc_flag(uint8_t* sem_mc, uint32_t block) {
+  static_assert(sizeof(device::distributed::Semaphore) == 128);
+  return reinterpret_cast<uint32_t*>(sem_mc + block * sizeof(device::distributed::Semaphore));
+}
+
+SGL_DEVICE void attn_res_sem_arrive_relaxed(uint32_t* flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.relaxed.sys.global.add.u32 [%0], 1;" ::"l"(flag) : "memory");
+#else
+  assert(false && "multimem red requires Hopper or later");
+#endif
+}
+
+SGL_DEVICE void attn_res_sem_arrive_release(uint32_t* flag) {
+#if SGL_ARCH_HOPPER_OR_GREATER
+  asm volatile("multimem.red.release.sys.global.add.u32 [%0], 1;" ::"l"(flag) : "memory");
+#else
+  assert(false && "multimem red requires Hopper or later");
+#endif
+}
+
+// Fused NVLS pull RS + local residual + attention-residual aggregation.
+// The entry/exit barriers make local o_proj writes visible before the
+// producer's multimem reduction and preserve the shared pull-semaphore
+// protocol used by the neighboring K3 collectives.
+template <typename Trait, uint32_t kOccupancy>
+__global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
+    attn_res_fused_pull_rs_kernel(const __grid_constant__ AttnResTMAParams params) {
+  __shared__ uint32_t exit_base;
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    const auto reserved = semaphore->counter_ptr()->inc(2 * params.world_size);
+    exit_base = reserved + params.world_size;
+    device::PDLWaitPrimary<true>();
+    attn_res_sem_arrive_relaxed(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_relaxed() - reserved < params.world_size)
+      ;
+  }
+  __syncthreads();
+
+  // Cooperative NVLS materialization: all TMA producer + consumer threads
+  // participate, so the remote reduction exposes hundreds of outstanding
+  // 16-byte loads per CTA instead of serializing the row through one warp.
+  using pull_vec_t = device::AlignedVector<bf16x2_t, 4>;
+  using SumOp = device::ReductionTrait<device::ReductionOp::SUM, bf16x2_t>;
+  constexpr uint32_t kRowVecs = Trait::kDim * sizeof(bf16_t) / sizeof(pull_vec_t);
+  for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
+    auto* prefix = params.prefix_out + static_cast<int64_t>(token) * Trait::kDim;
+    const auto* input_mc = params.input_mc + static_cast<int64_t>(token) * Trait::kDim * sizeof(bf16_t);
+    const auto* residual =
+        params.residual == nullptr ? nullptr : params.residual + static_cast<int64_t>(token) * Trait::kDim;
+    for (uint32_t vid = threadIdx.x; vid < kRowVecs; vid += blockDim.x) {
+      pull_vec_t vec;
+      ld_multimem_16B(vec, input_mc, vid);
+      if (residual != nullptr) {
+        pull_vec_t res;
+        res.load(residual, vid);
+#pragma unroll
+        for (uint32_t j = 0; j < 4; ++j) {
+          vec[j] = SumOp::reduce(vec[j], res[j]);
+        }
+      }
+      vec.store(prefix, vid);
+    }
+  }
+  __threadfence();
+  __syncthreads();
+
+  extern __shared__ char smem_raw[];
+  Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    attn_res_sem_arrive_release(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_acquire() - exit_base < params.world_size)
+      ;
+  }
+}
+
+// Local attention-residual aggregation + direct AG epilogue. The consumer
+// threads already hold each normalized 16B output vector in registers, so
+// Trait::forward multicast-stores those vectors into every peer's symmetric
+// full-token output instead of launching a separate all-gather.
+template <typename Trait, uint32_t kOccupancy>
+__global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
+    attn_res_fused_direct_ag_kernel(const __grid_constant__ AttnResTMAParams params) {
+  __shared__ uint32_t exit_base;
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    const auto reserved = semaphore->counter_ptr()->inc(2 * params.world_size);
+    exit_base = reserved + params.world_size;
+    attn_res_sem_arrive_relaxed(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_relaxed() - reserved < params.world_size)
+      ;
+  }
+  __syncthreads();
+
+  extern __shared__ char smem_raw[];
+  Trait::forward(params, reinterpret_cast<typename Trait::Smem*>(smem_raw));
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    auto* semaphore = &params.sem_local[blockIdx.x];
+    attn_res_sem_arrive_release(attn_res_sem_mc_flag(params.sem_mc, blockIdx.x));
+    while (semaphore->get_acquire() - exit_base < params.world_size)
+      ;
+  }
+}
+
 }  // namespace sglang
 
 using namespace sglang;
+using host::distributed::CommunicatorRef;
 
 // ---------------------------------------------------------------------------
 // Host launcher: constexpr kernel table over nvb.
@@ -435,6 +565,17 @@ struct AttnResFusedTmaKernel {
     return std::array<KernelFn, kMaxBankRows + 1>{nullptr, attn_res_fused_tma_kernel<Trait<I + 1>, kOccupancy>...};
   }
   static constexpr auto kTable = make_table(std::make_index_sequence<kMaxBankRows>{});
+  template <std::size_t... I>
+  static constexpr auto make_pull_table(std::index_sequence<I...>) {
+    return std::array<KernelFn, kMaxBankRows + 1>{nullptr, attn_res_fused_pull_rs_kernel<Trait<I + 1>, kOccupancy>...};
+  }
+  static constexpr auto kPullTable = make_pull_table(std::make_index_sequence<kMaxBankRows>{});
+  template <std::size_t... I>
+  static constexpr auto make_ag_table(std::index_sequence<I...>) {
+    return std::array<KernelFn, kMaxBankRows + 1>{
+        nullptr, attn_res_fused_direct_ag_kernel<Trait<I + 1>, kOccupancy>...};
+  }
+  static constexpr auto kAgTable = make_ag_table(std::make_index_sequence<kMaxBankRows>{});
 
   static void
   run(const tvm::ffi::TensorView prefix_sum,
@@ -495,10 +636,176 @@ struct AttnResFusedTmaKernel {
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
         .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
+        .input_mc = nullptr,
+        .residual = nullptr,
+        .prefix_out = nullptr,
+        .sem_local = nullptr,
+        .sem_mc = nullptr,
+        .output_mc = nullptr,
+        .world_size = 0,
+        .rank = 0,
         .stride_bm = NB * H,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),
     };
     LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kTable[nvb], params);
+  }
+
+  static void run_pull_rs(
+      CommunicatorRef ref,
+      const tvm::ffi::TensorView input,
+      std::optional<tvm::ffi::TensorView> residual,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView prefix_out,
+      int64_t nvb,
+      double eps,
+      int64_t input_mc_ptr,
+      int64_t sem_mc_ptr,
+      int64_t max_blocks) {
+    using namespace host;
+    const auto& data = *ref.get();
+    auto GT_ = SymbolicSize{"global_tokens"};
+    auto T_ = SymbolicSize{"local_tokens"};
+    auto H_ = SymbolicSize{"hidden_size"};
+    auto NB_ = SymbolicSize{"num_bank_slots"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({GT_, H_}).with_dtype<bf16_t>().with_device(device).verify(input);
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(out).verify(prefix_out);
+    if (residual.has_value()) {
+      TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(residual.value());
+    }
+    TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
+    TensorMatcher({H_}).with_dtype<bf16_t>().with_device(device).verify(cw).verify(ow);
+
+    const auto global_tokens = static_cast<int64_t>(GT_.unwrap());
+    const auto num_tokens = static_cast<int64_t>(T_.unwrap());
+    const auto H = static_cast<int64_t>(H_.unwrap());
+    const auto NB = static_cast<int64_t>(NB_.unwrap());
+    RuntimeCheck(data.world_size > 1, "fused pull RS requires world_size > 1");
+    RuntimeCheck(global_tokens == num_tokens * data.world_size, "global tokens must equal local tokens * world size");
+    RuntimeCheck(H == kDim, "fused pull RS: H must be ", kDim, ", got ", H);
+    RuntimeCheck(1 <= nvb && nvb <= kMaxBankRows && nvb <= NB, "fused pull RS: invalid nvb=", nvb, " NB=", NB);
+    RuntimeCheck(input_mc_ptr != 0, "fused pull RS requires multicast input");
+    RuntimeCheck(sem_mc_ptr != 0, "fused pull RS requires multicast semaphores");
+    RuntimeCheck(max_blocks > 0, "fused pull RS requires max_blocks > 0");
+    if (num_tokens == 0) return;
+
+    [[maybe_unused]] static const bool attrs_set = [] {
+      for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        RuntimeDeviceCheck(
+            cudaFuncSetAttribute(kPullTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+      }
+      return true;
+    }();
+
+    const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
+    const auto grid = std::min<int64_t>(
+        {static_cast<int64_t>(num_sm) * kOccupancy,
+         num_tokens,
+         max_blocks,
+         static_cast<int64_t>(data.num_pull_blocks)});
+    const auto local_elems = num_tokens * H;
+    const auto params = AttnResTMAParams{
+        .prefix_sum = static_cast<const bf16_t*>(prefix_out.data_ptr()),
+        .bank = static_cast<const bf16_t*>(bank.data_ptr()),
+        .cw = static_cast<const bf16_t*>(cw.data_ptr()),
+        .ow = static_cast<const bf16_t*>(ow.data_ptr()),
+        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .prefix_dst = nullptr,
+        .input_mc = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(input_mc_ptr)) +
+                    data.rank * local_elems * sizeof(bf16_t),
+        .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,
+        .prefix_out = static_cast<bf16_t*>(prefix_out.data_ptr()),
+        .sem_local = data.pull_semaphores[data.rank],
+        .sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr)),
+        .output_mc = nullptr,
+        .world_size = data.world_size,
+        .rank = data.rank,
+        .stride_bm = NB * H,
+        .eps = static_cast<float>(eps),
+        .num_tokens = static_cast<uint32_t>(num_tokens),
+    };
+    LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kPullTable[nvb], params);
+  }
+
+  static void run_direct_ag(
+      CommunicatorRef ref,
+      const tvm::ffi::TensorView prefix_sum,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView out,
+      int64_t nvb,
+      double eps,
+      int64_t output_mc_ptr,
+      int64_t sem_mc_ptr,
+      int64_t max_blocks,
+      bool write_prefix) {
+    using namespace host;
+    const auto& data = *ref.get();
+    auto T_ = SymbolicSize{"local_tokens"};
+    auto GT_ = SymbolicSize{"global_tokens"};
+    auto H_ = SymbolicSize{"hidden_size"};
+    auto NB_ = SymbolicSize{"num_bank_slots"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum);
+    TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
+    TensorMatcher({H_}).with_dtype<bf16_t>().with_device(device).verify(cw).verify(ow);
+    TensorMatcher({GT_, H_}).with_dtype<bf16_t>().with_device(device).verify(out);
+
+    const auto num_tokens = static_cast<int64_t>(T_.unwrap());
+    const auto global_tokens = static_cast<int64_t>(GT_.unwrap());
+    const auto H = static_cast<int64_t>(H_.unwrap());
+    const auto NB = static_cast<int64_t>(NB_.unwrap());
+    RuntimeCheck(data.world_size > 1, "fused direct AG requires world_size > 1");
+    RuntimeCheck(global_tokens == num_tokens * data.world_size, "global tokens must equal local tokens * world size");
+    RuntimeCheck(H == kDim, "fused direct AG: H must be ", kDim, ", got ", H);
+    RuntimeCheck(1 <= nvb && nvb <= kMaxBankRows && nvb <= NB, "fused direct AG: invalid nvb=", nvb, " NB=", NB);
+    RuntimeCheck(!write_prefix || nvb < NB, "fused direct AG: write_prefix targets bank row nvb, needs nvb < NB");
+    RuntimeCheck(output_mc_ptr != 0, "fused direct AG requires multicast output");
+    RuntimeCheck(sem_mc_ptr != 0, "fused direct AG requires multicast semaphores");
+    RuntimeCheck(max_blocks > 0, "fused direct AG requires max_blocks > 0");
+    if (num_tokens == 0) return;
+
+    [[maybe_unused]] static const bool attrs_set = [] {
+      for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        RuntimeDeviceCheck(cudaFuncSetAttribute(kAgTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+      }
+      return true;
+    }();
+
+    const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
+    const auto grid = std::min<int64_t>(
+        {static_cast<int64_t>(num_sm) * kOccupancy,
+         num_tokens,
+         max_blocks,
+         static_cast<int64_t>(data.num_pull_blocks)});
+    const auto params = AttnResTMAParams{
+        .prefix_sum = static_cast<const bf16_t*>(prefix_sum.data_ptr()),
+        .bank = static_cast<const bf16_t*>(bank.data_ptr()),
+        .cw = static_cast<const bf16_t*>(cw.data_ptr()),
+        .ow = static_cast<const bf16_t*>(ow.data_ptr()),
+        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
+        .input_mc = nullptr,
+        .residual = nullptr,
+        .prefix_out = nullptr,
+        .sem_local = data.pull_semaphores[data.rank],
+        .sem_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(sem_mc_ptr)),
+        .output_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(output_mc_ptr)),
+        .world_size = data.world_size,
+        .rank = data.rank,
+        .stride_bm = NB * H,
+        .eps = static_cast<float>(eps),
+        .num_tokens = static_cast<uint32_t>(num_tokens),
+    };
+    LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kAgTable[nvb], params);
   }
 };
