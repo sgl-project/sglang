@@ -70,6 +70,7 @@ from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import client_cancel_finish_reason
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -1262,8 +1263,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # The response_id is the same as the rid used when submitting the request
-        self.tokenizer_manager.abort_request(rid=response_id)
+        # The response_id is the same as the rid used when submitting the request.
+        # An explicit cancel is a client action, so mark it as a client cancel.
+        self.tokenizer_manager.abort_request(
+            rid=response_id, finished_reason=client_cancel_finish_reason()
+        )
 
         if task := self.background_tasks.get(response_id):
             task.cancel()

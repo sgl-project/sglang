@@ -152,6 +152,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.schedule_batch import client_cancel_finish_reason
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
@@ -1546,8 +1547,12 @@ async def configure_logging(
 async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
+        # A specific-rid abort via this endpoint is a client-initiated cancel;
+        # abort_all is an operational/admin action and keeps its default status.
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid,
+            abort_all=obj.abort_all,
+            finished_reason=(None if obj.abort_all else client_cancel_finish_reason()),
         )
         return Response(status_code=200)
     except Exception as e:

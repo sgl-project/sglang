@@ -112,7 +112,9 @@ class GrammarManager:
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+                req.set_finish_with_abort(
+                    "Aborted by AbortReq.", recv_req.finished_reason
+                )
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
