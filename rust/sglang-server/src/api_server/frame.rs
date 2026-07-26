@@ -75,7 +75,11 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     let mut off = 0usize;
     for &l in lens {
         let l = l as usize;
-        rows.push(serde_json::json!(&vals[off..(off + l).min(vals.len())]));
+        // `get`, not a clamped index: clamping only the END leaves `off` past
+        // `vals.len()` after one over-long row, making the next range reversed
+        // (`start > end`) — which panics on the api thread rather than yielding
+        // an empty row. Same reasoning as the egress decoder's `take_f32`.
+        rows.push(serde_json::json!(vals.get(off..off + l).unwrap_or(&[])));
         off += l;
     }
     serde_json::Value::Array(rows)
