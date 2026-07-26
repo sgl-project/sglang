@@ -10,6 +10,8 @@ with the gate/up LoRA delta injected into raw W13 output before activation,
 down LoRA-A reading the exact activated value, router coefficient and routed
 scaling each applied exactly once, and ``-1`` sentinels contributing nothing.
 ``route_coeff_precision`` declares whether coefficients are consumed in FP32
+(the CANONICAL form per the A2 ruling, plan section 48: every production
+backend keeps router weights FP32 into its combine)
 or BF16-rounded (provider parity axis; adjudication item A2).  Rounding order
 for ``bf16_rounded`` is declared as ``s x BF16(w)``: the FP32 router weight is
 rounded first and routed scaling multiplies afterward; ``BF16(s x w)``

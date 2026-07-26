@@ -4,7 +4,12 @@ import unittest
 
 import torch
 
-from sglang.srt.lora.sgl_lora.routing import build_virtual_expert_routing
+from sglang.srt.lora.sgl_lora.routing import (
+    ROUTE_ALIGNED,
+    ROUTE_FUSED_IDS,
+    ROUTE_RAW,
+    build_virtual_expert_routing,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,6 +33,7 @@ class TestSglLoraRouting(CustomTestCase):
         factor_map=None,
         block_size=16,
         dtype=torch.int32,
+        view=ROUTE_ALIGNED,
     ):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
@@ -40,7 +46,44 @@ class TestSglLoraRouting(CustomTestCase):
                 if factor_map is None
                 else torch.tensor(factor_map, dtype=dtype, device=self.device)
             ),
+            view=view,
         )
+
+    def test_narrower_views_refuse_fields_they_did_not_build(self):
+        """A view must not silently hand back a field it never computed.
+
+        The three views exist so a schedule pays only for what it reads (plan
+        section 29 R1). If an unbuilt field returned None instead of raising,
+        a consumer that requested the wrong view would pass None into a Triton
+        launch and fail somewhere unrelated -- or, worse, index a stale buffer.
+        """
+        ids, adapters = [[0, 1]], [0]
+        aligned = self._build(ids, adapters, factor_count=2, view=ROUTE_ALIGNED)
+        self.assertEqual(aligned.virtual_topk_ids.numel(), 2)
+        self.assertGreater(aligned.sorted_pair_ids.numel(), 0)
+
+        fused = self._build(ids, adapters, factor_count=2, view=ROUTE_FUSED_IDS)
+        self.assertTrue(
+            torch.equal(fused.virtual_topk_ids, aligned.virtual_topk_ids),
+            "fused_ids must agree bitwise with the aligned view it is a prefix of",
+        )
+        for field in ("sorted_pair_ids", "block_virtual_expert_ids"):
+            with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
+                getattr(fused, field)
+
+        raw = self._build(ids, adapters, factor_count=2, view=ROUTE_RAW)
+        with self.assertRaisesRegex(ValueError, ROUTE_FUSED_IDS):
+            raw.virtual_topk_ids
+        with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
+            raw.sorted_pair_ids
+        # A raw consumer fuses the key computation into its own kernel, so the
+        # sources must survive on the view.
+        self.assertEqual(raw.factor_expert_count, 2)
+        self.assertEqual(raw.token_slots.numel(), 1)
+
+    def test_unknown_view_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown route view"):
+            self._build([[0, 1]], [0], factor_count=2, view="grouped")
 
     def test_identity_and_explicit_factor_maps(self):
         cases = (
@@ -131,7 +174,175 @@ class TestSglLoraRouting(CustomTestCase):
         self.assertGreaterEqual(route.sorted_pair_ids.numel(), 9 * 4)
         self.assertGreaterEqual(route.block_virtual_expert_ids.numel(), 9)
 
+    def test_aligned_view_policy_boundaries(self):
+        """Pin the two-predicate align policy below, at, and above each edge.
+
+        Sited by the section 40 redo (plan section 13 rule 5): fused when
+        V >= 8192 (the JIT kernel's EPT 8->16 rung edge) OR P >= 16384 (fused
+        wins that column at every V, both timing modes). The policy constants
+        are load-bearing serving behavior; a silent change is a performance
+        regression no correctness test would catch — that exact failure
+        happened once, when a raised kernel ceiling never reached the
+        dispatch — so the values AND the edge behavior are pinned together.
+        """
+        from sglang.srt.lora.sgl_lora import fused_align
+        from sglang.srt.lora.sgl_lora.routing import (
+            _FUSED_ALIGN_MIN_PAIRS,
+            _FUSED_ALIGN_MIN_VIRTUAL,
+            _JIT_ALIGN_MAX_VIRTUAL_EXPERTS,
+            build_virtual_expert_routing,
+        )
+
+        self.assertEqual(_FUSED_ALIGN_MIN_VIRTUAL, 8192)
+        self.assertEqual(_FUSED_ALIGN_MIN_PAIRS, 16384)
+        self.assertEqual(_JIT_ALIGN_MAX_VIRTUAL_EXPERTS, 32767)
+
+        # (V, T, expects_fused): straddles both edges; K = 8 so P = 8 * T.
+        cases = (
+            (8160, 8, False),  # below both edges -> ID pass + JIT
+            (8192, 8, True),  # at the V edge (the EPT rung)
+            (12288, 8, True),  # kimi EP1 x 32 slots, the realistic large case
+            (1024, 2048, True),  # small V, P = 16384: the P edge
+            (1024, 1024, False),  # small V, P = 8192: below the P edge
+            (40960, 8, True),  # above the JIT ceiling: fused is the only path
+        )
+        original = fused_align.fused_align_block_size
+        for num_virtual, num_tokens, expects_fused in cases:
+            factor_experts = num_virtual // 32
+            with self.subTest(V=num_virtual, P=num_tokens * 8):
+                ids = torch.randint(
+                    0,
+                    factor_experts,
+                    (num_tokens, 8),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                slots = torch.randint(
+                    0, 32, (num_tokens,), dtype=torch.int32, device=self.device
+                )
+                calls: list[int] = []
+                try:
+
+                    def spy(*args, **kwargs):
+                        calls.append(1)
+                        return original(*args, **kwargs)
+
+                    fused_align.fused_align_block_size = spy
+                    route = build_virtual_expert_routing(
+                        ids,
+                        slots,
+                        factor_expert_count=factor_experts,
+                        max_loras=32,
+                        block_size=16,
+                        view=ROUTE_ALIGNED,
+                    )
+                finally:
+                    fused_align.fused_align_block_size = original
+                self.assertEqual(
+                    bool(calls),
+                    expects_fused,
+                    f"V={num_virtual}, P={num_tokens * 8} took the wrong path",
+                )
+                self.assertGreater(int(route.num_pairs_post_padded), 0)
+                self.assertEqual(route.sorted_pair_ids.dtype, torch.int32)
+                self.assertEqual(route.block_virtual_expert_ids.dtype, torch.int32)
+
+    def test_sentinel_blocks_isolate_invalid_pairs_on_both_align_paths(self):
+        """A5 pin-down (gate-1 packet): the sentinel-bucket contract, black-box.
+
+        Invalid pairs (base tokens, non-owned experts) ride sentinel routes.
+        The contract every LoRA kernel depends on: a block labelled ``-1``
+        never contains a valid pair, a valid pair never sits in a ``-1``
+        block, every slot inside the padded plan is a READABLE index (< P or
+        the padding value P — the stock B kernel dereferences ``-1`` blocks'
+        slots to zero-fill, which is how an uninitialized tail once caused an
+        illegal memory access), and every valid pair appears exactly once
+        under its own key's label. Checked through the dispatch on BOTH
+        policy paths — V=256 (ID pass + JIT) and V=12288 (fused) — since the
+        two implement the contract independently.
+        """
+        for factor_experts, slot_capacity in ((8, 32), (384, 32)):
+            num_virtual = factor_experts * slot_capacity
+            with self.subTest(V=num_virtual):
+                generator = torch.Generator(device="cpu").manual_seed(23)
+                num_tokens, top_k = 96, 8
+                topk_ids = torch.randint(
+                    -1,
+                    factor_experts,
+                    (num_tokens, top_k),
+                    generator=generator,
+                    dtype=torch.int32,
+                ).to(self.device)
+                token_slots = torch.randint(
+                    -1,
+                    slot_capacity,
+                    (num_tokens,),
+                    generator=generator,
+                    dtype=torch.int32,
+                ).to(self.device)
+                route = build_virtual_expert_routing(
+                    topk_ids,
+                    token_slots,
+                    factor_expert_count=factor_experts,
+                    max_loras=slot_capacity,
+                    block_size=16,
+                    view=ROUTE_ALIGNED,
+                )
+                num_pairs = num_tokens * top_k
+                keys = (
+                    torch.where(
+                        (token_slots[:, None] >= 0) & (topk_ids >= 0),
+                        token_slots[:, None].to(torch.int64) * factor_experts
+                        + topk_ids.to(torch.int64),
+                        torch.tensor(-1, dtype=torch.int64, device=self.device),
+                    )
+                    .reshape(-1)
+                    .cpu()
+                )
+                num_padded = int(route.num_pairs_post_padded)
+                sorted_ids = route.sorted_pair_ids.cpu()
+                block_ids = route.block_virtual_expert_ids.cpu()
+                self.assertTrue(bool((keys == -1).any()), "case must have sentinels")
+
+                seen: dict[int, int] = {}
+                for block in range(num_padded // 16):
+                    label = int(block_ids[block])
+                    slots = sorted_ids[block * 16 : (block + 1) * 16]
+                    self.assertTrue(
+                        bool((slots <= num_pairs).all()),
+                        f"block {block} holds an unreadable slot index",
+                    )
+                    real = slots[slots < num_pairs]
+                    for pair in real.tolist():
+                        self.assertNotIn(pair, seen, "pair appears twice in the plan")
+                        seen[pair] = label
+                        if label == -1:
+                            self.assertEqual(
+                                int(keys[pair]),
+                                -1,
+                                f"valid pair {pair} placed in a sentinel block",
+                            )
+                        else:
+                            self.assertEqual(
+                                int(keys[pair]),
+                                label,
+                                f"pair {pair} in block labelled {label}",
+                            )
+                valid = {i for i in range(num_pairs) if int(keys[i]) >= 0}
+                self.assertEqual(
+                    valid,
+                    {p for p, l in seen.items() if l != -1},
+                    "every valid pair must appear exactly once under its key",
+                )
+
     def test_alignment_capability_boundaries(self):
+        """Key canonicalization at the capability edges, via the FUSED_IDS view.
+
+        The fused_ids view is the one that always materializes the key array;
+        an `aligned` view built by the fused kernel deliberately does not (its
+        consumers read only the [T, K] shape), so asserting values through
+        `aligned` would couple this test to the dispatch policy.
+        """
         for factor_count in (1023, 1024, 8192):
             with self.subTest(factor_count=factor_count):
                 route = self._build(
@@ -140,6 +351,7 @@ class TestSglLoraRouting(CustomTestCase):
                     factor_count=factor_count,
                     max_loras=1,
                     block_size=1 if factor_count > 8191 else 16,
+                    view=ROUTE_FUSED_IDS,
                 )
                 self.assertEqual(
                     route.virtual_topk_ids.flatten().cpu().tolist(),

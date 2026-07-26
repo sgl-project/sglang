@@ -15,7 +15,7 @@ import triton.language as tl
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     invoke_fused_moe_kernel,
 )
-from sglang.srt.lora.sgl_lora.routing import VirtualExpertRouting
+from sglang.srt.lora.sgl_lora.routing import RouteView
 
 
 @triton.jit
@@ -112,7 +112,7 @@ def grouped_lora_a(
     input: torch.Tensor,
     weight: torch.Tensor,
     output: torch.Tensor,
-    routing: VirtualExpertRouting,
+    routing: RouteView,
     *,
     config: Mapping[str, int],
     pair_input: bool = False,
@@ -129,7 +129,7 @@ def grouped_lora_a(
     ``config`` is chosen by the caller. This primitive contains no serving
     selector or provisional rank/token threshold.
     """
-    num_pairs = routing.virtual_topk_ids.numel()
+    num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
 
@@ -156,7 +156,7 @@ def grouped_lora_a(
         weight.stride(2),
         output.stride(0),
         output.stride(1),
-        TOP_K=routing.virtual_topk_ids.shape[1],
+        TOP_K=routing.topk_ids.shape[1],
         N=weight.shape[1],
         K=weight.shape[2],
         PAIR_INPUT=pair_input,
@@ -175,7 +175,7 @@ def stock_grouped_lora_b(
     intermediate: torch.Tensor,
     weight: torch.Tensor,
     destination: torch.Tensor,
-    routing: VirtualExpertRouting,
+    routing: RouteView,
     *,
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
@@ -189,7 +189,7 @@ def stock_grouped_lora_b(
     static shape/layout/config validation.
     """
     num_slices = len(destination_offsets)
-    num_pairs = routing.virtual_topk_ids.numel()
+    num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
 
@@ -197,7 +197,9 @@ def stock_grouped_lora_b(
     rank = weight.shape[2]
     # The stock kernel does not read either tensor when routed weighting is
     # disabled. Reusing the contiguous route tensor avoids a forward allocation.
-    unused_topk_weights = routing.virtual_topk_ids
+    # The stock kernel takes a weights tensor it must not read
+    # (mul_routed_weight=False); any [T, K] tensor satisfies the signature.
+    unused_topk_weights = routing.topk_ids
     for slice_id, destination_offset in enumerate(destination_offsets):
         invoke_fused_moe_kernel(
             intermediate[:, slice_id * rank : (slice_id + 1) * rank],
@@ -210,7 +212,7 @@ def stock_grouped_lora_b(
             None,
             None,
             unused_topk_weights,
-            routing.virtual_topk_ids,
+            routing.topk_ids,
             routing.sorted_pair_ids,
             routing.block_virtual_expert_ids,
             routing.num_pairs_post_padded,

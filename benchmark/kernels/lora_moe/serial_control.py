@@ -11,9 +11,10 @@ No new kernels: LoRA math uses the production ``sgl_lora`` primitives
 down-B delta); the base GEMMs are plain BF16 ``torch.matmul`` per expert
 (FP32 accumulation) and the combine is plain fixed-order FP32 torch.
 
-Coefficient semantics: the combine consumes BF16-rounded coefficients
-(``route_coeff_precision="bf16_rounded"``, FlashInfer parity) at exactly one
-place — ``y = routed_scaling * sum_k bf16(w[t,k]) * (base_pair + delta_pair)``
+Coefficient semantics: the combine consumes FP32 coefficients
+(``route_coeff_precision="fp32"``, the A2 ruling of plan section 48 — the form
+every production backend computes) at exactly one
+place — ``y = routed_scaling * sum_k fp32(w[t,k]) * (base_pair + delta_pair)``
 computed in FP32 with a literal left-to-right slot loop — so the frozen
 equation holds exactly, including non-unit routed scaling.  Declared rounding
 order (A1): ``s x BF16(w)`` — weight rounded first, scaling applied at the
@@ -32,7 +33,7 @@ from sglang.srt.lora.sgl_lora.bf16 import (
 )
 from sglang.srt.lora.sgl_lora.moe_lora_runner import PROVISIONAL_LAUNCH_CONFIG
 from sglang.srt.lora.sgl_lora.routing import (
-    VirtualExpertRouting,
+    RouteView,
     build_virtual_expert_routing,
 )
 
@@ -53,9 +54,7 @@ def _device_tensors(tensors: CaseTensors, device: torch.device) -> CaseTensors:
     return CaseTensors(**moved)
 
 
-def _expert_routing(
-    case: MoeLoraBenchCase, tensors: CaseTensors
-) -> VirtualExpertRouting:
+def _expert_routing(case: MoeLoraBenchCase, tensors: CaseTensors) -> RouteView:
     """Per-expert factor route over the declared expert-ID domain."""
     return build_virtual_expert_routing(
         tensors.topk_ids,
@@ -67,9 +66,7 @@ def _expert_routing(
     )
 
 
-def _shared_routing(
-    case: MoeLoraBenchCase, tensors: CaseTensors
-) -> VirtualExpertRouting:
+def _shared_routing(case: MoeLoraBenchCase, tensors: CaseTensors) -> RouteView:
     """Adapter-only factor route (shared-outer control form).
 
     EP ownership is preserved: every locally owned expert maps to shared
@@ -178,7 +175,7 @@ def run_serial_materialized_control(
             case.provider_gate_up_layout,
             "gate_then_up",
         ),
-        "route_coeff_precision": (case.route_coeff_precision, "bf16_rounded"),
+        "route_coeff_precision": (case.route_coeff_precision, "fp32"),
         "cache_state": (case.cache_state, "hot"),
         "intermediate_size_physical": (
             case.intermediate_size_physical,
@@ -267,9 +264,9 @@ def run_serial_materialized_control(
     )
 
     # Combine: the frozen equation, exactly —
-    #   y = routed_scaling * sum_k bf16(w) * (base_pair + delta_pair)
+    #   y = routed_scaling * sum_k fp32(w) * (base_pair + delta_pair)
     # in FP32 with fixed slot order; coefficient and scaling applied once.
-    coeff = data.topk_weights.to(torch.bfloat16).to(torch.float32)
+    coeff = data.topk_weights.to(torch.float32)
     pair_sum = (
         (down_base.to(torch.float32) + down_delta.to(torch.float32))
         * coeff.reshape(-1, 1)
@@ -317,7 +314,7 @@ def run_base_only_torch(
     )
     activated = _activate(case, gate_up_base)
     down_base = _base_gemm(pair_expert, activated, data.w2, case.moe_hidden_size)
-    coeff = data.topk_weights.to(torch.bfloat16).to(torch.float32)
+    coeff = data.topk_weights.to(torch.float32)
     weighted = (down_base.to(torch.float32) * coeff.reshape(-1, 1)).view(
         case.num_tokens, case.top_k, case.moe_hidden_size
     )

@@ -8305,6 +8305,13 @@ class ServerArgs:
                     "sgl_lora currently requires trivial expert placement "
                     "without EPLB or redundant experts"
                 )
+            if self.enable_pdmux:
+                raise ValueError(
+                    "sgl_lora does not yet support PD-multiplexing: its "
+                    "fused-align routing scratch is cached per "
+                    "(device, num_buckets) and is not safe under concurrent "
+                    "prefill/decode streams"
+                )
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:

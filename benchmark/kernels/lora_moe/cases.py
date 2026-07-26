@@ -151,6 +151,30 @@ MODEL_PRESETS: dict[str, ModelGeometry] = {
             expert_form="nongated_one_slice",
             activation="relu2",
         ),
+        # Provider-benchmark geometries: the shapes the section 53/55 provider
+        # study measured, kept as named presets so the timing suite's cases
+        # are content-addressed like everything else. The correctness matrix
+        # curates its presets explicitly and never picks these up.
+        ModelGeometry(
+            name="bench_provider_e32",
+            hidden_size=512,
+            moe_hidden_size=512,
+            intermediate_size_global=256,
+            num_experts_global=32,
+            top_k=8,
+            expert_form="gated_two_slice",
+            activation="silu_glu",
+        ),
+        ModelGeometry(
+            name="bench_provider_e128",
+            hidden_size=512,
+            moe_hidden_size=512,
+            intermediate_size_global=512,
+            num_experts_global=128,
+            top_k=8,
+            expert_form="gated_two_slice",
+            activation="silu_glu",
+        ),
     )
 }
 

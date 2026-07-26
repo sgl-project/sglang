@@ -14,6 +14,7 @@ Usage (single GPU, eager only):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -28,6 +29,11 @@ from benchmark.kernels.lora_moe.cases import (
     build_case,
     capture_source_revision,
     materialize_case_tensors,
+)
+from benchmark.kernels.lora_moe.production_runner import (
+    prepare_production_forward,
+    production_runner_skip_reason,
+    run_production_runner,
 )
 from benchmark.kernels.lora_moe.reference import (
     reference_local_moe,
@@ -55,6 +61,24 @@ class CaseResult(msgspec.Struct, kw_only=True):
     replays: int
     passed: bool
     failure: str = ""
+    # Gate-2 review: a record must say WHICH provider it observed and carry
+    # elementwise output digests, so cross-provider bitwise identity is a
+    # checkable property of two archives rather than an inference from equal
+    # gate scalars. `production_provider` is the contract key read OFF THE
+    # CONSTRUCTED RUNNER (and asserted against the env request), not the
+    # request itself.
+    control_output_sha256: str | None = None
+    production_provider: str | None = None
+    production_output_sha256: str | None = None
+
+
+def _tensor_digest(tensor: torch.Tensor) -> str:
+    """SHA256 over dtype, shape, and raw element bytes (bf16 viewed as int16)."""
+    t = tensor.detach().cpu().contiguous()
+    header = f"{t.dtype}|{tuple(t.shape)}|".encode()
+    if t.dtype == torch.bfloat16:
+        t = t.view(torch.int16)
+    return hashlib.sha256(header + t.numpy().tobytes()).hexdigest()
 
 
 def step1_matrix(device: str, source_revision: str) -> list[MoeLoraBenchCase]:
@@ -63,7 +87,10 @@ def step1_matrix(device: str, source_revision: str) -> list[MoeLoraBenchCase]:
     def case(**kw) -> MoeLoraBenchCase:
         keywords = dict(
             device=device,
-            route_coeff_precision="bf16_rounded",
+            # A2 RULED (plan section 48): canonical = s x FP32(w), the form the
+            # production combine physically computes and every surveyed backend
+            # shares. bf16_rounded remains a diagnostic axis value.
+            route_coeff_precision="fp32",
             source_revision=source_revision,
             seed=11,
         )
@@ -394,6 +421,80 @@ def _check_case(
         require_bitwise_equal(repeat.output, result.output, label=f"replay {replay}")
     bitwise.append(f"{total_replays} replays bitwise stable")
 
+    # ---- Production runner as a SECOND observed backend (plan 31.6). ----
+    # Same reference, same matched-base discipline, same gates: the shipping
+    # path is held to the identical contract as the lab control, so a
+    # control-vs-production divergence cannot hide behind either being
+    # internally consistent.
+    skip_reason = production_runner_skip_reason(case)
+    production_provider_key = None
+    if skip_reason is not None:
+        bitwise.append(f"production runner skipped: {skip_reason}")
+    else:
+        # OBSERVE the provider off the constructed runner and assert it is
+        # the one the environment requested — recording the env value alone
+        # would not have caught the harness that hard-coded DeepGEMM while
+        # the env said cutedsl (third review pass).
+        from sglang.srt.environ import envs
+
+        runner, dispatcher, batch, dispatch_output = prepare_production_forward(
+            case, tensors, device=device
+        )
+        production_provider_key = runner.provider.contract.key
+        requested = envs.SGLANG_LORA_MOE_BASE_PROVIDER.get()
+        expected_key = {"deepgemm": "deepgemm_bf16", "cutedsl": "cutedsl_bf16"}[
+            requested
+        ]
+        if production_provider_key != expected_key:
+            raise AssertionError(
+                f"provider selection drift: env requested {requested!r} but the "
+                f"runner constructed {production_provider_key!r}"
+            )
+        production = dispatcher.combine(
+            runner.run(dispatch_output, batch, output_dtype=expected_dtype)
+        )
+        require_finite(production, label="production output finite")
+        if production.dtype != expected_dtype:
+            raise AssertionError(
+                f"production runner output dtype {production.dtype} != declared "
+                f"{case.output_dtype}"
+            )
+        production_base = run_production_runner(
+            case, tensors, device=device, disable_lora=True
+        )
+        if has_signal:
+            checks.append(
+                check_delta(
+                    production.cpu().float() - production_base.cpu().float(),
+                    full_reference - base_reference,
+                    gates,
+                    label="production runner e2e",
+                )
+            )
+            base_rows = (tensors.token_lora_mapping == -1).to(production.device)
+            if bool(base_rows.any()):
+                require_bitwise_equal(
+                    production[base_rows],
+                    production_base[base_rows],
+                    label="production mixed base rows bitwise",
+                )
+                bitwise.append(
+                    "production base rows bitwise-equal to its all-base forward"
+                )
+        else:
+            require_bitwise_equal(
+                production,
+                production_base,
+                label="production zero-LoRA parity",
+            )
+            bitwise.append("production zero-LoRA bitwise parity")
+        for replay in range(replays):
+            repeat = run_production_runner(case, tensors, device=device)
+            require_bitwise_equal(
+                repeat, production, label=f"production replay {replay}"
+            )
+        bitwise.append(f"production runner: {replays} replays bitwise stable")
+
     passed = all(record.passed for record in checks)
     return CaseResult(
         case=case,
@@ -401,6 +502,11 @@ def _check_case(
         bitwise_checks=bitwise,
         replays=total_replays,
         passed=passed,
+        control_output_sha256=_tensor_digest(result.output),
+        production_provider=production_provider_key,
+        production_output_sha256=(
+            _tensor_digest(production) if skip_reason is None else None
+        ),
     )
 
 

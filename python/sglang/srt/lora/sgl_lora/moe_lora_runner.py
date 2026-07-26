@@ -46,7 +46,8 @@ from sglang.srt.lora.sgl_lora.base_gemm_provider.base import MoeBaseProvider
 from sglang.srt.lora.sgl_lora.bf16 import grouped_lora_a, stock_grouped_lora_b
 from sglang.srt.lora.sgl_lora.quant_info import SglLoraBf16QuantInfo
 from sglang.srt.lora.sgl_lora.routing import (
-    VirtualExpertRouting,
+    ROUTE_ALIGNED,
+    RouteView,
     build_virtual_expert_routing,
 )
 
@@ -195,11 +196,11 @@ class SglMoeLoraRunner:
             if base_layer.quant_method.runner is not None
             else get_moe_runner_backend()
         )
-        # Only the DeepGEMM provider exists so far, so admission is gated on
-        # that backend AND on DeepGEMM being usable. Admitting a
-        # Triton-resident layer would bind the DeepGEMM provider anyway and
-        # fail with an unbound `deep_gemm` symbol on the first forward; a real
-        # Triton provider is separate later work.
+        # Both shipped providers (DeepGEMM and CuTeDSL) consume the DeepGEMM
+        # backend's canonical resident weight layout ([E, 2I, H] gate-first
+        # BF16 with EP-local expert IDs), so admission is gated on that
+        # backend AND on DeepGEMM being usable regardless of which provider
+        # the env selects; a Triton-resident provider is separate later work.
         if not resident_backend.is_deep_gemm():
             raise NotImplementedError(
                 "sgl_lora BF16 currently requires --moe-runner-backend "
@@ -209,8 +210,8 @@ class SglMoeLoraRunner:
             )
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise NotImplementedError(
-                "sgl_lora BF16 requires a usable JIT DeepGEMM build; its "
-                "masked grouped GEMM is the only base provider implemented"
+                "sgl_lora BF16 requires a usable JIT DeepGEMM build: every "
+                "base provider consumes the DeepGEMM-resident weight layout"
             )
         if base_layer.dispatcher.skip_local_expert_mapping:
             raise NotImplementedError(
@@ -240,12 +241,44 @@ class SglMoeLoraRunner:
             )
 
     @staticmethod
-    def _build_provider(base_layer: FusedMoE) -> MoeBaseProvider:
+    def select_provider_cls() -> type[MoeBaseProvider]:
+        """The env-selected provider class; shared with the guardrail matrix.
+
+        The production-runner backend of the correctness matrix must construct
+        its provider through THIS selection, not by naming a class, or an
+        env-selected provider is never the one the matrix observes.
+        """
+        from sglang.srt.environ import envs
         from sglang.srt.lora.sgl_lora.base_gemm_provider.deep_gemm_bf16 import (
             DeepGemmBf16Provider,
         )
 
-        return DeepGemmBf16Provider(
+        # An enumerable selection rather than an if-chain: an unknown name or
+        # an unsupported device fails HERE at attach, never as a wrong default
+        # (the failure mode review round 4 caught in the backend admission).
+        selected = envs.SGLANG_LORA_MOE_BASE_PROVIDER.get()
+        if selected == "deepgemm":
+            return DeepGemmBf16Provider
+        if selected == "cutedsl":
+            if torch.cuda.get_device_capability() < (9, 0):
+                raise NotImplementedError(
+                    "SGLANG_LORA_MOE_BASE_PROVIDER=cutedsl requires SM90+ "
+                    "(tcgen05 on SM100+, WGMMA on SM90); this device is "
+                    f"sm{torch.cuda.get_device_capability()}"
+                )
+            from sglang.srt.lora.sgl_lora.base_gemm_provider.cutedsl_bf16 import (
+                CuteDslBf16Provider,
+            )
+
+            return CuteDslBf16Provider
+        raise ValueError(
+            f"unknown SGLANG_LORA_MOE_BASE_PROVIDER {selected!r}; expected "
+            "'deepgemm' or 'cutedsl'"
+        )
+
+    @classmethod
+    def _build_provider(cls, base_layer: FusedMoE) -> MoeBaseProvider:
+        return cls.select_provider_cls()(
             SglLoraBf16QuantInfo(
                 w13_weight=base_layer.w13_weight,
                 w2_weight=base_layer.w2_weight,
@@ -378,19 +411,23 @@ class SglMoeLoraRunner:
 
     def _route_views(
         self, batch: SglMoeLoraBatch, topk_ids: torch.Tensor
-    ) -> tuple[VirtualExpertRouting, VirtualExpertRouting]:
+    ) -> tuple[RouteView, RouteView]:
         """Return ``(per_expert, outer)`` — only the views a site consumes.
 
         Without shared-outer factors both are the same object, so no second
         plan is built.
         """
         token_slots = _mask_disabled_adapter_slots(batch)
+        # Both LoRA kernels in this serial topology are grouped GEMMs, so this
+        # schedule consumes the aligned plan. An indexed schedule would request
+        # ROUTE_RAW here and derive the key inline instead.
         expert = build_virtual_expert_routing(
             topk_ids,
             token_slots,
             factor_expert_count=self.provider.num_local_experts,
             max_loras=batch.slot_capacity,
             block_size=self.launch_config.routing_block_size,
+            view=ROUTE_ALIGNED,
         )
         outer = expert
         if batch.shared_outer:
@@ -410,8 +447,8 @@ class SglMoeLoraRunner:
         batch: SglMoeLoraBatch,
         num_tokens: int,
         *,
-        a_route: VirtualExpertRouting,
-        b_route: VirtualExpertRouting,
+        a_route: RouteView,
+        b_route: RouteView,
     ) -> torch.Tensor:
         """Canonical ``[gate | up]`` pair-major delta, pre-activation."""
         from sglang.srt.utils import dispose_tensor
@@ -484,8 +521,8 @@ class SglMoeLoraRunner:
         batch: SglMoeLoraBatch,
         num_tokens: int,
         *,
-        a_route: VirtualExpertRouting,
-        b_route: VirtualExpertRouting,
+        a_route: RouteView,
+        b_route: RouteView,
     ) -> torch.Tensor:
         """Unweighted canonical pair delta ``[T*K, H]`` for the combine."""
         from sglang.srt.utils import dispose_tensor
