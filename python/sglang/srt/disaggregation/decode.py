@@ -2114,7 +2114,7 @@ class SchedulerDisaggregationDecodeMixin:
             ret = running_batch if not running_batch.is_empty() else None
 
         if ret is not None and self.draft_worker is not None:
-            ret.force_disable_cuda_graph = (
+            ret.force_disable_draft_cuda_graph = (
                 self.draft_worker.requires_dp_attention_eager_forward(ret)
             )
 

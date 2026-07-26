@@ -3,6 +3,11 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+    EAGLEDraftCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_v2 import (
     EAGLEWorkerV2,
@@ -15,6 +20,49 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestEaglePDDPFallback(CustomTestCase):
+    def test_draft_graph_gate_has_independent_dp_vote(self):
+        sync_info = MLPSyncBatchInfo(
+            dp_size=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=1,
+            num_tokens_for_logprob=1,
+            can_cuda_graph=True,
+            can_draft_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=True,
+            local_forward_mode=ForwardMode.DECODE.value,
+            can_run_breakable_cuda_graph=False,
+        )
+
+        local = sync_info._get_local_tensor(device="cpu")
+        fallback = sync_info._get_fallback_tensor(device="cpu")
+        self.assertEqual(local[2].item(), 1)
+        self.assertEqual(local[7].item(), 0)
+        # Idle/inactive DP ranks remain permissive for the draft vote.
+        self.assertEqual(fallback[7].item(), 1)
+
+    def test_seedless_gate_only_disables_draft_graph(self):
+        runner = object.__new__(EAGLEDraftCudaGraphRunner)
+        runner.require_mlp_tp_gather = False
+        runner.require_mlp_sync = True
+        runner.disable_padding = False
+        runner.captured_req_width = 1
+        runner.max_bs = 8
+
+        forward_batch = SimpleNamespace(
+            spec_info=SimpleNamespace(num_tokens_per_req=1),
+            batch_size=1,
+            can_run_dp_cuda_graph=True,
+            can_run_dp_draft_cuda_graph=False,
+        )
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
+        # The ordinary DP graph gate remains enabled for target verify and
+        # draft-extend; only the draft runner consumes the extra gate.
+        forward_batch.can_run_dp_draft_cuda_graph = True
+        self.assertTrue(runner.can_run_graph(forward_batch))
+
     def test_seedless_pd_draft_requests_rank_consistent_eager_forward(self):
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = SimpleNamespace(seed_dsa_topk_from_draft_extend=True)

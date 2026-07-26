@@ -1934,11 +1934,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
+    # Rank-consistent gate for speculative draft graph replay.  This is kept
+    # separate from can_run_dp_cuda_graph so a seedless DSA draft only falls
+    # back for the draft phase; target verify and draft-extend can still replay
+    # their graphs.
+    can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
-    # Rank-local speculative fallback. DP attention folds this into its
-    # existing can-run-graph all-gather so every MLP/EP rank takes the same
-    # eager-vs-graph path for the current forward.
-    force_disable_cuda_graph: bool = False
+    # Rank-local speculative draft fallback. DP attention folds this into a
+    # dedicated all-gathered draft graph gate so every MLP/EP rank takes the
+    # same draft eager-vs-graph path for the current forward.
+    force_disable_draft_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3073,8 +3078,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
-            force_disable_cuda_graph=self.force_disable_cuda_graph,
+            force_disable_draft_cuda_graph=self.force_disable_draft_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,

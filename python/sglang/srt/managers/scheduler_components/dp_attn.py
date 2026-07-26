@@ -83,6 +83,7 @@ class MLPSyncBatchInfo:
     num_tokens: int
     num_tokens_for_logprob: int
     can_cuda_graph: bool
+    can_draft_cuda_graph: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
@@ -106,6 +107,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
+                int(self.can_draft_cuda_graph),
             ],
             device=device,
             dtype=dtype,
@@ -121,6 +123,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
+                1,  # can_draft_cuda_graph
             ],
             device=device,
             dtype=dtype,
@@ -186,6 +189,7 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.can_draft_cuda_graph = bool(tp0_info[:, 7].min().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -212,6 +216,7 @@ def _update_gather_batch(
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+    batch.can_run_dp_draft_cuda_graph = mlp_sync_info.can_draft_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
 
 
@@ -260,10 +265,10 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    if local_batch is not None and getattr(
-        local_batch, "force_disable_cuda_graph", False
-    ):
-        can_cuda_graph = False
+    can_draft_cuda_graph = not (
+        local_batch is not None
+        and getattr(local_batch, "force_disable_draft_cuda_graph", False)
+    )
     # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
     # min()-reduces this across DP ranks, so a prefill batch with idle ranks
     # still resolves to True (idle ranks become a padded dummy extend).
@@ -311,6 +316,7 @@ def prepare_mlp_sync_batch_raw(
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_cuda_graph=can_cuda_graph,
+        can_draft_cuda_graph=can_draft_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
