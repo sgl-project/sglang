@@ -15,19 +15,23 @@ and one cuBLAS GEMM emits `[T, 896 + 3584]` fp32; a single epilogue kernel then
 runs the top-k on the gate slice and casts the latent slice to bf16.  Routing
 stays bit-identical to the fp32 path and routed_input comes out dense.
 
-Measured in-graph on a GB300, us per MoE layer, with the copy a dense-input runner
-(deep_gemm) needs:
+**overlap** -- the original fp32 gate + top-k run on the model's side stream
+while the latent down-projection runs on the main stream. The streams join
+before expert dispatch, and the side stream is then reused by the existing
+shared-expert overlap.
 
-    T            1     16    256   1024   1280   2560   4096  16384
-    baseline   22.3   21.9   31.2   61.4   65.9  125.2  185.1  735.8
-    merged     13.1   12.0   17.6   47.2   54.8  106.4  181.8  702.8
-    radix-only 17.3   17.5   24.2   51.3   55.0  100.7  154.5  621.8
+Measured in-graph on a GB300, us per MoE layer:
 
-The merge stops paying once the GEMM is compute-bound: it saves one read of
-`hidden_states` but costs doubled fp32 output traffic, and past ~1024 tokens the
-second outweighs the first.  1024 is where the merged path still wins clearly
-(47.2 vs 51.3); 1280-2048 is a wash and 2560 up belongs to the router-only path,
-so the threshold sits at the last power of two that is unambiguous.
+    T            512    768   1024   1280   2048   2560   4096   8192  16384
+    baseline    31.1   37.6   50.9   54.3   91.5   99.3  152.7  304.7  629.3
+    merged      26.1   37.3   46.7      -      -      -      -      -      -
+    overlap     29.0   33.7   46.5   52.4   90.5   96.4  151.2  307.1  637.8
+
+The fastest strategy is non-monotonic because cuBLAS changes GEMM algorithms at
+specific row counts. A GB300 JSON table therefore opts exact, repeatedly
+measured token counts into overlap; unmeasured shapes keep the conservative
+defaults (merged through 1024, unfused above it). This captures the clear 768
+and 2560 wins without regressing 512, 8192, or 16384.
 
 A bf16-output merged GEMM was measured too (fastest at T=1, 11.8 us).  It is not
 used: bf16 rounds the router logits and moves the selected expert set on 2-25% of
@@ -57,7 +61,9 @@ import os
 NUM_EXPERTS = 896
 TOPK = 16
 
-# Above this token count the merged GEMM stops paying; see the table above.
+# Above this token count the merged GEMM stops paying by default; see the table
+# above. A device strategy table may override individual, measured token counts
+# with the dual-stream overlap.
 MERGED_FRONT_MAX_TOKENS = 1024
 
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "moe_front")
@@ -107,6 +113,19 @@ def get_config(kind: str, num_tokens: int, device, default: dict) -> dict:
         else:
             break
     return dict(table[pick])
+
+
+def get_front_strategy(num_tokens: int, device) -> str:
+    """Return the measured front strategy for this exact workload.
+
+    GEMM algorithm changes make the merged/overlap crossover non-monotonic in
+    M. Therefore strategy tables are exact-match only. Unmeasured shapes keep
+    the robust defaults: merged fp32 through 1024 tokens, then unfused.
+    """
+    table = _table("strategy", _device_name(device))
+    if table is not None and num_tokens in table:
+        return str(table[num_tokens])
+    return "merged_fp32" if num_tokens <= MERGED_FRONT_MAX_TOKENS else "unfused"
 
 
 @cache_once

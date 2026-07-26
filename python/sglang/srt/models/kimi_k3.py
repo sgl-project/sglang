@@ -779,6 +779,13 @@ class KimiK3MoE(nn.Module):
 
         cfg = self.topk.topk_config
         bias = self.gate.e_score_correction_bias
+        if (
+            moe_front.get_front_strategy(
+                hidden_states.shape[0], hidden_states.device
+            )
+            != "merged_fp32"
+        ):
+            return None
         if not moe_front.fused_front_covered(
             hidden_states, self._front_w, bias, cfg.top_k, self.moe_hidden_size
         ):
@@ -805,6 +812,44 @@ class KimiK3MoE(nn.Module):
                 hidden_states.shape[0],
             )
         return build_precomputed_topk_output(w, i, cfg, self.layer_idx), routed
+
+    def _ep_front_overlap(self, hidden_states: torch.Tensor):
+        """Overlap the exact fp32 gate+top-k with the latent down projection.
+
+        The side stream is joined before returning. It is then free for the
+        existing shared-expert overlap, which is deliberately issued later.
+        """
+        if (
+            not self._ep_front_eligible
+            or self.alt_stream is None
+            or hidden_states.shape[0] == 0
+        ):
+            return None
+        from sglang.kernels.ops.moe import moe_front
+
+        if (
+            moe_front.get_front_strategy(
+                hidden_states.shape[0], hidden_states.device
+            )
+            != "overlap"
+        ):
+            return None
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.alt_stream):
+            router_logits = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+
+        routed_input, _ = self.routed_expert_down_proj(hidden_states)
+        current_stream.wait_stream(self.alt_stream)
+        # Top-k tensors were allocated on alt_stream but are consumed by the
+        # routed experts on current_stream. Tell the caching allocator about
+        # that lifetime before alt_stream is reused for the shared experts.
+        for value in topk_output:
+            if isinstance(value, torch.Tensor):
+                value.record_stream(current_stream)
+        return topk_output, routed_input
 
     def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
@@ -847,6 +892,8 @@ class KimiK3MoE(nn.Module):
         # merged-weight strategies compute both in one GEMM; see
         # kernels/ops/moe/moe_front.py for the strategy table.
         routed_input = self._ep_front(hidden_states)
+        if routed_input is None:
+            routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
