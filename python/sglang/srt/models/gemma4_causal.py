@@ -24,15 +24,15 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
-from sglang.srt.layers.gemma4_fused_ops import (
+from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
     gemma_routing_post_topk,
+)
+from sglang.srt.distributed import (
+    get_pp_group,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -58,8 +58,7 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
@@ -255,8 +254,7 @@ class Gemma4MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
 
         self.experts = experts_type(
-            num_experts=config.num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            num_experts=config.num_experts + get_server_args().ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
@@ -789,7 +787,7 @@ class Gemma4TextModel(PreTrainedModel):
         # combination until the runner becomes schema-aware; users can run
         # PP + PLE eagerly with --disable-cuda-graph.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
-            sa = get_global_server_args()
+            sa = get_server_args()
             if sa is not None and not sa.disable_cuda_graph:
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "

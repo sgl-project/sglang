@@ -12,6 +12,13 @@ class _FakeDBCacheConfig:
         return kwargs
 
 
+class _FakeForwardPattern:
+    # A class (not a SimpleNamespace instance) so it is a valid type in
+    # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_2 = "Pattern_2"
+    Pattern_3 = "Pattern_3"
+
+
 def _install_cache_dit_stub():
     cache_dit = types.ModuleType("cache_dit")
     cache_dit.refresh_calls = []
@@ -36,7 +43,7 @@ def _install_cache_dit_stub():
     cache_dit.steps_mask = steps_mask
     cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = types.SimpleNamespace(Pattern_3="Pattern_3")
+    cache_dit.ForwardPattern = _FakeForwardPattern
     cache_dit.ParamsModifier = object
     cache_dit.TaylorSeerCalibratorConfig = object
 
