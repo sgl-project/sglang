@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from typing import List, Optional
 
-from partial_json_parser.core.exceptions import MalformedJSON
+from partial_json_parser.core.exceptions import MalformedJSON, PartialJSON
 from partial_json_parser.core.options import Allow
 from xgrammar import StructuralTag
 
@@ -173,7 +173,14 @@ class InklingDetector(BaseFormatDetector):
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
         try:
             payload, end_idx = _partial_json_loads(current_text[start_idx:], flags)
-        except (MalformedJSON, json.JSONDecodeError):
+        except (MalformedJSON, PartialJSON, json.JSONDecodeError):
+            # PartialJSON and MalformedJSON are the two subclasses of
+            # partial_json_parser's own JSONDecodeError, which is unrelated to
+            # the stdlib one -- catching json.JSONDecodeError does not cover it.
+            # partial_json_parser raises PartialJSON for an incomplete string
+            # while Allow.STR is masked off (i.e. before the tool name is sent),
+            # which happens whenever a payload begins with a quote instead of an
+            # object. detect_and_parse already rejects those payloads gracefully.
             return StreamingParseResult(), False
         if not isinstance(payload, Mapping):
             return StreamingParseResult(), False
