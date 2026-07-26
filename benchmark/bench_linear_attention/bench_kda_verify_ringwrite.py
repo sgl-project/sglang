@@ -23,11 +23,11 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 
-HV = H = 32          # K3 KDA per TP8 rank
+HV = H = 32  # K3 KDA per TP8 rank
 K = V = 128
-L = 16               # ring length (linear_replayssm_cache_len)
-GAMMA = 7            # dspark block size -> T = draft_token_num
-LOWER_BOUND = -5.0   # K3 safe gate
+L = 16  # ring length (linear_replayssm_cache_len)
+GAMMA = 7  # dspark block size -> T = draft_token_num
+LOWER_BOUND = -5.0  # K3 safe gate
 RING_DTYPE = torch.bfloat16
 
 
@@ -59,18 +59,34 @@ def _verify(inp, cache_ring):
     kw = {}
     if cache_ring:
         kw = dict(
-            cache_ring=True, replayssm_rawv=inp["rawv"], replayssm_rawk=inp["rawk"],
-            replayssm_g=inp["gring"], replayssm_beta=inp["betar"],
+            cache_ring=True,
+            replayssm_rawv=inp["rawv"],
+            replayssm_rawk=inp["rawk"],
+            replayssm_g=inp["gring"],
+            replayssm_beta=inp["betar"],
         )
     return fused_sigmoid_gating_delta_rule_update(
-        A_log=inp["A_log"], a=inp["a"], dt_bias=inp["dt_bias"],
-        softplus_beta=1.0, softplus_threshold=20.0,
-        q=inp["q"], k=inp["k"], v=inp["v"], b=inp["b"],
-        initial_state_source=inp["h0"], initial_state_indices=inp["slots"],
-        cu_seqlens=inp["cu"], scale=K**-0.5, use_qk_l2norm_in_kernel=True,
-        is_kda=True, lower_bound=LOWER_BOUND, disable_state_update=True,
-        intermediate_states_buffer=inp["inter"], intermediate_state_indices=inp["slots"],
-        cache_steps=inp["T"], **kw,
+        A_log=inp["A_log"],
+        a=inp["a"],
+        dt_bias=inp["dt_bias"],
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        b=inp["b"],
+        initial_state_source=inp["h0"],
+        initial_state_indices=inp["slots"],
+        cu_seqlens=inp["cu"],
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        lower_bound=LOWER_BOUND,
+        disable_state_update=True,
+        intermediate_states_buffer=inp["inter"],
+        intermediate_state_indices=inp["slots"],
+        cache_steps=inp["T"],
+        **kw,
     )
 
 

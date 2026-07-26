@@ -36,13 +36,14 @@
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel
+#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
+
 #include <sgl_kernel/ptx/cp_async.cuh>
 #include <sgl_kernel/ptx/mbarrier.cuh>
 #include <sgl_kernel/ptx/sync.cuh>
 #include <sgl_kernel/ptx/tma.cuh>
-#include <sgl_kernel/type.cuh>   // For bf16_t, fp32_t
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel
-#include <sgl_kernel/warp.cuh>   // For device::warp::reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -112,8 +113,8 @@ SGL_DEVICE void cp_async_state_chunk_stage(
 }
 
 template <int kCopyThreads>
-SGL_DEVICE void cp_async_state_chunk_for(
-    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+SGL_DEVICE void
+cp_async_state_chunk_for(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
   const int tid = threadIdx.x;
   const int stage = chunk & 1;
@@ -130,8 +131,8 @@ SGL_DEVICE void cp_async_state_chunk_for(
   ptx::cp_async_commit_group();
 }
 
-SGL_DEVICE void cp_async_state_chunk(
-    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
+SGL_DEVICE void
+cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk) {
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
 
@@ -145,7 +146,13 @@ SGL_DEVICE void cp_async_state_chunk(
 // the mbarrier, completion is observed via ptx::mbar_wait_parity.
 template <int kStageChunkV>
 SGL_DEVICE void tma_state_chunk_stage(
-    float* s_state, const float* state, int slot, int i_hv, int64_t state_slot_stride, int chunk, int stage,
+    float* s_state,
+    const float* state,
+    int slot,
+    int i_hv,
+    int64_t state_slot_stride,
+    int chunk,
+    int stage,
     uint64_t* bar) {
   constexpr uint32_t kBytes = kStageChunkV * kDimK * sizeof(float);
   float* dst = s_state + stage * kStageChunkV * kDimK;
@@ -354,38 +361,42 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     const __nv_bfloat16* __restrict__ x_q,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv q-segment
     const __nv_bfloat16* __restrict__ x_k,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv k-segment
     const __nv_bfloat16* __restrict__ x_v,  // [B, HV*128] row bos*x_row_stride + hvv, sliced from mixed_qkv v-segment
-    const float* __restrict__ w_q_t,  // [kKernelWidth=4, H*128] dense conv taps for q, indexed w*hkv_dim + hk
-    const float* __restrict__ w_k_t,  // [4, H*128] dense conv taps for k
-    const float* __restrict__ w_v_t,  // [4, HV*128] dense conv taps for v
-    const float* __restrict__ bias_q,  // [H*128] conv bias for q, sliced from conv_bias
-    const float* __restrict__ bias_k,  // [H*128] conv bias for k
-    const float* __restrict__ bias_v,  // [HV*128] conv bias for v
-    __nv_bfloat16* __restrict__ cs_q,  // [slots, kConvStateWidth=3, H*128] q shift-register, sliced from conv_states
-    __nv_bfloat16* __restrict__ cs_k,  // [slots, 3, H*128] k shift-register
-    __nv_bfloat16* __restrict__ cs_v,  // [slots, 3, HV*128] v shift-register
-    const float* __restrict__ a_log,  // [H] per-head log-decay base, indexed by i_h
+    const float* __restrict__ w_q_t,        // [kKernelWidth=4, H*128] dense conv taps for q, indexed w*hkv_dim + hk
+    const float* __restrict__ w_k_t,        // [4, H*128] dense conv taps for k
+    const float* __restrict__ w_v_t,        // [4, HV*128] dense conv taps for v
+    const float* __restrict__ bias_q,       // [H*128] conv bias for q, sliced from conv_bias
+    const float* __restrict__ bias_k,       // [H*128] conv bias for k
+    const float* __restrict__ bias_v,       // [HV*128] conv bias for v
+    __nv_bfloat16* __restrict__ cs_q,     // [slots, kConvStateWidth=3, H*128] q shift-register, sliced from conv_states
+    __nv_bfloat16* __restrict__ cs_k,     // [slots, 3, H*128] k shift-register
+    __nv_bfloat16* __restrict__ cs_v,     // [slots, 3, HV*128] v shift-register
+    const float* __restrict__ a_log,      // [H] per-head log-decay base, indexed by i_h
     const __nv_bfloat16* __restrict__ g,  // [B, HV*128] raw forget gate, row bos*g_row_stride + i_hv*kDimK + k
-    const float* __restrict__ dt_bias,  // [H*128] gate bias added to g before the decay nonlinearity
-    const __nv_bfloat16* __restrict__ beta,  // [B, HV] raw beta logit, row bos*beta_row_stride + i_hv
-    const __nv_bfloat16* __restrict__ onorm_g,  // [B, HV*128] onorm sigmoid gate, row i_n*onormg_row_stride + i_hv*128 + v
-    const float* __restrict__ onorm_weight,  // [128] onorm RMSNorm scale, shared across all heads
+    const float* __restrict__ dt_bias,    // [H*128] gate bias added to g before the decay nonlinearity
+    const __nv_bfloat16* __restrict__ beta,     // [B, HV] raw beta logit, row bos*beta_row_stride + i_hv
+    const __nv_bfloat16* __restrict__ onorm_g,  // [B, HV*128] onorm sigmoid gate, row i_n*onormg_row_stride + i_hv*128
+                                                // + v
+    const float* __restrict__ onorm_weight,     // [128] onorm RMSNorm scale, shared across all heads
     const int* __restrict__ ssm_state_indices,  // [B] recurrent-state slot per token; <0 marks a padded cuda-graph slot
-    const int* __restrict__ cu_seqlens,  // [B+1] token offsets into x_q/x_k/x_v/g/beta; unused under kUseStaticDecodeLayout
-    float* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch = state_slot_stride
+    const int* __restrict__ cu_seqlens,         // [B+1] token offsets into x_q/x_k/x_v/g/beta; unused under
+                                                // kUseStaticDecodeLayout
+    float* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch =
+                                // state_slot_stride
     __nv_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
-    int B,     // live decode batch size (token count for this launch)
-    int H,     // local key/query heads on this TP rank (12 for K3)
-    int HV,    // local value heads on this TP rank (12 for K3, H==HV since KDA is MHA not GQA)
-    float lower_bound,  // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
-    float scale,        // query scale applied after L2-normalization
-    float onorm_eps,    // onorm RMSNorm epsilon
-    int64_t x_row_stride,     // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
-    int64_t g_row_stride,     // element stride between consecutive tokens' rows in g (>= HV*128)
-    int64_t beta_row_stride,  // element stride between consecutive tokens' rows in beta (>= HV)
-    int64_t onormg_row_stride,  // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
-    int64_t cs_slot_stride,   // element stride between consecutive slots in cs_q/cs_k/cs_v
-    int64_t cs_w_stride,      // element stride between shift-register taps (w=0..2) within a slot
-    int64_t state_slot_stride) {  // element stride between consecutive slots in state (dense HV*128*128, or larger for shared pools)
+    int B,                            // live decode batch size (token count for this launch)
+    int H,                            // local key/query heads on this TP rank (12 for K3)
+    int HV,                           // local value heads on this TP rank (12 for K3, H==HV since KDA is MHA not GQA)
+    float lower_bound,                // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
+    float scale,                      // query scale applied after L2-normalization
+    float onorm_eps,                  // onorm RMSNorm epsilon
+    int64_t x_row_stride,             // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
+    int64_t g_row_stride,             // element stride between consecutive tokens' rows in g (>= HV*128)
+    int64_t beta_row_stride,          // element stride between consecutive tokens' rows in beta (>= HV)
+    int64_t onormg_row_stride,        // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
+    int64_t cs_slot_stride,           // element stride between consecutive slots in cs_q/cs_k/cs_v
+    int64_t cs_w_stride,              // element stride between shift-register taps (w=0..2) within a slot
+    int64_t state_slot_stride) {  // element stride between consecutive slots in state (dense HV*128*128, or larger for
+                                  // shared pools)
   device::PDLWaitPrimary<kUsePDL>();
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -967,43 +978,44 @@ struct KdaFusedDecodeKernel {
     host::RuntimeDeviceCheck(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
 
-    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes).enable_pdl(kUsePDL)(
-        kernel,
-        /*x_q=*/mixed_ptr,
-        /*x_k=*/mixed_ptr + kSeg,
-        /*x_v=*/mixed_ptr + 2 * kSeg,
-        static_cast<const float*>(w_q_t.data_ptr()),
-        static_cast<const float*>(w_k_t.data_ptr()),
-        static_cast<const float*>(w_v_t.data_ptr()),
-        /*bias_q=*/bias_ptr,
-        /*bias_k=*/bias_ptr + kSeg,
-        /*bias_v=*/bias_ptr + 2 * kSeg,
-        /*cs_q=*/cs_ptr,
-        /*cs_k=*/cs_ptr + kSeg,
-        /*cs_v=*/cs_ptr + 2 * kSeg,
-        static_cast<const fp32_t*>(A_log.data_ptr()),
-        /*g=*/static_cast<const __nv_bfloat16*>(a.data_ptr()),
-        static_cast<const fp32_t*>(dt_bias.data_ptr()),
-        /*beta=*/static_cast<const __nv_bfloat16*>(b.data_ptr()),
-        static_cast<const __nv_bfloat16*>(onorm_g.data_ptr()),
-        static_cast<const fp32_t*>(onorm_weight.data_ptr()),
-        static_cast<const int32_t*>(indices.data_ptr()),
-        /*cu_seqlens=*/static_cast<const int32_t*>(nullptr),
-        static_cast<fp32_t*>(state.data_ptr()),
-        static_cast<__nv_bfloat16*>(out.data_ptr()),
-        B,
-        /*H=*/static_cast<int>(kH),
-        /*HV=*/static_cast<int>(kH),
-        static_cast<float>(lower_bound),
-        static_cast<float>(scale),
-        static_cast<float>(onorm_eps),
-        mixed_qkv.stride(0),
-        a.stride(0),
-        b.stride(0),
-        onorm_g.stride(0),
-        conv_states.stride(0),
-        conv_states.stride(1),
-        state_slot_stride);
+    LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            /*x_q=*/mixed_ptr,
+            /*x_k=*/mixed_ptr + kSeg,
+            /*x_v=*/mixed_ptr + 2 * kSeg,
+            static_cast<const float*>(w_q_t.data_ptr()),
+            static_cast<const float*>(w_k_t.data_ptr()),
+            static_cast<const float*>(w_v_t.data_ptr()),
+            /*bias_q=*/bias_ptr,
+            /*bias_k=*/bias_ptr + kSeg,
+            /*bias_v=*/bias_ptr + 2 * kSeg,
+            /*cs_q=*/cs_ptr,
+            /*cs_k=*/cs_ptr + kSeg,
+            /*cs_v=*/cs_ptr + 2 * kSeg,
+            static_cast<const fp32_t*>(A_log.data_ptr()),
+            /*g=*/static_cast<const __nv_bfloat16*>(a.data_ptr()),
+            static_cast<const fp32_t*>(dt_bias.data_ptr()),
+            /*beta=*/static_cast<const __nv_bfloat16*>(b.data_ptr()),
+            static_cast<const __nv_bfloat16*>(onorm_g.data_ptr()),
+            static_cast<const fp32_t*>(onorm_weight.data_ptr()),
+            static_cast<const int32_t*>(indices.data_ptr()),
+            /*cu_seqlens=*/static_cast<const int32_t*>(nullptr),
+            static_cast<fp32_t*>(state.data_ptr()),
+            static_cast<__nv_bfloat16*>(out.data_ptr()),
+            B,
+            /*H=*/static_cast<int>(kH),
+            /*HV=*/static_cast<int>(kH),
+            static_cast<float>(lower_bound),
+            static_cast<float>(scale),
+            static_cast<float>(onorm_eps),
+            mixed_qkv.stride(0),
+            a.stride(0),
+            b.stride(0),
+            onorm_g.stride(0),
+            conv_states.stride(0),
+            conv_states.stride(1),
+            state_slot_stride);
   }
 };
 

@@ -210,9 +210,7 @@ class TestUnifiedKVPoolMLA(unittest.TestCase):
         self.assertEqual(pool.max_slots("full"), total // full.entry_bytes())
         self.assertEqual(pool.max_slots("mamba"), total // mamba.entry_bytes())
         # allocation actually carries the pad
-        self.assertEqual(
-            pool._raw.numel(), total + 4 * full.entry_bytes()
-        )
+        self.assertEqual(pool._raw.numel(), total + 4 * full.entry_bytes())
 
     def test_reserved_floor_covers_page0_envelope(self):
         ps = 4
@@ -307,9 +305,7 @@ class _FakeKVCache:
 
 class TestTranslateKvLocDense(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64, multiplier=_L):
-        pool, full, mamba = _make_unified(
-            page_size=ps, n_full_tokens=n_full_tokens
-        )
+        pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
         full_alloc = MultiEndedAllocator(
             kvcache=_FakeKVCache(pool.max_slots("full")),
             unified_buffer=pool,

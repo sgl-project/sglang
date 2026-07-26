@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.kimi_k3.all_reduce import _COMM_MAP
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.kimi_k3.all_reduce import _COMM_MAP
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

@@ -92,7 +92,6 @@
 //     clusterlaunchcontrol.try_cancel.b128 {%0_lo, %0_hi}, [smem_b128_buf];
 // followed by the same `query_cancel.*` ops on the register pair.
 
-
 namespace ptx {
 
 // Parsed CLC response. `canceled == true` means the issuing cluster claimed
@@ -104,10 +103,10 @@ namespace ptx {
 // (cm, cn, ck), the cluster occupies CTAs at [x..x+cm-1] × [y..y+cn-1]
 // × [z..z+ck-1].
 struct ClcResponse {
-    uint32_t ctaid_x;
-    uint32_t ctaid_y;
-    uint32_t ctaid_z;
-    bool     canceled;
+  uint32_t ctaid_x;
+  uint32_t ctaid_y;
+  uint32_t ctaid_z;
+  bool canceled;
 };
 
 // Per-CTA smem block holding the CLC scheduler's HW-response buffer, the
@@ -136,9 +135,9 @@ struct ClcResponse {
 // to the queue, so downstream consumers can compare a single sentinel
 // rather than re-querying the response.
 struct ClcSmem {
-    alignas(16) uint8_t  response[16];
-    alignas(8)  uint64_t mbar;
-    alignas(8)  uint32_t slot_q[2];
+  alignas(16) uint8_t response[16];
+  alignas(8) uint64_t mbar;
+  alignas(8) uint32_t slot_q[2];
 };
 constexpr uint32_t CLC_SLOT_END = 0xFFFFFFFFu;
 
@@ -157,15 +156,13 @@ constexpr uint32_t CLC_SLOT_END = 0xFFFFFFFFu;
 // the HW scheduler responds. Wait via mbar_wait_parity on the same mbar.
 // Pair with `mbar_arrive_expect_tx(mbar, 16)` so the mbar's tx-count
 // matches the 16 B the HW writes.
-static __device__ __forceinline__ void clc_try_cancel(
-        void* response, uint64_t* mbar) {
-    asm volatile(
-        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::"
-        "complete_tx::bytes.b128 [%0], [%1];"
-        :: "r"(to_shared(response)), "r"(to_shared(mbar))
-        : "memory");
+static __device__ __forceinline__ void clc_try_cancel(void* response, uint64_t* mbar) {
+  asm volatile(
+      "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::"
+      "complete_tx::bytes.b128 [%0], [%1];" ::"r"(to_shared(response)),
+      "r"(to_shared(mbar))
+      : "memory");
 }
-
 
 // Parse the b128 response from smem. After the mbar wait returns the
 // HW response is sitting in `response`; this loads it once and decodes
@@ -175,36 +172,35 @@ static __device__ __forceinline__ void clc_try_cancel(
 //
 // Read-only; safe to call on every thread that needs the result. The
 // `ld.shared.b128` lands in a temporary, so concurrent calls don't race.
-static __device__ __forceinline__ ClcResponse clc_query_cancel(
-        const void* response) {
-    ClcResponse r{};
-    uint32_t valid = 0;
-    // The `fence.proxy.async.shared::cta` AFTER get_first_ctaid (inside the
-    // predicated success branch) is REQUIRED: without it, the response read
-    // can race with the next iteration's try_cancel.multicast — manifesting
-    // as a hang at high CLC issue cadence (small num_iters + large grid),
-    // caught by our gate. The PTX spec §9.7.13.17 example documents a stronger
-    // form (`fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster`);
-    // the weaker `.shared::cta` form here is the minimal one that passes
-    // empirically.
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p1;\n\t"
-        ".reg .b128 clc_result;\n\t"
-        "ld.shared.b128 clc_result, [%4];\n\t"
-        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;\n\t"
-        "selp.u32 %3, 1, 0, p1;\n\t"
-        "@!p1 bra.uni DONE_%=;\n\t"
-        "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 "
-            "{%0, %1, %2, _}, clc_result;\n\t"
-        "fence.proxy.async.shared::cta;\n\t"
-        "DONE_%=:\n\t"
-        "}\n"
-        : "=r"(r.ctaid_x), "=r"(r.ctaid_y), "=r"(r.ctaid_z), "=r"(valid)
-        : "r"(to_shared(response))
-        : "memory");
-    r.canceled = (valid != 0);
-    return r;
+static __device__ __forceinline__ ClcResponse clc_query_cancel(const void* response) {
+  ClcResponse r{};
+  uint32_t valid = 0;
+  // The `fence.proxy.async.shared::cta` AFTER get_first_ctaid (inside the
+  // predicated success branch) is REQUIRED: without it, the response read
+  // can race with the next iteration's try_cancel.multicast — manifesting
+  // as a hang at high CLC issue cadence (small num_iters + large grid),
+  // caught by our gate. The PTX spec §9.7.13.17 example documents a stronger
+  // form (`fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster`);
+  // the weaker `.shared::cta` form here is the minimal one that passes
+  // empirically.
+  asm volatile(
+      "{\n\t"
+      ".reg .pred p1;\n\t"
+      ".reg .b128 clc_result;\n\t"
+      "ld.shared.b128 clc_result, [%4];\n\t"
+      "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;\n\t"
+      "selp.u32 %3, 1, 0, p1;\n\t"
+      "@!p1 bra.uni DONE_%=;\n\t"
+      "clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 "
+      "{%0, %1, %2, _}, clc_result;\n\t"
+      "fence.proxy.async.shared::cta;\n\t"
+      "DONE_%=:\n\t"
+      "}\n"
+      : "=r"(r.ctaid_x), "=r"(r.ctaid_y), "=r"(r.ctaid_z), "=r"(valid)
+      : "r"(to_shared(response))
+      : "memory");
+  r.canceled = (valid != 0);
+  return r;
 }
 
 }  // namespace ptx

@@ -81,18 +81,14 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                     _ = _run(owner, x)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        captured = KimiK3DeltaAttention.forward_qkvbfg_fused(
-                            owner, x
-                        )
+                        captured = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
                     graph.replay()
                     torch.cuda.synchronize()
                 # note: owners share the same seeded weights
                 for got, ref, name in zip(
                     captured, serial, ("qkv", "beta", "forget_gate", "g")
                 ):
-                    self.assertTrue(
-                        torch.equal(got, ref), f"T={T} {name} mismatch"
-                    )
+                    self.assertTrue(torch.equal(got, ref), f"T={T} {name} mismatch")
 
     def test_eager_stream_branch_not_taken(self):
         x = torch.randn(3, _H, device="cuda", dtype=torch.bfloat16)

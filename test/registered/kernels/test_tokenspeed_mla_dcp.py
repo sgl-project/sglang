@@ -60,12 +60,8 @@ class TestTokenspeedMLADCP(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=8),
             ),
-            patch.object(
-                backend_module.tokenspeed_mla, "get_num_sm", return_value=148
-            ),
-            patch(
-                "sglang.srt.runtime_context.get_resources", return_value=resources
-            ),
+            patch.object(backend_module.tokenspeed_mla, "get_num_sm", return_value=148),
+            patch("sglang.srt.runtime_context.get_resources", return_value=resources),
             patch.object(
                 backend_module.torch, "empty", return_value=allocated
             ) as empty,

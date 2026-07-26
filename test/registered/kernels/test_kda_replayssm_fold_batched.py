@@ -34,11 +34,11 @@ DEV = "cuda"
 
 # (num_layers, num_slots, HV, H, K, V, L, has_track)
 SHAPES = [
-    (3, 6, 4, 4, 64, 64, 16, False),      # square heads, no track
-    (2, 5, 8, 2, 128, 128, 16, True),     # GQA 4:1, track on
-    (4, 7, 6, 3, 96, 80, 16, False),      # non-pow2 K/V, GQA 2:1
-    (2, 4, 4, 4, 64, 64, 16, True),       # track on
-    (1, 4, 4, 4, 64, 64, 8, False),       # single layer -> i_layer==0 path
+    (3, 6, 4, 4, 64, 64, 16, False),  # square heads, no track
+    (2, 5, 8, 2, 128, 128, 16, True),  # GQA 4:1, track on
+    (4, 7, 6, 3, 96, 80, 16, False),  # non-pow2 K/V, GQA 2:1
+    (2, 4, 4, 4, 64, 64, 16, True),  # track on
+    (1, 4, 4, 4, 64, 64, 8, False),  # single layer -> i_layer==0 path
 ]
 SHAPE_IDS = ["square", "gqa4-track", "nonpow2", "track", "single-layer"]
 
@@ -46,18 +46,33 @@ SHAPE_IDS = ["square", "gqa4-track", "nonpow2", "track", "single-layer"]
 def _rand_rings(num_layers, num_slots, HV, H, K, V, L):
     torch.manual_seed(0)
     return dict(
-        temporal=torch.randn(num_layers, num_slots, HV, V, K, device=DEV, dtype=torch.float32),
-        rawv=torch.randn(num_layers, num_slots, HV, L, V, device=DEV, dtype=torch.bfloat16),
-        rawk=torch.randn(num_layers, num_slots, H, L, K, device=DEV, dtype=torch.bfloat16),
-        gk=(-5.0) * torch.sigmoid(torch.randn(num_layers, num_slots, HV, L, K, device=DEV, dtype=torch.float32)),
-        beta=torch.sigmoid(torch.randn(num_layers, num_slots, HV, L, device=DEV, dtype=torch.float32)),
+        temporal=torch.randn(
+            num_layers, num_slots, HV, V, K, device=DEV, dtype=torch.float32
+        ),
+        rawv=torch.randn(
+            num_layers, num_slots, HV, L, V, device=DEV, dtype=torch.bfloat16
+        ),
+        rawk=torch.randn(
+            num_layers, num_slots, H, L, K, device=DEV, dtype=torch.bfloat16
+        ),
+        gk=(-5.0)
+        * torch.sigmoid(
+            torch.randn(
+                num_layers, num_slots, HV, L, K, device=DEV, dtype=torch.float32
+            )
+        ),
+        beta=torch.sigmoid(
+            torch.randn(num_layers, num_slots, HV, L, device=DEV, dtype=torch.float32)
+        ),
     )
 
 
 @pytest.mark.parametrize(
     "num_layers,num_slots,HV,H,K,V,L,has_track", SHAPES, ids=SHAPE_IDS
 )
-def test_fold_batched_matches_per_layer(num_layers, num_slots, HV, H, K, V, L, has_track):
+def test_fold_batched_matches_per_layer(
+    num_layers, num_slots, HV, H, K, V, L, has_track
+):
     r = _rand_rings(num_layers, num_slots, HV, H, K, V, L)
     B = min(3, num_slots - 1)
     # slots 1..B; one row is a -1 padding slot (must be skipped identically).
@@ -65,10 +80,18 @@ def test_fold_batched_matches_per_layer(num_layers, num_slots, HV, H, K, V, L, h
     if B > 1:
         slots[-1] = -1
     # accept_lens: mix 0 (skip), mid, full L.
-    accept = torch.tensor([[0, L // 2, L][i % 3] for i in range(B)], device=DEV, dtype=torch.int32)
+    accept = torch.tensor(
+        [[0, L // 2, L][i % 3] for i in range(B)], device=DEV, dtype=torch.int32
+    )
     if has_track:
-        track_idx = torch.arange(num_slots - B, num_slots, device=DEV, dtype=torch.int32)
-        track_step = torch.tensor([[-1, L // 2 - 1, 1][i % 3] for i in range(B)], device=DEV, dtype=torch.int32)
+        track_idx = torch.arange(
+            num_slots - B, num_slots, device=DEV, dtype=torch.int32
+        )
+        track_step = torch.tensor(
+            [[-1, L // 2 - 1, 1][i % 3] for i in range(B)],
+            device=DEV,
+            dtype=torch.int32,
+        )
     else:
         track_idx = track_step = None
 
@@ -76,18 +99,34 @@ def test_fold_batched_matches_per_layer(num_layers, num_slots, HV, H, K, V, L, h
     ref = r["temporal"].clone()
     for li in range(num_layers):
         commit_kda_replayssm_spec(
-            checkpoint_state=ref[li], rawv_cache=r["rawv"][li], rawk_cache=r["rawk"][li],
-            gk_cache=r["gk"][li], beta_cache=r["beta"][li],
-            ssm_state_indices=slots, accept_lens=accept, max_cache_len=L, num_k_heads=H,
-            mamba_track_indices=track_idx, mamba_steps_to_track=track_step, null_block_id=-1,
+            checkpoint_state=ref[li],
+            rawv_cache=r["rawv"][li],
+            rawk_cache=r["rawk"][li],
+            gk_cache=r["gk"][li],
+            beta_cache=r["beta"][li],
+            ssm_state_indices=slots,
+            accept_lens=accept,
+            max_cache_len=L,
+            num_k_heads=H,
+            mamba_track_indices=track_idx,
+            mamba_steps_to_track=track_step,
+            null_block_id=-1,
         )
     # batched: one launch
     bat = r["temporal"].clone()
     commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=bat, rawv_cache=r["rawv"], rawk_cache=r["rawk"],
-        gk_cache=r["gk"], beta_cache=r["beta"],
-        ssm_state_indices=slots, accept_lens=accept, max_cache_len=L, num_k_heads=H,
-        mamba_track_indices=track_idx, mamba_steps_to_track=track_step, null_block_id=-1,
+        checkpoint_state=bat,
+        rawv_cache=r["rawv"],
+        rawk_cache=r["rawk"],
+        gk_cache=r["gk"],
+        beta_cache=r["beta"],
+        ssm_state_indices=slots,
+        accept_lens=accept,
+        max_cache_len=L,
+        num_k_heads=H,
+        mamba_track_indices=track_idx,
+        mamba_steps_to_track=track_step,
+        null_block_id=-1,
     )
     assert torch.equal(ref, bat), (
         f"batched fold != per-layer loop; max abs diff "

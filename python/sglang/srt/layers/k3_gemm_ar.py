@@ -34,7 +34,6 @@ def _init() -> bool:
     if not envs.SGLANG_K3_GEMM_AR.get():
         return False
     from sglang.srt.distributed import get_tensor_model_parallel_world_size
-    from sglang.srt.distributed.parallel_state import get_tp_group
 
     world_size = get_tensor_model_parallel_world_size()
     if not (2 <= world_size <= 8):

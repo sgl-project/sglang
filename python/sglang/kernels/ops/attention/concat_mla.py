@@ -31,9 +31,7 @@ def _jit_concat_mla_absorb_q_module() -> Module:
         "concat_mla_absorb_q",
         *args,
         cuda_files=["elementwise/concat_mla.cuh"],
-        cuda_wrappers=[
-            ("concat_mla_absorb_q", f"ConcatMlaAbsorbQKernel<{args}>::run")
-        ],
+        cuda_wrappers=[("concat_mla_absorb_q", f"ConcatMlaAbsorbQKernel<{args}>::run")],
     )
 
 

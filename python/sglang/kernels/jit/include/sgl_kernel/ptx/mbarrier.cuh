@@ -2,8 +2,9 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx/addr.cuh>
 #include <sgl_kernel/utils.cuh>
+
+#include <sgl_kernel/ptx/addr.cuh>
 
 #include <cstdint>
 
@@ -87,24 +88,20 @@
 //   Caller maintains the phase counter and flips per stage-wrap (or
 //   per-cycle).
 
-
 namespace ptx {
 
 // mbarrier.init [bar], count;
 static SGL_DEVICE void mbar_init(uint64_t* bar, uint32_t count) {
-    asm volatile("mbarrier.init.shared.b64 [%0], %1;"
-                 :: "r"(to_shared(bar)), "r"(count));
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(to_shared(bar)), "r"(count));
 }
-
 
 // mbarrier.arrive [bar]. Returns the 64-bit phase state token, but the only
 // remaining waiter wrapper is parity-based, so the return is typically
 // discarded.
 static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
-    uint64_t state;
-    asm volatile("mbarrier.arrive.shared.b64 %0, [%1];"
-                 : "=l"(state) : "r"(to_shared(bar)));
-    return state;
+  uint64_t state;
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(to_shared(bar)));
+  return state;
 }
 
 // CLUSTER VARIANT: arrive on an mbar in CTA `cta_rank`'s smem (same cluster).
@@ -118,8 +115,8 @@ static SGL_DEVICE uint64_t mbar_arrive(uint64_t* bar) {
 //
 // First-principles derivation: see `ptx/b_mbarrier/README.md` "Cluster scope".
 static SGL_DEVICE void mbar_arrive_cluster(uint64_t* bar, uint32_t cta_rank) {
-    const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
-    asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];" :: "r"(mapped));
+  const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
+  asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];" ::"r"(mapped));
 }
 
 // RELEASE VARIANT: cross-CTA arrive with `.release.cta` memory-ordering
@@ -136,16 +133,14 @@ static SGL_DEVICE void mbar_arrive_cluster(uint64_t* bar, uint32_t cta_rank) {
 // paired with the MMA-warp's default-`.acquire` `try_wait`. Use this whenever
 // the arriving warp has done TMEM/smem work the waiting peer must observe.
 static SGL_DEVICE void mbar_arrive_cluster_release(uint64_t* bar, uint32_t cta_rank) {
-    const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
-    asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0], 1;" :: "r"(mapped));
+  const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
+  asm volatile("mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0], 1;" ::"r"(mapped));
 }
-
 
 // mbarrier.arrive.expect_tx [bar], bytes; (combined arrive + set tx-count).
 // State is sinked with `_` — caller must use parity-based wait.
 static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-                 :: "r"(to_shared(bar)), "r"(bytes));
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" ::"r"(to_shared(bar)), "r"(bytes));
 }
 
 // CLUSTER VARIANT: like mbar_arrive_expect_tx but the mbar lives in
@@ -153,11 +148,9 @@ static SGL_DEVICE void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
 // multiple peer CTAs into one CTA's mbar (typical: 2-CTA TMA where every
 // CTA's arrive_expect_tx targets CTA-0's mbar). Pair with the cluster TMA
 // load (`cp_async_bulk_tensor_2d_load_cluster`).
-static SGL_DEVICE void mbar_arrive_expect_tx_cluster(
-        uint64_t* bar, uint32_t cta_rank, uint32_t bytes) {
-    const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
-    asm volatile("mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;"
-                 :: "r"(mapped), "r"(bytes));
+static SGL_DEVICE void mbar_arrive_expect_tx_cluster(uint64_t* bar, uint32_t cta_rank, uint32_t bytes) {
+  const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
+  asm volatile("mbarrier.arrive.expect_tx.shared::cluster.b64 _, [%0], %1;" ::"r"(mapped), "r"(bytes));
 }
 
 // Wait for phase `parity` (0 or 1) to complete. `try_wait` form: hardware may
@@ -165,13 +158,12 @@ static SGL_DEVICE void mbar_arrive_expect_tx_cluster(
 // (system timeout). The default and only wait wrapper here — see header
 // comment for why state-token / test_wait variants are intentionally absent.
 static SGL_DEVICE void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\t"
-        "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
-        "@!p bra WAIT_%=;\n\t}\n"
-        :: "r"(to_shared(bar)), "r"(parity));
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity));
 }
-
 
 // CLUSTER VARIANT (BROKEN on sm_103a — DO NOT USE).
 //

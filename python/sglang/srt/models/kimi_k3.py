@@ -1514,17 +1514,13 @@ class KimiK3DeltaAttention(nn.Module):
                     return qkv, beta, forget_gate, g_proj_states
 
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(
-                    fused_states, self.split_sizes, dim=-1
-                )
+                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(
-                    fused_states, self.split_sizes, dim=-1
-                )
+                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -1839,9 +1835,7 @@ class KimiK3DecoderLayer(nn.Module):
                 all_reduce_fusion=self.all_reduce_fusion,
                 # Shared with the MLA gate stream: KDA and MLA layers never
                 # run concurrently within one forward, so the stream is free.
-                bfa_alt_stream=(
-                    alt_streams[2] if alt_streams is not None else None
-                ),
+                bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
             )
         else:
             self.self_attn = KimiK3MLAAttention(

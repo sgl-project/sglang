@@ -47,36 +47,31 @@ namespace dense_gemm_mainloop {
 // in fused_gemm_2cta_sf alone are 8 LoC × 4 = 32 LoC of duplication that
 // distill to ONE `group_n_swizzle<2, GROUP_N>(...)` call site.
 template <int CTA_GROUP, int GROUP_N>
-__device__ __forceinline__ int2 group_n_swizzle(
-        int linear, int crank, int cluster_grid_m, int grid_n) {
-    if constexpr (CTA_GROUP == 1) {
-        const int num_blocks_per_group = cluster_grid_m * GROUP_N;
-        const int group_idx = linear / num_blocks_per_group;
-        const int first_n   = group_idx * GROUP_N;
-        const int in_group  = linear - group_idx * num_blocks_per_group;
-        const int num_n_in_group = grid_n - first_n < GROUP_N
-                                       ? grid_n - first_n
-                                       : GROUP_N;
-        const int bid_m = in_group / num_n_in_group;
-        const int bid_n = first_n + (in_group % num_n_in_group);
-        (void)crank;
-        return {bid_m, bid_n};
-    } else {
-        const int c = linear / CTA_GROUP;
-        const int r = linear & (CTA_GROUP - 1);
-        const int num_blocks_per_group = cluster_grid_m * GROUP_N;
-        const int group_idx = c / num_blocks_per_group;
-        const int first_n = group_idx * GROUP_N;
-        const int in_group = c - group_idx * num_blocks_per_group;
-        const int num_n_in_group = grid_n - first_n < GROUP_N
-                                       ? grid_n - first_n
-                                       : GROUP_N;
-        const int cluster_bid_m = in_group / num_n_in_group;
-        const int cluster_bid_n = first_n + (in_group % num_n_in_group);
-        const int bid_m = cluster_bid_m * CTA_GROUP + r;
-        const int bid_n = cluster_bid_n;
-        (void)crank;  // `r` already encodes the intra-cluster lane.
-        return {bid_m, bid_n};
-    }
+__device__ __forceinline__ int2 group_n_swizzle(int linear, int crank, int cluster_grid_m, int grid_n) {
+  if constexpr (CTA_GROUP == 1) {
+    const int num_blocks_per_group = cluster_grid_m * GROUP_N;
+    const int group_idx = linear / num_blocks_per_group;
+    const int first_n = group_idx * GROUP_N;
+    const int in_group = linear - group_idx * num_blocks_per_group;
+    const int num_n_in_group = grid_n - first_n < GROUP_N ? grid_n - first_n : GROUP_N;
+    const int bid_m = in_group / num_n_in_group;
+    const int bid_n = first_n + (in_group % num_n_in_group);
+    (void)crank;
+    return {bid_m, bid_n};
+  } else {
+    const int c = linear / CTA_GROUP;
+    const int r = linear & (CTA_GROUP - 1);
+    const int num_blocks_per_group = cluster_grid_m * GROUP_N;
+    const int group_idx = c / num_blocks_per_group;
+    const int first_n = group_idx * GROUP_N;
+    const int in_group = c - group_idx * num_blocks_per_group;
+    const int num_n_in_group = grid_n - first_n < GROUP_N ? grid_n - first_n : GROUP_N;
+    const int cluster_bid_m = in_group / num_n_in_group;
+    const int cluster_bid_n = first_n + (in_group % num_n_in_group);
+    const int bid_m = cluster_bid_m * CTA_GROUP + r;
+    const int bid_n = cluster_bid_n;
+    (void)crank;  // `r` already encodes the intra-cluster lane.
+    return {bid_m, bid_n};
+  }
 }
 }  // namespace dense_gemm_mainloop

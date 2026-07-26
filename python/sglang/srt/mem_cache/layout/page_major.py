@@ -150,8 +150,8 @@ def build_dense_mla_views(
     page_bytes = page_size * layer_num * row_bytes
     n_dense = num_pages * layer_num * page_size
     assert anchor_bytes % itemsize == 0
-    last_view_end = anchor_bytes + (layer_num - 1) * page_size * row_bytes + (
-        n_dense * row_bytes
+    last_view_end = (
+        anchor_bytes + (layer_num - 1) * page_size * row_bytes + (n_dense * row_bytes)
     )
     assert last_view_end <= raw.numel() * raw.itemsize, (
         f"build_dense_mla_views: layer {layer_num - 1}'s view ends at byte "

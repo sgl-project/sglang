@@ -2,12 +2,13 @@
 
 #pragma once
 
-#include <sgl_kernel/ptx/addr.cuh>
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/ptx/addr.cuh>
+
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
 // ================= common/ptx/tma.cuh =================
 // TMA (Tensor Memory Accelerator) wrappers. PTX ISA 9.2 §9.7.9.25.
@@ -46,7 +47,6 @@
 //   - 2D tile: smem destination 16-byte aligned for no-swizzle, 128-byte for
 //              swizzled. Over-align to 128 always — costs nothing.
 
-
 namespace ptx {
 
 // ---- tensor-map descriptor prefetch ------------------------------------------
@@ -60,25 +60,23 @@ namespace ptx {
 // addressing resolves it to .param (PTX ISA §9.7.9.15, line 1888). Issue once,
 // off the hot path. Idempotent / side-effect-free beyond cache state.
 static SGL_DEVICE void prefetch_tensormap(const void* tmap) {
-    asm volatile("prefetch.tensormap [%0];" :: "l"(tmap) : "memory");
+  asm volatile("prefetch.tensormap [%0];" ::"l"(tmap) : "memory");
 }
-
 
 // ---- 1D bulk (no tensor map) -------------------------------------------------
 
 // global → shared::cluster, completed by a shared-memory mbarrier. The caller
 // must arm `bar` with `mbar_arrive_expect_tx(bar, bytes)` before issuing the
 // copy. `bytes` and both endpoints must be 16-byte aligned.
-static SGL_DEVICE void cp_async_bulk_1d_load(
-        void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
-    asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-        " [%0], [%1], %2, [%3];"
-        :: "r"(to_shared(smem_dst)), "l"(gmem_src), "r"(bytes),
-           "r"(to_shared(bar))
-        : "memory");
+static SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
+      "l"(gmem_src),
+      "r"(bytes),
+      "r"(to_shared(bar))
+      : "memory");
 }
-
 
 // ---- 2D tile-mode TMA (with tensor map) -------------------------------------
 
@@ -93,16 +91,17 @@ static SGL_DEVICE void cp_async_bulk_1d_load(
 
 // global → shared::cta. tmap is a CUtensorMap by pointer (typically a
 // __grid_constant__ kernel arg).
-static SGL_DEVICE void cp_async_bulk_tensor_2d_load(
-        uint32_t dst_smem, const CUtensorMap* tmap,
-        int32_t x, int32_t y, uint64_t* bar) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst_smem), "l"(tmap), "r"(x), "r"(y), "r"(to_shared(bar))
-        : "memory");
+static SGL_DEVICE void
+cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_smem),
+      "l"(tmap),
+      "r"(x),
+      "r"(y),
+      "r"(to_shared(bar))
+      : "memory");
 }
-
 
 // 4D single-CTA tile load (no cluster/multicast). Coordinate convention as 3D:
 // `x` = innermost (stride-1) offset, `y`/`z`/`w` = the next-outer dims. The
@@ -127,14 +126,16 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load(
 // local. Use `cp_async_bulk_tensor_2d_load_2sm` below for cluster MMA on
 // sm_100+. This wrapper is here for sm_90 compatibility.
 static SGL_DEVICE void cp_async_bulk_tensor_2d_load_cluster(
-        uint32_t dst_smem, const CUtensorMap* tmap,
-        int32_t x, int32_t y, uint64_t* bar, uint32_t cta_rank) {
-    const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst_smem), "l"(tmap), "r"(x), "r"(y), "r"(mapped)
-        : "memory");
+    uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar, uint32_t cta_rank) {
+  const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_smem),
+      "l"(tmap),
+      "r"(x),
+      "r"(y),
+      "r"(mapped)
+      : "memory");
 }
 
 // 2-CTA CLUSTER VARIANT (sm_100+): the canonical TMA load for cluster MMA
@@ -158,18 +159,25 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_cluster(
 //
 // `cache_hint` defaults to EVICT_NORMAL (0x10C0_0000_0000_0000).
 static SGL_DEVICE void cp_async_bulk_tensor_2d_load_2sm(
-        uint32_t dst_smem, const CUtensorMap* tmap,
-        int32_t x, int32_t y, uint64_t* bar, uint32_t cta_rank,
-        uint64_t cache_hint = 0x0ULL) {
-    const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
-    asm volatile(
-        "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.L2::cache_hint"
-        " [%0], [%1, {%2, %3}], [%4], %5;"
-        :: "r"(dst_smem), "l"(tmap), "r"(x), "r"(y), "r"(mapped), "l"(cache_hint)
-        : "memory");
+    uint32_t dst_smem,
+    const CUtensorMap* tmap,
+    int32_t x,
+    int32_t y,
+    uint64_t* bar,
+    uint32_t cta_rank,
+    uint64_t cache_hint = 0x0ULL) {
+  const uint32_t mapped = mapa_shared_cluster(to_shared(bar), cta_rank);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
+      ".mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_smem),
+      "l"(tmap),
+      "r"(x),
+      "r"(y),
+      "r"(mapped),
+      "l"(cache_hint)
+      : "memory");
 }
-
 
 // MULTICAST TMA load (cta_group::2 + multicast::cluster). Loads the SAME
 // bytes from gmem to MULTIPLE peers' smem within a cluster (identical
@@ -206,20 +214,27 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_2sm(
 //
 // Reference: PTX ISA 9.2 §9.7.9.25 (multicast::cluster qualifier).
 static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast(
-        uint32_t dst_smem, const CUtensorMap* tmap,
-        int32_t x, int32_t y, uint64_t* bar,
-        uint16_t multicast_mask = 0b11,
-        uint64_t cache_hint = 0x0ULL) {
-    // Clear bit 24 of mbar address — Sm100MmaPeerBitMask routes tx-count
-    // completion to leader CTA-0's mbar regardless of which peer issues.
-    const uint32_t mbar_addr = to_shared(bar) & 0xFEFFFFFFu;
-    asm volatile(
-        "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-        " [%0], [%1, {%4, %5}], [%2], %3, %6;"
-        :: "r"(dst_smem), "l"(tmap), "r"(mbar_addr), "h"(multicast_mask),
-           "r"(x), "r"(y), "l"(cache_hint)
-        : "memory");
+    uint32_t dst_smem,
+    const CUtensorMap* tmap,
+    int32_t x,
+    int32_t y,
+    uint64_t* bar,
+    uint16_t multicast_mask = 0b11,
+    uint64_t cache_hint = 0x0ULL) {
+  // Clear bit 24 of mbar address — Sm100MmaPeerBitMask routes tx-count
+  // completion to leader CTA-0's mbar regardless of which peer issues.
+  const uint32_t mbar_addr = to_shared(bar) & 0xFEFFFFFFu;
+  asm volatile(
+      "cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global"
+      ".mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+      " [%0], [%1, {%4, %5}], [%2], %3, %6;" ::"r"(dst_smem),
+      "l"(tmap),
+      "r"(mbar_addr),
+      "h"(multicast_mask),
+      "r"(x),
+      "r"(y),
+      "l"(cache_hint)
+      : "memory");
 }
 
 // MULTICAST TMA load (cta_group::1 + multicast::cluster). PTX ISA 9.2
@@ -254,20 +269,26 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast(
 // Pattern: ONE leader CTA issues; each peer (leader AND follower) keeps its
 // own `mbar_arrive_expect_tx(local_bar, BYTES)`.
 static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast_cg1(
-        uint32_t dst_smem, const CUtensorMap* tmap,
-        int32_t x, int32_t y, uint64_t* bar,
-        uint16_t multicast_mask = 0b11,
-        uint64_t cache_hint = 0x0ULL) {
-    const uint32_t mbar_addr = to_shared(bar);
-    asm volatile(
-        "cp.async.bulk.tensor.2d.cta_group::1.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
-        " [%0], [%1, {%4, %5}], [%2], %3, %6;"
-        :: "r"(dst_smem), "l"(tmap), "r"(mbar_addr), "h"(multicast_mask),
-           "r"(x), "r"(y), "l"(cache_hint)
-        : "memory");
+    uint32_t dst_smem,
+    const CUtensorMap* tmap,
+    int32_t x,
+    int32_t y,
+    uint64_t* bar,
+    uint16_t multicast_mask = 0b11,
+    uint64_t cache_hint = 0x0ULL) {
+  const uint32_t mbar_addr = to_shared(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.cta_group::1.shared::cluster.global"
+      ".mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
+      " [%0], [%1, {%4, %5}], [%2], %3, %6;" ::"r"(dst_smem),
+      "l"(tmap),
+      "r"(mbar_addr),
+      "h"(multicast_mask),
+      "r"(x),
+      "r"(y),
+      "l"(cache_hint)
+      : "memory");
 }
-
 
 // ====================================================================
 // CuteDSL-faithful (2,4) 8-CTA tiled-multicast TMA (sf S1).
@@ -294,7 +315,6 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast_cg1(
 // fan-out with the existing 2D multicast / 2sm_bit24 forms. If a future step
 // rebuilds the host tmaps to 3D/4D, add the cta_group::2 3D/4D load wrappers here.)
 
-
 // Make a 64-bit L2 cache-policy descriptor via PTX `createpolicy.fractional`
 // (sm_80+). Fraction defaults to 1.0 — apply the policy to 100% of bytes.
 // Returns an opaque uint64 cookie to feed `L2::cache_hint` qualifiers on
@@ -311,12 +331,11 @@ static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast_cg1(
 // REFERENCE: PTX ISA §9.7.9.4 (createpolicy.fractional).
 enum class L2EvictPolicy : int { NORMAL = 0, EVICT_FIRST = 1, EVICT_LAST = 2 };
 
-
 // ---- bulk-group completion --------------------------------------------------
 
 // Close the per-thread bulk async-group containing all prior bulk_group ops.
 static SGL_DEVICE void tma_store_commit() {
-    asm volatile("cp.async.bulk.commit_group;");
+  asm volatile("cp.async.bulk.commit_group;");
 }
 
 // Wait until at most N bulk-groups are pending. tma_store_wait_all() = wait_group 0.
@@ -324,11 +343,11 @@ static SGL_DEVICE void tma_store_commit() {
 // groups still in flight); N = 0 to drain everything.
 template <int N = 0>
 static SGL_DEVICE void tma_store_wait() {
-    asm volatile("cp.async.bulk.wait_group %0;" :: "n"(N));
+  asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N));
 }
 
 static SGL_DEVICE void tma_store_wait_all() {
-    asm volatile("cp.async.bulk.wait_group 0;");
+  asm volatile("cp.async.bulk.wait_group 0;");
 }
 
 }  // namespace ptx

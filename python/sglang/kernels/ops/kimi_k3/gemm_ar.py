@@ -29,7 +29,12 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -79,7 +84,7 @@ def init(
     *,
     world_size: int,
     rank: int,
-    group: "torch.distributed.ProcessGroup",
+    group: torch.distributed.ProcessGroup,
     k: int,
 ) -> None:
     """Allocate + rendezvous the P2P comm region (collective; call once from
@@ -109,9 +114,7 @@ def init(
     torch.cuda.synchronize()
     torch.distributed.barrier(group=group)
     # keep the peer buffer tensors alive alongside the region
-    peer_bufs = [
-        symm.get_buffer(r, [nbytes], torch.uint8) for r in range(world_size)
-    ]
+    peer_bufs = [symm.get_buffer(r, [nbytes], torch.uint8) for r in range(world_size)]
     ptrs = [t.data_ptr() for t in peer_bufs]
     import logging
 

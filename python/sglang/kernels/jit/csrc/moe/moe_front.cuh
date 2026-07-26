@@ -153,8 +153,7 @@ SGL_DEVICE uint32_t fgt_warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   return val;
 }
 
-SGL_DEVICE uint32_t
-fgt_block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
+SGL_DEVICE uint32_t fgt_block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32_t* smem_warp_sum) {
   const uint32_t inc = fgt_warp_inclusive_sum(lane_id, cnt);
   if (lane_id == 31) smem_warp_sum[warp_id] = inc;
   __syncthreads();
@@ -166,12 +165,7 @@ fgt_block_exclusive_sum(uint32_t cnt, uint32_t lane_id, uint32_t warp_id, uint32
 /// route_radix.cuh; the only change is the input dtype (fp32 in place of bf16).
 template <bool kUsePDL, typename T>
 SGL_DEVICE void fgt_select_topk(
-    const MoEFrontParams& params,
-    typename T::Smem& smem,
-    int m,
-    uint32_t tx,
-    uint32_t warp_id,
-    uint32_t lane_id) {
+    const MoEFrontParams& params, typename T::Smem& smem, int m, uint32_t tx, uint32_t warp_id, uint32_t lane_id) {
   constexpr uint32_t kVecSize = T::kVecSize;
   constexpr uint32_t kRadixLanes = T::kRadixSize / 2;
   enum { BAR_SUM = 1 };
@@ -240,8 +234,7 @@ SGL_DEVICE void fgt_select_topk(
         const auto warp_inc = fgt_warp_inclusive_sum(lane_id, local_val);
         if (lane_id == 31) smem.warp_sum[0][warp_id] = warp_inc;
         fgt_bar_sync(BAR_SUM, kRadixLanes);
-        const auto inter =
-            __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
+        const auto inter = __reduce_add_sync(0xFFFFFFFF, lane_id < warp_id ? smem.warp_sum[0][lane_id] : 0u);
         const auto prefix = inter + warp_inc;
         const auto above_r = total_active - prefix;
         const auto above_m = above_r + hist[1];
@@ -369,11 +362,11 @@ __global__ __launch_bounds__(kBlockSize)  //
 template <bool kUsePDL>
 struct FusedFrontEpilogueKernel {
   static void
-  run(const tvm::ffi::TensorView merged,   // [M, E + latent] fp32, row-dense
-      const tvm::ffi::TensorView bias,     // [E] fp32
-      const tvm::ffi::TensorView out_w,    // [M, topk] fp32
-      const tvm::ffi::TensorView out_i,    // [M, topk] int32
-      const tvm::ffi::TensorView routed,   // [M, latent] bf16
+  run(const tvm::ffi::TensorView merged,  // [M, E + latent] fp32, row-dense
+      const tvm::ffi::TensorView bias,    // [E] fp32
+      const tvm::ffi::TensorView out_w,   // [M, topk] fp32
+      const tvm::ffi::TensorView out_i,   // [M, topk] int32
+      const tvm::ffi::TensorView routed,  // [M, latent] bf16
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
@@ -400,8 +393,7 @@ struct FusedFrontEpilogueKernel {
     const auto M = static_cast<int>(M_.unwrap());
     const auto latent = static_cast<int>(L_.unwrap());
     RuntimeCheck(
-        E_.unwrap() == sglang::kFGTNumExperts && K_.unwrap() == sglang::kFGTTopK &&
-            topk == sglang::kFGTTopK,
+        E_.unwrap() == sglang::kFGTNumExperts && K_.unwrap() == sglang::kFGTTopK && topk == sglang::kFGTTopK,
         "fused_front_epilogue is specialized for E=896, topk=16");
     RuntimeCheck(
         static_cast<int>(W_.unwrap()) == static_cast<int>(sglang::kFGTNumExperts) + latent,
@@ -431,36 +423,32 @@ struct FusedFrontEpilogueKernel {
 
     // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
     // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
-    RuntimeCheck(
-        cast_vec == 2 || cast_vec == 4 || cast_vec == 8,
-        "fused_front_epilogue: cast_vec must be 2, 4 or 8");
+    RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
     RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
-#define SGL_FRONT_LAUNCH(BS, CV, CF)                                            \
-  LaunchKernel(M, BS, device.unwrap())                                          \
+#define SGL_FRONT_LAUNCH(BS, CV, CF)   \
+  LaunchKernel(M, BS, device.unwrap()) \
       .enable_pdl(kUsePDL)(sglang::fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
-#define SGL_FRONT_DISPATCH_CV(BS, CF)        \
-  do {                                       \
-    if (cast_vec == 2) {                     \
-      SGL_FRONT_LAUNCH(BS, 2, CF);           \
-    } else if (cast_vec == 4) {              \
-      SGL_FRONT_LAUNCH(BS, 4, CF);           \
-    } else {                                 \
-      SGL_FRONT_LAUNCH(BS, 8, CF);           \
-    }                                        \
+#define SGL_FRONT_DISPATCH_CV(BS, CF) \
+  do {                                \
+    if (cast_vec == 2) {              \
+      SGL_FRONT_LAUNCH(BS, 2, CF);    \
+    } else if (cast_vec == 4) {       \
+      SGL_FRONT_LAUNCH(BS, 4, CF);    \
+    } else {                          \
+      SGL_FRONT_LAUNCH(BS, 8, CF);    \
+    }                                 \
   } while (0)
-#define SGL_FRONT_DISPATCH_BS(CF)            \
-  do {                                       \
-    if (block_size == 448) {                 \
-      SGL_FRONT_DISPATCH_CV(448, CF);        \
-    } else {                                 \
-      SGL_FRONT_DISPATCH_CV(224, CF);        \
-    }                                        \
+#define SGL_FRONT_DISPATCH_BS(CF)     \
+  do {                                \
+    if (block_size == 448) {          \
+      SGL_FRONT_DISPATCH_CV(448, CF); \
+    } else {                          \
+      SGL_FRONT_DISPATCH_CV(224, CF); \
+    }                                 \
   } while (0)
 
-    RuntimeCheck(
-        block_size == 224 || block_size == 448,
-        "fused_front_epilogue: block_size must be 224 or 448");
+    RuntimeCheck(block_size == 224 || block_size == 448, "fused_front_epilogue: block_size must be 224 or 448");
     if (cast_first) {
       SGL_FRONT_DISPATCH_BS(true);
     } else {
@@ -471,4 +459,3 @@ struct FusedFrontEpilogueKernel {
 #undef SGL_FRONT_LAUNCH
   }
 };
-

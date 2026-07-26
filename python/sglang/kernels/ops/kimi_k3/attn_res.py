@@ -53,6 +53,7 @@ def _jit_fused_tma_module(
             extra_cuda_cflags=["-O3", "--use_fast_math"],
         )
 
+
 # Benchmarked-best (chunk_rows, occupancy, consumer_regs) per nvb
 # (GB200/GB300-class, H=7168). nvb=1 is latency-bound per token, so 2 CTAs/SM
 # (occupancy=2, which excludes setmaxnreg: 4*Nc + 2*Np > 512) wins large T by

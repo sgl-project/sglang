@@ -30,13 +30,12 @@
 // SF operands + UTCCP staging that don't compose with the dense pipeline here.
 // See `ptx/c_tcgen05_mma_dense/README.md` for the picking decision tree.
 
-
 namespace ptx {
 
 enum class MmaDenseKind : uint8_t {
-    F16    = 0,   // F16 / BF16 × F16 / BF16 → F16 / F32   (PTX kind::f16)
-    F8F6F4 = 1,   // FP8 / FP6 / FP4 mix    → F32          (PTX kind::f8f6f4)
-    TF32   = 2,   // TF32 × TF32           → F32          (PTX kind::tf32)
+  F16 = 0,     // F16 / BF16 × F16 / BF16 → F16 / F32   (PTX kind::f16)
+  F8F6F4 = 1,  // FP8 / FP6 / FP4 mix    → F32          (PTX kind::f8f6f4)
+  TF32 = 2,    // TF32 × TF32           → F32          (PTX kind::tf32)
 };
 
 // Per-kind atype/btype enum. `F16Type` (F16=0, BF16=1) for kind::f16;
@@ -45,10 +44,20 @@ enum class MmaDenseKind : uint8_t {
 // different values — this trait keeps the kernel-side type generic. kind::tf32
 // has no per-operand type choice (atype/btype are fixed at TF32=2), so its
 // trait maps to a placeholder enum the builder ignores.
-template <MmaDenseKind KIND> struct DenseAType;
-template <> struct DenseAType<MmaDenseKind::F16>    { using type = F16Type; };
-template <> struct DenseAType<MmaDenseKind::F8F6F4> { using type = FP8Type; };
-template <> struct DenseAType<MmaDenseKind::TF32>   { using type = F16Type; };
+template <MmaDenseKind KIND>
+struct DenseAType;
+template <>
+struct DenseAType<MmaDenseKind::F16> {
+  using type = F16Type;
+};
+template <>
+struct DenseAType<MmaDenseKind::F8F6F4> {
+  using type = FP8Type;
+};
+template <>
+struct DenseAType<MmaDenseKind::TF32> {
+  using type = F16Type;
+};
 
 template <MmaDenseKind KIND>
 using DenseAType_t = typename DenseAType<KIND>::type;
@@ -58,24 +67,24 @@ using DenseAType_t = typename DenseAType<KIND>::type;
 // major fields (see Table 44 of the PTX ISA).
 template <MmaDenseKind KIND>
 __host__ __device__ static __forceinline__ constexpr uint32_t mma_inst_desc_dense(
-        uint32_t M, uint32_t N,
-        DenseAType_t<KIND> a_type, DenseAType_t<KIND> b_type,
-        DType d_type   = DType::F32,
-        Major a_major  = Major::K,
-        Major b_major  = Major::K,
-        bool  negate_a = false,
-        bool  negate_b = false) {
-    if constexpr (KIND == MmaDenseKind::F16) {
-        return mma_inst_desc_f16(M, N, a_type, b_type, d_type, a_major, b_major,
-                                 negate_a, negate_b);
-    } else if constexpr (KIND == MmaDenseKind::TF32) {
-        (void)a_type; (void)b_type;   // kind::tf32 atype/btype fixed at TF32=2
-        return mma_inst_desc_tf32(M, N, d_type, a_major, b_major,
-                                  negate_a, negate_b);
-    } else {
-        return mma_inst_desc_f8f6f4(M, N, a_type, b_type, d_type, a_major, b_major,
-                                    negate_a, negate_b);
-    }
+    uint32_t M,
+    uint32_t N,
+    DenseAType_t<KIND> a_type,
+    DenseAType_t<KIND> b_type,
+    DType d_type = DType::F32,
+    Major a_major = Major::K,
+    Major b_major = Major::K,
+    bool negate_a = false,
+    bool negate_b = false) {
+  if constexpr (KIND == MmaDenseKind::F16) {
+    return mma_inst_desc_f16(M, N, a_type, b_type, d_type, a_major, b_major, negate_a, negate_b);
+  } else if constexpr (KIND == MmaDenseKind::TF32) {
+    (void)a_type;
+    (void)b_type;  // kind::tf32 atype/btype fixed at TF32=2
+    return mma_inst_desc_tf32(M, N, d_type, a_major, b_major, negate_a, negate_b);
+  } else {
+    return mma_inst_desc_f8f6f4(M, N, a_type, b_type, d_type, a_major, b_major, negate_a, negate_b);
+  }
 }
 
 // Single MMA-issue wrapper. `CTA_GROUP` is 1 (single-CTA) or 2 (cluster).
@@ -93,26 +102,25 @@ __host__ __device__ static __forceinline__ constexpr uint32_t mma_inst_desc_dens
 //     cta_group::1 — M ∈ {64, 128}, N ∈ {8, 16, …, 256} (steps of 8), K = 32.
 //     cta_group::2 — M ∈ {128, 256}, N ∈ {16, 32, …, 256} (steps of 16),  K = 32.
 template <MmaDenseKind KIND, int CTA_GROUP>
-static __device__ __forceinline__ void tcgen05_mma_dense(
-        uint32_t d, uint64_t desc_a, uint64_t desc_b,
-        uint32_t inst_desc_high, uint32_t scale_c) {
-    static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
-    if constexpr (KIND == MmaDenseKind::F16) {
-        if constexpr (CTA_GROUP == 1)
-            tcgen05_mma_f16    (d, desc_a, desc_b, inst_desc_high, scale_c);
-        else
-            tcgen05_mma_f16_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
-    } else if constexpr (KIND == MmaDenseKind::TF32) {
-        if constexpr (CTA_GROUP == 1)
-            tcgen05_mma_tf32    (d, desc_a, desc_b, inst_desc_high, scale_c);
-        else
-            tcgen05_mma_tf32_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
-    } else {
-        if constexpr (CTA_GROUP == 1)
-            tcgen05_mma_f8f6f4    (d, desc_a, desc_b, inst_desc_high, scale_c);
-        else
-            tcgen05_mma_f8f6f4_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
-    }
+static __device__ __forceinline__ void
+tcgen05_mma_dense(uint32_t d, uint64_t desc_a, uint64_t desc_b, uint32_t inst_desc_high, uint32_t scale_c) {
+  static_assert(CTA_GROUP == 1 || CTA_GROUP == 2, "CTA_GROUP must be 1 or 2");
+  if constexpr (KIND == MmaDenseKind::F16) {
+    if constexpr (CTA_GROUP == 1)
+      tcgen05_mma_f16(d, desc_a, desc_b, inst_desc_high, scale_c);
+    else
+      tcgen05_mma_f16_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
+  } else if constexpr (KIND == MmaDenseKind::TF32) {
+    if constexpr (CTA_GROUP == 1)
+      tcgen05_mma_tf32(d, desc_a, desc_b, inst_desc_high, scale_c);
+    else
+      tcgen05_mma_tf32_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
+  } else {
+    if constexpr (CTA_GROUP == 1)
+      tcgen05_mma_f8f6f4(d, desc_a, desc_b, inst_desc_high, scale_c);
+    else
+      tcgen05_mma_f8f6f4_2sm(d, desc_a, desc_b, inst_desc_high, scale_c);
+  }
 }
 
 }  // namespace ptx

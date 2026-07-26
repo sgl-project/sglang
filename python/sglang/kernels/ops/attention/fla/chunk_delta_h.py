@@ -362,9 +362,7 @@ def chunk_gated_delta_rule_fwd_h(
         initial_state_indices=initial_state_indices,
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
-        stride_init_state=(
-            initial_state.stride(0) if initial_state is not None else 0
-        ),
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,

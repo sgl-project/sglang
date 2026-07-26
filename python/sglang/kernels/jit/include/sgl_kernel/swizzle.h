@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 // ================= common/swizzle.h =================
 
@@ -39,14 +39,12 @@
 
 namespace swz {
 
-
 // 128B swizzle. Row stride = 128 bytes (= 8 atoms = 64 BF16 cols).
 // smem_atom = logical_atom XOR (r & 7). 8-row period.
 //
 // Returns the smem column index in BF16 units within the row.
 __host__ __device__ inline uint32_t smem_col_128b_bf16(uint32_t r, uint32_t c) {
-    return c ^ ((r & 7u) << 3);   // (r & 7) atoms shifted; atom = 8 BF16 cols
+  return c ^ ((r & 7u) << 3);  // (r & 7) atoms shifted; atom = 8 BF16 cols
 }
-
 
 }  // namespace swz

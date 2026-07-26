@@ -24,10 +24,10 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.kernels.ops.kimi_k3 import gemm_ar
-from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.kimi_k3 import gemm_ar
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(
     est_time=240,

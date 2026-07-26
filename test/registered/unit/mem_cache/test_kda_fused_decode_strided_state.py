@@ -39,7 +39,13 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.kda_fused_decode import _CONV_DIM, _CONV_STATE_W, _H, _SEG, covered
+from sglang.kernels.ops.attention.kda_fused_decode import (
+    _CONV_DIM,
+    _CONV_STATE_W,
+    _H,
+    _SEG,
+    covered,
+)
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     mamba_entry_bytes,
@@ -94,7 +100,9 @@ def _make_covered_side_args(batch: int):
     a = torch.zeros((batch, _SEG), dtype=bf16, device=_DEV)
     b = torch.zeros((batch, _H), dtype=bf16, device=_DEV)
     onorm_g = torch.zeros((batch, _SEG), dtype=bf16, device=_DEV)
-    conv_states = torch.zeros((_SLOTS, _CONV_STATE_W, _CONV_DIM), dtype=bf16, device=_DEV)
+    conv_states = torch.zeros(
+        (_SLOTS, _CONV_STATE_W, _CONV_DIM), dtype=bf16, device=_DEV
+    )
     cache_indices = torch.zeros((batch,), dtype=torch.int32, device=_DEV)
     return mixed_qkv, a, b, conv_states, onorm_g, cache_indices
 
@@ -113,9 +121,13 @@ class TestKdaFusedDecodeStridedState(unittest.TestCase):
         )
         # Inner [HV, V, K] IS contiguous — the contract the kernel's float4
         # state loads rely on and all covered() must still require.
-        self.assertEqual((ssm.stride(-1), ssm.stride(-2), ssm.stride(-3)), (1, _K, _V * _K))
+        self.assertEqual(
+            (ssm.stride(-1), ssm.stride(-2), ssm.stride(-3)), (1, _K, _V * _K)
+        )
 
-        mixed_qkv, a, b, conv_states, onorm_g, cache_indices = _make_covered_side_args(batch=2)
+        mixed_qkv, a, b, conv_states, onorm_g, cache_indices = _make_covered_side_args(
+            batch=2
+        )
 
         # (1) Accept the envelope-strided view — pre-fix .view(...).is_contiguous()
         # would reject this and drop decode to the unfused chain.
@@ -154,7 +166,9 @@ class TestKdaFusedDecodeStridedState(unittest.TestCase):
             (2, 5, 3, 7),
         ]
         for slot, i_hv, v, k in samples:
-            intra = i_hv * (_V * _K) + v * _K + k  # kernel's hardcoded intra-slot offset
+            intra = (
+                i_hv * (_V * _K) + v * _K + k
+            )  # kernel's hardcoded intra-slot offset
             kernel_off = base + slot * slot_stride + intra
 
             # (2a) The kernel formula names exactly the element torch indexing

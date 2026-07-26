@@ -2,16 +2,17 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/ptx/addr.cuh>
-#include <sgl_kernel/ptx/mbarrier.cuh>
-#include <sgl_kernel/ptx/sync.cuh>
-#include <sgl_kernel/ptx/tcgen05.cuh>
-#include <sgl_kernel/ptx/tma.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/ptx/addr.cuh>
+#include <sgl_kernel/ptx/mbarrier.cuh>
+#include <sgl_kernel/ptx/sync.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
+#include <sgl_kernel/ptx/tma.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 

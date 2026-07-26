@@ -4,39 +4,33 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 // ================= common/ptx/sync.cuh =================
 // Lightweight sync wrappers: named barrier.cta, fence.proxy.async variants.
 // PTX ISA 9.2 §9.7.13.
 
-
 namespace ptx {
-
 
 // fence.proxy.async.shared::cta — make generic-proxy smem writes visible to
 // the async proxy (TMA store engine). Required before any cp.async.bulk store
 // that reads smem written by regular ld/st.
 static SGL_DEVICE void fence_async_smem() {
-    asm volatile("fence.proxy.async.shared::cta;");
+  asm volatile("fence.proxy.async.shared::cta;");
 }
 
 // Publish mbarrier initialization from the generic proxy before an async
 // engine uses the barrier.
 static SGL_DEVICE void fence_mbarrier_init() {
-    asm volatile("fence.mbarrier_init.release.cluster;");
+  asm volatile("fence.mbarrier_init.release.cluster;");
 }
 
 // Partial-CTA rendezvous. `id` must be in [1, 15]; barrier 0 is reserved for
 // the full-CTA barrier used by __syncthreads().
-static SGL_DEVICE void named_barrier_sync(
-        uint32_t id, uint32_t num_threads) {
-    asm volatile("bar.sync %0, %1;"
-                 :: "r"(id), "r"(num_threads)
-                 : "memory");
+static SGL_DEVICE void named_barrier_sync(uint32_t id, uint32_t num_threads) {
+  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
 }
-
 
 // ---- Cluster-wide barrier (sm_90a+, sm_100a+, sm_103a) ----------------------
 //
@@ -49,10 +43,9 @@ static SGL_DEVICE void named_barrier_sync(
 // need one direction (e.g., signaling work-done before the peer reads),
 // the separate arrive/wait wrappers let you interleave other work between.
 
-
 static SGL_DEVICE void cluster_sync() {
-    asm volatile("barrier.cluster.arrive.aligned;");
-    asm volatile("barrier.cluster.wait.aligned;");
+  asm volatile("barrier.cluster.arrive.aligned;");
+  asm volatile("barrier.cluster.wait.aligned;");
 }
 
 // `cluster_sync` with explicit `release` / `acquire` semantics. Use this
@@ -60,10 +53,9 @@ static SGL_DEVICE void cluster_sync() {
 // writes done before/after — e.g., between `mbarrier.init` (release) and
 // any `.shared::cluster` use of those mbars (acquire). PTX ISA §9.7.13.
 static SGL_DEVICE void cluster_sync_rel_acq() {
-    asm volatile("barrier.cluster.arrive.release.aligned;");
-    asm volatile("barrier.cluster.wait.acquire.aligned;");
+  asm volatile("barrier.cluster.arrive.release.aligned;");
+  asm volatile("barrier.cluster.wait.acquire.aligned;");
 }
-
 
 // ---- elect.sync — pick one lane in the warp ---------------------------------
 //
@@ -74,22 +66,21 @@ static SGL_DEVICE void cluster_sync_rel_acq() {
 //
 // PTX ISA 9.2 §9.7.4. sm_90+.
 static SGL_DEVICE bool elect_one() {
-    uint32_t pred;
-    asm volatile(
-        "{\n\t.reg .pred p;\n\t"
-        "elect.sync _|p, 0xffffffff;\n\t"
-        "selp.b32 %0, 1, 0, p;\n\t}\n"
-        : "=r"(pred));
-    return pred != 0;
+  uint32_t pred;
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "elect.sync _|p, 0xffffffff;\n\t"
+      "selp.b32 %0, 1, 0, p;\n\t}\n"
+      : "=r"(pred));
+  return pred != 0;
 }
 
 // Rank of the executing CTA within its cluster.
 static SGL_DEVICE uint32_t cluster_cta_rank() {
-    uint32_t rank;
-    asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
-    return rank;
+  uint32_t rank;
+  asm("mov.u32 %0, %%cluster_ctarank;" : "=r"(rank));
+  return rank;
 }
-
 
 // ---- setmaxnreg.{dec,inc} — per-warpgroup register-budget reallocation ------
 //
@@ -140,17 +131,16 @@ static SGL_DEVICE uint32_t cluster_cta_rank() {
 
 template <int N>
 static SGL_DEVICE void setmaxnreg_dec() {
-    static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
-    static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N));
+  static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
+  static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(N));
 }
 
 template <int N>
 static SGL_DEVICE void setmaxnreg_inc() {
-    static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
-    static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N));
+  static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
+  static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
 }
-
 
 }  // namespace ptx

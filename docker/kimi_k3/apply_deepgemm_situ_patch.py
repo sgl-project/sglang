@@ -17,6 +17,7 @@ would otherwise hit a stale cache entry).
 Idempotent; also migrates the deprecated negative-sentinel V1 patch.
 Run on every node: python3 apply_deepgemm_situ_patch.py
 """
+
 P = "/usr/local/lib/python3.12/dist-packages/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh"
 
 OLD = """                        // Apply SwiGLU: silu(gate) * up
@@ -134,4 +135,6 @@ elif OLD in s:
     open(P, "w").write(s.replace(OLD, NEW))
     print("patched")
 else:
-    raise SystemExit("ERROR: expected SwiGLU epilogue block not found — header layout changed")
+    raise SystemExit(
+        "ERROR: expected SwiGLU epilogue block not found — header layout changed"
+    )

@@ -78,7 +78,10 @@ _tables = {}
 
 
 def _table(kind: str, device_name: str):
-    path = os.path.join(_CONFIG_DIR, f"{kind},E={NUM_EXPERTS},topk={TOPK},device_name={device_name}.json")
+    path = os.path.join(
+        _CONFIG_DIR,
+        f"{kind},E={NUM_EXPERTS},topk={TOPK},device_name={device_name}.json",
+    )
     if path not in _tables:
         table = None
         if os.path.exists(path):
@@ -130,7 +133,9 @@ def available() -> bool:
         _jit_module()
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
-        logging.getLogger(__name__).warning(f"Failed to load the JIT MoE front kernels: {e}")
+        logging.getLogger(__name__).warning(
+            f"Failed to load the JIT MoE front kernels: {e}"
+        )
         return False
 
 

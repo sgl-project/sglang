@@ -24,14 +24,14 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.kernels.ops.kimi_k3 import all_reduce
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
-from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.kernels.ops.kimi_k3 import all_reduce
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(
     est_time=240,
@@ -257,7 +257,10 @@ def _build_permuted_layout(num_tokens: int, seed: int):
     num_experts, tile = 896, 8
     gen = torch.Generator(device="cpu").manual_seed(seed)
     topk_ids = torch.stack(
-        [torch.randperm(num_experts, generator=gen)[:FIN_TOPK] for _ in range(num_tokens)]
+        [
+            torch.randperm(num_experts, generator=gen)[:FIN_TOPK]
+            for _ in range(num_tokens)
+        ]
     )
     counts = torch.bincount(topk_ids.flatten(), minlength=num_experts)
     padded = (counts + tile - 1) // tile * tile

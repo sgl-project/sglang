@@ -39,18 +39,20 @@ DEV = "cuda"
 
 # (bs, T, HV, H, K, V) -- cover GQA (H<HV), non-pow2 K/V, small T, single head.
 SHAPES = [
-    (16, 7, 4, 4, 64, 64),      # baseline square heads
+    (16, 7, 4, 4, 64, 64),  # baseline square heads
     (64, 7, 32, 32, 128, 128),  # K3-like TP8 shape
-    (8, 4, 8, 2, 128, 128),     # GQA: 4 v-heads per k-head
-    (4, 3, 6, 3, 96, 80),       # non-pow2 K/V, GQA 2:1
-    (1, 1, 4, 4, 64, 64),       # single req, single step
+    (8, 4, 8, 2, 128, 128),  # GQA: 4 v-heads per k-head
+    (4, 3, 6, 3, 96, 80),  # non-pow2 K/V, GQA 2:1
+    (1, 1, 4, 4, 64, 64),  # single req, single step
 ]
 SHAPE_IDS = ["square", "k3-tp8", "gqa4", "nonpow2", "single"]
 GATES = [(-5.0, "safe"), (None, "softplus")]
 
 
 @pytest.mark.parametrize("bs,T,HV,H,K,V", SHAPES, ids=SHAPE_IDS)
-@pytest.mark.parametrize("lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES])
+@pytest.mark.parametrize(
+    "lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES]
+)
 @pytest.mark.parametrize("pad", [False, True], ids=["nopad", "pad"])
 def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
     L = max(16, 2 * T)  # ring length; power-of-two backstop satisfied
@@ -115,8 +117,16 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
     acc = torch.full((bs,), T, device=DEV, dtype=torch.int32)
     ckpt = h0_src.clone()
     commit_kda_replayssm_spec(
-        ckpt, rawv, rawk, gring, betar, slots, acc,
-        max_cache_len=L, num_k_heads=H, use_qk_l2norm_in_kernel=True,
+        ckpt,
+        rawv,
+        rawk,
+        gring,
+        betar,
+        slots,
+        acc,
+        max_cache_len=L,
+        num_k_heads=H,
+        use_qk_l2norm_in_kernel=True,
         null_block_id=-1,
     )
 

@@ -23,22 +23,37 @@ from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
     commit_kda_replayssm_spec_all_layers,
 )
 
-NUM_LAYERS = 69      # K3 KDA layers per TP8 rank
-HV = H = 32          # K3 KDA heads per TP8 rank
+NUM_LAYERS = 69  # K3 KDA layers per TP8 rank
+HV = H = 32  # K3 KDA heads per TP8 rank
 K = V = 128
-L = 16               # ring length
-ACCEPT = 7           # dspark γ=7 committed prefix
+L = 16  # ring length
+ACCEPT = 7  # dspark γ=7 committed prefix
 
 
 def make_inputs(bs, device):
     torch.manual_seed(0)
     num_slots = bs + 1
     return dict(
-        temporal=torch.randn(NUM_LAYERS, num_slots, HV, V, K, device=device, dtype=torch.float32),
-        rawv=torch.randn(NUM_LAYERS, num_slots, HV, L, V, device=device, dtype=torch.bfloat16),
-        rawk=torch.randn(NUM_LAYERS, num_slots, H, L, K, device=device, dtype=torch.bfloat16),
-        gk=(-5.0) * torch.sigmoid(torch.randn(NUM_LAYERS, num_slots, HV, L, K, device=device, dtype=torch.float32)),
-        beta=torch.sigmoid(torch.randn(NUM_LAYERS, num_slots, HV, L, device=device, dtype=torch.float32)),
+        temporal=torch.randn(
+            NUM_LAYERS, num_slots, HV, V, K, device=device, dtype=torch.float32
+        ),
+        rawv=torch.randn(
+            NUM_LAYERS, num_slots, HV, L, V, device=device, dtype=torch.bfloat16
+        ),
+        rawk=torch.randn(
+            NUM_LAYERS, num_slots, H, L, K, device=device, dtype=torch.bfloat16
+        ),
+        gk=(-5.0)
+        * torch.sigmoid(
+            torch.randn(
+                NUM_LAYERS, num_slots, HV, L, K, device=device, dtype=torch.float32
+            )
+        ),
+        beta=torch.sigmoid(
+            torch.randn(
+                NUM_LAYERS, num_slots, HV, L, device=device, dtype=torch.float32
+            )
+        ),
         slots=torch.arange(1, bs + 1, device=device, dtype=torch.int32),
         accept=torch.full((bs,), ACCEPT, device=device, dtype=torch.int32),
     )
@@ -47,19 +62,31 @@ def make_inputs(bs, device):
 def run_per_layer(inp):
     for li in range(NUM_LAYERS):
         commit_kda_replayssm_spec(
-            checkpoint_state=inp["temporal"][li], rawv_cache=inp["rawv"][li],
-            rawk_cache=inp["rawk"][li], gk_cache=inp["gk"][li], beta_cache=inp["beta"][li],
-            ssm_state_indices=inp["slots"], accept_lens=inp["accept"],
-            max_cache_len=L, num_k_heads=H, null_block_id=-1,
+            checkpoint_state=inp["temporal"][li],
+            rawv_cache=inp["rawv"][li],
+            rawk_cache=inp["rawk"][li],
+            gk_cache=inp["gk"][li],
+            beta_cache=inp["beta"][li],
+            ssm_state_indices=inp["slots"],
+            accept_lens=inp["accept"],
+            max_cache_len=L,
+            num_k_heads=H,
+            null_block_id=-1,
         )
 
 
 def run_batched(inp):
     commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=inp["temporal"], rawv_cache=inp["rawv"], rawk_cache=inp["rawk"],
-        gk_cache=inp["gk"], beta_cache=inp["beta"],
-        ssm_state_indices=inp["slots"], accept_lens=inp["accept"],
-        max_cache_len=L, num_k_heads=H, null_block_id=-1,
+        checkpoint_state=inp["temporal"],
+        rawv_cache=inp["rawv"],
+        rawk_cache=inp["rawk"],
+        gk_cache=inp["gk"],
+        beta_cache=inp["beta"],
+        ssm_state_indices=inp["slots"],
+        accept_lens=inp["accept"],
+        max_cache_len=L,
+        num_k_heads=H,
+        null_block_id=-1,
     )
 
 
@@ -67,7 +94,11 @@ def run_batched(inp):
 @marker.benchmark("impl", ["per_layer", "batched"])
 def benchmark(bs: int, impl: str):
     inp = make_inputs(bs, "cuda")
-    fn = (lambda: run_per_layer(inp)) if impl == "per_layer" else (lambda: run_batched(inp))
+    fn = (
+        (lambda: run_per_layer(inp))
+        if impl == "per_layer"
+        else (lambda: run_batched(inp))
+    )
     return marker.do_bench(fn, use_cuda_graph=False, disable_log_bandwidth=True)
 
 

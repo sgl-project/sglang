@@ -48,7 +48,9 @@ _H = 2
 _K = 4
 _V = 4
 _SLOTS = 8
-_CONV_SHAPES = ((3, 8),)  # KDA conv layout [kernel-1, dim]; bf16 region pads the envelope
+_CONV_SHAPES = (
+    (3, 8),
+)  # KDA conv layout [kernel-1, dim]; bf16 region pads the envelope
 _CONV_DTYPE = torch.bfloat16
 _TEMPORAL_DTYPE = torch.float32
 # FlashKDA fused-path window: per-seq len must be in [chunk_size, max_seq_len].
@@ -135,9 +137,7 @@ class TestFlashKDAStridedStateAccess(unittest.TestCase):
         v = torch.randn(1, packed, _H, _V, dtype=torch.bfloat16)
         g = torch.randn(1, packed, _H, _K, dtype=torch.bfloat16)
         beta = torch.rand(1, packed, _H, dtype=torch.bfloat16) * 0.8 + 0.1
-        query_start_loc = torch.arange(
-            0, packed + 1, _SEQ_LEN, dtype=torch.int32
-        )
+        query_start_loc = torch.arange(0, packed + 1, _SEQ_LEN, dtype=torch.int32)
         return FlashKDAKernel().extend(
             q,
             k,

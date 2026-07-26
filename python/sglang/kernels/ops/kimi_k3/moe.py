@@ -9,6 +9,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+
 def _make_name(*args):
     return "kimi_k3_" + "_".join(str(a) for a in args)
 

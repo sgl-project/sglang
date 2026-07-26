@@ -171,9 +171,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
             unified.set_mla_kv_buffer(layer, _dense(locs, ps), nope, rope)
-            got_nope, got_rope = unified.get_mla_kv_buffer(
-                layer, _dense(locs, ps)
-            )
+            got_nope, got_rope = unified.get_mla_kv_buffer(layer, _dense(locs, ps))
             torch.cuda.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
@@ -192,8 +190,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
                 unified.set_kv_buffer(layer, _dense(src_t, ps), k, None)
             before = [
-                unified.get_key_buffer(l)[_dense(src_t, ps)].clone()
-                for l in range(_L)
+                unified.get_key_buffer(l)[_dense(src_t, ps)].clone() for l in range(_L)
             ]
             unified.move_kv_cache(dst_t, src_t)
             torch.cuda.synchronize()

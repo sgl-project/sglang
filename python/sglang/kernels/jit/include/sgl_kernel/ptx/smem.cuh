@@ -4,8 +4,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 // ================= common/ptx/smem.cuh =================
 // Shared-memory wrappers — only those without a clean C++ equivalent.
@@ -24,9 +24,7 @@
 //   specific cache hint (.cs / .cv) or to defeat compiler reordering, which
 //   we don't here.
 
-
 namespace ptx {
-
 
 // ldmatrix.sync.aligned.m8n8.x4.b16 — warp-collective load of
 // 4 × (8×8) BF16 matrices from smem into MMA-fragment registers.
@@ -45,24 +43,16 @@ namespace ptx {
 //
 // Mandatory `.sync.aligned`: every lane in the warp must execute the same
 // instruction with matching qualifiers.
-static SGL_DEVICE void ldmatrix_x4_b16(
-        uint32_t row_addr,
-        uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];"
-        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-        : "r"(row_addr));
+static SGL_DEVICE void ldmatrix_x4_b16(uint32_t row_addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(row_addr));
 }
 
 // ldmatrix.sync.aligned.m8n8.x2.b16 — warp-collective load of two 8x8
 // BF16 matrices from shared memory.
-static SGL_DEVICE void ldmatrix_x2_b16(
-        uint32_t row_addr, uint32_t& r0, uint32_t& r1) {
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.shared::cta.b16 {%0, %1}, [%2];"
-        : "=r"(r0), "=r"(r1)
-        : "r"(row_addr));
+static SGL_DEVICE void ldmatrix_x2_b16(uint32_t row_addr, uint32_t& r0, uint32_t& r1) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared::cta.b16 {%0, %1}, [%2];" : "=r"(r0), "=r"(r1) : "r"(row_addr));
 }
-
 
 }  // namespace ptx

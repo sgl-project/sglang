@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 // ================= common/ptx/cvt.cuh =================
 // Templated cvt wrappers — pack 2 FP32 inputs into the dst dtype's packed
@@ -74,16 +74,27 @@
 //
 // Spec: PTX ISA 9.2 §9.7.9.21. Per-format deep dive: ptx/d_cvt_pack/README.md.
 
-
 namespace ptx {
 
 // Tag types + their packed-pair container size.
-struct bf16  { using packed2_t = uint32_t; };   // bf16x2  = .b32
-struct f16   { using packed2_t = uint32_t; };   // f16x2   = .b32 (not exercised)
-struct e4m3  { using packed2_t = uint16_t; };   // e4m3x2  = .b16
-struct e5m2  { using packed2_t = uint16_t; };   // e5m2x2  = .b16
-struct e2m1  { using packed2_t = uint8_t;  };   // e2m1x2  = .b8
-struct ue8m0 { using packed2_t = uint16_t; };   // ue8m0x2 = .b16
+struct bf16 {
+  using packed2_t = uint32_t;
+};  // bf16x2  = .b32
+struct f16 {
+  using packed2_t = uint32_t;
+};  // f16x2   = .b32 (not exercised)
+struct e4m3 {
+  using packed2_t = uint16_t;
+};  // e4m3x2  = .b16
+struct e5m2 {
+  using packed2_t = uint16_t;
+};  // e5m2x2  = .b16
+struct e2m1 {
+  using packed2_t = uint8_t;
+};  // e2m1x2  = .b8
+struct ue8m0 {
+  using packed2_t = uint16_t;
+};  // ue8m0x2 = .b16
 
 // Forward declaration — instantiated via specializations.
 template <typename Dst>
@@ -91,9 +102,9 @@ static __device__ __forceinline__ typename Dst::packed2_t cvt_pack_f32x2_to(floa
 
 template <>
 __device__ __forceinline__ uint32_t cvt_pack_f32x2_to<bf16>(float a, float b) {
-    uint32_t d;
-    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(a), "f"(b));
-    return d;
+  uint32_t d;
+  asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(a), "f"(b));
+  return d;
 }
 
 // f16 specialization — packed pair via `cvt.rn.f16x2.f32`. Same packed-pair
@@ -103,47 +114,45 @@ __device__ __forceinline__ uint32_t cvt_pack_f32x2_to<bf16>(float a, float b) {
 // in single-rank kernels).
 template <>
 __device__ __forceinline__ uint32_t cvt_pack_f32x2_to<f16>(float a, float b) {
-    uint32_t d;
-    asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(a), "f"(b));
-    return d;
+  uint32_t d;
+  asm volatile("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(a), "f"(b));
+  return d;
 }
 
 template <>
 __device__ __forceinline__ uint16_t cvt_pack_f32x2_to<e4m3>(float a, float b) {
-    uint16_t d;
-    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
-                 : "=h"(d) : "f"(a), "f"(b));
-    return d;
+  uint16_t d;
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(d) : "f"(a), "f"(b));
+  return d;
 }
 
 template <>
 __device__ __forceinline__ uint16_t cvt_pack_f32x2_to<e5m2>(float a, float b) {
-    uint16_t d;
-    asm volatile("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;"
-                 : "=h"(d) : "f"(a), "f"(b));
-    return d;
+  uint16_t d;
+  asm volatile("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;" : "=h"(d) : "f"(a), "f"(b));
+  return d;
 }
 
 template <>
 __device__ __forceinline__ uint8_t cvt_pack_f32x2_to<e2m1>(float a, float b) {
-    // .b8 destination: declare a .b8 reg in inline-asm and surface via cvt.u32.u8.
-    uint32_t d;
-    asm volatile(
-        "{ .reg .b8 v;"
-        "  cvt.rn.satfinite.e2m1x2.f32 v, %1, %2;"
-        "  cvt.u32.u8 %0, v;"
-        "}"
-        : "=r"(d) : "f"(a), "f"(b));
-    return uint8_t(d & 0xffu);
+  // .b8 destination: declare a .b8 reg in inline-asm and surface via cvt.u32.u8.
+  uint32_t d;
+  asm volatile(
+      "{ .reg .b8 v;"
+      "  cvt.rn.satfinite.e2m1x2.f32 v, %1, %2;"
+      "  cvt.u32.u8 %0, v;"
+      "}"
+      : "=r"(d)
+      : "f"(a), "f"(b));
+  return uint8_t(d & 0xffu);
 }
 
 template <>
 __device__ __forceinline__ uint16_t cvt_pack_f32x2_to<ue8m0>(float a, float b) {
-    // Note: .rn is rejected by ptxas for ue8m0x2.f32 (despite the spec); use .rz.
-    uint16_t d;
-    asm volatile("cvt.rz.satfinite.ue8m0x2.f32 %0, %1, %2;"
-                 : "=h"(d) : "f"(a), "f"(b));
-    return d;
+  // Note: .rn is rejected by ptxas for ue8m0x2.f32 (despite the spec); use .rz.
+  uint16_t d;
+  asm volatile("cvt.rz.satfinite.ue8m0x2.f32 %0, %1, %2;" : "=h"(d) : "f"(a), "f"(b));
+  return d;
 }
 
 }  // namespace ptx

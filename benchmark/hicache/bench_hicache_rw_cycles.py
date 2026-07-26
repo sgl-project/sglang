@@ -85,9 +85,7 @@ def main() -> None:
         # Kimi-K3's hybrid radix cache materializes a complete KDA checkpoint
         # when the seed request has no decode tokens. Decode only on the
         # read/reread phases so the aligned sidecar checkpoint is published.
-        max_new_tokens = (
-            0 if phase in ("write", "filler") else args.max_new_tokens
-        )
+        max_new_tokens = 0 if phase in ("write", "filler") else args.max_new_tokens
         r = requests.post(
             f"{base}/generate",
             json={

@@ -748,9 +748,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if self.page_size == 1:
                 # dense = phys * multiplier; tombstone -1 scales negative → clamp 0.
                 if out is not None:
-                    tmp = torch.index_select(
-                        self.virtual_to_physical, 0, virt_tokens
-                    )
+                    tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
                     tmp = torch.clamp_min(tmp * dense_page_stride, 0)
                     out.copy_(tmp)
                     return out

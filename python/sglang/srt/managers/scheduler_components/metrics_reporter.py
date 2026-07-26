@@ -1014,9 +1014,7 @@ class SchedulerMetricsReporter:
         # logical units so usage stays in [0, 1]. logical_size == size when
         # dcp is off (always set in HostKVCache.__init__).
         host_total = host_pool.logical_size
-        self.stats.hicache_host_used_tokens = (
-            host_total - host_pool.available_size()
-        )
+        self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
 
     def _update_lora_metrics(self):

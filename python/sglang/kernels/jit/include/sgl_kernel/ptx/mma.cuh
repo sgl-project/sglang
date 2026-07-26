@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 // ================= common/ptx/mma.cuh =================
 // Warp-level mma.sync wrappers. PTX ISA 9.2 §9.7.14
@@ -13,21 +13,17 @@
 // pick for small/latency-bound and co-resident GEMMs
 // (recipes/gemm_design_guide §2.2/§2.3).
 
-
 namespace ptx {
-
 
 // mma.sync.aligned.m16n8k16.row.col bf16*bf16→f32, D += A·B. Same fragment
 // shape as the f16 form above (recipes/mma_sync_warp_gemm §Fragments).
-static __device__ __forceinline__ void mma_m16n8k16_bf16f32(
-        float4& d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-        uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
-        : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+static __device__ __forceinline__ void
+mma_m16n8k16_bf16f32(float4& d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+      : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-
 
 }  // namespace ptx
