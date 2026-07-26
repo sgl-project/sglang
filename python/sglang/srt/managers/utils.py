@@ -373,3 +373,29 @@ def msgpack_decode_explained(data: bytes) -> Any:
                 if 1 <= idx <= len(fields):
                     msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
         raise MsgpackDecodeError(rid, msg) from e
+
+
+def recompute_stop_regex_max_len(obj: Any) -> None:
+    """Re-derive ``stop_regex_max_len`` for a request the Rust server normalized.
+
+    That server sets ``is_normalized=True``, so ``SamplingParams.normalize`` will
+    early-return here and the bound it shipped came from ``regex-syntax`` — a
+    different dialect from ``re``, accepting patterns this interpreter rejects
+    (``\\p{L}``, ``(?<n>a)``) and vice versa (``\\Z``). Recomputing with
+    ``sre_parse`` corrects the bound and rejects an uncompilable pattern here,
+    where the caller answers the client, instead of letting the first
+    ``re.search`` of the decode loop raise ``re.error`` and take the scheduler
+    down.
+
+    Raises:
+        MsgpackDecodeError: so the caller's existing reject path returns a 400.
+    """
+    if (
+        not isinstance(obj, io_struct.TokenizedGenerateReqInput)
+        or obj.sampling_params is None
+    ):
+        return
+    try:
+        obj.sampling_params.recompute_stop_regex_max_len()
+    except re.error as e:
+        raise MsgpackDecodeError(obj.rid, f"invalid stop_regex: {e}") from e

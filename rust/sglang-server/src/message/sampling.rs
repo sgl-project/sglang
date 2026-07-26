@@ -249,9 +249,42 @@ impl<'de> Deserialize<'de> for SamplingParamsInput {
 
 impl Default for SamplingParams {
     fn default() -> Self {
-        // One source of defaults: the serde attributes above (an empty object
-        // deserializes to every field default).
-        serde_json::from_str("{}").expect("empty sampling_params object parses")
+        // Each field reads the same `default()` the serde attribute above names,
+        // so the values still live in one place — without re-parsing `{}` on
+        // every call (once per prompt of every params-less `/generate`). The
+        // struct literal makes completeness a compile error.
+        Self {
+            max_new_tokens: max_new_tokens_default(),
+            stop: None,
+            stop_token_ids: None,
+            stop_regex: None,
+            temperature: f64_one::default(),
+            top_p: f64_one::default(),
+            top_k: i64_top_k_all::default(),
+            min_p: f64_zero::default(),
+            frequency_penalty: f64_zero::default(),
+            presence_penalty: f64_zero::default(),
+            repetition_penalty: f64_one::default(),
+            min_new_tokens: i64_zero::default(),
+            n: i64_one::default(),
+            json_schema: None,
+            regex: None,
+            ebnf: None,
+            structural_tag: None,
+            ignore_eos: bool_false::default(),
+            skip_special_tokens: bool_true::default(),
+            spaces_between_special_tokens: bool_true::default(),
+            no_stop_trim: bool_false::default(),
+            custom_params: None,
+            stream_interval: None,
+            logit_bias: None,
+            sampling_seed: None,
+            stop_strs: Vec::new(),
+            stop_regex_strs: Vec::new(),
+            stop_str_max_len: 0,
+            stop_regex_max_len: 0,
+            is_normalized: false,
+        }
     }
 }
 
@@ -274,8 +307,9 @@ impl SamplingParams {
     /// null-tolerant deserializers above already did): copy the API aliases into
     /// the internal fields and apply the greedy / `top_k` special cases.
     fn post_init(&mut self) {
-        self.stop_strs = take_one_or_many(&self.stop);
-        self.stop_regex_strs = take_one_or_many(&self.stop_regex);
+        // Moved out, not cloned: `normalize_stops` clears both aliases anyway.
+        self.stop_strs = take_one_or_many(self.stop.take());
+        self.stop_regex_strs = take_one_or_many(self.stop_regex.take());
         // Python drops null entries and maps an empty set to None.
         if self.stop_token_ids.as_ref().is_some_and(|v| v.is_empty()) {
             self.stop_token_ids = None;
@@ -438,7 +472,7 @@ impl SamplingParams {
         // Python reads it, and the `/generate` body has no `n` of its own.
         if self.n != 1 {
             return Err(bad(format!(
-                "parallel sampling (n > 1) is not supported, got {}",
+                "n must be 1 (parallel sampling is not supported), got {}",
                 self.n
             )));
         }
@@ -451,11 +485,11 @@ fn bad(msg: String) -> Error {
 }
 
 /// Widen a `str | [str]` API alias into the list form the internal field holds.
-fn take_one_or_many(v: &Option<OneOrMany<String>>) -> Vec<String> {
+fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
     match v {
         None => Vec::new(),
-        Some(OneOrMany::One(s)) => vec![s.clone()],
-        Some(OneOrMany::Many(v)) => v.clone(),
+        Some(OneOrMany::One(s)) => vec![s],
+        Some(OneOrMany::Many(v)) => v,
     }
 }
 
