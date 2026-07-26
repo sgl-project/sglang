@@ -5,19 +5,45 @@ Two groups:
     the fused gate_qmv + silu + ×x_up kernel against the unfused reference
     (``mx.gather_qmm`` + ``nn.silu(gate) * x_up``) on both the unsorted and
     sorted paths. Gated by SGLANG_MLX_TEST_MODEL so CI hosts without a model
-    cache skip them.
+    cache skip them (stage-a sets HF_HUB_OFFLINE=1, so they stay skipped there).
   * Synthetic eligibility (no model, MLX only): the learned-bias fallback. The
     fused kernel recomputes the gate matmul and has no slot for the per-expert
     learned bias QuantizedSwitchLinear adds after the matmul, so ``can_fuse``
     must exclude a gate carrying one, and the patch must leave such a layer
-    unfused. These run whenever MLX is importable.
+    unfused. These run wherever MLX is available (Apple Silicon).
+
+Registered on the CPU suite but skipped wherever mlx is absent; runs for real
+only on Apple Silicon via stage-a-unit-test-mlx.
 """
 
+import importlib.util
 import os
+import platform
+import sys
 
 import pytest
 
-mx = pytest.importorskip("mlx.core")
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_mlx_ci(est_time=45, suite="stage-a-unit-test-mlx")
+
+_IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
+_HAS_MLX = (
+    importlib.util.find_spec("mlx") is not None
+    and importlib.util.find_spec("mlx_lm") is not None
+)
+
+# Module-level skip (not pytest.importorskip): the CI runner executes this file
+# as `python3 file.py`, where a top-level Skipped from importorskip would escape
+# uncaught and exit non-zero before pytest.main() ever runs.
+pytestmark = pytest.mark.skipif(
+    not (_IS_APPLE_SILICON and _HAS_MLX),
+    reason="Apple-Silicon-only test (requires Darwin/arm64 + mlx + mlx_lm)",
+)
+
+if _HAS_MLX:
+    import mlx.core as mx
 
 
 # Model-based tests need a real checkpoint; synthetic tests below do not.
@@ -462,3 +488,7 @@ def test_forced_kernel_rejection_falls_back_correctly(monkeypatch):
                 atol=1e-6,
             ).item()
         ), f"forced rejection {label}: max_abs={max_abs:.3e} rel={rel:.2%}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
