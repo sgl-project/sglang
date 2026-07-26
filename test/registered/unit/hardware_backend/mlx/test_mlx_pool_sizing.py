@@ -707,5 +707,68 @@ class TestMlxProbeCalibration(unittest.TestCase):
         self.assertIsNone(r._max_safe_prefill_chunk)
 
 
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestStubSchedulerCapComposition(unittest.TestCase):
+    """initialize() composes the scheduler cap: _resolve_max_running_requests
+    (honors --max-running-requests and the aux-state bound) capped by the
+    runner's memory-safe value when the runner auto-sized the pool.
+
+    Stubs are built via __new__ like the resolver tests in
+    test_max_running_requests.py, which also regression-guards the
+    class-attribute default for _mlx_max_running_requests: an
+    __init__-bypassing harness must not hit AttributeError in initialize().
+    """
+
+    def _stub_for_initialize(self):
+        from sglang.srt.hardware_backend.mlx import model_runner_stub as mrs
+
+        stub = mrs.MlxModelRunnerStub.__new__(mrs.MlxModelRunnerStub)
+        stub._mlx_pool_size = 100
+        stub.dp_size = 1
+        stub.device = "cpu"
+        stub.server_args = types.SimpleNamespace(
+            enable_memory_saver=False,
+            max_running_requests=None,
+            max_mamba_cache_size=None,
+            disable_radix_cache=True,
+        )
+        stub.model_config = types.SimpleNamespace(
+            is_hybrid_swa=False,
+            sliding_window_size=None,
+            attention_chunk_size=None,
+            dtype="float16",
+            num_hidden_layers=1,
+            num_attention_layers=1,
+            context_len=64,
+            use_ngram_embedding=False,
+        )
+        return stub
+
+    @contextlib.contextmanager
+    def _plain_arch(self):
+        from sglang.srt.hardware_backend.mlx import model_runner_stub as mrs
+
+        with mock.patch.object(mrs, "mambaish_config", lambda cfg: None):
+            yield
+
+    def test_runner_memory_safe_value_caps_the_resolver(self):
+        stub = self._stub_for_initialize()
+        stub._mlx_max_running_requests = 3
+        with self._plain_arch():
+            stub.initialize()
+        # The resolver default is min(100 // 2, 4096) = 50; the runner's
+        # memory-safe bound must win.
+        self.assertEqual(stub.max_running_requests, 3)
+
+    def test_without_runner_value_resolver_default_stands(self):
+        # No instance attribute set at all: relies on the class-attribute
+        # default (None), exactly how __init__-bypassing harnesses construct
+        # stubs.
+        stub = self._stub_for_initialize()
+        with self._plain_arch():
+            stub.initialize()
+        self.assertEqual(stub.max_running_requests, 50)
+
+
 if __name__ == "__main__":
     unittest.main()

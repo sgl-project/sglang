@@ -106,6 +106,11 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
+    # initialize() reads this unconditionally. Tests construct the stub via
+    # __new__ (bypassing __init__), so default it as a class attribute to keep
+    # those harnesses working instead of raising AttributeError.
+    _mlx_max_running_requests = None
+
     def __init__(
         self,
         *args,
