@@ -222,6 +222,43 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+@dataclass(frozen=True)
+class DualTransformerBlockAdapterSpec:
+    """BlockAdapter metadata for dual-transformer DiT pipelines.
+
+    This describes the cache-dit-facing structure of a pair of transformers.
+    The denoising loop semantics live in DenoisingStage; this spec only covers
+    how cache-dit should find blocks and interpret each block's forward.
+    """
+
+    blocks_attr: tuple[str, str]
+    blocks_name: Optional[List[str]]
+    forward_pattern: List[ForwardPattern]
+    check_forward_pattern: bool
+    check_num_outputs: bool
+    has_separate_cfg: bool
+
+
+DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec] = {
+    "wan2.2": DualTransformerBlockAdapterSpec(
+        blocks_attr=("blocks", "blocks"),
+        blocks_name=None,
+        forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
+        check_forward_pattern=True,
+        check_num_outputs=False,
+        has_separate_cfg=True,
+    ),
+    "ideogram4": DualTransformerBlockAdapterSpec(
+        blocks_attr=("layers", "layers"),
+        blocks_name=["layers", "layers"],
+        forward_pattern=[ForwardPattern.Pattern_3, ForwardPattern.Pattern_3],
+        check_forward_pattern=False,
+        check_num_outputs=False,
+        has_separate_cfg=False,
+    ),
+}
+
+
 # Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
 # Value: (blocks attr, forward_pattern). forward_pattern must
 # match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
@@ -404,9 +441,10 @@ def enable_cache_on_dual_transformer(
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
-    For models with two transformers (high-noise expert and low-noise expert),
-    cache-dit requires enabling cache on both simultaneously via BlockAdapter.
-    This cannot be done by calling enable_cache separately on each transformer.
+    For models with two transformers, cache-dit requires enabling cache on both
+    simultaneously via BlockAdapter. The two transformers may be split by denoising
+    range, or run as paired conditional/unconditional branches. This cannot be done
+    by calling enable_cache separately on each transformer.
 
     Args:
         primary_config: CacheDitConfig for primary transformer.
@@ -414,14 +452,11 @@ def enable_cache_on_dual_transformer(
         sp_group: Sequence parallel process group (for Ulysses/Ring).
         tp_group: Tensor parallel process group.
     """
-    _supported_dual_transformer_models = [
-        "wan2.2",
-        "ideogram4",
-    ]
-    if model_name not in _supported_dual_transformer_models:
+    adapter_spec = DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS.get(model_name)
+    if adapter_spec is None:
         raise ValueError(
             f"Dual-transformer cache-dit is only supported for "
-            f"{_supported_dual_transformer_models}, got {model_name}."
+            f"{sorted(DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS)}, got {model_name}."
         )
 
     if not primary_config.enabled:
@@ -533,46 +568,28 @@ def enable_cache_on_dual_transformer(
         transformer_2, parallelism_config, sp_group, tp_group
     )
 
-    if model_name == "wan2.2":
-        transformer_blocks = getattr(transformer, "blocks", None)
-        transformer_2_blocks = getattr(transformer_2, "blocks", None)
-        blocks_name = None
-        forward_pattern = [ForwardPattern.Pattern_2, ForwardPattern.Pattern_2]
-        check_forward_pattern = True
-        check_num_outputs = False
-        has_separate_cfg = True
-    elif model_name == "ideogram4":
-        transformer_blocks = getattr(transformer, "layers", None)
-        transformer_2_blocks = getattr(transformer_2, "layers", None)
-        blocks_name = ["layers", "layers"]
-        forward_pattern = [ForwardPattern.Pattern_3, ForwardPattern.Pattern_3]
-        check_forward_pattern = False
-        check_num_outputs = False
-        has_separate_cfg = False
-    else:
-        raise ValueError(
-            f"Dual-transformer is not implemented for model {model_name} yet."
-        )
-
+    transformer_blocks_attr, transformer_2_blocks_attr = adapter_spec.blocks_attr
+    transformer_blocks = getattr(transformer, transformer_blocks_attr, None)
+    transformer_2_blocks = getattr(transformer_2, transformer_2_blocks_attr, None)
     if transformer_blocks is None or transformer_2_blocks is None:
-        expected_attr = "layers" if model_name == "ideogram4" else "blocks"
         raise ValueError(
-            f"Dual transformers for {model_name} must have '{expected_attr}' "
-            "attribute for cache-dit. "
-            f"transformer has {expected_attr}: {transformer_blocks is not None}, "
-            f"secondary transformer has {expected_attr}: {transformer_2_blocks is not None}"
+            f"Dual transformers for {model_name} must expose cache-dit block "
+            f"attributes {adapter_spec.blocks_attr}. "
+            f"transformer has {transformer_blocks_attr}: "
+            f"{transformer_blocks is not None}, secondary transformer has "
+            f"{transformer_2_blocks_attr}: {transformer_2_blocks is not None}"
         )
 
     cache_dit.enable_cache(
         BlockAdapter(
             transformer=[transformer, transformer_2],
             blocks=[transformer_blocks, transformer_2_blocks],
-            blocks_name=blocks_name,
-            forward_pattern=forward_pattern,
+            blocks_name=adapter_spec.blocks_name,
+            forward_pattern=adapter_spec.forward_pattern,
             params_modifiers=[primary_modifier, secondary_modifier],
-            check_forward_pattern=check_forward_pattern,
-            check_num_outputs=check_num_outputs,
-            has_separate_cfg=has_separate_cfg,
+            check_forward_pattern=adapter_spec.check_forward_pattern,
+            check_num_outputs=adapter_spec.check_num_outputs,
+            has_separate_cfg=adapter_spec.has_separate_cfg,
         ),
         parallelism_config=None,
     )

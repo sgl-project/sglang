@@ -190,23 +190,23 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=80 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=80,
             ),
         ):
@@ -366,11 +366,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                         return_value=None,
                     ),
                     patch(
-                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                        "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                         return_value=80 * 1024**3,
                     ),
                     patch(
-                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                        "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                         return_value=80,
                     ),
                 ):
@@ -510,6 +510,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         warmup=False,
         server_warmup=False,
         warmup_resolutions=None,
+        enable_torch_compile=False,
         disagg_role=None,
         explicit=(),
     ):
@@ -520,6 +521,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa.warmup = warmup
         sa.server_warmup = server_warmup
         sa.warmup_resolutions = warmup_resolutions
+        sa.enable_torch_compile = enable_torch_compile
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
         sa._explicit_arg_names = set(explicit)
         sa._adjust_warmup()
@@ -589,11 +591,39 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
+    def test_torch_compile_defaults_to_server_warmup(self):
+        sa = self._resolve(enable_torch_compile=True)
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
     def test_legacy_warmup_on_uses_defaulted_server_mode(self):
         # `serve --warmup` (legacy ON, mode defaulted to "server" but not
         # explicit) must resolve to server-based warmup, not silently downgrade
         # to request mode.
         sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
+
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_torch_compile_respects_explicit_warmup_off(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            enable_torch_compile=True,
+            explicit=("warmup_mode",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_torch_compile_uses_server_warmup_for_explicit_resolutions(self):
+        sa = self._resolve(
+            warmup_resolutions=["1024x1024"],
+            enable_torch_compile=True,
+            explicit=("warmup_resolutions",),
+        )
         self.assertEqual(sa.warmup_mode, "server")
         self.assertTrue(sa.warmup)
         self.assertTrue(sa.server_warmup)
@@ -623,6 +653,14 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertTrue(sa.warmup)
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_torch_compile_server_warmup_disabled_for_disagg_role(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(enable_torch_compile=True, disagg_role=RoleType.DENOISER)
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
 
     def test_invalid_mode_raises(self):
         with self.assertRaises(ValueError):
@@ -668,27 +706,27 @@ class TestOffloadDefaults(unittest.TestCase):
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 side_effect=get_available_gpu_memory,
             ),
         ):
@@ -706,19 +744,19 @@ class TestOffloadDefaults(unittest.TestCase):
         with (
             patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=memory_gb,
             ),
         ):
@@ -1575,23 +1613,23 @@ class TestOffloadDefaults(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=80 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=80,
             ),
         ):
@@ -1619,23 +1657,23 @@ class TestOffloadDefaults(unittest.TestCase):
                 PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
                 return_value=False,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=140 * 1024**3,
             ),
             patch(
-                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
                 return_value=134,
             ),
         ):
@@ -1817,9 +1855,9 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
         self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
-    def test_disagg_args_import_path_stays_compatible(self):
+    def test_disagg_args_import_path_matches_server_args_package(self):
         from sglang.multimodal_gen.runtime.disaggregation import disagg_args
-        from sglang.multimodal_gen.runtime.server_args_disagg import (
+        from sglang.multimodal_gen.runtime.server_args.disagg import (
             DisaggServerArgsMixin,
         )
 
