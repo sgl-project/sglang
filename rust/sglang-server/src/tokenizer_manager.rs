@@ -1,7 +1,7 @@
 //! TokenizerManager — owns the request lifecycle across two isolated threads:
 //!
 //!   * [`ingress`] — drives the ingress FSM (Received → Validating →
-//!     Normalizing → {Tokenizing | Queued}) and pushes tokenized requests to the
+//!     Normalizing → {Tokenizing | PreSendValidating}) and pushes tokenized requests to the
 //!     scheduler ring.
 //!   * [`egress`] — drains the scheduler-output ring and routes each chunk to
 //!     the owning detokenizer shard.
@@ -14,7 +14,7 @@ mod egress;
 mod ingress;
 
 pub use egress::{ActivityCounter, Egress};
-pub use ingress::Ingress;
+pub use ingress::{Ingress, Limits};
 
 use crate::ids::RidHash;
 use crate::message::{DetokMsg, Request};
@@ -33,7 +33,7 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
 pub enum TmEvent {
     /// A freshly received request from the API server.
     Ingress(Request),
-    /// A request back from the tokenizer pool: `Queued` (ids filled) on success,
+    /// A request back from the tokenizer pool: `PreSendValidating` (ids filled) on success,
     /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
     /// Client disconnected: forwarded to the scheduler as an `AbortReq` so

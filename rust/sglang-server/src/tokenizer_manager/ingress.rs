@@ -8,10 +8,11 @@
 //! Edges driven here (from the design table):
 //!   Received      → Validating
 //!   Validating    → Normalizing   (generate: sampling-param normalize/verify)
-//!   Validating    → Queued        (control: no tokenize, no sampling params)
-//!   Normalizing   → {Encoding | Tokenizing | Queued}   (by ValidationOutcome)
-//!   Tokenizing    → Queued        (on TokenizeDone, when the request returns)
-//!   Queued        → ring          (handed to the scheduler)
+//!   Validating    → PreSendValidating   (control: no tokenize, no sampling params)
+//!   Normalizing   → {Encoding | Tokenizing | PreSendValidating}  (by ValidationOutcome)
+//!   Tokenizing    → PreSendValidating   (on TokenizeDone, when the request returns)
+//!   PreSendValidating → Queued          (checks needing the tokenized length)
+//!   Queued        → ring                (handed to the scheduler)
 //!
 //! The egress edges (Streaming/Finalizing/Completed) are driven on the egress
 //! side (see `egress` + `detokenizer`).
@@ -22,7 +23,8 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RidHash;
 use crate::message::{
-    AbortReq, ControlRequest, DetokMsg, EgressItem, IngressMsg, Request, RequestKind,
+    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
+    RequestKind,
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
@@ -35,11 +37,43 @@ pub struct Ingress {
     rx: flume::Receiver<TmEvent>,
     senders: Senders,
     ingress: IngressProducer,
-    skip_tokenizer_init: bool,
-    /// `model_config.vocab_size`; bounds client-supplied token ids in
-    /// `validate` (`None` → unknown, checks skipped).
-    vocab_size: Option<u64>,
+    limits: Limits,
     shutdown: flume::Receiver<()>,
+}
+
+/// What ingress admits, resolved once at boot from the scheduler's `server_args`.
+/// A struct rather than more positional `new` arguments — these grew from two to
+/// six, and every one of them is an `Option<u64>`/`bool` that would be trivial to
+/// swap at a call site.
+#[derive(Clone, Debug, Default)]
+pub struct Limits {
+    /// Token-ids-in mode: a generate request must arrive already tokenized.
+    pub skip_tokenizer_init: bool,
+    /// `model_config.vocab_size`; bounds client-supplied token ids
+    /// (`None` → unknown, checks skipped).
+    pub vocab_size: Option<u64>,
+    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`
+    /// (`None` → unknown, check skipped).
+    pub context_len: Option<u64>,
+    /// Output slots reserved on top of the input (eagle draft tokens).
+    pub num_reserved_tokens: u64,
+    /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
+    pub allow_auto_truncate: bool,
+    /// Whether the server can produce hidden states at all.
+    pub enable_return_hidden_states: bool,
+}
+
+impl Limits {
+    pub fn from_server_args(sa: &crate::runtime::ServerArgs) -> Self {
+        Self {
+            skip_tokenizer_init: sa.skip_tokenizer_init,
+            vocab_size: sa.model_config.vocab_size,
+            context_len: sa.model_config.context_len,
+            num_reserved_tokens: sa.num_reserved_tokens,
+            allow_auto_truncate: sa.allow_auto_truncate,
+            enable_return_hidden_states: sa.enable_return_hidden_states,
+        }
+    }
 }
 
 impl Ingress {
@@ -47,16 +81,14 @@ impl Ingress {
         rx: flume::Receiver<TmEvent>,
         senders: Senders,
         ingress: IngressProducer,
-        skip_tokenizer_init: bool,
-        vocab_size: Option<u64>,
+        limits: Limits,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
             rx,
             senders,
             ingress,
-            skip_tokenizer_init,
-            vocab_size,
+            limits,
             shutdown,
         }
     }
@@ -102,7 +134,7 @@ impl Ingress {
                 // Validate, then register the sink before the request leaves Rust.
                 // Failures move to `Failed` and fall through to the reject arm.
                 RequestState::Received => {
-                    if let Err(e) = validate(&mut req, self.skip_tokenizer_init, self.vocab_size) {
+                    if let Err(e) = validate(&mut req, &self.limits) {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
@@ -114,7 +146,8 @@ impl Ingress {
                     }
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control skips straight to Queued; generate goes to Normalizing.
+                // Control skips normalization (no sampling params) straight to the
+                // pre-send checks; generate goes to Normalizing.
                 RequestState::Validating => match &req.kind {
                     RequestKind::Control(_) => {
                         let _ = req
@@ -140,10 +173,10 @@ impl Ingress {
                         };
                         match g
                             .sampling_params
-                            .normalize(self.skip_tokenizer_init, self.vocab_size)
+                            .normalize(self.limits.skip_tokenizer_init, self.limits.vocab_size)
                         {
                             Err(e) => Err(e),
-                            // Client ids skip the pool (→ Queued); text is tokenized.
+                            // Client ids skip the pool; text goes to the tokenizer.
                             Ok(()) if g.already_tokenized() => {
                                 Ok(ValidationOutcome::AlreadyTokenized)
                             }
@@ -161,7 +194,8 @@ impl Ingress {
                     }
                 }
                 // Hand off to the tokenizer pool; it returns the request as a
-                // `Tokenized` event (Queued, or Failed on error). Doesn't loop.
+                // `Tokenized` event (PreSendValidating, or Failed on error).
+                // Doesn't loop.
                 RequestState::Tokenizing => {
                     if let Err(err) = self.senders.tok.send(req) {
                         // Pool gone (workers exited); flume hands the request back.
@@ -169,6 +203,20 @@ impl Ingress {
                         self.fail(&mut req, Error::Internal("tokenizer pool gone".into()));
                     }
                     return;
+                }
+                // The checks that need the final `input_ids`: every branch
+                // converges here (client ids arrive directly, text arrives from
+                // the tokenizer pool), so they run once per request regardless of
+                // how it was tokenized. `validate` runs too early — at `Received`
+                // a text request has no ids yet.
+                RequestState::PreSendValidating => {
+                    if let RequestKind::Generate(g) = &mut req.kind
+                        && let Err(e) = check_total_tokens(g, &self.limits)
+                    {
+                        let _ = req.state.apply(Event::Error(e)); // → Failed
+                        continue;
+                    }
+                    let _ = req.state.apply(Event::PreSendValidated); // → Queued
                 }
                 // Push the wire message (control frame or generate payload) to the ring.
                 RequestState::Queued => {
@@ -307,11 +355,8 @@ impl Ingress {
 /// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
 /// generate request must already carry token ids (no tokenizer to byte-encode
 /// text); control requests carry none and are exempt.
-fn validate(
-    req: &mut Request,
-    skip_tokenizer_init: bool,
-    vocab_size: Option<u64>,
-) -> Result<(), Error> {
+fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
+    let (skip_tokenizer_init, vocab_size) = (limits.skip_tokenizer_init, limits.vocab_size);
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
@@ -349,7 +394,54 @@ fn validate(
         }
     }
 
+    // The scheduler only computes hidden states when launched for it, so without
+    // this the request would 200 with `meta_info.hidden_states` silently absent
+    // (Python `TokenizerManager._validate_one_request`).
+    if !limits.enable_return_hidden_states
+        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states == Some(true))
+    {
+        return Err(Error::Validation(
+            "The server is not configured to return the hidden states. \
+             Please set `--enable-return-hidden-states` to enable this feature."
+                .into(),
+        ));
+    }
+
     Ok(())
+}
+
+/// `input + max_new_tokens` must fit the context window (Python
+/// `TokenizerManager._validate_one_request`, "Validate total tokens"). Without it
+/// the scheduler silently clamps `max_new_tokens` and the client gets a 200 with a
+/// truncated completion instead of an actionable 400.
+///
+/// Under `allow_auto_truncate` we clamp too — but Python's way, from a value the
+/// client can compute, and it is the launch flag that opted into it.
+fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
+    let (Some(max_req_len), Some(max_new_tokens)) =
+        (limits.context_len, g.sampling_params.max_new_tokens)
+    else {
+        return Ok(()); // context length unknown, or no cap requested
+    };
+    // Python counts the reserved slots as part of the input, so a request can be
+    // rejected for them even when the prompt alone fits.
+    let input_len =
+        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
+    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
+    if total <= max_req_len {
+        return Ok(());
+    }
+    if limits.allow_auto_truncate {
+        g.sampling_params.max_new_tokens = Some(max_req_len.saturating_sub(input_len) as i64);
+        return Ok(());
+    }
+    Err(Error::Validation(format!(
+        "Requested token count exceeds the model's maximum context length of \
+         {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
+         tokens from the input messages and {max_new_tokens} tokens for the \
+         completion. Please reduce the number of tokens in the input messages or \
+         the completion to fit within the limit."
+    )))
 }
 
 #[cfg(test)]
@@ -368,6 +460,17 @@ mod tests {
         IngressConsumer,
         flume::Sender<TmEvent>,
     ) {
+        make_ingress_with(test_limits())
+    }
+
+    fn make_ingress_with(
+        limits: Limits,
+    ) -> (
+        Ingress,
+        flume::Receiver<DetokMsg>,
+        IngressConsumer,
+        flume::Sender<TmEvent>,
+    ) {
         let (tok_tx, _tok_rx) = flume::unbounded();
         let (detok_tx, detok_rx) = flume::unbounded();
         let senders = Senders {
@@ -381,8 +484,16 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, senders, ingress_producer, false, Some(1000), sd_rx);
+        let ingress = Ingress::new(tm_rx, senders, ingress_producer, limits, sd_rx);
         (ingress, detok_rx, consumer, tm_tx)
+    }
+
+    /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
+    fn test_limits() -> Limits {
+        Limits {
+            vocab_size: Some(1000),
+            ..Default::default()
+        }
     }
 
     fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
@@ -399,6 +510,149 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    /// `input + max_new_tokens` past the context window is an actionable 400, not a
+    /// silently truncated 200 (Python `TokenizerManager._validate_one_request`).
+    /// The message names both halves so the client can fix the right one.
+    #[test]
+    fn total_tokens_over_context_is_rejected() {
+        let limits = Limits {
+            context_len: Some(10),
+            ..test_limits()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(100),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = check_total_tokens(&mut g, &limits).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.http_status(), 400);
+        assert!(msg.contains("total of 103 tokens"), "{msg}");
+        assert!(msg.contains("3 tokens from the input"), "{msg}");
+        assert!(msg.contains("100 tokens for the completion"), "{msg}");
+        // Exactly filling the window is allowed (Python compares with `>`).
+        g.sampling_params.max_new_tokens = Some(7);
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
+    }
+
+    /// The reserved slots (eagle draft tokens) count as input, so a request can be
+    /// rejected for them even when the prompt alone would fit.
+    #[test]
+    fn reserved_tokens_count_toward_the_limit() {
+        let limits = Limits {
+            context_len: Some(10),
+            num_reserved_tokens: 5,
+            ..test_limits()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(3), // 3 + 3 fits, but 3 + 5 + 3 does not
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let msg = check_total_tokens(&mut g, &limits).unwrap_err().to_string();
+        assert!(msg.contains("8 tokens from the input"), "{msg}");
+    }
+
+    /// `--allow-auto-truncate` opts into clamping instead of rejecting; with no
+    /// context length, or no `max_new_tokens` cap, there is nothing to check.
+    #[test]
+    fn auto_truncate_clamps_and_unknowns_skip() {
+        let sp = |max_new_tokens| SamplingParams {
+            max_new_tokens,
+            ..Default::default()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]),
+            sampling_params: sp(Some(100)),
+            ..Default::default()
+        };
+        let truncating = Limits {
+            context_len: Some(10),
+            allow_auto_truncate: true,
+            ..test_limits()
+        };
+        assert!(check_total_tokens(&mut g, &truncating).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(7), "clamped to fit");
+
+        // Unknown context length → no ceiling to enforce.
+        g.sampling_params = sp(Some(100));
+        assert!(check_total_tokens(&mut g, &test_limits()).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(100), "untouched");
+
+        // No cap requested → nothing to add to the input length.
+        g.sampling_params = sp(None);
+        let capped = Limits {
+            context_len: Some(1),
+            ..test_limits()
+        };
+        assert!(check_total_tokens(&mut g, &capped).is_ok());
+    }
+
+    /// `return_hidden_states` on a server not launched for it is a 400: the
+    /// scheduler never computes them, so the request would otherwise 200 with
+    /// `meta_info.hidden_states` silently missing.
+    #[test]
+    fn hidden_states_gated_on_server_support() {
+        let req = |want| {
+            let mut r = generate_req(31, SamplingParams::default());
+            if let RequestKind::Generate(g) = &mut r.kind {
+                g.return_hidden_states = want;
+            }
+            r
+        };
+        let disabled = test_limits();
+        let err = validate(&mut req(Some(true)), &disabled).unwrap_err();
+        assert_eq!(err.http_status(), 400);
+        assert!(
+            err.to_string().contains("--enable-return-hidden-states"),
+            "message must name the flag: {err}"
+        );
+        // Not asking for them, or asking on a server that supports them, is fine.
+        assert!(validate(&mut req(Some(false)), &disabled).is_ok());
+        assert!(validate(&mut req(None), &disabled).is_ok());
+        let enabled = Limits {
+            enable_return_hidden_states: true,
+            ..test_limits()
+        };
+        assert!(validate(&mut req(Some(true)), &enabled).is_ok());
+    }
+
+    /// End-to-end through `drive`: an over-context request is rejected on the way
+    /// to the ring, after registration — so it must be deregistered, not leaked.
+    #[test]
+    fn over_context_request_deregisters_and_never_reaches_the_ring() {
+        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress_with(Limits {
+            context_len: Some(4),
+            ..test_limits()
+        });
+        ingress.drive(generate_req(
+            33,
+            SamplingParams {
+                max_new_tokens: Some(64),
+                ..Default::default()
+            },
+        ));
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(33)),
+            "registered before the check",
+        );
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid_hash }) if rid_hash == RidHash(33)),
+            "must deregister on reject",
+        );
+        assert!(
+            consumer.drain(16).headers.is_empty(),
+            "must not reach the scheduler"
+        );
     }
 
     /// A request rejected at normalization (post-register) must not leak: the shard
@@ -535,11 +789,11 @@ mod tests {
     fn tokenized_return_pushes_without_deregister() {
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
         let mut req = generate_req(15, SamplingParams::default());
-        // Simulate a successful pool return: ids filled, Queued.
+        // Simulate a successful pool return: ids filled, PreSendValidating.
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![1, 2, 3]);
         }
-        req.state = RequestState::Queued;
+        req.state = RequestState::PreSendValidating;
         tm_tx.send(TmEvent::Tokenized(req)).unwrap();
         drop(tm_tx);
         ingress.run();
