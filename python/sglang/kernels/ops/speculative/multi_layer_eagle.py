@@ -760,7 +760,7 @@ def fill_draft_extend_prepare_buffers_native(
 ):
     """Native PyTorch implementation of fill_draft_extend_prepare_buffers.
 
-    Used on Ascend NPU where the triton mega-kernel triggers CCU errors.
+    Used on NPU where the triton mega-kernel triggers CCU errors.
     Mirrors the triton kernel's semantics exactly.
     """
     num_tokens = src_input_ids.shape[0]
