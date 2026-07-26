@@ -15,10 +15,12 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -399,3 +401,21 @@ def recompute_stop_regex_max_len(obj: Any) -> None:
         obj.sampling_params.recompute_stop_regex_max_len()
     except re.error as e:
         raise MsgpackDecodeError(obj.rid, f"invalid stop_regex: {e}") from e
+
+
+def compute_num_reserved_tokens(server_args: ServerArgs) -> int:
+    """Output token slots reserved per request, on top of its input.
+
+    The current eagle implementation stores draft tokens in the output token
+    slots, so the context budget has to account for them; every other algorithm
+    reserves nothing. Shared by `TokenizerManager` and the rust server's
+    `server_args` blob (`RustServer._build_server_args`), which needs the same
+    number to run the total-token check in Rust.
+    """
+    algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if not algorithm.is_eagle():
+        return 0
+    return max(
+        server_args.speculative_eagle_topk * server_args.speculative_num_steps,
+        server_args.max_speculative_num_draft_tokens,
+    )
