@@ -31,7 +31,7 @@ from .common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
-    _resolve_local_or_cached_file,
+    resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     download_from_hf,
     get_tokenizer_from_processor,
@@ -72,7 +72,7 @@ def _build_processor_manually(
     proc_ref = auto_map.get("AutoProcessor")
     if not proc_ref:
         try:
-            pp_file = _resolve_local_or_cached_file(
+            pp_file = resolve_local_or_cached_file(
                 model_path, "preprocessor_config.json", revision
             )
             with open(pp_file) as f:

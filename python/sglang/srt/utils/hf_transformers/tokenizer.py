@@ -31,7 +31,7 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
-    _resolve_local_or_cached_file,
+    resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
     resolve_runai_obj_uri,
@@ -62,7 +62,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
 
     try:
         revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
-        config_file = _resolve_local_or_cached_file(
+        config_file = resolve_local_or_cached_file(
             tokenizer_name, "tokenizer_config.json", revision
         )
         with open(config_file) as f:
@@ -273,7 +273,7 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
     try:
         from tokenizers import Tokenizer as RawTokenizer
 
-        tok_file = _resolve_local_or_cached_file(
+        tok_file = resolve_local_or_cached_file(
             model_name_or_path, "tokenizer.json", revision
         )
         raw = RawTokenizer.from_file(tok_file)
@@ -337,7 +337,7 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
     )
 
     try:
-        config_file = _resolve_local_or_cached_file(
+        config_file = resolve_local_or_cached_file(
             model_name_or_path, "tokenizer_config.json", revision
         )
         with open(config_file) as f:
