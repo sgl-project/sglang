@@ -204,9 +204,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Replaces the eager torch ring-write in kda_backend; gate/beta now come
         # from the kernel itself (bit-identical to the state update). rawk uses the
         # k-head i_h (shared across a GQA group); rawv/g/beta use the v-head i_hv.
+        # step_idx < MAX_CACHE_LEN: absorb-inflated rows can exceed the ring;
+        # the overflow steps are past the committable prefix, so drop them
+        # (writing them would smash the next slot's ring).
         if CACHE_RING:
             ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
-            if ring_slot >= 0:
+            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot

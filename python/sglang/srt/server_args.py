@@ -6040,17 +6040,25 @@ class ServerArgs:
 
             ragged_mode = read_ragged_verify_mode()
             if ragged_mode is not RaggedVerifyMode.STATIC:
-                # The ring is written only on the dense verify layout; every
-                # non-static mode (compact, cap-accept) builds a ragged layout that
-                # skips the ring-write, and there is no intermediate_ssm fallback ->
-                # commit would fold a stale ring into the SSM state.
-                raise ValueError(
-                    "--enable-linear-replayssm-spec (ReplaySSM) requires the dense "
-                    f"verify layout, but SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value}: "
-                    "the per-slot ring is written only on the dense layout, so a "
-                    "ragged-mode commit would fold a stale ring into the SSM state. "
-                    "Use SGLANG_RAGGED_VERIFY_MODE=static."
-                )
+                # Ragged ring-writes need the KDA fold-every-commit family
+                # (DSPARK/DFLASH) + the triton verify kernel (nv_cutedsl falls
+                # back to it for ragged layouts). The GDN circular ring
+                # (cursor-advanced) and the flashinfer verify kernel (no
+                # ring-write) would fold a stale ring -> keep refusing.
+                verify = self.linear_attn_verify_backend
+                if _algo not in ("DSPARK", "DFLASH") or verify not in (
+                    "triton",
+                    "nv_cutedsl",
+                ):
+                    raise ValueError(
+                        "--enable-linear-replayssm-spec with "
+                        f"SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value} requires the "
+                        "KDA fold-every-commit family (DSPARK/DFLASH) and a "
+                        "ring-writing verify kernel (--linear-attn-verify-backend "
+                        "triton or nv_cutedsl); got "
+                        f"algorithm={self.speculative_algorithm!r}, "
+                        f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
+                    )
             if self.disaggregation_mode == "prefill":
                 raise ValueError(
                     "--enable-linear-replayssm-spec is not supported on a PD "

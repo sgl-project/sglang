@@ -799,18 +799,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        # ReplaySSM (fold-every-commit): store the draft window's raw inputs into
-        # the per-slot ring so commit replays the accepted prefix into the fp32
-        # checkpoint, replacing the per-step intermediate_ssm. Dense verify only
-        # (there is no intermediate_ssm fallback under replayssm); the compact/
-        # ragged tier is refused at startup (see server_args).
-        # the ReplaySSM ring-write is fused into the verify kernel (CACHE_RING)
-        # -- it stores pre-norm k / raw v / in-kernel gate / beta per step from the
-        # values the recurrent kernel already holds, replacing the eager torch
-        # scatter. Dense verify only; ring_kwargs is empty otherwise (and for
-        # non-triton verify kernels, which never see replayssm).
+        # ReplaySSM: the ring-write is fused into the triton verify kernel
+        # (CACHE_RING). Ragged layouts work natively -- step_idx is the
+        # within-row step under varlen, so row i writes
+        # ring[slot][0..verify_lens[i]) and commit folds at most commit_lens
+        # of them (absorb overflow is bounded in-kernel). ring_kwargs stays
+        # empty for non-triton verify kernels, which never see replayssm.
         ring_kwargs = {}
-        if replayssm_rawv is not None and ragged_layout is None:
+        if replayssm_rawv is not None:
             ring_kwargs = dict(
                 cache_ring=True,
                 replayssm_rawv=replayssm_rawv,
