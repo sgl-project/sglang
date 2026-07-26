@@ -206,14 +206,14 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
 ) -> None:
-    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for CUDA graph
+    replay (FlashInfer fa2 only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
-    replay. The caller passes host-known qo/kv layout in, so we call the underlying
-    ``_cached_module.plan`` directly with no readback; the ``_plan_info`` produced
-    is identical to plan()'s.
+    replay. The caller passes exact or conservative host-known scheduling metadata,
+    so we call ``_cached_module.plan`` directly with no readback. Device indptr and
+    indices remain authoritative for attention addressing.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
     assert (
@@ -299,6 +299,13 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
+        self._enable_dflash_sync_free_decode = (
+            envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
+            and model_runner.spec_algorithm.is_dflash()
+        )
+        self._dflash_fast_plan_kind = (
+            "draft" if model_runner.is_draft_worker else "target_verify"
+        )
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -802,6 +809,29 @@ class FlashInferAttnBackend(AttentionBackend):
             # plan() above set up _cached_module (host metadata supplied per-replay
             # in call_begin_forward).
             for w in self.draft_extend_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
+        if (
+            in_capture
+            and forward_mode.is_target_verify()
+            and self._enable_dflash_sync_free_decode
+            and (
+                (
+                    self._dflash_fast_plan_kind == "draft"
+                    and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                )
+                or (
+                    self._dflash_fast_plan_kind == "target_verify"
+                    and self.dispatch_reason is None
+                )
+            )
+            and self.prefill_backend == "fa2"
+        ):
+            # The draft worker uses two sliding-window wrappers, while the
+            # Qwen3.5 target uses one full-attention FlashInfer wrapper. Both
+            # can rebuild scheduling metadata from CPU-known sequence lengths.
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w._sglang_dflash_fast_prefill_plan_kind = self._dflash_fast_plan_kind
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1819,6 +1849,9 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
+        paged_kernel_lens_cpu = (
+            seq_lens_cpu if not use_ragged and seq_lens_cpu is not None else None
+        )
 
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
@@ -1836,6 +1869,7 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            paged_kernel_lens_cpu=paged_kernel_lens_cpu,
             custom_kv_indices=custom_kv_indices,
         )
 
@@ -1870,10 +1904,12 @@ class FlashInferIndicesUpdaterPrefill:
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
+        prefix_lens_is_seq_lens = prefix_lens is seq_lens
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
+            paged_kernel_lens_cpu = None
             if wrapper_id == 0:
                 if use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
@@ -1895,12 +1931,20 @@ class FlashInferIndicesUpdaterPrefill:
                         seq_lens,
                         sliding_window_size + seq_lens - prefix_lens,
                     )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    if seq_lens_cpu is not None and prefix_lens_is_seq_lens:
+                        paged_kernel_lens_cpu = torch.clamp(
+                            seq_lens_cpu, max=sliding_window_size
+                        )
+                        paged_kernel_lens_sum = int(paged_kernel_lens_cpu.sum())
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
                 paged_kernel_lens_sum = seq_lens_sum
+                if seq_lens_cpu is not None and prefix_lens_is_seq_lens:
+                    paged_kernel_lens_cpu = seq_lens_cpu
                 kv_start_idx = seq_lens - paged_kernel_lens
             use_sliding_window_kv_pool = (
                 wrapper_id == 0 and self._swa_kv_pool is not None
@@ -1923,6 +1967,8 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                seq_lens_cpu=seq_lens_cpu,
+                paged_kernel_lens_cpu=paged_kernel_lens_cpu,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2045,6 +2091,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        paged_kernel_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
     ):
@@ -2157,6 +2204,11 @@ class FlashInferIndicesUpdaterPrefill:
             hasattr(wrapper_paged.begin_forward, "func")
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
+        dflash_fast_plan_kind = getattr(
+            wrapper_paged,
+            "_sglang_dflash_fast_prefill_plan_kind",
+            None,
+        )
         if uses_fast_prefill:
             assert (
                 seq_lens_cpu is not None
@@ -2164,7 +2216,23 @@ class FlashInferIndicesUpdaterPrefill:
             assert (
                 num_tokens_per_req is not None and num_tokens_per_req > 0
             ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            is_dflash_fast_prefill = (
+                spec_info is not None
+                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                and dflash_fast_plan_kind in ("draft", "target_verify")
+            )
+            if is_dflash_fast_prefill:
+                assert paged_kernel_lens_cpu is not None, (
+                    "DFlash fast_prefill_plan requires CPU-known paged "
+                    "kernel lengths; prefix_lens must default to seq_lens"
+                )
+                # These conservative host lengths only produce FlashInfer
+                # scheduling metadata; device indptr remains authoritative.
+                kv_lens_host = (
+                    paged_kernel_lens_cpu.to(torch.int32) + num_tokens_per_req
+                )
+            else:
+                kv_lens_host = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2173,13 +2241,13 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
+                kv_lens_host=kv_lens_host,
                 max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
+                max_kv_len=int(kv_lens_host.max()),
             )
 
         if window_left >= 0:

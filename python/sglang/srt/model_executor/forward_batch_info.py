@@ -1119,20 +1119,89 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            use_gpu_cache = (
+                envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
+                and self.spec_algorithm is not None
+                and self.spec_algorithm.is_dflash()
+            )
+            if use_gpu_cache:
+                mrope_deltas = [
+                    (
+                        torch.zeros(1, dtype=torch.int64, device=device)
+                        if mm_inputs[i] is None
+                        else self._get_or_create_mrope_delta_gpu_cache(
+                            mm_inputs[i], device
+                        ).squeeze(0)
+                    )
+                    for i in range(batch_size)
+                ]
+                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
+            else:
+                mrope_deltas = [
+                    (
+                        torch.zeros(1, dtype=torch.int64)
+                        if mm_inputs[i] is None
+                        else mm_inputs[i].mrope_position_delta.squeeze(0)
+                    )
+                    for i in range(batch_size)
+                ]
+                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
 
         self.mrope_positions = next_input_positions
+
+    @staticmethod
+    def _canonical_mrope_cache_device(device) -> torch.device:
+        target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None:
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        return target_device
+
+    @classmethod
+    def _get_or_create_mrope_delta_gpu_cache(
+        cls, mm_input: MultimodalInputs, device
+    ) -> torch.Tensor:
+        source = mm_input.mrope_position_delta
+        if source is None:
+            raise RuntimeError("DFlash MRoPE GPU cache requires mrope_position_delta")
+
+        target_device = cls._canonical_mrope_cache_device(device)
+        try:
+            source_version = source._version
+        except RuntimeError:
+            # Inference tensors do not expose a version counter. Reassignment
+            # is still detected by source id; these metadata tensors are immutable.
+            source_version = None
+        cache = mm_input.mrope_position_delta_gpu_cache
+        cache_is_valid = (
+            cache is not None
+            and cache.device == target_device
+            and cache.dtype == source.dtype
+            and cache.shape == source.shape
+            and mm_input.mrope_position_delta_gpu_cache_source_id == id(source)
+            and mm_input.mrope_position_delta_gpu_cache_source_version == source_version
+        )
+        if not cache_is_valid:
+            cache = source.to(device=target_device, non_blocking=True)
+            mm_input.mrope_position_delta_gpu_cache = cache
+            mm_input.mrope_position_delta_gpu_cache_source_id = id(source)
+            mm_input.mrope_position_delta_gpu_cache_source_version = source_version
+        return cache
+
+    def _prewarm_dflash_mrope_delta_gpu_cache(
+        self, model_runner: ModelRunner, batch: ScheduleBatch
+    ) -> None:
+        if (
+            not envs.SGLANG_DFLASH_SYNC_FREE_DECODE.get()
+            or self.spec_algorithm is None
+            or not self.spec_algorithm.is_dflash()
+        ):
+            return
+        for mm_input in batch.multimodal_inputs:
+            if mm_input is not None and mm_input.mrope_position_delta is not None:
+                self._get_or_create_mrope_delta_gpu_cache(mm_input, model_runner.device)
 
     def _expand_mrope_from_input(
         self,
@@ -1160,6 +1229,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
+        # Populate the tiny per-request delta cache during prefill, before the
+        # speculative decode loop can leave draft work queued on the CUDA stream.
+        self._prewarm_dflash_mrope_delta_gpu_cache(model_runner, batch)
+
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
