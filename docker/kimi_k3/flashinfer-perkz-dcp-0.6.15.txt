@@ -3,7 +3,7 @@ index f41976df..c56b21c5 100644
 --- a/flashinfer/cute_dsl/attention/mla_dispatch.py
 +++ b/flashinfer/cute_dsl/attention/mla_dispatch.py
 @@ -9,8 +9,10 @@ controlled by the ``cute_dsl_impl`` kwarg, with three valid values:
- 
+
  * ``"auto"`` (default) — library picks the right implementation.
    Monolithic by default, automatically promoted to modular when the call
 -  uses a feature monolithic doesn't support (currently: ``sinks``).
@@ -24,13 +24,13 @@ index f41976df..c56b21c5 100644
 +    "cp_rank",
 +    "causal_seqlens_kv_global",
 +)
- 
- 
+
+
  def _has_modular_only_feature(kwargs: dict) -> Optional[str]:
 @@ -56,6 +64,45 @@ def _has_modular_only_feature(kwargs: dict) -> Optional[str]:
      return None
- 
- 
+
+
 +def _validate_dcp_kwargs(kwargs: dict) -> bool:
 +    """Validate dispatcher-level DCP selection and return whether it is enabled.
 +
@@ -72,14 +72,14 @@ index f41976df..c56b21c5 100644
 +
  def _resolve_impl(*, requested: str, kwargs: dict) -> str:
      """Map a user request and call kwargs to a concrete impl name.
- 
+
 @@ -67,9 +114,19 @@ def _resolve_impl(*, requested: str, kwargs: dict) -> str:
              f"Invalid cute_dsl_impl={requested!r}; expected one of {VALID_IMPLS}"
          )
- 
+
 +    enable_dcp = _validate_dcp_kwargs(kwargs)
      needs_modular = _has_modular_only_feature(kwargs)
- 
+
 +    if enable_dcp and needs_modular is not None:
 +        raise ValueError(
 +            f"DCP cannot be combined with {needs_modular!r}: DCP requires the "
@@ -91,12 +91,12 @@ index f41976df..c56b21c5 100644
 +        if enable_dcp:
 +            return "monolithic"
          return "modular" if needs_modular is not None else _DEFAULT_IMPL
- 
+
      if requested == "monolithic" and needs_modular is not None:
 @@ -80,6 +137,13 @@ def _resolve_impl(*, requested: str, kwargs: dict) -> str:
              f"right impl based on the call) or cute_dsl_impl='modular'."
          )
- 
+
 +    if requested == "modular" and enable_dcp:
 +        raise ValueError(
 +            "cute_dsl_impl='modular' was requested with enable_dcp=True, but "
@@ -105,8 +105,8 @@ index f41976df..c56b21c5 100644
 +        )
 +
      return requested  # "modular" or "monolithic"
- 
- 
+
+
 @@ -91,18 +155,19 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
      :func:`flashinfer.cute_dsl.attention.wrappers.batch_mla.cute_dsl_mla_decode`
      (modular, supports ``sinks=``) and
@@ -116,7 +116,7 @@ index f41976df..c56b21c5 100644
 +    (monolithic, supports static DCP). Implementation-specific keyword
 +    arguments are validated before dispatch and stripped only when their
 +    default values make them irrelevant to the selected implementation.
- 
+
      Parameters
      ----------
      cute_dsl_impl : str, default ``"auto"``
@@ -132,7 +132,7 @@ index f41976df..c56b21c5 100644
 +        feature request.
      """
      impl = _resolve_impl(requested=cute_dsl_impl, kwargs=kwargs)
- 
+
 @@ -122,5 +187,8 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
          kwargs = {k: v for k, v in kwargs.items() if k not in MODULAR_ONLY_KWARGS}
          from .monolithic.mla_decode import cute_dsl_mla_decode as _impl
@@ -147,7 +147,7 @@ index cb491ae1..eb9be701 100644
 --- a/flashinfer/cute_dsl/attention/monolithic/mla_decode.py
 +++ b/flashinfer/cute_dsl/attention/monolithic/mla_decode.py
 @@ -32,6 +32,7 @@ from flashinfer.utils import device_support_pdl
- 
+
  from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
  from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 +from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout
@@ -156,8 +156,8 @@ index cb491ae1..eb9be701 100644
      get_max_active_clusters,
 @@ -40,6 +41,60 @@ from flashinfer.cute_dsl.utils import (
  )
- 
- 
+
+
 +_CUDA_GRID_Y_MAX = 65_535
 +_REDUCER_D_TILE_CANDIDATES = (1, 2, 4)
 +_STATIC_REDUCER_MAX_SPLITS = 32
@@ -258,7 +258,7 @@ index cb491ae1..eb9be701 100644
 +        mma_qk_tile_m, num_q_tiles, kv_lora_rank, B, split_kv, cutlass.Float32
      )
      return split_kv, workspace_size
- 
+
 @@ -79,8 +144,19 @@ def _check_can_implement(
      is_persistent: bool,
      is_var_seq: bool,
@@ -278,7 +278,7 @@ index cb491ae1..eb9be701 100644
 +
      mma_qk_tiler_mn = (128, 128)
      mma_pv_tiler_mn = (128, 256)
- 
+
 @@ -129,15 +205,20 @@ def _get_compiled_mla_kernel(
      is_persistent: bool,
      is_var_seq: bool,
@@ -292,19 +292,19 @@ index cb491ae1..eb9be701 100644
 +    cp_world: int = 1,
  ) -> Callable:
      """Compile and cache an MLA decode kernel.
- 
+
      Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
      page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
 -    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
 +    causal_seqlens_kv_global, cp_rank_scalar, block_split_kvs,
 +    softmax_scale_scalar, output_scale_scalar).
- 
+
      All scalar arguments must be pre-wrapped as Int32/Float32.
      """
 @@ -157,14 +238,6 @@ def _get_compiled_mla_kernel(
      cutlass_dtype = torch_to_cutlass_dtype(torch_dtype)
      cutlass_out_dtype = torch_to_cutlass_dtype(torch_out_dtype)
- 
+
 -    # Derive the seq_len_q-into-heads fold factor.  F > 1 means the kernel
 -    # repacks the [H, S_q] tile to [H*F, S_q/F] internally so MTP / spec-decoding
 -    # with H < 128 fully populates the 128-wide MMA-M tile.
@@ -326,7 +326,7 @@ index cb491ae1..eb9be701 100644
 +        enable_dcp=enable_dcp,
 +        cp_world=cp_world,
      )
- 
+
      # All dimensions as sym_int — this matches the original kernel's use of
 @@ -271,6 +347,18 @@ def _get_compiled_mla_kernel(
          (sym_batch,),
@@ -366,11 +366,11 @@ index cb491ae1..eb9be701 100644
 +    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
  ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
      """CuTe DSL MLA decode kernel for Blackwell SM100.
- 
+
 @@ -336,8 +430,9 @@ def cute_dsl_mla_decode(
          Pre-allocated workspace buffer (int8 or uint8). Required size depends on batch size
          and split_kv (auto-computed from B, q_len, and number of SMs):
- 
+
 -        - Formula: ``B * H * q_len * split_kv * (kv_lora_rank + 1) * 4`` bytes
 -          (0 when split_kv == 1, which happens when B >= num_SMs / 2)
 +        - Formula: ``B * 128 * q_tiles * split_kv * (kv_lora_rank + 1) * 4``
@@ -391,7 +391,7 @@ index cb491ae1..eb9be701 100644
 @@ -375,13 +470,25 @@ def cute_dsl_mla_decode(
          * ``[B * q_len, H]`` (matches ``trtllm-gen`` shape; the wrapper
            reshapes via ``.view`` to the native layout).
- 
+
 +        Caller-provided buffers must be contiguous.
 +
          If ``return_lse`` is True and this is None, a buffer of the native
@@ -426,7 +426,7 @@ index cb491ae1..eb9be701 100644
 +        )
      B, q_len, H, D_qk = query.shape
      assert D_qk == kv_lora_rank + qk_rope_head_dim
- 
+
 +    if not isinstance(enable_dcp, bool):
 +        raise TypeError(f"enable_dcp must be a bool, got {type(enable_dcp).__name__}")
 +    if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
@@ -507,7 +507,7 @@ index cb491ae1..eb9be701 100644
 @@ -415,7 +601,8 @@ def cute_dsl_mla_decode(
          kv_cache = kv_cache.squeeze(1)
      page_size = kv_cache.shape[1]
- 
+
 -    # Split query into latent and rope components — keep contiguous [B, q_len, H, D].
 +    # Split query into latent and rope components.  The slices share the flat
 +    # affine token/head row stride established above.
@@ -521,7 +521,7 @@ index cb491ae1..eb9be701 100644
 -        B, q_len, H, kv_lora_rank, max_active_blocks
 +        B, q_len, H, kv_lora_rank, max_active_blocks, max_seq_len
      )
- 
+
 +    _, num_q_tiles, _ = compute_q_tile_layout(H, q_len)
 +    is_persistent = not is_var_seq
 +    _validate_nonpersistent_grid_y(B, num_q_tiles, is_persistent)
@@ -547,7 +547,7 @@ index cb491ae1..eb9be701 100644
 @@ -486,9 +685,6 @@ def cute_dsl_mla_decode(
      block_split_kvs = None
      skip_correction_threshold = 0.0
- 
+
 -    # for fix-length, set is_persistent to True; otherwise, set to False.
 -    is_persistent = not is_var_seq
 -
@@ -561,7 +561,7 @@ index cb491ae1..eb9be701 100644
 +        enable_dcp=enable_dcp,
 +        cp_world=cp_world,
      )
- 
+
      enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 @@ -519,9 +717,13 @@ def cute_dsl_mla_decode(
          is_persistent=is_persistent,
@@ -575,7 +575,7 @@ index cb491ae1..eb9be701 100644
 +        enable_dcp=enable_dcp,
 +        cp_world=cp_world,
      )
- 
+
      # Call the kernel
 @@ -536,6 +738,8 @@ def cute_dsl_mla_decode(
          workspace_bytes,
@@ -591,7 +591,7 @@ index 8e33acee..8202fb3b 100644
 --- a/flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py
 +++ b/flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py
 @@ -77,6 +77,7 @@ from cutlass.cutlass_dsl import BaseDSL
- 
+
  from .mla_helpers import (
      ceil_div,
 +    compute_q_tile_layout,
@@ -599,7 +599,7 @@ index 8e33acee..8202fb3b 100644
      LOG2_E,
      MLAStaticTileScheduler,
 @@ -108,15 +109,17 @@ launcher and ``flashinfer/cute_dsl/attention/mla_dispatch.py`` for impl selectio
- 
+
  Constraints:
  * Data type requirements:
 -  - Input/output: Float16
@@ -630,7 +630,7 @@ index 8e33acee..8202fb3b 100644
 +        cp_world: int = 1,
      ):
          """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
- 
+
 @@ -164,17 +170,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          :type is_var_split_kv: bool
          :param enable_pdl: Whether to use PDL
@@ -663,7 +663,7 @@ index 8e33acee..8202fb3b 100644
 +            compile-time parameter when DCP is enabled.
 +        :type cp_world: int
          """
- 
+
          self.latent_dim = 512
 @@ -189,25 +202,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          self.page_size = page_size
@@ -758,7 +758,7 @@ index 8e33acee..8202fb3b 100644
 +        # Keep unpacked output aliases for the split-KV reducer, which
 +        # launches only real (head, q_token) rows.
 +        o_unpacked = o
- 
+
          # Reinterpret contiguous [num_pages, page_size, D] as [page_size, D, num_pages]
          # Input stride: (PS*D, D, 1) → Target: (D, 1, PS*D)
 @@ -419,54 +458,62 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
@@ -766,7 +766,7 @@ index 8e33acee..8202fb3b 100644
              ),
          )
 +        lse_unpacked = lse
- 
+
 -        # When num_heads < M tile, fold up to F = fold_sq_ratio tokens of
 -        # seq_len_q into the head dimension so M_eff = num_heads * F (≤ M_tile).
 -        # E.g., H=32, S_q=4 → F=4, M_eff=128, S_q_eff=1
@@ -816,7 +816,7 @@ index 8e33acee..8202fb3b 100644
 +                    stride=(t.stride[0], t.stride[1], t.stride[3]),
                  ),
              )
- 
+
 +        q_latent = _flatten_q_rows(q_latent)
 +        q_rope = _flatten_q_rows(q_rope)
 +
@@ -991,9 +991,9 @@ index 8e33acee..8202fb3b 100644
 +                    )
                  tile_sched.advance_to_next_work()
                  work_tile = tile_sched.get_current_work()
- 
+
          return
- 
+
 +    @cute.jit
 +    def store_empty_dcp_work(
 +        self,
@@ -1080,7 +1080,7 @@ index 8e33acee..8202fb3b 100644
 +        else:
 +            k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
 +            local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
- 
+
          # Alloc shared memory
          smem = utils.SmemAllocator()
 -        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
@@ -1090,7 +1090,7 @@ index 8e33acee..8202fb3b 100644
 +        smem_lse_scale = cute.make_tensor(
 +            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
 +        )
- 
+
          if cutlass.const_expr(self.enable_pdl):
              cute.arch.griddepcontrol_wait()
 -        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
@@ -1102,7 +1102,7 @@ index 8e33acee..8202fb3b 100644
 +            lse_per_thread = cute.ceil_div(
 +                self.reducer_max_splits, self.threads_per_warp
 +            )
- 
+
              local_lse = cute.make_rmem_tensor(
                  cute.make_layout(lse_per_thread), self.lse_dtype
 @@ -1439,39 +1593,61 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
@@ -1172,9 +1172,9 @@ index 8e33acee..8202fb3b 100644
 +                        smem_lse_scale[split_kv_idx] = cute.math.exp2(
 +                            local_lse[i] - global_lse, fastmath=True
 +                        )
- 
+
          pipeline.sync(barrier_id=4)
- 
+
          elements_per_thread = cute.ceil_div(
 -            self.latent_dim, self.threads_per_warp * self.num_compute_warps
 +            self.reducer_d_tile, self.threads_per_warp * self.num_compute_warps
@@ -1209,7 +1209,7 @@ index 8e33acee..8202fb3b 100644
 @@ -1665,7 +1849,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          # page table
          mPT = common_params.mPT[None, common_params.blk_coord[2]]
- 
+
 -        # Flatten divide and partition global tensors for QK TMA load
 +        # The single flattened descriptor is bounded by S_q * H.  It can load
 +        # across token boundaries and zero-fills only the final M128 tail.
@@ -1235,7 +1235,7 @@ index 8e33acee..8202fb3b 100644
 @@ -1742,11 +1925,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
              tSgKR,
          )
- 
+
 +        # Q is flattened as (Sq * Hq, D, B).  The logical query-tile
 +        # coordinate therefore lives in the residual-M mode created by
 +        # flat_divide, rather than in a separate grouped-query mode.
@@ -1247,12 +1247,12 @@ index 8e33acee..8202fb3b 100644
 -            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
 +            None, common_params.blk_coord[1], None, common_params.blk_coord[2]
          ]
- 
+
          # Flatten divide and partition global tensors for V TMA load
 @@ -1837,6 +2023,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
              load_pt_release_state,
          )
- 
+
 +    @cute.jit
 +    def issue_q_tma_load(
 +        self,
@@ -1318,14 +1318,14 @@ index 8e33acee..8202fb3b 100644
 @@ -2361,24 +2567,48 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
          """
- 
+
 -        k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
 -
          row_max = -self.acc_dtype.inf
          row_sum = self.acc_dtype(0)
          correction_factor = self.acc_dtype(1)
          common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
- 
+
 -        # Number of tiles from the global-K end that may contain causal-masked
 -        # positions. Min k_bound = K - (S_q-1), which can span up to
 -        # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
@@ -1373,13 +1373,13 @@ index 8e33acee..8202fb3b 100644
 +                (common_params.K - self.seq_len_q + 1 + first_q_token) // tile_n,
 +                cutlass.Int32(0),
 +            )
- 
+
          # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
          while k_tile_count > 1 and k_index < first_mask_tile_idx:
 @@ -2431,52 +2661,28 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
              k_index = k_index + 1
              k_tile_count = k_tile_count - 1
- 
+
 -        # Phase 3: this work-split's final tile.
 -        if cutlass.const_expr(common_params.mAccO is not None):
 -            # Split-KV: only apply mask when this final tile is globally in
@@ -1448,9 +1448,9 @@ index 8e33acee..8202fb3b 100644
 +            k_index >= first_mask_tile_idx,
 +            True,
 +        )
- 
+
          return mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state
- 
+
 @@ -2635,8 +2841,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          :param correction_factor: The correction factor
          :type correction_factor: cutlass.Float32
@@ -1464,7 +1464,7 @@ index 8e33acee..8202fb3b 100644
          :type is_local_last_tile: cutlass.Boolean
 @@ -2680,40 +2886,49 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
          tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
- 
+
          row_max_new = row_max
 -        # Spec-decoding (MTP) causal mask: each row represents one (q_token, head)
 -        # pair; row r's effective K bound is K - (S_q - 1 - q_tok(r)).
@@ -1536,7 +1536,7 @@ index 8e33acee..8202fb3b 100644
 -                    )
              # reduction for row_max
              row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
- 
+
 @@ -2741,23 +2956,34 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
              tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
              if apply_mask:
@@ -1589,7 +1589,7 @@ index 8e33acee..8202fb3b 100644
 @@ -3173,15 +3399,45 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
              # load o
              cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
- 
+
 +            row_has_key = True
 +            if cutlass.const_expr(self.enable_dcp):
 +                # The coordinate tensor returned by local_tile already carries
@@ -1636,7 +1636,7 @@ index 8e33acee..8202fb3b 100644
 +                        * epilogue_params.output_scale
 +                        * cute.arch.rcp_approx(row_sum)
 +                    )
- 
+
              # store o to global memory
              tR2G_rO_src = None
 @@ -3262,6 +3518,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
@@ -1649,9 +1649,9 @@ index 8e33acee..8202fb3b 100644
              # no split-KV merge), convert from log2 base to natural log.
              # When writing the per-split intermediate (mAccLSE branch), keep
 @@ -3504,25 +3762,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
- 
+
          return tile_sched_params, grid
- 
+
 -    @staticmethod
 -    def compute_fold_sq_ratio(num_heads: int, seq_len_q: int, m_tile: int) -> int:
 -        """Derive the seq_len_q-into-heads fold factor F.
@@ -1689,7 +1689,7 @@ index 8e33acee..8202fb3b 100644
 +        # used by initialize_workspace(). The flat internal path passes 128.
 +        workspace_rows = max(H, 128)
 +        return B * workspace_rows * S * split_kv * (D + 1) * acc_dtype.width // 8
- 
+
      @cute.jit
      def initialize_workspace(
 @@ -3593,29 +3831,29 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
@@ -1752,7 +1752,7 @@ index f79683bc..f0aa6e72 100644
 --- a/flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py
 +++ b/flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py
 @@ -75,6 +75,7 @@ from cutlass.cutlass_dsl import BaseDSL
- 
+
  from .mla_helpers import (
      ceil_div,
 +    compute_q_tile_layout,
@@ -1760,7 +1760,7 @@ index f79683bc..f0aa6e72 100644
      LOG2_E,
      MLAStaticTileScheduler,
 @@ -106,15 +107,17 @@ launcher and ``flashinfer/cute_dsl/attention/mla_dispatch.py`` for impl selectio
- 
+
  Constraints:
  * Data type requirements:
 -  - Input/output: Float8E4M3FN
@@ -1791,7 +1791,7 @@ index f79683bc..f0aa6e72 100644
 +        cp_world: int = 1,
      ):
          """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
- 
+
 @@ -162,17 +168,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
          :type is_var_split_kv: bool
          :param enable_pdl: Whether to use PDL
@@ -1824,7 +1824,7 @@ index f79683bc..f0aa6e72 100644
 +            to global key ``k * cp_world + cp_rank``.
 +        :type cp_world: int
          """
- 
+
          self.latent_dim = 512
 @@ -187,25 +200,36 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
          self.page_size = page_size
@@ -1938,7 +1938,7 @@ index f79683bc..f0aa6e72 100644
 +        # Keep unpacked output aliases for the split-KV reducer, which
 +        # launches only real (head, q_token) rows.
 +        o_unpacked = o
- 
+
          # Reinterpret contiguous [num_pages, page_size, D] as [page_size, D, num_pages]
          # Input stride: (PS*D, D, 1) → Target: (D, 1, PS*D)
 @@ -461,54 +500,53 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
@@ -1946,7 +1946,7 @@ index f79683bc..f0aa6e72 100644
              ),
          )
 +        lse_unpacked = lse
- 
+
 -        # When num_heads < M tile, fold up to F = fold_sq_ratio tokens of
 -        # seq_len_q into the head dimension so M_eff = num_heads * F (≤ M_tile).
 -        # E.g., H=32, S_q=4 → F=4, M_eff=128, S_q_eff=1
@@ -1996,7 +1996,7 @@ index f79683bc..f0aa6e72 100644
 +                    stride=(t.stride[0], t.stride[1], t.stride[3]),
                  ),
              )
- 
+
 +        q_latent = _flatten_q_rows(q_latent)
 +        q_rope = _flatten_q_rows(q_rope)
 +
@@ -2198,7 +2198,7 @@ index f79683bc..f0aa6e72 100644
                  tile_sched.advance_to_next_work()
                  work_tile = tile_sched.get_current_work()
          return
- 
+
 +    @cute.jit
 +    def store_empty_dcp_work(
 +        self,
@@ -2285,7 +2285,7 @@ index f79683bc..f0aa6e72 100644
 +        else:
 +            k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
 +            local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
- 
+
          # Alloc shared memory
          smem = utils.SmemAllocator()
 -        storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
@@ -2295,7 +2295,7 @@ index f79683bc..f0aa6e72 100644
 +        smem_lse_scale = cute.make_tensor(
 +            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
 +        )
- 
+
          if cutlass.const_expr(self.enable_pdl):
              cute.arch.griddepcontrol_wait()
 -        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
@@ -2307,7 +2307,7 @@ index f79683bc..f0aa6e72 100644
 +            lse_per_thread = cute.ceil_div(
 +                self.reducer_max_splits, self.threads_per_warp
 +            )
- 
+
              local_lse = cute.make_rmem_tensor(
                  cute.make_layout(lse_per_thread), self.lse_dtype
 @@ -1669,39 +1818,59 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
@@ -2375,9 +2375,9 @@ index f79683bc..f0aa6e72 100644
 +                        smem_lse_scale[split_kv_idx] = cute.math.exp2(
 +                            local_lse[i] - global_lse, fastmath=True
 +                        )
- 
+
          pipeline.sync(barrier_id=4)
- 
+
          elements_per_thread = cute.ceil_div(
 -            self.latent_dim, self.threads_per_warp * self.num_compute_warps
 +            self.reducer_d_tile, self.threads_per_warp * self.num_compute_warps
@@ -2412,7 +2412,7 @@ index f79683bc..f0aa6e72 100644
 @@ -1820,7 +1997,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
          # page table
          mPT = common_params.mPT[None, common_params.blk_coord[2]]
- 
+
 -        # Flatten divide and partition global tensors for QK TMA load
 +        # The descriptor has one bounded flat M mode, so TMA can cross query
 +        # token boundaries and zero-fills only the final physical tile.
@@ -2422,7 +2422,7 @@ index f79683bc..f0aa6e72 100644
 @@ -1898,11 +2076,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
              tSgKR,
          )
- 
+
 +        # Q is flattened as (Sq * Hq, D, B).  The logical query-tile
 +        # coordinate therefore lives in the residual-M mode created by
 +        # flat_divide, rather than in a separate grouped-query mode.
@@ -2434,12 +2434,12 @@ index f79683bc..f0aa6e72 100644
 -            None, None, None, common_params.blk_coord[1], common_params.blk_coord[2]
 +            None, common_params.blk_coord[1], None, common_params.blk_coord[2]
          ]
- 
+
          # set extra params
 @@ -2002,6 +2183,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
              k_tile_count -= 1
          return load_v_producer_state
- 
+
 +    @cute.jit
 +    def issue_q_tma_load(
 +        self,
@@ -2556,7 +2556,7 @@ index f79683bc..f0aa6e72 100644
 +                (common_params.K - self.seq_len_q + 1 + first_q_token) // tile_n,
 +                cutlass.Int32(0),
 +            )
- 
+
 -        # first_mask_tile_idx is the global index of the first tile that may
 -        # need masking. Runtime because it depends on K (per-batch in
 -        # var-seq / split-KV).
@@ -2565,7 +2565,7 @@ index f79683bc..f0aa6e72 100644
 +        # phase 2 for final metadata exchange, even when that tile is dense.
 +        # Masking itself remains controlled by first_mask_tile_idx below.
 +        first_phase_2_tile_idx = cutlass.min(first_mask_tile_idx, k_tile_total - 1)
- 
+
          # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
          # 2softmax: each group steps by 2 k-tiles; phase boundaries respect this.
 -        while k_tile_count > 0 and k_index < first_mask_tile_idx:
@@ -2613,7 +2613,7 @@ index f79683bc..f0aa6e72 100644
              k_index = k_index + 2
              k_tile_count = k_tile_count - 1
 @@ -2635,14 +2876,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
- 
+
          if odd_k_tile:
              if cutlass.const_expr(is_second_compute_warp):
 -                # next first compute warp in this wave
@@ -2657,12 +2657,12 @@ index f79683bc..f0aa6e72 100644
 +        :param is_order_chain_last_tile: Whether this group owns the final tile
 +            in the logical work item's cross-group order chain
 +        :type is_order_chain_last_tile: cutlass.Boolean
- 
+
          :return: The MMA s consumer state, the P MMA producer state, the P correction producer state, the row max, the row sum, and the correction factor
          :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
 @@ -3028,40 +3276,52 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
          tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
- 
+
          row_max_new = row_max
 -        # Spec-decoding (MTP) causal mask: each row represents one (q_token, head)
 -        # pair; row r's effective K bound is K - (S_q - 1 - q_tok(r)).
@@ -2797,7 +2797,7 @@ index f79683bc..f0aa6e72 100644
          else:
 @@ -3285,9 +3556,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
              )
- 
+
          # Pingpong B — signal the OTHER group to start its critical section.
 -        # Split-phase .arrive() contributes this group's threads to the other
 -        # group's bar and falls through immediately. cfence: control-flow fence
@@ -2806,7 +2806,7 @@ index f79683bc..f0aa6e72 100644
 +        # final owner waits for the peer's parity-tail rendezvous, preventing a
 +        # persistent group from arriving on the same named-barrier generation
 +        # again in the next logical work item before this one has reset.
- 
+
          # split kv case
          if is_local_last_tile:
 @@ -3304,9 +3576,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
@@ -2825,12 +2825,12 @@ index f79683bc..f0aa6e72 100644
 +            else:
 +                self.softmax_order_bar_1.arrive()  # g0 → g1
          # cute.nvgpu.cfence()
- 
+
          mma_s_consumer_state.advance()
 @@ -3547,6 +3825,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
- 
+
          return mma_o_consumer_state
- 
+
 +    @cute.jit
 +    def dcp_split_has_valid_key(
 +        self,
@@ -2854,7 +2854,7 @@ index f79683bc..f0aa6e72 100644
          self,
 @@ -3600,14 +3896,33 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
              cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
- 
+
              # apply output scale and normalize by row_sum
 -            for i in cutlass.range(
 -                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
@@ -2890,7 +2890,7 @@ index f79683bc..f0aa6e72 100644
 +                        * epilogue_params.output_scale
 +                        * cute.arch.rcp_approx(row_sum)
 +                    )
- 
+
              # store o to global memory
              tR2G_rO_src = None
 @@ -3688,6 +4003,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
@@ -2903,9 +2903,9 @@ index f79683bc..f0aa6e72 100644
              # no split-KV merge), convert from log2 base to natural log.
              # When writing the per-split intermediate (mAccLSE branch), keep
 @@ -3905,25 +4222,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
- 
+
          return tile_sched_params, grid
- 
+
 -    @staticmethod
 -    def compute_fold_sq_ratio(num_heads: int, seq_len_q: int, m_tile: int) -> int:
 -        """Derive the seq_len_q-into-heads fold factor F.
@@ -2943,7 +2943,7 @@ index f79683bc..f0aa6e72 100644
 +        # used by initialize_workspace(). The flat internal path passes 128.
 +        workspace_rows = max(H, 128)
 +        return B * workspace_rows * S * split_kv * (D + 1) * acc_dtype.width // 8
- 
+
      @cute.jit
      def initialize_workspace(
 @@ -3994,29 +4291,29 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
@@ -3006,7 +3006,7 @@ index 722bcfdf..0acd6919 100644
 --- a/flashinfer/cute_dsl/attention/monolithic/mla_helpers.py
 +++ b/flashinfer/cute_dsl/attention/monolithic/mla_helpers.py
 @@ -302,3 +302,34 @@ MAX_SPLITS = 256
- 
+
  def ceil_div(a: int, b: int) -> int:
      return (a + b - 1) // b
 +
@@ -3046,8 +3046,8 @@ index bf422ec6..84b2c11f 100644
 +++ b/flashinfer/mla/_core.py
 @@ -1983,13 +1983,66 @@ def _round_to_seq_len_bucket(x: int) -> int:
      return 1 << (x - 1).bit_length()
- 
- 
+
+
 +def _resolve_cute_dsl_workspace_sizer(
 +    cute_dsl_impl: str,
 +    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
@@ -3110,7 +3110,7 @@ index bf422ec6..84b2c11f 100644
 +    enable_dcp: bool = False,
  ) -> int:
      """Largest batch the caller's workspace can support for cute-dsl MLA decode.
- 
+
 @@ -1997,15 +2050,22 @@ def _cute_dsl_max_supported_batch(
      split-K state. Binary-search for the largest ``B <= candidate_max`` whose
      ``get_workspace_size(...)`` fits in ``workspace_bytes``.
@@ -3120,7 +3120,7 @@ index bf422ec6..84b2c11f 100644
 +    workspace_sizer, resolved_impl = _resolve_cute_dsl_workspace_sizer(
 +        cute_dsl_impl, sinks, enable_dcp
      )
- 
+
      lo, hi = 1, max(1, candidate_max)
      while lo < hi:
          mid = (lo + hi + 1) // 2
@@ -3149,7 +3149,7 @@ index bf422ec6..84b2c11f 100644
 +    enable_dcp: bool = False,
  ) -> Tuple[int, ...]:
      """Compute the autotune bucket list from kernel/workspace limits only.
- 
+
 @@ -2048,13 +2112,112 @@ def _compute_mla_decode_buckets(
              num_heads=num_heads,
              kv_lora_rank=kv_lora_rank,
@@ -3161,10 +3161,10 @@ index bf422ec6..84b2c11f 100644
 +            enable_dcp=enable_dcp,
          )
          cap = max(cap, cute_dsl_cap)
- 
+
      return get_hybrid_num_tokens_buckets(max(1, cap))
- 
- 
+
+
 +def _validate_mla_dcp_args(
 +    *,
 +    query: torch.Tensor,
@@ -3274,11 +3274,11 @@ index bf422ec6..84b2c11f 100644
 +    cp_world: int = 1,
  ) -> Optional[str]:
      """Return None if cute-dsl can handle this call, else a human-readable reason.
- 
+
 @@ -2123,8 +2286,14 @@ def _cute_dsl_incompatibility_reason(
      try:
          from ..cute_dsl.attention.mla_dispatch import _resolve_impl
- 
+
 -        resolved_impl = _resolve_impl(requested=cute_dsl_impl, kwargs={"sinks": sinks})
 -    except (ValueError, ImportError) as e:
 +        resolved_impl = _resolve_impl(
@@ -3290,12 +3290,12 @@ index bf422ec6..84b2c11f 100644
 +        )
 +    except (TypeError, ValueError, ImportError) as e:
          return f"cute-dsl backend (MLA decode kernel): {e}"
- 
+
      try:
 @@ -2133,7 +2302,7 @@ def _cute_dsl_incompatibility_reason(
          else:
              from ..cute_dsl.attention.wrappers.batch_mla import _check_can_implement
- 
+
 -        _check_can_implement(
 +        check_kwargs = dict(
              torch_dtype=query.dtype,
@@ -3312,7 +3312,7 @@ index bf422ec6..84b2c11f 100644
 +    except (TypeError, ValueError, ImportError) as e:
          return f"cute-dsl backend (MLA decode kernel) cannot implement this configuration: {e}"
      return None
- 
+
 @@ -2155,8 +2327,11 @@ def _mla_decode_tuning_config(
      buckets: tuple[int, ...],
      num_pages: int,
@@ -3323,13 +3323,13 @@ index bf422ec6..84b2c11f 100644
  ) -> TuningConfig:
 -    """One TuningConfig (and one pair of initializer closures) per key.
 +    """One TuningConfig and stable initializer set per key.
- 
+
      Memoized because ``AutoTuner._find_nearest_profile`` lru-caches on
      ``(shapes, tuning_config)``: a fresh config per dispatcher call shares
 @@ -2164,12 +2339,13 @@ def _mla_decode_tuning_config(
      ``tensor_initializers``) but never compares equal (closures compare by
      identity), so would result in a leak.
- 
+
 -    The DynamicTensorSpec sweeps batch dim across all four ``inputs`` tensors
 -    (query, block_tables, seq_lens, out). ``block_tables`` is initialized via
 -    ``random_(0, num_pages)`` which wraps mod kv_cache size — safe for autotune
@@ -3344,12 +3344,12 @@ index bf422ec6..84b2c11f 100644
 +    measurements. ``seq_lens`` is filled with ``profile_seq_len``; the
 +    synthetic DCP global bound preserves that exact rank-local length.
      """
- 
+
      def init_block_tables(shapes, dtype, device):
 @@ -2182,14 +2358,32 @@ def _mla_decode_tuning_config(
          tensor.fill_(profile_seq_len)
          return tensor
- 
+
 +    def init_causal_seqlens_kv_global(shapes, dtype, device):
 +        tensor = torch.empty(shapes, dtype=dtype, device=device)
 +        tensor.fill_(profile_seq_len * cp_world + cp_rank)
@@ -3395,7 +3395,7 @@ index bf422ec6..84b2c11f 100644
 +    cp_rank: int = 0,
  ) -> TuningConfig:
      """Reduce call args to the memoization key of ``_mla_decode_tuning_config``.
- 
+
 @@ -2229,10 +2430,21 @@ def _build_mla_decode_tuning_config(
          q_len,
          num_heads,
@@ -3406,7 +3406,7 @@ index bf422ec6..84b2c11f 100644
 +        sinks,
 +        enable_dcp,
      )
- 
+
 -    return _mla_decode_tuning_config(buckets, num_pages, profile_seq_len)
 +    return _mla_decode_tuning_config(
 +        buckets,
@@ -3416,8 +3416,8 @@ index bf422ec6..84b2c11f 100644
 +        cp_world,
 +        cp_rank,
 +    )
- 
- 
+
+
  class TrtllmGenMlaDecodeRunner(TunableRunner):
 @@ -2458,6 +2670,9 @@ class CuteDslMlaDecodeRunner(TunableRunner):
          return_lse: bool,
@@ -3428,7 +3428,7 @@ index bf422ec6..84b2c11f 100644
 +        cp_rank: int = 0,
      ):
          from ..cute_dsl.attention import cute_dsl_mla_decode
- 
+
 @@ -2482,6 +2697,13 @@ class CuteDslMlaDecodeRunner(TunableRunner):
          self.return_lse = return_lse
          self.sinks = sinks
@@ -3440,7 +3440,7 @@ index bf422ec6..84b2c11f 100644
 +        self._workspace_sizer, self._resolved_cute_dsl_impl = (
 +            _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)
 +        )
- 
+
      def __hash__(self):
          # See TrtllmGenMlaDecodeRunner.__hash__ — tactic-determining state is
 @@ -2495,15 +2717,19 @@ class CuteDslMlaDecodeRunner(TunableRunner):
@@ -3451,7 +3451,7 @@ index bf422ec6..84b2c11f 100644
 -            _get_split_kv_and_workspace_size,
 -        )
          from ..cute_dsl.utils import get_num_sm
- 
+
          q = inputs[0]
          B, q_len, num_heads, _ = q.shape
 -        _, ws = _get_split_kv_and_workspace_size(
@@ -3470,7 +3470,7 @@ index bf422ec6..84b2c11f 100644
              self.workspace_buffer.numel() * self.workspace_buffer.element_size()
 @@ -2513,14 +2739,24 @@ class CuteDslMlaDecodeRunner(TunableRunner):
          return [-1]
- 
+
      def get_cache_key_extras(self, inputs):
 -        q, _, _, out = inputs
 +        q, _, _, out = inputs[:4]
@@ -3510,7 +3510,7 @@ index bf422ec6..84b2c11f 100644
 +            getattr(self, "enable_dcp", False),
 +            getattr(self, "cp_world", 1),
          )
- 
+
      def forward(
 @@ -2544,7 +2783,31 @@ class CuteDslMlaDecodeRunner(TunableRunner):
          do_preparation: bool = False,
@@ -3559,8 +3559,8 @@ index bf422ec6..84b2c11f 100644
 +            cp_rank=self.cp_rank,
 +            causal_seqlens_kv_global=causal_seqlens_kv_global,
          )
- 
- 
+
+
 @@ -2595,6 +2862,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
      cum_seq_lens_q: Optional[torch.Tensor] = None,
      max_q_len: Optional[int] = None,
@@ -3571,7 +3571,7 @@ index bf422ec6..84b2c11f 100644
 +    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
  ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
      r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
- 
+
 @@ -2639,12 +2910,15 @@ def trtllm_batch_decode_with_kv_cache_mla(
          With ``backend="trtllm-gen"``, the final dimension may use its native
          width and does not need padding to a multiple of ``128 / page_size``.
@@ -3606,7 +3606,7 @@ index bf422ec6..84b2c11f 100644
 +    causal_seqlens_kv_global : Optional[torch.Tensor] = None
 +        Contiguous CUDA int32 tensor ``[batch_size]`` containing the global
 +        exclusive causal bound for the newest query token. Required with DCP.
- 
+
      Note
      ----
 @@ -2779,11 +3065,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
@@ -3624,13 +3624,13 @@ index bf422ec6..84b2c11f 100644
 +    cap and cache the winning tactic per shape signature. Subsequent calls under
 +    ``autotune(False)`` use the cached choice; any batch outside the tuned range
 +    falls back to the runner's default tactic with a one-time warning.
- 
+
      The autotune bucket range and cache key do **not** depend on
      ``kv_cache.shape[0]`` (the number of pages in the pool), so reallocating the
 @@ -2805,6 +3092,19 @@ def trtllm_batch_decode_with_kv_cache_mla(
      if max_q_len is not None and cum_seq_lens_q is None:
          raise ValueError("max_q_len is only supported when cum_seq_lens_q is provided")
- 
+
 +    backend = _validate_mla_dcp_args(
 +        query=query,
 +        backend=backend,
@@ -3668,7 +3668,7 @@ index bf422ec6..84b2c11f 100644
 +                cp_rank=cp_rank,
              )
          )
- 
+
 @@ -3217,8 +3520,17 @@ def trtllm_batch_decode_with_kv_cache_mla(
          kv_lora_rank=kv_lora_rank,
          max_seq_len=max_seq_len,
@@ -3692,8 +3692,8 @@ index 610afb82..7b32bb88 100644
 --- a/flashinfer/trace/templates/attention.py
 +++ b/flashinfer/trace/templates/attention.py
 @@ -2692,6 +2692,11 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
- 
- 
+
+
  def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
 +    if kwargs.get("enable_dcp", False):
 +        raise NotImplementedError(
@@ -4840,7 +4840,7 @@ index e8549a72..f52dee4f 100644
 --- a/tests/attention/test_cute_dsl_mla_decode.py
 +++ b/tests/attention/test_cute_dsl_mla_decode.py
 @@ -83,15 +83,19 @@ def torch_reference_mla(
- 
+
      outputs = []
      lses = []
 +    # Copy the small metadata arrays once.  Calling CUDA ``.item()`` for every
@@ -4851,7 +4851,7 @@ index e8549a72..f52dee4f 100644
 -        seq_len = cache_seqs[b].item()
 +        seq_len = cache_seqs_host[b]
          num_pages_needed = (seq_len + page_size - 1) // page_size
- 
+
          # Gather KV for this batch via page table
 -        page_indices = page_table[b, :num_pages_needed]
 +        page_indices = page_table_host[b][:num_pages_needed]
@@ -4864,8 +4864,8 @@ index e8549a72..f52dee4f 100644
          kv_indices_t = torch.tensor(kv_indices, device=q_nope.device)
 @@ -254,28 +258,21 @@ def test_cute_dsl_mla_decode_fp16(
          torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)
- 
- 
+
+
 -# Exercises the spec-decoding (MTP) causal mask + fold_sq path: num_heads < 128
 -# forces the kernel to pack F = compute_fold_sq_ratio(H, q_len, 128) tokens of
 -# q_len into the head dim so the 128-wide MMA-M tile is fully populated.
@@ -4897,14 +4897,14 @@ index e8549a72..f52dee4f 100644
 -        pytest.skip("fold_sq / MTP causal mask are monolithic-only features")
 +    """Run and reference-check one monolithic packed-query configuration."""
      skip_if_unsupported()
- 
+
 -    from flashinfer.cute_dsl.attention import cute_dsl_mla_decode
 -
      torch.manual_seed(42)
      device = torch.device("cuda")
- 
+
 @@ -288,17 +285,19 @@ def test_cute_dsl_mla_decode_fold_sq(
- 
+
      # torch.randn doesn't support fp8; for FP8 inputs create as fp16 then convert.
      is_fp8 = dtype == torch.float8_e4m3fn
 +    query_storage = torch.randn(
@@ -4930,13 +4930,13 @@ index e8549a72..f52dee4f 100644
 +    query = query_storage[:, ::query_token_stride]
 +    if query_token_stride != 1:
 +        assert query.stride(1) != num_heads * query.stride(2)
- 
+
      num_pages_per_batch = (seq_len_k + page_size - 1) // page_size
      total_pages = num_pages_per_batch * batch_size + 10
 @@ -319,25 +318,79 @@ def test_cute_dsl_mla_decode_fold_sq(
          for p in range(num_pages_per_batch):
              block_tables[b, p] = b * num_pages_per_batch + p
- 
+
 -    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32, device=device)
 -
 -    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
@@ -4950,7 +4950,7 @@ index e8549a72..f52dee4f 100644
 +        seq_lens = torch.full(
 +            (batch_size,), seq_len_k, dtype=torch.int32, device=device
 +        )
- 
+
 -    out = cute_dsl_mla_decode(
 -        query=query,
 -        kv_cache=kv_cache,
@@ -4968,7 +4968,7 @@ index e8549a72..f52dee4f 100644
 +    workspace_buffer = workspace_factory(
 +        256 * 1024 * 1024, dtype=torch.int8, device=device
      )
- 
+
 +    if via_public_api:
 +        assert out_dtype is None
 +        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
@@ -5031,7 +5031,7 @@ index e8549a72..f52dee4f 100644
          kv_flat = kv_cache.reshape(-1, D_qk).to(torch.float32)
 @@ -351,7 +404,7 @@ def test_cute_dsl_mla_decode_fold_sq(
      c_rope_ref = kv_flat[:, latent_dim:]
- 
+
      # Monolithic-only test — kernel always applies the MTP causal mask here.
 -    ref_out = torch_reference_mla(
 +    ref_out, ref_lse = torch_reference_mla(
@@ -5044,7 +5044,7 @@ index e8549a72..f52dee4f 100644
          apply_mtp_mask=True,
 +        return_lse=True,
      )
- 
+
      if is_fp8:
 @@ -369,45 +423,518 @@ def test_cute_dsl_mla_decode_fold_sq(
          torch.testing.assert_close(
@@ -5284,8 +5284,8 @@ index e8549a72..f52dee4f 100644
 +        is_var_seq=True,
 +        enable_pdl=False,
 +    )
- 
- 
+
+
 -def test_compute_fold_sq_ratio():
 -    """Unit test the static helper used by both run() and the wrapper."""
 +def test_cute_dsl_mla_decode_padded_q_tile_fp8_output():
@@ -5374,7 +5374,7 @@ index e8549a72..f52dee4f 100644
 +    from flashinfer.cute_dsl.attention.monolithic.mla_helpers import (
 +        compute_q_tile_layout,
      )
- 
+
      cases = [
 -        # (num_heads, seq_len_q, m_tile, expected)
 -        (128, 1, 128, 1),  # H == M_tile → no fold
@@ -5587,8 +5587,8 @@ index e8549a72..f52dee4f 100644
          )
 +        == 8
 +    )
- 
- 
+
+
  @pytest.mark.parametrize("batch_size", [1, 4, 16])
 diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
 index a36c1e88..a5cf0100 100644

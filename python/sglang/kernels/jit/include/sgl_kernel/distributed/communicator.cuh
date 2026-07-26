@@ -43,10 +43,7 @@ SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
 
 SGL_DEVICE uint32_t atomic_add_acq_rel_gpu(uint32_t* ptr, uint32_t val) {
   uint32_t old;
-  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-               : "=r"(old)
-               : "l"(ptr), "r"(val)
-               : "memory");
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(val) : "memory");
   return old;
 }
 

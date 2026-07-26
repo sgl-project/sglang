@@ -312,19 +312,20 @@ struct ConcatMlaAbsorbQKernel {
     const int grid_size = div_ceil(num_items, num_warps_per_block);
     const int block_size = num_warps_per_block * 32;
 
-    LaunchKernel(grid_size, block_size, device.unwrap()).enable_pdl(kUsePDL)(
-        concat_mla_absorb_q_kernel<kUsePDL>,
-        static_cast<bf16_t*>(a.data_ptr()),
-        static_cast<bf16_t*>(b.data_ptr()),
-        static_cast<bf16_t*>(out.data_ptr()),
-        num_items,
-        dim_1,
-        S0_a.unwrap(),
-        static_cast<int>(S1_a.unwrap()),
-        S0_b.unwrap(),
-        static_cast<int>(S1_b.unwrap()),
-        S0_out.unwrap(),
-        static_cast<int>(S1_out.unwrap()));
+    LaunchKernel(grid_size, block_size, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            concat_mla_absorb_q_kernel<kUsePDL>,
+            static_cast<bf16_t*>(a.data_ptr()),
+            static_cast<bf16_t*>(b.data_ptr()),
+            static_cast<bf16_t*>(out.data_ptr()),
+            num_items,
+            dim_1,
+            S0_a.unwrap(),
+            static_cast<int>(S1_a.unwrap()),
+            S0_b.unwrap(),
+            static_cast<int>(S1_b.unwrap()),
+            S0_out.unwrap(),
+            static_cast<int>(S1_out.unwrap()));
   }
 };
 
