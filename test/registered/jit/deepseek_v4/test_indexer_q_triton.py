@@ -9,6 +9,12 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large"
+)
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _hadamard_matrix(n: int, device: torch.device) -> torch.Tensor:
@@ -58,14 +64,10 @@ def test_indexer_q_triton_matches_reference(batch_size: int):
     q_input = torch.randn(
         batch_size, num_heads, 128, dtype=torch.bfloat16, device=device
     )
-    weight = torch.randn(
-        batch_size, num_heads, dtype=torch.bfloat16, device=device
-    )
+    weight = torch.randn(batch_size, num_heads, dtype=torch.bfloat16, device=device)
     angles = torch.randn(256, 32, dtype=torch.float32, device=device)
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
-    positions = torch.randint(
-        0, 256, (batch_size,), dtype=torch.int32, device=device
-    )
+    positions = torch.randint(0, 256, (batch_size,), dtype=torch.int32, device=device)
 
     actual_q, actual_weight = _fused_q_indexer_rope_hadamard_quant_triton(
         q_input, weight, weight_scale, freqs_cis, positions
@@ -74,17 +76,13 @@ def test_indexer_q_triton_matches_reference(batch_size: int):
         q_input, weight, weight_scale, freqs_cis, positions
     )
     torch.testing.assert_close(actual_q.float(), expected_q.float(), rtol=0, atol=0)
-    torch.testing.assert_close(
-        actual_weight, expected_weight, rtol=1e-5, atol=1e-7
-    )
+    torch.testing.assert_close(actual_weight, expected_weight, rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.skipif(
     not is_hip()
-    or hasattr(
-        torch.ops.sgl_kernel, "dsv4_fused_q_indexer_rope_hadamard_quant"
-    ),
+    or hasattr(torch.ops.sgl_kernel, "dsv4_fused_q_indexer_rope_hadamard_quant"),
     reason="requires ROCm without the native operator",
 )
 def test_indexer_q_public_dispatch_uses_triton_fallback():
