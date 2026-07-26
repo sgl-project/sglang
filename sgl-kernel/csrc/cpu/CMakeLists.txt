@@ -102,7 +102,7 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
 )
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ppc64le|ppc64")
     add_compile_definitions(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
     list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
 endif()
@@ -126,6 +126,15 @@ if(MY_ARCH_DIR STREQUAL "x86_64")
         -mamx-tile
         -mamx-bf16
         -mamx-int8
+        -fopenmp
+    )
+elseif(MY_ARCH_DIR STREQUAL "ppc64")
+    add_compile_options(
+        -O3
+        -Wno-unknown-pragmas
+        -Wno-psabi
+        -mcpu=native
+        -mvsx
         -fopenmp
     )
 else()
