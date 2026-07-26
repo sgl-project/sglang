@@ -98,6 +98,8 @@ except ImportError:
     sys.modules["triton.language.extra.libdevice"] = sys.modules["triton"].language
     sys.modules["triton.backends"] = TritonPlaceholder()
     sys.modules["triton.backends.compiler"] = TritonPlaceholder()
+    sys.modules["triton.compiler"] = TritonPlaceholder()
+    sys.modules["triton.compiler.compiler"] = TritonPlaceholder()
     
     triton = sys.modules["triton"]
 from packaging import version as pkg_version
