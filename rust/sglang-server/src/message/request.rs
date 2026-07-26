@@ -13,6 +13,14 @@ use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
 use crate::error::Error;
 
+/// Hard cap on prompts per `/generate` body. Every column below is allocated per
+/// item, so this bounds the work a single request can ask for.
+const MAX_BATCH_SIZE: usize = 4096;
+
+/// Hard cap on the total bytes a broadcast `sampling_params` may clone into the
+/// batch (see the `One` arm of the fan-out).
+const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
+
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
 /// [`into_requests`](GenerateBody::into_requests). `deny_unknown_fields` rejects (4xx) unknowns.
@@ -137,6 +145,14 @@ impl GenerateBody {
                 "batch must contain at least one item".into(),
             ));
         }
+        // Cap the batch BEFORE building any column: everything below allocates
+        // per item, and the body limit is disabled, so an unbounded `n` turns a
+        // small body into an unbounded allocation.
+        if n > MAX_BATCH_SIZE {
+            return Err(Error::Validation(format!(
+                "batch size {n} exceeds the maximum of {MAX_BATCH_SIZE}"
+            )));
+        }
 
         // A list is per-item; a single object broadcasts to every item.
         let sps: Vec<SamplingParams> = match sampling_params {
@@ -150,7 +166,24 @@ impl GenerateBody {
                 }
                 v
             }
-            Some(SamplingParamsInput::One(sp)) => vec![*sp; n],
+            Some(SamplingParamsInput::One(sp)) => {
+                // Broadcasting deep-clones the client's params once per prompt,
+                // heap and all — `stop`, `logit_bias` and `custom_params` (arbitrary
+                // JSON) are still unnormalized client data here. The blow-up is
+                // quadratic in the body: ~1 MB of `custom_params` broadcast to 200k
+                // prompts is ~200 GB of clones, and a Rust allocation failure calls
+                // `abort()`, which is uncatchable and takes the scheduler process
+                // with it. Bound the product, not just `n`.
+                let per_clone = serde_json::to_string(&*sp).map_or(0, |s| s.len());
+                if per_clone.saturating_mul(n) > MAX_BROADCAST_CLONE_BYTES {
+                    return Err(Error::Validation(format!(
+                        "sampling_params ({per_clone} bytes) broadcast to {n} prompts \
+                         would allocate more than the {MAX_BROADCAST_CLONE_BYTES}-byte \
+                         limit; send a shorter `sampling_params` or a smaller batch"
+                    )));
+                }
+                vec![*sp; n]
+            }
         };
 
         // rid: absent → mint one uuid per item here, so every request carries its
@@ -479,6 +512,36 @@ mod tests {
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
         assert!(ps[0].stream);
+    }
+
+    /// The body limit is disabled, so an unbounded batch turns a small body into an
+    /// unbounded allocation. Worse, broadcasting `sampling_params` deep-clones the
+    /// client's `custom_params`/`logit_bias`/`stop` once per prompt, so the blow-up
+    /// is quadratic in the body — and a Rust allocation failure `abort()`s the
+    /// scheduler process rather than raising. Both the count and the product are
+    /// capped before any column is built.
+    #[test]
+    fn oversized_batches_are_rejected_before_allocating() {
+        let texts: Vec<String> = (0..MAX_BATCH_SIZE + 1).map(|i| i.to_string()).collect();
+        let body = serde_json::json!({ "text": texts }).to_string();
+        let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum"), "{err}");
+
+        // At the cap it is accepted.
+        let texts: Vec<String> = (0..MAX_BATCH_SIZE).map(|i| i.to_string()).collect();
+        let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
+        assert_eq!(reqs.len(), MAX_BATCH_SIZE);
+
+        // A small batch with a huge broadcast `custom_params` is the quadratic case:
+        // few items, but each clone carries the whole blob.
+        let blob = "x".repeat(1 << 20); // 1 MiB
+        let body = serde_json::json!({
+            "text": vec!["hi"; 200],
+            "sampling_params": { "custom_params": { "k": blob } },
+        })
+        .to_string();
+        let err = requests(&body).unwrap_err().to_string();
+        assert!(err.contains("would allocate more than"), "{err}");
     }
 
     /// `token_ids_logprob` mirrors Python `_normalize_batch`'s nested-structure

@@ -58,8 +58,17 @@ fn ragged_logprob_tuples(
         if l == 0 {
             positions.push(serde_json::Value::Null);
         } else {
+            // Bounds-checked like `hidden_states_rows`: a header whose `lens` run
+            // past the value buffer would otherwise panic the api thread on an
+            // out-of-range index.
             let tuples: Vec<serde_json::Value> = (off..off + l)
-                .map(|j| serde_json::json!([lp_value(vals[j]), idxs[j], text_slot(texts, j)]))
+                .filter_map(|j| {
+                    Some(serde_json::json!([
+                        lp_value(*vals.get(j)?),
+                        *idxs.get(j)?,
+                        text_slot(texts, j)
+                    ]))
+                })
                 .collect();
             positions.push(serde_json::Value::Array(tuples));
         }

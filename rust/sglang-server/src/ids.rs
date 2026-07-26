@@ -1,9 +1,10 @@
 //! Lightweight identifiers used across pipeline stages.
 
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::hash_map::RandomState,
     fmt::{Debug, Display, Formatter, Result},
-    hash::{Hash, Hasher},
+    hash::BuildHasher,
+    sync::OnceLock,
 };
 
 use uuid::Uuid;
@@ -17,13 +18,19 @@ use uuid::Uuid;
 pub struct RidHash(pub u64);
 
 impl RidHash {
-    /// Derive the routing key from a rid string. `DefaultHasher::new()` uses
-    /// fixed keys, so every stage (ingress push, egress decode, abort) computes
-    /// the same id from the same rid — no shared map.
+    /// Derive the routing key from a rid string. Every stage (ingress push, egress
+    /// decode, abort) hashes with the same per-process seed, so they agree without
+    /// a shared map.
+    ///
+    /// The seed is RANDOM, not fixed. `Register` is an insert-overwrite, so two
+    /// rids colliding delivers one client's tokens to another's connection — and
+    /// rids are routinely client-supplied. With the fixed `DefaultHasher` keys
+    /// (SipHash with (0, 0)) that is an offline ~2^32 birthday search anyone can
+    /// run, not a 2^-64 accident. The digest never crosses the wire (Python knows
+    /// only the rid string), so reseeding costs nothing.
     pub fn from_rid(rid: &str) -> Self {
-        let mut h = DefaultHasher::new();
-        rid.hash(&mut h);
-        RidHash(h.finish())
+        static SEED: OnceLock<RandomState> = OnceLock::new();
+        RidHash(SEED.get_or_init(RandomState::new).hash_one(rid))
     }
 
     /// Shard index for `n` detokenizer shards. Pure function of the id so the

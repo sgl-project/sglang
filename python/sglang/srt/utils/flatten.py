@@ -99,12 +99,22 @@ class FlatPairColumns:
 
     def accept(self, j):
         vv = (self.vals[j] if self.vals else None) or []
+        ii = (self.idxs[j] if self.idxs else None) or []
+        # Parity assert, the flat twin of `flatten_ragged`'s: only `len(vv)` is
+        # recorded in `lens`, but both buffers are extended, so a longer idx column
+        # silently pushes every LATER column's offset out by the difference. The
+        # decoder cannot catch it — the data buffer only grows, so the receiver's
+        # bounds check still passes and it hands the client another column's bytes
+        # reinterpreted as logprobs, with a 200.
+        assert len(ii) == len(
+            vv
+        ), f"{self.name}: request {j} has {len(ii)} idx entries but {len(vv)} vals"
         if self.first_none_to_nan and vv and vv[0] is None:
             self.v.append(float("nan"))
             self.v.extend(vv[1:])
         else:
             self.v.extend(vv)
-        self.i.extend((self.idxs[j] if self.idxs else None) or [])
+        self.i.extend(ii)
         self.lens.append(len(vv))
 
     def header_cols(self):
