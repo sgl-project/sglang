@@ -8,6 +8,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from torch import nn
+
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
@@ -37,7 +39,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.srt.utils import add_prefix
-from torch import nn
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -353,9 +354,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
         head_dim = hidden_size // num_attention_heads
-        assert head_dim == sum(config.axes_dims), (
-            f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
-        )
+        assert head_dim == sum(
+            config.axes_dims
+        ), f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
         mlp_only_layers = tuple(config.mlp_only_layers)
 
         self.hidden_size = hidden_size
