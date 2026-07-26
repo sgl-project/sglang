@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -774,6 +775,7 @@ class MooncakeKVManager(CommonKVManager):
         decode_prefix_len: int,
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -791,12 +793,22 @@ class MooncakeKVManager(CommonKVManager):
         if plan.src_token_indices.size == 0:
             return 0
 
-        src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-            self.get_mla_kv_ptrs_with_pp(
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            src_kv_ptrs = self.kv_args.kv_data_ptrs
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+        else:
+            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
-        )
+        layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
             plan.src_token_indices,
             plan.dst_token_indices,
@@ -1575,6 +1587,9 @@ class MooncakeKVManager(CommonKVManager):
                                 decode_prefix_len=req.decode_prefix_len or 0,
                                 num_kv_tokens=kv_chunk.num_kv_tokens,
                                 executor=executor,
+                                dst_layer_ids=(
+                                    target_rank_registration_info.dst_kv_layer_ids
+                                ),
                             )
                         elif (
                             self.is_mla_backend

@@ -523,12 +523,6 @@ class CommonKVManager(BaseKVManager):
                 raise RuntimeError(
                     "PD decode DCP requires an MLA or hybrid-MLA KV pool."
                 )
-            if info.attn_tp_size != self.attn_tp_size:
-                raise RuntimeError(
-                    "PD decode DCP currently requires equal prefill/decode "
-                    f"attention TP, got prefill={info.attn_tp_size}, "
-                    f"decode={self.attn_tp_size}."
-                )
             if info.attn_cp_size != 1:
                 raise RuntimeError(
                     "PD decode DCP currently requires prefill attention CP=1, "
