@@ -1,0 +1,334 @@
+"""Helion implementation of SGLang's packed KDA decode contract."""
+
+from __future__ import annotations
+
+import functools
+
+import helion
+import helion.language as hl
+import torch
+
+# SGLang initializes torch.distributed, but this kernel has no collectives.
+_IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
+
+# FP32 state: CUDA x traverses V tiles, keeping the x grid at 16 across all
+# supported TP sizes.
+_KDA_CONFIG = helion.Config(
+    block_sizes=[8],
+    loop_orders=[[2, 1, 0]],
+    num_warps=1,
+    num_stages=1,
+    indexing="pointer",
+    pid_type="xyz",
+)
+
+_KDA_BF16_CONFIG = helion.Config(
+    atomic_indexing=[],
+    block_sizes=[16],
+    indexing=[
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "pointer",
+        "tensor_descriptor",
+    ],
+    l2_groupings=[16],
+    load_eviction_policies=["last", "", "last", "last", "", "", "", "last", "first"],
+    loop_orders=[[2, 1, 0]],
+    num_stages=4,
+    num_warps=1,
+    pid_type="flat",
+    range_flattens=[None],
+    range_multi_buffers=[None],
+    range_num_stages=[],
+    range_unroll_factors=[0],
+    range_warp_specializes=[None],
+)
+
+
+def _helion_fused_recurrent_kda_packed_decode_body(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+) -> torch.Tensor:
+    """Fused packed KDA decode body; mutates ``initial_state`` and ``out``."""
+    B = mixed_qkv.size(0)
+    HV = hl.specialize(initial_state.size(-3))
+    V = hl.specialize(initial_state.size(-2))
+    K = hl.specialize(initial_state.size(-1))
+    H = hl.specialize((mixed_qkv.size(1) - HV * V) // (2 * K))
+    heads_per_q = HV // H
+
+    hl.specialize(
+        (
+            mixed_qkv.stride(0),
+            mixed_qkv.stride(1),
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            A_log.stride(0),
+            dt_bias.stride(0),
+            initial_state.stride(0),
+            initial_state.stride(1),
+            initial_state.stride(2),
+            initial_state.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            ssm_state_indices.stride(0),
+        )
+    )
+
+    block_v = hl.register_block_size(1, V)
+
+    for tile_b, tile_hv, tile_v in hl.tile([B, HV, V], block_size=[1, 1, block_v]):
+        k_offsets = hl.arange(K)
+        i_b = tile_b.id
+        i_hv = tile_hv.id
+        i_h = i_hv // heads_per_q
+
+        state_index = ssm_state_indices[i_b].long()
+        if state_index < 0:
+            out[i_b, 0, i_hv, tile_v] = 0.0
+        else:
+            q_offsets = i_h * K + k_offsets
+            k_input_offsets = H * K + i_h * K + k_offsets
+            v_offsets = 2 * H * K + i_hv * V + tile_v.index
+
+            gate_input = a[i_b, i_hv * K + k_offsets].float()
+            gate_input = gate_input + dt_bias[i_hv * K + k_offsets].float()
+            gate_exp = torch.exp(gate_input)
+            softplus = torch.where(
+                gate_input <= 20.0,
+                torch.log(1.0 + gate_exp),
+                gate_input,
+            )
+            A_log_value = A_log[i_hv].float()
+            A = torch.exp(A_log_value)
+            beta = torch.sigmoid(b[i_b, i_hv].float())
+            log_decay = -A * softplus
+
+            state = initial_state[state_index, i_hv, tile_v.index, k_offsets].float()
+            decay = torch.exp(log_decay)
+            state = state * decay[None, :]
+
+            k = mixed_qkv[i_b, k_input_offsets].float()
+            if use_qk_l2norm_in_kernel:
+                k = k / torch.sqrt((k * k).sum() + 1e-6)
+            v = mixed_qkv[i_b, v_offsets].float()
+            value_residual = v - (state * k[None, :]).sum(-1)
+            value_residual = value_residual * beta
+            state = state + value_residual[:, None] * k[None, :]
+
+            q = mixed_qkv[i_b, q_offsets].float()
+            if use_qk_l2norm_in_kernel:
+                q = q / torch.sqrt((q * q).sum() + 1e-6)
+            q = q * scale
+            output = (state * q[None, :]).sum(-1)
+
+            out[i_b, 0, i_hv, tile_v] = output.to(out.dtype)
+            initial_state[state_index, i_hv, tile_v.index, k_offsets] = state
+
+    return out
+
+
+_helion_fused_recurrent_kda_packed_decode = helion.kernel(
+    _helion_fused_recurrent_kda_packed_decode_body,
+    static_shapes=False,
+    config=_KDA_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)
+_helion_fused_recurrent_kda_packed_decode_bf16 = helion.kernel(
+    _helion_fused_recurrent_kda_packed_decode_body,
+    static_shapes=False,
+    config=_KDA_BF16_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)
+
+
+@functools.cache
+def _supports_tensor_descriptors(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+def _validate_packed_decode_inputs(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+) -> tuple[int, int, int, int, int]:
+    """Apply the shape and layout checks from SGLang's packed wrapper."""
+    if mixed_qkv.ndim != 2:
+        raise ValueError(
+            f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
+        )
+    if mixed_qkv.stride(-1) != 1:
+        raise ValueError("`mixed_qkv` must be contiguous in the last dim.")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(
+            f"`a` and `b` must be 2D tensors (got a.ndim={a.ndim}, b.ndim={b.ndim})."
+        )
+    if a.stride(-1) != 1 or b.stride(-1) != 1:
+        raise ValueError("`a`/`b` must be contiguous in the last dim.")
+    if A_log.ndim != 1 or dt_bias.ndim != 1:
+        raise ValueError("`A_log`/`dt_bias` must be 1D tensors.")
+    if A_log.stride(0) != 1 or dt_bias.stride(0) != 1:
+        raise ValueError("`A_log`/`dt_bias` must be contiguous.")
+    if ssm_state_indices.ndim != 1:
+        raise ValueError(
+            "`ssm_state_indices` must be 1D for packed decode "
+            f"(got ndim={ssm_state_indices.ndim})."
+        )
+    if not out.is_contiguous():
+        raise ValueError("`out` must be contiguous.")
+
+    device = mixed_qkv.device
+    if any(
+        tensor.device != device
+        for tensor in (
+            a,
+            b,
+            A_log,
+            dt_bias,
+            initial_state,
+            out,
+            ssm_state_indices,
+        )
+    ):
+        raise ValueError("All inputs must be on the same device.")
+
+    B = mixed_qkv.shape[0]
+    if a.shape[0] != B or b.shape[0] != B:
+        raise ValueError(
+            "Mismatched batch sizes: "
+            f"mixed_qkv.shape[0]={B}, a.shape[0]={a.shape[0]}, "
+            f"b.shape[0]={b.shape[0]}."
+        )
+    if ssm_state_indices.shape[0] != B:
+        raise ValueError(
+            f"`ssm_state_indices` must have shape [B] "
+            f"(got {tuple(ssm_state_indices.shape)}; expected ({B},))."
+        )
+
+    if initial_state.ndim != 4:
+        raise ValueError(
+            f"`initial_state` must be a 4D tensor (got ndim={initial_state.ndim})."
+        )
+    if initial_state.stride(-1) != 1:
+        raise ValueError("`initial_state` must be contiguous in the last dim.")
+    HV, V, K = initial_state.shape[-3:]
+    if a.shape[1] != HV * K:
+        raise ValueError(
+            f"`a` must have shape [B, HV*K] with HV={HV}, K={K} "
+            f"(got a.shape={tuple(a.shape)})."
+        )
+    if b.shape[1] != HV:
+        raise ValueError(
+            f"`b` must have shape [B, HV] with HV={HV} (got b.shape={tuple(b.shape)})."
+        )
+    if A_log.numel() != HV:
+        raise ValueError(f"`A_log` must have {HV} elements (got {A_log.numel()}).")
+    if dt_bias.numel() != HV * K:
+        raise ValueError(
+            f"`dt_bias` must have {HV * K} elements (got {dt_bias.numel()})."
+        )
+    if out.shape != (B, 1, HV, V):
+        raise ValueError(
+            f"`out` must have shape {(B, 1, HV, V)} (got out.shape={tuple(out.shape)})."
+        )
+
+    qkv_dim = mixed_qkv.shape[1]
+    qk_dim = qkv_dim - HV * V
+    if qk_dim <= 0 or qk_dim % 2 != 0:
+        raise ValueError(
+            f"Invalid packed `mixed_qkv` last dim={qkv_dim} for HV={HV}, V={V}."
+        )
+    q_dim = qk_dim // 2
+    if q_dim % K != 0:
+        raise ValueError(
+            f"Invalid packed Q size {q_dim}: must be divisible by K={K}. "
+            "KDA packed decode requires num_q_heads == num_k_heads and "
+            "head_q_dim == head_k_dim."
+        )
+    H = q_dim // K
+    if H <= 0 or HV % H != 0:
+        raise ValueError(
+            f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
+        )
+    return B, H, HV, K, V
+
+
+def helion_fused_recurrent_kda_packed_decode(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Helion implementation of SGLang's packed KDA decode contract.
+
+    Inputs, mutations, padding semantics, and outputs match
+    ``fused_recurrent_kda_packed_decode``:
+
+    * ``mixed_qkv`` is ``[B, 2*H*K + HV*V]`` after the short convolution.
+    * ``a`` and ``b`` are raw forget-gate and beta logits.
+    * ``initial_state`` is ``[num_slots, HV, V, K]`` and is updated in place.
+    * ``ssm_state_indices == -1`` writes a zero output and leaves state untouched.
+    * ``out`` is ``[B, 1, HV, V]`` and is written in place.
+    * The return is the same ``(out, initial_state)`` object pair supplied by the
+      caller.
+    """
+    _validate_packed_decode_inputs(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state,
+        out,
+        ssm_state_indices,
+    )
+    kernel = (
+        _helion_fused_recurrent_kda_packed_decode_bf16
+        if initial_state.dtype is torch.bfloat16
+        and _supports_tensor_descriptors(initial_state.device)
+        else _helion_fused_recurrent_kda_packed_decode
+    )
+    result = kernel(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        scale,
+        initial_state,
+        out,
+        ssm_state_indices,
+        use_qk_l2norm_in_kernel,
+    )
+    return result, initial_state

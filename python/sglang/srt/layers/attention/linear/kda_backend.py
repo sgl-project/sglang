@@ -47,9 +47,25 @@ class KDAKernelDispatcher:
     ):
         self.verify_backend = verify_backend
         triton_kernel = TritonKDAKernel()
+        helion_kernel = None
+        if decode_backend.is_helion() or prefill_backend.is_helion():
+            if not is_cuda():
+                raise ValueError("KDA Helion backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_helion import (
+                HelionKDAKernel,
+            )
+
+            helion_kernel = HelionKDAKernel(
+                triton_kernel,
+                enable_decode=decode_backend.is_helion(),
+                enable_prefill=prefill_backend.is_helion(),
+            )
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_helion():
+            assert helion_kernel is not None
+            self.decode_kernel = helion_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("KDA CuTe DSL backend requires CUDA")
@@ -71,7 +87,7 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -110,6 +126,9 @@ class KDAKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_helion():
+            assert helion_kernel is not None
+            self.extend_kernel = helion_kernel
         elif prefill_backend.is_flashkda():
             from sglang.srt.layers.attention.linear.kernels.kda_flashkda import (
                 FlashKDAKernel,
@@ -166,8 +185,9 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA supports 'triton', 'flashkda', 'cutedsl', 'nvidia_kda', or "
-                "'ptx_kda' (cutedsl/nvidia_kda prefill need SM100, ptx_kda SM103)."
+                "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
+                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
+                "SM100, ptx_kda SM103)."
             )
 
         self.supports_packed_decode = getattr(

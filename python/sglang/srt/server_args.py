@@ -370,6 +370,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
+    "helion",
 ]
 
 
@@ -2536,7 +2537,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The optional Helion backend is KDA-only and requires sglang[helion].",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2575,7 +2576,8 @@ class ServerArgs:
         "is numerically correct, but KDA decode is SLOWER than the packed "
         "baseline (the per-K g_cache is K x larger and the reconstruction "
         "refolds the per-K decay every step), so it is not recommended for KDA "
-        "models. Requires the Triton linear-attn decode backend and "
+        "models. Requires the Triton linear-attn decode implementation; KDA "
+        "with the Helion backend delegates ReplaySSM decode to Triton. Requires "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
@@ -6057,6 +6059,7 @@ class ServerArgs:
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
         if (
             self.linear_attn_decode_backend is None
+            and self.linear_attn_backend != "helion"
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
             # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
@@ -6135,8 +6138,9 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
-        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # ReplaySSM buffered decode guards. Runs on the Triton implementation;
+        # KDA's Helion adapter delegates this mode to its Triton fallback.
+        # cuda-graph is supported (slice 1b: CUDA-graph-safe static
         # write-cursor buffers). The RADIX prefix cache is now supported (slice
         # 2b: the decode kernel force-flushes the ring into temporal[slot] on
         # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
@@ -6150,10 +6154,11 @@ class ServerArgs:
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
         if self.enable_linear_replayssm:
-            if decode != "triton":
+            if decode not in {"triton", "helion"}:
                 raise ValueError(
-                    "--enable-linear-replayssm requires the Triton "
-                    "linear-attn decode backend, got "
+                    "--enable-linear-replayssm requires the Triton decode "
+                    "implementation (directly or through the KDA Helion "
+                    "fallback), got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             from sglang.srt.arg_groups.overrides import (
