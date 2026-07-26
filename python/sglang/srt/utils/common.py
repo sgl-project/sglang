@@ -84,7 +84,12 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
+try:
+    import triton
+    HAS_TRITON = True
+except ImportError:
+    triton = None
+    HAS_TRITON = False
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -205,9 +210,25 @@ def is_host_cpu_arm64() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_host_cpu_ppc64le() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("ppc64le", "ppc64", "powerpc64le")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    is_host_cpu_supported = (
+        is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_ppc64le()
+    )
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+
+
+def is_triton_available() -> bool:
+    return HAS_TRITON
 
 
 @lru_cache(maxsize=1)
@@ -3150,7 +3171,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if triton is not None:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class EmptyContextManager:
@@ -4267,7 +4289,8 @@ class CachedKernel:
 
     def __init__(self, fn, key_fn=None):
         self.fn = fn
-        assert isinstance(fn, triton.runtime.jit.JITFunction)
+        if triton is not None:
+            assert isinstance(fn, triton.runtime.jit.JITFunction)
 
         original_fn = fn.fn
         self.signature = inspect.signature(original_fn)

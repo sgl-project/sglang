@@ -31,7 +31,7 @@ include_directories(
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 # Exclude all arch dependent files, then add back only files for this arch
-set(ARCH_DIRS "x86_64|aarch64|ppc64")
+set(ARCH_DIRS "x86_64|aarch64|ppc64le")
 list(FILTER SOURCES EXCLUDE REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/(${ARCH_DIRS})/")
 
 # Platform-specific source and library directory
@@ -44,7 +44,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(MY_ARCH_DIR "aarch64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64le|ppc64")
     set(PLAT_LIB_DIR "/usr/lib/powerpc64le-linux-gnu")
-    set(MY_ARCH_DIR "ppc64")
+    set(MY_ARCH_DIR "ppc64le")
 else()
     set(PLAT_LIB_DIR "/usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu")
 endif()
@@ -128,7 +128,7 @@ if(MY_ARCH_DIR STREQUAL "x86_64")
         -mamx-int8
         -fopenmp
     )
-elseif(MY_ARCH_DIR STREQUAL "ppc64")
+elseif(MY_ARCH_DIR STREQUAL "ppc64le")
     add_compile_options(
         -O3
         -Wno-unknown-pragmas

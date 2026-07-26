@@ -3,7 +3,12 @@ from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-import triton
+from sglang.srt.utils.common import HAS_TRITON
+
+if HAS_TRITON:
+    import triton
+else:
+    triton = None
 
 logger = logging.getLogger(__name__)
 
