@@ -101,22 +101,15 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
 
 @dataclass
 class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
-    """Payload for the SM100 (Blackwell) trtllm-gen MXFP4 MoE path.
+    """Payload for the SM100 (Blackwell) trtllm-gen MXFP4 MoE path."""
 
-    Consumes MXFP4 packed weights (e2m1 x 2) with block scales and runs
-    FlashInfer's ``trtllm_fp4_block_scale_moe``. Carries BYPASSED topk (the
-    kernel routes from ``router_logits`` internally) and the precision selector
-    for its own input quant (bf16 passthrough or mxfp8).
-    """
-
-    # Packed MXFP4 weights (uint8, e2m1 x 2) + block scales. Per-tensor scale
-    # packing is annotated at the trtllm_fp4_block_scale_moe call site below.
+    # Packed MXFP4 weights: uint8, e2m1 x 2.
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
     w13_weight_scale: torch.Tensor
     w2_weight_scale: torch.Tensor
 
-    # Per-expert bias + SwiGLU scalars (fp32, per expert). GPT-OSS sets these.
+    # fp32 per expert. GPT-OSS sets these.
     w13_weight_bias: torch.Tensor
     w2_weight_bias: torch.Tensor
     gemm1_alpha: torch.Tensor
@@ -334,7 +327,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
     """Dispatch flashinfer_mxfp4 by quant-info type.
 
     Both mxfp4 paths register under this single ``("none", "flashinfer_mxfp4")``
-    key but call different kernels, so the payload type selects between them.
+    key but call different kernels.
     """
     if isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
         return _fused_experts_flashinfer_mxfp4_sm90_cutlass(
@@ -453,9 +446,8 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 ) -> StandardCombineInput:
     """SM100 (Blackwell) trtllm-gen MXFP4 fused experts.
 
-    Consumes BYPASSED topk directly -- the kernel routes from ``router_logits``
-    internally, so there is no ``to_standard()`` conversion -- and quantizes the
-    input itself (bf16 passthrough or mxfp8).
+    Consumes BYPASSED topk directly: the kernel routes from ``router_logits``
+    internally. Quantizes the input itself (bf16 passthrough or mxfp8).
     """
     from flashinfer import mxfp8_quantize, trtllm_fp4_block_scale_moe
 

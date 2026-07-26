@@ -2,9 +2,8 @@
 
 Drives the real chain -- ``create_moe_runner`` -> ``MoeRunner`` -> the fused func
 registered for ``("none", "flashinfer_mxfp4")`` -> the SM100 helper -- with only
-``trtllm_fp4_block_scale_moe`` faked, so the kernel arguments are checked without
-a GPU. Numerical equivalence needs Blackwell and lives in
-``test_mxfp4_trtllm_gen.py``.
+``trtllm_fp4_block_scale_moe`` faked, so it runs without a GPU. Numerical
+equivalence needs Blackwell and lives in ``test_mxfp4_trtllm_gen.py``.
 
 Run anywhere (CPU-only, no flashinfer):
 
@@ -80,8 +79,7 @@ class _MockDispatchOutput:
 @pytest.fixture(autouse=True)
 def _cpu_runnable(monkeypatch):
     """Pin ``_is_cpu`` False so ``apply`` takes the SM100 branch rather than the
-    AMX one, and neutralize the symmetric-memory / TP-group allocation wrapper
-    so no distributed init is needed."""
+    AMX one, and neutralize the symmetric-memory / TP-group allocation wrapper."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
 
