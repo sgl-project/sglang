@@ -233,8 +233,8 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
     or dropping the bf16-vs-default input-quant branch)."""
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
 
-    # Bypass symmetric-memory / TP-group in the fused-func module (where the
-    # kernel call now lives) so the test avoids distributed init.
+    # Bypass symmetric-memory / TP-group in the fused-func module, where the
+    # kernel call now lives.
     monkeypatch.setattr(
         fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )

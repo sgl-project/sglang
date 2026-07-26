@@ -1275,10 +1275,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm120",
             "trtllm_sm100",
         ):
-            # Register the fused func at runner construction so the FusedOpPool
-            # lookup at `MoeRunner.__init__` finds it.
-            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
-
+            # NOTE: MoeRunner.__init__ (runner.py) imports flashinfer_cutlass
+            # before its FusedOpPool lookup, which is what registers the fused
+            # func. Do not re-add an import here.
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             raise NotImplementedError(
