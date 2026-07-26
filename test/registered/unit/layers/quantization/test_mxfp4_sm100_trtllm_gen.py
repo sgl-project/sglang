@@ -231,15 +231,15 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
     Turns red if apply mis-wires a ``FlashInferTrtllmGenMxfp4MoeQuantInfo`` field
     into the kernel (e.g. swapping ``local_expert_offset`` / ``local_num_experts``
     or dropping the bf16-vs-default input-quant branch)."""
-    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+    import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as fi_trtllm_mod
 
     # Bypass symmetric-memory / TP-group in the fused-func module, where the
     # kernel call now lives.
     monkeypatch.setattr(
-        fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
+        fi_trtllm_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
-    monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(fi_trtllm_mod, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(fi_trtllm_mod, "get_tp_group", lambda: None)
 
     fixtures = _make_random_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
