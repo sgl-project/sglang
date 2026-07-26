@@ -185,12 +185,15 @@ impl ImageProcessorSpec for MyModelProcessor {
 
 - All fan-out goes through `common::par`, so whether this crate owns threads is
   decided by the `parallel` feature alone. With it on: CPU pool capped at
-  `min(8, cores)` (override `SGL_MM_RS_THREADS`), plus a separate 16-thread I/O
-  pool so slow URLs cannot starve preprocessing. With it off: no rayon, no
+  `min(8, cores)` (override `SGL_MM_RS_THREADS`). With it off: no rayon, no
   threads, everything inline. Output is bit-identical either way — the fan-outs
   are order-preserving maps and writes into disjoint slices, never reductions.
   Note that sizing a pool to 1 is *not* the same as off: `install` blocks the
   caller and would serialize every concurrent request in the process.
+- Media fetch is blocking I/O and deliberately never enters the CPU pool; it
+  runs inline and sequentially in `driver::process`. The server hands over
+  pre-fetched bytes, so fetch would get its own I/O pool before ever being
+  fanned out.
 - PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB. Samples deeper
   than 8 bits are rejected rather than rescaled (PIL clips instead).
 - Lanczos and Bicubic resize are bit-exact clones of PIL's fixed-point

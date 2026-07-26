@@ -1,11 +1,11 @@
 //! The crate's only parallelism seam.
 //!
-//! Every fan-out in the crate goes through the two functions below, so whether
+//! Every fan-out in the crate goes through the functions below, so whether
 //! this crate owns worker threads at all is decided in exactly one place: the
 //! `parallel` cargo feature.
 //!
 //! * **feature on** (the PyO3 extension): work is fanned out on the crate's
-//!   rayon pools. A Python processor calls in from one or two worker threads
+//!   rayon pool. A Python processor calls in from one or two worker threads
 //!   with the GIL released, so intra-call parallelism is the whole point.
 //! * **feature off** (the pure-Rust `rlib` that `sglang-server` links): rayon
 //!   is not even a dependency, and everything runs inline on the calling
@@ -41,35 +41,6 @@ where
 
 #[cfg(not(feature = "parallel"))]
 pub fn try_map<'a, T, R, E>(
-    items: &'a [T],
-    f: impl Fn(&'a T) -> Result<R, E> + Send + Sync,
-) -> Result<Vec<R>, E>
-where
-    T: Send + Sync,
-    R: Send,
-    E: Send,
-{
-    items.iter().map(f).collect()
-}
-
-/// [`try_map`] for blocking I/O (media fetch), which must not occupy the
-/// CPU pool: one request's slow URLs would stall every other request's
-/// preprocessing.
-#[cfg(feature = "parallel")]
-pub fn try_map_io<'a, T, R, E>(
-    items: &'a [T],
-    f: impl Fn(&'a T) -> Result<R, E> + Send + Sync,
-) -> Result<Vec<R>, E>
-where
-    T: Send + Sync,
-    R: Send,
-    E: Send,
-{
-    super::io_pool().install(|| items.par_iter().map(f).collect())
-}
-
-#[cfg(not(feature = "parallel"))]
-pub fn try_map_io<'a, T, R, E>(
     items: &'a [T],
     f: impl Fn(&'a T) -> Result<R, E> + Send + Sync,
 ) -> Result<Vec<R>, E>

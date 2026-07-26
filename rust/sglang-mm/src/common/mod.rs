@@ -30,22 +30,6 @@ pub fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Blocking-I/O pool for media source loading, kept separate from [`pool`] so
-/// a request full of slow URLs cannot starve CPU preprocessing. The width
-/// mirrors the Python processors' `auto_mm_io_worker_num = 16` (threads here
-/// are parked on sockets, not cores).
-#[cfg(feature = "parallel")]
-pub fn io_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(16)
-            .thread_name(|i| format!("sgl-mm-io-{i}"))
-            .build()
-            .expect("failed to build rayon io pool")
-    })
-}
-
 /// Content hash for cache/dedup identity: blake3 truncated to its first 8
 /// bytes, big-endian. Deliberately *not* Python's `mm_utils.data_hash` (which
 /// is SHA-256 truncated the same way) — hashes are consistent within a path,

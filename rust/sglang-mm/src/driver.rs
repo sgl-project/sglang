@@ -66,23 +66,16 @@ pub fn process(
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
-    // Stage 1 is blocking I/O and stages 2-3 are CPU-bound, so they use
-    // separate seams (`par::try_map_io` vs `par::try_map`): one request's slow
-    // URLs must not occupy the workers other requests need for decode/resize —
-    // the split the Python processors make with `auto_mm_io_worker_num` vs
-    // `auto_mm_processor_worker_num`.
-    // Pre-fetched requests (the shape a server that owns its own async HTTP
-    // hands over) have no I/O to do, so they must not pay for the I/O seam —
-    // resolving `Bytes` is just a slice wrap.
-    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = if input
+    // Stage 1 (fetch) is blocking I/O and runs inline, sequentially: it must
+    // NOT go through `par::try_map` — one request's slow URLs would occupy the
+    // CPU workers other requests need for decode/resize. The server supplies
+    // concurrency across requests, and its request shape is pre-fetched
+    // `Bytes` anyway; give fetch its own I/O pool before ever fanning it out.
+    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = input
         .images
         .iter()
-        .any(|source| matches!(source, ImageSource::String(_)))
-    {
-        par::try_map_io(&input.images, resolve)
-    } else {
-        input.images.iter().map(resolve).collect::<Result<_, _>>()
-    }?;
+        .map(resolve)
+        .collect::<Result<_, _>>()?;
     let processed: Vec<(ProcessedItem, u64)> =
         par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
             // The Python (PIL) path decodes more formats (GIF/WebP/BMP, 16-bit
