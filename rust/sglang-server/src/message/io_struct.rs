@@ -192,39 +192,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod wire_dump {
-    use super::*;
-    use crate::message::GenerateBody;
-    #[test]
-    fn dump() {
-        let d =
-            "/tmp/claude-0/-sgl-workspace-sglang/1612e3df-52df-42ee-93e5-2d237db61639/scratchpad";
-        let body: GenerateBody = serde_json::from_str(
-            r#"{"text": "hi", "rid": "r1", "return_logprob": true, "top_logprobs_num": 3,
-                "logprob_start_len": 2, "return_hidden_states": true, "stream": true,
-                "token_ids_logprob": [5, 6],
-                "sampling_params": {"max_new_tokens": 7, "temperature": 0, "stop": "END"}}"#,
-        )
-        .unwrap();
-        let (ps, _) = body.into_requests().unwrap();
-        let mut p = ps.into_iter().next().unwrap();
-        p.sampling_params.normalize(false, Some(1000)).unwrap();
-        std::fs::write(format!("{d}/hdr15.msgpack"), p.encode_header().unwrap()).unwrap();
-        std::fs::write(
-            format!("{d}/abort15.msgpack"),
-            ControlRequest::AbortReq(AbortReq::new("r1".into(), false))
-                .encode()
-                .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            format!("{d}/ctrl15.msgpack"),
-            ControlRequest::GetInternalStateReq(GetInternalStateReq::new("r1".into()))
-                .encode()
-                .unwrap(),
-        )
-        .unwrap();
-    }
-}
