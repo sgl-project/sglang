@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from array import array
+from unittest import mock
 
 import torch
 
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache_components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -129,17 +134,37 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         )
         self.assertEqual(result.slot_indices.tolist(), [3, 4])
 
+    def test_unified_swa_sweep_gates_on_swa_lock_not_full_lock(self):
+        """With unlocked_only + swa_resident_only, the sweep filters on the SWA
+        component lock: a FULL-locked node whose SWA lock was already released
+        (early dec_swa_lock_only) must still be swept, and a node whose SWA
+        lock is still held must not."""
+        cache = self._make_unified_cache((ComponentType.FULL, ComponentType.SWA))
+        self._add_unified_child(cache, [1, 2], lock_ref=1, swa_value=[1, 2])
+        held = self._add_unified_child(cache, [3, 4], swa_value=[3, 4])
+        held.component_data[ComponentType.SWA].lock_ref = 1
+
+        result = walk_radix_cache_for_canary(
+            radix_cache=cache, unlocked_only=True, swa_resident_only=True
+        )
+        self.assertEqual(result.slot_indices.tolist(), [1, 2])
+
     def _make_unified_cache(
         self, tree_components: tuple[ComponentType, ...]
     ) -> UnifiedRadixCache:
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_components = tree_components
         cache.components = {ct: None for ct in tree_components}
-        root = UnifiedTreeNode(tree_components)
-        root.component_data[BASE_COMPONENT_TYPE].value = torch.tensor(
-            [], dtype=torch.int32, device=self.device
+        cache.is_swa_enabled = ComponentType.SWA in tree_components
+        cache.tree_core = UnifiedTreeCore(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+            ),
+            {ct: mock.MagicMock() for ct in tree_components},
         )
-        cache.root_node = root
         return cache
 
     def _add_unified_child(
@@ -189,6 +214,23 @@ class TestSelfUnitRadixWalker(CustomTestCase):
             swa_resident_only=True,
         )
         self.assertEqual(result.slot_indices.tolist(), [3, 4])
+
+    def test_unified_walk_spans_device_evicted_nodes_without_emitting_them(self):
+        """Verify device-evicted (host-only) nodes emit no slots but still advance
+        positions by their key length and pass the prev-slot chain through."""
+        cache = self._make_unified_cache((ComponentType.FULL,))
+        evicted = UnifiedTreeNode(cache.tree_components)
+        evicted.parent = cache.root_node
+        evicted.key = RadixKey(array("q", [7, 8]), None)
+        cache.root_node.children[evicted.id] = evicted
+        grandchild = self._add_unified_child(cache, [5, 6])
+        cache.root_node.children.pop(grandchild.id)
+        grandchild.parent = evicted
+        evicted.children[grandchild.id] = grandchild
+        result = walk_radix_cache_for_canary(radix_cache=cache)
+        self.assertEqual(result.slot_indices.tolist(), [5, 6])
+        self.assertEqual(result.positions.tolist(), [2, 3])
+        self.assertEqual(result.prev_slot_indices.tolist(), [-1, 5])
 
     def test_unified_swa_resident_only_noop_without_swa_component(self):
         """Verify swa_resident_only is a no-op when SWA is not enabled."""
