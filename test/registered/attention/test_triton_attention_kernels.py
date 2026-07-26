@@ -4,18 +4,18 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
     decode_attention_fwd_normal,
 )
-from sglang.srt.layers.attention.triton_ops.extend_attention import (
+from sglang.kernels.ops.attention.extend_attention import (
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
     redundant_attention,
 )
-from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
@@ -320,7 +320,7 @@ class TestTritonAttention(CustomTestCase):
             self._test_extend_attention_once(19, 12331, 12, 4, value)
 
     def test_extend_attention_block_sizes(self):
-        from sglang.srt.layers.attention.triton_ops import extend_attention as ea
+        from sglang.kernels.ops.attention import extend_attention as ea
 
         if not ea._is_hip:
             self.skipTest("HIP-only block-size selection")

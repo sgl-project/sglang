@@ -74,6 +74,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+
+def _attn_mask_meta_local_pad(attn_mask_meta) -> int:
+    if attn_mask_meta is None or isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+        return 0
+    return attn_mask_meta.get("local_pad", 0)
+
+
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
@@ -694,7 +701,7 @@ class QwenImageCrossAttention(nn.Module):
         # fully sequence-parallel, so no leading tokens are replicated.
         sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
-        sp_txt_pad = (attn_mask_meta or {}).get("local_pad", 0)
+        sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
         (
             img_query,

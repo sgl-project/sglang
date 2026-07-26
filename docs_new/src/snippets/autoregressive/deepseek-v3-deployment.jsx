@@ -154,7 +154,6 @@ export const DeepSeekV3Deployment = () => {
     if (strategyArray.includes('dp')) cmd += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
     if (strategyArray.includes('ep')) cmd += ' \\\n  --ep 8';
     if (strategyArray.includes('mtp')) {
-      cmd = 'SGLANG_ENABLE_SPEC_V2=1 ' + cmd;
       cmd += ' \\\n  --speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4';
     }
 
