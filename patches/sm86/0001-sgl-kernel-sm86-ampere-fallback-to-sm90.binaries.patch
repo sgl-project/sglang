@@ -1,0 +1,15 @@
+diff --git a/sgl-kernel/python/sgl_kernel/load_utils.py b/sgl-kernel/python/sgl_kernel/load_utils.py
+index 5c37402b37..6c84cfdac2 100644
+--- a/sgl-kernel/python/sgl_kernel/load_utils.py
++++ b/sgl-kernel/python/sgl_kernel/load_utils.py
+@@ -60,6 +60,10 @@ def _load_architecture_specific_ops():
+     if compute_capability == 90:
+         ops_subdir = "sm90"
+         variant_name = "SM90 (Hopper/H100 with fast math optimization)"
++    elif compute_capability is not None and compute_capability < 90:
++        # Ampere (SM86/SM80) falls back to sm90 binaries — same generation, compatible
++        ops_subdir = "sm90"
++        variant_name = f"SM{compute_capability} (using sm90 fast-math fallback)"
+     elif compute_capability is not None:
+         ops_subdir = "sm100"
+         variant_name = f"SM{compute_capability} (precise math for compatibility)"

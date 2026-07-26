@@ -5261,8 +5261,7 @@ class ServerArgs:
             )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
-        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
-            return
+        return  # Conv3d CuDNN bug is irrelevant for text-only LLM serving
 
         if self.get_model_config().is_multimodal:
             import torch

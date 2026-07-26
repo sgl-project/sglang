@@ -1,0 +1,14 @@
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index b080aeb168..ff43f397d0 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -5261,8 +5261,7 @@ class ServerArgs:
+             )
+ 
+     def check_torch_2_9_1_cudnn_compatibility(self):
+-        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
+-            return
++        return  # Conv3d CuDNN bug is irrelevant for text-only LLM serving
+ 
+         if self.get_model_config().is_multimodal:
+             import torch

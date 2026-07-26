@@ -1,0 +1,17 @@
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index f01225487b..b0003ca400 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1286,11 +1286,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                                 num_experts,
+                             )
+                     else:
+-                        # Skip loading extra parameters for GPTQ models.
+-                        if (
+-                            name_mapped.endswith(ignore_suffixes)
+-                            and name_mapped not in params_dict
+-                        ):
++                        if name_mapped not in params_dict:
+                             continue
+                         param = params_dict[name_mapped]
+                         # We should ask the weight loader to return success or
