@@ -88,8 +88,16 @@ try:
     import triton
     HAS_TRITON = True
 except ImportError:
-    triton = None
     HAS_TRITON = False
+    import sys
+    from sglang.srt.utils.dummy_triton import TritonPlaceholder
+    
+    sys.modules["triton"] = TritonPlaceholder()
+    sys.modules["triton.language"] = sys.modules["triton"].language
+    sys.modules["triton.language.extra"] = sys.modules["triton"].language
+    sys.modules["triton.language.extra.libdevice"] = sys.modules["triton"].language
+    
+    triton = sys.modules["triton"]
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
