@@ -113,6 +113,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
@@ -222,6 +223,74 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
                 "stamp crashes result processing."
             ),
         )
+
+
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestOverlapLoopGracefulExit(unittest.TestCase):
+    """The MLX overlap loop must honor ``gracefully_exit`` like the standard loops.
+
+    ``handle_shutdown`` (ShutdownReq) only sets ``scheduler.gracefully_exit``;
+    actual teardown happens after the event loop returns —
+    ``run_scheduler_process``'s ``finally`` calls ``release_host_resources()``
+    only once the loop breaks.  ``event_loop_normal`` and ``event_loop_overlap``
+    check the flag at the top of every iteration; a loop that never checks it
+    spins forever, so the TokenizerManager's shutdown path times out after its
+    15 s grace period and falls back to ``kill_process_tree`` — host resources
+    never get their user-space release.
+    """
+
+    def _make_scheduler(self, *, recv_side_effect):
+        from collections import deque
+
+        scheduler = MagicMock()
+        scheduler.forward_ct = 0
+        scheduler.gracefully_exit = False
+        scheduler._engine_paused = False
+        scheduler.waiting_queue = []
+        scheduler.result_queue = deque()
+        scheduler.request_receiver.recv_requests.side_effect = recv_side_effect
+        # Model handle_shutdown: processing a non-empty recv batch (the
+        # ShutdownReq) flips the flag; the loop must notice at the top of the
+        # next iteration instead of polling forever.
+        scheduler.process_input_requests.side_effect = lambda reqs: (
+            setattr(scheduler, "gracefully_exit", True) if reqs else None
+        )
+        plan = MagicMock()
+        plan.batch_to_run = None
+        scheduler.get_next_batch_to_run.return_value = plan
+        return scheduler
+
+    def test_loop_exits_after_shutdown_req(self):
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        # Iteration 1: recv the ShutdownReq stand-in (flag flips inside
+        # process_input_requests).  Iteration 2 must break before polling
+        # again; the sentinel raising instead means the loop never exits.
+        scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
+
+        SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+
+        self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
+
+    def test_loop_exits_when_shutdown_arrives_while_paused(self):
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        # A paused engine still recvs and processes control requests — that is
+        # how unpause (and shutdown) arrive — but `continue`s past the rest of
+        # the body.  The flag check must sit above the paused-continue, like in
+        # event_loop_normal/event_loop_overlap, or shutdown during a pause
+        # spins forever.
+        scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
+        scheduler._engine_paused = True
+
+        SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+
+        self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
+        scheduler.get_next_batch_to_run.assert_not_called()
 
 
 if __name__ == "__main__":

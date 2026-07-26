@@ -1132,6 +1132,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
         scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
