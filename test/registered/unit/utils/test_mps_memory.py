@@ -26,10 +26,11 @@ from unittest.mock import MagicMock, patch
 import sglang._apple_silicon_memory as apple_mem
 import sglang._mps_stub as mps_stub
 from sglang.srt.utils.common import get_available_gpu_memory
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
 
 GiB = 1 << 30
 
