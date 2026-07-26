@@ -539,7 +539,9 @@ class SWAComponent(TreeComponent):
         ):
             x = self._evict_device_cursor
             assert x.component_data[ct].value is not None
-            if x in self.tree_core.evictable_device_leaves:
+            if x in self.tree_core.evictable_device_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 self._evict_device_cursor = (
                     lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
                 )
@@ -1045,7 +1047,9 @@ class SWAComponent(TreeComponent):
             if not enabled:
                 x_next = host_lru.get_prev_no_host_lock(x)
             cd = x.component_data[ct]
-            if x in self.tree_core.evictable_host_leaves:
+            if x in self.tree_core.evictable_host_leaves and (
+                not enabled or self._can_evict_leaf_atomically(x)
+            ):
                 self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             else:
                 assert cd.host_value is not None

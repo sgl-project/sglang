@@ -1364,6 +1364,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             is_leaf = node in self.evictable_host_leaves
 
         trigger_priority = trigger.eviction_priority(is_leaf)
+        base_evicted = False
 
         for comp in self.components:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
@@ -1381,6 +1382,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                             continue
                         if EvictLayer.HOST in target and cd.host_lock_ref != 0:
                             continue
+                        if cd.session_ref > 0 and trigger.session_ref(node) == 0:
+                            continue
                     if EvictLayer.DEVICE in target:
                         assert cd.lock_ref == 0
                     if EvictLayer.HOST in target:
@@ -1393,6 +1396,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         device_frees=device_frees,
                         host_frees=host_frees,
                     )
+                    if comp.component_type == BASE_COMPONENT_TYPE:
+                        base_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
@@ -1402,6 +1407,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and trigger.component_type == BASE_COMPONENT_TYPE
         ):
             node.component_data[trigger.component_type].value = None
+
+        if EvictLayer.DEVICE in target and base_evicted:
+            node.component_data[BASE_COMPONENT_TYPE].value = None
 
         self._update_evictable_leaf_sets(node)
 
