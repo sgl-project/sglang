@@ -1017,17 +1017,13 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
-            except ValueError as e:
-                logger.info(
-                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
+            except ValueError:
+                logger.exception(
+                    "[load_mm_data(simple)] error loading %s data at index=%d",
                     modality.name,
                     idx,
-                    e,
                 )
-                raise ValueError(
-                    f"An exception occurred while loading {modality.name} data "
-                    f"at index {idx}: {e}"
-                ) from e
+                raise
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",

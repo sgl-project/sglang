@@ -877,11 +877,13 @@ class WaitingImageRequest:
                 self.close_recv_socket()
                 return
 
+            # Extract original req_id from part_req_id and drop stale payloads
+            # that may arrive on a reused ZMQ port after a prior request aborted.
             original_req_id = extract_original_req_id(recv_obj.req_id)
             if original_req_id != self.recv_req.rid:
                 logger.warning(
                     f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                    f"got rid={recv_obj.req_id}"
+                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
                 )
                 return
             recv_obj.req_id = original_req_id
