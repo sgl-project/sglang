@@ -896,6 +896,10 @@ class Envs:
     # the fp8 path plus its per-call activation quant. MoE expert weights are
     # unaffected. Trades ~2x dense weight memory for decode latency.
     SGLANG_BS1_BF16_DENSE = EnvBool(False)
+    # Route only profiled GLM-5.2 tiny-M dense shapes from the load-time BF16
+    # path through the Blackwell CuTe-DSL TGV kernel. Default-off and inert
+    # unless SGLANG_BS1_BF16_DENSE is also enabled.
+    SGLANG_BS1_BF16_TGV = EnvBool(False)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
