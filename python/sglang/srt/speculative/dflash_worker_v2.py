@@ -1688,19 +1688,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
-        vocab_mask = None
+        grammar_mask = None
         if batch.has_grammar:
-            # Grammar barrier: advance the previous batch's FSM over its committed
-            # tokens before building this batch's bitmask. Runs after the target
-            # launch, so the advance and the traversal both overlap the forward.
-            if grammar_barrier is not None:
-                grammar_barrier()
-            vocab_mask = build_grammar_vocab_mask(
+            grammar_mask = build_grammar_vocab_mask(
                 reqs=batch.reqs,
-                verify_input=verify_input,
                 tree=grammar_tree,
                 sampling_info=batch.sampling_info,
                 device=logits_output.next_token_logits.device,
+                barrier=grammar_barrier,
             )
 
         if sampling_info is not None:
@@ -1711,10 +1706,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # Constrain every chain position before accept picks from it.
-        if vocab_mask is not None:
-            verify_input.grammar.apply_vocab_mask(
-                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
-            )
+        if grammar_mask is not None:
+            grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
         new_seq_lens = None
