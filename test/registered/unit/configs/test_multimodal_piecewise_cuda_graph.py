@@ -105,6 +105,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.model_config = SimpleNamespace(
             is_embedding_gemma=True,
             is_multimodal=False,
+            context_len=2048,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
         )
         args.cuda_graph_config = CudaGraphConfig(
