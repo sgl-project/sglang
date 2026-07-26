@@ -62,7 +62,6 @@ class LingBotVideoRouter(nn.Module):
         return torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
 
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # selection uses bias-added score, weights gather the bias-free score; fp32.
         with torch.amp.autocast(tokens.device.type, enabled=False):
             logits = F.linear(tokens.float(), self.weight.float())
         if self.score_func == "softmax":

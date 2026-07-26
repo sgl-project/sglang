@@ -474,10 +474,6 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_autocast()
         auto_tuner.finalize_auto_flags()
         self.adjust_pipeline_config()
-        self._adjust_srt_moe_args()
-
-    def _adjust_srt_moe_args(self):
-        """Hook for future MoE server-args adjustment."""
 
     def _adjust_disagg_parallelism_aliases(self):
         if self.decoder_tp is None:

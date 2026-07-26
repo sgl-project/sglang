@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _lingbot_flow_shift_kwarg(
+def _flow_shift_kwarg(
     batch, server_args: ServerArgs
 ) -> tuple[str, float | None]:
     shift = (
@@ -48,7 +48,7 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         )
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
-            prepare_extra_kwargs=[_lingbot_flow_shift_kwarg],
+            prepare_extra_kwargs=[_flow_shift_kwarg],
         )
         self.add_stage(
             DenoisingStage(

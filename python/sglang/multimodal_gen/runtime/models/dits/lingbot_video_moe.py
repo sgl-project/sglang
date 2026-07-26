@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -112,8 +112,8 @@ class LingBotVideoAttention(nn.Module):
         qkv_bias: bool,
         out_bias: bool,
         prefix: str = "",
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        quant_config: QuantizationConfig | None = None,
+        supported_attention_backends: Optional[set[AttentionBackendEnum]] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -170,18 +170,16 @@ class LingBotVideoAttention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cos, sin = freqs_cis
         q, _ = self.to_q(x)
         k, _ = self.to_k(x)
         v, _ = self.to_v(x)
-        # norm_q/k are per-head_dim: apply after unflattening to (B, S, H, D).
         q = self.norm_q(q.unflatten(2, (self.local_num_heads, self.head_dim)))
         k = self.norm_k(k.unflatten(2, (self.local_num_heads, self.head_dim)))
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        # B>1: flatten batch into the token axis (Triton RoPE indexes cos per token).
         B, S, H, D = q.shape
         if B > 1:
             q = q.reshape(1, B * S, H, D)
@@ -223,8 +221,8 @@ class LingBotVideoBlock(nn.Module):
         routed_scaling_factor,
         layer_idx: int,
         prefix: str = "",
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        quant_config: QuantizationConfig | None = None,
+        supported_attention_backends: Optional[set[AttentionBackendEnum]] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -267,7 +265,7 @@ class LingBotVideoBlock(nn.Module):
         x: torch.Tensor,
         temb6: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         expected_tokens = x.shape[0] * x.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
@@ -347,7 +345,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         self,
         config: LingBotVideoMoEConfig,
         hf_config: dict[str, Any],
-        quant_config: QuantizationConfig | None = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
@@ -439,7 +437,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         hidden_states: torch.Tensor,  # (B, C, T, H, W)
         timestep: torch.Tensor,  # (B,) in [0, 1000] (= sigma*1000)
         encoder_hidden_states: torch.Tensor,  # (B, L, text_dim)
-        encoder_attention_mask: torch.Tensor | None = None,  # (B, L) 1=valid
+        encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
         **kwargs,
     ) -> torch.Tensor:
         B, C, T, H, W = hidden_states.shape
