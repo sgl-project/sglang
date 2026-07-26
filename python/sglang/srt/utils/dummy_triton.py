@@ -35,7 +35,19 @@ class TritonPlaceholder(types.ModuleType):
         if name.startswith("__") and name.endswith("__"):
             # Return None for unknown dunder attrs so inspect/os.path don't break
             return None
-        child = TritonPlaceholder(f"triton.{name}")
+        
+        # If the requested attribute is Capitalized (like Config, JITFunction),
+        # return an actual class that can be safely subclassed by PyTorch.
+        if name and name[0].isupper():
+            class DummyClass:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def __getattr__(self, item):
+                    return None
+            child = DummyClass
+        else:
+            child = TritonPlaceholder(f"{self.__package__}.{name}")
+            
         # Cache it to avoid creating new objects on every access
         object.__setattr__(self, name, child)
         return child
