@@ -248,9 +248,7 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def requires_dcp_relayout(
-        self, dst_dcp_size: int, dst_dcp_rank: int
-    ) -> bool:
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:
             if self.dcp_rank != dst_dcp_rank:
                 raise RuntimeError(
@@ -270,16 +268,12 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
-    def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[int]
-    ) -> List[int]:
+    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [
             item_len // page_size for item_len in self.kv_args.kv_item_lens
         ]
-        dst_token_lens = [
-            item_len // page_size for item_len in dst_page_item_lens
-        ]
+        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
         if src_token_lens != dst_token_lens:
             raise RuntimeError(
                 "PD DCP source/destination KV geometry differs: "
@@ -528,12 +522,6 @@ class CommonKVManager(BaseKVManager):
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
                     "PD decode DCP requires an MLA or hybrid-MLA KV pool."
-                )
-            if info.attn_tp_size != self.attn_tp_size:
-                raise RuntimeError(
-                    "PD decode DCP currently requires equal prefill/decode "
-                    f"attention TP, got prefill={info.attn_tp_size}, "
-                    f"decode={self.attn_tp_size}."
                 )
             if info.attn_cp_size != 1:
                 raise RuntimeError(
