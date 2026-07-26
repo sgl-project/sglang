@@ -628,12 +628,14 @@ mod tests {
     }
 
     /// An unknown key is a 400, mirroring Python's `SamplingParams(**kwargs)`
-    /// TypeError — a typo must not be silently ignored.
+    /// TypeError — a typo must not be silently ignored. (The bogus key is
+    /// deliberately not a near-miss of a real field: an editor spell-checker
+    /// kept "correcting" a misspelling here into a valid name, which silently
+    /// turned this assertion into a tautology.)
     #[test]
     fn unknown_field_is_rejected() {
-        // NOTE: `temperature` is a deliberate typo — the point of the test.
-        assert!(serde_json::from_str::<SamplingParams>(r#"{"temperature": 0.7}"#).is_err());
-        // The correctly spelled field still parses.
+        assert!(serde_json::from_str::<SamplingParams>(r#"{"zzz_not_a_field": 1}"#).is_err());
+        // ...while every declared field still parses.
         assert!(serde_json::from_str::<SamplingParams>(r#"{"temperature": 0.7}"#).is_ok());
     }
 
