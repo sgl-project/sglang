@@ -149,8 +149,8 @@ def validate_attn_res_carry(
         torch.linspace(-0.01, 0.01, hidden_size, device=device).view(1, -1)
     )
 
-    full = AttnResidual(initial, 8, 12)
-    carried = AttnResidual(initial, 8, 12)
+    full = AttnResidual(initial, 8)
+    carried = AttnResidual(initial, 8)
     full_normed, _ = full.forward(
         initial, None, score_proj, score_norm, out_norm, write=True
     )

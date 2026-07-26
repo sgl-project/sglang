@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #
-# The public API is the AttnResidual class (constructed once per forward
-# pass; type against BaseAttentionResidual). It owns the frozen snapshot bank
-# [T, NB, H] and the valid-row counter, and dispatches each aggregation point
-# (score rows → softmax → weighted sum → RMSNorm) by hardware capability:
+# The public API is the AttnResidual class (constructed once per forward pass).
+# It owns the frozen snapshot bank [T, NB, H] and the valid-row counter, and
+# dispatches each aggregation point (score rows → softmax → weighted sum →
+# RMSNorm) by hardware capability:
 #   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
@@ -14,7 +14,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional, Protocol
+from typing import Optional
 
 import torch
 import triton
@@ -366,64 +366,22 @@ def _aggregate(
 # ---- Public API ---------------------------------------------------------------
 
 
-class BaseAttnResidual(Protocol):
-    """Snapshot bank + aggregation of one K3 attention-residual stream.
-
-    One instance lives for one model forward pass. Type annotations should
-    use this protocol; construct AttnResidual.
-    """
-
-    # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
-    # legacy kernel path.
-    block_residual: torch.Tensor
-
-    def write(self, prefix_sum: torch.Tensor, rows: Optional[slice] = None) -> None: ...
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        prefix_sum: Optional[torch.Tensor],
-        score_proj: ReplicatedLinear,
-        score_norm: RMSNorm,
-        out_norm: RMSNorm,
-        rows: Optional[slice] = None,
-        write: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-    def forward_sp_all_gather(
-        self,
-        hidden_states: torch.Tensor,
-        prefix_sum: Optional[torch.Tensor],
-        score_proj: ReplicatedLinear,
-        score_norm: RMSNorm,
-        out_norm: RMSNorm,
-        rows: slice,
-        write: bool = False,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]: ...
-
-    def forward_sp_reduce_scatter(
-        self,
-        hidden_states: torch.Tensor,
-        prefix_sum: Optional[torch.Tensor],
-        score_proj: ReplicatedLinear,
-        score_norm: RMSNorm,
-        out_norm: RMSNorm,
-        rows: slice,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]: ...
-
-
 class AttnResidual:
-    """Default implementation backed by the capability-dispatched kernels above."""
+    """Snapshot bank + aggregation of one K3 attention-residual stream,
+    backed by the capability-dispatched kernels above.
+
+    One instance lives for one model forward pass.
+    """
 
     def __init__(
         self,
         hidden_states: torch.Tensor,
         block_num: int,
-        attn_res_block_size: int,
         block_residual: Optional[torch.Tensor] = None,
     ) -> None:
-        self.block_size = attn_res_block_size
         num_tokens, hidden_size = hidden_states.shape
+        # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
+        # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
             (num_tokens, block_num, hidden_size)
         )
