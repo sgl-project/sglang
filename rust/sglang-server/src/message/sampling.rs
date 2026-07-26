@@ -307,6 +307,13 @@ impl SamplingParams {
     /// null-tolerant deserializers above already did): copy the API aliases into
     /// the internal fields and apply the greedy / `top_k` special cases.
     fn post_init(&mut self) {
+        // Python's `__post_init__` guard. Without it a second `normalize` reads
+        // the aliases `normalize_stops` already cleared and silently wipes
+        // `stop_strs`/`stop_regex_strs` to empty — the request would stop
+        // matching its stop strings.
+        if self.is_normalized {
+            return;
+        }
         // Moved out, not cloned: `normalize_stops` clears both aliases anyway.
         self.stop_strs = take_one_or_many(self.stop.take());
         self.stop_regex_strs = take_one_or_many(self.stop_regex.take());
@@ -729,6 +736,29 @@ mod tests {
         assert_eq!(sp.temperature, 1.0);
         assert_eq!(sp.top_k, TOP_K_ALL);
         assert!(sp.skip_special_tokens);
+    }
+
+    /// `normalize` must be idempotent: `post_init` reads the API aliases, which
+    /// `normalize_stops` clears, so without Python's `if self.is_normalized:
+    /// return` guard a second call wipes `stop_strs` and drops the stop bound to
+    /// zero — silently, leaving a request that never stops.
+    #[test]
+    fn normalize_is_idempotent() {
+        let mut once = norm(r#"{"stop": ["END", "STOP"], "stop_regex": "\\d{3}"}"#);
+        let twice = {
+            let mut p = once.clone();
+            p.normalize(false, None).expect("second normalize");
+            p
+        };
+        assert_eq!(once, twice, "a second normalize must change nothing");
+        assert_eq!(twice.stop_strs, vec!["END".to_string(), "STOP".to_string()]);
+        assert_eq!(twice.stop_str_max_len, 4);
+        assert_eq!(twice.stop_regex_max_len, 3);
+
+        // Greedy handling must not re-fire either: temperature is 1.0 after the
+        // first pass, which is not in the greedy window.
+        once.normalize(false, None).unwrap();
+        assert_eq!(once.top_k, twice.top_k);
     }
 
     /// `skip_tokenizer_init` has no tokenizer, so the text-matching stop features
