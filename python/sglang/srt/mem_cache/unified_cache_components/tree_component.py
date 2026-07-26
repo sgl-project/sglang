@@ -75,6 +75,14 @@ class EvictLayer(IntFlag):
     ALL = DEVICE | HOST
 
 
+@dataclasses.dataclass(frozen=True)
+class PrepareLoadBackResult:
+    """Outcome of prepare_load_back; default = nothing to prepare."""
+
+    # Freshly allocated device mamba slot, recovered on failure.
+    allocated_mamba_slot: Optional[torch.Tensor] = None
+
+
 class CacheTransferPhase(str, Enum):
 
     BACKUP_HOST = "backup_host"  # D→H
@@ -379,6 +387,22 @@ class TreeComponent(ABC):
         pass
 
     # ---- HiCache Hooks ----
+
+    def prepare_load_back(
+        self,
+        node: UnifiedTreeNode,
+        *,
+        req: Optional[Req] = None,
+    ) -> PrepareLoadBackResult:
+        """Cache-level pre-allocation before a load-back builds its transfers."""
+        return PrepareLoadBackResult()
+
+    def finalize_load_back(
+        self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
+    ) -> None:
+        """Release state populated by prepare_load_back when the load-back did
+        not go through."""
+        pass
 
     def build_hicache_transfers(
         self,

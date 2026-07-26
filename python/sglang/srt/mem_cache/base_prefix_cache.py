@@ -177,6 +177,8 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        full_kv_hit_length: Longest Full-KV prefix available on either device or
+                            host, independent of other components.
     """
 
     device_indices: torch.Tensor
@@ -188,6 +190,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    full_kv_hit_length: int = 0
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -205,6 +208,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        full_kv_hit_length=0,
     )
 
 
@@ -235,6 +239,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+
+    def release_host_resources(self) -> None:
+        """Release pinned host buffers in userspace on graceful shutdown.
+
+        Kernel-side unpinning during process reclaim can stall teardown for
+        tens of seconds (see HostKVCache.destroy). Idempotent.
+        """
 
     @abstractmethod
     def reset(self):
