@@ -1364,8 +1364,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if not situ_moe.available():
                     raise RuntimeError(
                         "activation='situ' with the flashinfer_mxfp4 runner "
-                        "needs the private SiTU cubin pool: set "
-                        "SGLANG_TRTLLM_GEN_MOE_SDK (see "
+                        "needs the SiTU cubin pool: set "
+                        "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL (see "
                         "sglang/kernels/ops/moe/trtllm_gen_moe.py)."
                     )
                 # EP is cubin-internal: each rank computes its local expert slice

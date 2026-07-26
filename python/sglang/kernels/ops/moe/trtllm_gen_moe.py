@@ -1,22 +1,26 @@
 """TRT-LLM-gen fused MoE (SiTU) compiled through the sglang JIT system.
 
-Builds the trtllm-gen fused-MoE host/runner sources from the NVIDIA x
-Moonshot private FlashInfer snapshot ("SDK") with sglang's own tvm-ffi
-`load_jit`, so the kernel is available inside the sglang process without
-importing the fork's ``flashinfer`` python package (the box serves with
-flashinfer 0.6.15; the fork snapshot is 0.6.13rc1 and the two cannot be
-imported side by side).
+Builds the trtllm-gen fused-MoE host/runner sources with sglang's own
+tvm-ffi ``load_jit`` from a **self-contained cubin pool**
+(``SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL``): a downloadable directory holding
 
-The SDK directory (fork checkout: ``csrc/``, ``include/``, ``3rdparty/``,
-``local_cubins/<pool>/``) and the SiTU cubin pool stay on-box as artifacts —
-INTERNAL COLLABORATION material, never committed here — and are located via
-``SGLANG_TRTLLM_GEN_MOE_SDK`` (and optionally
-``SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL``). This module vendors only glue:
+  * the prebuilt SiTU cubins (``local/``) + ``config.json`` +
+    ``flashinferMetaInfo.h``,
+  * the flat batched-gemm ABI headers (staged into a
+    ``trtllmGen_bmm_export/``-shaped include tree at build time),
+  * an ``overlay/`` with only the sources/headers that differ from the
+    public ``flashinfer`` pip package.
+
+Every unmodified source and the CUTLASS headers come from the installed
+``flashinfer`` package's ``data/`` tree (the wheel ships it for its own
+JIT), so running this backend needs exactly one download and one env var —
+no extra source checkout.
+
+This module vendors only glue:
 
   * header staging: the pool ships the batched-gemm ABI headers flat; they
     are copied into a content-addressed include tree shaped like
-    ``flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/`` (mirrors
-    ``gen_trtllm_gen_fused_moe_sm100_module(is_private=True)``);
+    ``flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/``;
   * JIT build of the 12 launcher/runner/routing sources with the private
     ABI defines (``TLLM_GEN_LOCAL_CUBINS_ABI`` etc.);
   * the ctypes cubin-loader callback (the .so asks for cubins by absolute
@@ -53,8 +57,8 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# ActivationType / RoutingMethodType values from the fork's tllm_enums
-# (kept as plain ints here so this module has no fork import).
+# ActivationType / RoutingMethodType values from trtllm-gen's tllm_enums
+# (kept as plain ints here to avoid importing anything for them).
 ACTIVATION_SITU = 9
 ROUTING_DEEPSEEK_V3 = 2
 _ROUTING_TOPK = 5
@@ -105,68 +109,37 @@ _SOURCES = [
 
 logger = logging.getLogger(__name__)
 
-# Formal on-box install location, searched when SGLANG_TRTLLM_GEN_MOE_SDK is
-# unset. The pre-formalization ad-hoc location (/scratch/nv_work/...) is still
-# honored as a fallback but is deprecated.
-_SDK_DEFAULT_DIR = "/opt/sglang/trtllm_gen_moe_sdk"
-_SDK_LEGACY_DIR = "/scratch/nv_work/trtllmgen_MOE"
-_warned_legacy_sdk_dir = False
-
-
-def _warn_legacy_sdk_dir(path: pathlib.Path) -> None:
-    global _warned_legacy_sdk_dir
-    if _warned_legacy_sdk_dir:
-        return
-    _warned_legacy_sdk_dir = True
-    logger.warning(
-        "trtllm-gen MoE SDK resolved from the deprecated location %s; move it "
-        "to %s (or point SGLANG_TRTLLM_GEN_MOE_SDK at it). The legacy "
-        "nv_work fallback will be removed.",
-        path,
-        _SDK_DEFAULT_DIR,
-    )
-
-
-def _sdk_dir_if_valid(p: str) -> Optional[pathlib.Path]:
-    path = pathlib.Path(p)
-    return path if (path / "csrc").is_dir() else None
-
-
-def sdk_dir() -> Optional[pathlib.Path]:
-    p = envs.SGLANG_TRTLLM_GEN_MOE_SDK.get()
-    if p:
-        path = _sdk_dir_if_valid(p)
-        if path is not None and "/nv_work/" in str(path.resolve()):
-            _warn_legacy_sdk_dir(path)
-        return path
-    path = _sdk_dir_if_valid(_SDK_DEFAULT_DIR)
-    if path is not None:
-        return path
-    path = _sdk_dir_if_valid(_SDK_LEGACY_DIR)
-    if path is not None:
-        _warn_legacy_sdk_dir(path)
-    return path
-
 
 def cubin_pool_dir() -> Optional[pathlib.Path]:
     p = envs.SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL.get()
-    if p:
-        pool = pathlib.Path(p)
-        return pool if pool.is_dir() else None
-    sdk = sdk_dir()
-    if sdk is None:
+    if not p:
         return None
-    pools = sorted((sdk / "local_cubins").glob("*/"))
-    return pools[-1] if pools else None
+    pool = pathlib.Path(p)
+    return pool if pool.is_dir() else None
+
+
+def _flashinfer_data_dir() -> Optional[pathlib.Path]:
+    """The installed public flashinfer package's JIT source tree (ships
+    csrc/, include/ and its pinned cutlass), used as the base layer under
+    the pool's overlay."""
+    try:
+        import flashinfer  # noqa: PLC0415
+    except ImportError:
+        return None
+    data = pathlib.Path(flashinfer.__file__).parent / "data"
+    return data if (data / "csrc").is_dir() else None
 
 
 def available() -> bool:
     pool = cubin_pool_dir()
     return (
-        sdk_dir() is not None
-        and pool is not None
+        pool is not None
         and (pool / "flashinferMetaInfo.h").is_file()
         and (pool / "local").is_dir()
+        # Modified sources ship in the pool's overlay/, everything else
+        # compiles from the installed flashinfer package.
+        and (pool / "overlay" / "csrc").is_dir()
+        and _flashinfer_data_dir() is not None
     )
 
 
@@ -190,12 +163,28 @@ def _stage_headers(pool: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def _cuda_include_dir() -> str:
+def _cuda_home() -> pathlib.Path:
     home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if not home:
         nvcc = shutil.which("nvcc")
         home = str(pathlib.Path(nvcc).parent.parent) if nvcc else "/usr/local/cuda"
-    return str(pathlib.Path(home) / "include")
+    return pathlib.Path(home)
+
+
+def _cuda_include_dir() -> str:
+    return str(_cuda_home() / "include")
+
+
+def _cuda_stub_ldflags() -> list[str]:
+    """-L flags for the libcuda driver stub, so -lcuda links in bare build
+    environments (containers without the driver lib on the default linker
+    path); the real driver is dlopened at runtime as usual."""
+    home = _cuda_home()
+    stubs = [
+        home / "lib64" / "stubs",
+        *home.glob("targets/*/lib/stubs"),
+    ]
+    return [f"-L{s}" for s in stubs if s.is_dir()]
 
 
 _CUBIN_CB_KEEPALIVE = {}
@@ -240,14 +229,27 @@ def _setup_cubin_loader(so_path: str, pool_local: pathlib.Path) -> None:
 
 @cache_once
 def _jit_trtllm_gen_moe_module() -> Module:
-    sdk = sdk_dir()
     pool = cubin_pool_dir()
-    if sdk is None or pool is None:
+    fi_data = _flashinfer_data_dir()
+    if pool is None or not (pool / "overlay" / "csrc").is_dir() or fi_data is None:
         raise RuntimeError(
-            "trtllm-gen MoE SDK not found: set SGLANG_TRTLLM_GEN_MOE_SDK to the "
-            "private FlashInfer snapshot checkout (internal collaboration "
-            "artifact; ships csrc/, include/ and local_cubins/)."
+            "trtllm-gen MoE sources not found: point "
+            "SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL at an unpacked cubin pool "
+            "(cubins + flat ABI headers + overlay/) and install the public "
+            "flashinfer package."
         )
+    # Overlay first (its modified sources/headers shadow the public copies),
+    # installed flashinfer data as the base.
+    src_roots = [pool / "overlay", fi_data]
+    include_roots = [pool / "overlay", fi_data]
+
+    def _resolve_source(rel: str) -> str:
+        for root in src_roots:
+            cand = root / rel
+            if cand.is_file():
+                return str(cand)
+        raise RuntimeError(f"trtllm-gen MoE source not found in any root: {rel}")
+
     staged = _stage_headers(pool)
     meta_tag = staged.name
     cubin_path = str((pool / "local").resolve())
@@ -260,8 +262,8 @@ def _jit_trtllm_gen_moe_module() -> Module:
     path_tag = hashlib.sha256(cubin_path.encode()).hexdigest()[:8]
     build_dir = cache / f"sgl_trtllm_gen_moe_{meta_tag}_{path_tag}"
 
-    cpp_files = [str(sdk / s) for s in _SOURCES if s.endswith(".cpp")]
-    cuda_files = [str(sdk / s) for s in _SOURCES if s.endswith(".cu")]
+    cpp_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cpp")]
+    cuda_files = [_resolve_source(s) for s in _SOURCES if s.endswith(".cu")]
     # quantization.cu emits fp4 cvt instructions (.e2m1x2) that need the
     # arch-specific feature set: compile for sm_XXXa, not plain sm_XXX.
     # The trtllm-gen cubins themselves are prebuilt (sm100f) and loaded at
@@ -290,7 +292,7 @@ def _jit_trtllm_gen_moe_module() -> Module:
                 f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{cubin_path}\\"',
                 "-Xcompiler=-fvisibility=hidden",
             ],
-            extra_ldflags=["-lcuda", "-lnvrtc"],
+            extra_ldflags=[*_cuda_stub_ldflags(), "-lcuda", "-lnvrtc"],
             extra_include_paths=[
                 str(staged),
                 str(
@@ -300,15 +302,29 @@ def _jit_trtllm_gen_moe_module() -> Module:
                     / "batched_gemm"
                     / "trtllmGen_bmm_export"
                 ),
-                str(sdk / "include"),
-                str(sdk / "csrc"),
-                str(sdk / "csrc" / "nv_internal"),
-                str(sdk / "csrc" / "nv_internal" / "include"),
-                str(sdk / "3rdparty" / "cutlass" / "include"),
+                # Per-root include layout: include/, csrc/, csrc/nv_internal/,
+                # csrc/nv_internal/include/, plus the flashinfer package's
+                # pinned CUTLASS (data/cutlass/). The overlay root comes first
+                # so modified headers shadow the public copies.
+                *[
+                    str(root / sub)
+                    for root in include_roots
+                    for sub in (
+                        "include",
+                        "csrc",
+                        "csrc/nv_internal",
+                        "csrc/nv_internal/include",
+                    )
+                ],
+                *[
+                    str(root / "cutlass" / "include")
+                    for root in include_roots
+                    if (root / "cutlass" / "include").is_dir()
+                ],
                 # Host .cpp files (g++) need the CUDA headers explicitly; nvcc
-                # adds them implicitly for .cu. CUDA 13's bundled CCCL is used
-                # as-is (mixing the fork's pinned 3rdparty/cccl with the
-                # toolkit's explodes).
+                # adds them implicitly for .cu. CUDA 13's bundled CCCL is
+                # used as-is (mixing another pinned CCCL with the toolkit's
+                # explodes).
                 _cuda_include_dir(),
             ],
             build_directory=str(build_dir),

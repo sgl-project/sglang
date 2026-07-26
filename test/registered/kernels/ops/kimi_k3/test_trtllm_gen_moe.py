@@ -1,12 +1,11 @@
 """Golden-comparison test for kernels.ops.moe.trtllm_gen_moe (TRT-LLM-gen SiTU MoE).
 
-Needs on-box internal artifacts, so it self-skips when they are absent:
+Needs on-box artifacts, so it self-skips when they are absent:
 
-  * ``SGLANG_TRTLLM_GEN_MOE_SDK`` -> private FlashInfer snapshot checkout
-    (csrc/, include/, 3rdparty/, local_cubins/ with the SiTU pool);
+  * ``SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL`` -> unpacked SiTU cubin pool
+    (cubins + flat ABI headers + overlay/);
   * ``SGLANG_TRTLLM_GEN_MOE_GOLDEN`` -> .pt of inputs/shuffled-weights/outputs
-    produced by the fork's own harness in a separate process (the fork python
-    cannot be imported next to the serving flashinfer).
+    produced by the reference harness in a separate process.
 
 Validated expectation (GB300, 2026-07-18): outputs are bit-exact against the
 fork kernel for w4a16 and w4a8 at T=1 and T=64 (same cubins, same config
@@ -32,8 +31,8 @@ _GOLDEN = os.environ.get("SGLANG_TRTLLM_GEN_MOE_GOLDEN", "")
 
 pytestmark = pytest.mark.skipif(
     not (trtllm_gen_moe.available() and os.path.isfile(_GOLDEN)),
-    reason="needs SGLANG_TRTLLM_GEN_MOE_SDK + SGLANG_TRTLLM_GEN_MOE_GOLDEN "
-    "(internal on-box artifacts)",
+    reason="needs SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL + SGLANG_TRTLLM_GEN_MOE_GOLDEN "
+    "(on-box artifacts)",
 )
 
 

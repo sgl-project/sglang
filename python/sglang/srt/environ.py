@@ -733,12 +733,10 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
 
-    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to the private
-    # FlashInfer snapshot checkout (internal collaboration artifact with
-    # csrc/, include/, 3rdparty/, local_cubins/). Unset = feature off.
-    SGLANG_TRTLLM_GEN_MOE_SDK = EnvStr(None)
-    # Optional explicit SiTU cubin pool dir (default: newest under
-    # <SDK>/local_cubins/).
+    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
+    # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
+    # single downloadable archive). Needs the public flashinfer package
+    # installed for the unmodified JIT sources. Unset = feature off.
     SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
 
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
