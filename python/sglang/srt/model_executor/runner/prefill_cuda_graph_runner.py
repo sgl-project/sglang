@@ -167,6 +167,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.enable_lora = model_runner.server_args.enable_lora
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
@@ -292,7 +293,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
-        self._capture_lora = model_runner.server_args.enable_lora and isinstance(
+        self._capture_lora = self.enable_lora and isinstance(
             self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
         )
         if self._capture_lora:
@@ -710,7 +711,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # LoRA batches may only replay the graph when prepare_lora_batch put
         # their metadata in the static buffers (same predicate); keyed off
         # enable_lora, not lora_ids, which is non-None even without LoRA.
-        if self.model_runner.server_args.enable_lora and not (
+        if self.enable_lora and not (
             self._capture_lora
             and self.model_runner.lora_manager.can_use_prefill_cuda_graph(forward_batch)
         ):
