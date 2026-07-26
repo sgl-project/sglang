@@ -1,6 +1,6 @@
 """MMMU accuracy gate for the Rust tokenizer manager's native multimodal path.
 
-``test_rust_native_mm.py`` checks that the rust server (``SGLANG_RUST_SERVER=1``)
+``test_rust_native_mm_e2e.py`` checks that the rust server (``SGLANG_RUST_SERVER=1``)
 produces *valid* multimodal output; this test checks that native Rust image
 preprocessing produces *equally good* model inputs. A systematic preprocessing
 skew (wrong resample filter, channel order, normalization, patch layout) still
