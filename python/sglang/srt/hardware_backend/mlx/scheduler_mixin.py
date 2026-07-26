@@ -16,6 +16,7 @@ the GPU runs both steps back-to-back with no idle gap.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -153,6 +154,10 @@ class SchedulerMlxOverlapMixin:
         pending_next: Optional[MlxPendingJob] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
+            # This loop bypasses run_batch(), which is where launch_ts is
+            # normally set, so _record_step_counters would read None. Set it
+            # here at the same "about to launch" point run_batch uses.
+            batch.launch_ts = time.monotonic()
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
@@ -181,14 +186,19 @@ class SchedulerMlxOverlapMixin:
             )
             # Composition is identical to prev: reuse a fresh batch copy
             # of the same underlying ScheduleBatch so process_batch_result
-            # updates the same req objects with the new token.
+            # updates the same req objects with the new token. This is a
+            # real, separate launch though, so it gets its own launch_ts
+            # rather than inheriting prev's (which would collapse the
+            # decode-step interval _record_step_counters computes to zero).
+            batch_copy = prev.batch_copy.copy()
+            batch_copy.launch_ts = time.monotonic()
             return MlxPendingJob(
                 lazy_tokens=lazy_tokens,
                 prefills=prefills,
                 extends=extends,
                 decode=decode,
                 mode=mode,
-                batch_copy=prev.batch_copy.copy(),
+                batch_copy=batch_copy,
                 schedule_batch=prev.schedule_batch,
                 reqs=prev.reqs,
             )
