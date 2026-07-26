@@ -369,12 +369,30 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         # Query / KV preparation mirrors the base cute-dsl decode (both FP16 and
         # FP8 KV), then swaps to the DCP kernel call + rank-local return.
         merge_query = q_rope is not None
+        query = None
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if (
+                    save_kv_cache
+                    and self._fused_set_kv_concat_q_fp8
+                    and not self._unified_mla
+                ):
+                    # Static pool: out_cache_loc is already the physical loc.
+                    # Fused: bf16->fp8 quantize + KV scatter + q concat in one
+                    # launch; None when not covered.
+                    query = self._set_kv_and_concat_q_fp8_fused(
+                        layer=layer,
+                        loc=forward_batch.out_cache_loc,
+                        q=q,
+                        q_rope=q_rope,
+                        k=k,
+                        k_rope=k_rope,
+                    )
+                if query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -389,13 +407,15 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 )
             merge_query = False
 
-        if save_kv_cache:
+        if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
-        if merge_query:
+        if query is not None:
+            pass  # fused fp8 path already built the query and wrote KV
+        elif merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
