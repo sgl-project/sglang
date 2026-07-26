@@ -1,4 +1,4 @@
-//! Qwen VL family (Qwen2-VL / 2.5-VL / 3-VL / 3.5) native image processor.
+//! Qwen VL family (Qwen2-VL / 2.5-VL / 3-VL / 3.5) server-pipeline image processor.
 //!
 //! Pure-Rust equivalent of the HF `Qwen2VLImageProcessor` pipeline the Python
 //! `QwenVLImageProcessor` drives: `smart_resize` → bicubic resize → rescale +
@@ -9,15 +9,26 @@
 
 use rayon::prelude::*;
 
-use crate::common::{self, resize};
-use crate::registry::{MmFamilyProcessor, MropeItem, ProcessedImage};
+use crate::common::{self, resize, tokens};
+use crate::pipeline::{
+    DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
+    TokenLayout,
+};
 
 const MAX_RATIO: f64 = 200.0;
 
+/// One media item's placement for M-RoPE: inclusive token range + patch grid.
+pub struct MropeItem {
+    pub start: u32,
+    pub end: u32,
+    pub grid: [u32; 3],
+}
+
 /// Resolved processor params, deserialized from the Python-side spec JSON
-/// (unknown fields like `family` / token ids are ignored here).
+/// (unknown fields like `family` are ignored here).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct QwenVlSpec {
+    pub image_token_id: i32,
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,
@@ -103,8 +114,17 @@ impl QwenVlProcessor {
     }
 }
 
+impl QwenVlProcessor {
+    fn tokens_per_image(&self, grid: &[u32; 3]) -> usize {
+        (grid[0] as usize * grid[1] as usize * grid[2] as usize)
+            / (self.spec.merge_size * self.spec.merge_size)
+    }
+}
+
 impl MmFamilyProcessor for QwenVlProcessor {
-    fn process_image(&self, rgb: &[u8], h: usize, w: usize) -> Result<ProcessedImage, String> {
+    fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String> {
+        let DecodedMedia::Image { rgb, height, width } = media;
+        let (h, w) = (*height, *width);
         let (th, tw) = smart_resize(
             h,
             w,
@@ -118,26 +138,52 @@ impl MmFamilyProcessor for QwenVlProcessor {
                 .install(|| resize::resize_rgb_filter(rgb, h, w, th, tw, resize::Filter::Bicubic));
             &resized
         } else {
-            rgb
+            rgb.as_slice()
         };
         let (gh, gw) = (th / self.spec.patch_size, tw / self.spec.patch_size);
-        Ok(ProcessedImage {
-            pixel_values: self.patchify(data, th, tw),
-            grid_thw: [1, gh as u32, gw as u32],
+        let pixel_values = self.patchify(data, th, tw);
+        let dim = pixel_values.len() / (gh * gw);
+        Ok(ProcessedItem {
+            feature: Tensor {
+                shape: vec![gh * gw, dim],
+                data: TensorData::F32(pixel_values),
+            },
+            aux: vec![(
+                "image_grid_thw".to_string(),
+                Tensor {
+                    shape: vec![3],
+                    data: TensorData::I64(vec![1, gh as i64, gw as i64]),
+                },
+            )],
+            geometry: Geometry::Grid([1, gh as u32, gw as u32]),
         })
     }
 
-    fn tokens_per_image(&self, grid: &[u32; 3]) -> usize {
-        (grid[0] as usize * grid[1] as usize * grid[2] as usize)
-            / (self.spec.merge_size * self.spec.merge_size)
+    fn layout(&self, input_ids: &[i32], items: &[Geometry]) -> Result<TokenLayout, String> {
+        let counts = items
+            .iter()
+            .map(|Geometry::Grid(grid)| self.tokens_per_image(grid))
+            .collect::<Vec<_>>();
+        tokens::layout_by_placeholder(input_ids, self.spec.image_token_id, &counts)
     }
 
-    fn mrope_image_only(
+    fn positions(
         &self,
         input_len: usize,
-        items: &[MropeItem],
-    ) -> Result<(Vec<i64>, i64), String> {
-        mrope_image_only(input_len, items, self.spec.merge_size)
+        offsets: &[(u32, u32)],
+        items: &[Geometry],
+    ) -> Result<PositionOutput, String> {
+        let mrope_items = offsets
+            .iter()
+            .zip(items)
+            .map(|(&(start, end), Geometry::Grid(grid))| MropeItem {
+                start,
+                end,
+                grid: *grid,
+            })
+            .collect::<Vec<_>>();
+        let (positions, delta) = mrope_image_only(input_len, &mrope_items, self.spec.merge_size)?;
+        Ok(PositionOutput::MRope { positions, delta })
     }
 }
 
@@ -243,6 +289,57 @@ pub fn mrope_image_only(
     Ok((pos, max + 1 - len as i64))
 }
 
+/// The qwen scheduler-drain shape, extracted from the generic driver
+/// [`Output`](crate::driver::Output). Shared by `sglang-server`'s MM worker
+/// and the parity binding so the mapping can't drift; replaced by a generic
+/// named-tensor handoff once a second family needs a different shape.
+pub struct QwenDrain {
+    pub input_ids: Vec<i32>,
+    /// All items' `pixel_values`, concatenated in prompt order.
+    pub features: Vec<f32>,
+    pub grids: Vec<[u32; 3]>,
+    pub hashes: Vec<u64>,
+    pub offsets: Vec<(u32, u32)>,
+    pub mrope: Vec<i64>,
+    pub mrope_delta: i64,
+}
+
+pub fn pack_drain(output: crate::driver::Output) -> Result<QwenDrain, String> {
+    use crate::pipeline::PositionOutput;
+
+    let PositionOutput::MRope { positions, delta } = output.positions else {
+        return Err("qwen_vl drain: expected M-RoPE positions".into());
+    };
+    let mut features = Vec::new();
+    let mut grids = Vec::with_capacity(output.items.len());
+    let mut hashes = Vec::with_capacity(output.items.len());
+    for item in output.items {
+        let TensorData::F32(pixel_values) = item.feature.data else {
+            return Err("qwen_vl drain: expected f32 feature".into());
+        };
+        features.extend(pixel_values);
+        let grid = item
+            .aux
+            .into_iter()
+            .find_map(|(name, tensor)| match (name.as_str(), tensor.data) {
+                ("image_grid_thw", TensorData::I64(v)) => Some(v),
+                _ => None,
+            })
+            .ok_or("qwen_vl drain: missing image_grid_thw")?;
+        grids.push([grid[0] as u32, grid[1] as u32, grid[2] as u32]);
+        hashes.push(item.hash);
+    }
+    Ok(QwenDrain {
+        input_ids: output.input_ids,
+        features,
+        grids,
+        hashes,
+        offsets: output.offsets,
+        mrope: positions,
+        mrope_delta: delta,
+    })
+}
+
 // --- Python bindings (parity tests drive the exact server pipeline) ---
 
 #[cfg(feature = "python")]
@@ -252,7 +349,7 @@ mod python {
     use pyo3::prelude::*;
 
     use super::*;
-    use crate::registry::MmFamilyProcessor;
+    use crate::pipeline::TensorData;
 
     /// `(pixel_values flat f32, (t, h, w))` for one preprocessed image.
     type PyProcessedImage<'py> = (Bound<'py, PyArray1<f32>>, (u32, u32, u32));
@@ -280,12 +377,15 @@ mod python {
         let proc = QwenVlProcessor::from_spec_json(spec_json).map_err(PyValueError::new_err)?;
         let out = py
             .detach(move || {
-                let (rgb, h, w) = crate::common::decode_rgb(&data)?;
-                proc.process_image(&rgb, h, w)
+                let (rgb, height, width) = crate::common::decode_rgb(&data)?;
+                proc.process_item(&DecodedMedia::Image { rgb, height, width })
             })
             .map_err(PyValueError::new_err)?;
-        let [t, h, w] = out.grid_thw;
-        Ok((out.pixel_values.into_pyarray(py), (t, h, w)))
+        let Geometry::Grid([t, h, w]) = out.geometry;
+        let TensorData::F32(pixel_values) = out.feature.data else {
+            return Err(PyValueError::new_err("qwen_vl: expected f32 feature"));
+        };
+        Ok((pixel_values.into_pyarray(py), (t, h, w)))
     }
 
     #[pyfunction]
@@ -351,23 +451,23 @@ mod python {
             input_ids,
             images,
         };
-        let output = py
+        let drain = py
             .detach(move || {
-                let pipeline = crate::registry::pipeline_from_spec(&spec_json)?;
-                crate::driver::process(&pipeline, input, |_| {
+                let family = crate::registry::pipeline_from_spec(&spec_json)?;
+                let output = crate::driver::process(family.as_ref(), input, |_| {
                     Err("native parity API requires input_ids".into())
-                })
+                })?;
+                pack_drain(output)
             })
             .map_err(PyValueError::new_err)?;
-        let mm = output.mm;
         Ok((
-            output.input_ids,
-            mm.features.into_pyarray(py),
-            mm.grids.into_iter().map(|[t, h, w]| (t, h, w)).collect(),
-            mm.hashes,
-            mm.offsets,
-            mm.mrope.into_pyarray(py),
-            mm.mrope_delta,
+            drain.input_ids,
+            drain.features.into_pyarray(py),
+            drain.grids.into_iter().map(|[t, h, w]| (t, h, w)).collect(),
+            drain.hashes,
+            drain.offsets,
+            drain.mrope.into_pyarray(py),
+            drain.mrope_delta,
         ))
     }
 
@@ -391,6 +491,7 @@ mod tests {
 
     fn spec() -> QwenVlSpec {
         QwenVlSpec {
+            image_token_id: 1,
             patch_size: 2,
             merge_size: 2,
             temporal_patch_size: 2,

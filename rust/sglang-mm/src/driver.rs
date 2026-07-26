@@ -1,9 +1,14 @@
 //! Shared multimodal request driver for the server (pure-Rust) pipeline.
+//!
+//! Owns the request control flow — parallel fan-out, layout application,
+//! failure semantics — while every model decision lives behind
+//! [`MmFamilyProcessor`] (see `pipeline.rs`). Families produce data; they
+//! cannot alter orchestration.
 
 use rayon::prelude::*;
 
 use crate::common::{self, fetch, tokens};
-use crate::registry::{MropeItem, Pipeline, ProcessedImage};
+use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
 /// One raw image source from the request.
 #[derive(Debug)]
@@ -22,23 +27,24 @@ pub struct MmInput {
     pub images: Vec<ImageSource>,
 }
 
-/// The per-request mm buffers parked for the scheduler drain.
-pub struct MmResult {
-    pub features: Vec<f32>,
-    pub grids: Vec<[u32; 3]>,
-    /// Content hash of each image's `pixel_values` bytes — same identity
-    /// domain as the Python path's `hash_feature`, but a different algorithm
-    /// (blake3 here vs SHA-256 there): hashes are consistent within the
-    /// native path, never comparable across the two paths.
-    pub hashes: Vec<u64>,
-    pub offsets: Vec<(u32, u32)>,
-    pub mrope: Vec<i64>,
-    pub mrope_delta: i64,
+/// One processed media item at the request boundary.
+pub struct OutputItem {
+    pub feature: crate::pipeline::Tensor,
+    pub aux: crate::pipeline::NamedTensors,
+    /// Content hash of the feature tensor bytes — same identity domain as
+    /// the Python path's `hash_feature`, but a different algorithm (blake3
+    /// here vs SHA-256 there): hashes are consistent within the server pipeline,
+    /// never comparable across the two paths.
+    pub hash: u64,
 }
 
+/// The per-request result parked for the scheduler drain.
 pub struct Output {
     pub input_ids: Vec<i32>,
-    pub mm: MmResult,
+    /// In prompt order; `offsets[i]` is `items[i]`'s inclusive token range.
+    pub items: Vec<OutputItem>,
+    pub offsets: Vec<(u32, u32)>,
+    pub positions: PositionOutput,
 }
 
 /// Run one request through the pipeline. Any `Err` rejects the request back
@@ -46,14 +52,14 @@ pub struct Output {
 /// (video/audio, precomputed features, undecodable images), since there is
 /// no Python fallback path.
 pub fn process(
-    pipeline: &Pipeline,
+    family: &dyn MmFamilyProcessor,
     input: MmInput,
     tokenize: impl FnOnce(&str) -> Result<Vec<i32>, String>,
 ) -> Result<Output, String> {
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
-    let processed: Vec<(ProcessedImage, u64)> = common::pool().install(|| {
+    let processed: Vec<(ProcessedItem, u64)> = common::pool().install(|| {
         input
             .images
             .par_iter()
@@ -65,9 +71,9 @@ pub fn process(
                 // The Python (PIL) path decodes more formats (GIF/WebP/BMP,
                 // 16-bit PNG); those error here and reject the request.
                 let (rgb, height, width) = common::decode_rgb(&bytes)?;
-                let image = pipeline.processor.process_image(&rgb, height, width)?;
-                let hash = common::sha256_u64(f32_bytes(&image.pixel_values));
-                Ok((image, hash))
+                let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
+                let hash = common::sha256_u64(item.feature.data.as_bytes());
+                Ok((item, hash))
             })
             .collect::<Result<Vec<_>, String>>()
     })?;
@@ -82,56 +88,27 @@ pub fn process(
             tokenize(text)?
         }
     };
-    let counts = processed
+    let geometries = processed
         .iter()
-        .map(|(image, _)| pipeline.processor.tokens_per_image(&image.grid_thw))
+        .map(|(item, _)| item.geometry.clone())
         .collect::<Vec<_>>();
-    let expanded = tokens::expand_placeholders(&input_ids, pipeline.image_token_id, &counts)?;
-    let mrope_items = expanded
-        .offsets
-        .iter()
-        .zip(&processed)
-        .map(|(&(start, end), (image, _))| MropeItem {
-            start,
-            end,
-            grid: image.grid_thw,
-        })
-        .collect::<Vec<_>>();
-    let (mrope, mrope_delta) = pipeline
-        .processor
-        .mrope_image_only(expanded.input_ids.len(), &mrope_items)?;
+    let layout = family.layout(&input_ids, &geometries)?;
+    let expanded = tokens::apply_layout(&input_ids, &layout, processed.len())?;
+    let positions = family.positions(expanded.input_ids.len(), &expanded.offsets, &geometries)?;
 
-    let mut features = Vec::with_capacity(
-        processed
-            .iter()
-            .map(|(image, _)| image.pixel_values.len())
-            .sum(),
-    );
-    let mut grids = Vec::with_capacity(processed.len());
-    let mut hashes = Vec::with_capacity(processed.len());
-    for (image, hash) in processed {
-        features.extend(image.pixel_values);
-        grids.push(image.grid_thw);
-        hashes.push(hash);
-    }
     Ok(Output {
         input_ids: expanded.input_ids,
-        mm: MmResult {
-            features,
-            grids,
-            hashes,
-            offsets: expanded.offsets,
-            mrope,
-            mrope_delta,
-        },
+        items: processed
+            .into_iter()
+            .map(|(item, hash)| OutputItem {
+                feature: item.feature,
+                aux: item.aux,
+                hash,
+            })
+            .collect(),
+        offsets: expanded.offsets,
+        positions,
     })
-}
-
-fn f32_bytes(values: &[f32]) -> &[u8] {
-    // Safety: f32 is plain-old-data with no padding.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
 }
 
 #[cfg(test)]
@@ -152,31 +129,34 @@ mod tests {
 
     #[test]
     fn processes_typed_image_request() {
-        let pipeline = pipeline_from_spec(SPEC).unwrap();
+        let family = pipeline_from_spec(SPEC).unwrap();
         let input = MmInput {
             text: None,
             input_ids: Some(vec![7, 1, 8]),
             images: vec![ImageSource::Bytes(png(8, 8))],
         };
-        let out = process(&pipeline, input, |_| Err("no tokenizer".into())).unwrap();
+        let out = process(family.as_ref(), input, |_| Err("no tokenizer".into())).unwrap();
         // 8x8, factor 4 → grid [1, 4, 4] → 16 patches / merge² = 4 tokens.
-        assert_eq!(out.mm.grids, vec![[1, 4, 4]]);
         assert_eq!(out.input_ids, vec![7, 1, 1, 1, 1, 8]);
-        assert_eq!(out.mm.offsets, vec![(1, 4)]);
-        assert_eq!(out.mm.mrope.len(), 3 * out.input_ids.len());
-        assert_eq!(out.mm.features.len(), 16 * 3 * 2 * 2 * 2);
-        assert_eq!(out.mm.hashes.len(), 1);
+        assert_eq!(out.offsets, vec![(1, 4)]);
+        let item = &out.items[0];
+        assert_eq!(item.feature.shape, [16, 3 * 2 * 2 * 2]);
+        assert_eq!(item.aux[0].0, "image_grid_thw");
+        let crate::pipeline::PositionOutput::MRope { positions, .. } = &out.positions else {
+            panic!("qwen emits mrope")
+        };
+        assert_eq!(positions.len(), 3 * out.input_ids.len());
     }
 
     #[test]
     fn image_free_and_mismatched_requests_rejected() {
-        let pipeline = pipeline_from_spec(SPEC).unwrap();
+        let family = pipeline_from_spec(SPEC).unwrap();
         let no_images = MmInput {
             text: None,
             input_ids: Some(vec![7, 1]),
             images: vec![],
         };
-        let err = process(&pipeline, no_images, |_| unreachable!())
+        let err = process(family.as_ref(), no_images, |_| unreachable!())
             .err()
             .unwrap();
         assert!(err.contains("image sources"));
@@ -185,7 +165,7 @@ mod tests {
             input_ids: Some(vec![7, 8]),
             images: vec![ImageSource::Bytes(png(8, 8))],
         };
-        let err = process(&pipeline, no_placeholder, |_| unreachable!())
+        let err = process(family.as_ref(), no_placeholder, |_| unreachable!())
             .err()
             .unwrap();
         assert!(err.contains("placeholder"));

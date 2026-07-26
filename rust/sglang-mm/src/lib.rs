@@ -4,11 +4,12 @@
 //! * PyO3 extension `sglang.srt.multimodal._core` (feature `python`, default),
 //!   used by Python processors (e.g. Inkling) and by parity tests.
 //! * Pure-Rust `rlib` (`default-features = false`), linked by `sglang-server`'s
-//!   native MM worker path — no pyo3 in that dependency graph.
+//!   MM worker path — no pyo3 in that dependency graph.
 
 pub mod common;
 pub mod driver;
 pub mod inkling;
+pub mod pipeline;
 pub mod qwen_vl;
 pub mod registry;
 

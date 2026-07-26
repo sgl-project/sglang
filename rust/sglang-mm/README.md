@@ -10,43 +10,94 @@ Built two ways:
   via setuptools-rust when installing sglang — used by Python processors and
   parity tests.
 - **Pure-Rust `rlib`** (`default-features = false`) linked by `sglang-server`'s
-  native MM worker path — no pyo3 in that dependency graph.
+  MM worker path — no pyo3 in that dependency graph.
 
 ## Architecture
 
 ```
 src/
 ├── lib.rs                    # module root; PyO3 module (_core) feature-gated
-├── registry.rs               # ImageProcessorSpec registry (Python-facing)
-│                             # + MmFamilyProcessor trait / pipeline_from_spec
-│                             #   (pure-Rust pipeline driven by sglang-server)
+├── pipeline.rs               # the server-pipeline contract: MmFamilyProcessor
+│                             #   trait + the carriers (Tensor, TokenLayout, ...)
 ├── driver.rs                 # model-independent request driver (fetch →
-│                             #   decode → preprocess → expand → M-RoPE)
+│                             #   decode → process_item → layout → positions)
+├── registry.rs               # ImageProcessorSpec registry (Python-facing)
+│                             #   + pipeline_from_spec (family factory)
 ├── common/
-│   ├── mod.rs                # thread pool, image decode, SHA256 hash, base64
+│   ├── mod.rs                # thread pool, image decode, content hash, base64
 │   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
 │   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
-│   ├── tokens.rs             # placeholder-id expansion + per-item offsets
+│   ├── tokens.rs             # TokenLayout mechanics (apply_layout + helpers)
 │   └── transforms.rs         # reusable primitives: normalize, pad, extract_patches
 └── <model>/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
 ```
 
-## Native server pipeline (`MmFamilyProcessor`)
+## Server pipeline architecture
 
-`sglang-server`'s MM workers process image-only requests for supported model
-families entirely in Rust: `common::fetch` → decode → the family's
-`MmFamilyProcessor` (resize/normalize/patchify + M-RoPE) → `common::tokens`
-placeholder expansion. The Python side selects the family by passing a spec
-JSON (`{"family": "qwen_vl", ...resolved processor params}`) to
-`registry::pipeline_from_spec`. Anything outside a family's scope
-(video/audio, precomputed features, unknown source shapes, placeholder
-mismatches) is rejected back to the client as a 400 — there is no Python
-fallback path.
+`sglang-server`'s MM workers process an image request entirely in Rust.
+`driver::process` runs the same fixed steps for every model family:
+
+```
+MmInput { text?, input_ids?, images }
+  1. per image (rayon-parallel):
+       fetch_bytes → decode_rgb → family.process_item()
+                                    → ProcessedItem { feature, aux, geometry }
+  2. family.layout(input_ids, geometries)   → TokenLayout
+       apply_layout: expanded input_ids + per-item (start, end) offsets
+  3. family.positions(len, offsets, geoms)  → Rope1D | MRope
+  4. Output { input_ids, items: [{feature, aux, hash}], offsets, positions }
+```
+
+The driver owns these steps and their failure semantics — any `Err` at any
+step rejects the request as a 400 (there is no Python fallback path). A
+model family fills in only the `family.*` calls, by implementing
+`MmFamilyProcessor` (`pipeline.rs`): it describes its data, it never runs
+the request. With qwen as the example:
+
+- **`process_item`** — one decoded image → `ProcessedItem`:
+  - `feature`: the model's feature tensor. Qwen: `pixel_values`, from
+    smart_resize → bicubic → normalize → patchify. The driver hashes its
+    bytes as the item identity (Python: `MultimodalDataItem.feature` +
+    `hash_feature`).
+  - `aux`: named tensors for the model runner. Qwen: `image_grid_thw`;
+    other families: `image_sizes`, `tgt_sizes`, ... (Python:
+    `model_specific_data`).
+  - `geometry`: whatever this family's `layout`/`positions` need later.
+    Qwen: the `[t, h, w]` patch grid.
+- **`layout`** — how the prompt expands, described as a value. Example: the
+  prompt `[A, <pad>, B]` with one 4-token image becomes
+
+  ```
+  [Text(0..1), Media { item: 0, Repeat(<pad> × 4) }, Text(2..3)]
+  ```
+
+  which the driver expands to `[A, <pad>, <pad>, <pad>, <pad>, B]` with
+  offsets `[(1, 4)]`. Qwen builds this with the `layout_by_placeholder`
+  helper; families that interleave tile markers or row separators
+  (internvl/minicpm-style) use `Explicit` id sequences instead. Expansion,
+  offsets, and position inputs all derive from this one value, so a family
+  cannot get them out of sync.
+- **`positions`** — `Rope1D` (default: the scheduler needs nothing extra)
+  or `MRope` (qwen's image-only fast path).
+- **`capabilities`** — which modalities the family accepts; the server
+  rejects everything else per family.
+
+Why not give each family the whole request, like Python's per-family
+`process_mm_data_async` override? In the server core, every request must
+resolve to exactly one accept/reject with its buffers parked in order —
+that invariant only holds structurally if the driver owns the flow.
+
+Two things stay in Python permanently: HF config parsing (a family is
+configured by a spec JSON of already-resolved params, selected via
+`registry::pipeline_from_spec`) and the thin drain adapter mapping
+feature/aux tensors to model kwargs. The carriers grow by need, not
+speculation: `DecodedMedia` gains a variant per modality (video/audio),
+`Geometry` per family style (tile sets), `TensorData` per dtype.
 
 Supported families: `qwen_vl` (Qwen2-VL / 2.5-VL / 3-VL / 3.5; images only).
-Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a `family`
-arm in `pipeline_from_spec`.
+Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
+`family` arm in `pipeline_from_spec`.
 
 `common::fetch` matches the Python `get_image_bytes` semantics
 (`REQUEST_TIMEOUT` env, proxy env vars) with two deliberate differences:
