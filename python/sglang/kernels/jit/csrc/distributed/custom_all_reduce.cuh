@@ -204,18 +204,19 @@ SGL_DEVICE void st_multimem_16B(const V& x, void* mc_addr, int64_t vec_offset) {
 #endif
 }
 
+template <uint32_t kWorldSize>
 struct AllReduceParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   uint32_t num_elements;
   uint32_t rank;
   void* const* __restrict__ graph_params;
-  uint8_t* pull_workspaces[kMaxWorldSize];    // must be symmetric memory
-  uint8_t* push_workspaces[kMaxWorldSize];    // must be symmetric memory
-  Semaphore* pull_semaphores[kMaxWorldSize];  // must be symmetric memory
+  uint8_t* pull_workspaces[kWorldSize];    // must be symmetric memory
+  uint8_t* push_workspaces[kWorldSize];    // must be symmetric memory
+  Semaphore* pull_semaphores[kWorldSize];  // must be symmetric memory
   Counter* push_counter;
   uint8_t* pull_mc_workspace;  // must be a multicast address
-  int64_t push_buffer_stride;  // per-buffer bytes; each rank holds 2 * kMaxWorldSize buffers
+  int64_t push_buffer_stride;  // per-buffer bytes; each rank holds 2 * world_size buffers
 };
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -228,12 +229,12 @@ struct AllReducePushImpl {
   using vec_t = device::AlignedVector<T2, kVecSize>;
   static_assert(kWorldSize <= kMaxWorldSize);
 
-  static SGL_DEVICE bool sync_enter_push(const AllReduceParams& params) {
+  static SGL_DEVICE bool sync_enter_push(const AllReduceParams<kWorldSize>& params) {
     device::PDLWaitPrimary<kUsePDL>();
     return (params.push_counter[blockIdx.x].get() % 2) != 0;
   }
 
-  static SGL_DEVICE void sync_exit_push(const AllReduceParams& params) {
+  static SGL_DEVICE void sync_exit_push(const AllReduceParams<kWorldSize>& params) {
     device::PDLTriggerSecondary<kUsePDL>();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -305,7 +306,7 @@ struct AllReducePushImpl {
   }
 
  public:
-  static SGL_DEVICE void forward_1shot(const AllReduceParams& params) {
+  static SGL_DEVICE void forward_1shot(const AllReduceParams<kWorldSize>& params) {
     // push local data to peer ranks, then reduce locally
     const auto phase = sync_enter_push(params);
     const auto r = params.rank;
@@ -343,7 +344,7 @@ struct AllReducePullImpl {
   static_assert(kWorldSize <= kMaxWorldSize);
 
   template <bool kFence>
-  static SGL_DEVICE uint32_t sync_enter_pull(const AllReduceParams& params) {
+  static SGL_DEVICE uint32_t sync_enter_pull(const AllReduceParams<kWorldSize>& params) {
     uint32_t current_counter_val = 0;
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
       device::PDLWaitPrimary<kUsePDL>();
@@ -372,7 +373,7 @@ struct AllReducePullImpl {
   }
 
   template <bool kFence>
-  static SGL_DEVICE void sync_exit_pull(const AllReduceParams& params, uint32_t current) {
+  static SGL_DEVICE void sync_exit_pull(const AllReduceParams<kWorldSize>& params, uint32_t current) {
     device::PDLTriggerSecondary<kUsePDL>();
     __syncthreads();
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
@@ -436,7 +437,7 @@ struct AllReducePullImpl {
   }
 
  public:
-  static SGL_DEVICE void forward_1shot(const AllReduceParams& params) {
+  static SGL_DEVICE void forward_1shot(const AllReduceParams<kWorldSize>& params) {
     const auto total_num_vecs = device::div_ceil(params.num_elements, kElemsPerVec);
     void* data[kWorldSize];
     if constexpr (kMode == PullMode::Graph) {
@@ -455,7 +456,7 @@ struct AllReducePullImpl {
     sync_exit_pull<false>(params, counter);
   }
 
-  static SGL_DEVICE void forward_2shot(const AllReduceParams& params) {
+  static SGL_DEVICE void forward_2shot(const AllReduceParams<kWorldSize>& params) {
     const auto total_num_vecs = device::div_ceil(params.num_elements, kElemsPerVec);
     const auto avg_vecs = total_num_vecs / kWorldSize;
     const auto rem_vecs = total_num_vecs % kWorldSize;
@@ -481,9 +482,9 @@ struct AllReducePullImpl {
   }
 };
 
-template <typename Impl, int kShot>
+template <typename Impl, uint32_t kWorldSize, int kShot>
 __global__ __launch_bounds__(1024, 1)  //
-    void all_reduce_kernel(const __grid_constant__ AllReduceParams params) {
+    void all_reduce_kernel(const __grid_constant__ AllReduceParams<kWorldSize> params) {
   static_assert(kShot == 1 || kShot == 2, "invalid shot");
   if constexpr (kShot == 1) {
     return Impl::forward_1shot(params);
@@ -528,9 +529,10 @@ struct AllReduceKernel {
   using Tensor = tvm::ffi::Tensor;
   using TensorView = tvm::ffi::TensorView;
   template <int kShot, PullMode kPullMode>
-  static constexpr auto kernel_pull = all_reduce_kernel<AllReducePullImpl<T, kWorldSize, kPullMode, kUsePDL>, kShot>;
+  static constexpr auto kernel_pull =
+      all_reduce_kernel<AllReducePullImpl<T, kWorldSize, kPullMode, kUsePDL>, kWorldSize, kShot>;
   template <int kShot>
-  static constexpr auto kernel_push = all_reduce_kernel<AllReducePushImpl<T, kWorldSize, kUsePDL>, kShot>;
+  static constexpr auto kernel_push = all_reduce_kernel<AllReducePushImpl<T, kWorldSize, kUsePDL>, kWorldSize, kShot>;
 
  public:
   static Tensor run(CommunicatorRef ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg) {
@@ -549,7 +551,7 @@ struct AllReduceKernel {
     const auto graph_ptr = use_graph ? std::get<TensorView>(pull_arg).data_ptr() : nullptr;
     const bool inplace = use_graph && algo == "2shot_pull";
     Tensor out = inplace ? in_ : ffi::empty_like(in_);
-    AllReduceParams params{
+    AllReduceParams<kWorldSize> params{
         .input = in_.data_ptr(),
         .output = out.data_ptr(),
         .num_elements = num_elems,
