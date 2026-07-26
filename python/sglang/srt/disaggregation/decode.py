@@ -1147,11 +1147,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_types = self.kv_manager.kv_args.state_types
             state_indices: Optional[List] = []
             if StateType.C128_STATE in state_types:
-                clear_c128_state = getattr(
-                    self.token_to_kv_pool, "clear_c128_req_state", None
+                assert isinstance(
+                    self.token_to_kv_pool, DeepSeekV4TokenToKVPool
                 )
-                if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
+                self.token_to_kv_pool.clear_c128_req_state(
+                    int(decode_req.req.req_pool_idx)
+                )
             for st in state_types:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())
