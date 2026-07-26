@@ -138,7 +138,7 @@ impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
             // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success.
+            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
             let event = {
                 let RequestKind::Generate(g) = &mut req.kind else {
                     tracing::error!("tokenizer pool received a non-generate request");

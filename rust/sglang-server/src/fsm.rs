@@ -65,7 +65,9 @@ pub enum Event {
     PreSendValidated,
     SchedulerPicked,
     // --- egress ---
-    Chunk { finish: bool },
+    Chunk {
+        finish: bool,
+    },
     FinalFrameSent,
     // --- terminal (valid from any state) ---
     Error(Error),
@@ -118,9 +120,9 @@ impl RequestState {
             // ingress
             (Received, Validated(_)) => Validating,
             // Generate requests pass through Normalizing (sampling-param
-            // normalize/verify); control requests skip straight to Queued.
+            // normalize/verify); control requests skip it, having none.
             (Validating, NeedsNormalize) => Normalizing,
-            (Validating, Validated(AlreadyTokenized)) => Queued,
+            (Validating, Validated(AlreadyTokenized)) => PreSendValidating,
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
             (Normalizing, Validated(AlreadyTokenized)) => PreSendValidating,
