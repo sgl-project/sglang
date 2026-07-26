@@ -350,18 +350,14 @@ impl SamplingParams {
             .map(|s| s.len() as i64)
             .max()
             .unwrap_or(0);
-        // The full-scan sentinel for any stop_regex, with no attempt to derive a
-        // tighter bound. `recompute_stop_regex_max_len` (managers/utils.py) re-derives
-        // it with `sre_parse` + `re.compile` on the way in, so anything computed here
-        // is overwritten before the scheduler sees it — and the scheduler runs these
-        // through Python's `re`, so only Python's parser can judge them. Matching
-        // dialects from here bought a bound nobody reads and cost two rounds of
-        // scheduler-killing mismatches; the sentinel is always a safe over-estimate.
-        let stop_regex_max_len = if self.stop_regex_strs.is_empty() {
-            0
-        } else {
-            STOP_REGEX_MAX_LEN
-        };
+        // Validate + bound every stop_regex here, before it can reach the
+        // scheduler's `re.search` (see `stop_regex_bound`). A rejected pattern is a
+        // 400 for this request; an accepted one carries a bound the scheduler uses
+        // to size its match window.
+        let mut stop_regex_max_len = 0;
+        for pattern in &self.stop_regex_strs {
+            stop_regex_max_len = stop_regex_max_len.max(stop_regex_bound(pattern)?);
+        }
         self.stop_regex_max_len = stop_regex_max_len;
 
         // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
@@ -509,6 +505,200 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
         None => Vec::new(),
         Some(OneOrMany::One(s)) => vec![s],
         Some(OneOrMany::Many(v)) => v,
+    }
+}
+
+/// Escapes that mean the same thing to `regex-syntax` and to Python's `re`.
+///
+/// An allowlist, not a blocklist. The blocklist version of this function is what
+/// shipped `\p{L}` and `(?<n>a)` to a scheduler that could not compile them: every
+/// escape either side adds lands in the gap by default. Here the default is
+/// "reject", so a new escape is a 400 until someone checks both dialects.
+const SHARED_ESCAPES: &[char] = &[
+    'A', 'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'a', 'f', 'n', 'r', 't', 'v',
+];
+
+/// Reject the constructs `regex-syntax` accepts but Python's `re` cannot compile.
+///
+/// Everything else in this module rests on one property: **anything Rust admits,
+/// Python can compile.** The reverse is allowed to fail — rejecting a pattern
+/// Python would have accepted (`\Z`, backreferences, look-around) costs a client
+/// a 400, while admitting one it cannot compile costs the whole scheduler, since
+/// `re.search` runs on the decode hot path where nothing catches it.
+fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
+    let reject = |what: String| {
+        Err(bad(format!(
+            "stop_regex {pattern:?} uses {what}, which Python's `re` cannot compile"
+        )))
+    };
+    // ASCII-only comparisons, so scanning bytes is safe: a UTF-8 continuation byte
+    // is >= 0x80 and matches no arm.
+    let b = pattern.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                let Some(&e) = b.get(i + 1) else {
+                    return reject("a trailing backslash".into());
+                };
+                // `\xHH` is shared; Rust's braced `\x{10FFFF}` is not.
+                if e == b'x' && b.get(i + 2) == Some(&b'{') {
+                    return reject("a braced `\\x{…}` escape".into());
+                }
+                // Any letter/digit escape not confirmed in both dialects: `\p`/`\P`
+                // (Python: bad escape), `\u{…}`, `\z` (Rust-only), `\Z` (Python-only),
+                // `\1` (backreference).
+                if e.is_ascii_alphanumeric() && !SHARED_ESCAPES.contains(&(e as char)) {
+                    return reject(format!("the escape `\\{}`", e as char));
+                }
+                i += 2; // skip the escaped character, so `\(` is not a group open
+            }
+            // `(?<name>…)` is a named group to Rust; Python spells it `(?P<name>…)`
+            // and errors on this one. `(?<=` / `(?<!` are look-behind, which
+            // `regex-syntax` rejects on its own.
+            b'(' if b[i..].starts_with(b"(?<")
+                && !b[i..].starts_with(b"(?<=")
+                && !b[i..].starts_with(b"(?<!") =>
+            {
+                return reject("a `(?<name>…)` group (Python spells it `(?P<name>…)`)".into());
+            }
+            // A flag-setting group — `(?i)`, `(?-i)`, `(?imsx)`. Python 3.11+ reads
+            // these as GLOBAL flags: they must sit at position 0, and a clearing
+            // form (`(?-i)`) is invalid entirely — it wants `(?-i:…)`. Rust scopes
+            // them and accepts both anywhere.
+            b'(' if is_flag_group(&b[i..]) && (i > 0 || b[i..].contains(&b'-')) => {
+                return reject(
+                    "inline flags Python reads as global (only a leading `(?flags)` \
+                     without `-` is portable)"
+                        .into(),
+                );
+            }
+            // A `[` inside a character class. Rust reads it as a literal (or a
+            // POSIX class); Python's parser terminates the class differently and
+            // can end up parsing the remainder as a group — `[a[:alpha:](?=-]` is
+            // "unterminated subpattern" there. It also warns "Possible nested set".
+            b'[' => {
+                let mut j = i + 1;
+                if b.get(j) == Some(&b'^') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b']') {
+                    j += 1; // a leading `]` is a literal in both dialects
+                }
+                while j < b.len() && b[j] != b']' {
+                    match b[j] {
+                        b'\\' => j += 2,
+                        b'[' => return reject("a `[` nested inside a character class".into()),
+                        _ => j += 1,
+                    }
+                }
+                i = j.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Whether `b` opens a flag-setting group: `(?` + flag letters (and `-`) + `)`,
+/// with no `:` (that would be `(?i:…)`, a scoped group Python also accepts).
+fn is_flag_group(b: &[u8]) -> bool {
+    let Some(rest) = b.strip_prefix(b"(?") else {
+        return false;
+    };
+    let end = rest.iter().position(|&c| c == b')');
+    match end {
+        Some(end) if end > 0 => rest[..end]
+            .iter()
+            .all(|&c| c.is_ascii_alphabetic() || c == b'-'),
+        _ => false,
+    }
+}
+
+/// Validate a `stop_regex` and return the strict upper bound on the characters it
+/// can match — the Rust port of Python's `get_max_seq_length`.
+///
+/// Bounded expressions get their real length; unbounded quantifiers get
+/// [`STOP_REGEX_MAX_LEN`] (an over-estimate, so the scheduler never under-buffers
+/// and misses a stop). **Anything `regex-syntax` cannot parse is a 400** — the
+/// admit-on-unknown fallback this used to have is precisely how `\p{L}` and a
+/// variable-width look-behind reached the scheduler. The nest limit is pinned well
+/// under the ~495 levels Python's parser survives, so deep nesting is rejected here
+/// rather than raising `RecursionError` there.
+fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
+    reject_python_incompatible(pattern)?;
+    let hir = regex_syntax::ParserBuilder::new()
+        .nest_limit(100)
+        .build()
+        .parse(pattern)
+        .map_err(|e| {
+            bad(format!(
+                "stop_regex {pattern:?} is not a valid regular expression: {e}"
+            ))
+        })?;
+    let ast = regex_syntax::ast::parse::ParserBuilder::new()
+        .nest_limit(100)
+        .build()
+        .parse(pattern)
+        .map_err(|e| {
+            bad(format!(
+                "stop_regex {pattern:?} is not a valid regular expression: {e}"
+            ))
+        })?;
+    if repeats_an_assertion(&ast) {
+        return Err(bad(format!(
+            "stop_regex {pattern:?} quantifies a zero-width assertion, which Python's \
+             `re` rejects (\"nothing to repeat\" / \"multiple repeat\")"
+        )));
+    }
+    Ok(hir_max_len(&hir))
+}
+
+/// Whether any repetition in `ast` applies to a zero-width assertion — `$*`,
+/// `\b{2}`, `^+`. `regex-syntax` accepts them; Python's `re` raises "nothing to
+/// repeat". Found by fuzzing the two parsers against each other, not by reading
+/// either one's docs.
+///
+/// Checked on the AST, not the HIR: the HIR translator folds `$+` down to a bare
+/// `Look`, so by then the shape Python objects to is gone.
+fn repeats_an_assertion(ast: &regex_syntax::ast::Ast) -> bool {
+    use regex_syntax::ast::Ast;
+    match ast {
+        // A quantified assertion (`$*`) or a quantified quantifier (`a?*`, which
+        // Python calls "multiple repeat"). Both parse fine in Rust.
+        Ast::Repetition(rep) => {
+            matches!(&*rep.ast, Ast::Assertion(_) | Ast::Repetition(_))
+                || repeats_an_assertion(&rep.ast)
+        }
+        Ast::Group(g) => repeats_an_assertion(&g.ast),
+        Ast::Concat(c) => c.asts.iter().any(repeats_an_assertion),
+        Ast::Alternation(a) => a.asts.iter().any(repeats_an_assertion),
+        _ => false,
+    }
+}
+
+/// Strict upper bound on the characters `hir` can match; `None` (unbounded) maps to
+/// the full-scan sentinel. Saturating throughout: a nested `{65535}` repeat would
+/// otherwise overflow into a small — and therefore unsafe — bound.
+fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => 0,
+        HirKind::Literal(lit) => lit.0.len() as i64,
+        HirKind::Class(_) => 1,
+        HirKind::Repetition(rep) => match rep.max {
+            None => STOP_REGEX_MAX_LEN,
+            Some(max) => (max as i64)
+                .saturating_mul(hir_max_len(&rep.sub))
+                .min(STOP_REGEX_MAX_LEN),
+        },
+        HirKind::Capture(cap) => hir_max_len(&cap.sub),
+        HirKind::Concat(subs) => subs
+            .iter()
+            .map(hir_max_len)
+            .fold(0i64, i64::saturating_add)
+            .min(STOP_REGEX_MAX_LEN),
+        HirKind::Alternation(subs) => subs.iter().map(hir_max_len).max().unwrap_or(0),
     }
 }
 
@@ -830,7 +1020,7 @@ mod tests {
         assert_eq!(once, twice, "a second normalize must change nothing");
         assert_eq!(twice.stop_strs, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(twice.stop_str_max_len, 4);
-        assert_eq!(twice.stop_regex_max_len, STOP_REGEX_MAX_LEN);
+        assert_eq!(twice.stop_regex_max_len, 3);
 
         // Greedy handling must not re-fire either: temperature is 1.0 after the
         // first pass, which is not in the greedy window.
@@ -890,42 +1080,95 @@ mod tests {
         assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
     }
 
-    /// Rust no longer judges `stop_regex` at all: it stamps the full-scan sentinel
-    /// and leaves both the bound and the verdict to Python, whose `re` is the engine
-    /// that actually runs the pattern (`recompute_stop_regex_max_len` overwrites this
-    /// value on the way in, and 400s what it cannot compile).
+    /// The property this whole design rests on: **anything Rust admits, Python can
+    /// compile.** The reverse may fail — rejecting a pattern Python would accept
+    /// costs one client a 400, while admitting one it cannot compile costs the
+    /// scheduler, because `re.search` runs on the decode hot path where nothing
+    /// catches the `re.error`.
     ///
-    /// So patterns `regex-syntax` used to reject — including ones Python accepts,
-    /// like `\Z` — must pass through here, and even a malformed one is Python's call.
+    /// The `python_compiles` column is measured on CPython 3.12; every `false` row
+    /// MUST also be rejected here, and that is what the assertion checks.
     #[test]
-    fn stop_regex_gets_the_sentinel_and_no_verdict() {
-        assert_eq!(
-            norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len,
-            STOP_REGEX_MAX_LEN
-        );
-        assert_eq!(
-            norm(r#"{"stop_regex": "\\d+"}"#).stop_regex_max_len,
-            STOP_REGEX_MAX_LEN
-        );
-        // No stop_regex → 0, so the scheduler skips the regex path entirely.
-        assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
-
-        for pattern in [
-            r"(a)\1",    // backreference — regex-syntax rejects, `re` accepts
-            r"(?=x)y",   // look-around — same
-            r"\Z",       // python-only anchor spelling — same
-            r"(?<=a*)b", // variable-width look-behind: parses, fails to compile
-            "(",         // malformed even for `re` — still Python's 400 to give
-        ] {
-            let json = format!(
-                r#"{{"stop_regex": {}}}"#,
-                serde_json::to_string(pattern).unwrap()
-            );
-            let sp = norm(&json);
-            assert_eq!(
-                sp.stop_regex_max_len, STOP_REGEX_MAX_LEN,
-                "{pattern} must pass through with the sentinel"
+    fn admitted_patterns_always_compile_in_python() {
+        // (pattern, does `re.compile` succeed in Python?)
+        let cases: &[(&str, bool)] = &[
+            // Python rejects these — Rust must too, or the scheduler dies.
+            (r"\p{L}", false),     // regex-syntax ACCEPTS: the round-1 hole
+            (r"\P{L}", false),     // …and its negation
+            ("(?<n>a)", false),    // regex-syntax ACCEPTS: named-group spelling
+            (r"\x{1F600}", false), // braced hex escape is Rust-only
+            (r"\u{41}", false),    // ditto
+            ("(?<=a*)b", false),   // variable-width look-behind: the round-2 hole
+            ("(", false),
+            ("[z-a]", false),
+            ("a{2,1}", false),
+            // Found by fuzzing the two parsers against each other, not by reading
+            // docs — every one of these parses cleanly in `regex-syntax`:
+            ("$*", false), // quantified assertion: "nothing to repeat"
+            (r"\b{2}", false),
+            ("^+", false),
+            ("a?*", false), // quantified quantifier: "multiple repeat"
+            ("a{2,5}?*", false),
+            ("a(?i)b", false),           // inline flags after position 0
+            ("(?-i)a", false),           // clearing flags: Python wants `(?-i:…)`
+            ("[a[:alpha:](?=-]", false), // `[` nested in a class re-terminates it
+            // Python accepts these; Rust may reject them (a false 400 is safe).
+            (r"\d{6}", true),
+            ("abc", true),
+            ("(?P<n>a)", true),
+            (r"a\.b", true),
+            (r"\bword\b", true),
+            (r"[\d\s]{2}", true),
+            (r"a\Z", true),   // Rust rejects: `\Z` is Python-only spelling
+            (r"(a)\1", true), // Rust rejects: backreference
+            ("(?=x)y", true), // Rust rejects: look-around
+            ("a{,5}", true),  // Rust rejects: regex-syntax won't parse it
+        ];
+        for &(pattern, python_compiles) in cases {
+            let admitted = stop_regex_bound(pattern).is_ok();
+            assert!(
+                !admitted || python_compiles,
+                "{pattern:?} is admitted by Rust but Python cannot compile it — \
+                 this reaches `re.search` on the decode path and kills the scheduler"
             );
         }
+    }
+
+    /// Deep nesting is rejected here rather than blowing Python's parser stack:
+    /// CPython compiles up to ~495 levels and raises `RecursionError` past that, so
+    /// the parser's nest limit is pinned well below it.
+    #[test]
+    fn deep_nesting_is_rejected_below_pythons_limit() {
+        let nest = |n: usize| format!("{}a{}", "(".repeat(n), ")".repeat(n));
+        assert!(
+            stop_regex_bound(&nest(10)).is_ok(),
+            "ordinary nesting is fine"
+        );
+        assert!(
+            stop_regex_bound(&nest(400)).is_err(),
+            "must be rejected here — Python raises RecursionError, not re.error"
+        );
+        assert!(stop_regex_bound(&nest(2000)).is_err());
+    }
+
+    /// Bounded patterns get their real length; unbounded ones the full-scan
+    /// sentinel, so the scheduler never under-buffers and misses a stop.
+    #[test]
+    fn stop_regex_bound_is_finite_when_bounded() {
+        let len = |p: &str| stop_regex_bound(p).expect("valid pattern");
+        assert_eq!(len(r"\d{6}"), 6);
+        assert_eq!(len("abc"), 3);
+        assert_eq!(len(r"^abc$"), 3); // anchors are zero-width
+        assert_eq!(len("a|bbb"), 3); // alternation → max branch
+        assert_eq!(len(r"(ab){3}"), 6);
+        assert_eq!(len(r"a\d{2,5}"), 6);
+        assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
+        // End to end, through the path `/generate` takes.
+        assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
+        assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
+        let _ = norm_err(r#"{"stop_regex": "("}"#);
+        let _ = norm_err(r#"{"stop_regex": ["\\d{6}", "("]}"#);
     }
 }
