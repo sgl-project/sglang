@@ -931,6 +931,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_inserts_tracked_slot_and_frees_live_slot(self):
+        _set_dummy_server_args_for_auxiliary_state_tests()
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
             max_context_len=8,
@@ -971,6 +972,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_unfinished_frees_tracked_source_slot(self):
+        _set_dummy_server_args_for_auxiliary_state_tests()
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
             max_context_len=8,
@@ -1012,6 +1014,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
         self,
     ):
+        _set_dummy_server_args_for_auxiliary_state_tests()
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
             max_context_len=8,
@@ -1051,6 +1054,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
+        _set_dummy_server_args_for_auxiliary_state_tests()
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
             max_context_len=8,
