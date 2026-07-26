@@ -1,4 +1,4 @@
-use rayon::prelude::*;
+use super::par;
 
 const PRECISION_BITS: i32 = 32 - 8 - 2;
 
@@ -124,32 +124,30 @@ fn clip8(v: i32) -> u8 {
 
 fn resample_horizontal(src: &[u8], h: usize, w: usize, out_w: usize, c: &Coeffs) -> Vec<u8> {
     let mut out = vec![0u8; h * out_w * 3];
-    out.par_chunks_mut(out_w * 3)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let src_row = &src[y * w * 3..(y + 1) * w * 3];
-            for xx in 0..out_w {
-                let (xmin, count) = c.bounds[xx];
-                let k = &c.kk[xx * c.ksize..xx * c.ksize + count];
-                let mut s = [1i32 << (PRECISION_BITS - 1); 3];
-                for (x, &coef) in k.iter().enumerate() {
-                    let p = (xmin + x) * 3;
-                    s[0] += src_row[p] as i32 * coef;
-                    s[1] += src_row[p + 1] as i32 * coef;
-                    s[2] += src_row[p + 2] as i32 * coef;
-                }
-                let o = xx * 3;
-                row[o] = clip8(s[0]);
-                row[o + 1] = clip8(s[1]);
-                row[o + 2] = clip8(s[2]);
+    par::for_chunks_mut(&mut out, out_w * 3, |y, row| {
+        let src_row = &src[y * w * 3..(y + 1) * w * 3];
+        for xx in 0..out_w {
+            let (xmin, count) = c.bounds[xx];
+            let k = &c.kk[xx * c.ksize..xx * c.ksize + count];
+            let mut s = [1i32 << (PRECISION_BITS - 1); 3];
+            for (x, &coef) in k.iter().enumerate() {
+                let p = (xmin + x) * 3;
+                s[0] += src_row[p] as i32 * coef;
+                s[1] += src_row[p + 1] as i32 * coef;
+                s[2] += src_row[p + 2] as i32 * coef;
             }
-        });
+            let o = xx * 3;
+            row[o] = clip8(s[0]);
+            row[o + 1] = clip8(s[1]);
+            row[o + 2] = clip8(s[2]);
+        }
+    });
     out
 }
 
 fn resample_vertical(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> {
     let mut out = vec![0u8; out_h * w * 3];
-    out.par_chunks_mut(w * 3).enumerate().for_each(|(yy, row)| {
+    par::for_chunks_mut(&mut out, w * 3, |yy, row| {
         let (ymin, count) = c.bounds[yy];
         let k = &c.kk[yy * c.ksize..yy * c.ksize + count];
         for x in 0..w {
@@ -170,7 +168,21 @@ fn resample_vertical(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> 
 }
 
 /// PIL-exact separable resize of a flat HWC RGB buffer with the given filter.
+///
+/// Enters the fan-out pool once for both passes; the per-row `for_chunks_mut`
+/// calls inside then reuse that entry rather than injecting a job per pass.
 pub fn resize_rgb_filter(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    filter: Filter,
+) -> Vec<u8> {
+    par::in_pool(move || resize_passes(src, h, w, out_h, out_w, filter))
+}
+
+fn resize_passes(
     src: &[u8],
     h: usize,
     w: usize,

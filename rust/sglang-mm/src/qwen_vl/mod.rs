@@ -7,9 +7,7 @@
 //! copies duplicated for stills) — plus the image-only M-RoPE fast path.
 //! All parameters come from the runtime spec; nothing is hardcoded per model.
 
-use rayon::prelude::*;
-
-use crate::common::{self, resize, token_layout};
+use crate::common::{par, resize, token_layout};
 use crate::pipeline::{
     DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
     TokenLayout,
@@ -78,37 +76,32 @@ impl QwenVlProcessor {
         let block_row = gw * m * dim; // one merged-block row of patches
         let mut out = vec![0.0f32; gh * gw * dim];
 
-        common::pool().install(|| {
-            out.par_chunks_mut(block_row)
-                .enumerate()
-                .for_each(|(i, chunk)| {
-                    let mut p = 0;
-                    for j in 0..gw / m {
-                        for mh in 0..m {
-                            for mw in 0..m {
-                                let y0 = (i * m + mh) * ps;
-                                let x0 = (j * m + mw) * ps;
-                                let patch = &mut chunk[p * dim..(p + 1) * dim];
-                                for c in 0..3 {
-                                    let ch = &mut patch[c * tps * ps * ps..];
-                                    for py in 0..ps {
-                                        let src = ((y0 + py) * w + x0) * 3 + c;
-                                        for px in 0..ps {
-                                            ch[py * ps + px] =
-                                                self.lut[c][rgb[src + px * 3] as usize];
-                                        }
-                                    }
-                                    // Temporal copies of a still are duplicates.
-                                    let (t0, rest) = ch.split_at_mut(ps * ps);
-                                    for t in 0..tps - 1 {
-                                        rest[t * ps * ps..(t + 1) * ps * ps].copy_from_slice(t0);
-                                    }
+        par::for_chunks_mut(&mut out, block_row, |i, chunk| {
+            let mut p = 0;
+            for j in 0..gw / m {
+                for mh in 0..m {
+                    for mw in 0..m {
+                        let y0 = (i * m + mh) * ps;
+                        let x0 = (j * m + mw) * ps;
+                        let patch = &mut chunk[p * dim..(p + 1) * dim];
+                        for c in 0..3 {
+                            let ch = &mut patch[c * tps * ps * ps..];
+                            for py in 0..ps {
+                                let src = ((y0 + py) * w + x0) * 3 + c;
+                                for px in 0..ps {
+                                    ch[py * ps + px] = self.lut[c][rgb[src + px * 3] as usize];
                                 }
-                                p += 1;
+                            }
+                            // Temporal copies of a still are duplicates.
+                            let (t0, rest) = ch.split_at_mut(ps * ps);
+                            for t in 0..tps - 1 {
+                                rest[t * ps * ps..(t + 1) * ps * ps].copy_from_slice(t0);
                             }
                         }
+                        p += 1;
                     }
-                });
+                }
+            }
         });
         out
     }
@@ -134,8 +127,7 @@ impl MmFamilyProcessor for QwenVlProcessor {
         )?;
         let resized;
         let data = if (th, tw) != (h, w) {
-            resized = common::pool()
-                .install(|| resize::resize_rgb_filter(rgb, h, w, th, tw, resize::Filter::Bicubic));
+            resized = resize::resize_rgb_filter(rgb, h, w, th, tw, resize::Filter::Bicubic);
             &resized
         } else {
             rgb.as_slice()

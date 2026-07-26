@@ -13,7 +13,7 @@ license.workspace = true
 [package.metadata.sglang]
 python-module = "sglang.srt.multimodal._core"
 debug = false
-features = ["python"]
+features = ["python", "parallel"]
 
 [lib]
 # Unique per-crate artifact name (the shared workspace target/ dir cannot hold
@@ -26,15 +26,21 @@ name = "sglang_mm_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# `python` gates every PyO3 binding, and is deliberately NOT default: cargo
-# unifies a package's features across everything selected in one invocation,
-# so a default-on `python` would leak pyo3 back into sglang-server's copy of
-# this crate under `cargo build --workspace` even though the server depends on
-# it with `default-features = false`. Opting in explicitly keeps the pure-Rust
-# core pure no matter how the workspace is built; the wheel asks for it via
+# Both features are deliberately NOT default: cargo unifies a package's
+# features across everything selected in one invocation, so anything default-on
+# here would leak back into sglang-server's copy of this crate under
+# `cargo build --workspace` even though the server depends on it with
+# `default-features = false`. Opting in explicitly keeps the pure-Rust core
+# pure no matter how the workspace is built; the wheel asks for both via
 # `[package.metadata.sglang] features` above.
 default = []
+# Every PyO3 binding.
 python = ["dep:pyo3", "dep:numpy"]
+# Fan work out onto crate-owned rayon pools (see `common::par`). Off for the
+# rlib: sglang-server provides concurrency across requests and owns its core
+# budget, so preprocessing runs inline on the calling thread and rayon is not
+# linked at all. Orthogonal to `python` so both shapes stay testable.
+parallel = ["dep:rayon"]
 
 [dependencies]
 pyo3 = { workspace = true, optional = true }
@@ -44,7 +50,7 @@ base64 = "0.22"
 blake3 = "1"
 half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the

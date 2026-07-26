@@ -5,9 +5,7 @@
 //! [`MmFamilyProcessor`] (see `pipeline.rs`). Families produce data; they
 //! cannot alter orchestration.
 
-use rayon::prelude::*;
-
-use crate::common::{self, fetch, token_layout};
+use crate::common::{self, fetch, par, token_layout};
 use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
 /// One raw image source from the request.
@@ -47,6 +45,15 @@ pub struct Output {
     pub positions: PositionOutput,
 }
 
+/// Resolve one image source to raw encoded bytes, borrowing when the request
+/// already carries them.
+fn resolve(source: &ImageSource) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    match source {
+        ImageSource::String(source) => Ok(fetch::fetch_bytes(source)?.into()),
+        ImageSource::Bytes(bytes) => Ok(bytes.as_slice().into()),
+    }
+}
+
 /// Run one request through the pipeline. Any `Err` rejects the request back
 /// to the client — including inputs merely outside the pipeline's scope
 /// (video/audio, precomputed features, undecodable images), since there is
@@ -59,34 +66,32 @@ pub fn process(
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
-    // Stage 1 (blocking I/O) runs on the wide io pool, stages 2-3 (CPU) on the
-    // core-sized pool. Keeping them apart is what stops one request's slow
-    // remote URLs from occupying every worker and stalling everyone else's
-    // decode/resize — the split the Python processors make with
-    // `auto_mm_io_worker_num` vs `auto_mm_processor_worker_num`.
-    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = common::io_pool().install(|| {
-        input
-            .images
-            .par_iter()
-            .map(|source| match source {
-                ImageSource::String(source) => Ok(fetch::fetch_bytes(source)?.into()),
-                ImageSource::Bytes(bytes) => Ok(bytes.as_slice().into()),
-            })
-            .collect::<Result<Vec<_>, String>>()
-    })?;
-    let processed: Vec<(ProcessedItem, u64)> = common::pool().install(|| {
-        fetched
-            .par_iter()
-            .map(|bytes| {
-                // The Python (PIL) path decodes more formats (GIF/WebP/BMP,
-                // 16-bit PNG); those error here and reject the request.
-                let (rgb, height, width) = common::decode_rgb(bytes)?;
-                let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
-                let hash = common::content_hash_u64(item.feature.data.as_bytes());
-                Ok((item, hash))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    })?;
+    // Stage 1 is blocking I/O and stages 2-3 are CPU-bound, so they use
+    // separate seams (`par::try_map_io` vs `par::try_map`): one request's slow
+    // URLs must not occupy the workers other requests need for decode/resize —
+    // the split the Python processors make with `auto_mm_io_worker_num` vs
+    // `auto_mm_processor_worker_num`.
+    // Pre-fetched requests (the shape a server that owns its own async HTTP
+    // hands over) have no I/O to do, so they must not pay for the I/O seam —
+    // resolving `Bytes` is just a slice wrap.
+    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = if input
+        .images
+        .iter()
+        .any(|source| matches!(source, ImageSource::String(_)))
+    {
+        par::try_map_io(&input.images, resolve)
+    } else {
+        input.images.iter().map(resolve).collect::<Result<_, _>>()
+    }?;
+    let processed: Vec<(ProcessedItem, u64)> =
+        par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
+            // The Python (PIL) path decodes more formats (GIF/WebP/BMP, 16-bit
+            // PNG); those error here and reject the request.
+            let (rgb, height, width) = common::decode_rgb(bytes)?;
+            let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
+            let hash = common::content_hash_u64(item.feature.data.as_bytes());
+            Ok((item, hash))
+        })?;
 
     let input_ids = match input.input_ids {
         Some(input_ids) if !input_ids.is_empty() => input_ids,

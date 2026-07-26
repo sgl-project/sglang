@@ -1,9 +1,8 @@
 use std::sync::OnceLock;
 
-use half::bf16;
-use rayon::prelude::*;
-
 use crate::common;
+use crate::common::par;
+use half::bf16;
 
 const MEAN: [f32; 3] = [
     0.48145466f64 as f32,
@@ -78,9 +77,7 @@ fn patchify_into(arr: &[u8], h: usize, w: usize, ps: usize, out: &mut [u16]) {
         }
     };
 
-    common::pool().install(|| {
-        out.par_chunks_mut(row_elems).enumerate().for_each(body);
-    });
+    par::for_chunks_mut(out, row_elems, |index, chunk| body((index, chunk)));
 }
 
 fn patchify_alloc(arr: &[u8], h: usize, w: usize, ps: usize) -> Vec<u16> {
@@ -108,15 +105,10 @@ impl crate::registry::ImageProcessorSpec for InklingProcessor {
         if patch_size == 0 {
             return Err("patch_size must be greater than zero".into());
         }
-        common::pool().install(|| {
-            datas
-                .par_iter()
-                .map(|data| {
-                    let hash = common::content_hash_u64(data);
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-                })
-                .collect()
+        par::try_map(datas, |data| {
+            let hash = common::content_hash_u64(data);
+            let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+            Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
         })
     }
 }
@@ -128,10 +120,10 @@ mod python {
     use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
     use pyo3::exceptions::PyValueError;
     use pyo3::prelude::*;
-    use rayon::prelude::*;
 
     use super::patchify_alloc;
     use crate::common;
+    use crate::common::par;
 
     /// `(height, width, patches_as_u16_bits)` for one decoded image.
     type Patches = (usize, usize, Vec<u16>);
@@ -185,10 +177,8 @@ mod python {
         check_ps(patch_size)?;
         let (h, w, out) = py
             .detach(move || {
-                common::pool().install(|| {
-                    let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
-                    Ok::<_, String>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-                })
+                let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
+                Ok::<_, String>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
             })
             .map_err(PyValueError::new_err)?;
         Ok((h, w, out.into_pyarray(py)))
@@ -204,23 +194,17 @@ mod python {
         rescale_cap: Option<i64>,
     ) -> PyResult<Vec<PyPatches<'py>>> {
         check_ps(patch_size)?;
-        let results: Vec<Result<Patches, String>> = py.detach(move || {
-            common::pool().install(|| {
-                datas
-                    .par_iter()
-                    .map(|data| {
-                        let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                        Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-                    })
-                    .collect()
+        let results: Vec<Patches> = py
+            .detach(move || {
+                par::try_map(&datas, |data| -> Result<Patches, String> {
+                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
+                })
             })
-        });
+            .map_err(PyValueError::new_err)?;
         results
             .into_iter()
-            .map(|r| {
-                let (h, w, v) = r.map_err(PyValueError::new_err)?;
-                Ok((h, w, v.into_pyarray(py)))
-            })
+            .map(|(h, w, v)| Ok((h, w, v.into_pyarray(py))))
             .collect()
     }
 
@@ -234,24 +218,18 @@ mod python {
         rescale_cap: Option<i64>,
     ) -> PyResult<Vec<PyHashedPatches<'py>>> {
         check_ps(patch_size)?;
-        let results: Vec<Result<HashedPatches, String>> = py.detach(move || {
-            common::pool().install(|| {
-                datas
-                    .par_iter()
-                    .map(|data| {
-                        let hash = common::content_hash_u64(data);
-                        let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                        Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-                    })
-                    .collect()
+        let results: Vec<HashedPatches> = py
+            .detach(move || {
+                par::try_map(&datas, |data| -> Result<HashedPatches, String> {
+                    let hash = common::content_hash_u64(data);
+                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
+                })
             })
-        });
+            .map_err(PyValueError::new_err)?;
         results
             .into_iter()
-            .map(|r| {
-                let (h, w, v, hash) = r.map_err(PyValueError::new_err)?;
-                Ok((h, w, v.into_pyarray(py), hash))
-            })
+            .map(|(h, w, v, hash)| Ok((h, w, v.into_pyarray(py), hash)))
             .collect()
     }
 
@@ -279,19 +257,17 @@ mod python {
             .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
             .to_vec();
         let (oh, ow, out) = py.detach(move || {
-            common::pool().install(|| {
-                let (tw, th) = common::resize::scaled_dims(w, h, rescale_frac, rescale_cap);
-                let (rgb, h, w) = if (tw, th) != (w, h) {
-                    (
-                        common::resize::resize_lanczos_rgb(&rgb, h, w, th, tw),
-                        th,
-                        tw,
-                    )
-                } else {
-                    (rgb, h, w)
-                };
-                (h, w, patchify_alloc(&rgb, h, w, patch_size))
-            })
+            let (tw, th) = common::resize::scaled_dims(w, h, rescale_frac, rescale_cap);
+            let (rgb, h, w) = if (tw, th) != (w, h) {
+                (
+                    common::resize::resize_lanczos_rgb(&rgb, h, w, th, tw),
+                    th,
+                    tw,
+                )
+            } else {
+                (rgb, h, w)
+            };
+            (h, w, patchify_alloc(&rgb, h, w, patch_size))
         });
         Ok((oh, ow, out.into_pyarray(py), hash))
     }

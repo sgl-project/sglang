@@ -1,13 +1,19 @@
 pub mod fetch;
+pub mod par;
 pub mod resize;
 pub mod token_layout;
 pub mod transforms;
 
+#[cfg(feature = "parallel")]
 use std::sync::OnceLock;
 
 /// CPU pool: decode, resize, patchify, hash. Sized to cores (capped at 8)
 /// because the work is compute-bound — never run blocking I/O on it, or one
 /// request's remote fetches stall every other request's preprocessing.
+///
+/// Only exists under the `parallel` feature; reach it through [`par`], never
+/// directly, so the rayon-less build stays compiling.
+#[cfg(feature = "parallel")]
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -28,6 +34,7 @@ pub fn pool() -> &'static rayon::ThreadPool {
 /// a request full of slow URLs cannot starve CPU preprocessing. The width
 /// mirrors the Python processors' `auto_mm_io_worker_num = 16` (threads here
 /// are parked on sockets, not cores).
+#[cfg(feature = "parallel")]
 pub fn io_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -87,7 +94,7 @@ mod python {
     use pyo3::prelude::*;
     use pyo3::types::PyBytes;
 
-    use super::{decode_rgb, pool, resize};
+    use super::{decode_rgb, resize};
 
     #[pyfunction]
     pub fn resize_rgb<'py>(
@@ -110,9 +117,7 @@ mod python {
             .as_slice()
             .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
             .to_vec();
-        let out = py.detach(move || {
-            pool().install(|| resize::resize_lanczos_rgb(&data, h, w, out_h, out_w))
-        });
+        let out = py.detach(move || resize::resize_lanczos_rgb(&data, h, w, out_h, out_w));
         Ok(out.into_pyarray(py))
     }
 
