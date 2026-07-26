@@ -428,8 +428,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         }
     # DSPARK: verify runs on the decode backend (mode=decode below), so this
     # picks the verify kernel -- mode=prefill routes it to flashinfer, which is
-    # slow and syncs, while plain decode is cold under dspark. tokenspeed is
-    # fastest on fp8 KV, trtllm-gen otherwise.
+    # slow and syncs, while plain decode is cold under dspark.
     q_len = server_args.speculative_num_draft_tokens or (
         server_args.speculative_dspark_block_size + 1
         if server_args.speculative_dspark_block_size is not None
@@ -438,10 +437,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     )
     overrides = {}
     if backends_unset:
-        if server_args.kv_cache_dtype == "fp8_e4m3" and q_len <= 8:
-            backend = "tokenspeed_mla"
-        else:
-            backend = "trtllm_mla"
+        backend = "trtllm_mla"
         overrides["decode_attention_backend"] = backend
         overrides["prefill_attention_backend"] = "trtllm_mla"
     else:
