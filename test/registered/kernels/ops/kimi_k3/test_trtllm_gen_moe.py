@@ -14,6 +14,7 @@ selection); the tolerance below only guards against a future tactic split.
 """
 
 import os
+import sys
 
 import pytest
 import torch
@@ -81,3 +82,7 @@ def test_matches_fork_kernel(golden, mode, tokens):
     ref = case["output"].cuda().to(torch.float32)
     diff = (out.to(torch.float32) - ref).abs()
     assert diff.max().item() < 0.2 and diff.mean().item() < 0.02
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

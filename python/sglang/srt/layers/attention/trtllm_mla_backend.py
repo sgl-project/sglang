@@ -802,8 +802,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        *,
+        causal_seqs: Optional[torch.Tensor] = None,
+        cp_world: int = 1,
+        cp_rank: int = 0,
+        return_lse: bool = False,
     ) -> torch.Tensor:
-        """Hook for subclasses to swap the decode/spec-verify kernel."""
+        """Hook for subclasses to swap the decode/spec-verify kernel.
+
+        The DCP arguments belong to the hook contract because forward_extend
+        passes them on the DCP target-verify path. This implementation does not
+        forward them to the kernel and returns no LSE, so only the DCP-capable
+        subclasses serve them."""
+        if cp_world > 1 or return_lse:
+            raise NotImplementedError(
+                "trtllm_mla does not forward the cyclic DCP metadata to its "
+                "decode kernel and returns no rank-local LSE for the cross-rank "
+                "merge; select cutedsl_mla or tokenspeed_mla for a DCP "
+                "target-verify run"
+            )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale

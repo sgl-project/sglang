@@ -1,5 +1,8 @@
 """K3 GPU preprocess: shared batched pipeline hook contract (CPU parts)."""
 
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.multimodal.processors.kimi_k3 import _fill_transparent_bg
@@ -32,3 +35,7 @@ def test_fill_transparent_bg_no_config_drops_alpha():
     out = _fill_transparent_bg(batch, None)
     assert out.shape == (2, 3, 4, 4)
     assert torch.equal(out, batch[:, :3])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
