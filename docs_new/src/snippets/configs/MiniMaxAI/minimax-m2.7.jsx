@@ -84,7 +84,8 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
     accuracy: {
       gpqa_pct:
 `ns prepare_data gpqa
@@ -127,7 +128,7 @@ ns eval \\
   --parallel 32 \\
   --host {{CURL_HOST}} --port {{CURL_PORT}}`,
     },
-    numPromptsByConc: { 1: 10, 100: 500 },
+    numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
   accuracyLabels: [
@@ -144,7 +145,7 @@ ns eval \\
     h200:   "lmsysorg/sglang:v0.5.10.post1",
     b200:   "lmsysorg/sglang:v0.5.10.post1",
     gb300:  "lmsysorg/sglang:v0.5.10.post1-cu130",
-    mi300x: "lmsysorg/sglang:v0.5.10.post1-rocm720-mi30x",
+    mi300x: "lmsysorg/sglang:v0.5.16-rocm700-mi30x",
     mi325x: "lmsysorg/sglang:v0.5.10.post1-rocm720-mi30x",
     mi355x: "lmsysorg/sglang:v0.5.10.post1-rocm720-mi35x",
     // xeon: no docker mapping — install from source (CPU build); falls back to :dev.

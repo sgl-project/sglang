@@ -39,19 +39,19 @@ export const benchmarks = [
   },
   {
     // MI300X ×2 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=2 ep=2 / low-latency.
-    // Measured on AMD Instinct MI300X (8×192 GB), sglang 0.5.13.post1,
-    // docker lmsysorg/sglang:v0.5.13.post1-rocm720-mi30x.
+    // Measured on AMD Instinct MI300X (8×192 GB), sglang 0.5.16,
+    // docker lmsysorg/sglang:v0.5.16-rocm700-mi30x.
     // Server flags: --attention-backend triton --mem-fraction-static 0.85
     //   --kv-cache-dtype fp8_e4m3.
-    // Benchmark: sglang.bench_serving --dataset-name random --random-input-len 1000
-    //   --random-output-len 1000 --warmup-requests 64 --request-rate inf.
+    // Benchmark: sglang.bench_serving --dataset-name random --random-input-len 8192
+    //   --random-output-len 1024 --flush-cache --request-rate inf.
     match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.5.13.post1",
+    sglang_version: "0.5.16",
     speed: [
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1, num_prompts: 64 },
-        ttft_ms: 210, tpot_ms: 14.94, tokens_per_sec_per_gpu: 33 },
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 16, num_prompts: 256 },
-        ttft_ms: 167, tpot_ms: 31.80, tokens_per_sec_per_gpu: 243 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 32 },
+        ttft_ms: 751, tpot_ms: 15.11, tokens_per_sec_per_gpu: 30 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 32 },
+        ttft_ms: 1704, tpot_ms: 35.48, tokens_per_sec_per_gpu: 191 },
     ],
     // sgl-eval GSM8K, --no-thinking, --max-tokens 8192, tp=2 ep=2.
     // 1319 examples, 94.31% correct, 7.43% truncated (hitting max_tokens), 0% errors.
@@ -59,24 +59,26 @@ export const benchmarks = [
   },
   {
     // MI300X ×4 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=4 ep=4 / balanced.
+    // Same server and benchmark config as low-latency entry above (tp=4 ep=4 instead).
     match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-    sglang_version: "0.5.13.post1",
+    sglang_version: "0.5.16",
     speed: [
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 64, num_prompts: 512 },
-        ttft_ms: 419, tpot_ms: 42.48, tokens_per_sec_per_gpu: 351 },
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 256, num_prompts: 1024 },
-        ttft_ms: 337, tpot_ms: 71.72, tokens_per_sec_per_gpu: 809 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64, num_prompts: 128 },
+        ttft_ms: 3026, tpot_ms: 74.01, tokens_per_sec_per_gpu: 212 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256, num_prompts: 512 },
+        ttft_ms: 9296, tpot_ms: 168.73, tokens_per_sec_per_gpu: 390 },
     ],
   },
   {
     // MI300X ×8 / MiniMax-M2.7 / FP8 KV cache (fp8_e4m3) / tp=8 ep=8 / high-throughput.
+    // Same server and benchmark config as low-latency entry above (tp=8 ep=8 instead).
     match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "0.5.13.post1",
+    sglang_version: "0.5.16",
     speed: [
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 1024, num_prompts: 2048 },
-        ttft_ms: 3547, tpot_ms: 239.18, tokens_per_sec_per_gpu: 538 },
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 4096, num_prompts: 4096 },
-        ttft_ms: 18251, tpot_ms: 431.16, tokens_per_sec_per_gpu: 1043 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024, num_prompts: 2048 },
+        ttft_ms: 23261, tpot_ms: 508.06, tokens_per_sec_per_gpu: 322 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 4096, num_prompts: 4096 },
+        ttft_ms: 218886, tpot_ms: 536.96, tokens_per_sec_per_gpu: 462 },
     ],
   },
 ];
