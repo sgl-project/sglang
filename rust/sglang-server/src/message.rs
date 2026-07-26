@@ -3,22 +3,25 @@
 //! Grouped by flow direction: [`request`] (the `/generate` body fan-out, the
 //! in-flight request bodies + scheduler ingress wire), [`egress`]
 //! (the response back-channel + egress-ring frames and decoded chunk events),
-//! [`sampling`] (sampling-params normalization, the Python `SamplingParams` port).
+//! [`sampling`] (sampling-params normalization, the Python `SamplingParams`
+//! port), [`io_struct`] (the scheduler wire structs), [`types`] (the shared
+//! wire-shape adapters both directions use).
 
 mod egress;
+mod io_struct;
 mod request;
 mod sampling;
+mod types;
 
 pub use egress::{
     ChunkEvent, ChunkExtras, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, EgressItem,
     EgressSink, SinkError, for_each_chunk, frame_egress_batch_cols, frame_egress_error,
     frame_egress_result,
 };
-pub use request::{
-    ControlRequest, GenerateBody, GenerateRequest, RequestKind, abort_req_msgpack,
-    control_req_msgpack,
-};
-pub use sampling::normalize_sampling_params;
+pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
+pub use request::{GenerateBody, GenerateRequest, RequestKind};
+pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
+pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
 use bytes::Bytes;
 

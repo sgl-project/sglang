@@ -21,10 +21,8 @@ use bytes::Bytes;
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
 use crate::ids::RidHash;
-use crate::message::DetokMsg;
-use crate::message::normalize_sampling_params;
 use crate::message::{
-    EgressItem, IngressMsg, Request, RequestKind, abort_req_msgpack, control_req_msgpack,
+    AbortReq, ControlRequest, DetokMsg, EgressItem, IngressMsg, Request, RequestKind,
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
@@ -140,7 +138,10 @@ impl Ingress {
                             );
                             return;
                         };
-                        match normalize_sampling_params(&mut g.sampling_params) {
+                        match g
+                            .sampling_params
+                            .normalize(self.skip_tokenizer_init, self.vocab_size)
+                        {
                             Err(e) => Err(e),
                             // Client ids skip the pool (→ Queued); text is tokenized.
                             Ok(()) if g.already_tokenized() => {
@@ -171,12 +172,12 @@ impl Ingress {
                 }
                 // Push the wire message (control frame or generate payload) to the ring.
                 RequestState::Queued => {
-                    match &req.kind {
-                        RequestKind::Control(c) => {
-                            let tag = c.tag;
-                            self.push_control_to_ring(req, tag);
-                        }
-                        RequestKind::Generate(_) => self.push_to_ring(req),
+                    // `matches!` reads the discriminant without holding a borrow,
+                    // so `req` can be moved into the push below.
+                    if matches!(req.kind, RequestKind::Generate(_)) {
+                        self.push_to_ring(req);
+                    } else {
+                        self.push_control_to_ring(req);
                     }
                     return;
                 }
@@ -207,7 +208,7 @@ impl Ingress {
         let (decode_logprob_text, no_stop_trim) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
-                sampling_flag(&g.sampling_params, "no_stop_trim"),
+                g.sampling_params.no_stop_trim,
             ),
             RequestKind::Control(_) => (false, false),
         };
@@ -226,8 +227,14 @@ impl Ingress {
     /// Push a bare control request (`[tag, rid, nil]`) onto the ingress ring. The
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
     /// egress ring as a single `Result`.
-    fn push_control_to_ring(&self, mut req: Request, tag: &str) {
-        let header = match control_req_msgpack(tag, &req.rid) {
+    fn push_control_to_ring(&self, mut req: Request) {
+        let encode = match &req.kind {
+            RequestKind::Control(control) => control.encode(),
+            _ => Err(Error::Internal(
+                "non-control request reached push_control_to_ring".into(),
+            )),
+        };
+        let header = match encode {
             Ok(b) => b,
             Err(e) => {
                 self.fail(&mut req, e);
@@ -253,7 +260,7 @@ impl Ingress {
             .detok_for(id)
             .send(DetokMsg::Deregister { rid_hash: id });
 
-        match abort_req_msgpack(&rid) {
+        match ControlRequest::AbortReq(AbortReq::new(rid.clone(), false)).encode() {
             Ok(header) => {
                 if !self.ingress.try_push(IngressMsg {
                     header,
@@ -274,10 +281,10 @@ impl Ingress {
         // own their data, so the borrow ends before any `fail(&mut req)`.
         let serialized = match &req.kind {
             RequestKind::Generate(g) if g.already_tokenized() => g
-                .to_header_msgpack(&req.rid)
-                .map(|header| (header, g.input_ids_i64_le())),
+                .encode_header()
+                .map(|header| (header, g.encode_data_buf())),
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
-            RequestKind::Control(_) => Err(Error::Internal(
+            _ => Err(Error::Internal(
                 "non-generate request reached push_to_ring".into(),
             )),
         };
@@ -295,19 +302,6 @@ impl Ingress {
         // On success the scheduler owns the request (egress arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
-}
-
-/// Read a boolean flag from the (opaque) sampling-params map; absent/non-bool →
-/// `false`. Used to lift per-request detok flags (e.g. `no_stop_trim`) out of the
-/// sampling params the client sends untyped.
-fn sampling_flag(sampling_params: &Option<rmpv::Value>, key: &str) -> bool {
-    let Some(rmpv::Value::Map(m)) = sampling_params else {
-        return false;
-    };
-    m.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_bool())
-        .unwrap_or(false)
 }
 
 /// `Received → Validating` + admissibility check. Under `skip_tokenizer_init` a
@@ -343,13 +337,12 @@ fn validate(
                 }
             }
         }
-        if let Some(rmpv::Value::Array(ids)) = &g.token_ids_logprob {
-            for v in ids {
-                let id = v.as_i64().unwrap_or(-1);
+        if let Some(ids) = &g.token_ids_logprob {
+            for &id in ids {
                 if id < 0 || id as u64 >= vs {
                     return Err(Error::Validation(format!(
                         "token_ids_logprob contains out-of-vocabulary token id \
-                         {v}; valid range is [0, {vs})"
+                         {id}; valid range is [0, {vs})"
                     )));
                 }
             }
@@ -363,7 +356,7 @@ fn validate(
 mod tests {
     use super::*;
     use crate::fsm::RequestState;
-    use crate::message::{EgressSink, GenerateRequest};
+    use crate::message::{EgressSink, GenerateRequest, SamplingParams};
     use crate::ring::{IngressConsumer, ingress_ring};
     use tokio::sync::mpsc;
 
@@ -392,18 +385,19 @@ mod tests {
         (ingress, detok_rx, consumer, tm_tx)
     }
 
-    fn generate_req(id: u64, sampling_params: rmpv::Value) -> Request {
+    fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
         let (tx, _rx) = mpsc::channel(8);
         Request {
             rid_hash: RidHash(id),
             rid: id.to_string(),
             state: RequestState::Received,
             sink: EgressSink::Local(tx),
-            kind: RequestKind::Generate(GenerateRequest {
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: id.to_string(),
                 input_ids: Some(vec![1, 2, 3]),
-                sampling_params: Some(sampling_params),
+                sampling_params,
                 ..Default::default()
-            }),
+            })),
         }
     }
 
@@ -412,8 +406,11 @@ mod tests {
     #[test]
     fn rejected_request_deregisters_from_shard() {
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        // top_p = 2.0 is outside (0, 1], so `normalize_sampling_params` rejects it.
-        let bad = rmpv::Value::Map(vec![(rmpv::Value::from("top_p"), rmpv::Value::F64(2.0))]);
+        // top_p = 2.0 is outside (0, 1], so `SamplingParams::normalize` rejects it.
+        let bad = SamplingParams {
+            top_p: 2.0,
+            ..Default::default()
+        };
         ingress.drive(generate_req(7, bad));
 
         assert!(
@@ -436,7 +433,7 @@ mod tests {
     #[test]
     fn out_of_vocab_input_ids_rejected() {
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(21, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(21, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![1, 2_000_000_000]);
         }
@@ -454,7 +451,7 @@ mod tests {
     #[test]
     fn negative_and_logprob_token_ids_rejected() {
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(22, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(22, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![-1]);
         }
@@ -465,9 +462,9 @@ mod tests {
         }
 
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
-        let mut req = generate_req(23, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(23, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
-            g.token_ids_logprob = Some(rmpv::Value::Array(vec![rmpv::Value::from(999_999)]));
+            g.token_ids_logprob = Some(vec![999_999]);
         }
         ingress.drive(req);
         match detok_rx.try_recv() {
@@ -481,7 +478,7 @@ mod tests {
     fn admitted_request_keeps_registration() {
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
         // Empty map → all sampling defaults, passes normalization.
-        ingress.drive(generate_req(9, rmpv::Value::Map(vec![])));
+        ingress.drive(generate_req(9, SamplingParams::default()));
 
         assert!(
             matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid_hash, .. }) if rid_hash == RidHash(9)),
@@ -499,7 +496,7 @@ mod tests {
     fn tokenize_failure_deregisters_via_ingress() {
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
         // The pool marks a failed encode as `Failed(err)` before returning it.
-        let mut req = generate_req(11, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(11, SamplingParams::default());
         let _ = req
             .state
             .apply(Event::Error(Error::Tokenize("boom".into())));
@@ -537,7 +534,7 @@ mod tests {
     #[test]
     fn tokenized_return_pushes_without_deregister() {
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
-        let mut req = generate_req(15, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(15, SamplingParams::default());
         // Simulate a successful pool return: ids filled, Queued.
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![1, 2, 3]);
@@ -561,7 +558,7 @@ mod tests {
         // `make_ingress` drops the tok receiver, so `tok.send` fails.
         let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
         // No ids → NeedsTokenize → Tokenizing branch.
-        let mut req = generate_req(21, rmpv::Value::Map(vec![]));
+        let mut req = generate_req(21, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = None;
         }

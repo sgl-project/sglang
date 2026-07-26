@@ -140,8 +140,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
 
 
 @unittest.skipIf(
-    importlib.util.find_spec("sglang_server") is None,
-    "sglang_server wheel not installed",
+    importlib.util.find_spec("sglang.srt.server._core") is None,
+    "embedded rust server extension not built",
 )
 class TestNightlyGsm8KEvalWithRustServer(TestNightlyGsm8KEval):
     @classmethod
