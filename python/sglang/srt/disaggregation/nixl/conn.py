@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -224,6 +225,7 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dcp_dst_region_indices: Optional[List[int]] = None
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -974,13 +976,22 @@ class NixlKVManager(CommonKVManager):
         decode_only_spec_dec = n_dst > n_src
 
         if peer_info.requires_dcp_relayout:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+            )
+            peer_info.dcp_dst_region_indices = dst_indices
+            dst_kv_mem_kinds = [peer_info.dst_kv_mem_kinds[j] for j in dst_indices]
+            dst_kv_item_lens = [peer_info.dst_kv_item_lens[j] for j in dst_indices]
             dst_mem_kind = _homogeneous_kv_mem_kind(
-                peer_info.dst_kv_mem_kinds[:n_src],
+                dst_kv_mem_kinds,
                 "PD DCP destination",
             )
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                peer_info.dst_kv_item_lens[:n_src]
+                dst_kv_item_lens
             )
             return
 
@@ -1621,16 +1632,19 @@ class NixlKVManager(CommonKVManager):
             self.agent.send_notif(peer_name, notif.encode("ascii"))
             return None
 
-        num_src_regions = len(self.kv_args.kv_item_lens)
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        dst_kv_ptrs = [
+            dst_info.dst_kv_ptrs[dst_idx]
+            for dst_idx in dst_info.dcp_dst_region_indices
+        ]
 
         # Prepared handles encode page-level offsets, while DCP relayout needs
         # flat descriptors for the selected token rows.
         return self._send_kvcache_generic(
             peer_name=peer_name,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
-            dst_data_ptrs=dst_info.dst_kv_ptrs[:num_src_regions],
+            dst_data_ptrs=dst_kv_ptrs,
             item_lens=token_item_lens,
             prefill_data_indices=plan.src_token_indices,
             dst_data_indices=plan.dst_token_indices,
