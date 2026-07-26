@@ -37,10 +37,13 @@ using host::distributed::CommunicatorRef;
 
 inline constexpr uint32_t kMaxWorldSize = device::distributed::kMaxWorldSize;
 
+// Graph* reduce the registered graph inputs in place (cuda-graph only, zero-copy);
+// Eager* stage the input through the pull workspace; *Multicast use NVLS multimem.
 enum class PullMode {
   Graph,
   Eager,
-  Multicast,  // also eager
+  GraphMulticast,
+  EagerMulticast,
 };
 
 template <typename T>
@@ -405,7 +408,7 @@ struct AllReducePullImpl {
     const auto num_threads = blockDim.x * gridDim.x;
     const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-      if constexpr (kMode == PullMode::Multicast) {
+      if constexpr (kMode == PullMode::EagerMulticast || kMode == PullMode::GraphMulticast) {
         vec_t out_vec;
         ld_multimem_16B(out_vec, mc_addr, vid);
         if constexpr (kIs2shot) {
@@ -476,7 +479,15 @@ struct AllReducePullImpl {
       }
     }
     const auto counter = sync_enter_pull<false>(params);
-    const auto mc_addr = reinterpret_cast<vec_t*>(params.pull_mc_workspace) + local_vec_bias;
+    // GraphMulticast reduces the registered input's own multicast VA in place (zero
+    // copy); EagerMulticast reduces the staged pull_mc_workspace.
+    void* mc_base;
+    if constexpr (kMode == PullMode::GraphMulticast) {
+      mc_base = params.graph_params[0];
+    } else {
+      mc_base = params.pull_mc_workspace;
+    }
+    const auto mc_addr = reinterpret_cast<vec_t*>(mc_base) + local_vec_bias;
     reduce_impl<true>(local_num_vecs, data, params.output, mc_addr);
     sync_exit_pull<true>(params, counter);
   }
@@ -535,7 +546,8 @@ struct AllReduceKernel {
   static constexpr auto kernel_push = all_reduce_kernel<AllReducePushImpl<T, kWorldSize, kUsePDL>, kWorldSize, kShot>;
 
  public:
-  static Tensor run(CommunicatorRef ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg) {
+  static Tensor
+  run(CommunicatorRef ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg, bool multicast) {
     using namespace host;
     const auto& data = *ref.get();
     RuntimeCheck(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push", "Invalid algo: ", algo);
@@ -586,8 +598,9 @@ struct AllReduceKernel {
 
     using enum PullMode;
     RuntimeCheck(nbytes <= data.pull_bytes, "Input size ", nbytes, " exceeds pull workspace size ", data.pull_bytes);
-    const auto pull_mode = use_graph ? Graph : std::get<bool>(pull_arg) ? Multicast : Eager;
-    RuntimeCheck(pull_mode != Multicast || data.pull_mc_workspace != nullptr, "Multicast requires an mc workspace");
+    const auto pull_mode = use_graph ? (multicast ? GraphMulticast : Graph) : (multicast ? EagerMulticast : Eager);
+    RuntimeCheck(
+        pull_mode != EagerMulticast || data.pull_mc_workspace != nullptr, "EagerMulticast requires an mc workspace");
 
     const uint32_t num_blocks = data.num_pull_blocks;
     const auto cuda_memcpy = [&](void* dst, const void* src) {
@@ -614,7 +627,7 @@ struct AllReduceKernel {
       if (!use_graph) cuda_memcpy(local_workspace, in_.data_ptr());
       const auto kernel = (pull_mode == Graph) ? kernel_pull<1, Graph>
                           : pull_mode == Eager ? kernel_pull<1, Eager>
-                                               : kernel_pull<1, Multicast>;
+                                               : kernel_pull<1, EagerMulticast>;
       // then launch kernel to reduce and write to output
       LaunchKernel(num_blocks, choose_block_size(num_vecs), stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
@@ -623,10 +636,11 @@ struct AllReduceKernel {
       // first copy to workspace
       if (!use_graph) cuda_memcpy(local_workspace, in_.data_ptr());
       // then launch kernel to reduce in workspace
-      const auto kernel = (pull_mode == Graph) ? kernel_pull<2, Graph>
-                          : pull_mode == Eager ? kernel_pull<2, Eager>
-                                               : kernel_pull<2, Multicast>;
-      if (pull_mode == Multicast) {
+      const auto kernel = (pull_mode == Graph)          ? kernel_pull<2, Graph>
+                          : pull_mode == Eager          ? kernel_pull<2, Eager>
+                          : pull_mode == EagerMulticast ? kernel_pull<2, EagerMulticast>
+                                                        : kernel_pull<2, GraphMulticast>;
+      if (pull_mode == EagerMulticast || pull_mode == GraphMulticast) {
         const auto max_blocks = data.num_multicast_blocks;
         constexpr uint32_t kMulticastNumThreads = 512u;
         // NOTE: too much traffic will degrade performance in multicast
@@ -645,8 +659,12 @@ struct AllReduceKernel {
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 tvm::ffi::Tensor custom_all_reduce(
-    CommunicatorRef comm, tvm::ffi::Tensor input, std::string algo, std::variant<tvm::ffi::TensorView, bool> pull_arg) {
-  return AllReduceKernel<T, kWorldSize, kUsePDL>::run(comm, input, algo, pull_arg);
+    CommunicatorRef comm,
+    tvm::ffi::Tensor input,
+    std::string algo,
+    std::variant<tvm::ffi::TensorView, bool> pull_arg,
+    bool multicast) {
+  return AllReduceKernel<T, kWorldSize, kUsePDL>::run(comm, input, algo, pull_arg, multicast);
 }
 
 }  // namespace
