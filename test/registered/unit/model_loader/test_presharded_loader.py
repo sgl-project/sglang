@@ -531,7 +531,7 @@ class TestBuildDumpPlan(unittest.TestCase):
             self.assertIn("Rank 0", msg)
             self.assertIn("shared", msg.lower())
 
-    def test_ensure_presharded_dir_writable_rejects_readonly(self):
+    def test_ensure_dir_writable_and_shared_rejects_readonly(self):
         # Guard against spending a full source load before discovering a
         # read-only dump root (HF cache mounts). Mock OSError because root
         # can often still write to mode-0555 dirs under CAP_DAC_OVERRIDE.
@@ -542,20 +542,42 @@ class TestBuildDumpPlan(unittest.TestCase):
             "os.makedirs", side_effect=OSError("Read-only file system")
         ):
             with self.assertRaises(RuntimeError) as ctx:
-                loader._ensure_presharded_dir_writable("/ro/presharded")
+                loader._ensure_dir_writable_and_shared("/ro/presharded")
             self.assertIn("not writable", str(ctx.exception).lower())
             self.assertIn("presharded_path", str(ctx.exception))
 
-    def test_ensure_presharded_dir_writable_ok_rank0(self):
+    def test_ensure_dir_writable_and_shared_ok_rank0(self):
         loader = object.__new__(PreshardedModelLoader)
         with tempfile.TemporaryDirectory() as tmp:
             leaf = os.path.join(tmp, "TP-8-sig-test")
             with mock.patch.object(
                 loader, "_world_rank_and_size", return_value=(0, 1)
-            ), mock.patch.object(loader, "_world_barrier") as barrier:
-                loader._ensure_presharded_dir_writable(leaf)
+            ), mock.patch.object(loader, "_world_barrier"):
+                loader._ensure_dir_writable_and_shared(leaf)
             self.assertTrue(os.path.isdir(leaf))
-            barrier.assert_called_once()
+            # Probe files are cleaned up, not left behind.
+            self.assertEqual(
+                [p for p in os.listdir(leaf) if p.startswith(".presharded_probe")],
+                [],
+            )
+
+    def test_ensure_dir_writable_and_shared_rejects_per_host(self):
+        # Multi-node with a node-local dump dir: rank 1 writes its own probe
+        # fine but never sees rank 0's (different filesystem), so this must
+        # fail fast here, not after every rank has paid for a full weight load.
+        loader = object.__new__(PreshardedModelLoader)
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf = os.path.join(tmp, "TP-8-sig-test")
+            os.makedirs(leaf)  # rank 1's own (empty) node-local copy
+            with mock.patch.object(
+                loader, "_world_rank_and_size", return_value=(1, 2)
+            ), mock.patch.object(loader, "_world_barrier"), mock.patch(
+                "time.sleep"
+            ), self.assertRaises(
+                RuntimeError
+            ) as ctx:
+                loader._ensure_dir_writable_and_shared(leaf)
+        self.assertIn("shared filesystem", str(ctx.exception).lower())
 
 
 class TestStructuralSignature(unittest.TestCase):

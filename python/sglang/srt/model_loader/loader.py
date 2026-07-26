@@ -2003,34 +2003,44 @@ class PreshardedModelLoader(DefaultModelLoader):
             if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
                 attn.bias = conv1d.bias
 
-    def _ensure_presharded_dir_writable(self, presharded_dir: str) -> None:
-        rank, _ = self._world_rank_and_size()
+    def _ensure_dir_writable_and_shared(self, presharded_dir: str) -> None:
+        # Fail before the weight load, not after. Shared matters because dedup
+        # has one rank load a file another rank wrote, so a per-host directory
+        # would otherwise fail only when rank 0 collects manifests.
+        rank, world_size = self._world_rank_and_size()
+        own_probe = os.path.join(presharded_dir, f".presharded_probe_{rank:05d}")
         try:
             os.makedirs(presharded_dir, exist_ok=True)
-            if rank == 0:
-                probe = os.path.join(presharded_dir, ".presharded_write_probe")
-                last_err: Optional[OSError] = None
-                for _ in range(5):
-                    try:
-                        with open(probe, "w") as f:
-                            f.write("ok")
-                        os.unlink(probe)
-                        last_err = None
-                        break
-                    except OSError as e:
-                        last_err = e
-                        os.makedirs(presharded_dir, exist_ok=True)
-                        time.sleep(0.05)
-                if last_err is not None:
-                    raise last_err
+            with open(own_probe, "w") as f:
+                f.write("ok")
         except OSError as e:
             raise RuntimeError(
-                f"Presharded dump directory is not writable: {presharded_dir}. "
-                "Set model_loader_extra_config "
-                '\'{"presharded_path": "..."}\' (or draft_presharded_path for '
-                "the draft model) to a writable shared filesystem path. "
+                f"Presharded dump directory is not writable by rank {rank}: "
+                f"{presharded_dir}. Set model_loader_extra_config "
+                '\'{"presharded_path": "..."}\' (or draft_presharded_path '
+                "for the draft model) to a writable shared filesystem path. "
                 f"Original error: {e}"
             ) from e
+        self._world_barrier()
+
+        if world_size > 1 and rank != 0:
+            rank0_probe = os.path.join(presharded_dir, ".presharded_probe_00000")
+            for _ in range(5):  # retry to absorb NFS metadata latency
+                if os.path.isfile(rank0_probe):
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(
+                    f"Presharded dump directory is not on a shared filesystem: "
+                    f"{presharded_dir}. Rank {rank} cannot see a file written "
+                    "by rank 0; all ranks must dump to one filesystem. Set "
+                    'model_loader_extra_config \'{"presharded_path": "..."}\' '
+                    "(or draft_presharded_path) to shared storage."
+                )
+        self._world_barrier()
+
+        with suppress(OSError):
+            os.unlink(own_probe)
         self._world_barrier()
 
     def _first_time_load_and_dump(
@@ -2040,7 +2050,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         presharded_dir: str,
         shard_config: Dict[str, Any],
     ) -> nn.Module:
-        self._ensure_presharded_dir_writable(presharded_dir)
+        self._ensure_dir_writable_and_shared(presharded_dir)
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
