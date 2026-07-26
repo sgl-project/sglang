@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
@@ -306,15 +307,16 @@ class CompressedTensorsConfig(QuantizationConfig):
                 target_scheme_map[target]["input_activations"] = None
                 if is_activation_quantization_format(quant_format):
                     input_activations = quant_config.get("input_activations")
-                    # The only case where we have activation quant supported
-                    # but no input_activations provided in the config
-                    # should be w8a16fp8 w8a16fp8 can also run for cases where
-                    # there is an input_quant but it is ignored
+                    # When activation quant format is set but no
+                    # input_activations provided: valid for w8a16fp8 (FLOAT
+                    # weights) and pack-quantized without activation quant
+                    # (INT weights, W4A16 style).
                     if not input_activations:
-                        assert (
-                            target_scheme_map[target]["weights"].type
-                            == QuantizationType.FLOAT
-                        )
+                        weight_type = target_scheme_map[target]["weights"].type
+                        if weight_type == QuantizationType.INT:
+                            pass
+                        else:
+                            assert weight_type == QuantizationType.FLOAT
                     else:
                         target_scheme_map[target]["input_activations"] = (
                             QuantizationArgs.model_validate(  # noqa: E501
@@ -363,6 +365,33 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_token
             and weight_quant.symmetric
             and is_dynamic
+        )
+
+    def _is_wint4afp8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        """Detect W4AFP8: packed INT4 weights + 8-bit dynamic per-token activations."""
+        if weight_quant is None or input_quant is None:
+            return False
+        return (
+            self.quant_format == CompressionFormat.pack_quantized.value
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and input_quant.num_bits == 8
+            and input_quant.type in [QuantizationType.FLOAT, QuantizationType.INT]
+            and input_quant.dynamic  # currently not support static input scales
+        )
+
+    def _is_wint4abf16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        """Detect W4A16: packed INT4 weights with no activation quantization (activations stay BF16)."""
+        if weight_quant is None or input_quant is not None:
+            return False
+        return (
+            self.quant_format == CompressionFormat.pack_quantized.value
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
         )
 
     def _is_static_tensor_w8a8(
@@ -721,6 +750,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise NotImplementedError(
                     f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
+        elif self._is_wint4afp8(weight_quant, input_quant):
+            # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.
+            if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
+                logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
+                return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            logger.info_once("Using CompressedTensorsW4AFP8MoE")
+            return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
             if _is_npu:
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")

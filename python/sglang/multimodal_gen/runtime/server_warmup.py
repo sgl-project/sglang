@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     should_include_warmup_image,
+    supports_synthetic_warmup,
 )
 
 logger = init_logger(__name__)
@@ -85,13 +86,19 @@ def is_realtime_serving(server_args: ServerArgs) -> bool:
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return should_run_server_warmup(server_args) and not is_realtime_serving(
-        server_args
+    return (
+        should_run_server_warmup(server_args)
+        and supports_synthetic_warmup(server_args)
+        and not is_realtime_serving(server_args)
     )
 
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.warmup_resolutions is not None
+    return (
+        server_args.warmup
+        and server_args.warmup_resolutions is not None
+        and supports_synthetic_warmup(server_args)
+    )
 
 
 def format_warmup_req(req_or_group: Any) -> str:
@@ -102,9 +109,12 @@ def format_warmup_req(req_or_group: Any) -> str:
     if req is None:
         return prefix
 
-    shape = f"{req.width}x{req.height}"
-    if req.num_frames is not None and req.num_frames > 1:
-        shape += f"x{req.num_frames}f"
+    width = getattr(req, "width", None)
+    height = getattr(req, "height", None)
+    shape = "action" if width is None or height is None else f"{width}x{height}"
+    num_frames = getattr(req, "num_frames", None)
+    if num_frames is not None and num_frames > 1:
+        shape += f"x{num_frames}f"
 
     default_steps = req.extra.get("cache_dit_num_inference_steps")
     if default_steps is not None and default_steps != req.num_inference_steps:

@@ -24,19 +24,24 @@ from sglang.srt.lora.trtllm_lora_temp import (
     get_original_merged_column_forward,
     is_two_stream_active,
     lora_overlap_alloc_stream,
+    supports_two_stream_dense_lora,
 )
 
 
 def merged_column_lora_forward(self, input_: torch.Tensor):
     """O9 — side-stream LoRA-A shrink ‖ base merged-column GEMM."""
-    if not self.set_lora or not is_two_stream_active(input_):
+    if (
+        not self.set_lora
+        or not is_two_stream_active(input_)
+        or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
+    ):
         return get_original_merged_column_forward()(self, input_)
 
-    from sglang.srt.lora.trtllm_lora_temp.triton_ops import (
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.gate_up_lora_b import (
         gate_up_lora_b_fwd,
-        qkv_lora_b_fwd,
-        sgemm_lora_a_fwd,
     )
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.qkv_lora_b import qkv_lora_b_fwd
+    from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import sgemm_lora_a_fwd
 
     bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
     side_stream = get_lora_side_stream()
