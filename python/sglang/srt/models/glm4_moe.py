@@ -478,6 +478,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_shared_ep()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -522,6 +523,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_shared_ep()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -544,6 +546,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_shared_ep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -1194,9 +1197,14 @@ class Glm4MoeForCausalLM(nn.Module):
         ):
             disable_reason = "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_shared_ep()
         ):
-            disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
+            disable_reason = (
+                "GLM-4.5 cannot fuse shared experts with the selected "
+                "expert-parallel A2A backend."
+            )
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
 

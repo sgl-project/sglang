@@ -745,6 +745,7 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    a_is_prequantized: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -757,7 +758,15 @@ def invoke_fused_moe_kernel(
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
-        if block_shape is None:
+        if a_is_prequantized:
+            assert A.dtype == torch.float8_e4m3fn
+            assert A_scale is not None
+            assert block_shape is not None and len(block_shape) == 2
+            block_n, block_k = block_shape
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+        elif block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
@@ -782,6 +791,7 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a8:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
@@ -801,9 +811,11 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16 or use_int4_w4a16:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
+        assert not a_is_prequantized, "prequantized A currently supports FP8 only"
         assert A_scale is None
         assert B_scale is None
 

@@ -88,7 +88,10 @@ def _jit_silu_mul_quant_contig_module(
         make_name("silu_mul_quant_contig"),
         *args,
         cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulContigPostQuantKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"SiluAndMulContigPostQuantKernel<{args}>::run"),
+            ("run_valid", f"SiluAndMulContigPostQuantKernel<{args}>::run_valid"),
+        ],
         extra_cuda_cflags=["-use_fast_math"],
     )
 
@@ -223,15 +226,21 @@ def silu_and_mul_contig_post_quant(
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    valid_rows: Optional[torch.Tensor] = None,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )
-    module.run(
-        input,
-        output,
-        output_scale,
-        transposed,
-        float(swiglu_limit) if apply_swiglu_limit else 0.0,
-    )
+    limit = float(swiglu_limit) if apply_swiglu_limit else 0.0
+    if valid_rows is None:
+        module.run(input, output, output_scale, transposed, limit)
+    else:
+        module.run_valid(
+            input,
+            output,
+            output_scale,
+            valid_rows,
+            transposed,
+            limit,
+        )

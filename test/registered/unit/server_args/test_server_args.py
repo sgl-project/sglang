@@ -18,6 +18,9 @@ from sglang.srt.entrypoints.sidecar import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
+from sglang.srt.layers.moe.shared_ep.admission import (
+    validate_shared_ep_server_args,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -1857,6 +1860,110 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestSharedEpConstraints(CustomTestCase):
+    def _args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.moe_a2a_backend = "shared_ep"
+        args.moe_runner_backend = "deep_gemm"
+        args.tp_size = 8
+        args.dp_size = 8
+        args.enable_dp_attention = True
+        args.enable_lora = False
+        args.lora_paths = None
+        args.enable_two_batch_overlap = False
+        args.enable_single_batch_overlap = False
+        args.speculative_algorithm = None
+        args.speculative_moe_a2a_backend = None
+        args.speculative_moe_runner_backend = None
+        args.speculative_num_steps = None
+        args.speculative_eagle_topk = None
+        args.speculative_num_draft_tokens = None
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(
+                backend=Backend.FULL, max_bs=32, bs=[1, 2, 4, 8, 16, 32]
+            ),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_release_decode_capacity_is_admitted(self):
+        validate_shared_ep_server_args(self._args())
+
+    def test_release_requires_dp8_with_dp_attention(self):
+        for overrides, pattern in (
+            ({"dp_size": 4}, "DP8"),
+            ({"enable_dp_attention": False}, "enable-dp-attention"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    validate_shared_ep_server_args(self._args(**overrides))
+
+    def test_release_rejects_lora(self):
+        for overrides in (
+            {"enable_lora": True},
+            {"lora_paths": ["adapter"]},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "LoRA"):
+                    validate_shared_ep_server_args(self._args(**overrides))
+
+    def test_auto_target_runner_resolves_to_deep_gemm(self):
+        args = self._args(moe_runner_backend="auto")
+
+        validate_shared_ep_server_args(args)
+
+        self.assertEqual(args.moe_runner_backend, "deep_gemm")
+
+    def test_conflicting_target_runner_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend deep_gemm"):
+            validate_shared_ep_server_args(self._args(moe_runner_backend="triton"))
+
+    def test_overlap_is_rejected(self):
+        for field in ("enable_two_batch_overlap", "enable_single_batch_overlap"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    validate_shared_ep_server_args(self._args(**{field: True}))
+
+    def test_speculative_decoding_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "does not support speculative"):
+            validate_shared_ep_server_args(
+                self._args(
+                    speculative_algorithm="EAGLE",
+                )
+            )
+
+    def test_oversized_decode_cuda_graph_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "32"):
+            validate_shared_ep_server_args(
+                self._args(
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(
+                            backend=Backend.FULL,
+                            max_bs=64,
+                            bs=[1, 32, 64],
+                        ),
+                        prefill=PhaseConfig(backend=Backend.DISABLED),
+                    )
+                )
+            )
+
+    def test_disabled_decode_cuda_graph_ignores_capture_size(self):
+        validate_shared_ep_server_args(
+            self._args(
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(
+                        backend=Backend.DISABLED,
+                        max_bs=64,
+                        bs=[64],
+                    ),
+                    prefill=PhaseConfig(backend=Backend.DISABLED),
+                )
+            )
+        )
 
 
 if __name__ == "__main__":
