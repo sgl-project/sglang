@@ -34,6 +34,8 @@ except ImportError as e:
 
 
 if TYPE_CHECKING:
+    from lmcache.v1.multiprocess.futures import MessagingFuture
+
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -167,6 +169,11 @@ class LMCRadixCache(RadixCache):
             kvcache.register_layer_transfer_counter(self.layer_done_executor)
 
         self._in_flight_nodes: list[TreeNode] = []
+        # MP stores complete via a per-request daemon future rather than the
+        # shared store_stream, so they need their own in-flight list carrying
+        # (node, future, request_id). request_id rides along because the
+        # deferred reconcile also owes end_session for that request.
+        self._in_flight_mp_stores: list[tuple[TreeNode, MessagingFuture, str]] = []
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
@@ -175,6 +182,7 @@ class LMCRadixCache(RadixCache):
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
                 self._in_flight_nodes.clear()
+                self._in_flight_mp_stores.clear()
         if hasattr(self, "_mp_load_back_markers"):
             self._mp_load_back_markers.clear()
 
@@ -478,11 +486,13 @@ class LMCRadixCache(RadixCache):
             request_id=req.rid,
         )
         if self._mode is LMCacheMode.MP:
-            self.lmcache_connector.store_kv(store_md)
-            # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
-            self._mp_load_back_markers.pop(req.rid, None)
-            self.dec_lock_ref(new_last_node)
-            self.lmcache_connector.end_session(req.rid)
+            # The daemon copies out of these slots in another process; defer the
+            # unlock to evict()'s reconcile so the node stays pinned until the
+            # copy lands. Nothing downstream consumes the store result, so there
+            # is no reason to block the scheduler on it here.
+            future = self.lmcache_connector.store_kv_async(store_md)
+            with self._node_lock:
+                self._in_flight_mp_stores.append((new_last_node, future, req.rid))
         elif self._mode is LMCacheMode.IP:
             with device_stream_context(self.store_stream):
                 self.lmcache_connector.store_kv(store_md)
@@ -490,16 +500,45 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
 
+    def _reconcile_mp_stores(self) -> None:
+        """Settle the MP stores submitted since the last reconcile.
+
+        Waits on each daemon future, then unpins the node so its KV slots
+        become evictable again. A failed store is logged rather than raised:
+        this runs on the eviction path, where raising would turn a
+        recoverable cache-tier failure into a serving outage. The unpin
+        happens regardless of outcome -- skipping it would pin those slots
+        for the lifetime of the process, precisely when memory is scarce.
+        """
+        with self._node_lock:
+            in_flight = self._in_flight_mp_stores
+            self._in_flight_mp_stores = []
+
+        for node, future, rid in in_flight:
+            try:
+                if not future.result():
+                    logger.error("LMCache MP store failed for request %s", rid)
+            except Exception:
+                logger.exception("LMCache MP store errored for request %s", rid)
+            finally:
+                self.dec_lock_ref(node)
+                self._mp_load_back_markers.pop(rid, None)
+                self.lmcache_connector.end_session(rid)
+
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
         if self.disable:
             return EvictResult()
 
+        # IP: the store stream signals completion for every queued store.
         self.store_stream.synchronize()
         with self._node_lock:
             for node in self._in_flight_nodes:
                 self.dec_lock_ref(node)
             self._in_flight_nodes.clear()
+
+        # MP: each store carries its own daemon future.
+        self._reconcile_mp_stores()
 
         return super().evict(params)
 
