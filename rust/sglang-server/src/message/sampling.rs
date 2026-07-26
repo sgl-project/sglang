@@ -681,20 +681,166 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
+    /// The scheduler decodes this map with msgspec, which **silently drops**
+    /// unknown keys — so a field renamed on one side only is invisible at runtime:
+    /// the request succeeds with that sampling param quietly not applied. That is
+    /// the drift this file's header warns about, so pin the key vocabulary; a
+    /// rename or addition then has to be a deliberate edit here too.
+    ///
+    /// The two sets are separate because the `Option` fields are
+    /// `skip_serializing_if`: absent from a default request, present once set.
+    /// Both must stay in sync with `sampling_params.py` (30 fields there).
+    #[test]
+    fn serialized_key_set_is_pinned() {
+        /// Always on the wire: every non-`Option` field.
+        const ALWAYS: &[&str] = &[
+            "frequency_penalty",
+            "ignore_eos",
+            "is_normalized",
+            "max_new_tokens",
+            "min_new_tokens",
+            "min_p",
+            "n",
+            "no_stop_trim",
+            "presence_penalty",
+            "repetition_penalty",
+            "skip_special_tokens",
+            "spaces_between_special_tokens",
+            "stop_regex_max_len",
+            "stop_regex_strs",
+            "stop_str_max_len",
+            "stop_strs",
+            "temperature",
+            "top_k",
+            "top_p",
+        ];
+        /// Emitted only when set (`skip_serializing_if = "Option::is_none"`).
+        const OPTIONAL: &[&str] = &[
+            "custom_params",
+            "ebnf",
+            "json_schema",
+            "logit_bias",
+            "regex",
+            "sampling_seed",
+            "stop",
+            "stop_regex",
+            "stop_token_ids",
+            "stream_interval",
+            "structural_tag",
+        ];
+
+        let keys = |sp: &SamplingParams| -> Vec<String> {
+            let v = wire(sp);
+            let mut k: Vec<String> = v.as_object().expect("a map").keys().cloned().collect();
+            k.sort();
+            k
+        };
+
+        assert_eq!(
+            keys(&SamplingParams::default()),
+            ALWAYS,
+            "unset key set drifted"
+        );
+
+        // Every optional populated. Parsed, not normalized: `normalize` moves the
+        // `stop`/`stop_regex` aliases into `stop_strs`/`stop_regex_strs` and clears
+        // them, so a normalized request never carries all 30 at once.
+        let full: SamplingParams = serde_json::from_str(
+            r#"{
+                "stop": "x", "stop_token_ids": [1], "stop_regex": "y",
+                "json_schema": "{}", "regex": "a", "ebnf": "b", "structural_tag": "t",
+                "custom_params": {"k": 1}, "stream_interval": 2,
+                "logit_bias": {"3": 1.0}, "sampling_seed": 4
+            }"#,
+        )
+        .expect("parses");
+        let mut expected: Vec<&str> = ALWAYS.iter().chain(OPTIONAL).copied().collect();
+        expected.sort();
+        assert_eq!(keys(&full), expected, "populated key set drifted");
+        assert_eq!(expected.len(), 30, "sampling_params.py declares 30 fields");
+    }
+
+    /// Each range check rejects, and rejects for the *stated* reason — the message
+    /// must name the offending field, so a mis-ordered or copy-pasted check (e.g.
+    /// `presence_penalty` guarded by the `frequency_penalty` bound) can't pass by
+    /// merely erroring.
     #[test]
     fn verify_rejects_out_of_range() {
-        for json in [
-            r#"{"top_p": 2.0}"#,
-            r#"{"top_k": 0, "temperature": 0.7}"#,
-            r#"{"min_p": 1.5}"#,
-            r#"{"frequency_penalty": 3.0}"#,
-            r#"{"presence_penalty": -3.0}"#,
-            r#"{"repetition_penalty": 0.0}"#,
-            r#"{"max_new_tokens": 8, "min_new_tokens": 9}"#,
-            r#"{"regex": "a", "ebnf": "b"}"#,
-            r#"{"n": 2}"#,
+        for (json, want) in [
+            (r#"{"top_p": 2.0}"#, "top_p"),
+            (r#"{"top_k": 0, "temperature": 0.7}"#, "top_k"),
+            (r#"{"min_p": 1.5}"#, "min_p"),
+            (r#"{"frequency_penalty": 3.0}"#, "frequency_penalty"),
+            (r#"{"presence_penalty": -3.0}"#, "presence_penalty"),
+            (r#"{"repetition_penalty": 0.0}"#, "repetition_penalty"),
+            (
+                r#"{"max_new_tokens": 8, "min_new_tokens": 9}"#,
+                "min_new_tokens",
+            ),
+            (r#"{"temperature": -0.1}"#, "temperature"),
+            (r#"{"max_new_tokens": -1}"#, "max_new_tokens"),
+            (r#"{"regex": "a", "ebnf": "b"}"#, "Only one of"),
+            (r#"{"n": 2}"#, "n must be 1"),
         ] {
-            let _ = norm_err(json);
+            let err = norm_err(json).to_string();
+            assert!(
+                err.contains(want),
+                "{json} must be rejected for {want}: {err}"
+            );
+        }
+    }
+
+    /// The inclusive bounds must ACCEPT their endpoints. Only the rejecting side
+    /// was covered, and far from the edge (`frequency_penalty: 3.0`), so flipping
+    /// any `..=` to `..` — or `>= 1` to `> 1` — would 400 legitimate requests
+    /// without failing a single test.
+    #[test]
+    fn verify_accepts_inclusive_boundaries() {
+        for json in [
+            r#"{"top_p": 1.0, "temperature": 0.7}"#,
+            r#"{"min_p": 0.0, "temperature": 0.7}"#,
+            r#"{"min_p": 1.0, "temperature": 0.7}"#,
+            r#"{"top_k": 1, "temperature": 0.7}"#,
+            r#"{"frequency_penalty": 2.0}"#,
+            r#"{"frequency_penalty": -2.0}"#,
+            r#"{"presence_penalty": 2.0}"#,
+            r#"{"presence_penalty": -2.0}"#,
+            r#"{"repetition_penalty": 2.0}"#,
+            r#"{"max_new_tokens": 0}"#,
+            r#"{"min_new_tokens": 0}"#,
+            // min == max is in range: `[0, max_new_tokens]` is inclusive.
+            r#"{"max_new_tokens": 8, "min_new_tokens": 8}"#,
+            // Greedy: temperature 0 is the documented sentinel, not an under-run.
+            r#"{"temperature": 0.0}"#,
+            r#"{"n": 1}"#,
+        ] {
+            let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
+            sp.normalize(false, None)
+                .unwrap_or_else(|e| panic!("{json} is in range but was rejected: {e}"));
+        }
+    }
+
+    /// And the first value past each endpoint is still rejected — the pair of
+    /// tests brackets the boundary instead of testing one side of it.
+    #[test]
+    fn verify_rejects_just_past_the_boundaries() {
+        for json in [
+            r#"{"top_p": 0.0, "temperature": 0.7}"#, // exclusive lower bound
+            r#"{"repetition_penalty": 0.0}"#,        // exclusive lower bound
+            r#"{"top_k": 0, "temperature": 0.7}"#,
+            r#"{"min_p": 1.0000001, "temperature": 0.7}"#,
+            r#"{"frequency_penalty": 2.0000001}"#,
+            r#"{"presence_penalty": -2.0000001}"#,
+            r#"{"repetition_penalty": 2.0000001}"#,
+            r#"{"max_new_tokens": -1}"#,
+            r#"{"min_new_tokens": -1}"#,
+            r#"{"max_new_tokens": 8, "min_new_tokens": 9}"#,
+        ] {
+            let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
+            assert!(
+                sp.normalize(false, None).is_err(),
+                "{json} is out of range but was accepted"
+            );
         }
     }
 
