@@ -41,6 +41,9 @@ class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
 class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     """EAGLE3 parity on XPU (triton, no overlap, deterministic)."""
 
+    # 8B target OOMs the 11.9GiB B580; use the matched Llama-3.2-1B EAGLE3 pair.
+    model = "meta-llama/Llama-3.2-1B-Instruct"
+    draft_model = "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct"
     disable_overlap = False
     attention_backend = "triton"
     # Decode full-graph was active by default when this test was added
