@@ -58,7 +58,7 @@ img_item = next(i for i in out.mm_items if i.modality.name == "IMAGE")
 aud_item = next(i for i in out.mm_items if i.modality.name == "AUDIO")
 # The rust image path stores its raw-bytes content hash (blake3) eagerly;
 # non-rust items get hashed lazily from the feature at set_pad_value time.
-assert img_item.hash == _rs_common.data_hash(img), "image hash != rust data_hash"
+assert img_item.hash == _rs_common.content_hash(img), "image hash != rust content_hash"
 assert aud_item.hash is None, "audio hash expected to be lazy (feature-based)"
 print(f"  assemble: image hash={img_item.hash:#x} OK")
 

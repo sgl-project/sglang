@@ -1,7 +1,8 @@
 """Qwen placeholder expansion, offsets, and M-RoPE parity.
 
-Covers ``expand_placeholders`` in ``rust/sglang-mm/src/common/tokens.rs`` and
-``mrope_image_only`` in ``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
+Covers ``layout_by_placeholder`` / ``apply_layout`` in
+``rust/sglang-mm/src/common/token_layout.rs`` and ``mrope_image_only`` in
+``rust/sglang-mm/src/qwen_vl/mod.rs`` (via the
 ``_core.qwen_vl.process_native_mm`` and ``mrope_image_only_py``
 bindings), against ``BaseMultimodalProcessor`` expansion/offsets and
 ``MRotaryEmbedding.get_rope_index``.
@@ -18,7 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _utils import (  # noqa: E402
+from _mm_rust_utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
     PROCESSOR_CONFIGS,
     VIDEO_TOKEN_ID,

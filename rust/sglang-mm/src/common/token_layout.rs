@@ -15,10 +15,17 @@ pub struct ExpandedPrompt {
     pub offsets: Vec<(u32, u32)>,
 }
 
-/// Apply a family's [`TokenLayout`] to the original prompt. Validates that
-/// text ranges are in bounds, that every one of the `n_items` media items is
-/// placed exactly once, and that no item expands to zero tokens (which would
-/// have no representable offset).
+/// Apply a family's [`TokenLayout`] to the original prompt.
+///
+/// The point of the layout being data is that a family cannot get expansion,
+/// offsets, and positions out of sync, so this validates the whole contract
+/// rather than just indexing safely:
+/// * text ranges are in bounds, ascending, and non-overlapping;
+/// * together with the media placeholders they cover every source token
+///   exactly once — a family that forgets a tail segment must not silently
+///   truncate the prompt;
+/// * every one of the `n_items` media items is placed exactly once;
+/// * no item expands to zero tokens (which would have no representable offset).
 pub fn apply_layout(
     src: &[i32],
     layout: &TokenLayout,
@@ -26,15 +33,30 @@ pub fn apply_layout(
 ) -> Result<ExpandedPrompt, String> {
     let mut out = Vec::new();
     let mut offsets: Vec<Option<(u32, u32)>> = vec![None; n_items];
+    // Source tokens consumed so far: `Text` copies them, a `Media` segment
+    // replaces exactly the one placeholder token sitting at this position.
+    let mut consumed = 0usize;
     for segment in &layout.segments {
         match segment {
             Segment::Text(range) => {
                 let text = src
                     .get(range.clone())
                     .ok_or_else(|| format!("layout: text range {range:?} out of bounds"))?;
+                if range.start != consumed {
+                    return Err(format!(
+                        "layout: text range {range:?} does not resume at source index {consumed}"
+                    ));
+                }
+                consumed = range.end;
                 out.extend_from_slice(text);
             }
             Segment::Media { item, pattern } => {
+                if consumed >= src.len() {
+                    return Err(format!(
+                        "layout: media item {item} has no source placeholder at index {consumed}"
+                    ));
+                }
+                consumed += 1;
                 let start = out.len() as u32;
                 let n = match pattern {
                     TokenPattern::Repeat { id, n } => {
@@ -57,6 +79,12 @@ pub fn apply_layout(
                 }
             }
         }
+    }
+    if consumed != src.len() {
+        return Err(format!(
+            "layout: covers {consumed} of {} source token(s)",
+            src.len()
+        ));
     }
     let offsets = offsets
         .into_iter()
@@ -173,5 +201,39 @@ mod tests {
             segments: vec![Segment::Text(0..4)],
         };
         assert!(apply_layout(&[7, 1, 9], &out_of_bounds, 0).is_err());
+    }
+
+    /// A family that skips, repeats, or reorders source tokens would silently
+    /// serve a truncated or scrambled prompt; the layout must reject it instead.
+    #[test]
+    fn incomplete_or_disordered_coverage_errs() {
+        let media = || Segment::Media {
+            item: 0,
+            pattern: TokenPattern::Repeat { id: 5, n: 2 },
+        };
+        let cases = [
+            // Dropped tail: [7, PAD, 9] expanded without the trailing 9.
+            vec![Segment::Text(0..1), media()],
+            // Dropped head.
+            vec![media(), Segment::Text(2..3)],
+            // Gap in the middle (source index 1 never consumed).
+            vec![Segment::Text(0..1), Segment::Text(2..3), media()],
+            // Duplicated source span.
+            vec![
+                Segment::Text(0..1),
+                Segment::Text(0..1),
+                media(),
+                Segment::Text(2..3),
+            ],
+            // Out of order.
+            vec![Segment::Text(2..3), media(), Segment::Text(0..1)],
+        ];
+        for (i, segments) in cases.into_iter().enumerate() {
+            let layout = TokenLayout { segments };
+            assert!(
+                apply_layout(&[7, 1, 9], &layout, 1).is_err(),
+                "case {i} should be rejected"
+            );
+        }
     }
 }

@@ -200,10 +200,6 @@ pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: u
     resize_rgb_filter(src, h, w, out_h, out_w, Filter::Lanczos)
 }
 
-pub fn resize_bicubic_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
-    resize_rgb_filter(src, h, w, out_h, out_w, Filter::Bicubic)
-}
-
 pub fn scaled_dims(w: usize, h: usize, frac: Option<f64>, cap: Option<i64>) -> (usize, usize) {
     let Some(frac) = frac else {
         return (w, h);

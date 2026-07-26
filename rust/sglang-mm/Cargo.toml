@@ -8,9 +8,12 @@ license.workspace = true
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module
 # of the main sglang wheel at the given import path. debug = false keeps
 # editable installs on release builds (image preprocessing is perf-sensitive).
+# features: the wheel build needs the PyO3 bindings, which are NOT default (see
+# [features] below).
 [package.metadata.sglang]
 python-module = "sglang.srt.multimodal._core"
 debug = false
+features = ["python"]
 
 [lib]
 # Unique per-crate artifact name (the shared workspace target/ dir cannot hold
@@ -23,10 +26,14 @@ name = "sglang_mm_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# `python` gates every PyO3 binding. sglang-server links the pure-Rust core
-# with `default-features = false` so pyo3's extension-module linker config
-# never leaks into the server's own dependency graph.
-default = ["python"]
+# `python` gates every PyO3 binding, and is deliberately NOT default: cargo
+# unifies a package's features across everything selected in one invocation,
+# so a default-on `python` would leak pyo3 back into sglang-server's copy of
+# this crate under `cargo build --workspace` even though the server depends on
+# it with `default-features = false`. Opting in explicitly keeps the pure-Rust
+# core pure no matter how the workspace is built; the wheel asks for it via
+# `[package.metadata.sglang] features` above.
+default = []
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]

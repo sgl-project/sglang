@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _utils import (  # noqa: E402
+from _mm_rust_utils import (  # noqa: E402
     IMAGE_TOKEN_ID,
     PROCESSOR_CONFIGS,
     VISION_END_ID,
@@ -51,9 +51,23 @@ def gif_bytes():
     "sglang-mm native Qwen driver not built",
 )
 class TestNativeDriverErrorPaths(CustomTestCase):
-    def assert_rejected(self, input_ids, images, pattern):
+    def assert_rejected(self, input_ids, images, pattern, spec=SPEC):
         with self.assertRaisesRegex(ValueError, pattern):
-            QWEN_CORE.process_native_mm(input_ids, images, SPEC)
+            QWEN_CORE.process_native_mm(input_ids, images, spec)
+
+    def test_degenerate_geometry_rejected_not_panicked(self):
+        """A thin image against a tight ``max_pixels`` floors a side of the
+        smart_resize target to 0. That used to panic on a worker thread inside
+        the resize coefficient math; a Rust panic surfaces as ``PanicException``
+        (a ``BaseException``), not ``ValueError``, so this asserts the request
+        is rejected cleanly rather than crashing the pipeline."""
+        config = dict(PROCESSOR_CONFIGS["qwen2_5_vl"], min_pixels=3136, max_pixels=3136)
+        self.assert_rejected(
+            IMAGE_IDS,
+            [image_bytes(2000, 10)],
+            "smart_resize",
+            spec=spec_json(config),
+        )
 
     def test_placeholder_count_mismatches_rejected(self):
         cases = {

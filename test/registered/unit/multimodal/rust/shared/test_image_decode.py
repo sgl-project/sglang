@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _utils import load_core  # noqa: E402
+from _mm_rust_utils import load_core  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

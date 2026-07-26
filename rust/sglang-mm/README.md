@@ -6,11 +6,12 @@ GIL-released.
 
 Built two ways:
 
-- **PyO3 extension** `sglang.srt.multimodal._core` (feature `python`, default)
-  via setuptools-rust when installing sglang — used by Python processors and
-  parity tests.
-- **Pure-Rust `rlib`** (`default-features = false`) linked by `sglang-server`'s
-  MM worker path — no pyo3 in that dependency graph.
+- **PyO3 extension** `sglang.srt.multimodal._core` (feature `python`, requested
+  by the wheel build) via setuptools-rust when installing sglang — used by
+  Python processors and parity tests.
+- **Pure-Rust `rlib`** (default features, i.e. no `python`) linked by
+  `sglang-server`'s MM worker path — that copy of the crate needs no pyo3 and
+  no libpython.
 
 ## Architecture
 
@@ -27,7 +28,7 @@ src/
 │   ├── mod.rs                # thread pool, image decode, content hash, base64
 │   ├── fetch.rs              # media source → bytes (data:/base64/file/http)
 │   ├── resize.rs             # PIL-exact Lanczos + Bicubic resize
-│   ├── tokens.rs             # TokenLayout mechanics (apply_layout + helpers)
+│   ├── token_layout.rs       # TokenLayout mechanics (apply_layout + helpers)
 │   └── transforms.rs         # reusable primitives: normalize, pad, extract_patches
 └── <model>/
     └── mod.rs                # model-specific processor (inkling, qwen_vl, ...)
@@ -100,9 +101,9 @@ Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 `family` arm in `pipeline_from_spec`.
 
 `common::fetch` matches the Python `get_image_bytes` semantics
-(`REQUEST_TIMEOUT` env, proxy env vars) with two deliberate differences:
-HTTP downloads are capped at 64 MiB, and `NO_PROXY` is not honored (ureq
-limitation).
+(`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`) with two
+deliberate differences: HTTP downloads are capped at 64 MiB, and `file://` URLs
+actually work (the Python helper passes the un-stripped URL to `open()`).
 
 ## Python API
 
@@ -113,7 +114,8 @@ from sglang.srt.multimodal._core import common, inkling
 common.resize_rgb(arr, out_w, out_h)
 common.scaled_dims(w, h, rescale_frac, rescale_cap)
 common.image_decode_rgb(bytes)          # -> (h, w, ndarray)
-common.data_hash(bytes)                 # -> u64 SHA256
+common.content_hash(bytes)              # -> u64 (blake3, truncated)
+common.fetch_bytes(source)              # -> bytes (data:/base64/file/http)
 common.base64_decode(str)               # -> bytes
 
 # Model-specific
@@ -148,7 +150,7 @@ impl ImageProcessorSpec for MyModelProcessor {
     ) -> Result<Vec<(usize, usize, Vec<u16>, u64)>, String> {
         common::pool().install(|| {
             datas.par_iter().map(|data| {
-                let hash = common::sha256_u64(data);
+                let hash = common::content_hash_u64(data);
                 let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
                 // Use common::transforms::* or model-specific logic
                 let patches = my_patchify(&rgb, h, w, patch_size);
@@ -178,9 +180,15 @@ impl ImageProcessorSpec for MyModelProcessor {
 
 ## Design notes
 
-- Thread pool capped at `min(8, cores)`. Override: `SGL_MM_RS_THREADS`.
-- PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB.
-- Lanczos resize is a bit-exact clone of PIL's fixed-point implementation.
+- CPU pool capped at `min(8, cores)`. Override: `SGL_MM_RS_THREADS`. Blocking
+  media fetch runs on a separate 16-thread I/O pool so slow URLs cannot starve
+  preprocessing.
+- PNG decode is bit-exact vs PIL; JPEG may differ by ±1 LSB. Samples deeper
+  than 8 bits are rejected rather than rescaled (PIL clips instead).
+- Lanczos and Bicubic resize are bit-exact clones of PIL's fixed-point
+  implementations.
+- `common::content_hash_u64` is blake3, *not* Python's SHA-256
+  `mm_utils.data_hash`. Hashes are consistent within one path only.
 
 ## Build
 
@@ -189,11 +197,12 @@ Automatically built when installing sglang:
 pip install -e "python"
 ```
 
-Or standalone for development:
+Or standalone for development (the PyO3 bindings are behind a non-default
+feature — see `[features]` in `Cargo.toml` for why):
 ```bash
 cd rust/sglang-mm
 pip install maturin
-maturin develop --release
+maturin develop --release --features python
 ```
 
 ## Test

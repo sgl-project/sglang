@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use crate::common::{self, resize, tokens};
+use crate::common::{self, resize, token_layout};
 use crate::pipeline::{
     DecodedMedia, Geometry, MmFamilyProcessor, PositionOutput, ProcessedItem, Tensor, TensorData,
     TokenLayout,
@@ -141,6 +141,17 @@ impl MmFamilyProcessor for QwenVlProcessor {
             rgb.as_slice()
         };
         let (gh, gw) = (th / self.spec.patch_size, tw / self.spec.patch_size);
+        // `smart_resize` guarantees both: dims are positive and divisible by
+        // `patch_size * merge_size`. `patchify` indexes on that (and the `dim`
+        // division below needs a non-empty grid), so fail loudly rather than
+        // panic if a future spec change breaks the guarantee.
+        if gh == 0 || gw == 0 || gh % self.spec.merge_size != 0 || gw % self.spec.merge_size != 0 {
+            return Err(format!(
+                "qwen_vl: patch grid {gh}x{gw} is empty or not a multiple of \
+                 merge_size {}",
+                self.spec.merge_size
+            ));
+        }
         let pixel_values = self.patchify(data, th, tw);
         let dim = pixel_values.len() / (gh * gw);
         Ok(ProcessedItem {
@@ -164,7 +175,7 @@ impl MmFamilyProcessor for QwenVlProcessor {
             .iter()
             .map(|Geometry::Grid(grid)| self.tokens_per_image(grid))
             .collect::<Vec<_>>();
-        tokens::layout_by_placeholder(input_ids, self.spec.image_token_id, &counts)
+        token_layout::layout_by_placeholder(input_ids, self.spec.image_token_id, &counts)
     }
 
     fn positions(
@@ -226,6 +237,17 @@ pub fn smart_resize(
         let beta = (min_pixels as f64 / (h * w)).sqrt();
         h_bar = ((h * beta / f).ceil() * f) as usize;
         w_bar = ((w * beta / f).ceil() * f) as usize;
+    }
+    // The downscale branch floors without a lower clamp (as Python does), so a
+    // very thin image against a small `max_pixels` can floor a side to 0.
+    // Python then fails inside PIL's resize; here it would reach the resize
+    // coefficient math (overflow panic in debug, garbage in release) and the
+    // `dim = len / (gh * gw)` division, so reject it as a request error.
+    if h_bar == 0 || w_bar == 0 {
+        return Err(format!(
+            "smart_resize: {height}x{width} degenerates to {h_bar}x{w_bar} at \
+             max_pixels={max_pixels}; image is too thin for this pixel budget"
+        ));
     }
     Ok((h_bar, w_bar))
 }
@@ -529,6 +551,40 @@ mod tests {
         assert_eq!(smart_resize(4000, 48, 32, 4, 1 << 30).unwrap(), (4000, 64));
         // Extreme aspect ratio rejected.
         assert!(smart_resize(10000, 10, 28, 3136, 12845056).is_err());
+    }
+
+    /// A thin image against a small `max_pixels` floors one side to 0. That
+    /// used to reach the resize coefficient math and panic on a worker thread
+    /// (`attempt to multiply with overflow`) instead of rejecting the request.
+    #[test]
+    fn degenerate_target_is_rejected_not_panicked() {
+        // Aspect ratio 200 is exactly at MAX_RATIO, so it passes that guard;
+        // 10 / beta then floors to 0 with factor 28.
+        assert!(smart_resize(10, 2000, 28, 3136, 3136).is_err());
+
+        let mut spec = spec();
+        spec.patch_size = 14;
+        spec.min_pixels = 3136;
+        spec.max_pixels = 3136;
+        let proc = QwenVlProcessor::new(spec).unwrap();
+        let err = proc
+            .process_item(&DecodedMedia::Image {
+                rgb: vec![0u8; 10 * 2000 * 3],
+                height: 10,
+                width: 2000,
+            })
+            .err()
+            .expect("degenerate geometry must be an Err, never a panic");
+        assert!(err.contains("smart_resize"), "unexpected error: {err}");
+    }
+
+    /// The server's message layer gates modalities on what a family declares,
+    /// so a family gaining video/audio support must not silently inherit the
+    /// images-only default.
+    #[test]
+    fn qwen_declares_images_only() {
+        let caps = QwenVlProcessor::new(spec()).unwrap().capabilities();
+        assert!(!caps.video && !caps.audio);
     }
 
     #[test]

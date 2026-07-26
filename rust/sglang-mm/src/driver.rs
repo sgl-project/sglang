@@ -7,7 +7,7 @@
 
 use rayon::prelude::*;
 
-use crate::common::{self, fetch, tokens};
+use crate::common::{self, fetch, token_layout};
 use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
 /// One raw image source from the request.
@@ -31,9 +31,9 @@ pub struct MmInput {
 pub struct OutputItem {
     pub feature: crate::pipeline::Tensor,
     pub aux: crate::pipeline::NamedTensors,
-    /// Content hash of the feature tensor bytes — same identity domain as
-    /// the Python path's `hash_feature`, but a different algorithm (blake3
-    /// here vs SHA-256 there): hashes are consistent within the server pipeline,
+    /// [`common::content_hash_u64`] of the feature tensor bytes — the same
+    /// identity role as the Python path's `hash_feature`, but a different
+    /// algorithm, so hashes are consistent within the server pipeline and
     /// never comparable across the two paths.
     pub hash: u64,
 }
@@ -59,20 +59,30 @@ pub fn process(
     if input.images.is_empty() {
         return Err("multimodal request without image sources".into());
     }
-    let processed: Vec<(ProcessedItem, u64)> = common::pool().install(|| {
+    // Stage 1 (blocking I/O) runs on the wide io pool, stages 2-3 (CPU) on the
+    // core-sized pool. Keeping them apart is what stops one request's slow
+    // remote URLs from occupying every worker and stalling everyone else's
+    // decode/resize — the split the Python processors make with
+    // `auto_mm_io_worker_num` vs `auto_mm_processor_worker_num`.
+    let fetched: Vec<std::borrow::Cow<'_, [u8]>> = common::io_pool().install(|| {
         input
             .images
             .par_iter()
-            .map(|source| {
-                let bytes: std::borrow::Cow<'_, [u8]> = match source {
-                    ImageSource::String(source) => fetch::fetch_bytes(source)?.into(),
-                    ImageSource::Bytes(bytes) => bytes.as_slice().into(),
-                };
+            .map(|source| match source {
+                ImageSource::String(source) => Ok(fetch::fetch_bytes(source)?.into()),
+                ImageSource::Bytes(bytes) => Ok(bytes.as_slice().into()),
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    let processed: Vec<(ProcessedItem, u64)> = common::pool().install(|| {
+        fetched
+            .par_iter()
+            .map(|bytes| {
                 // The Python (PIL) path decodes more formats (GIF/WebP/BMP,
                 // 16-bit PNG); those error here and reject the request.
-                let (rgb, height, width) = common::decode_rgb(&bytes)?;
+                let (rgb, height, width) = common::decode_rgb(bytes)?;
                 let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
-                let hash = common::sha256_u64(item.feature.data.as_bytes());
+                let hash = common::content_hash_u64(item.feature.data.as_bytes());
                 Ok((item, hash))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -93,7 +103,7 @@ pub fn process(
         .map(|(item, _)| item.geometry.clone())
         .collect::<Vec<_>>();
     let layout = family.layout(&input_ids, &geometries)?;
-    let expanded = tokens::apply_layout(&input_ids, &layout, processed.len())?;
+    let expanded = token_layout::apply_layout(&input_ids, &layout, processed.len())?;
     let positions = family.positions(expanded.input_ids.len(), &expanded.offsets, &geometries)?;
 
     Ok(Output {

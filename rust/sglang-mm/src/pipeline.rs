@@ -94,7 +94,7 @@ pub enum Segment {
 }
 
 /// Prompt geometry as data: the family *describes* the expansion, the driver
-/// *applies* it (`common::tokens::apply_layout`) — deriving final input ids
+/// *applies* it (`common::token_layout::apply_layout`) — deriving final input ids
 /// and per-item offsets, and validating that every item is placed exactly
 /// once.
 pub struct TokenLayout {

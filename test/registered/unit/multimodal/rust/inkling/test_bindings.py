@@ -3,7 +3,7 @@
 Covers the ``#[pyfunction]``s in ``rust/sglang-mm/src/inkling/mod.rs``
 (``patchify_rgb`` / ``decode_patchify`` / ``decode_patchify_batch`` /
 ``preprocess_images`` / ``rescale_patchify_hash``) plus
-``_core.common.data_hash``.
+``_core.common.content_hash``.
 
 The inkling bindings are otherwise exercised only by the GPU e2e model test;
 this pins the binding surface (signatures, dtypes, cross-binding consistency)
@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from _utils import image_bytes, load_core  # noqa: E402
+from _mm_rust_utils import image_bytes, load_core  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -54,7 +54,7 @@ class TestInklingBindings(CustomTestCase):
         [(ph, pw, pre, phash)] = CORE.inkling.preprocess_images([data], PATCH_SIZE)
         self.assertEqual((ph, pw), (h, w))
         np.testing.assert_array_equal(np.asarray(pre), patches)
-        self.assertEqual(phash, CORE.common.data_hash(data))
+        self.assertEqual(phash, CORE.common.content_hash(data))
 
         rh, rw, rpatches, rhash = CORE.inkling.rescale_patchify_hash(
             arr, data, PATCH_SIZE

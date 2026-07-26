@@ -1,10 +1,13 @@
 pub mod fetch;
 pub mod resize;
-pub mod tokens;
+pub mod token_layout;
 pub mod transforms;
 
 use std::sync::OnceLock;
 
+/// CPU pool: decode, resize, patchify, hash. Sized to cores (capped at 8)
+/// because the work is compute-bound — never run blocking I/O on it, or one
+/// request's remote fetches stall every other request's preprocessing.
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -21,7 +24,26 @@ pub fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-pub fn sha256_u64(data: &[u8]) -> u64 {
+/// Blocking-I/O pool for media source loading, kept separate from [`pool`] so
+/// a request full of slow URLs cannot starve CPU preprocessing. The width
+/// mirrors the Python processors' `auto_mm_io_worker_num = 16` (threads here
+/// are parked on sockets, not cores).
+pub fn io_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .thread_name(|i| format!("sgl-mm-io-{i}"))
+            .build()
+            .expect("failed to build rayon io pool")
+    })
+}
+
+/// Content hash for cache/dedup identity: blake3 truncated to its first 8
+/// bytes, big-endian. Deliberately *not* Python's `mm_utils.data_hash` (which
+/// is SHA-256 truncated the same way) — hashes are consistent within a path,
+/// never comparable across the Rust and Python paths.
+pub fn content_hash_u64(data: &[u8]) -> u64 {
     let digest = blake3::hash(data);
     u64::from_be_bytes(digest.as_bytes()[..8].try_into().unwrap())
 }
@@ -116,9 +138,11 @@ mod python {
         Ok((h, w, rgb.into_pyarray(py)))
     }
 
+    /// Named `content_hash`, not `data_hash`, so it is not mistaken for
+    /// `sglang.srt.managers.mm_utils.data_hash` (SHA-256); this is blake3.
     #[pyfunction]
-    pub fn data_hash(py: Python<'_>, data: Vec<u8>) -> u64 {
-        py.detach(move || super::sha256_u64(&data))
+    pub fn content_hash(py: Python<'_>, data: Vec<u8>) -> u64 {
+        py.detach(move || super::content_hash_u64(&data))
     }
 
     #[pyfunction]
@@ -150,7 +174,7 @@ mod python {
         m.add_function(wrap_pyfunction!(resize_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(scaled_dims, &m)?)?;
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
-        m.add_function(wrap_pyfunction!(data_hash, &m)?)?;
+        m.add_function(wrap_pyfunction!(content_hash, &m)?)?;
         m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
         m.add_function(wrap_pyfunction!(base64_decode, &m)?)?;
         parent.add_submodule(&m)?;

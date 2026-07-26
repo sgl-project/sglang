@@ -112,7 +112,7 @@ impl crate::registry::ImageProcessorSpec for InklingProcessor {
             datas
                 .par_iter()
                 .map(|data| {
-                    let hash = common::sha256_u64(data);
+                    let hash = common::content_hash_u64(data);
                     let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
                     Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
                 })
@@ -239,7 +239,7 @@ mod python {
                 datas
                     .par_iter()
                     .map(|data| {
-                        let hash = common::sha256_u64(data);
+                        let hash = common::content_hash_u64(data);
                         let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
                         Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
                     })
@@ -273,7 +273,7 @@ mod python {
                 "expected HWC RGB array with 3 channels, got {c}"
             )));
         }
-        let hash = common::sha256_u64(raw_bytes);
+        let hash = common::content_hash_u64(raw_bytes);
         let rgb = arr
             .as_slice()
             .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
