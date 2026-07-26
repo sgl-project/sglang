@@ -17,11 +17,22 @@
 #      the devbox had it applied manually)
 #   3. adds the configs.cuh CPU/cycle timeout bump (cross-node init headroom)
 #
-# Idempotent (grep/count-guarded). Default arch = GB300 sm_103a.
+# Idempotent (grep/count-guarded). The default wheel contains native cubins for
+# Hopper sm_90, B200 sm_100a, and GB300 sm_103a.
 set -euo pipefail
-: "${TORCH_CUDA_ARCH_LIST:=10.3a}"
+: "${TORCH_CUDA_ARCH_LIST:=9.0;10.0a;10.3a}"
 DEEPEP_DIR="${DEEPEP_DIR:-/sgl-workspace/DeepEP}"
 DEEPEP_COMMIT="${DEEPEP_COMMIT:-d28bd676c2120573c9f1425f0c16c39faa4117e6}"
+
+# PyTorch accepts CUDA architecture lists separated by spaces or semicolons.
+read -r -a CUDA_ARCHES <<< "${TORCH_CUDA_ARCH_LIST//;/ }"
+[ "${#CUDA_ARCHES[@]}" -gt 0 ] || { echo "ERROR: TORCH_CUDA_ARCH_LIST is empty"; exit 1; }
+for CUDA_ARCH in "${CUDA_ARCHES[@]}"; do
+  [[ "$CUDA_ARCH" =~ ^[0-9]+\.[0-9]+a?$ ]] || {
+    echo "ERROR: unsupported CUDA architecture '$CUDA_ARCH' in TORCH_CUDA_ARCH_LIST='$TORCH_CUDA_ARCH_LIST'"
+    exit 1
+  }
+done
 
 # The base image is expected to ship the DeepEP source here; clone-pin if not.
 if [ ! -d "$DEEPEP_DIR/csrc" ]; then
@@ -132,8 +143,18 @@ rm -rf build dist
 TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" python3 setup.py bdist_wheel
 pip install dist/*.whl --force-reinstall --no-deps
 
-echo "== verify installed cubin arch"
+echo "== verify installed cubin arches"
 SO=$(find /usr/local/lib/python3*/dist-packages -maxdepth 1 -name "deep_ep_cpp*.so" | head -1)
-SM="sm_${TORCH_CUDA_ARCH_LIST%a}"; SM="${SM/./}"
-cuobjdump --list-elf "$SO" | grep -q "$SM" || { echo "ERROR: cubin arch $SM not found in $SO"; cuobjdump --list-elf "$SO" | head; exit 1; }
-echo "== OK: DeepEP rebuilt (topk16 + hidden3584 + SourceMeta align + cccl) for $SM"
+[ -n "$SO" ] || { echo "ERROR: installed deep_ep_cpp shared object not found"; exit 1; }
+CUBIN_LIST=$(cuobjdump --list-elf "$SO")
+VERIFIED_SMS=()
+for CUDA_ARCH in "${CUDA_ARCHES[@]}"; do
+  SM="sm_${CUDA_ARCH/./}"
+  grep -Eq "(^|[^[:alnum:]_])${SM}([^[:alnum:]_]|$)" <<< "$CUBIN_LIST" || {
+    echo "ERROR: cubin arch $SM not found in $SO"
+    printf '%s\n' "$CUBIN_LIST" | head
+    exit 1
+  }
+  VERIFIED_SMS+=("$SM")
+done
+echo "== OK: DeepEP rebuilt (topk16 + hidden3584 + SourceMeta align + cccl) for ${VERIFIED_SMS[*]}"
