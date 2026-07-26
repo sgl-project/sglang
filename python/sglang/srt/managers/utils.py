@@ -402,8 +402,13 @@ def recompute_stop_regex_max_len(obj: Any) -> None:
         return
     try:
         obj.sampling_params.recompute_stop_regex_max_len()
-    except re.error as e:
-        raise MsgpackDecodeError(obj.rid, f"invalid stop_regex: {e}") from e
+    except (re.error, RecursionError) as e:
+        # RecursionError, not just re.error: both the compile and the length walk
+        # recurse per nesting level, so a deeply nested pattern (`"("*2000 + "a" +
+        # `")"*2000`, ~4 KB) blows the stack instead of raising a regex error. It
+        # is not an `re.error`, so it would escape this guard, unwind out of
+        # `RustServer.drain`, and take down the scheduler's receive loop.
+        raise MsgpackDecodeError(obj.rid, f"invalid stop_regex: {e!r}") from e
 
 
 def compute_num_reserved_tokens(server_args: ServerArgs) -> int:

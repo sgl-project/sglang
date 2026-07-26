@@ -191,18 +191,26 @@ pub struct SamplingParams {
     pub sampling_seed: Option<i64>,
 
     // --- Internal fields (populated by the pipeline below, not API-facing) ---
+    //
+    // All `skip_deserializing`: they are outputs of `normalize`, and a client that
+    // could set them would be setting the pipeline's own state. `is_normalized` is
+    // the dangerous one — `{"is_normalized": true, "temperature": 0.0}` makes
+    // `post_init` early-return, so the greedy mapping never runs and temperature 0
+    // reaches the scheduler's `logits.div_()`; `stop` would likewise be dropped
+    // without ever reaching `stop_strs`. They still SERIALIZE: the scheduler needs
+    // them on the wire.
     /// From `stop`; a list after `normalize` (Python widens str → [str] there).
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub stop_strs: Vec<String>,
     /// From `stop_regex`.
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub stop_regex_strs: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub stop_str_max_len: i64,
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub stop_regex_max_len: i64,
     /// Set by `normalize`; tells the scheduler its own pass can early-return.
-    #[serde(default)]
+    #[serde(skip_deserializing)]
     pub is_normalized: bool,
 }
 
@@ -342,14 +350,18 @@ impl SamplingParams {
             .map(|s| s.len() as i64)
             .max()
             .unwrap_or(0);
-        // Finite bound per regex (bounded → its real max length; unbounded →
-        // MAX_LEN), matching Python's `max(get_max_seq_length(r) for r in …)`.
-        // A malformed pattern is a 400 here, as `sre_parse.parse` raising is
-        // there — the scheduler `re.search`es these every decode step.
-        let mut stop_regex_max_len = 0;
-        for pattern in &self.stop_regex_strs {
-            stop_regex_max_len = stop_regex_max_len.max(regex_max_seq_length(pattern)?);
-        }
+        // The full-scan sentinel for any stop_regex, with no attempt to derive a
+        // tighter bound. `recompute_stop_regex_max_len` (managers/utils.py) re-derives
+        // it with `sre_parse` + `re.compile` on the way in, so anything computed here
+        // is overwritten before the scheduler sees it — and the scheduler runs these
+        // through Python's `re`, so only Python's parser can judge them. Matching
+        // dialects from here bought a bound nobody reads and cost two rounds of
+        // scheduler-killing mismatches; the sentinel is always a safe over-estimate.
+        let stop_regex_max_len = if self.stop_regex_strs.is_empty() {
+            0
+        } else {
+            STOP_REGEX_MAX_LEN
+        };
         self.stop_regex_max_len = stop_regex_max_len;
 
         // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
@@ -497,87 +509,6 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
         None => Vec::new(),
         Some(OneOrMany::One(s)) => vec![s],
         Some(OneOrMany::Many(v)) => v,
-    }
-}
-
-/// Strict upper bound on the characters a `stop_regex` can match — the Rust port
-/// of Python's `get_max_seq_length` (`sampling_params.py`). Bounded expressions
-/// get their finite length; unbounded quantifiers, or a pattern `regex-syntax`
-/// rejects only because it is *stricter* than Python's `re`, fall back to
-/// [`STOP_REGEX_MAX_LEN`] — always an over-estimate, so the scheduler never
-/// under-buffers and misses a stop. A pattern Python would reject too is a 400.
-fn regex_max_seq_length(pattern: &str) -> Result<i64, Error> {
-    match regex_syntax::parse(pattern) {
-        Ok(hir) => Ok(hir_max_len(&hir)),
-        Err(e) => match malformed_regex_reason(&e) {
-            Some(reason) => Err(bad(format!(
-                "stop_regex {pattern:?} is not a valid regular expression: {reason}"
-            ))),
-            None => Ok(STOP_REGEX_MAX_LEN),
-        },
-    }
-}
-
-/// Why `pattern` is malformed, or `None` if `regex-syntax` rejected it for a
-/// reason Python's `re` would not.
-///
-/// A parse failure alone is not evidence of a bad pattern: `regex-syntax` is the
-/// stricter dialect and rejects plenty that `sre_parse` accepts (backreferences,
-/// look-around, `\Z`, `(?#…)`, `a{2`). Those must keep falling back to
-/// [`STOP_REGEX_MAX_LEN`], because the scheduler runs them through Python's `re`,
-/// where they work. But an *unbalanced* pattern (`"("`, `"[z-a]"`) reaches
-/// `re.search` in `_check_str_based_finish` on the decode hot path, where the
-/// resulting `re.error` is uncaught and takes the scheduler down — so the error
-/// kinds below, all of which `sre_parse.parse` also raises on, are rejected at
-/// ingress instead, exactly as Python's `normalize()` would.
-///
-/// The classification is one-directional and cannot be exhaustive (a pattern only
-/// *Python* rejects, e.g. `(?<n>a)`, still gets through). Widening the reject set
-/// risks 400ing valid patterns, so it stays conservative.
-fn malformed_regex_reason(err: &regex_syntax::Error) -> Option<String> {
-    use regex_syntax::ast::ErrorKind;
-
-    let regex_syntax::Error::Parse(err) = err else {
-        return None;
-    };
-    matches!(
-        err.kind(),
-        ErrorKind::GroupUnclosed          // "("
-            | ErrorKind::GroupUnopened    // ")"
-            | ErrorKind::ClassUnclosed    // "[", "[]"
-            | ErrorKind::ClassRangeInvalid // "[z-a]"
-            | ErrorKind::EscapeUnexpectedEof // trailing "\"
-            | ErrorKind::RepetitionMissing // "*a"
-            | ErrorKind::RepetitionCountInvalid // "a{2,1}"
-    )
-    .then(|| err.kind().to_string())
-}
-
-fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
-    use regex_syntax::hir::HirKind;
-    match hir.kind() {
-        // Zero-width: empty match, anchors (`^`/`$`/`\b`).
-        HirKind::Empty | HirKind::Look(_) => 0,
-        // A concatenated literal run contributes its character count.
-        HirKind::Literal(lit) => std::str::from_utf8(&lit.0)
-            .map(|s| s.chars().count())
-            .unwrap_or(lit.0.len()) as i64,
-        // Any single-character class (`[..]`, `\d`, `.`) → 1.
-        HirKind::Class(_) => 1,
-        // `{m,n}` → n * inner; `+`/`*`/`{m,}` (max None) → unbounded.
-        HirKind::Repetition(rep) => match rep.max {
-            None => STOP_REGEX_MAX_LEN,
-            Some(max) => (max as i64)
-                .saturating_mul(hir_max_len(&rep.sub))
-                .min(STOP_REGEX_MAX_LEN),
-        },
-        HirKind::Capture(cap) => hir_max_len(&cap.sub),
-        HirKind::Concat(subs) => subs
-            .iter()
-            .map(hir_max_len)
-            .fold(0i64, i64::saturating_add)
-            .min(STOP_REGEX_MAX_LEN),
-        HirKind::Alternation(subs) => subs.iter().map(hir_max_len).max().unwrap_or(0),
     }
 }
 
@@ -899,7 +830,7 @@ mod tests {
         assert_eq!(once, twice, "a second normalize must change nothing");
         assert_eq!(twice.stop_strs, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(twice.stop_str_max_len, 4);
-        assert_eq!(twice.stop_regex_max_len, 3);
+        assert_eq!(twice.stop_regex_max_len, STOP_REGEX_MAX_LEN);
 
         // Greedy handling must not re-fire either: temperature is 1.0 after the
         // first pass, which is not in the greedy window.
@@ -959,72 +890,42 @@ mod tests {
         assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
     }
 
-    /// Bounded regexes get their finite length; unbounded / unparsable ones fall
-    /// back to the full-scan `MAX_LEN`. Mirrors Python `get_max_seq_length`.
+    /// Rust no longer judges `stop_regex` at all: it stamps the full-scan sentinel
+    /// and leaves both the bound and the verdict to Python, whose `re` is the engine
+    /// that actually runs the pattern (`recompute_stop_regex_max_len` overwrites this
+    /// value on the way in, and 400s what it cannot compile).
+    ///
+    /// So patterns `regex-syntax` used to reject — including ones Python accepts,
+    /// like `\Z` — must pass through here, and even a malformed one is Python's call.
     #[test]
-    fn regex_bound_is_finite_when_bounded() {
-        let len = |p: &str| regex_max_seq_length(p).expect("valid pattern");
-        // Bounded: exact length (the reviewer's six-digit example → 6, not 1<<30).
-        assert_eq!(len(r"\d{6}"), 6);
-        assert_eq!(len("abc"), 3);
-        assert_eq!(len(r"^abc$"), 3); // anchors are zero-width
-        assert_eq!(len("a|bbb"), 3); // alternation → max branch
-        assert_eq!(len(r"(ab){3}"), 6); // group * repeat
-        assert_eq!(len(r"a\d{2,5}"), 6); // 1 + 5
-        // Unbounded → MAX_LEN.
-        assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
-        assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
-        assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
-    }
-
-    /// Patterns `regex-syntax` rejects but Python's `re` accepts must NOT 400 —
-    /// the scheduler matches them with Python's engine, where they work. They
-    /// only lose their static bound and fall back to the full-scan sentinel.
-    #[test]
-    fn stricter_than_python_patterns_fall_back_to_max_len() {
-        for pattern in [
-            r"(a)\1",     // backreference
-            r"(?=x)y",    // look-around
-            r"\Z",        // python-only anchor spelling
-            r"(?#note)a", // inline comment group
-            "a{2",        // python reads this as the literal "a{2"
-            r"[\b]",      // backspace inside a class
-        ] {
-            assert_eq!(
-                regex_max_seq_length(pattern).expect("must not be rejected"),
-                STOP_REGEX_MAX_LEN,
-                "{pattern} must fall back, not 400"
-            );
-        }
-    }
-
-    /// A malformed `stop_regex` is a 400 at ingress, mirroring Python's
-    /// `sre_parse.parse` raising inside `normalize()`. Without this the pattern
-    /// rides to the scheduler, where `re.search` raises `re.error` uncaught on
-    /// the decode hot path — i.e. any client could kill the scheduler.
-    /// Every pattern here also raises in `sre_parse.parse`.
-    #[test]
-    fn malformed_stop_regex_is_rejected() {
-        for pattern in ["(", ")", "[", "[]", "\\", "*a", "a{2,1}", "[z-a]"] {
-            assert!(
-                regex_max_seq_length(pattern).is_err(),
-                "{pattern} must be rejected"
-            );
-        }
-        // End to end, through the same path `/generate` takes.
-        let _ = norm_err(r#"{"stop_regex": "("}"#);
-        let _ = norm_err(r#"{"stop_regex": ["\\d{6}", "("]}"#);
-    }
-
-    /// End-to-end: a bounded `stop_regex` normalizes to its finite length, not the
-    /// O(T²) full-scan sentinel.
-    #[test]
-    fn bounded_stop_regex_gets_finite_max_len() {
-        assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
+    fn stop_regex_gets_the_sentinel_and_no_verdict() {
+        assert_eq!(
+            norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len,
+            STOP_REGEX_MAX_LEN
+        );
         assert_eq!(
             norm(r#"{"stop_regex": "\\d+"}"#).stop_regex_max_len,
             STOP_REGEX_MAX_LEN
         );
+        // No stop_regex → 0, so the scheduler skips the regex path entirely.
         assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
+
+        for pattern in [
+            r"(a)\1",    // backreference — regex-syntax rejects, `re` accepts
+            r"(?=x)y",   // look-around — same
+            r"\Z",       // python-only anchor spelling — same
+            r"(?<=a*)b", // variable-width look-behind: parses, fails to compile
+            "(",         // malformed even for `re` — still Python's 400 to give
+        ] {
+            let json = format!(
+                r#"{{"stop_regex": {}}}"#,
+                serde_json::to_string(pattern).unwrap()
+            );
+            let sp = norm(&json);
+            assert_eq!(
+                sp.stop_regex_max_len, STOP_REGEX_MAX_LEN,
+                "{pattern} must pass through with the sentinel"
+            );
+        }
     }
 }

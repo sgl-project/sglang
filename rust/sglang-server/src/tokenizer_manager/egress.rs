@@ -73,8 +73,15 @@ impl Runnable for Egress {
                     let ok = for_each_chunk(body, |ev| {
                         buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
                     });
+                    // Routing only fills the buckets; nothing is delivered until the
+                    // sends below. So dropping them here makes rejection atomic for
+                    // free: a frame whose columns drifted would otherwise deliver the
+                    // requests decoded before the bad one, carrying another request's
+                    // logprobs — the corruption the decoder's bounds checks exist to
+                    // prevent. Better a lost frame than a silently wrong one.
                     if !ok {
-                        tracing::warn!("egress: bad batch frame");
+                        tracing::warn!("egress: bad batch frame; dropping it whole");
+                        continue;
                     }
                     for (i, b) in buckets.iter_mut().enumerate() {
                         if b.is_empty() {

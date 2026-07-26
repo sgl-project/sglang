@@ -15,6 +15,7 @@
 
 import logging
 import math
+import re
 from typing import Dict, List, Optional, Set, Union
 
 import msgspec
@@ -290,6 +291,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
 
         Raises:
             re.error: if any stop regex is invalid for this interpreter.
+            RecursionError: if it nests deeper than the parser's stack allows.
         """
         if not self.stop_regex_strs:
             return
@@ -298,6 +300,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             if isinstance(self.stop_regex_strs, str)
             else self.stop_regex_strs
         )
+        # `re.compile`, not just `sre_parse.parse`: the parser accepts patterns
+        # the compiler rejects (a variable-width look-behind such as `(?<=a*)b`
+        # parses fine and then fails to compile), and it is `re.search` in the
+        # decode loop that would raise. Compiling here also warms `re`'s cache for
+        # that loop.
+        for p in patterns:
+            re.compile(p)
         self.stop_regex_max_len = max(get_max_seq_length(p) for p in patterns)
 
 
