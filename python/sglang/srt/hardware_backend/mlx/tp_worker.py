@@ -141,6 +141,26 @@ class MlxTpModelWorker(TpModelWorker):
             req.mamba_last_track_seqlen = None
             self._mlx_runner.sync_and_release_request(req.rid)
 
+    def prepare_for_retraction(self, req) -> None:
+        """Drop MLX runner state when the scheduler retracts (or OOM-aborts) a request.
+
+        Retraction frees the request's row and KV slots via
+        ``release_kv_cache(..., is_insert=False)`` — *without* the finish
+        pre-release hook — and the request goes back to the waiting queue to
+        restart from scratch. Dropping its runner state now guarantees:
+
+        * a re-scheduled request is routed as a fresh ``"prefill"``
+          (``has_request`` is False), so it re-reads its cached prefix from the
+          pool instead of extending a now-invalid private cache; and
+        * no later ``flush_decode_kv_for_slots`` reads its freed row or recycled
+          KV slots (the row-generation check only catches a *reused* row, not a
+          freed one whose KV slots were handed to a different-row request).
+
+        ``remove_request`` is a pure discard — it never syncs, which is correct
+        because the retracted request's KV slots are already freed.
+        """
+        self._mlx_runner.remove_request(req.rid)
+
     def _gather_prefill_prefix_slots(self, reqs) -> set[int]:
         """Union of prefix slot IDs for reqs that will start a fresh prefill.
 
