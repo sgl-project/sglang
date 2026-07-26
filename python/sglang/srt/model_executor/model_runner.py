@@ -588,10 +588,7 @@ class ModelRunner:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
-        if (
-            self.parallelism_config is not None
-            and self.remote_instance_weight_transporter.weight_info is not None
-        ):
+        if self.parallelism_config is not None:
             self._register_parallelism_config_to_bootstrap()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
