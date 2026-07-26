@@ -37,6 +37,7 @@ export const config = {
   // "Low Latency" / "High Throughput" subtitles.
   strategies: [
     { id: "low-latency",     label: "Low-Latency"     },
+    { id: "balanced",        label: "Balanced"         },
     { id: "high-throughput", label: "High-Throughput" },
   ],
   nodesOptions: [
@@ -71,14 +72,15 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `python3 benchmark/gsm8k/bench_sglang.py --port {{CURL_PORT}}`,
       mmlu_pct:
 `python3 benchmark/mmlu/bench_sglang.py --port {{CURL_PORT}}`,
     },
-    numPromptsByConc: { 1: 10, 100: 1000 },
+    numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
   // The eval set rendered in the benchmark card + "⚡ Reproduce" (the engine
@@ -96,7 +98,7 @@ export const config = {
     // B300 / GB300 require the CUDA 13 image variant (legacy §3.2 note).
     b300:  "lmsysorg/sglang:dev-cu130",
     gb300: "lmsysorg/sglang:dev-cu130",
-    mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi300x: "lmsysorg/sglang:v0.5.16-rocm700-mi30x",
     mi325x: "lmsysorg/sglang:dev-rocm720-mi30x",
     mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
   },
@@ -406,7 +408,25 @@ export const config = {
       ],
     },
     {
+      match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "mi300x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
