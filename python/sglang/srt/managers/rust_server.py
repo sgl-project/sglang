@@ -21,6 +21,7 @@ import msgspec
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
+    recompute_stop_regex_max_len,
 )
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
@@ -121,6 +122,7 @@ class RustServer:
             nbytes = n * 8
             try:
                 obj = msgpack_decode_explained(header)
+                recompute_stop_regex_max_len(obj)
             except MsgpackDecodeError as e:
                 # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
                 logger.warning(
