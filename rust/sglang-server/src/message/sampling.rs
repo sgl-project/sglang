@@ -1,6 +1,7 @@
-//! Sampling-params normalization — the Rust port of `SamplingParams`'s
-//! `__post_init__` + `normalize` + `verify`
-//! (python/sglang/srt/sampling/sampling_params.py).
+//! [`SamplingParams`] — the typed Rust port of Python `SamplingParams`
+//! (python/sglang/srt/sampling/sampling_params.py): every field, plus its
+//! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
+//! `TokenizerManager._create_tokenized_object` does).
 //!
 //! The embedded Rust server replaces the Python `TokenizerManager`, which is the
 //! only place those three run on the normal (zmq) path. Running them here, in the
@@ -9,21 +10,30 @@
 //! `is_normalized=true` on the wire so the scheduler's `__post_init__` and
 //! `normalize` early-return; its `verify` is likewise skipped (we did it here).
 //!
-//! KEEP IN SYNC with `sampling_params.py`: the constants and ranges below mirror
-//! that file. `stop_str_max_len` is the stop string's **UTF-8 byte length** — a
-//! provably safe over-estimate of its token length (a token spans ≥ 1 byte, so
-//! `bytes ≥ tokens`; `chars` is *not* a bound — one char can be several tokens,
-//! e.g. `𓀀` → 3). The scheduler uses this only as a match-window *size* (capped at
-//! the output length), so any over-estimate matches the same stops — only an
-//! under-estimate misses. Python encodes each stop with the tokenizer for the
-//! exact token count; the byte-length bound avoids needing the tokenizer here.
+//! KEEP IN SYNC with `sampling_params.py`: the field list, defaults and ranges
+//! below mirror that file, and the struct is serialized by field name into the
+//! `TokenizedGenerateReqInput` header, so a renamed/added Python field must be
+//! mirrored here (an unknown key would be silently dropped by msgspec).
 //!
-//! Not ported (the Rust OpenAI/`/generate` handlers don't populate them): the
-//! vocab-bounded `logit_bias` range check, and `stop_token_ids` filtering. Add
-//! them here if those fields start flowing through.
+//! Two deliberate deviations, both safe over-estimates or stricter:
+//!   * `stop_str_max_len` is the stop string's **UTF-8 byte length** — a provably
+//!     safe over-estimate of its token length (a token spans ≥ 1 byte, so
+//!     `bytes ≥ tokens`; `chars` is *not* a bound — one char can be several
+//!     tokens, e.g. `𓀀` → 3). The scheduler uses it only as a match-window
+//!     *size* (capped at the output length), so an over-estimate matches the same
+//!     stops — only an under-estimate misses. Python encodes each stop with the
+//!     tokenizer for the exact count; the byte bound avoids needing it here.
+//!   * `n > 1` (parallel sampling) is rejected, mirroring the `/generate` body
+//!     check — the rust egress maps one rid to one response.
 
-use rmpv::Value;
+use std::collections::BTreeMap;
+use std::fmt;
 
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use super::OneOrMany;
 use crate::error::Error;
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
@@ -37,206 +47,409 @@ const TOP_K_ALL: i64 = 1 << 30;
 /// re-scan the full accumulated output every token (O(T²)).
 const STOP_REGEX_MAX_LEN: i64 = 1 << 30;
 
-/// Normalize and verify the request's sampling params in place, then mark them
-/// `is_normalized=true` so the scheduler skips its own pass. `None`/absent map →
-/// an all-defaults map. Returns `Error::Validation` (HTTP 400) for any param the
-/// Python `verify` would reject.
+/// One module per field default, each exposing the two hooks serde needs under
+/// one name: `default` (key absent) and `deserialize` (key present — including
+/// an explicit `null`, which Python's `__post_init__` maps back to the default:
+/// "callers can pass null without crashing verify"). They cannot be one function
+/// — serde calls `default()` with no arguments and `deserialize(deserializer)` —
+/// but `deserialize` defers to `default()`, so the value is written once.
+macro_rules! defaulted {
+    ($($name:ident: $ty:ty = $value:expr;)*) => {$(
+        mod $name {
+            use serde::{Deserialize, Deserializer};
+
+            pub(super) fn default() -> $ty { $value }
+
+            pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<$ty, D::Error> {
+                Ok(Option::<$ty>::deserialize(d)?.unwrap_or_else(default))
+            }
+        }
+    )*};
+}
+
+defaulted! {
+    f64_one: f64 = 1.0;
+    f64_zero: f64 = 0.0;
+    i64_top_k_all: i64 = super::TOP_K_ALL;
+    i64_zero: i64 = 0;
+    i64_one: i64 = 1;
+    bool_false: bool = false;
+    bool_true: bool = true;
+}
+
+/// `max_new_tokens` is `Optional[int] = 128`: an *absent* key means 128, but an
+/// explicit `null` means None (no limit) — so it keeps its `Option` rather than
+/// going through [`defaulted`].
+fn max_new_tokens_default() -> Option<i64> {
+    Some(128)
+}
+
+/// The sampling parameters of one `/generate` request. Deserialized from the
+/// client's `sampling_params` object (unknown keys are a 400, mirroring Python's
+/// `SamplingParams(**kwargs)` TypeError) and serialized by field name into the
+/// scheduler header once [`normalize`](Self::normalize) has run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SamplingParams {
+    // --- API parameters (set by callers) ---
+    #[serde(default = "max_new_tokens_default")]
+    pub max_new_tokens: Option<i64>,
+    /// API input alias, copied to `stop_strs` then cleared by `normalize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<OneOrMany<String>>,
+    /// Python `Optional[Set[int]]`. A `null` *element* is a 400 here where Python
+    /// filters it out — a typed list can't hold one, and it is malformed input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_token_ids: Option<Vec<i64>>,
+    /// API input alias, copied to `stop_regex_strs` then cleared by `normalize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_regex: Option<OneOrMany<String>>,
+    #[serde(
+        default = "f64_one::default",
+        deserialize_with = "f64_one::deserialize"
+    )]
+    pub temperature: f64,
+    #[serde(
+        default = "f64_one::default",
+        deserialize_with = "f64_one::deserialize"
+    )]
+    pub top_p: f64,
+    #[serde(
+        default = "i64_top_k_all::default",
+        deserialize_with = "i64_top_k_all::deserialize"
+    )]
+    pub top_k: i64,
+    #[serde(
+        default = "f64_zero::default",
+        deserialize_with = "f64_zero::deserialize"
+    )]
+    pub min_p: f64,
+    #[serde(
+        default = "f64_zero::default",
+        deserialize_with = "f64_zero::deserialize"
+    )]
+    pub frequency_penalty: f64,
+    #[serde(
+        default = "f64_zero::default",
+        deserialize_with = "f64_zero::deserialize"
+    )]
+    pub presence_penalty: f64,
+    #[serde(
+        default = "f64_one::default",
+        deserialize_with = "f64_one::deserialize"
+    )]
+    pub repetition_penalty: f64,
+    #[serde(
+        default = "i64_zero::default",
+        deserialize_with = "i64_zero::deserialize"
+    )]
+    pub min_new_tokens: i64,
+    #[serde(
+        default = "i64_one::default",
+        deserialize_with = "i64_one::deserialize"
+    )]
+    pub n: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ebnf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_tag: Option<String>,
+    #[serde(
+        default = "bool_false::default",
+        deserialize_with = "bool_false::deserialize"
+    )]
+    pub ignore_eos: bool,
+    #[serde(
+        default = "bool_true::default",
+        deserialize_with = "bool_true::deserialize"
+    )]
+    pub skip_special_tokens: bool,
+    #[serde(
+        default = "bool_true::default",
+        deserialize_with = "bool_true::deserialize"
+    )]
+    pub spaces_between_special_tokens: bool,
+    #[serde(
+        default = "bool_false::default",
+        deserialize_with = "bool_false::deserialize"
+    )]
+    pub no_stop_trim: bool,
+    /// Opaque JSON object forwarded to a custom logit processor. Python types it
+    /// as `Dict[str, JsonScalar | list | dict]`; it is never inspected here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_interval: Option<i64>,
+    /// Token id (as a string key, matching Python) → bias. Keys are vocab-bounded
+    /// by [`verify`](Self::verify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<BTreeMap<String, f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_seed: Option<i64>,
+
+    // --- Internal fields (populated by the pipeline below, not API-facing) ---
+    /// From `stop`; a list after `normalize` (Python widens str → [str] there).
+    #[serde(default)]
+    pub stop_strs: Vec<String>,
+    /// From `stop_regex`.
+    #[serde(default)]
+    pub stop_regex_strs: Vec<String>,
+    #[serde(default)]
+    pub stop_str_max_len: i64,
+    #[serde(default)]
+    pub stop_regex_max_len: i64,
+    /// Set by `normalize`; tells the scheduler its own pass can early-return.
+    #[serde(default)]
+    pub is_normalized: bool,
+}
+
+/// The `/generate` body's `sampling_params`: one object (broadcast to every
+/// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
 ///
-/// One pass over the map: the fields we normalize are read into typed locals and
-/// everything else (max_new_tokens, grammars, unknowns) is carried through
-/// untouched. See `TM_CORES` (`runtime::threads`) for the ingress-scaling ceiling
-/// this constant feeds into.
-pub fn normalize_sampling_params(sp: &mut Option<Value>) -> Result<(), Error> {
-    let map = match sp.take() {
-        Some(Value::Map(m)) => m,
-        None => Vec::new(),
-        Some(_) => return Err(Error::Validation("sampling_params must be a map".into())),
-    };
+/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
+/// the input and, on failure, reports only "data did not match any variant" —
+/// losing the field-level message ("unknown field `temperature`, expected one of
+/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
+/// single `deserialize_any` dispatch keeps the inner error verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SamplingParamsInput {
+    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
+    /// every `GenerateBody` that big regardless of which form arrived.
+    One(Box<SamplingParams>),
+    Many(Vec<SamplingParams>),
+}
 
-    // Defaults match the SamplingParams field defaults; a present-but-null value
-    // reads as absent (keeps the default), matching Python's `x if x is not None`.
-    let mut temperature_in = 1.0;
-    let mut top_k_in = -1i64;
-    let mut top_p = 1.0;
-    let mut min_p = 0.0;
-    let mut frequency_penalty = 0.0;
-    let mut presence_penalty = 0.0;
-    let mut repetition_penalty = 1.0;
-    let mut min_new_tokens = 0i64;
-    let mut max_new_tokens = 128i64; // field default is 128, not None
-    let mut stop_strs: Vec<String> = Vec::new();
-    let mut stop_regex_strs: Vec<String> = Vec::new();
-    let mut grammars = 0usize;
+impl<'de> Deserialize<'de> for SamplingParamsInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
 
-    // Single pass: pull the normalized fields into locals, keep everything else as
-    // passthrough. Fields we re-emit below are dropped here to avoid duplicate keys.
-    let mut out: Vec<(Value, Value)> = Vec::with_capacity(map.len() + 8);
-    for (k, v) in map {
-        match k.as_str() {
-            Some("temperature") => {
-                temperature_in = opt_f64("temperature", &v)?.unwrap_or(temperature_in)
+        impl<'de> Visitor<'de> for InputVisitor {
+            type Value = SamplingParamsInput;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a sampling_params object, or a list of them (one per prompt)")
             }
-            Some("top_k") => top_k_in = opt_i64("top_k", &v)?.unwrap_or(top_k_in),
-            Some("top_p") => top_p = opt_f64("top_p", &v)?.unwrap_or(top_p),
-            Some("min_p") => min_p = opt_f64("min_p", &v)?.unwrap_or(min_p),
-            Some("frequency_penalty") => {
-                frequency_penalty = opt_f64("frequency_penalty", &v)?.unwrap_or(frequency_penalty)
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                SamplingParams::deserialize(MapAccessDeserializer::new(map))
+                    .map(|p| SamplingParamsInput::One(Box::new(p)))
             }
-            Some("presence_penalty") => {
-                presence_penalty = opt_f64("presence_penalty", &v)?.unwrap_or(presence_penalty)
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
             }
-            Some("repetition_penalty") => {
-                repetition_penalty =
-                    opt_f64("repetition_penalty", &v)?.unwrap_or(repetition_penalty)
-            }
-            Some("min_new_tokens") => {
-                min_new_tokens = opt_i64("min_new_tokens", &v)?.unwrap_or(min_new_tokens)
-            }
-            // Read for verify but kept on the wire — the scheduler still needs it.
-            Some("max_new_tokens") => {
-                max_new_tokens = opt_i64("max_new_tokens", &v)?.unwrap_or(max_new_tokens);
-                out.push((k, v));
-            }
-            // stop / stop_regex → string lists + match-window lengths (below). Kept
-            // on the wire too; the scheduler reads stop_strs, the alias is harmless.
-            Some("stop") => {
-                stop_strs = to_string_list(Some(&v));
-                out.push((k, v));
-            }
-            Some("stop_regex") => {
-                stop_regex_strs = to_string_list(Some(&v));
-                out.push((k, v));
-            }
-            // Grammars are mutually exclusive: count the non-null ones, keep them.
-            Some("regex") | Some("json_schema") | Some("ebnf") => {
-                if !v.is_nil() {
-                    grammars += 1;
-                }
-                out.push((k, v));
-            }
-            // Drop any pre-existing copies of the fields we re-emit below.
-            Some("stop_strs")
-            | Some("stop_str_max_len")
-            | Some("stop_regex_strs")
-            | Some("stop_regex_max_len")
-            | Some("is_normalized") => {}
-            _ => out.push((k, v)),
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        // One source of defaults: the serde attributes above (an empty object
+        // deserializes to every field default).
+        serde_json::from_str("{}").expect("empty sampling_params object parses")
+    }
+}
+
+impl SamplingParams {
+    /// `__post_init__` → `normalize` → `verify`, the order
+    /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
+    /// request-local 400. `skip_tokenizer_init` stands in for Python's
+    /// `tokenizer is None`; `vocab_size` bounds `logit_bias` keys.
+    pub fn normalize(
+        &mut self,
+        skip_tokenizer_init: bool,
+        vocab_size: Option<u64>,
+    ) -> Result<(), Error> {
+        self.post_init();
+        self.normalize_stops(skip_tokenizer_init)?;
+        self.verify(vocab_size)
+    }
+
+    /// Python `__post_init__` (minus the null-to-default coercions, which the
+    /// null-tolerant deserializers above already did): copy the API aliases into
+    /// the internal fields and apply the greedy / `top_k` special cases.
+    fn post_init(&mut self) {
+        self.stop_strs = take_one_or_many(&self.stop);
+        self.stop_regex_strs = take_one_or_many(&self.stop_regex);
+        // Python drops null entries and maps an empty set to None.
+        if self.stop_token_ids.as_ref().is_some_and(|v| v.is_empty()) {
+            self.stop_token_ids = None;
+        }
+        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
+            // Greedy: temperature ~0 → temperature=1.0, top_k=1.
+            self.temperature = 1.0;
+            self.top_k = 1;
+        }
+        if self.top_k == -1 {
+            self.top_k = TOP_K_ALL; // -1 disables top_k → whole vocabulary
         }
     }
 
-    // --- __post_init__: greedy / top_k special cases ---
-    let (temperature, top_k) = if (0.0..SAMPLING_EPS).contains(&temperature_in) {
-        // Greedy: temperature ~0 → temperature=1.0, top_k=1.
-        (1.0, 1)
-    } else if top_k_in == -1 {
-        (temperature_in, TOP_K_ALL) // -1 disables top_k → whole vocabulary
-    } else {
-        (temperature_in, top_k_in)
-    };
-    // Match window: UTF-8 byte length is a safe upper bound on the token count.
-    let stop_str_max_len = stop_strs.iter().map(|s| s.len() as i64).max().unwrap_or(0);
-    // Finite bound per regex (bounded → its real max length; unbounded → MAX_LEN),
-    // matching Python's `max(get_max_seq_length(r) for r in stop_regex_strs)`.
-    let stop_regex_max_len = stop_regex_strs
-        .iter()
-        .map(|r| regex_max_seq_length(r))
-        .max()
-        .unwrap_or(0);
+    /// Python `normalize(tokenizer)`: size the stop match windows, reject
+    /// tokenizer-dependent features when there is no tokenizer, and clear the API
+    /// aliases so they don't ride the wire twice.
+    fn normalize_stops(&mut self, skip_tokenizer_init: bool) -> Result<(), Error> {
+        // Match window: UTF-8 byte length is a safe upper bound on the token count.
+        self.stop_str_max_len = self
+            .stop_strs
+            .iter()
+            .map(|s| s.len() as i64)
+            .max()
+            .unwrap_or(0);
+        // Finite bound per regex (bounded → its real max length; unbounded →
+        // MAX_LEN), matching Python's `max(get_max_seq_length(r) for r in …)`.
+        self.stop_regex_max_len = self
+            .stop_regex_strs
+            .iter()
+            .map(|r| regex_max_seq_length(r))
+            .max()
+            .unwrap_or(0);
 
-    // --- verify: same ranges as SamplingParams.verify (range-only subset) ---
-    if !temperature.is_finite() || temperature < 0.0 {
-        return Err(bad(format!(
-            "temperature must be a non-negative finite number, got {temperature}"
-        )));
-    }
-    if !(top_p > 0.0 && top_p <= 1.0) {
-        return Err(bad(format!("top_p must be in (0, 1], got {top_p}")));
-    }
-    if !(0.0..=1.0).contains(&min_p) {
-        return Err(bad(format!("min_p must be in [0, 1], got {min_p}")));
-    }
-    if top_k < 1 {
-        return Err(bad(format!(
-            "top_k must be -1 (disable) or at least 1, got {top_k_in}"
-        )));
-    }
-    if !(-2.0..=2.0).contains(&frequency_penalty) {
-        return Err(bad(format!(
-            "frequency_penalty must be in [-2, 2], got {frequency_penalty}"
-        )));
-    }
-    if !(-2.0..=2.0).contains(&presence_penalty) {
-        return Err(bad(format!(
-            "presence_penalty must be in [-2, 2], got {presence_penalty}"
-        )));
-    }
-    if !(repetition_penalty > 0.0 && repetition_penalty <= 2.0) {
-        return Err(bad(format!(
-            "repetition_penalty must be in (0, 2], got {repetition_penalty}"
-        )));
-    }
-    if min_new_tokens < 0 {
-        return Err(bad(format!(
-            "min_new_tokens must be non-negative, got {min_new_tokens}"
-        )));
-    }
-    if max_new_tokens < 0 {
-        return Err(bad(format!(
-            "max_new_tokens must be at least 0, got {max_new_tokens}"
-        )));
-    }
-    if min_new_tokens > max_new_tokens {
-        return Err(bad(format!(
-            "min_new_tokens must be in [0, max_new_tokens({max_new_tokens})], got {min_new_tokens}"
-        )));
-    }
-    // Grammars are mutually exclusive (count taken during the pass above).
-    if grammars > 1 {
-        return Err(bad(
-            "Only one of regex, json_schema, or ebnf can be set".into()
-        ));
+        // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
+        // `eos_token_id`, which `skip_tokenizer_init` does not have.
+        if skip_tokenizer_init {
+            if !self.stop_strs.is_empty() {
+                return Err(bad(
+                    "stop is unavailable when skip_tokenizer_init=True (requires a \
+                     tokenizer to decode tokens to text for matching)"
+                        .into(),
+                ));
+            }
+            if !self.stop_regex_strs.is_empty() {
+                return Err(bad(
+                    "stop_regex is unavailable when skip_tokenizer_init=True (requires a \
+                     tokenizer to decode tokens to text for matching)"
+                        .into(),
+                ));
+            }
+            if self.min_new_tokens > 0 {
+                return Err(bad(format!(
+                    "min_new_tokens={} is unavailable when skip_tokenizer_init=True \
+                     (requires a tokenizer for eos_token_id)",
+                    self.min_new_tokens
+                )));
+            }
+        }
+
+        self.stop = None;
+        self.stop_regex = None;
+        self.is_normalized = true;
+        Ok(())
     }
 
-    // --- emit the normalized fields; is_normalized=true tells the scheduler its
-    // __post_init__/normalize/verify are already done ---
-    out.push((Value::from("temperature"), Value::F64(temperature)));
-    out.push((Value::from("top_k"), Value::from(top_k)));
-    out.push((Value::from("top_p"), Value::F64(top_p)));
-    out.push((Value::from("min_p"), Value::F64(min_p)));
-    out.push((
-        Value::from("frequency_penalty"),
-        Value::F64(frequency_penalty),
-    ));
-    out.push((
-        Value::from("presence_penalty"),
-        Value::F64(presence_penalty),
-    ));
-    out.push((
-        Value::from("repetition_penalty"),
-        Value::F64(repetition_penalty),
-    ));
-    out.push((Value::from("min_new_tokens"), Value::from(min_new_tokens)));
-    out.push((Value::from("stop_strs"), string_array(&stop_strs)));
-    out.push((
-        Value::from("stop_str_max_len"),
-        Value::from(stop_str_max_len),
-    ));
-    out.push((
-        Value::from("stop_regex_strs"),
-        string_array(&stop_regex_strs),
-    ));
-    out.push((
-        Value::from("stop_regex_max_len"),
-        Value::from(stop_regex_max_len),
-    ));
-    out.push((Value::from("is_normalized"), Value::Boolean(true)));
-
-    *sp = Some(Value::Map(out));
-    Ok(())
+    /// Python `verify(vocab_size)` — the same ranges, messages and mutual
+    /// exclusions, plus the rust-server `n == 1` restriction.
+    fn verify(&self, vocab_size: Option<u64>) -> Result<(), Error> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(bad(format!(
+                "temperature must be a non-negative finite number, got {}",
+                self.temperature
+            )));
+        }
+        if !(self.top_p > 0.0 && self.top_p <= 1.0) {
+            return Err(bad(format!("top_p must be in (0, 1], got {}", self.top_p)));
+        }
+        if !(0.0..=1.0).contains(&self.min_p) {
+            return Err(bad(format!("min_p must be in [0, 1], got {}", self.min_p)));
+        }
+        if self.top_k < 1 {
+            return Err(bad(format!(
+                "top_k must be -1 (disable) or at least 1, got {}",
+                self.top_k
+            )));
+        }
+        if !(-2.0..=2.0).contains(&self.frequency_penalty) {
+            return Err(bad(format!(
+                "frequency_penalty must be in [-2, 2], got {}",
+                self.frequency_penalty
+            )));
+        }
+        if !(-2.0..=2.0).contains(&self.presence_penalty) {
+            return Err(bad(format!(
+                "presence_penalty must be in [-2, 2], got {}",
+                self.presence_penalty
+            )));
+        }
+        if !(self.repetition_penalty > 0.0 && self.repetition_penalty <= 2.0) {
+            return Err(bad(format!(
+                "repetition_penalty must be in (0, 2], got {}",
+                self.repetition_penalty
+            )));
+        }
+        if self.min_new_tokens < 0 {
+            return Err(bad(format!(
+                "min_new_tokens must be non-negative, got {}",
+                self.min_new_tokens
+            )));
+        }
+        // `None` = no limit, so the max_new_tokens checks only apply when set.
+        if let Some(max_new_tokens) = self.max_new_tokens {
+            if max_new_tokens < 0 {
+                return Err(bad(format!(
+                    "max_new_tokens must be at least 0, got {max_new_tokens}"
+                )));
+            }
+            if self.min_new_tokens > max_new_tokens {
+                return Err(bad(format!(
+                    "min_new_tokens must be in [0, max_new_tokens({max_new_tokens})], got {}",
+                    self.min_new_tokens
+                )));
+            }
+        }
+        // An out-of-vocabulary bias key would index past the logits row in the
+        // scheduler, so bound it here (`None` = vocab unknown, skip).
+        if let (Some(logit_bias), Some(vocab_size)) = (&self.logit_bias, vocab_size) {
+            for key in logit_bias.keys() {
+                let token_id: u64 = key
+                    .parse()
+                    .map_err(|_| bad(format!("logit_bias keys must be token ids, got {key:?}")))?;
+                if token_id >= vocab_size {
+                    return Err(bad(format!(
+                        "logit_bias must have keys in [0, {}], got {token_id}",
+                        vocab_size - 1
+                    )));
+                }
+            }
+        }
+        // Grammars are mutually exclusive.
+        let grammars = [&self.json_schema, &self.regex, &self.ebnf]
+            .iter()
+            .filter(|g| g.is_some())
+            .count();
+        if grammars > 1 {
+            return Err(bad(
+                "Only one of regex, json_schema, or ebnf can be set".into()
+            ));
+        }
+        // Not a Python restriction: the rust egress maps one rid to one response,
+        // so parallel sampling would drop all but the first sample (the
+        // `/generate` body enforces the same on its own `n`).
+        if self.n != 1 {
+            return Err(bad(format!(
+                "parallel sampling (n > 1) is not supported, got {}",
+                self.n
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn bad(msg: String) -> Error {
     Error::Validation(msg)
+}
+
+/// Widen a `str | [str]` API alias into the list form the internal field holds.
+fn take_one_or_many(v: &Option<OneOrMany<String>>) -> Vec<String> {
+    match v {
+        None => Vec::new(),
+        Some(OneOrMany::One(s)) => vec![s.clone()],
+        Some(OneOrMany::Many(v)) => v.clone(),
+    }
 }
 
 /// Strict upper bound on the characters a `stop_regex` can match — the Rust port
@@ -279,118 +492,56 @@ fn hir_max_len(hir: &regex_syntax::hir::Hir) -> i64 {
     }
 }
 
-/// Parse an optional numeric param: null/absent → `Ok(None)` (keep the default,
-/// matching Python's `x if x is not None`); a number → `Ok(Some)`; any other type →
-/// a request-local 400. A wrong type must NOT silently fall back to the default —
-/// `temperature: "bad"` has different semantics than an unset temperature and must
-/// be rejected, not accepted as 1.0.
-fn opt_f64(name: &str, v: &Value) -> Result<Option<f64>, Error> {
-    if v.is_nil() {
-        return Ok(None);
-    }
-    as_f64(v)
-        .map(Some)
-        .ok_or_else(|| bad(format!("{name} must be a number")))
-}
-
-/// Like [`opt_f64`] for integer fields (a float is accepted and truncated, as
-/// before); a non-numeric type is a 400 rather than a silent default.
-fn opt_i64(name: &str, v: &Value) -> Result<Option<i64>, Error> {
-    if v.is_nil() {
-        return Ok(None);
-    }
-    as_i64(v)
-        .map(Some)
-        .ok_or_else(|| bad(format!("{name} must be a number")))
-}
-
-/// Coerce a value to f64 (int or float); non-numeric (incl. null) → None. Used by
-/// [`opt_f64`] as the pure "is this a number?" extractor.
-fn as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::F64(f) => Some(*f),
-        Value::F32(f) => Some(*f as f64),
-        Value::Integer(i) => i.as_f64(),
-        _ => None,
-    }
-}
-
-fn as_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Integer(i) => i.as_i64(),
-        Value::F64(f) => Some(*f as i64),
-        Value::F32(f) => Some(*f as i64),
-        _ => None,
-    }
-}
-
-/// `stop` / `stop_regex` accept a single string or a list of strings; null/absent
-/// or any other shape → empty list.
-fn to_string_list(v: Option<&Value>) -> Vec<String> {
-    match v {
-        Some(Value::String(s)) => s.as_str().map(|s| vec![s.to_string()]).unwrap_or_default(),
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn string_array(strs: &[String]) -> Value {
-    Value::Array(strs.iter().map(|s| Value::from(s.as_str())).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn norm(pairs: &[(&str, Value)]) -> Vec<(Value, Value)> {
-        let mut sp = Some(Value::Map(
-            pairs
-                .iter()
-                .map(|(k, v)| (Value::from(*k), v.clone()))
-                .collect(),
-        ));
-        normalize_sampling_params(&mut sp).unwrap();
-        match sp.unwrap() {
-            Value::Map(m) => m,
-            _ => unreachable!(),
-        }
+    /// Parse client JSON exactly as `/generate` does, then run the full pipeline.
+    fn norm(json: &str) -> SamplingParams {
+        let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
+        sp.normalize(false, None).expect("normalizes");
+        sp
     }
 
-    fn get<'a>(m: &'a [(Value, Value)], k: &str) -> &'a Value {
-        m.iter()
-            .find(|(kk, _)| kk.as_str() == Some(k))
-            .map(|(_, v)| v)
-            .unwrap()
+    fn norm_err(json: &str) -> Error {
+        let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
+        sp.normalize(false, None).expect_err("must reject")
+    }
+
+    /// The wire shape the scheduler decodes: a map of field names → values — the
+    /// same `serde_json::Value` the header encoder hands to msgpack.
+    fn wire(sp: &SamplingParams) -> serde_json::Value {
+        serde_json::to_value(sp).expect("serializes")
+    }
+
+    fn get(v: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+        v.get(key).cloned()
     }
 
     #[test]
     fn greedy_sets_temp_one_topk_one() {
-        let m = norm(&[("temperature", Value::F64(0.0))]);
-        assert_eq!(get(&m, "temperature"), &Value::F64(1.0));
-        assert_eq!(get(&m, "top_k").as_i64(), Some(1));
-        assert_eq!(get(&m, "is_normalized"), &Value::Boolean(true));
+        let sp = norm(r#"{"temperature": 0.0}"#);
+        assert_eq!(sp.temperature, 1.0);
+        assert_eq!(sp.top_k, 1);
+        assert!(sp.is_normalized);
     }
 
     #[test]
     fn topk_minus_one_becomes_all() {
-        let m = norm(&[("temperature", Value::F64(0.7))]);
-        assert_eq!(get(&m, "top_k").as_i64(), Some(TOP_K_ALL));
+        assert_eq!(norm(r#"{"temperature": 0.7}"#).top_k, TOP_K_ALL);
+        assert_eq!(
+            norm(r#"{"top_k": -1, "temperature": 0.7}"#).top_k,
+            TOP_K_ALL
+        );
     }
 
     #[test]
     fn stop_list_and_max_len_by_bytes() {
-        let m = norm(&[(
-            "stop",
-            Value::Array(vec![Value::from("Question:"), Value::from("\n\n")]),
-        )]);
-        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(9)); // "Question:" (ASCII)
-        let Value::Array(a) = get(&m, "stop_strs") else {
-            panic!("stop_strs not array")
-        };
-        assert_eq!(a.len(), 2);
+        let sp = norm(r#"{"stop": ["Question:", "\n\n"]}"#);
+        assert_eq!(sp.stop_strs.len(), 2);
+        assert_eq!(sp.stop_str_max_len, 9); // "Question:" (ASCII)
+        // The API alias is cleared, so it never rides the wire twice.
+        assert!(sp.stop.is_none());
     }
 
     /// A multi-byte stop char must use its byte length as the window bound: `𓀀`
@@ -398,77 +549,137 @@ mod tests {
     /// under-size the tail and miss the stop; byte count (4) ≥ the token span.
     #[test]
     fn stop_str_max_len_uses_bytes_not_chars() {
-        let m = norm(&[("stop", Value::from("𓀀"))]);
+        let sp = norm(r#"{"stop": "𓀀"}"#);
         assert_eq!("𓀀".chars().count(), 1);
         assert_eq!("𓀀".len(), 4);
-        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(4));
+        assert_eq!(sp.stop_strs, vec!["𓀀".to_string()]); // scalar widened to a list
+        assert_eq!(sp.stop_str_max_len, 4);
     }
 
     #[test]
     fn no_stop_yields_empty_list_zero_len() {
-        let m = norm(&[("temperature", Value::F64(0.0))]);
-        assert_eq!(get(&m, "stop_str_max_len").as_i64(), Some(0));
-        assert_eq!(get(&m, "stop_strs"), &Value::Array(vec![]));
+        let sp = norm(r#"{"temperature": 0.0}"#);
+        assert!(sp.stop_strs.is_empty());
+        assert_eq!(sp.stop_str_max_len, 0);
     }
 
-    /// The single pass must carry unknown fields through untouched and must not
-    /// duplicate a field it normalizes (client-sent temperature is replaced, not
-    /// appended alongside the original).
+    /// The wire map is what the scheduler's msgspec decoder reads by field name:
+    /// the normalized values must be present under the Python names, and the
+    /// `is_normalized` flag must be set so its own pass early-returns.
     #[test]
-    fn passthrough_preserved_and_normalized_fields_not_duplicated() {
-        let m = norm(&[
-            ("temperature", Value::F64(0.7)),
-            ("max_new_tokens", Value::from(64i64)),
-            ("ignore_eos", Value::Boolean(true)),
-        ]);
-        // Unknown / read-only fields survive verbatim.
-        assert_eq!(get(&m, "max_new_tokens").as_i64(), Some(64));
-        assert_eq!(get(&m, "ignore_eos"), &Value::Boolean(true));
-        // Exactly one temperature entry, holding the normalized value.
-        let temps: Vec<_> = m
-            .iter()
-            .filter(|(k, _)| k.as_str() == Some("temperature"))
-            .collect();
-        assert_eq!(temps.len(), 1);
-        assert_eq!(temps[0].1, Value::F64(0.7));
+    fn wire_map_carries_python_field_names() {
+        let sp = norm(r#"{"temperature": 0.7, "max_new_tokens": 64, "ignore_eos": true}"#);
+        let w = wire(&sp);
+        assert_eq!(get(&w, "temperature").unwrap().as_f64(), Some(0.7));
+        assert_eq!(get(&w, "max_new_tokens").unwrap().as_i64(), Some(64));
+        assert_eq!(get(&w, "ignore_eos").unwrap().as_bool(), Some(true));
+        assert_eq!(get(&w, "top_k").unwrap().as_i64(), Some(TOP_K_ALL));
+        assert_eq!(get(&w, "is_normalized").unwrap().as_bool(), Some(true));
+        assert_eq!(get(&w, "stop_str_max_len").unwrap().as_i64(), Some(0));
+        // Unset optionals are omitted, so msgspec applies the Python defaults.
+        assert_eq!(get(&w, "regex"), None);
+        assert_eq!(get(&w, "stop"), None);
+    }
+
+    /// `max_new_tokens` is the one field where absent and null differ: absent =
+    /// 128 (the Python field default), explicit null = None (no limit).
+    #[test]
+    fn max_new_tokens_null_is_unlimited_absent_is_default() {
+        assert_eq!(norm("{}").max_new_tokens, Some(128));
+        assert_eq!(norm(r#"{"max_new_tokens": null}"#).max_new_tokens, None);
+        // None = no limit, so a large min_new_tokens is not a range error.
+        let sp = norm(r#"{"max_new_tokens": null, "min_new_tokens": 4096}"#);
+        assert_eq!(sp.min_new_tokens, 4096);
     }
 
     #[test]
-    fn verify_rejects_bad_top_p() {
-        let mut sp = Some(Value::Map(vec![(Value::from("top_p"), Value::F64(2.0))]));
-        assert!(normalize_sampling_params(&mut sp).is_err());
+    fn verify_rejects_out_of_range() {
+        for json in [
+            r#"{"top_p": 2.0}"#,
+            r#"{"top_k": 0, "temperature": 0.7}"#,
+            r#"{"min_p": 1.5}"#,
+            r#"{"frequency_penalty": 3.0}"#,
+            r#"{"presence_penalty": -3.0}"#,
+            r#"{"repetition_penalty": 0.0}"#,
+            r#"{"max_new_tokens": 8, "min_new_tokens": 9}"#,
+            r#"{"regex": "a", "ebnf": "b"}"#,
+            r#"{"n": 2}"#,
+        ] {
+            let _ = norm_err(json);
+        }
     }
 
+    /// A wrong JSON type for a numeric field is rejected at parse time — it must
+    /// NOT silently fall back to the default (`temperature: "bad"` has different
+    /// semantics than an unset temperature).
     #[test]
-    fn verify_rejects_topk_zero() {
-        let mut sp = Some(Value::Map(vec![
-            (Value::from("temperature"), Value::F64(0.7)),
-            (Value::from("top_k"), Value::from(0i64)),
-        ]));
-        assert!(normalize_sampling_params(&mut sp).is_err());
-    }
-
-    /// A wrong JSON type for a numeric field is a 400 — it must NOT silently fall
-    /// back to the default. `temperature: "bad"` previously normalized to 1.0 and
-    /// returned 200; now it is rejected. Covers a float and an int field.
-    #[test]
-    fn wrong_typed_numeric_field_is_rejected() {
-        for field in ["temperature", "top_p", "top_k", "max_new_tokens"] {
-            let mut sp = Some(Value::Map(vec![(Value::from(field), Value::from("bad"))]));
+    fn wrong_typed_field_is_rejected() {
+        for json in [
+            r#"{"temperature": "bad"}"#,
+            r#"{"top_k": "bad"}"#,
+            r#"{"max_new_tokens": "bad"}"#,
+            r#"{"stop": 3}"#,
+        ] {
             assert!(
-                normalize_sampling_params(&mut sp).is_err(),
-                "{field}: \"bad\" must be a 400, not a silent default"
+                serde_json::from_str::<SamplingParams>(json).is_err(),
+                "{json} must not parse"
             );
         }
     }
 
-    /// A present-but-null numeric field keeps the default (Python's
-    /// `x if x is not None`) — null is absent, not a wrong type, so it's accepted.
+    /// An unknown key is a 400, mirroring Python's `SamplingParams(**kwargs)`
+    /// TypeError — a typo must not be silently ignored.
     #[test]
-    fn null_numeric_field_keeps_default() {
-        let m = norm(&[("temperature", Value::Nil), ("top_k", Value::Nil)]);
-        assert_eq!(get(&m, "temperature"), &Value::F64(1.0)); // default 1.0
-        assert_eq!(get(&m, "top_k").as_i64(), Some(TOP_K_ALL)); // default -1 → all
+    fn unknown_field_is_rejected() {
+        // NOTE: `temperature` is a deliberate typo — the point of the test.
+        assert!(serde_json::from_str::<SamplingParams>(r#"{"temperature": 0.7}"#).is_err());
+        // The correctly spelled field still parses.
+        assert!(serde_json::from_str::<SamplingParams>(r#"{"temperature": 0.7}"#).is_ok());
+    }
+
+    /// A present-but-null non-optional field keeps the default (Python's
+    /// `x if x is not None`) — null is absent, not a wrong type.
+    #[test]
+    fn null_field_keeps_default() {
+        let sp = norm(r#"{"temperature": null, "top_k": null, "skip_special_tokens": null}"#);
+        assert_eq!(sp.temperature, 1.0);
+        assert_eq!(sp.top_k, TOP_K_ALL);
+        assert!(sp.skip_special_tokens);
+    }
+
+    /// `skip_tokenizer_init` has no tokenizer, so the text-matching stop features
+    /// and `min_new_tokens` (needs eos_token_id) are 400s, not silent no-ops.
+    /// Mirrors Python `raise_if_tokenizer_required`.
+    #[test]
+    fn tokenizer_dependent_features_rejected_without_tokenizer() {
+        for json in [
+            r#"{"stop": "END"}"#,
+            r#"{"stop_regex": "\\d+"}"#,
+            r#"{"min_new_tokens": 1}"#,
+        ] {
+            let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
+            assert!(
+                sp.normalize(true, None).is_err(),
+                "{json} must be rejected under skip_tokenizer_init"
+            );
+        }
+        // The same params are fine when a tokenizer is present.
+        let mut sp: SamplingParams = serde_json::from_str(r#"{"stop": "END"}"#).unwrap();
+        assert!(sp.normalize(false, None).is_ok());
+    }
+
+    /// `logit_bias` keys index the logits row, so an out-of-vocab id is a 400
+    /// (Python `verify`'s vocab bound). Skipped when the vocab size is unknown.
+    #[test]
+    fn logit_bias_keys_are_vocab_bounded() {
+        let mut sp: SamplingParams =
+            serde_json::from_str(r#"{"logit_bias": {"1000": 1.0}}"#).unwrap();
+        assert!(sp.clone().normalize(false, Some(1000)).is_err());
+        assert!(sp.normalize(false, Some(1001)).is_ok());
+
+        let mut sp: SamplingParams =
+            serde_json::from_str(r#"{"logit_bias": {"999": -1.0}}"#).unwrap();
+        assert!(sp.normalize(false, Some(1000)).is_ok());
     }
 
     /// Bounded regexes get their finite length; unbounded / unparsable ones fall
@@ -494,16 +705,11 @@ mod tests {
     /// O(T²) full-scan sentinel.
     #[test]
     fn bounded_stop_regex_gets_finite_max_len() {
-        let m = norm(&[("stop_regex", Value::from(r"\d{6}"))]);
-        assert_eq!(get(&m, "stop_regex_max_len").as_i64(), Some(6));
-
-        let m = norm(&[("stop_regex", Value::from(r"\d+"))]);
+        assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
         assert_eq!(
-            get(&m, "stop_regex_max_len").as_i64(),
-            Some(STOP_REGEX_MAX_LEN)
+            norm(r#"{"stop_regex": "\\d+"}"#).stop_regex_max_len,
+            STOP_REGEX_MAX_LEN
         );
-
-        let m = norm(&[("temperature", Value::F64(0.7))]);
-        assert_eq!(get(&m, "stop_regex_max_len").as_i64(), Some(0)); // no regex → 0
+        assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
     }
 }
