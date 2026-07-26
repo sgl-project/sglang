@@ -381,6 +381,34 @@ class MambaPool:
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
+    def _detect_conv_window_axis(
+        self, conv_state_shape: List[Tuple[int, int]], win_len: int
+    ) -> int:
+        """Prefer GDN's trailing axis when both match; mixed layer layouts cannot
+        share one overlapping conv-window buffer.
+        """
+        axis = None
+        for conv_shape in conv_state_shape:
+            if conv_shape[-1] == win_len:
+                shape_axis = len(conv_shape) - 1
+            elif conv_shape[0] == win_len:
+                shape_axis = 0
+            else:
+                raise ValueError(
+                    f"conv_state shape {conv_shape} has no axis of length "
+                    f"conv_kernel-1={win_len}; cannot build the deduplicated "
+                    "sliding-window conv-intermediate view."
+                )
+            if axis is None:
+                axis = shape_axis
+            elif axis != shape_axis:
+                raise ValueError(
+                    "inconsistent conv-window axis across conv shapes "
+                    f"{conv_state_shape}; a single conv_window_axis cannot serve "
+                    "mixed layouts."
+                )
+        return axis
+
     def _allocate_deduplicated_conv_window(
         self,
         *,
@@ -445,6 +473,7 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        self.mamba_layer_ids = list(mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -676,6 +705,10 @@ class MambaPool:
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
+                    win_len = cache_params.shape.conv_kernel - 1
+                    self.conv_window_axis = self._detect_conv_window_axis(
+                        conv_state_shape, win_len
+                    )
                     intermediate_conv_window_cache = []
                     for conv_shape in conv_state_shape:
                         phys, view = self._allocate_deduplicated_conv_window(
@@ -842,6 +875,7 @@ class MambaPool:
         return (
             not _is_npu
             and len(convs) > 0
+            and convs[0].shape[0] > 0
             and convs[0].is_cuda
             and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
         )
@@ -1037,6 +1071,16 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_layer_ids(self):
+        """Global model-layer id for each RDMA state entry.
+
+        Aligned element-wise with get_contiguous_buf_infos(), which flattens
+        the state list tensor-major x layer. Lets PD transfer match entries
+        by layer id when prefill (PP stage) holds a subset of the mamba layers.
+        """
+        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
+        return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
@@ -3593,6 +3637,11 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the full-attention KV buffers."""
+        layer_ids = list(self.full_attention_layer_id_mapping)
+        return layer_ids if self.use_mla else layer_ids * 2
+
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
@@ -3602,6 +3651,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_layer_ids(self):
+        """Global layer id per mamba state entry, aligned with get_state_buf_infos()."""
+        return self.mamba_pool.get_state_layer_ids()
 
     def get_state_slice_outer_counts(self):
         """Get the row count preceding each mamba state slice axis."""
