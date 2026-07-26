@@ -27,7 +27,7 @@ if HAS_TRITON:
                 )
             tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
         tl.store(phase_ptr, NEXT_PHASE)
-except ImportError:
+else:
     triton = None
     _phase_check_kernel = None
 
