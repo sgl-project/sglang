@@ -133,7 +133,7 @@ def hisparse_v2_expansion_ratio(server_args) -> float:
         if ratio <= 0:
             raise ValueError(f"expansion_ratio must be > 0, got {ratio}")
         return ratio
-    if getattr(server_args, "hicache_size", 0):
+    if server_args.hicache_size:
         logger.warning(
             "HiSparse V2: --hicache-size is set, so the default expanded "
             "indexer sizing (1 + hicache_ratio = %.1f) may not match the "

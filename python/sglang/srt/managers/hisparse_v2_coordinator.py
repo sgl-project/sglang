@@ -351,6 +351,18 @@ class HiSparseV2Coordinator:
             u8 = [r.view(torch.uint8) for r in refs]
             strides = {v.stride(0) for v in u8}
             assert len(strides) == 1, f"inconsistent host strides: {strides}"
+            # The serve kernel reads token_bytes bytes at each host row
+            # offset (host_kv_stride spaces rows; page_first interleaves
+            # layers, so stride is a layer-count multiple of the cell). A
+            # host cell narrower than the device row would silently
+            # corrupt KV via overread.
+            assert (
+                u8[0].stride(0) >= self.token_bytes
+                and u8[0].stride(0) % self.token_bytes == 0
+            ), (
+                f"host KV row stride {u8[0].stride(0)} is not a multiple "
+                f"of the device row stride {self.token_bytes}"
+            )
             self._host_ptrs.copy_(
                 torch.tensor([v.data_ptr() for v in u8], dtype=torch.int64)
             )

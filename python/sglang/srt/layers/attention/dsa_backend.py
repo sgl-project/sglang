@@ -386,6 +386,7 @@ class DeepseekSparseAttnBackend(
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.enable_hisparse_v2 = model_runner.enable_hisparse_v2
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
@@ -780,12 +781,11 @@ class DeepseekSparseAttnBackend(
 
         Non-V2 rows are bit-identical to the standard table, so the whole
         table can be substituted unconditionally in a mixed batch.
-        Returns None when V2 is off (V1 coordinator lacks
-        get_indexer_page_table), no V2-admitted request is active, or the
-        table is empty — callers then keep the standard table."""
+        Returns None when V2 is off, no V2-admitted request is active, or
+        the table is empty — callers then keep the standard table."""
         if (
             self.hisparse_coordinator is None
-            or not hasattr(self.hisparse_coordinator, "get_indexer_page_table")
+            or not self.enable_hisparse_v2
             or num_pages <= 0
         ):
             return None
@@ -2065,9 +2065,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if self.hisparse_coordinator is not None and hasattr(
-            self.token_to_kv_pool, "translate_loc_to_hisparse_device"
-        ):
+        if self.hisparse_coordinator is not None and not self.enable_hisparse_v2:
             # V1: flash_mla_sparse_fwd / tilelang require int32 page indices.
             page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                 page_table_1

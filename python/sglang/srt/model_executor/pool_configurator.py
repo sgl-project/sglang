@@ -220,7 +220,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 # hisparse_v2_expansion_ratio — single source of truth);
                 # charge that extra per-token indexer cost here so the pool
                 # allocation matches its byte budget.
-                if getattr(kvc.server_args, "enable_hisparse_v2", False):
+                if kvc.server_args.enable_hisparse_v2:
                     from sglang.srt.mem_cache.kv_cache_configurator import (
                         calculate_mla_kv_cache_dim,
                     )

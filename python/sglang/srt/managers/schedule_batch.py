@@ -2693,7 +2693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return (len(req.output_ids), -len(req.origin_input_ids))
 
         def hisparse_v2_protected(req: Req) -> bool:
-            return getattr(req, "_hisparse_v2_unlocked", False)
+            return req._hisparse_v2_unlocked
 
         if server_args.retraction_policy == "priority":
             priority_sign = 1 if server_args.schedule_low_priority_values_first else -1

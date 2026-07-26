@@ -1706,6 +1706,14 @@ class KVCacheConfigurator:
                 self.server_args, self.model_config
             )
             capacity_limit = token_capacity // per_req_gpu_cost
+            if capacity_limit <= 0:
+                raise RuntimeError(
+                    f"HiSparse V2: KV pool capacity ({token_capacity} tokens) "
+                    f"is smaller than one per-request device buffer "
+                    f"({per_req_gpu_cost} tokens); no request could ever run. "
+                    "Increase --max-total-tokens / --mem-fraction-static or "
+                    "reduce hisparse_config device_buffer_size."
+                )
         else:
             capacity_limit = token_capacity // 2
 

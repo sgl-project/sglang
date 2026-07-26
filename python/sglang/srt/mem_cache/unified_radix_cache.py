@@ -753,7 +753,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=req.priority or 0,
             )
 
             # components prepare insert data + return effective cache_len
@@ -942,7 +942,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             dtype=torch.int64, copy=True
         )
         new_node = self._add_new_node(
-            node, suffix_key, suffix_vals, priority=getattr(req, "priority", 0) or 0
+            node, suffix_key, suffix_vals, priority=req.priority or 0
         )
 
         # Reuse the eviction path wholesale: write_backup → demote on
@@ -979,7 +979,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
