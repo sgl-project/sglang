@@ -45,12 +45,20 @@ dynamo-renderer = "5.0.0"
 flume = "0.12.0"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
+# Same major as the workspace pyo3: the zero-copy MM drain
+# (`take_mm`) moves Rust vectors into numpy arrays.
+numpy = "0.29.0"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Pinned EXACTLY: this crate's accepted grammar defines the
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
+# The pure-Rust core of the MM pipeline. `default-features = false`
+# drops the pyo3 bindings so the crate links as a plain rlib; the dependency
+# is renamed so `use sglang_mm::…` reads naturally while the crate keeps its
+# unique `sglang_mm_core` artifact name in the shared workspace target/.
+sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.

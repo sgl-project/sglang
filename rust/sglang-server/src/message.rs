@@ -11,6 +11,7 @@
 mod egress;
 mod finish_reason;
 mod io_struct;
+pub mod mm_payload;
 mod request;
 mod sampling;
 mod types;
@@ -22,7 +23,11 @@ pub use egress::{
 };
 pub use finish_reason::Matched;
 pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
-pub use request::{GenerateBody, GenerateRequest, RequestKind};
+pub use request::{GenerateBody, GenerateRequest, MmRequest, RequestKind};
+// Only tests build an `MmData` directly; everything else receives it packed
+// inside a `GenerateRequest` by `split`.
+#[cfg(test)]
+pub use request::MmData;
 pub(crate) use sampling::{SamplingParams, SamplingParamsInput};
 pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 

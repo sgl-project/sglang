@@ -17,14 +17,17 @@
 //! The egress edges (Streaming/Finalizing/Completed) are driven on the egress
 //! side (see `egress` + `detokenizer`).
 
+use std::collections::HashMap;
+
 use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, RequestState, ValidationOutcome};
+use crate::ids::Rid;
 
 use crate::message::{
-    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, Request,
-    RequestKind,
+    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, MmRequest,
+    Request, RequestKind,
 };
 use crate::ring::IngressProducer;
 use crate::runtime::{Runnable, ServerArgs};
@@ -41,6 +44,21 @@ pub struct Ingress {
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
+    /// Whether the model is multimodal (an MM worker pool consumes `mm_tx`).
+    /// When false, mm fields on a request are silently ignored — the exact
+    /// Python `TokenizerManager` behavior (`mm_processor is None` skips the MM
+    /// block without error).
+    mm_enabled: bool,
+    /// → MM worker pool (spawned via `Server.start_mm_workers`).
+    mm_tx: flume::Sender<MmRequest>,
+    /// Requests parked in `Encoding` while an MM worker processes their
+    /// media; resumed by `MmEncoded` / `MmFailed`. Only this (single) thread
+    /// touches it, so no lock.
+    pending_mm: HashMap<Rid, Request>,
+    /// Native MM results sidecar — purged here when a late result arrives for
+    /// a request that is no longer parked (it would otherwise leak: only the
+    /// scheduler drain pops entries).
+    mm_sidecar: crate::mm::Sidecar,
     shutdown: flume::Receiver<()>,
 }
 
@@ -98,12 +116,16 @@ impl TryFrom<&ServerArgs> for Limits {
 }
 
 impl Ingress {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
+        mm_enabled: bool,
+        mm_tx: flume::Sender<MmRequest>,
+        mm_sidecar: crate::mm::Sidecar,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
@@ -112,6 +134,10 @@ impl Ingress {
             senders,
             ingress,
             limits,
+            mm_enabled,
+            mm_tx,
+            pending_mm: HashMap::new(),
+            mm_sidecar,
             shutdown,
         }
     }
@@ -124,7 +150,7 @@ enum Lane {
 }
 
 impl Runnable for Ingress {
-    fn run(self) {
+    fn run(mut self) {
         loop {
             // Select, not a drain-then-block: an abort arriving while the inbox is
             // idle must still be handled at once.
@@ -138,6 +164,12 @@ impl Runnable for Ingress {
                 // A fresh request and one returning from the tokenizer pool.
                 Some(Lane::Event(TmEvent::Ingress(req) | TmEvent::Tokenized(req))) => {
                     self.drive(req)
+                }
+                Some(Lane::Event(TmEvent::MmEncoded { rid, input_ids })) => {
+                    self.on_mm_encoded(rid, input_ids)
+                }
+                Some(Lane::Event(TmEvent::MmFailed { rid, message })) => {
+                    self.on_mm_failed(rid, message)
                 }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
@@ -168,6 +200,9 @@ impl Ingress {
         if err.http_status() == 500 {
             tracing::error!(rid = %req.rid, error = %err, "ingress rejected request");
         }
+        // A rejected request never reaches the scheduler drain: purge any
+        // parked MM result (no-op for the common non-mm request).
+        self.mm_sidecar.lock().unwrap().remove(req.rid.as_str());
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(EgressItem::Error(err)); // client may be gone
         if registered {
@@ -178,11 +213,12 @@ impl Ingress {
     }
 
     /// Drive a request through its ingress states until it terminates (failed or
-    /// pushed to the ring) or is handed to the tokenizer pool (re-entering as a
-    /// `Tokenized` event). Each arm acts and advances the FSM; the loop
-    /// re-dispatches. The arms are the design table's states, `Failed` the single
-    /// reject path.
-    fn drive(&self, mut req: Request) {
+    /// pushed to the ring), is handed to the tokenizer pool (re-entering as a
+    /// `Tokenized` event), or is parked in `pending_mm` awaiting an MM worker
+    /// (re-entering via `MmEncoded` / `MmFailed`). Each arm acts and advances
+    /// the FSM; the loop re-dispatches. The arms are the design table's states,
+    /// `Failed` the single reject path.
+    fn drive(&mut self, mut req: Request) {
         // Flipped once `register_detok` succeeds; `fail` must not deregister before
         // that (see `fail`). A pool return re-enters `drive` already registered.
         let mut registered = !matches!(req.state, RequestState::Received);
@@ -235,6 +271,13 @@ impl Ingress {
                             .normalize(self.limits.skip_tokenizer_init, self.limits.vocab_size)
                         {
                             Err(e) => Err(e),
+                            // Multimodal (and MM workers are up): the native MM
+                            // pipeline produces the final input_ids — even for
+                            // pre-tokenized prompts (placeholder expansion), the
+                            // same precedence as the Python TokenizerManager.
+                            Ok(()) if self.mm_enabled && g.has_multimodal() => {
+                                Ok(ValidationOutcome::HasMultimodal)
+                            }
                             // Client ids skip the pool; text goes to the tokenizer.
                             Ok(()) if g.already_tokenized() => {
                                 Ok(ValidationOutcome::AlreadyTokenized)
@@ -251,6 +294,46 @@ impl Ingress {
                             let _ = req.state.apply(Event::Validated(o));
                         }
                     }
+                }
+                // Hand off to the MM worker pool and park the request; it
+                // re-enters via `MmEncoded` (→ PreSendValidating) or `MmFailed`
+                // (→ reject). Doesn't loop.
+                RequestState::Encoding => {
+                    let payload = {
+                        let RequestKind::Generate(g) = &req.kind else {
+                            self.fail(
+                                &mut req,
+                                Error::Internal("non-generate request in Encoding".into()),
+                                registered,
+                            );
+                            return;
+                        };
+                        match g.to_mm_payload_msgpack() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.fail(&mut req, e, registered);
+                                return;
+                            }
+                        }
+                    };
+                    let msg = MmRequest {
+                        rid: req.rid.clone(),
+                        payload,
+                    };
+                    // Full channel = the MM pool can't keep up → backpressure,
+                    // same as a full ingress ring. Disconnected = pool gone.
+                    if let Err(e) = self.mm_tx.try_send(msg) {
+                        let err = match e {
+                            flume::TrySendError::Full(_) => Error::QueueFull,
+                            flume::TrySendError::Disconnected(_) => {
+                                Error::Internal("mm worker pool gone".into())
+                            }
+                        };
+                        self.fail(&mut req, err, registered);
+                        return;
+                    }
+                    self.pending_mm.insert(req.rid.clone(), req);
+                    return;
                 }
                 // Hand off to the tokenizer pool; it returns the request as a
                 // `Tokenized` event (PreSendValidating, or Failed on error).
@@ -392,6 +475,39 @@ impl Ingress {
         }
     }
 
+    /// An MM worker finished a parked request: fill the final expanded
+    /// `input_ids`, advance `Encoding → PreSendValidating`, and resume driving
+    /// (pre-send checks → ring): expanded image tokens count against the same
+    /// input + `max_new_tokens` ceiling as tokenized text.
+    /// No pending entry means the request was already rejected/aborted — the
+    /// result is dropped (its sidecar entry is popped by the abort path /
+    /// never attached).
+    fn on_mm_encoded(&mut self, rid: Rid, input_ids: Vec<i32>) {
+        let Some(mut req) = self.pending_mm.remove(&rid) else {
+            tracing::debug!(rid = %rid, "mm result for unknown/finished request; dropped");
+            // The request will never reach the scheduler drain, so its
+            // sidecar entry (if any) must be purged here or it leaks.
+            self.mm_sidecar.lock().unwrap().remove(rid.as_str());
+            return;
+        };
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(input_ids);
+        }
+        let _ = req.state.apply(Event::EncodeDone); // Encoding → PreSendValidating
+        self.drive(req);
+    }
+
+    /// An MM worker failed a parked request (bad URL, processor error):
+    /// reject it back to the client, mirroring the Python TokenizerManager's
+    /// per-request exception → 400 behavior.
+    fn on_mm_failed(&mut self, rid: Rid, message: String) {
+        let Some(mut req) = self.pending_mm.remove(&rid) else {
+            tracing::debug!(rid = %rid, "mm failure for unknown/finished request; dropped");
+            return;
+        };
+        self.fail(&mut req, Error::Encode(message), true); // parked ⇒ registered
+    }
+
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
@@ -400,6 +516,13 @@ impl Ingress {
     /// That wastes GPU work until the request finishes on its own, but it cannot be
     /// misdelivered — the rid is unique to this request for the process's lifetime
     /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    ///
+    /// A request parked in `pending_mm` is deliberately left there: its MM
+    /// processing completes, it flows to the scheduler, and its output is
+    /// dropped by the (deregistered) detok shard. That keeps the sidecar entry
+    /// from leaking (the ring drain always consumes it) at the cost of one
+    /// bounded wasted generation — the Python server has the same race when an
+    /// abort lands while `_tokenize_one_request` is mid-flight.
     fn on_abort(&self, source: AbortSource) {
         let rid = source.rid().clone();
         let _ = self
@@ -616,12 +739,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —
-    /// dropping it closes the ring → false QueueFull), and tm inbox sender.
+    /// dropping it closes the ring → false QueueFull), tm inbox sender, and the
+    /// mm-bridge receiver (keep alive — dropping it makes mm submits fail).
     fn make_ingress() -> (
         Ingress,
         flume::Receiver<DetokMsg>,
         IngressConsumer,
         flume::Sender<TmEvent>,
+        flume::Receiver<MmRequest>,
     ) {
         make_ingress_with(test_limits())
     }
@@ -633,6 +758,7 @@ mod tests {
         flume::Receiver<DetokMsg>,
         IngressConsumer,
         flume::Sender<TmEvent>,
+        flume::Receiver<MmRequest>,
     ) {
         make_ingress_inner(test_limits(), abort_rx)
     }
@@ -644,6 +770,7 @@ mod tests {
         flume::Receiver<DetokMsg>,
         IngressConsumer,
         flume::Sender<TmEvent>,
+        flume::Receiver<MmRequest>,
     ) {
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
@@ -658,6 +785,7 @@ mod tests {
         flume::Receiver<DetokMsg>,
         IngressConsumer,
         flume::Sender<TmEvent>,
+        flume::Receiver<MmRequest>,
     ) {
         let (tok_tx, _tok_rx) = flume::unbounded();
         let (detok_tx, detok_rx) = flume::unbounded();
@@ -669,12 +797,23 @@ mod tests {
         };
         let (ingress_producer, consumer) = ingress_ring(16);
         let (tm_tx, tm_rx) = flume::unbounded();
+        let (mm_tx, mm_rx) = flume::unbounded();
         // Keep the shutdown sender alive (leak) so its branch never fires — tests
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
-        (ingress, detok_rx, consumer, tm_tx)
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            ingress_producer,
+            limits,
+            true,
+            mm_tx,
+            Default::default(),
+            sd_rx,
+        );
+        (ingress, detok_rx, consumer, tm_tx, mm_rx)
     }
 
     /// Both abort sources do the same two things: drop the detok entry so no
@@ -707,6 +846,9 @@ mod tests {
                 },
                 ingress_producer,
                 test_limits(),
+                true,
+                flume::unbounded().0,
+                Default::default(),
                 sd_rx,
             );
 
@@ -960,7 +1102,7 @@ mod tests {
     /// to the ring, after registration — so it must be deregistered, not leaked.
     #[test]
     fn over_context_request_deregisters_and_never_reaches_the_ring() {
-        let (ingress, detok_rx, consumer, _tm_tx) = make_ingress_with(Limits {
+        let (mut ingress, detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress_with(Limits {
             context_len: 4,
             ..test_limits()
         });
@@ -1071,7 +1213,17 @@ mod tests {
         let (_tm_tx, tm_rx) = flume::unbounded();
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, producer, test_limits(), sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            producer,
+            test_limits(),
+            true,
+            flume::unbounded().0,
+            Default::default(),
+            sd_rx,
+        );
 
         ingress.on_abort(AbortSource::Guard("pushed".into()));
         ingress.on_abort(AbortSource::Guard("dropped".into()));
@@ -1108,7 +1260,7 @@ mod tests {
     #[test]
     fn pre_registration_failure_does_not_deregister() {
         // Rejected inside `validate` (out-of-vocab id), which runs before registration.
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         let mut req = generate_req(41, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![2_000_000_000]);
@@ -1121,7 +1273,7 @@ mod tests {
         );
 
         // A post-registration reject still deregisters (the leak fix stays fixed).
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         ingress.drive(generate_req(
             42,
             SamplingParams {
@@ -1140,7 +1292,7 @@ mod tests {
     /// sees `Register` then `Deregister`. Regression for RSS growth on bad input.
     #[test]
     fn rejected_request_deregisters_from_shard() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         // top_p = 2.0 is outside (0, 1], so `SamplingParams::normalize` rejects it.
         let bad = SamplingParams {
             top_p: 2.0,
@@ -1167,7 +1319,7 @@ mod tests {
     /// and kills the scheduler process (`make_ingress` bounds vocab at 1000).
     #[test]
     fn out_of_vocab_input_ids_rejected() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         let mut req = generate_req(21, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![1, 2_000_000_000]);
@@ -1185,7 +1337,7 @@ mod tests {
     /// Same guard for negative ids and for `token_ids_logprob` entries.
     #[test]
     fn negative_and_logprob_token_ids_rejected() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         let mut req = generate_req(22, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.input_ids = Some(vec![-1]);
@@ -1196,7 +1348,7 @@ mod tests {
             Ok(_) => panic!("negative token id must not be admitted"),
         }
 
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         let mut req = generate_req(23, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
             g.token_ids_logprob = Some(vec![999_999]);
@@ -1211,7 +1363,7 @@ mod tests {
     /// A valid request is registered and handed onward — never deregistered.
     #[test]
     fn admitted_request_keeps_registration() {
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         // Empty map → all sampling defaults, passes normalization.
         ingress.drive(generate_req(9, SamplingParams::default()));
 
@@ -1229,7 +1381,7 @@ mod tests {
     /// path and deregistered, not leaked.
     #[test]
     fn tokenize_failure_deregisters_via_ingress() {
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
+        let (ingress, detok_rx, _consumer, tm_tx, _mm_rx) = make_ingress();
         // The pool marks a failed encode as `Failed(err)` before returning it.
         let mut req = generate_req(11, SamplingParams::default());
         let _ = req
@@ -1253,7 +1405,7 @@ mod tests {
     fn abort_deregisters_from_shard() {
         // Aborts arrive on their own unbounded lane now, not the request inbox.
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress_with_abort(abort_rx);
+        let (ingress, detok_rx, _consumer, tm_tx, _mm_rx) = make_ingress_with_abort(abort_rx);
         abort_tx.send(AbortSource::Guard("rid-13".into())).unwrap();
         drop(abort_tx);
         drop(tm_tx);
@@ -1270,7 +1422,7 @@ mod tests {
     /// rejected; its registration is untouched.
     #[test]
     fn tokenized_return_pushes_without_deregister() {
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
+        let (ingress, detok_rx, _consumer, tm_tx, _mm_rx) = make_ingress();
         let mut req = generate_req(15, SamplingParams::default());
         // Simulate a successful pool return: ids filled, PreSendValidating.
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -1293,7 +1445,7 @@ mod tests {
     #[test]
     fn tokenize_pool_gone_deregisters() {
         // `make_ingress` drops the tok receiver, so `tok.send` fails.
-        let (ingress, detok_rx, _consumer, _tm_tx) = make_ingress();
+        let (mut ingress, detok_rx, _consumer, _tm_tx, _mm_rx) = make_ingress();
         // No ids → NeedsTokenize → Tokenizing branch.
         let mut req = generate_req(21, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut req.kind {
@@ -1310,5 +1462,128 @@ mod tests {
             "pool-gone hand-off must deregister rid 21",
         );
         assert!(detok_rx.try_recv().is_err(), "no further shard messages");
+    }
+
+    /// Build a generate request carrying an image. The parked entry and the
+    /// `MmEncoded` resume path agree on identity via the rid string.
+    fn mm_generate_req(rid: &str) -> Request {
+        let (tx, _rx) = mpsc::channel(8);
+        Request {
+            rid: rid.to_string().into(),
+            state: RequestState::Received,
+            sink: EgressSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: rid.to_string().into(),
+                text: Some("<image> hi".into()),
+                mm: Some(Box::new(crate::message::MmData {
+                    image_data: Some(rmpv::Value::from("data:image/jpeg;base64,xxxx")),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// A multimodal request parks in `Encoding` (submitted to the mm worker
+    /// pool, not the tokenizer pool, not the ring) until `MmEncoded` resumes
+    /// it → ring.
+    #[test]
+    fn mm_request_parks_then_mm_encoded_pushes_to_ring() {
+        let (mut ingress, _detok_rx, consumer, _tm_tx, mm_rx) = make_ingress();
+        ingress.drive(mm_generate_req("mm-1"));
+
+        // Submitted to the mm pool with the mm payload; nothing on the ring yet.
+        let sub = mm_rx.try_recv().expect("mm pool must receive the request");
+        assert_eq!(sub.rid.as_str(), "mm-1");
+        let val = rmpv::decode::read_value(&mut &sub.payload[..]).unwrap();
+        let arr = val
+            .as_array()
+            .expect("payload is [text, ids, img, vid, aud]");
+        assert_eq!(arr[0].as_str(), Some("<image> hi"));
+        assert!(arr[1].is_nil(), "no client input_ids");
+        assert_eq!(arr[2].as_str(), Some("data:image/jpeg;base64,xxxx"));
+        assert!(consumer.drain(16).headers.is_empty(), "parked, not queued");
+
+        // Bridge returns the final expanded ids → pushed to the ring.
+        ingress.on_mm_encoded("mm-1".to_string().into(), vec![5, 6, 7, 8]);
+        let batch = consumer.drain(16);
+        assert_eq!(batch.headers.len(), 1);
+        assert_eq!(
+            batch.lengths,
+            vec![4],
+            "expanded ids ride the columnar cell"
+        );
+    }
+
+    /// A bridge failure rejects the parked request (deregister, no ring push).
+    #[test]
+    fn mm_failure_rejects_parked_request() {
+        let (mut ingress, detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
+        ingress.drive(mm_generate_req("mm-2"));
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })),
+            "registered before parking",
+        );
+
+        ingress.on_mm_failed("mm-2".to_string().into(), "bad image".into());
+        assert!(
+            matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid })
+                if rid.as_str() == "mm-2"),
+            "mm failure must deregister",
+        );
+        assert!(consumer.drain(16).headers.is_empty(), "nothing queued");
+    }
+
+    /// With no bridge attached (`mm_enabled == false`, the non-multimodal-model
+    /// case), image_data is silently ignored and the request tokenizes as plain
+    /// text — the Python TokenizerManager behavior when `mm_processor is None`.
+    #[test]
+    fn mm_fields_ignored_when_bridge_disabled() {
+        let (tok_tx, tok_rx) = flume::unbounded();
+        let (detok_tx, _detok_rx) = flume::unbounded();
+        let senders = Senders {
+            tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
+            tok: tok_tx,
+            detok: vec![detok_tx],
+        };
+        let (ingress_producer, _consumer) = ingress_ring(16);
+        let (_tm_tx, tm_rx) = flume::unbounded();
+        let (mm_tx, mm_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        std::mem::forget(abort_tx);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let mut ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            senders,
+            ingress_producer,
+            test_limits(),
+            false,
+            mm_tx,
+            Default::default(),
+            sd_rx,
+        );
+
+        ingress.drive(mm_generate_req("mm-3"));
+        assert!(
+            mm_rx.try_recv().is_err(),
+            "bridge disabled: nothing submitted to the mm channel",
+        );
+        assert!(
+            tok_rx.try_recv().is_ok(),
+            "request must fall through to plain tokenization",
+        );
+    }
+
+    /// A late mm result for a rid that is no longer parked is dropped without
+    /// panicking (e.g. hash-collision overwrite) — regression guard.
+    #[test]
+    fn late_mm_result_is_dropped() {
+        let (mut ingress, _detok_rx, consumer, _tm_tx, _mm_rx) = make_ingress();
+        ingress.on_mm_encoded("ghost".to_string().into(), vec![1]);
+        ingress.on_mm_failed("ghost".to_string().into(), "boom".into());
+        assert!(consumer.drain(16).headers.is_empty());
     }
 }

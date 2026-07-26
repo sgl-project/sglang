@@ -36,6 +36,15 @@ pub enum TmEvent {
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled) on success,
     /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
+    /// An MM worker finished a request parked in `Encoding`: `input_ids` are
+    /// the final (placeholder-expanded) prompt ids from the native pipeline.
+    /// The mm buffers ride the Rust sidecar (rid-keyed, popped by
+    /// `RustServer.drain` via `Server.take_mm`), not this event.
+    MmEncoded { rid: Rid, input_ids: Vec<i32> },
+    /// An MM worker rejected a request parked in `Encoding` (bad media URL,
+    /// unsupported modality, preprocess error, …) — reject it back to the
+    /// client as a 400.
+    MmFailed { rid: Rid, message: String },
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.
