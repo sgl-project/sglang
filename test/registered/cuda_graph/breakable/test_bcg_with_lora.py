@@ -32,9 +32,11 @@ BASE_MODEL = "Qwen/Qwen3-4B"
 LORA_ADAPTER = "nissenj/Qwen3-4B-lora-v2"
 LORA_NAME = "lora0"
 
-# Max per-token prompt logprob diff tolerated between graph and eager runs
-# (bf16; token-axis padding can perturb GEMM tiling slightly).
-GRAPH_VS_EAGER_TOLERANCE = 1e-1
+# Both servers run with --enable-deterministic-inference (batch-invariant
+# kernels), so logprobs must not depend on how the scheduler composes
+# prefill batches — the graph-vs-eager comparison is exact by construction.
+# Measured diff is 0 on H200 for both csgmv and triton; 1e-2 is headroom.
+GRAPH_VS_EAGER_TOLERANCE = 1e-2
 # The adapter must move at least one prompt logprob by this much.
 LORA_EFFECT_THRESHOLD = 5e-2
 
@@ -110,6 +112,7 @@ class BCGLoRAServerMixin:
             "0.8",
             "--random-seed",
             "42",
+            "--enable-deterministic-inference",
         ]
 
     @classmethod
