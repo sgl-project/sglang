@@ -107,6 +107,7 @@ except ImportError:
     sys.modules["triton.compiler.compiler"] = _triton_mock.compiler.compiler
     sys.modules["triton.runtime"] = _triton_mock.runtime
     sys.modules["triton.runtime.autotuner"] = _triton_mock.runtime.autotuner
+    sys.modules["triton.runtime.jit"] = _triton_mock.runtime.jit
 
     triton = _triton_mock
 from packaging import version as pkg_version
