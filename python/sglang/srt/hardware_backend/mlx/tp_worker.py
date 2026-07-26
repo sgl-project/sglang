@@ -78,6 +78,12 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         self._mlx_active_rids: set[str] = set()
+        # Requests whose KV-cache release point has passed (finished or
+        # aborted) but whose MLX per-request state may still be referenced by
+        # an in-flight overlap pending job.  Actually released by
+        # _cleanup_stale_rids on the next scheduler-built forward, by which
+        # point every pending job containing them has been finalized.
+        self._mlx_released_rids: set[str] = set()
         self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
@@ -116,14 +122,31 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
     def _cleanup_stale_rids(self, forward_mode, current_rids: set[str]) -> None:
-        """Remove MLX state for decode-mode requests that dropped out of the batch."""
+        """Remove MLX state for requests that dropped out of the batch.
+
+        Decode batches drop every request not in the current composition.
+        Extend batches release only requests explicitly marked at their KV
+        release point (prepare_for_kv_cache_release): without this, workloads
+        that never form a decode batch (prefill-only traffic, e.g.
+        max_new_tokens=1 classification/scoring) leak one per-request
+        ContiguousAttentionKVCache list per request, unbounded.
+
+        Both paths run at the start of a scheduler-built forward, after every
+        previously launched overlap pending job has been finalized, so no
+        in-flight chained decode can still reference the removed state.
+        """
         if forward_mode.is_decode():
             stale_rids = self._mlx_active_rids - current_rids
             for rid in stale_rids:
                 self._mlx_runner.remove_request(rid)
             self._mlx_active_rids = current_rids
+            self._mlx_released_rids -= stale_rids
         else:
-            self._mlx_active_rids |= current_rids
+            releasable = self._mlx_released_rids - current_rids
+            for rid in releasable:
+                self._mlx_runner.remove_request(rid)
+            self._mlx_released_rids -= releasable
+            self._mlx_active_rids = (self._mlx_active_rids | current_rids) - releasable
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point.
@@ -140,6 +163,12 @@ class MlxTpModelWorker(TpModelWorker):
             # insert. Any older tracked slot is released during component cleanup.
             req.mamba_last_track_seqlen = None
             self._mlx_runner.sync_and_release_request(req.rid)
+
+            # Mark for deferred release; see _cleanup_stale_rids. Removing
+            # here would break overlap: a chained pending job launched before
+            # this request was known to be finished may still reference its
+            # per-request caches and token list.
+            self._mlx_released_rids.add(req.rid)
 
     def prepare_for_retraction(self, req) -> None:
         """Drop MLX runner state when the scheduler retracts (or OOM-aborts) a request.

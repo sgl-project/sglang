@@ -239,16 +239,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
-                        # Pre-release hook: a request can finish through this
-                        # (mixed / prefill) path too, not only the decode path.
-                        # Without it, the MLX runner's dirty decode tail is dropped
-                        # while the radix insert still runs with is_insert=True,
-                        # so a later prefix hit reads stale slots.
-                        prepare_release = getattr(
-                            self.model_worker, "prepare_for_kv_cache_release", None
-                        )
-                        if callable(prepare_release):
-                            prepare_release(req)
+                        self._prepare_model_worker_kv_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -338,6 +329,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
+                        self._prepare_model_worker_kv_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
@@ -936,6 +928,20 @@ class SchedulerBatchResultProcessor:
             None if logprobs is None else logprobs[i]
         )
 
+    def _prepare_model_worker_kv_release(self, req: Req) -> None:
+        """Give the model worker a pre-release hook for a finished request.
+
+        Backends with worker-owned per-request state (MLX) snapshot and mark
+        it for release here, while the request's bookkeeping is still valid.
+        Called on every finish path — prefill-finished requests included —
+        right before release_kv_cache. No-op for workers without the hook.
+        """
+        prepare_release = getattr(
+            self.model_worker, "prepare_for_kv_cache_release", None
+        )
+        if callable(prepare_release):
+            prepare_release(req)
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -976,11 +982,7 @@ class SchedulerBatchResultProcessor:
             else:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                prepare_release = getattr(
-                    self.model_worker, "prepare_for_kv_cache_release", None
-                )
-                if callable(prepare_release):
-                    prepare_release(req)
+                self._prepare_model_worker_kv_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
                     if get_server_args().enable_mamba_extra_buffer_lazy()
