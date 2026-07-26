@@ -102,17 +102,40 @@ def _make_scheduler(tree_cache, *, waiting_queue):
     s.running_batch = None
     s.last_batch = None
     s.dllm_config = None
+    # Queue-limit admission control; tests that exercise it raise the limit.
+    s.max_queued_requests = None
+    s.enable_priority_scheduling = False
+    s.schedule_low_priority_values_first = False
     return s
 
 
-def _queue_turn(session, scheduler, rid, input_ids, session_id="s0"):
+def _new_turn(session, rid, input_ids, session_id="s0"):
+    """Build a real turn without queueing it, as `_add_request_to_queue` sees it."""
     req = session.create_req(
         _make_recv_req(rid, input_ids, session_id), None, VOCAB_SIZE
     )
     req.mamba_pool_idx = None
     req.req_pool_idx = None
     req.kv = None
+    return req
+
+
+def _queue_turn(session, scheduler, rid, input_ids, session_id="s0"):
+    req = _new_turn(session, rid, input_ids, session_id)
     scheduler.waiting_queue.append(req)
+    return req
+
+
+def _plain_req(rid, input_ids, priority=None):
+    """Ordinary non-session traffic, which also flows through the queue limit."""
+    req = _new_turn(
+        Session(capacity_of_str_len=0, session_id=rid, streaming=True),
+        rid,
+        input_ids,
+        session_id=rid,
+    )
+    req.session = None
+    req.priority = priority
     return req
 
 
@@ -462,6 +485,195 @@ class TestQueuedSessionAbortMambaOwnership(CustomTestCase):
 
         self.assertEqual([t.tolist() for t in released], [[[2]]])
         self.assertIsNone(req.mamba_pool_idx)
+        self.assertEqual(tree_cache.cache_finished_req_calls, [])
+        self.assertFalse(session._inflight)
+
+
+class TestQueueLimitSessionRemoval(CustomTestCase):
+    """`_abort_on_queued_limit` is the third terminal waiting-queue path.
+
+    It removes a turn either by rejecting an incoming request once the queue is
+    full, or -- under priority scheduling -- by evicting an existing, lower
+    priority one. Both removals are as final as an explicit abort, so both need
+    the same session finalization. Only the `DisaggregationMode.NULL` branch of
+    `_add_request_to_queue` consults the limit, so the PD queues never reach it.
+    """
+
+    def setUp(self):
+        self._parallel_override = get_parallel().override(tp_rank=0)
+        self._parallel_override.__enter__()
+        self.addCleanup(self._parallel_override.__exit__, None, None, None)
+
+    def _committed_session(self, tree_cache, *, priority_scheduling=False):
+        """A session with one committed turn, and a scheduler at its queue limit."""
+        session = Session(capacity_of_str_len=0, session_id="s0", streaming=True)
+        scheduler = _make_scheduler(tree_cache, waiting_queue=[])
+        scheduler.max_queued_requests = 1
+        scheduler.enable_priority_scheduling = priority_scheduling
+
+        first = _queue_turn(session, scheduler, "r1", [11, 12, 13])
+        _finish_turn(session, first, [91, 92])
+        scheduler.waiting_queue.clear()
+        return session, scheduler
+
+    # -- incoming request rejected --------------------------------------
+
+    def test_queue_limit_rejection_finalizes_the_session(self):
+        """A turn refused admission must release the session it borrowed."""
+        tree_cache = _RecordingTreeCache()
+        session, scheduler = self._committed_session(tree_cache)
+        scheduler.waiting_queue.append(_plain_req("other", [1, 2]))
+
+        # The queue is already full, so this turn never joins it.
+        incoming = _new_turn(session, "r2", [44, 55, 66])
+        self.assertTrue(session._inflight)
+
+        with unittest.mock.patch.object(
+            session, "abort_req", wraps=session.abort_req
+        ) as abort_spy:
+            rejected = scheduler._abort_on_queued_limit(incoming)
+
+        self.assertTrue(rejected)
+        self.assertEqual(abort_spy.call_count, 1)
+        self.assertFalse(session._inflight)
+        self.assertNotIn(incoming, scheduler.waiting_queue)
+        self.assertEqual(tree_cache.cache_finished_req_calls, [])
+
+        # Non-session traffic on the same path keeps its existing behaviour.
+        self.assertTrue(scheduler._abort_on_queued_limit(_plain_req("p1", [3, 4])))
+        self.assertEqual(tree_cache.cache_finished_req_calls, [])
+
+    def test_queue_limit_rejection_does_not_commit_the_turn(self):
+        """A rejected prompt never ran, so it must not become session history."""
+        tree_cache = _RecordingTreeCache()
+        session, scheduler = self._committed_session(tree_cache)
+        scheduler.waiting_queue.append(_plain_req("other", [1, 2]))
+        committed_len = session.committed_origin_len
+
+        scheduler._abort_on_queued_limit(_new_turn(session, "r2", [44, 55, 66]))
+
+        self.assertEqual(session.committed_origin_len, committed_len)
+        self.assertEqual(list(session.req_nodes), ["r1"])
+
+        follow_up = session.create_req(
+            _make_recv_req("r3", [77, 88], "s0"), None, VOCAB_SIZE
+        )
+        self.assertIsNone(follow_up.to_finish)
+        context = list(follow_up.origin_input_ids)
+        self.assertEqual(context, [11, 12, 13, 91, 92, 77, 88])
+        for token in (44, 55, 66):
+            self.assertNotIn(token, context)
+
+    # -- existing request evicted by priority ---------------------------
+
+    def test_priority_eviction_finalizes_the_evicted_session_turn(self):
+        """The evicted turn, not the admitted one, must be finalized."""
+        tree_cache = _RecordingTreeCache()
+        session, scheduler = self._committed_session(
+            tree_cache, priority_scheduling=True
+        )
+
+        queued = _queue_turn(session, scheduler, "r2", [44, 55, 66])
+        queued.priority = 1
+        self.assertTrue(session._inflight)
+
+        # Larger values rank higher by default, so this preempts the queued turn.
+        incoming = _plain_req("hi", [7, 8], priority=9)
+
+        with unittest.mock.patch.object(
+            session, "abort_req", wraps=session.abort_req
+        ) as abort_spy:
+            rejected = scheduler._abort_on_queued_limit(incoming)
+
+        # The incoming request was admitted, so it is the queued turn that went.
+        self.assertFalse(rejected)
+        self.assertNotIn(queued, scheduler.waiting_queue)
+        self.assertEqual(abort_spy.call_count, 1)
+        self.assertFalse(session._inflight)
+        self.assertEqual(tree_cache.cache_finished_req_calls, [])
+
+    def test_priority_eviction_does_not_commit_the_turn(self):
+        """Eviction must leave the last committed prefix as the session's tail."""
+        tree_cache = _RecordingTreeCache()
+        session, scheduler = self._committed_session(
+            tree_cache, priority_scheduling=True
+        )
+        committed_len = session.committed_origin_len
+
+        queued = _queue_turn(session, scheduler, "r2", [44, 55, 66])
+        queued.priority = 1
+        scheduler._abort_on_queued_limit(_plain_req("hi", [7, 8], priority=9))
+
+        self.assertEqual(session.committed_origin_len, committed_len)
+        self.assertEqual(list(session.req_nodes), ["r1"])
+
+        follow_up = session.create_req(
+            _make_recv_req("r3", [77, 88], "s0"), None, VOCAB_SIZE
+        )
+        self.assertIsNone(follow_up.to_finish)
+        context = list(follow_up.origin_input_ids)
+        self.assertEqual(context, [11, 12, 13, 91, 92, 77, 88])
+        for token in (44, 55, 66):
+            self.assertNotIn(token, context)
+
+    def test_priority_eviction_preserves_slot_owned_state(self):
+        """State the evicted turn borrowed from its slot stays with the slot."""
+        streaming_cache, mamba_allocator = _make_streaming_cache()
+        session, scheduler = self._committed_session(
+            streaming_cache, priority_scheduling=True
+        )
+
+        slot = SessionSlot(
+            req_pool_idx=3,
+            kv_committed_len=5,
+            kv=SimpleNamespace(kv_allocated_len=5, swa_evicted_seqlen=0),
+            mamba_pool_idx=torch.tensor([2], dtype=torch.int64),
+        )
+        streaming_cache.slots["s0"] = slot
+
+        queued = _queue_turn(session, scheduler, "r2", [44, 55, 66])
+        slot.restore_to_req(queued)
+        queued.priority = 1
+
+        scheduler._abort_on_queued_limit(_plain_req("hi", [7, 8], priority=9))
+
+        self.assertIn("s0", streaming_cache.slots)
+        self.assertEqual(slot.req_pool_idx, 3)
+        self.assertIsNotNone(slot.mamba_pool_idx)
+        self.assertEqual(mamba_allocator.freed, [])
+        self.assertEqual(streaming_cache.inner.token_to_kv_pool_allocator.freed, [])
+        self.assertEqual(streaming_cache.req_to_token_pool.free_slots, [])
+        self.assertFalse(session._inflight)
+        self.assertEqual(list(session.req_nodes), ["r1"])
+
+    def test_priority_eviction_releases_first_turn_mamba_state(self):
+        """Eviction is the last chance to free a first turn's own Mamba state.
+
+        `get_new_batch_prefill` deliberately leaves a session request's Mamba
+        index alone when it declines to admit it, so a first turn can sit in the
+        waiting queue still owning one.
+        """
+        session = Session(capacity_of_str_len=0, session_id="s0", streaming=True)
+        tree_cache = _RecordingTreeCache()
+        scheduler = _make_scheduler(tree_cache, waiting_queue=[])
+        scheduler.max_queued_requests = 1
+        scheduler.enable_priority_scheduling = True
+
+        queued = _queue_turn(session, scheduler, "r1", [11, 12, 13])
+        queued.priority = 1
+        queued.mamba_pool_idx = torch.tensor([2], dtype=torch.int64)
+
+        released = []
+        tree_cache.supports_mamba = lambda: True
+        tree_cache.req_to_token_pool = SimpleNamespace(
+            mamba_allocator=SimpleNamespace(free=released.append)
+        )
+
+        scheduler._abort_on_queued_limit(_plain_req("hi", [7, 8], priority=9))
+
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual([t.tolist() for t in released], [[[2]]])
+        self.assertIsNone(queued.mamba_pool_idx)
         self.assertEqual(tree_cache.cache_finished_req_calls, [])
         self.assertFalse(session._inflight)
 

@@ -2786,6 +2786,16 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
+        # Terminal for `req_to_abort`, whether it is the incoming turn that was
+        # never admitted or an existing queued turn evicted by a higher priority
+        # one, so both need the same finalization as an explicit abort.
+        slot_owned_state = self._finalize_queued_session_turn(req_to_abort)
+        # A turn that never ran still owns any Mamba state allocated for it, and
+        # nothing else will free it. State on loan from a session slot is
+        # skipped: the slot keeps owning it for the next turn.
+        if req_to_abort.mamba_pool_idx is not None and not slot_owned_state:
+            release_kv_cache(req_to_abort, self.tree_cache, is_insert=False)
+
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
