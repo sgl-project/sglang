@@ -21,7 +21,6 @@ QWEN3_6_27B_64K_PREFIX_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
@@ -46,24 +45,23 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     "--max-running-requests",
     20,
     "--max-mamba-cache-size",
-    120,
+    160,
     "--mem-fraction-static",
-    0.8,
+    0.82,
     "--cuda-graph-bs",
     1,
     2,
-    4,
-    8,
+    5,
     10,
-    12,
-    16,
-    18,
+    15,
+    17,
+    19,
     20,
-    "--enable-prefill-delayer",
-    "--prefill-delayer-queue-min-ratio",
-    0.5,
-    "--prefill-delayer-max-delay-ms",
-    30000,
+    # "--enable-prefill-delayer",
+    # "--prefill-delayer-queue-min-ratio",
+    # 0.7,
+    # "--prefill-delayer-max-delay-ms",
+    # 20000,
     "--dtype",
     "bfloat16",
     "--mamba-ssm-dtype",
@@ -76,11 +74,15 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
-class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCaseBase):
-    """Test NPU performance for Qwen3.6-27B-w8a8 2p in64k out1k prefix90 50ms"""
+class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCaseBase):
+    """Test NPU performance for Qwen3.6-27B 1p in64k out1k prefix90 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model = QWEN3_6_27B_MODEL_PATH
@@ -88,17 +90,20 @@ class TestNPUQwen3_6_27B_2P_In64k_Out1k_Prefix90_50ms(TestNpuPerformanceTestCase
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     dataset_name = "generated-shared-prefix"
     max_concurrency = 20
-    num_prompts = 80
+    num_prompts = 20
     input_len = 64000
     output_len = 1000
     random_range_ratio = 1
+    seed = 1
     repeat_rate = 0.9
     request_rate = float("inf")
+    warmup_requests = 1
     tpot = 50
     output_token_throughput = 225
+    pop_sglang_is_in_ci_for_gsp = True
 
     def test_npu_qwen3_6_27b_2p_in64k_out1k_prefix90_50ms(self):
-        """Run NPU performance test for Qwen3.6-27B-w8a8 in64k out1k prefix90 50ms"""
+        """Run NPU performance test for Qwen3.6-27B in64k out1k prefix90 50ms"""
         self.run_throughput()
 
 

@@ -1,9 +1,8 @@
 """simple-evals GSM8K accuracy mixin for Intel XPU nightly tests.
 
-Mirrors the AMD/NVIDIA nightly flow (``test_gsm8k_eval_amd.py`` /
-``test_text_models_gsm8k_eval.py``): launch an SGLang server with XPU
-flags, then call ``sglang.test.run_eval`` with ``eval_name="gsm8k"`` so
-the same ``simple_eval_gsm8k.GSM8KEval`` evaluator scores every backend.
+Launches an SGLang server with XPU flags, then calls ``sglang.test.run_eval``
+with ``eval_name="gsm8k"`` so the ``simple_eval_gsm8k.GSM8KEval`` evaluator
+scores the run.
 
 Subclasses set ``model``, ``tp_size``, ``accuracy``, and may override
 ``other_args`` / ``env`` / ``num_examples`` / ``num_threads``.
@@ -46,20 +45,12 @@ class SimpleEvalGSM8KXPUMixin(ABC):
     env: dict | None = None
 
     server_cmd: str = ""
-    # 200 questions matches the limit used by the XPU 70B lm-eval YAML and
-    # fits inside run_suite's per-file timeout when num_threads=1 keeps
-    # throughput low. Subclasses on cheaper-per-token hardware (TP=1, no
-    # Level Zero wedge) can raise this or set None for the full 1319-question
-    # GSM8K test set, matching the AMD/NVIDIA nightly defaults.
+    # Subset that fits run_suite's per-file timeout; set None for the full set.
     num_examples: int | None = 200
-    # Single-stream eval: intel_xpu attention at TP>=2 wedges the Level Zero
-    # driver in ur_command_list_manager::appendUSMMemcpy on concurrent prefill.
-    # Subclasses on hardware that handles parallel prefill cleanly may bump.
+    # Single-stream: intel_xpu attention at TP>=2 wedges the Level Zero driver
+    # on concurrent prefill. Subclasses may bump on hardware that handles it.
     num_threads: int = 1
-    # Short generations reduce the rate of prefill->decode->prefill handoffs,
-    # which is what trips the same Level Zero wedge on TP>=2 (observed at the
-    # default 2048; 512 matches the original few_shot_gsm8k limit and is still
-    # enough for GSM8K CoT answers).
+    # Short generations reduce prefill->decode handoffs that trip the same wedge.
     max_tokens: int = 512
 
     @classmethod
