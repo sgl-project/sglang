@@ -14,10 +14,12 @@ import logging
 import os
 from array import array
 from itertools import chain
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     compute_num_reserved_tokens,
@@ -28,14 +30,203 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
 from sglang.version import __version__
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.server._core import Server
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class NativeMmHost:
+    """Builds and validates the native Rust MM pipeline for one model.
+
+    Construction loads the same model-specific ``mm_processor`` stack the
+    Python TokenizerManager would build — not to process requests (the Rust
+    worker pool does that natively, GIL-free), but as the source of truth
+    :meth:`resolve_native_spec` validates and resolves the pipeline parameters
+    from. At drain time :meth:`build_native_mm` wraps the Rust-produced
+    buffers into the scheduler's ``MultimodalProcessorOutput``.
+
+    There is no Python fallback: a model without a native spec fails at
+    launch, and per-request inputs outside the pipeline's scope (video/audio,
+    precomputed features, undecodable images) are rejected by the Rust worker
+    as a 400.
+    """
+
+    # Rust mm-worker threads == max concurrently-processed mm requests.
+    MM_WORKERS = 8
+
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        processor: Any = None,
+    ):
+        # Lazy imports: this class is only instantiated for multimodal models
+        # under SGLANG_RUST_SERVER.
+        from sglang.srt.managers.multimodal_processor import (
+            get_mm_processor,
+            import_processors,
+        )
+        from sglang.srt.managers.tokenizer_manager import (
+            _determine_tensor_transport_mode,
+            _get_processor_wrapper,
+        )
+
+        self.server_args = server_args
+        self.model_config = model_config
+
+        # Same processor stack the Python TokenizerManager builds
+        # (init_tokenizer_and_processor, multimodal branch). The HF
+        # AutoProcessor is reused from the caller's init_tokenizer (already
+        # loaded, identical construction args) when available.
+        import_processors("sglang.srt.multimodal.processors")
+        if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
+            import_processors(mm_process_pkg, overwrite=True)
+        _processor = processor or _get_processor_wrapper(self.server_args)
+        transport_mode = _determine_tensor_transport_mode(self.server_args)
+        self.mm_processor = get_mm_processor(
+            self.model_config.hf_config,
+            self.server_args,
+            _processor,
+            transport_mode,
+            model_config=self.model_config,
+        )
+        self._processor = _processor
+        # Set by resolve_native_spec() when the model family has a pure-Rust
+        # pipeline; consumed by build_native_mm (the drain-time adapter).
+        self._native: Optional[Dict[str, Any]] = None
+
+    # Model types whose image-only M-RoPE matches the native fast path.
+    NATIVE_QWEN_MODEL_TYPES = frozenset(
+        ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+    )
+
+    def resolve_native_spec(self) -> Optional[str]:
+        """JSON spec for the Rust-native MM pipeline, or ``None`` when the
+        model has no native pipeline (the launch gate turns that into a hard
+        error). Only resolved settings are carried (patch geometry, pixel
+        limits, normalization, token ids) — never the HF config. Conservative
+        by design: any unrecognized knob disables the native path rather than
+        approximating it."""
+        import json
+
+        from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+        hf_config = self.model_config.hf_config
+        if (
+            type(self.mm_processor) is not QwenVLImageProcessor
+            or getattr(hf_config, "model_type", None)
+            not in self.NATIVE_QWEN_MODEL_TYPES
+        ):
+            return None
+        ip = getattr(self._processor, "image_processor", None)
+        if type(ip).__name__ not in (
+            "Qwen2VLImageProcessor",
+            "Qwen2VLImageProcessorFast",
+        ):
+            return None
+
+        # `--mm-process-config {"image": {...}}`: only pixel-limit overrides
+        # are mirrored natively; anything else disables the native pipeline.
+        image_overrides = dict(
+            (self.server_args.mm_process_config or {}).get("image", {})
+        )
+        if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
+            return None
+
+        size = getattr(ip, "size", None) or {}
+        min_pixels = image_overrides.get(
+            "min_pixels", getattr(ip, "min_pixels", None) or size.get("shortest_edge")
+        )
+        max_pixels = image_overrides.get(
+            "max_pixels", getattr(ip, "max_pixels", None) or size.get("longest_edge")
+        )
+        try:
+            spec = {
+                "family": "qwen_vl",
+                "image_token_id": hf_config.image_token_id,
+                "patch_size": ip.patch_size,
+                "merge_size": ip.merge_size,
+                "temporal_patch_size": ip.temporal_patch_size,
+                "min_pixels": int(min_pixels),
+                "max_pixels": int(max_pixels),
+                "image_mean": [float(x) for x in ip.image_mean],
+                "image_std": [float(x) for x in ip.image_std],
+            }
+        except (AttributeError, TypeError):  # missing/odd processor attrs
+            return None
+        self._native = {
+            **spec,
+            "vision_start_token_id": getattr(hf_config, "vision_start_token_id", None),
+            "vision_end_token_id": getattr(hf_config, "vision_end_token_id", None),
+            "video_token_id": getattr(hf_config, "video_token_id", None),
+            "feature_dim": 3
+            * spec["temporal_patch_size"]
+            * spec["patch_size"]
+            * spec["patch_size"],
+        }
+        logger.info("rust server: native MM pipeline enabled (family=qwen_vl)")
+        return json.dumps(spec)
+
+    def build_native_mm(self, entry: tuple):
+        """Drain-time adapter: wrap the Rust-produced buffers into the
+        scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
+        here — all processing (load, resize, patchify, token expansion, M-RoPE)
+        already ran in Rust. This runs on the scheduler loop, so it must stay
+        copy-free AND hash-free: the numpy arrays from ``take_mm`` own the Rust
+        buffers (zero copy), ``torch.from_numpy`` only wraps them, and each
+        item's ``hash`` is the worker-precomputed feature hash so the
+        scheduler's ``set_pad_value`` skips ``hash_feature``. Any per-byte work
+        here (memcpy, sha256 — tens of MB per image-heavy request) measurably
+        stalls every running request's inter-token latency."""
+        import torch
+
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+
+        native = self._native
+        features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
+        features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
+        items = []
+        row = 0
+        for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
+            n = t * h * w
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=features[row : row + n],
+                    hash=item_hash,
+                    offsets=[tuple(offset)],
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
+                    },
+                )
+            )
+            row += n
+        if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
+            for item in items:
+                item.set_pad_value()
+        mrope_positions = torch.from_numpy(mrope_arr.reshape(3, -1))
+        return MultimodalProcessorOutput(
+            mm_items=items,
+            im_token_id=native["image_token_id"],
+            im_start_id=native["vision_start_token_id"],
+            im_end_id=native["vision_end_token_id"],
+            video_token_id=native["video_token_id"],
+            mrope_positions=mrope_positions,
+            mrope_position_delta=torch.tensor([[mrope_delta]], dtype=torch.long),
+        )
 
 
 class RustServer:
@@ -45,8 +236,14 @@ class RustServer:
     all implemented as Rust threads in scheduler process.
     """
 
-    def __init__(self, server: Server, max_per_poll: int = 256):
+    def __init__(
+        self,
+        server: Server,
+        mm_host: Optional[NativeMmHost] = None,
+        max_per_poll: int = 256,
+    ):
         self.server = server
+        self.mm_host = mm_host
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -92,6 +289,41 @@ class RustServer:
             server_args_json=cls._build_server_args(scheduler),
         )
 
+        # Multimodal models must have a native Rust pipeline — there is no
+        # Python fallback. The host resolves/validates the spec from the same
+        # processor stack the Python TokenizerManager would build; the Rust
+        # worker pool then processes every mm request natively.
+        mm_host = None
+        if scheduler.model_config.is_multimodal:
+            # New threads inherit the spawning thread's CPU affinity, and this
+            # launch thread still has the full mask here. Narrow it to the
+            # server cores first so every MM thread created below — the
+            # processor's executors and the Rust MM workers — stays off the
+            # scheduler's reserved launch cores: MM preprocessing scheduled
+            # onto those cores preempts the scheduler loop and inflates
+            # inter-token latency.
+            if server_cores is not None:
+                try:
+                    os.sched_setaffinity(0, set(server_cores))
+                except OSError as e:
+                    logger.warning(
+                        "rust server: cannot confine mm threads to server cores: %s", e
+                    )
+            mm_host = NativeMmHost(
+                server_args=server_args,
+                model_config=scheduler.model_config,
+                processor=scheduler.processor,
+            )
+            spec = mm_host.resolve_native_spec()
+            if spec is None:
+                raise RuntimeError(
+                    "SGLANG_RUST_SERVER=1: no native Rust MM pipeline for "
+                    f"model_type={scheduler.model_config.hf_config.model_type!r} "
+                    f"(supported: {', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}; "
+                    "images only). Unset SGLANG_RUST_SERVER to serve this model."
+                )
+            server.start_mm_workers(spec, mm_host.MM_WORKERS)
+
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
             try:
@@ -111,7 +343,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server)
+        return cls(server, mm_host=mm_host)
 
     def wait_ingress(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -162,6 +394,14 @@ class RustServer:
                 ids.frombytes(ids_view[pos : pos + nbytes])
                 obj.input_ids = ids
                 pos += nbytes
+            if self.mm_host is not None and isinstance(obj, TokenizedGenerateReqInput):
+                # Natively processed: the buffers rode a Rust sidecar (stored
+                # strictly before the ring push); wrap them into tensors here —
+                # the only Python step of the native path. `None` for text-only
+                # requests on a multimodal model.
+                native = self.server.take_mm(obj.rid)
+                if native is not None:
+                    obj.mm_inputs = self.mm_host.build_native_mm(native)
             out.append(obj)
         return out
 
@@ -370,6 +610,17 @@ class RustServer:
             scheduler.server_args
         )
         server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
+
+        # The Rust server only reads local files (hub-blind, so it can never
+        # disagree with huggingface_hub about cache layout): resolve a repo-id
+        # tokenizer_path to the cached tokenizer.json here. No network — the
+        # scheduler's init_tokenizer already downloaded it.
+        if not scheduler.server_args.skip_tokenizer_init:
+            path = server_args["tokenizer_path"] or server_args["model_path"]
+            if not os.path.exists(path):
+                server_args["tokenizer_path"] = _resolve_local_or_cached_file(
+                    path, "tokenizer.json", server_args["revision"]
+                )
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
