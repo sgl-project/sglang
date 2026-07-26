@@ -363,7 +363,9 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     if skip_tokenizer_init
         && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
     {
-        return Err(Error::Tokenize(
+        // `Validation` (400), not `Tokenize` (500): the client sent a request this
+        // server cannot serve, which is their error to fix — Python 400s it too.
+        return Err(Error::Validation(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));
     }
@@ -410,38 +412,70 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     Ok(())
 }
 
-/// `input + max_new_tokens` must fit the context window (Python
-/// `TokenizerManager._validate_one_request`, "Validate total tokens"). Without it
-/// the scheduler silently clamps `max_new_tokens` and the client gets a 200 with a
-/// truncated completion instead of an actionable 400.
+/// The context-window checks that need the tokenized length, mirroring Python
+/// `TokenizerManager._validate_one_request`: the input alone must fit, and then
+/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
+/// and the client gets a 200 with a truncated completion instead of an actionable
+/// 400.
 ///
-/// Under `allow_auto_truncate` we clamp too — but Python's way, from a value the
-/// client can compute, and it is the launch flag that opted into it.
+/// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
+/// opted into that.
 fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let (Some(max_req_len), Some(max_new_tokens)) =
-        (limits.context_len, g.sampling_params.max_new_tokens)
-    else {
-        return Ok(()); // context length unknown, or no cap requested
+    let Some(max_req_len) = limits.context_len else {
+        return Ok(()); // context length unknown — nothing to enforce
     };
     // Python counts the reserved slots as part of the input, so a request can be
     // rejected for them even when the prompt alone fits.
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
+
+    // Input length first, and unconditionally: `max_new_tokens: null` means "no
+    // cap", which must not disable this. Python's comparison is `>=` — a prompt
+    // that exactly fills the window leaves no room to generate.
+    if input_len >= max_req_len {
+        if !limits.allow_auto_truncate {
+            return Err(Error::Validation(format!(
+                "The input ({input_len} tokens) is longer than the model's context \
+                 length ({max_req_len} tokens)."
+            )));
+        }
+        if let Some(ids) = &mut g.input_ids {
+            ids.truncate(max_req_len as usize);
+        }
+    }
+    let input_len =
+        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
+
+    let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
+        return Ok(()); // no cap requested → nothing to add to the input length
+    };
     let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
     if total <= max_req_len {
         return Ok(());
     }
-    if limits.allow_auto_truncate {
-        g.sampling_params.max_new_tokens = Some(max_req_len.saturating_sub(input_len) as i64);
-        return Ok(());
+    if !limits.allow_auto_truncate {
+        return Err(Error::Validation(format!(
+            "Requested token count exceeds the model's maximum context length of \
+             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
+             tokens from the input messages and {max_new_tokens} tokens for the \
+             completion. Please reduce the number of tokens in the input messages or \
+             the completion to fit within the limit."
+        )));
     }
-    Err(Error::Validation(format!(
-        "Requested token count exceeds the model's maximum context length of \
-         {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-         tokens from the input messages and {max_new_tokens} tokens for the \
-         completion. Please reduce the number of tokens in the input messages or \
-         the completion to fit within the limit."
-    )))
+    let clamped = max_req_len.saturating_sub(input_len) as i64;
+    // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
+    // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
+    // and `is_normalized: true` stops the scheduler from re-verifying, so nothing
+    // downstream would catch it. Python validates before it verifies; we can't
+    // reorder the FSM, so we re-assert the one invariant the clamp can violate.
+    if g.sampling_params.min_new_tokens > clamped {
+        return Err(Error::Validation(format!(
+            "min_new_tokens must be in [0, max_new_tokens({clamped})], got {}",
+            g.sampling_params.min_new_tokens
+        )));
+    }
+    g.sampling_params.max_new_tokens = Some(clamped);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -588,13 +622,93 @@ mod tests {
         assert!(check_total_tokens(&mut g, &test_limits()).is_ok());
         assert_eq!(g.sampling_params.max_new_tokens, Some(100), "untouched");
 
-        // No cap requested → nothing to add to the input length.
+        // No cap requested → nothing to add to the input length, but the input
+        // itself is still checked (see `input_length_is_checked_unconditionally`).
         g.sampling_params = sp(None);
-        let capped = Limits {
-            context_len: Some(1),
+        let roomy = Limits {
+            context_len: Some(100),
             ..test_limits()
         };
-        assert!(check_total_tokens(&mut g, &capped).is_ok());
+        assert!(check_total_tokens(&mut g, &roomy).is_ok());
+    }
+
+    /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
+    /// alone must still fit. Gating the whole function on `max_new_tokens` let an
+    /// over-long prompt through to the scheduler with no ingress error at all.
+    /// Python compares with `>=`: a prompt that exactly fills the window leaves no
+    /// room to generate.
+    #[test]
+    fn input_length_is_checked_unconditionally() {
+        let limits = Limits {
+            context_len: Some(3),
+            ..test_limits()
+        };
+        let req = |max_new_tokens| GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]), // exactly fills a 3-token window
+            sampling_params: SamplingParams {
+                max_new_tokens,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for max_new_tokens in [None, Some(1)] {
+            let err = check_total_tokens(&mut req(max_new_tokens), &limits)
+                .expect_err("input == context_len must be rejected (Python uses >=)");
+            assert_eq!(err.http_status(), 400);
+            assert!(err.to_string().contains("longer than the model's context"));
+        }
+        // One token shorter fits, with or without a cap.
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        g.sampling_params.max_new_tokens = None;
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+
+        // Under auto-truncate the input is cut to fit instead of rejected.
+        let truncating = Limits {
+            allow_auto_truncate: true,
+            ..limits.clone()
+        };
+        let mut g = req(None);
+        assert!(check_total_tokens(&mut g, &truncating).is_ok());
+        assert_eq!(
+            g.input_ids.as_deref(),
+            Some(&[1, 2, 3][..]),
+            "fits at the cap"
+        );
+    }
+
+    /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
+    /// `max_new_tokens` can leave `min_new_tokens > max_new_tokens`. Nothing
+    /// downstream re-checks — `is_normalized: true` makes the scheduler's own
+    /// verify early-return — so the clamp has to re-assert it here.
+    #[test]
+    fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
+        let limits = Limits {
+            context_len: Some(10),
+            allow_auto_truncate: true,
+            ..test_limits()
+        };
+        let mut g = GenerateRequest {
+            input_ids: Some(vec![1, 2, 3]), // clamps max_new_tokens to 7
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(100),
+                min_new_tokens: 50, // …which is below min_new_tokens
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = check_total_tokens(&mut g, &limits)
+            .expect_err("a clamp that inverts min/max must 400, not ride the wire");
+        assert_eq!(err.http_status(), 400);
+        assert!(err.to_string().contains("min_new_tokens"), "{err}");
+
+        // A clamp that keeps the invariant still clamps.
+        g.sampling_params.min_new_tokens = 2;
+        g.sampling_params.max_new_tokens = Some(100);
+        assert!(check_total_tokens(&mut g, &limits).is_ok());
+        assert_eq!(g.sampling_params.max_new_tokens, Some(7));
     }
 
     /// `return_hidden_states` on a server not launched for it is a 400: the

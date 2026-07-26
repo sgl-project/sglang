@@ -133,7 +133,12 @@ async fn generate(
 ) -> Response {
     let body = match body {
         Ok(Json(body)) => body,
-        Err(rejection) => return (StatusCode::BAD_REQUEST, rejection.body_text()).into_response(),
+        // A body that fails to parse has no readable `stream` flag, so this one
+        // can only answer unary — as Python's does (FastAPI rejects before its
+        // handler runs).
+        Err(rejection) => {
+            return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
     };
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
@@ -143,7 +148,7 @@ async fn generate(
         // The error carries its own status (a bad batch is `Validation` → 400).
         Err(e) => {
             let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
-            return (code, e.to_string()).into_response();
+            return pre_submit_error(code, &e.to_string(), stream);
         }
     };
     if !is_batch {
@@ -156,6 +161,26 @@ async fn generate(
     } else {
         generate_batch(&state, payloads, stream).await
     }
+}
+
+/// Answer an error raised *before* anything was submitted, in the shape the client
+/// asked for.
+///
+/// Two parity points with Python's `generate_request`. The body is the same
+/// `{"error": {...}}` object every other path emits — not bare text, which a client
+/// parsing JSON chokes on. And a streaming request gets 200 plus one SSE error
+/// frame and `[DONE]`, not a 400: the client has already committed to reading a
+/// stream, and Python answers it inside `stream_results()`.
+fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
+    let body = error_value(code.as_u16(), message);
+    if !stream {
+        return (code, Json(body)).into_response();
+    }
+    let frames = [body.to_string(), "[DONE]".to_string()];
+    Sse::new(futures::stream::iter(
+        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
+    ))
+    .into_response()
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -595,5 +620,39 @@ mod tests {
                 "count stays cumulative"
             );
         }
+    }
+    /// Pre-submit errors must look like every other error the server emits — a
+    /// JSON `{"error": …}` object, not bare text — and a streaming request must get
+    /// 200 + an SSE error frame rather than a 400, because Python answers it from
+    /// inside `stream_results()` after the stream has already been committed to.
+    #[tokio::test]
+    async fn pre_submit_errors_match_python_shape() {
+        let unary = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", false);
+        assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(v["error"]["message"], "bad input");
+        assert_eq!(v["error"]["code"], 400);
+
+        let streamed = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", true);
+        assert_eq!(
+            streamed.status(),
+            StatusCode::OK,
+            "the stream itself is 200"
+        );
+        let body = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#""code":400"#),
+            "carries the status in-band: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "terminated: {text}"
+        );
     }
 }
