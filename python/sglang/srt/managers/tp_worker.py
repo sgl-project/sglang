@@ -224,6 +224,37 @@ class BaseTpWorker(ABC):
             tensors = dict(bucket.reconstruct_tensors())
         else:
             tensors = MultiprocessingSerializer.deserialize(serialized)
+        if recv_req.expected_checksums is not None:
+            import hashlib
+
+            exp = recv_req.expected_checksums
+            mismatch, missing = [], []
+            for name, want in exp.items():
+                if name not in tensors:
+                    missing.append(name)
+                    continue
+                got = hashlib.sha256(
+                    tensors[name]
+                    .detach()
+                    .cpu()
+                    .contiguous()
+                    .flatten()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes()
+                ).hexdigest()
+                if got != want:
+                    mismatch.append(name)
+            extra = [n for n in tensors if n not in exp]
+            if mismatch or missing or extra:
+                raise RuntimeError(
+                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
+                    f"{len(extra)} extra {extra[:5]}"
+                )
+            logger.info(
+                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -314,8 +345,8 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Scale joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_scale_joiner:
+        # Elastic joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(
