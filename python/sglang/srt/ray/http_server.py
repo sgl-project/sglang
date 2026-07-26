@@ -44,7 +44,7 @@ def launch_server(
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
 
-    server_args.placement_group = None
+    server_args.override("ray.http_server.clear_placement_group", placement_group=None)
 
     (
         tokenizer_manager,
@@ -52,6 +52,7 @@ def launch_server(
         port_args,
         scheduler_init_result,
         subprocess_watchdog,
+        _weight_cache_daemon_procs,
     ) = RayEngine._launch_subprocesses(
         server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,

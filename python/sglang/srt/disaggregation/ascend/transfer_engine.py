@@ -31,7 +31,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ):
         if import_error is not None:
             logger.warning(
-                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
+                "Please install memfabric_hybrid, for details, see docs_new/docs/advanced_features/pd_disaggregation.mdx"
             )
             raise import_error
 

@@ -26,7 +26,6 @@ QWEN3_8B_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
 }
@@ -101,6 +100,7 @@ class TestQwen8B(TestNpuPerformanceTestCaseBase):
     input_len = 3500
     output_len = 1500
     random_range_ratio = 1
+    seed = 1
     tpot = 37
     output_token_throughput = 1586
 

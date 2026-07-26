@@ -279,6 +279,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     logger.debug("All workers are ready")
 
     if launch_http_server:
+        if server_args.pipeline_config.task_type.is_action_gen():
+            logger.info(
+                "VLA pipeline ready: model=%s; per-request details are "
+                "debug-only (use --log-level debug).",
+                server_args.model_id or server_args.model_path,
+            )
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")

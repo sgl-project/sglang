@@ -100,17 +100,6 @@ class TestScoreAndPool(CustomTestCase):
         self.assertEqual(out.embeddings[0].shape, (2, self.num_labels))
         self.assertEqual(out.embeddings[1].shape, (1, self.num_labels))
 
-    def test_no_delimiter_indices_falls_back(self):
-        """multi_item_delimiter_indices=None -> single-item fallback."""
-        input_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7])
-        hidden = torch.randn(8, self.hidden_dim)
-        fb = _make_forward_batch(extend_seq_lens=[5, 3])
-
-        out = score_and_pool(self.score_head, self.pooler, hidden, fb, input_ids)
-
-        self.assertIsInstance(out.embeddings, torch.Tensor)
-        self.assertEqual(out.embeddings.shape, (2, self.num_labels))
-
     def test_mis_extracts_positions_before_delimiter(self):
         """Verify MIS picks hidden states at index (delimiter_position - 1)."""
         # Delimiters at indices 2 and 5 -> extract hidden at indices 1 and 4

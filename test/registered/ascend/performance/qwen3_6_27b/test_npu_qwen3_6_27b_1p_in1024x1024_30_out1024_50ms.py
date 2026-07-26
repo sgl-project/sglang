@@ -23,7 +23,6 @@ QWEN3_6_27B_1024_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_NPU_PROFILING": "1",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
@@ -48,11 +47,11 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    50,
+    60,
     "--max-mamba-cache-size",
     60,
     "--mem-fraction-static",
-    0.76,
+    0.74,
     "--cuda-graph-bs",
     2,
     4,
@@ -64,6 +63,7 @@ QWEN3_6_27B_1024_OTHER_ARGS = [
     42,
     45,
     50,
+    60,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -97,13 +97,14 @@ class TestNPUQwen3_6_27B_1P_In1024x1024_30_Out1024_50ms(TestNpuPerformanceTestCa
     envs = QWEN3_6_27B_1024_ENVS
     backend = "sglang-oai-chat"
     dataset_name = "image"
-    max_concurrency = 48
-    num_prompts = 48
+    max_concurrency = 60
+    num_prompts = 240
     input_len = 30
     output_len = 1024
     random_range_ratio = 1
     image_resolution = "1024x1024"
     image_count = 1
+    seed = 1
     tpot = 50
     output_token_throughput = 800.8
 
