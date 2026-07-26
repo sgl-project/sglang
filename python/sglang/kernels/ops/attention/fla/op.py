@@ -4,16 +4,9 @@
 
 import os
 
-from sglang.srt.utils.common import HAS_TRITON
-
-if HAS_TRITON:
-    import triton
-    import triton.language as tl
-    import triton.language.extra.libdevice as tldevice
-else:
-    triton = None
-    tl = None
-    tldevice = None
+import triton
+import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from sglang.kernels.ops.attention.fla.utils import is_gather_supported
 

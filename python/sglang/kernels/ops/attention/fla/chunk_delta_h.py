@@ -6,14 +6,8 @@ import os
 from typing import Optional, Tuple
 
 import torch
-from sglang.srt.utils.common import HAS_TRITON
-
-if HAS_TRITON:
-    import triton
-    import triton.language as tl
-else:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
