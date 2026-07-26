@@ -10,9 +10,7 @@ def is_blocks(name: str, module) -> bool:
 
 @dataclass
 class LingBotVideoMoEArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_blocks]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
 
     param_names_mapping: dict = field(default_factory=dict)
     reverse_param_names_mapping: dict = field(default_factory=dict)

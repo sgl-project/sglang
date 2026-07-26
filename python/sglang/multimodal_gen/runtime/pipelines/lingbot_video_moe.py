@@ -14,9 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _flow_shift_kwarg(
-    batch, server_args: ServerArgs
-) -> tuple[str, float | None]:
+def _flow_shift_kwarg(batch, server_args: ServerArgs) -> tuple[str, float | None]:
     shift = (
         batch.flow_shift
         if batch.flow_shift is not None
