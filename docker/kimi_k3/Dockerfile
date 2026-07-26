@@ -15,6 +15,15 @@
 # Build (on/for aarch64; nvcc cross-compiles the DeepEP cubin, no GPU needed):
 #   docker build -f docker/kimi_k3/Dockerfile \
 #     --build-arg TORCH_CUDA_ARCH_LIST=10.3a -t kimi-k3 .
+#
+# FlashInfer MXFP4 MoE runner (trtllm-gen SiTU cubins) — runtime opt-in, no
+# image change needed: download the SiTU cubin pool archive (link published
+# with the release), unzip it, and run the container with
+#   -v /host/path/trtllm_gen_moe_cubin_pool:/opt/trtllm_gen_moe_cubin_pool \
+#   -e SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool
+# The runner is auto-selected on SM100/103 when the pool is present; the
+# remaining kernel sources JIT-compile from the installed flashinfer wheel on
+# first launch and are cached.
 FROM lmsysorg/sglang:v0.5.15.post1 AS base
 
 # GB300 = sm_103a. Override for other Blackwell (e.g. 10.0a for B200).
