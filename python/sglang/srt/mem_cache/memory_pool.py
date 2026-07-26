@@ -958,6 +958,10 @@ class MambaPool:
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
+    def supports_cpu_copy(self) -> bool:
+        """Whether the Mamba state supports a CPU save/restore round trip."""
+        return True
+
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         # Accept both the legacy 2-tuple (conv, temporal) and the 3-tuple that also
         # carries the ReplaySSM spec-verify cursors.
@@ -1755,6 +1759,11 @@ class MHATokenToKVPool(KVCache):
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
         )
 
+        # Subclasses may provide their own buffer layout without using the base
+        # _create_buffers implementation. Keep the optional scale-buffer state
+        # defined so the inherited CPU-copy capability check remains safe.
+        self.k_scale_buffer = None
+        self.v_scale_buffer = None
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -2830,6 +2839,9 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
             device=self.device,
         )
 
+    def supports_cpu_copy(self) -> bool:
+        return False
+
     def _finalize_allocation_log(self, num_tokens: int):
         self.mem_usage = 0.0
         placeholder_bytes = (
@@ -3759,7 +3771,10 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
     def supports_cpu_copy(self) -> bool:
-        return self.full_kv_pool.supports_cpu_copy()
+        return (
+            self.full_kv_pool.supports_cpu_copy()
+            and self.mamba_pool.supports_cpu_copy()
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)

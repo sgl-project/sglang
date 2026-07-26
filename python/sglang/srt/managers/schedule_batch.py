@@ -2632,9 +2632,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
-        decode_retract_must_abort = (
-            server_args.disaggregation_mode == "decode"
-            and not self.token_to_kv_pool_allocator.supports_cpu_copy()
+        retracted_reqs_can_resume = (
+            server_args.disaggregation_mode != "decode"
+            or self.token_to_kv_pool_allocator.supports_cpu_copy()
         )
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2654,9 +2654,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 idx,
                 len(sorted_indices),
                 server_args,
-                offload_kv=not decode_retract_must_abort,
+                offload_kv=retracted_reqs_can_resume,
             )
-            if decode_retract_must_abort:
+            if not retracted_reqs_can_resume:
                 req.to_finish = FINISH_ABORT(
                     "Request was retracted due to out-of-memory and cannot be "
                     "resumed because this KV cache does not support synchronous "
@@ -2680,7 +2680,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
             last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
+                "Out of memory even after releasing all other requests "
                 "in the decode batch. Aborting the last request.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )

@@ -3189,6 +3189,25 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _finalize_retraction_abort(self, req: Req) -> None:
+        abort_reason: FINISH_ABORT = req.to_finish
+        prepare_abort(req, abort_reason.message, status_code=abort_reason.status_code)
+        req.finished_reason = abort_reason
+        req.to_finish = None
+        req.time_stats.trace_ctx.abort(abort_info=abort_reason)
+        req.time_stats.set_completion_time()
+
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.finalize_release_on_finish(req)
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason=req.finished_reason.to_json(),
+                rid=req.rid,
+            ),
+            req,
+        )
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3241,14 +3260,7 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                    ),
-                    req,
-                )
+                self._finalize_retraction_abort(req)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
