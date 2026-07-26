@@ -1,4 +1,7 @@
-"""Full native Qwen driver parity at the scheduler-input boundary."""
+"""``NativeMmHost`` (managers/rust_server.py) parity for the Qwen family: the
+spec built by ``resolve_native_spec()`` drives the real native Rust driver and
+``build_native_mm()`` wraps its buffers; the result must be indistinguishable
+from the Python ``mm_processor`` output at the scheduler-input boundary."""
 
 import asyncio
 import base64
@@ -34,7 +37,7 @@ DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_native_mm", None)
 
 
 @unittest.skipUnless(DRIVER, "sglang-mm native Qwen driver not built")
-class TestQwenSchedulerInputParity(CustomTestCase):
+class TestQwenNativeMmHost(CustomTestCase):
     def setUp(self):
         self.config = PROCESSOR_CONFIGS["qwen2_5_vl"]
         self.processor = make_processor(self.config)

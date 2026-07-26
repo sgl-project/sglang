@@ -1,4 +1,8 @@
-"""Unit tests for native MM scheduler-input tensor wrapping."""
+"""``NativeMmHost.build_native_mm`` (managers/rust_server.py): the drain-time
+wrapping contracts — tensors are zero-copy views over the Rust-owned buffers,
+and pad values come from worker-precomputed hashes (the scheduler loop must
+never hash features). Synthetic buffers only, so this runs without the Rust
+extension (unlike the qwen parity suite)."""
 
 import os
 import unittest
@@ -16,7 +20,7 @@ from sglang.srt.managers.rust_server import NativeMmHost  # noqa: E402
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestNativeMmDrainAdapter(CustomTestCase):
+class TestBuildNativeMm(CustomTestCase):
     def setUp(self):
         self.host = NativeMmHost.__new__(NativeMmHost)
         self.host._native = {
