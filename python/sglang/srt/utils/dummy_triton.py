@@ -13,7 +13,9 @@ class TritonPlaceholder(types.ModuleType):
         super().__init__(name)
         self.__version__ = "3.2.0"
         self.__path__ = []
-        self.__file__ = None
+        # Must be a str (not None) so that inspect.getmodule/os.path.splitext
+        # doesn't crash when iterating sys.modules.
+        self.__file__ = f"<{name}-placeholder>"
         self.__spec__ = None
         self.__loader__ = None
         self.__package__ = name
