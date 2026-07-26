@@ -11,11 +11,15 @@ import soundfile as sf
 import torch
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bench"))
 from bench_parity import make_photo_like
 
 from sglang.srt.managers.mm_utils import data_hash, hash_feature
+from sglang.srt.multimodal._core import common as _rs_common
 from sglang.srt.multimodal.inkling import InklingProcessor
+from sglang.srt.multimodal.inkling.image_processing_rust import (
+    InklingRustImageProcessor,
+)
 from sglang.srt.multimodal.processors import inkling as prc
 
 
@@ -39,7 +43,9 @@ def make_proc():
     proc.IMAGE_TOKEN_ID = 100
     proc.AUDIO_TOKEN_ID = 101
     proc.AUDIO_END_TOKEN_ID = 102
-    proc.inkling_processor = InklingProcessor()
+    proc.inkling_processor = InklingProcessor(
+        image_processor=InklingRustImageProcessor()
+    )
     return proc
 
 
@@ -50,14 +56,19 @@ aud = wav_bytes()
 out = proc.assemble([1, 100, 2, 101, 3], [img], [aud])
 img_item = next(i for i in out.mm_items if i.modality.name == "IMAGE")
 aud_item = next(i for i in out.mm_items if i.modality.name == "AUDIO")
-assert img_item.hash == data_hash(img), "image hash != data_hash(raw bytes)"
-assert aud_item.hash == data_hash(aud), "audio hash != data_hash(raw bytes)"
-print(f"  assemble: image hash={img_item.hash:#x} audio hash={aud_item.hash:#x} OK")
+# The rust image path stores its raw-bytes content hash (blake3) eagerly;
+# non-rust items get hashed lazily from the feature at set_pad_value time.
+assert img_item.hash == _rs_common.content_hash(img), "image hash != rust content_hash"
+assert aud_item.hash is None, "audio hash expected to be lazy (feature-based)"
+print(f"  assemble: image hash={img_item.hash:#x} OK")
 
 h0 = img_item.hash
 img_item.set_pad_value()
 assert img_item.hash == h0 and img_item.pad_value is not None
 print(f"  set_pad_value: hash preserved, pad_value={img_item.pad_value} OK")
+aud_item.set_pad_value()
+assert aud_item.hash is not None and aud_item.pad_value is not None
+print("  set_pad_value: audio feature-hash filled OK")
 
 out2 = proc.assemble([1, 100, 2], [img], [])
 assert out2.mm_items[0].hash == h0
@@ -73,14 +84,8 @@ out3 = asyncio.run(
 assert all(i.hash == h0 for i in out3.mm_items), "data: URL roundtrip hash mismatch"
 print("  process_mm_data_async: concurrent resolve + hash OK")
 
-orig = prc._resolve_media_item
-prc._resolve_media_item = lambda it: (time.sleep(0.3), orig(it))[1]
-t0 = time.perf_counter()
-asyncio.run(prc._resolve_media_items([data_url] * 8))
-elapsed = time.perf_counter() - t0
-prc._resolve_media_item = orig
-assert elapsed < 1.2, f"8x 0.3s resolves took {elapsed:.2f}s; expected ~0.3s"
-print(f"  concurrency: 8 x 0.3s resolves in {elapsed:.2f}s OK")
+# (The old `_resolve_media_items` concurrency helper is gone; resolution now
+# happens inline in `process_mm_data_async`, covered by the roundtrip above.)
 
 imgs_5 = [png_bytes(make_photo_like(1080, 1920, seed=s)) for s in range(5)]
 feats = [
