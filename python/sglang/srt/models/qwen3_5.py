@@ -41,6 +41,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
@@ -201,19 +202,20 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 def _can_fuse_gdn_norm_quant(
     linear: nn.Module, head_v_dim: int, num_groups: int, activation: str
 ) -> bool:
-    quant_method = getattr(linear, "quant_method", None)
+    quant_method = linear.quant_method
+    if quant_method.__class__.__name__ != "Fp8LinearMethod":
+        return False
     return (
         _is_cuda
         and head_v_dim == 128
         and activation in ("swish", "silu", "sigmoid")
         and (not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or num_groups % 4 == 0)
-        and quant_method.__class__.__name__ == "Fp8LinearMethod"
-        and getattr(quant_method, "block_quant", False)
-        and getattr(quant_method, "weight_block_size", None) == [128, 128]
-        and getattr(linear, "orig_dtype", None) == torch.bfloat16
+        and quant_method.block_quant
+        and quant_method.weight_block_size == [128, 128]
+        and linear.orig_dtype == torch.bfloat16
         and quant_method.w8a8_block_fp8_linear
         is deepgemm_w8a8_block_fp8_linear_with_fallback
-        and not get_bool_env_var("SGLANG_DISABLE_QWEN_GDN_NORM_QUANT_FUSION")
+        and not envs.SGLANG_DISABLE_QWEN_GDN_NORM_QUANT_FUSION.get()
     )
 
 
