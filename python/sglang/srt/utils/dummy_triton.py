@@ -13,6 +13,10 @@ class TritonPlaceholder(types.ModuleType):
         super().__init__(name)
         self.__version__ = "3.2.0"
         self.__path__ = []
+        self.__file__ = None
+        self.__spec__ = None
+        self.__loader__ = None
+        self.__package__ = name
         self.cdiv = lambda a, b: (a + b - 1) // b
 
     def _dummy_decorator(self, *args, **kwargs):
@@ -22,9 +26,13 @@ class TritonPlaceholder(types.ModuleType):
         return lambda f: f
 
     def __getattr__(self, name):
-        """Return a new TritonPlaceholder for any unknown attribute.
-        This handles arbitrary chains like triton.backends.compiler.AttrsDescriptor
+        """Return a new TritonPlaceholder for regular attributes.
+        Returns None for dunder attributes to prevent inspect module errors
+        (e.g. inspect.getabsfile expects __file__ to be a str or None).
         """
+        if name.startswith("__") and name.endswith("__"):
+            # Return None for unknown dunder attrs so inspect/os.path don't break
+            return None
         child = TritonPlaceholder(f"triton.{name}")
         # Cache it to avoid creating new objects on every access
         object.__setattr__(self, name, child)
