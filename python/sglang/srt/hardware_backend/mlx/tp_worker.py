@@ -132,10 +132,11 @@ class MlxTpModelWorker(TpModelWorker):
         Chained decode steps bypass this on purpose: they advance MLX cache
         offsets without allocator bookkeeping, and the decode-KV pool sync
         must stay clamped to the scheduler-committed bound (issue #30093).
+        ``req.kv_committed_len`` is set by batch prep (prepare_for_extend /
+        prepare_for_decode) before dispatch, so it is current here.
         """
-        seq_lens = batch.seq_lens.cpu().tolist()
-        for req, seq_len in zip(batch.reqs, seq_lens):
-            self._mlx_runner.note_committed_len(req.rid, seq_len)
+        for req in batch.reqs:
+            self._mlx_runner.note_committed_len(req.rid, req.kv_committed_len)
 
     def prepare_for_kv_cache_release(self, req) -> None:
         """Snapshot MLX auxiliary state at the scheduler's radix insert point.
