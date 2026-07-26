@@ -1635,8 +1635,7 @@ class NixlKVManager(CommonKVManager):
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
         dst_kv_ptrs = [
-            dst_info.dst_kv_ptrs[dst_idx]
-            for dst_idx in dst_info.dcp_dst_region_indices
+            dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
 
         # Prepared handles encode page-level offsets, while DCP relayout needs

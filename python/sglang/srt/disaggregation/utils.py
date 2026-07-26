@@ -919,7 +919,12 @@ def resolve_dcp_dst_entry_indices(
         # runs speculative decoding and the prefill side does not.
         return list(range(n_src))
     # A one-sided mapping is rejected by build_transfer_entry_pairs itself.
-    return [j for _, j in build_transfer_entry_pairs(src_layer_ids, dst_layer_ids, n_src, n_dst)]
+    return [
+        j
+        for _, j in build_transfer_entry_pairs(
+            src_layer_ids, dst_layer_ids, n_src, n_dst
+        )
+    ]
 
 
 def append_state_component(
