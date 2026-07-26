@@ -45,3 +45,15 @@ class TritonPlaceholder(types.ModuleType):
         if args and callable(args[0]):
             return args[0]
         return lambda f: f
+
+    def __contains__(self, item):
+        """Support 'x in triton.backends.backends' style checks — always False."""
+        return False
+
+    def __iter__(self):
+        """Support iteration over placeholder objects — always empty."""
+        return iter([])
+
+    def __bool__(self):
+        """Evaluate as False in boolean context (e.g. if triton.backends: ...)."""
+        return False
