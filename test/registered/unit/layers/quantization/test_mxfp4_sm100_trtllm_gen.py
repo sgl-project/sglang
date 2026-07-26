@@ -1,4 +1,4 @@
-"""SM100 trtllm-gen MXFP4 MoE integration test.
+"""Focused SM100 trtllm-gen MXFP4 MoE regression test.
 
 ``Mxfp4MoEMethod.apply`` (SM100 branch, via the unified MoeRunner) must feed
 ``trtllm_fp4_block_scale_moe`` the same args a direct kernel call does, so the
