@@ -724,9 +724,13 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            # Same contract as update_weights_from_distributed: the weight-update
+            # NCCL group and the tokenizer->scheduler fan-out cover every
+            # dp-attention rank. Serving the loaded adapters under dp attention
+            # additionally requires the dp-attention LoRA support (#31520).
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from distributed. Lora name=%s, group=%s",
                 obj.lora_name,
