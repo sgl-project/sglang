@@ -37,7 +37,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -74,6 +78,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
+    _OngoingPrefetch,
     _OngoingWriteThrough,
 )
 from sglang.srt.runtime_context import get_server_args
@@ -3658,9 +3663,10 @@ class UnifiedRadixCacheSuite:
         sw = cache.sliding_window_size
         swa = cache.components[ComponentType.SWA]
         # pool can't satisfy even after evict -> participates but aborts (no buffer)
-        with mock.patch.object(
-            cache.swa_kv_pool_host, "alloc", return_value=None
-        ), mock.patch.object(cache, "evict_host", autospec=True) as evict_host:
+        with (
+            mock.patch.object(cache.swa_kv_pool_host, "alloc", return_value=None),
+            mock.patch.object(cache, "evict_host", autospec=True) as evict_host,
+        ):
             self.assertTrue(
                 swa.prepare_prefetch(
                     cache.root_node.id, prefetch_tokens=sw
@@ -4315,9 +4321,14 @@ class UnifiedRadixCacheSuite:
         retry_slot = req_to_token_pool.mamba_allocator.alloc(1)
 
         # first alloc fails -> prepare must evict a mamba slot and retry
-        with mock.patch.object(
-            req_to_token_pool.mamba_allocator, "alloc", side_effect=[None, retry_slot]
-        ), mock.patch.object(cache, "evict", autospec=True) as evict:
+        with (
+            mock.patch.object(
+                req_to_token_pool.mamba_allocator,
+                "alloc",
+                side_effect=[None, retry_slot],
+            ),
+            mock.patch.object(cache, "evict", autospec=True) as evict,
+        ):
             prep = comp.prepare_load_back(leaf.id, req=req)
         evict.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
@@ -5992,9 +6003,12 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
                     device_frees.clear()
                     host_frees.clear()
 
-                with mock.patch.object(
-                    cache.tree_core, name, return_value=make_result()
-                ), mock.patch.object(cache, "_free_values", side_effect=record):
+                with (
+                    mock.patch.object(
+                        cache.tree_core, name, return_value=make_result()
+                    ),
+                    mock.patch.object(cache, "_free_values", side_effect=record),
+                ):
                     returned = call()
                 self.assertEqual(returned, expected)
                 ((device_frees, host_frees),) = drained
@@ -6022,11 +6036,16 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
             )
             for ct in order
         }
-        with mock.patch.object(
-            cache,
-            "_apply_cache_action",
-            side_effect=lambda action: freed.append(("device", action.component_type)),
-        ), mock.patch.dict(cache.components, fake_components):
+        with (
+            mock.patch.object(
+                cache,
+                "_apply_cache_action",
+                side_effect=lambda action: freed.append(
+                    ("device", action.component_type)
+                ),
+            ),
+            mock.patch.dict(cache.components, fake_components),
+        ):
             cache._free_values(device_frees, host_frees)
 
         self.assertEqual(
@@ -6051,9 +6070,10 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
                 raise RuntimeError("boom")
 
         host_mock = mock.MagicMock()
-        with mock.patch.object(
-            cache, "_apply_cache_action", side_effect=boom_on_swa
-        ), mock.patch.dict(cache.components, {ComponentType.FULL: host_mock}):
+        with (
+            mock.patch.object(cache, "_apply_cache_action", side_effect=boom_on_swa),
+            mock.patch.dict(cache.components, {ComponentType.FULL: host_mock}),
+        ):
             with self.assertRaises(RuntimeError):
                 cache._free_values(device_frees, host_frees)
 
@@ -6138,6 +6158,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]
         insert_result.prefix_len = 4
+        insert_result.host_insert_dropped = False
         cache.tree_core.insert_host.return_value = insert_result
         cache.ongoing_prefetch = {
             "req": (
@@ -6176,6 +6197,220 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             order.commit.call_args.kwargs["cache_actions"], insert_result.cache_actions
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+
+
+class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
+    """Prefetch must not hang a backed-up host child under an un-backed-up parent.
+
+    Under write-through that broke the "child backed up => parent backed up"
+    invariant, failing as an idle-sanity error and, on eviction, as
+    `_remove_leaf_from_parent -> assert v == node`. Fix: drop the refill.
+    """
+
+    ps = 16
+    cfg = CacheConfig(
+        page_size=ps,
+        components=(ComponentType.FULL,),
+        kv_size=4096,
+        max_context_len=4096,
+    )
+
+    def _init_hicache(self, cache, *, write_policy="write_through"):
+        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+
+        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
+
+        def get_mha_host_pool_cls_wrapper(device_pool):
+            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
+
+            def kv_host_pool_wrapper(*args, **kwargs):
+                kwargs["pin_memory"] = False
+                return host_pool_cls(*args, **kwargs)
+
+            return kv_host_pool_wrapper
+
+        patcher = mock.patch.object(
+            assembler,
+            "get_mha_host_pool_cls",
+            side_effect=get_mha_host_pool_cls_wrapper,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            page_size=self.cfg.page_size,
+            hicache_io_backend="direct",
+            hicache_write_policy=write_policy,
+        )
+        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
+        set_global_server_args_for_scheduler(server_args)
+        cache.init_hicache(server_args, cache.cache_init_params)
+        cache.write_through_threshold = 1 << 30
+        cache.load_back_threshold = 0
+
+    def _insert_device(self, cache, allocator, ids):
+        """Insert a device-only chain (no auto-backup) and return its leaf id."""
+        key = RadixKey(array("q", ids)).page_aligned(self.ps)
+        val = allocator.alloc(len(key))
+        self.assertIsNotNone(val)
+        val = val.to(dtype=torch.int64)
+        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0))
+        return cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+
+    def _attach_host_child(self, cache, parent_id, start_token):
+        """Mimic a prefetch commit: hang a backed-up host chain under `parent_id`."""
+        ps = self.ps
+        child_key = RadixKey(
+            array("q", list(range(start_token, start_token + 2 * ps)))
+        ).page_aligned(ps)
+        host_idx = cache.cache_controller.mem_pool_host.alloc(len(child_key))
+        self.assertIsNotNone(host_idx, "host pool alloc failed")
+        host_idx = host_idx.to(dtype=torch.int64)
+        hashes = [f"h{i}" for i in range(len(child_key) // ps)]
+        res = cache.tree_core.insert_host(parent_id, child_key, host_idx, hashes)
+        if res.host_insert_dropped:
+            cache.cache_controller.mem_pool_host.free(host_idx)
+        return res.inserted_host_node
+
+    def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
+        """Write-through: a refill under an un-backed-up parent is dropped."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        parent = cache.tree_core.node_by_id(parent_id)
+        self.assertFalse(parent.backuped)
+
+        child = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNone(child)
+        self.assertEqual(len(parent.children), 0)
+        cache.sanity_check()
+
+    def test_dropped_prefetch_releases_all_host_resources(self):
+        """The caller owns every completed buffer when host insertion drops."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 2 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(self.ps, dtype=torch.int64),
+        )
+        mamba_transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.arange(1, dtype=torch.int64),
+        )
+        swa_component = mock.Mock()
+        mamba_component = mock.Mock()
+        cache.tree_core.components_by_type[ComponentType.SWA] = swa_component
+        cache.tree_core.components_by_type[ComponentType.MAMBA] = mamba_component
+        comp_xfers = {
+            ComponentType.SWA: [swa_transfer],
+            ComponentType.MAMBA: [mamba_transfer],
+        }
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.pool_storage_result = PoolTransferResult(
+            kv_hit_pages=completed_tokens // self.ps,
+            extra_pool_hit_pages={
+                PoolName.SWA: 1,
+                PoolName.MAMBA: 1,
+            },
+        )
+        anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
+        req_id = "drop-all-resources"
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent_id,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        )
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+
+        with (
+            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            # Isolate the drop-release branch under test from the hybrid-sync
+            # step: treat the whole fetched prefix as usable so the insert runs.
+            mock.patch.object(
+                cache,
+                "_sync_and_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            # No storage backend in this fixture, so the real release queues
+            # don't exist; assert on the release call instead of draining them.
+            mock.patch.object(
+                cache.cache_controller, "append_host_mem_release"
+            ) as release,
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        swa_component.commit_hicache_transfer.assert_not_called()
+        mamba_component.commit_hicache_transfer.assert_not_called()
+        self.assertEqual(cache.pop_prefetch_loaded_tokens(req_id), 0)
+        self.assertEqual(len(cache.tree_core.node_by_id(parent_id).children), 0)
+
+        drop_releases = [
+            call
+            for call in release.call_args_list
+            if call.kwargs.get("extra_pools") is not None
+        ]
+        self.assertEqual(len(drop_releases), 1)
+        self.assertTrue(
+            torch.equal(
+                drop_releases[0].kwargs["host_indices"],
+                host_indices[:completed_tokens],
+            )
+        )
+        self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
+        self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
+
+        cache.sanity_check()
+
+    def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
+        """Write-through: eviction after such a refill must not corrupt the tree."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        self._attach_host_child(cache, parent_id, start_token=1000)
+
+        cache.evict(EvictParams(num_tokens=10 * self.ps))
+        cache.sanity_check()
+
+    def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):
+        """Write-back keeps the refill (it has no backed-up-parent requirement)."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        child = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(child)
+        cache.sanity_check()
 
 
 if __name__ == "__main__":
