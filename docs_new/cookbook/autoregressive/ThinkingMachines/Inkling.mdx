@@ -40,8 +40,6 @@ docker pull lmsysorg/sglang:inkling-rocm700-mi35x   # AMD MI350X / MI355X
 docker pull lmsysorg/sglang:dev-cu13-inkling-dspark # CUDA 13 + DSpark support
 ```
 
-<Note>The **DSpark** strategy needs the `dev-cu13-inkling-dspark` build — DSpark isn't in the `inkling-cu1x` images yet. The command panel below pulls that image in for the DSpark cell and states the prerequisite in the command's first comment line.</Note>
-
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
 
 </Tab>
@@ -307,19 +305,6 @@ To try it, select the **Long Context** strategy in the Deploy panel above for an
 
 ### 3.7 DSpark (Speculative Decoding)
 
-The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — [`RadixArk/Inkling-DSpark-Preview`](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) — served unquantized (`--speculative-draft-model-quantization unquant`) alongside the NVFP4 target.
+The **DSpark** deploy strategy is the second speculative-decoding path for Inkling. Unlike **MTP**, which drives Inkling's own multi-layer draft head, DSpark runs a **separate draft checkpoint** — `RadixArk/Inkling-DSpark-Preview` — served unquantized alongside the NVFP4 target.
 
-<Note>
-DSpark requires an SGLang build with DSpark support: `docker pull lmsysorg/sglang:dev-cu13-inkling-dspark`. The `inkling-cu13` / `inkling-cu12` images don't carry it yet. The generated command repeats this prerequisite in its first comment line.
-</Note>
-
-Selecting **DSpark** in the Deploy panel emits the full recipe — you don't hand-tune the draft depth: DSpark reads its block size from the draft checkpoint's config, so there's no `--speculative-num-steps` / `--speculative-eagle-topk` / `--speculative-num-draft-tokens` to set (pass `--speculative-num-draft-tokens` only to override it, as `block_size + 1`).
-
-What differs from the Balanced recipe, and why:
-
-- `--mem-fraction-static 0.68` — the unquantized draft weights live outside the FP4 target, so the static budget shrinks to leave room for the target's memory pool.
-- `--max-running-requests 68`, `--chunked-prefill-size 8192`, `--cuda-graph-max-bs-prefill 8192` — the scheduling/prefill envelope this tier was measured under.
-- `--disable-flashinfer-autotune`, `--skip-server-warmup` — cut startup time; drop either one if you'd rather pay the warmup cost for autotuned kernels.
-- No `--enable-multimodal`. The verified DSpark run is text-only; add the flag if you need image/audio input on this tier, but that combination hasn't been verified.
-
-Verified end-to-end on B200 (TP=8, NVFP4).
+It needs an SGLang build with DSpark support (`lmsysorg/sglang:dev-cu13-inkling-dspark`); the `inkling-cu13` / `inkling-cu12` images don't carry it yet, so the generated command states that prerequisite in its first comment line. The recipe is text-only (no `--enable-multimodal`). Verified end-to-end on B200 (TP=8, NVFP4).

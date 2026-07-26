@@ -771,16 +771,10 @@ export const Playground = ({ config }) => {
             { dpAttnOn: h.hasFlag(flags, "--enable-dp-attention") }).disabled) {
           return { flags, env };
         }
-        // Strip every spec-owned flag, not just the ones deriveFromBase matches
-        // on: a base whose recipe carries a separate draft checkpoint (DSpark /
-        // DFlash) or EAGLE-only switches would otherwise leak them into the
-        // picked preset (e.g. an EAGLE command still pointing at a DSpark draft).
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
           "--speculative-ngram-max-bfs-breadth",
-          "--speculative-draft-model-path", "--speculative-draft-model-quantization",
-          "--enable-multi-layer-eagle", "--speculative-use-rejection-sampling",
         ]);
         const preset = (fc.options || []).find((p) => p.id === value);
         if (preset?.flags?.length) flags = h.insertBeforeTail(flags, preset.flags);
