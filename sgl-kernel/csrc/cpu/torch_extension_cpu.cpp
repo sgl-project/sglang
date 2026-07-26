@@ -258,6 +258,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight);
 // scale prepack for mxfp4
 at::Tensor convert_scale_packed(at::Tensor& scale);
 
+#if defined(__x86_64__) || defined(__aarch64__)
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
@@ -270,6 +271,7 @@ at::Tensor int8_scaled_mm_cpu(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+#endif
 
 // fp8 gemm
 at::Tensor fp8_scaled_mm_cpu(
@@ -285,6 +287,7 @@ at::Tensor fp8_scaled_mm_cpu(
 at::Tensor mxfp4_scaled_mm_cpu(
     at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
+#if defined(__x86_64__) || defined(__aarch64__)
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -293,6 +296,7 @@ at::Tensor int8_scaled_mm_with_quant(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // int4 gemm
@@ -706,6 +710,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("convert_scale_packed(Tensor scale) -> Tensor");
   m.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
 
+#if defined(__x86_64__) || defined(__aarch64__)
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
@@ -715,6 +720,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
       "out_dtype, bool is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_cpu", torch::kCPU, &int8_scaled_mm_cpu);
+#endif
 
   // fp8 gemm
   m.def(
@@ -726,11 +732,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
   m.impl("mxfp4_scaled_mm_cpu", torch::kCPU, &mxfp4_scaled_mm_cpu);
 
+#if defined(__x86_64__) || defined(__aarch64__)
   // quant + igemm
   m.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, ScalarType out_dtype, bool "
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
+#endif
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // int4 gemm
