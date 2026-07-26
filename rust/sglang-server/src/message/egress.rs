@@ -787,6 +787,85 @@ mod tests {
         assert!(events[1].extras.is_none());
     }
 
+    /// All SEVEN extras families in one frame, each with a distinct length AND
+    /// distinct values. The existing extras test exercises only `out_lp` /
+    /// `out_top` / `hidden`, so transposing a header pair — `in_top_*` with
+    /// `out_tid_*`, say — leaves every assertion passing while the client receives
+    /// another request's logprobs under the wrong key. Lengths differ per family
+    /// (2/1/2/1/2/1/3 elements) so a swap misaligns the cursors too.
+    #[test]
+    fn decodes_all_extras_families_without_transposition() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1")]), // rids
+            Value::Array(vec![Value::Nil]),       // finish
+            arr_u(&[9]),                          // prompt
+            arr_u(&[1]),                          // tok_lens
+            arr_u(&[2]),                          // out_lp_lens      (2 flat)
+            arr_u(&[1]),                          // in_lp_lens       (1 flat)
+            arr_u(&[1]),                          // out_top_reqlens  (1 position…
+            arr_u(&[2]),                          // out_top_poslens  …k=2)
+            arr_u(&[1]),                          // in_top_reqlens   (1 position…
+            arr_u(&[1]),                          // in_top_poslens   …k=1)
+            arr_u(&[1]),                          // out_tid_reqlens  (1 position…
+            arr_u(&[2]),                          // out_tid_poslens  …2 ids)
+            arr_u(&[1]),                          // in_tid_reqlens   (1 position…
+            arr_u(&[1]),                          // in_tid_poslens   …1 id)
+            arr_u(&[1]),                          // hidden_reqlens   (1 row…
+            arr_u(&[3]),                          // hidden_poslens   …dim 3)
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+
+        // Concatenated in `for_each_chunk`'s column order.
+        let mut data = Vec::new();
+        data.extend(i(&[100])); // token_ids
+        data.extend(f(&[-1.1, -1.2])); // out_lp_val
+        data.extend(i(&[11, 12])); // out_lp_idx
+        data.extend(f(&[-2.1])); // in_lp_val
+        data.extend(i(&[21])); // in_lp_idx
+        data.extend(f(&[-3.1, -3.2])); // out_top_val
+        data.extend(i(&[31, 32])); // out_top_idx
+        data.extend(f(&[-4.1])); // in_top_val
+        data.extend(i(&[41])); // in_top_idx
+        data.extend(f(&[-5.1, -5.2])); // out_tid_val
+        data.extend(i(&[51, 52])); // out_tid_idx
+        data.extend(f(&[-6.1])); // in_tid_val
+        data.extend(i(&[61])); // in_tid_idx
+        data.extend(f(&[7.1, 7.2, 7.3])); // hidden_val
+
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert_eq!(events.len(), 1);
+        let ex = events[0].extras.as_deref().expect("extras present");
+
+        assert_eq!(ex.out_lp_val, vec![-1.1, -1.2]);
+        assert_eq!(ex.out_lp_idx, vec![11, 12]);
+        assert_eq!(ex.in_lp_val, vec![-2.1]);
+        assert_eq!(ex.in_lp_idx, vec![21]);
+        assert_eq!(ex.out_top_val, vec![-3.1, -3.2]);
+        assert_eq!(ex.out_top_idx, vec![31, 32]);
+        assert_eq!(ex.out_top_lens, vec![2]);
+        assert_eq!(ex.in_top_val, vec![-4.1]);
+        assert_eq!(ex.in_top_idx, vec![41]);
+        assert_eq!(ex.in_top_lens, vec![1]);
+        assert_eq!(ex.out_tid_val, vec![-5.1, -5.2]);
+        assert_eq!(ex.out_tid_idx, vec![51, 52]);
+        assert_eq!(ex.out_tid_lens, vec![2]);
+        assert_eq!(ex.in_tid_val, vec![-6.1]);
+        assert_eq!(ex.in_tid_idx, vec![61]);
+        assert_eq!(ex.in_tid_lens, vec![1]);
+        assert_eq!(ex.hidden_val, vec![7.1, 7.2, 7.3]);
+        assert_eq!(ex.hidden_lens, vec![3]);
+        // Every byte of the data buffer was consumed by exactly one family.
+        assert_eq!(events[0].token_ids, vec![100]);
+    }
+
     /// The common frame must stay small: logprob/hidden columns are boxed behind
     /// `ChunkExtras`, so the inline decode array is a few KiB — not MiB — even at
     /// batch 4096. A regression that inlines a rare column would blow this up.
