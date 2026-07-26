@@ -33,7 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -131,6 +131,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        has_kv_on_another_pp_stage = (
+            self._cell_size == 0
+            and mambaish is not None
+            and bool(mambaish.full_attention_layer_ids)
+            and kvc.ps.pp_size > 1
+        )
+        self._zero_kv_max_tokens = (
+            torch.iinfo(torch.int64).max
+            if has_kv_on_another_pp_stage
+            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+        )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -275,7 +286,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif kvc.server_args.kv_cache_dtype == "mxfp8":
+            elif get_model().kv_cache_dtype == "mxfp8":
                 scale_block_size = 32
                 n = model_config.get_num_kv_heads(tp_size)
                 cell_size += (
@@ -287,7 +298,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        max_total_num_tokens = (
+            available_bytes // self._cell_size
+            if self._cell_size
+            else self._zero_kv_max_tokens
+        )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -335,7 +350,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        if kvc.server_args.kv_cache_dtype == "mxfp8":
+        if get_model().kv_cache_dtype == "mxfp8":
             scale_block_size = 32
             self._full_per_token += (
                 model_config.get_num_kv_heads(tp_size)
