@@ -30,7 +30,9 @@ FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
 
 
 SUPPORTS_AUTOTUNE_CACHE = (
-    "cache_results" in inspect.signature(triton.autotune).parameters
+    HAS_TRITON
+    and hasattr(triton, "autotune")
+    and "cache_results" in inspect.signature(triton.autotune).parameters
 )
 
 autotune_cache_kwargs = (
@@ -53,15 +55,16 @@ def check_environments():
             "Please consider using a Linux environment for compatibility."
         )
 
-    triton_version = version.parse(triton.__version__)
-    required_triton_version = version.parse("3.2.0")
+    if HAS_TRITON and triton is not None:
+        triton_version = version.parse(triton.__version__)
+        required_triton_version = version.parse("3.2.0")
 
-    if triton_version < required_triton_version:
-        logger.warning(
-            f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
-            "Errors may occur and these issues will not be fixed. "
-            "Please consider upgrading Triton."
-        )
+        if triton_version < required_triton_version:
+            logger.warning(
+                f"Current Triton version {triton_version} is below the recommended 3.2.0 version. "
+                "Errors may occur and these issues will not be fixed. "
+                "Please consider upgrading Triton."
+            )
 
     # Check Python version
     py_version = version.parse(f"{sys.version_info.major}.{sys.version_info.minor}")
@@ -282,7 +285,11 @@ use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
-is_gather_supported = hasattr(triton.language, "gather")
+is_gather_supported = (
+    HAS_TRITON
+    and hasattr(triton, "language")
+    and hasattr(triton.language, "gather")
+)
 
 
 def get_all_max_shared_mem():
