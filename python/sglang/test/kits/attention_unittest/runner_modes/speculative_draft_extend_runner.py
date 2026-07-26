@@ -192,7 +192,7 @@ def _run_draft_extend_cuda_graph_case(
     run_graph_eager: bool = True,
     compare_replay_to_graph_eager: bool = True,
     pad_style: str = "small_real",
-    pad_num_tokens_per_bs: int | None = None,
+    pad_num_tokens_per_req: int | None = None,
 ):
     adapter = SpeculativeCudaGraphAdapter(
         build_fixture=build_fixture,
@@ -217,7 +217,7 @@ def _run_draft_extend_cuda_graph_case(
         atol=atol,
         rtol=rtol,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=pad_num_tokens_per_bs,
+        pad_num_tokens_per_req=pad_num_tokens_per_req,
     )
     run_speculative_cuda_graph_case(
         testcase,
@@ -299,7 +299,7 @@ def run_dense_draft_extend_v2_cuda_graph_case(
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=num_tokens_per_req,
+        pad_num_tokens_per_req=num_tokens_per_req,
     )
 
 
@@ -367,7 +367,7 @@ def run_mla_draft_extend_v2_cuda_graph_case(
         run_graph_eager=False,
         compare_replay_to_graph_eager=False,
         pad_style=pad_style,
-        pad_num_tokens_per_bs=num_tokens_per_req,
+        pad_num_tokens_per_req=num_tokens_per_req,
     )
 
 
@@ -556,14 +556,10 @@ def _capture_eagle_draft_extend_graph_runner(
             _single_rank_graph_capture,
         ),
         patch(
-            "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_tensor_model_parallel_rank",
-            lambda: 0,
-        ),
-        patch(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1),
+        get_parallel().override(attn_cp_size=1, tp_rank=0),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftExtendCudaGraphRunner(
