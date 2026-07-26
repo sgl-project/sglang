@@ -30,7 +30,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
-from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
+from sglang.srt.utils.hf_transformers.common import resolve_local_or_cached_file
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -59,8 +59,15 @@ class NativeMmHost:
     as a 400.
     """
 
-    # Rust mm-worker threads == max concurrently-processed mm requests.
-    MM_WORKERS = 8
+    # Rust mm-worker threads when --mm-processor-worker-num is 0 ("model-
+    # specific default"). The workers are GIL-free, so unlike the Python
+    # processor pool more than one is always usable.
+    AUTO_MM_WORKERS = 8
+
+    # Model types whose image-only M-RoPE matches the native fast path.
+    NATIVE_QWEN_MODEL_TYPES = frozenset(
+        ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+    )
 
     def __init__(
         self,
@@ -76,12 +83,14 @@ class NativeMmHost:
             import_processors,
         )
         from sglang.srt.managers.tokenizer_manager import (
-            _determine_tensor_transport_mode,
-            _get_processor_wrapper,
+            determine_tensor_transport_mode,
+            get_processor_wrapper,
         )
 
         self.server_args = server_args
         self.model_config = model_config
+        # Rust mm-worker threads == max concurrently-processed mm requests.
+        self.mm_workers = server_args.mm_processor_worker_num or self.AUTO_MM_WORKERS
 
         # Same processor stack the Python TokenizerManager builds
         # (init_tokenizer_and_processor, multimodal branch). The HF
@@ -90,8 +99,8 @@ class NativeMmHost:
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        _processor = processor or _get_processor_wrapper(self.server_args)
-        transport_mode = _determine_tensor_transport_mode(self.server_args)
+        _processor = processor or get_processor_wrapper(self.server_args)
+        transport_mode = determine_tensor_transport_mode(self.server_args)
         self.mm_processor = get_mm_processor(
             self.model_config.hf_config,
             self.server_args,
@@ -103,11 +112,6 @@ class NativeMmHost:
         # Set by resolve_native_spec() when the model family has a pure-Rust
         # pipeline; consumed by build_native_mm (the drain-time adapter).
         self._native: Optional[Dict[str, Any]] = None
-
-    # Model types whose image-only M-RoPE matches the native fast path.
-    NATIVE_QWEN_MODEL_TYPES = frozenset(
-        ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
-    )
 
     def resolve_native_spec(self) -> Optional[str]:
         """JSON spec for the Rust-native MM pipeline, or ``None`` when the
@@ -322,7 +326,7 @@ class RustServer:
                     f"(supported: {', '.join(sorted(NativeMmHost.NATIVE_QWEN_MODEL_TYPES))}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
                 )
-            server.start_mm_workers(spec, mm_host.MM_WORKERS)
+            server.start_mm_workers(spec, mm_host.mm_workers)
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -618,7 +622,7 @@ class RustServer:
         if not scheduler.server_args.skip_tokenizer_init:
             path = server_args["tokenizer_path"] or server_args["model_path"]
             if not os.path.exists(path):
-                server_args["tokenizer_path"] = _resolve_local_or_cached_file(
+                server_args["tokenizer_path"] = resolve_local_or_cached_file(
                     path, "tokenizer.json", server_args["revision"]
                 )
 

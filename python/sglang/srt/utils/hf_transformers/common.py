@@ -229,7 +229,7 @@ def resolve_runai_obj_uri(model_name_or_path: str) -> str:
     return model_name_or_path
 
 
-def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
+def resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
     """Resolve a file from a local directory or HF hub cache (no network)."""
     local_path = Path(model_name_or_path) / filename
     if local_path.is_file():
@@ -244,7 +244,7 @@ def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
 def _cached_file_exists(model_name_or_path, filename, revision=None) -> bool:
     """Whether *filename* is available locally or in the HF cache (no network)."""
     try:
-        _resolve_local_or_cached_file(model_name_or_path, filename, revision)
+        resolve_local_or_cached_file(model_name_or_path, filename, revision)
         return True
     except Exception:
         return False

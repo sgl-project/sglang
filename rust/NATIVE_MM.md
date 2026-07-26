@@ -19,7 +19,8 @@ tm-ingress FSM: Received → … → Normalizing
   │  request parks in `pending_mm`; its [text, input_ids, image, video,
   │  audio] msgpack payload goes down a bounded channel
   ▼
-MM worker pool (sglang-server/src/mm.rs, N plain threads)
+MM worker pool (sglang-server/src/mm.rs, N plain threads;
+  │  N = --mm-processor-worker-num, or 8 when 0/unset)
   │  sglang-mm driver::process (inline on the worker thread — the
   │  rlib owns no threads; the pool is the concurrency):
   │    fetch (data:/base64/file/http) → decode → smart_resize →
