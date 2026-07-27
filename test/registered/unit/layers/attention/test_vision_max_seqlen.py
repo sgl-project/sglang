@@ -25,6 +25,7 @@ def test_vision_flash3_uses_precomputed_max_seqlen(monkeypatch):
     monkeypatch.setattr(
         vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
     )
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn, raising=False)
 
     attention = vision.VisionFlash3Attention(use_data_parallel=True)
     q = torch.zeros(3, 1, 8)
@@ -89,6 +90,7 @@ def test_vision_flash4_uses_precomputed_max_seqlen(monkeypatch):
     monkeypatch.setattr(
         vision, "flash_attn_varlen_func", fake_flash_attn, raising=False
     )
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn, raising=False)
 
     attention = vision.VisionFlash4Attention(use_data_parallel=True)
     q = torch.zeros(3, 1, 8)
@@ -154,6 +156,7 @@ def test_kimi_moonvit_precomputes_sequence_lengths_once():
             max_seqlen,
             rope_freqs_cis,
             sequence_lengths,
+            forward_metadata=None,
         ):
             recorded["cu_seqlens"] = cu_seqlens
             recorded["max_seqlen"] = max_seqlen

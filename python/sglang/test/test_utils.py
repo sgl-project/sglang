@@ -768,6 +768,11 @@ def _subprocess_popen_with_outputs(
     env: Optional[dict],
     return_stdout_stderr: Optional[tuple],
 ) -> subprocess.Popen:
+    # Release allocator-cached GPU memory to the driver before spawning a
+    # server: cached blocks stay cudaMalloc'd and shrink the child's memory.
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
     if not return_stdout_stderr:
         return subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
@@ -921,6 +926,11 @@ def popen_launch_server(
         merged = os.environ.copy()
         merged.update(env)
         env = merged
+
+    # A dying predecessor can hold the derived port plan past
+    # kill_process_tree() while GPU teardown completes; give CI launches
+    # teardown-sized patience (see wait_port_available).
+    env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -2201,6 +2211,7 @@ def _visible_gpu_indices(pynvml) -> List[int]:
 
 
 def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+    self_pid = os.getpid()
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
@@ -2209,10 +2220,25 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
             continue
         try:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-            proc_info = ", ".join(
-                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}" for proc in procs
-            )
         except pynvml.NVMLError:
+            procs = None
+        if procs is not None:
+            # Discount our own usage: the caching allocator retains memory
+            # across test classes, and waiting on ourselves never succeeds.
+            self_used = sum(
+                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+            )
+            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+                continue
+            proc_info = ", ".join(
+                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
+                for proc in procs
+                if proc.pid != self_pid
+            ) or (
+                f"no other compute processes;"
+                f" self pid={self_pid} holds {_format_gib(self_used)}"
+            )
+        else:
             proc_info = ""
         reports.append(
             f"GPU {index} uses {_format_gib(used_bytes)}"

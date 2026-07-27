@@ -503,6 +503,8 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if _is_npu:
+            return False
         if self.tp_size == 1:
             return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
