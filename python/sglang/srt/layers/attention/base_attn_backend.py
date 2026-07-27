@@ -88,6 +88,13 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def draft_extend_metadata_captured_in_graph(self) -> bool:
+        """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
+        this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
+        graph, so a replaying runner may skip the eager
+        :py:meth:`init_forward_metadata_out_graph` call."""
+        return False
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 

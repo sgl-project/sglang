@@ -32,6 +32,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _unsupported_derived_weight_cache_error() -> Optional[str]:
+    """Reject online weight updates that derived-weight caches cannot survive.
+
+    The HPC-Ops bf16xfp32 GEMM caches the fp32 weight split; in-place loader
+    writes are invisible to it, so an update would silently keep serving the
+    old weights. The check is startup-determined and rank-uniform, so an
+    update never proceeds on some workers while rejected on others.
+    """
+    from sglang.kernels.ops.attention.dsv4.gemm import hpc_bf16xfp32_gemm_enabled
+
+    if hpc_bf16xfp32_gemm_enabled():
+        return (
+            "Online weight updates are not supported while the HPC-Ops "
+            "bf16xfp32 GEMM optimization is enabled: the cached weight "
+            "split would keep serving the old weights."
+        )
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -104,6 +123,21 @@ class WeightUpdater:
             logger.error(message)
             return False, message
 
+    def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
+        """Reject weight mutations while the CUDA IPC weight cache is active:
+        param.data is the daemon's master copy shared with every co-attached
+        engine, so an in-place update would silently corrupt them all.
+        """
+        mode = self.get_model_runner().server_args.weight_cache_mode
+        if mode != "off":
+            raise RuntimeError(
+                f"[weight_cache] {op} is not supported while the weight cache is "
+                f"active (--weight-cache-mode {mode}): model weights are shared "
+                f"with the daemon via CUDA IPC, so mutating them in place would "
+                f"corrupt the daemon's master copy and every co-attached engine. "
+                f"Restart with --weight-cache-mode off to use this operation."
+            )
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -112,6 +146,11 @@ class WeightUpdater:
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        self._assert_weight_cache_inactive("update_weights_from_disk")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -197,6 +236,10 @@ class WeightUpdater:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
+        self._assert_weight_cache_inactive("update_weights_from_distributed")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
 
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
@@ -278,7 +321,12 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         monkey_patch_torch_reductions()
+        self._assert_weight_cache_inactive("update_weights_from_tensor")
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
@@ -338,6 +386,11 @@ class WeightUpdater:
 
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+        self._assert_weight_cache_inactive("update_weights_from_ipc")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,
