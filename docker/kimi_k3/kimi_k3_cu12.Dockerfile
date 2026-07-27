@@ -57,10 +57,12 @@ RUN set -eu; \
     done
 
 # --- 1. Kimi-K3 SGLang code (replaces the base's stock sglang, editable) ---
-COPY . /sgl-workspace/sglang
 # Keep the installed extension modules, but discard Rust and pip build
 # artifacts that are not used at runtime.
-RUN cd /sgl-workspace/sglang && \
+RUN rm -rf /sgl-workspace/sglang && \
+    git clone --branch kimi-k3 \
+      https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
+    cd /sgl-workspace/sglang && \
     rm -rf .git && \
     test ! -e .git && \
     pip install -e python --no-deps && \
