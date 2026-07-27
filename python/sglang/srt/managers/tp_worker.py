@@ -266,8 +266,8 @@ class BaseTpWorker(ABC):
             self.model_runner,
             return_hidden_states_before_norm=False,
         )
-        output = self.model_runner.forward(forward_batch).logits_output
-        return output  # Returns EmbeddingPoolerOutput
+        output = self.model_runner.forward(forward_batch)
+        return output.logits_output, output.can_run_graph
 
 
 class TpModelWorker(BaseTpWorker):
@@ -342,8 +342,8 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Scale joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_scale_joiner:
+        # Elastic joiners cannot enter the launch-time WORLD broadcast.
+        if server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(

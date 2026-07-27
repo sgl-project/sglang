@@ -23,8 +23,9 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -467,6 +468,7 @@ def run_eagle_verify(
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
+    grammar_barrier=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -527,13 +529,16 @@ def run_eagle_verify(
             ),
         )
 
-    # Prepare grammar data on CPU if needed
-    if batch.has_grammar:
-        retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-        retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-        draft_tokens_cpu = verify_input.draft_token.view(
-            verify_input.retrieve_next_token.shape
-        ).cpu()
+    # Must stay ahead of the target verify launch below.
+    grammar_tree = (
+        GrammarTree.from_device(
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
+        )
+        if batch.has_grammar
+        else None
+    )
 
     if metadata_ready_pre_pad:
         # Multi-layer eagle preserved-verbatim behavior: metadata init is
@@ -559,24 +564,15 @@ def run_eagle_verify(
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
-    vocab_mask = None
+    grammar_mask = None
     if batch.has_grammar:
-        # Generate the logit mask for structured output.
-        vocab_mask = generate_token_bitmask(
-            batch.reqs,
-            verify_input,
-            retrieve_next_token_cpu,
-            retrieve_next_sibling_cpu,
-            draft_tokens_cpu,
-            batch.sampling_info.vocab_size,
+        grammar_mask = build_grammar_vocab_mask(
+            reqs=batch.reqs,
+            tree=grammar_tree,
+            sampling_info=batch.sampling_info,
+            device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
-
-        if vocab_mask is not None:
-            assert verify_input.grammar is not None
-            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-            # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
-            # and will be applied to produce wrong results
-            batch.sampling_info.vocab_mask = None
 
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
@@ -585,7 +581,7 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

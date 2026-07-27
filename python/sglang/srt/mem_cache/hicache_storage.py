@@ -132,9 +132,16 @@ class PoolTransferResult:
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """Record actual load/write success counts per extra pool."""
+        """Record actual load/write success counts per extra pool.
+
+        Every extra pool contributes a prefix that must be contiguous from the
+        start, so count the leading run of successes
+        """
         self.extra_pool_hit_pages.update(
-            {name: sum(rs) for name, rs in results.items()}
+            {
+                name: (rs.index(False) if False in rs else len(rs))
+                for name, rs in results.items()
+            }
         )
 
 

@@ -1,6 +1,6 @@
 import torch
 
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from sglang.kernels.ops.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 

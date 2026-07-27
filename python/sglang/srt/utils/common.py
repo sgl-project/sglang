@@ -288,6 +288,15 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+# Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
+# This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
+is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version,
+        device_capability_majors=[10, 11],
+        cuda_version=(12, 8),
+    )
+)
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
@@ -434,23 +443,9 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        # Use mem_get_info() with a sanity cap to avoid KV-cache over-allocation
-        # on drivers that incorrectly return total memory as free memory.
-        # Consistent with the fallback: free = max(0, total - allocated).
-        try:
-            free_gpu_memory, total_gpu_memory = torch.xpu.mem_get_info(gpu_id)
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            free_gpu_memory = min(
-                float(free_gpu_memory),
-                max(0.0, float(total_gpu_memory) - used_memory),
-            )
-        except Exception:
-            # Fallback for devices/drivers that do not support querying free memory
-            used_memory = float(torch.xpu.memory_allocated(gpu_id))
-            total_gpu_memory = float(
-                torch.xpu.get_device_properties(gpu_id).total_memory
-            )
-            free_gpu_memory = max(0.0, total_gpu_memory - used_memory)
+        used_memory = torch.xpu.memory_allocated(gpu_id)
+        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
+        free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()
@@ -557,6 +552,18 @@ def get_dispatch_device_backend():
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
+
+
+def create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Stream(device=device)
+
+
+def device_stream_context(stream):
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 def get_amdgpu_memory_capacity():
@@ -1532,6 +1539,24 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
+    from sglang.srt.multimodal.audio_from_video import (
+        decode_audio_container,
+        is_audio_container,
+    )
+
+    if isinstance(source, bytes):
+        header = source[:16]
+    else:
+        with open(source, "rb") as audio_stream:
+            header = audio_stream.read(16)
+
+    if is_audio_container(header):
+        return decode_audio_container(
+            source,
+            target_sr=sr,
+            mono=mono,
+        )
+
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
@@ -1733,6 +1758,20 @@ def _normalize_video_input(
         return None
 
 
+def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
+    """Normalize a video input and return its encoded bytes."""
+    if isinstance(video_file, VideoData):
+        video_file = video_file.url
+
+    source = _normalize_video_input(video_file)
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            return f.read()
+    raise ValueError(f"Unsupported video input type: {type(video_file)}")
+
+
 def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
@@ -1820,7 +1859,7 @@ def suppress_noisy_warnings():
     cutlass_dsl_noisy = {
         (
             DeprecationWarning,
-            "Use explicit `struct.scalar.ptr` for pointer instead.",
+            "Using `struct.scalar` as pointer is deprecated.",
         ),
         (
             UserWarning,
@@ -1911,7 +1950,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.14")
+        min_version: Minimum version required (e.g., "0.6.15.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
