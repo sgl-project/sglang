@@ -548,11 +548,6 @@ const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u', '-'];
 /// A stop-string window this long is meaningless anyway.
 const MAX_REPEAT_COUNT: u64 = 256;
 
-/// Most distinct ways a `stop_regex` may match before it is refused — an estimate
-/// of the search space `re`'s backtracking engine can explore (see
-/// [`match_paths`]). Ordinary stop patterns sit in the single digits.
-const MAX_MATCH_PATHS: u64 = 4096;
-
 /// Longest `stop_regex` accepted. A 1 MB literal pattern takes ~677 ms just to
 /// compile, and that cost lands on the scheduler.
 const MAX_STOP_REGEX_LEN: usize = 4096;
@@ -767,110 +762,13 @@ fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
              repetitions; matching it would dominate every decode step"
         )));
     }
-    let paths = match_paths(&ast);
-    if paths > MAX_MATCH_PATHS {
-        return Err(bad(format!(
-            "stop_regex {pattern:?} can match in ~{paths} different ways; matching it \
-             against a non-match explores all of them on every decode step. Make the \
-             pattern less ambiguous (avoid optional or alternating parts inside a \
-             repetition)"
-        )));
-    }
     if repeats_an_assertion(&ast) {
         return Err(bad(format!(
             "stop_regex {pattern:?} quantifies a zero-width assertion, which Python's \
              `re` rejects, or a repetition count Python cannot honour"
         )));
     }
-    let bound = hir_max_len(&hir);
-    // Every stop_regex must be BOUNDED. An unbounded one gets the full-scan
-    // sentinel, which makes the scheduler match against the entire accumulated
-    // output — growing one token per step — so any ambiguity in the pattern turns
-    // into super-linear backtracking that nothing can interrupt: `(?:.|.)*Z` is
-    // 9 bytes and takes 4.5 s at 26 characters of ordinary model prose, never
-    // returning past ~35. The cost is inside `re`'s C loop with the GIL held, so
-    // no timeout, seatbelt or signal can reach it.
-    //
-    // Structural rules cannot catch this family — `(?:.|.)*Z` has a single
-    // repetition and no nesting; the ambiguity is inside the body. Bounding the
-    // window is what actually removes it: with a finite bound the scheduler
-    // matches a fixed-size tail, so the work per step stops growing.
-    if bound >= STOP_REGEX_MAX_LEN {
-        return Err(bad(format!(
-            "stop_regex {pattern:?} is unbounded (`*`, `+`, or `{{n,}}`); it would be \
-             matched against the whole accumulated output on every decode step. Give \
-             it a bounded repetition, e.g. `a{{0,32}}` instead of `a*`"
-        )));
-    }
-    Ok(bound)
-}
-
-/// Estimate how many distinct ways `ast` can match — the size of the search space
-/// Python's backtracking engine explores before giving up on a non-match.
-///
-/// This is the cost model the earlier structural rules kept approximating. Neither
-/// "reject nested repeats" nor "reject unbounded repeats" catches `(?:.?){30}Z`:
-/// it is a single, bounded repetition, and the blowup lives in the body's
-/// AMBIGUITY — `.?` matches a given character two ways, so 30 copies give 2^30
-/// paths, and `Z` never matches, so every one of them is tried. 4.5 s on 26
-/// characters of ordinary model prose, inside `re`'s C loop with the GIL held.
-///
-/// Saturating and deliberately crude: over-counting costs a false 400, while
-/// under-counting costs the scheduler. Concatenation multiplies, alternation adds,
-/// and a repeat of `k` raises its body to the `k`th power — with a `+1` per
-/// position when the body is nullable, since "match nothing here" is another path.
-fn match_paths(ast: &regex_syntax::ast::Ast) -> u64 {
-    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
-    match ast {
-        Ast::Concat(c) => c
-            .asts
-            .iter()
-            .map(match_paths)
-            .fold(1u64, u64::saturating_mul),
-        Ast::Alternation(a) => a
-            .asts
-            .iter()
-            .map(match_paths)
-            .fold(0u64, u64::saturating_add),
-        Ast::Group(g) => match_paths(&g.ast),
-        Ast::Repetition(rep) => {
-            let body = match_paths(&rep.ast).saturating_add(u64::from(nullable(&rep.ast)));
-            let k = match &rep.op.kind {
-                RepetitionKind::Range(RepetitionRange::Exactly(n)) => *n,
-                RepetitionKind::Range(RepetitionRange::Bounded(_, hi)) => *hi,
-                // Unbounded forms are rejected before this runs; treat them as the
-                // cap so a reordering cannot silently admit one.
-                _ => return u64::MAX,
-            };
-            if body <= 1 {
-                return 1; // an unambiguous body stays unambiguous however often it repeats
-            }
-            (0..k).fold(1u64, |acc, _| acc.saturating_mul(body))
-        }
-        _ => 1, // literal, class, dot, assertion, flags
-    }
-}
-
-/// Whether `ast` can match the empty string. A nullable repetition body is the
-/// classic ambiguity source: every position can be "used" or "skipped".
-fn nullable(ast: &regex_syntax::ast::Ast) -> bool {
-    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
-    match ast {
-        Ast::Empty(_) | Ast::Flags(_) | Ast::Assertion(_) => true,
-        Ast::Concat(c) => c.asts.iter().all(nullable),
-        Ast::Alternation(a) => a.asts.iter().any(nullable),
-        Ast::Group(g) => nullable(&g.ast),
-        Ast::Repetition(rep) => match &rep.op.kind {
-            RepetitionKind::ZeroOrOne | RepetitionKind::ZeroOrMore => true,
-            RepetitionKind::Range(RepetitionRange::Exactly(n)) => *n == 0 || nullable(&rep.ast),
-            RepetitionKind::Range(RepetitionRange::AtLeast(n)) => *n == 0 || nullable(&rep.ast), // codespell:ignore atleast
-            RepetitionKind::Range(RepetitionRange::Bounded(lo, _)) => {
-                *lo == 0 || nullable(&rep.ast)
-            }
-            _ => nullable(&rep.ast),
-        },
-        _ => false,
-    }
+    Ok(hir_max_len(&hir))
 }
 
 /// Reject repetitions whose cost compounds down the nesting.
@@ -1469,50 +1367,6 @@ mod tests {
         }
     }
 
-    /// The ambiguity family, which no structural rule caught: `(?:.?){30}Z` is a
-    /// SINGLE bounded repetition, so the nesting-product and unbounded rules both
-    /// pass it — the blowup is 2^30 match paths through a nullable body, and `Z`
-    /// never matches so every path is tried (4.5 s on 26 characters of ordinary
-    /// model prose, GIL held).
-    #[test]
-    fn ambiguous_patterns_are_rejected_by_path_count() {
-        for pattern in [
-            "(?:.?){30}Z",
-            "(?:a{0,1}){4000}b",
-            "(?:a|ab){20}c",
-            "(?:(?:a?)?){40}z",
-        ] {
-            assert!(
-                stop_regex_bound(pattern).is_err(),
-                "{pattern} is ambiguous and must be rejected"
-            );
-        }
-        for pattern in [
-            r"\d{6}",
-            "abc",
-            "(?:ab){3}",
-            "[0-9]{1,3}",
-            r"\bword\b",
-            "(a|b){3}",
-            "(?i)END",
-        ] {
-            assert!(
-                stop_regex_bound(pattern).is_ok(),
-                "{pattern} is unambiguous and must be accepted"
-            );
-        }
-        assert_eq!(paths_of("abc"), 1);
-        assert_eq!(paths_of("a|b|c"), 3);
-        assert_eq!(paths_of("(?:a|b){3}"), 8);
-    }
-
-    fn paths_of(pattern: &str) -> u64 {
-        let ast = regex_syntax::ast::parse::Parser::new()
-            .parse(pattern)
-            .expect("parses");
-        match_paths(&ast)
-    }
-
     /// Both `stop_regex` caps, neither of which had a test: deleting either `if`
     /// left the suite green. The count cap bounds per-step recompilation (Python's
     /// `re` cache is 512 entries); the length cap bounds compile time (a 1 MB
@@ -1658,14 +1512,9 @@ mod tests {
         assert_eq!(len("a|bbb"), 3); // alternation → max branch
         assert_eq!(len(r"(ab){3}"), 6);
         assert_eq!(len(r"a\d{2,5}"), 6);
-        // Unbounded patterns are now REJECTED, not sentinel-bounded: the sentinel
-        // made the scheduler re-match the whole accumulated output every step.
-        for unbounded in [r"\d+", ".*", r"a{3,}", "(?:.|.)*Z", "(a|a)*b"] {
-            assert!(
-                stop_regex_bound(unbounded).is_err(),
-                "{unbounded} is unbounded and must be rejected"
-            );
-        }
+        assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
+        assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
         // End to end, through the path `/generate` takes.
         assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
         assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);

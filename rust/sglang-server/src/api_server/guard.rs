@@ -73,9 +73,17 @@ impl Drop for AbortGuard {
         // and nothing is generating anyway. So the release below is unconditional
         // again — no rid is held back, and none is released while its abort is
         // still undelivered.
-        for (_, rid) in self.rids.drain(..) {
-            let _ = self.senders.abort.send(rid);
+        // Aborted rids are released by `Ingress::on_abort`, after the deregister
+        // and the ring push actually happen. Releasing them here would order the
+        // send rather than the effect, and a retry could then register ahead of the
+        // stale abort.
+        let aborted: Vec<String> = self.rids.drain(..).map(|(_, rid)| rid).collect();
+        for rid in &aborted {
+            let _ = self.senders.abort.send(rid.clone());
         }
+        // Disarmed rids finished naturally: no abort was sent for them, so nothing
+        // downstream will ever release them.
+        self.owned.retain(|rid| !aborted.contains(rid));
         // Release the in-flight rids so the client can reuse them. Every rid the
         // guard covered, disarmed or not — a disarmed one finished, which is
         // exactly when it stops being in flight.
@@ -104,24 +112,39 @@ mod tests {
     /// `/health_generate` probe relies on. It never sees a terminal frame here, so
     /// dropping the guard is the only path that deregisters its detok sink (via the
     /// ingress `on_abort`). Regression for the detok-entry leak per health probe.
-    /// The guard owns the `live_rids` release: without it a finished rid stays "in
-    /// flight" forever and every retry 400s, which defeats client-supplied rids as
-    /// idempotency keys. Disarmed rids count too — disarmed means finished.
+    /// Release ownership is SPLIT, and that split is the fix for the
+    /// disconnect/resubmit race: a rid the guard aborted stays held until
+    /// `Ingress::on_abort` has actually deregistered it and pushed the `AbortReq`.
+    /// Releasing it here would order the send, not the effect, and a retry could
+    /// register ahead of the stale abort. A DISARMED rid finished naturally — no
+    /// abort was sent, so nothing downstream would ever release it.
     #[test]
-    fn guard_releases_live_rids_on_drop() {
-        let live: super::super::LiveRids = Default::default();
-        live.lock().unwrap().insert("r1".to_string());
-        live.lock().unwrap().insert("r2".to_string());
-        let (tm_tx, _tm_rx) = flume::unbounded();
-        let id1 = RidHash::from_rid("r1");
-        let mut guard = AbortGuard::new(senders_with_abort(tm_tx), live.clone(), id1, "r1".into());
-        guard.arm(RidHash::from_rid("r2"), "r2".to_string());
-        guard.disarm(id1); // finished naturally — still must be released
-        drop(guard);
-        assert!(
-            live.lock().unwrap().is_empty(),
-            "every rid the guard covered must be released, disarmed or not"
+    fn guard_releases_only_the_rids_it_did_not_abort() {
+        let live: crate::tokenizer_manager::LiveRids = Default::default();
+        live.lock().unwrap().insert("done".to_string());
+        live.lock().unwrap().insert("aborted".to_string());
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let done = RidHash::from_rid("done");
+        let mut guard = AbortGuard::new(
+            senders_with_abort(abort_tx),
+            live.clone(),
+            done,
+            "done".into(),
         );
+        guard.arm(RidHash::from_rid("aborted"), "aborted".to_string());
+        guard.disarm(done); // finished naturally
+        drop(guard);
+
+        let held = live.lock().unwrap();
+        assert!(
+            !held.contains("done"),
+            "a finished rid must be released here"
+        );
+        assert!(
+            held.contains("aborted"),
+            "an aborted rid stays held until on_abort has issued the deregister"
+        );
+        assert_eq!(abort_rx.try_recv().unwrap(), "aborted");
     }
 
     #[test]

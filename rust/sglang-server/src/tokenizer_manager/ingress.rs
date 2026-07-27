@@ -28,7 +28,7 @@ use crate::message::{
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::tokenizer_manager::{LiveRids, Senders, TmEvent};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -38,6 +38,9 @@ pub struct Ingress {
     /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
     /// abort is handled promptly even while the bounded inbox is saturated.
     abort_rx: flume::Receiver<String>,
+    /// In-flight rid registry. Released HERE, not by the guard that queued the
+    /// abort — see [`Ingress::on_abort`].
+    live_rids: LiveRids,
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
@@ -83,6 +86,7 @@ impl Ingress {
     pub fn new(
         rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<String>,
+        live_rids: LiveRids,
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
@@ -91,6 +95,7 @@ impl Ingress {
         Self {
             rx,
             abort_rx,
+            live_rids,
             senders,
             ingress,
             limits,
@@ -368,6 +373,18 @@ impl Ingress {
             }
             Err(e) => tracing::warn!(rid = %rid, error = %e, "abort encode failed"),
         }
+
+        // Release the rid only now — AFTER the deregister and the ring push have
+        // been issued. `AbortGuard::drop` used to release it right after enqueuing
+        // the abort, which orders the SEND, not the EFFECT: this handler runs later
+        // and can stall on either bounded send above, so a retry could pass the
+        // duplicate check and register before the stale abort drained. The shard
+        // then saw [Register, Deregister] and the retry got a 500, while a real
+        // `AbortReq` naming it went to the scheduler. An epoch on the detok
+        // messages cannot fix that — `AbortReq` matches by rid STRING.
+        if let Ok(mut live) = self.live_rids.lock() {
+            live.remove(&rid);
+        }
     }
 
     /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and
@@ -593,7 +610,15 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            LiveRids::default(),
+            senders,
+            ingress_producer,
+            limits,
+            sd_rx,
+        );
         (ingress, detok_rx, consumer, tm_tx)
     }
 
