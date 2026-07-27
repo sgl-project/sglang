@@ -2336,10 +2336,10 @@ class AiterAttnBackend(AttentionBackend):
             # Qwen3.5 (head_dim 256) otherwise runs the slow Triton / CK
             # batch-prefill path. When opted in on gfx950, route pure prefill
             # (no cached prefix, no sliding window) through aiter's hand-written
-            # hd256 fp8 asm kernel. q/k/v are cast directly to fp8 with identity
-            # (1.0) descales, matching the mla_fp8_prefill_attn convention used
-            # elsewhere in this file. All other shapes fall through to the
-            # mha_batch_prefill_func path below.
+            # hd256 fp8 asm kernel. q/k/v are quantized to fp8 with per-tensor
+            # descales (amax / fp8_max) so the kernel can recover true magnitudes.
+            # All other shapes fall through to the mha_batch_prefill_func path
+            # below.
             use_hd256_fastpath = False
             if _use_fmha_fp8_hd256:
                 use_hd256_fastpath = (
@@ -2354,29 +2354,29 @@ class AiterAttnBackend(AttentionBackend):
             if use_hd256_fastpath:
                 cu_seqlens_q = self.qo_indptr[:bs0]
                 max_q_len = self.forward_metadata.max_q_len
-                one_scale = torch.ones((1,), dtype=torch.float32, device=q.device)
-                q_f8 = (
-                    q.contiguous()
-                    .view(-1, layer.tp_q_head_num, layer.head_dim)
-                    .to(fp8_dtype)
-                )
-                k_f8 = (
-                    k.contiguous()
-                    .view(-1, layer.tp_k_head_num, layer.head_dim)
-                    .to(fp8_dtype)
-                )
-                v_f8 = (
-                    v.contiguous()
-                    .view(-1, layer.tp_v_head_num, layer.head_dim)
-                    .to(fp8_dtype)
-                )
+                fp8_max = torch.finfo(fp8_dtype).max
+
+                def _to_fp8_pertensor(x, num_heads):
+                    # Per-tensor fp8 quantization: scale amax to fp8's max so the
+                    # full range is used, and return the descale so the kernel can
+                    # recover the true magnitudes (real = quantized * descale).
+                    x = x.contiguous().view(-1, num_heads, layer.head_dim)
+                    scale = (x.abs().amax().to(torch.float32) / fp8_max).clamp(
+                        min=1e-12
+                    )
+                    x_f8 = (x / scale).to(fp8_dtype)
+                    return x_f8, scale.view(1)
+
+                q_f8, q_scale = _to_fp8_pertensor(q, layer.tp_q_head_num)
+                k_f8, k_scale = _to_fp8_pertensor(k, layer.tp_k_head_num)
+                v_f8, v_scale = _to_fp8_pertensor(v, layer.tp_v_head_num)
                 o = flash_attn_varlen_fp8_pertensor_func(
                     q_f8,
                     k_f8,
                     v_f8,
-                    one_scale,
-                    one_scale,
-                    one_scale,
+                    q_scale,
+                    k_scale,
+                    v_scale,
                     cu_seqlens_q,
                     cu_seqlens_q,
                     max_q_len,
