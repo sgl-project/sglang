@@ -17,9 +17,14 @@ use crate::error::Error;
 /// item, so this bounds the work a single request can ask for.
 const MAX_BATCH_SIZE: usize = 4096;
 
-/// Hard cap on the total bytes a broadcast `sampling_params` may clone into the
-/// batch (see the `One` arm of the fan-out).
+/// Hard cap on the total bytes a broadcast value may clone into the batch (see
+/// the `One` arms of the fan-out).
 const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
+
+/// Live heap per byte of serialized JSON, measured on `custom_params`-shaped
+/// input (63.7 MiB of JSON → ~1008 MiB resident). `serde_json::Value` pays for
+/// enum tags, `String` headers and map nodes that the wire form does not.
+const JSON_TO_HEAP_FACTOR: usize = 16;
 
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
@@ -100,6 +105,21 @@ impl GenerateBody {
             ..
         } = self;
 
+        // Cap the batch BEFORE the columns below allocate anything. Reading the
+        // declared length off the input costs nothing; the previous placement (after
+        // the match) had already allocated ~1.7 GiB for a 114 MiB body, most of it
+        // the `vec![None; n]` twin column.
+        let declared_n = match (&text, &input_ids) {
+            (Some(OneOrMany::Many(v)), None) => v.len(),
+            (None, Some(OneOrMany::Many(v))) => v.len(),
+            _ => 1,
+        };
+        if declared_n > MAX_BATCH_SIZE {
+            return Err(Error::Validation(format!(
+                "batch size {declared_n} exceeds the maximum of {MAX_BATCH_SIZE}"
+            )));
+        }
+
         // Per-item (text, input_ids) columns + whether the input used list form.
         type Columns = (Vec<Option<String>>, Vec<Option<TokenIds>>, bool);
         // Exactly one of text / input_ids (Python `_validate_inputs`), and no
@@ -145,14 +165,6 @@ impl GenerateBody {
                 "batch must contain at least one item".into(),
             ));
         }
-        // Cap the batch BEFORE building any column: everything below allocates
-        // per item, and the body limit is disabled, so an unbounded `n` turns a
-        // small body into an unbounded allocation.
-        if n > MAX_BATCH_SIZE {
-            return Err(Error::Validation(format!(
-                "batch size {n} exceeds the maximum of {MAX_BATCH_SIZE}"
-            )));
-        }
 
         // A list is per-item; a single object broadcasts to every item.
         let sps: Vec<SamplingParams> = match sampling_params {
@@ -174,7 +186,13 @@ impl GenerateBody {
                 // prompts is ~200 GB of clones, and a Rust allocation failure calls
                 // `abort()`, which is uncatchable and takes the scheduler process
                 // with it. Bound the product, not just `n`.
-                let per_clone = serde_json::to_string(&*sp).map_or(0, |s| s.len());
+                // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
+                // JSON became ~1008 MiB of live heap once parsed into `Value`
+                // nodes, `String`s and map entries. Scale by that measured factor
+                // so the budget bounds memory rather than wire size.
+                let per_clone = serde_json::to_string(&*sp)
+                    .map_or(0, |s| s.len())
+                    .saturating_mul(JSON_TO_HEAP_FACTOR);
                 check_broadcast_budget(per_clone, n, "sampling_params")?;
                 vec![*sp; n]
             }
@@ -309,7 +327,8 @@ pub struct GenerateRequest {
     pub return_logprob: Option<bool>,
     pub logprob_start_len: Option<i64>,
     pub top_logprobs_num: Option<i64>,
-    /// This request's `token_ids_logprob` ids (already fanned out by `into_requests`).
+    /// This request's `token_ids_logprob` ids, fanned out by `into_requests` and
+    /// collapsed to `None` when empty (the scheduler branches on `is not None`).
     pub token_ids_logprob: Option<TokenIds>,
     pub return_hidden_states: Option<bool>,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple

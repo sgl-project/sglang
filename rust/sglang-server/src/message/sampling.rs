@@ -354,8 +354,20 @@ impl SamplingParams {
         // scheduler's `re.search` (see `stop_regex_bound`). A rejected pattern is a
         // 400 for this request; an accepted one carries a bound the scheduler uses
         // to size its match window.
+        if self.stop_regex_strs.len() > MAX_STOP_REGEX_COUNT {
+            return Err(bad(format!(
+                "at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, got {}",
+                self.stop_regex_strs.len()
+            )));
+        }
         let mut stop_regex_max_len = 0;
         for pattern in &self.stop_regex_strs {
+            if pattern.len() > MAX_STOP_REGEX_LEN {
+                return Err(bad(format!(
+                    "stop_regex is {} bytes, over the {MAX_STOP_REGEX_LEN}-byte limit",
+                    pattern.len()
+                )));
+            }
             stop_regex_max_len = stop_regex_max_len.max(stop_regex_bound(pattern)?);
         }
         self.stop_regex_max_len = stop_regex_max_len;
@@ -529,6 +541,14 @@ const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u'];
 /// then `MemoryError`). Neither is an `re.error`, so neither is caught downstream.
 /// A stop-string window this long is meaningless anyway.
 const MAX_REPEAT_COUNT: u64 = 4096;
+
+/// Longest `stop_regex` accepted. A 1 MB literal pattern takes ~677 ms just to
+/// compile, and that cost lands on the scheduler.
+const MAX_STOP_REGEX_LEN: usize = 4096;
+
+/// Most `stop_regex` patterns accepted per request. Python's `re` cache holds 512
+/// (`re._MAXCACHE`), so past that every pattern recompiles on every decode step.
+const MAX_STOP_REGEX_COUNT: usize = 64;
 
 const SHARED_ESCAPES: &[char] = &[
     'A', 'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'a', 'f', 'n', 'r', 't', 'v',
