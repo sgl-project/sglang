@@ -17,6 +17,7 @@ inherited ``MambaComponent`` code paths actually run against
 from __future__ import annotations
 
 import importlib.util
+import platform
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -26,10 +27,11 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
+_IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
-_SKIP_REASON = "requires mlx"
+_SKIP_REASON = "requires Apple Silicon and mlx"
 
-if _HAS_MLX:
+if _IS_APPLE_SILICON and _HAS_MLX:
     import mlx.core as mx
     import torch
 
@@ -135,7 +137,7 @@ def _cow_req():
     )
 
 
-@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestMlxAuxiliaryStateRealRadixCache(unittest.TestCase):
     def setUp(self):
         _set_server_args()

@@ -366,7 +366,8 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             # deferred batch copy (forward_batch.mamba_cow_src_indices); the
             # MLX runner has no such pass and restores straight from the
             # request's own slot, so copy the snapshot now and clear the
-            # deferred marker.
+            # deferred marker. If scheduler admission later rejects the
+            # request, this copy is discarded and repeated on the next match.
             self.cache.req_to_token_pool.auxiliary_state_pool.copy_from(
                 req.mamba_cow_src_index, req.mamba_pool_idx.unsqueeze(0)
             )
