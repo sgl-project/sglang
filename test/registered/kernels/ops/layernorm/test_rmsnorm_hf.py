@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+    can_use_rmsnorm_hf,
     is_supported_rmsnorm_hf_hidden_size,
     rmsnorm_hf,
 )
@@ -45,8 +46,8 @@ BS_LIST = get_ci_test_range(
 )
 HIDDEN_SIZE_LIST = get_ci_test_range(
     # Warp-kernel shapes (q/k RMSNorm head dims) + CTA-kernel shapes.
-    [32, 64, 96, 128, 256, 512, 1024, 2048, 3072, 4096, 8192, 16384],
-    [128, 512, 4096, 16384],
+    [32, 64, 96, 128, 256, 512, 1024, 2048, 3072, 3584, 4096, 8192, 16384],
+    [128, 512, 3584, 4096, 16384],
 )
 
 
@@ -125,6 +126,7 @@ def test_rmsnorm_hf_empty_input() -> None:
         (500, False),
         (512, True),
         (3072, True),
+        (3584, True),
         (4096, True),
         (8192, True),
         (4097, False),
@@ -132,6 +134,11 @@ def test_rmsnorm_hf_empty_input() -> None:
 )
 def test_is_supported_hidden_size(hidden_size: int, expected: bool) -> None:
     assert is_supported_rmsnorm_hf_hidden_size(hidden_size) is expected
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_can_use_rmsnorm_hf_bagel_hidden_size(dtype: torch.dtype) -> None:
+    assert can_use_rmsnorm_hf(3584, dtype) is True
 
 
 if __name__ == "__main__":

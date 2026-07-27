@@ -26,6 +26,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from sglang.jit_kernel.rmsnorm_hf import (
+    can_use_rmsnorm_hf,
+    is_supported_rmsnorm_hf_hidden_size,
+    rmsnorm_hf,
+)
 from sglang.multimodal_gen.configs.models.dits.bagel import (
     BagelDiTArchConfig,
     BagelDiTConfig,
@@ -602,6 +607,14 @@ class _BagelRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: Tensor) -> Tensor:
+        if _can_use_bagel_rmsnorm_jit(hidden_states, self.weight):
+            hidden_size = hidden_states.shape[-1]
+            original_shape = hidden_states.shape
+            flat_hidden_states = hidden_states.contiguous().reshape(-1, hidden_size)
+            return rmsnorm_hf(flat_hidden_states, self.weight, self.eps).reshape(
+                original_shape
+            )
+
         input_dtype = hidden_states.dtype
         normalized = hidden_states.float()
         variance = normalized.pow(2).mean(-1, keepdim=True)
@@ -612,6 +625,23 @@ class _BagelRMSNorm(nn.Module):
     def variance_epsilon(self) -> float:
         """Expose the epsilon name used by SGLang's fused Q/K helper."""
         return self.eps
+
+
+def _can_use_bagel_rmsnorm_jit(hidden_states: Tensor, weight: Tensor) -> bool:
+    """Return whether BAGEL can preserve its HF RMSNorm semantics with JIT."""
+    return (
+        current_platform.is_cuda()
+        and hidden_states.is_cuda
+        and hidden_states.layout == torch.strided
+        and hidden_states.dim() > 0
+        and hidden_states.numel() > 0
+        and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype == hidden_states.dtype
+        and weight.device == hidden_states.device
+        and weight.numel() == hidden_states.shape[-1]
+        and is_supported_rmsnorm_hf_hidden_size(hidden_states.shape[-1])
+        and can_use_rmsnorm_hf(hidden_states.shape[-1], hidden_states.dtype)
+    )
 
 
 def _can_use_fused_fp32_qk_norm(

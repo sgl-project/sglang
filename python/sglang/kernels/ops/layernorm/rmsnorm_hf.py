@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -16,6 +17,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
 _CTA_BLOCK_SIZE = 512
 _WARP_SIZE = 32
 
@@ -44,6 +46,44 @@ def _jit_rmsnorm_hf_module(hidden_size: int, dtype: torch.dtype) -> Module:
         cuda_files=["elementwise/rmsnorm_hf.cuh"],
         cuda_wrappers=[("rmsnorm_hf", f"{kernel_cls}<{args}>::run")],
     )
+
+
+@torch.compiler.assume_constant_result
+@cache_once
+def can_use_rmsnorm_hf(hidden_size: int, dtype: torch.dtype) -> bool:
+    """Return whether the matching HF-semantics RMSNorm kernel can load.
+
+    Args:
+        hidden_size: Size of the normalized last dimension.
+        dtype: Activation and weight dtype.
+
+    Returns:
+        ``True`` when the configuration is supported and its JIT module loads.
+
+    Raises:
+        torch.cuda.OutOfMemoryError: If compiling the kernel exhausts GPU memory.
+    """
+    if dtype not in (torch.float16, torch.bfloat16):
+        logger.warning("Unsupported dtype=%s for JIT HF RMSNorm kernel", dtype)
+        return False
+    if not is_supported_rmsnorm_hf_hidden_size(hidden_size):
+        logger.warning(
+            "Unsupported hidden_size=%d for JIT HF RMSNorm kernel", hidden_size
+        )
+        return False
+    try:
+        _jit_rmsnorm_hf_module(hidden_size, dtype)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as error:
+        logger.warning(
+            "Failed to load JIT HF RMSNorm kernel for hidden_size=%d, dtype=%s: %s",
+            hidden_size,
+            dtype,
+            error,
+        )
+        return False
+    return True
 
 
 def rmsnorm_hf(

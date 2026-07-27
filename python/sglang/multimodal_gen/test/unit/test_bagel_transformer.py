@@ -845,6 +845,104 @@ def test_bf16_rms_norm_matches_official_cast_order(
     torch.testing.assert_close(norm(hidden_states), expected, rtol=0, atol=0)
 
 
+def test_bagel_rms_norm_dispatches_jit_with_flattened_input() -> None:
+    norm = _BagelRMSNorm(512, eps=1e-6).to(torch.bfloat16)
+    hidden_states = torch.randn(2, 3, 512, dtype=torch.bfloat16)
+    kernel_output = torch.randn(6, 512, dtype=torch.bfloat16)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_rmsnorm_jit",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.rmsnorm_hf",
+            return_value=kernel_output,
+        ) as rmsnorm_kernel,
+    ):
+        actual = norm(hidden_states)
+
+    assert actual.shape == hidden_states.shape
+    torch.testing.assert_close(actual, kernel_output.reshape_as(hidden_states))
+    flat_input, weight, eps = rmsnorm_kernel.call_args.args
+    assert flat_input.shape == (6, 512)
+    assert flat_input.is_contiguous()
+    assert weight is norm.weight
+    assert eps == norm.eps
+
+
+def test_bagel_rms_norm_falls_back_when_jit_capability_is_unavailable() -> None:
+    norm = _BagelRMSNorm(512, eps=1e-6).to(torch.bfloat16)
+    hidden_states = torch.randn(3, 512, dtype=torch.bfloat16)
+    normalized = hidden_states.float()
+    expected = norm.weight * (
+        normalized * torch.rsqrt(normalized.pow(2).mean(-1, keepdim=True) + norm.eps)
+    ).to(hidden_states.dtype)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_rmsnorm_jit",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.rmsnorm_hf",
+        ) as rmsnorm_kernel,
+    ):
+        actual = norm(hidden_states)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    rmsnorm_kernel.assert_not_called()
+
+
+def test_bagel_rms_norm_propagates_kernel_launch_failures() -> None:
+    norm = _BagelRMSNorm(512, eps=1e-6).to(torch.float16)
+    hidden_states = torch.randn(2, 512, dtype=torch.float16)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_rmsnorm_jit",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.rmsnorm_hf",
+            side_effect=RuntimeError("kernel launch failed"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="kernel launch failed"):
+            norm(hidden_states)
+
+
+def test_bagel_rms_norm_never_hides_cuda_oom() -> None:
+    norm = _BagelRMSNorm(512, eps=1e-6).to(torch.float16)
+    hidden_states = torch.randn(2, 512, dtype=torch.float16)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_rmsnorm_jit",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.rmsnorm_hf",
+            side_effect=torch.cuda.OutOfMemoryError("out of memory"),
+        ),
+    ):
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="out of memory"):
+            norm(hidden_states)
+
+
+def test_bagel_rms_norm_keeps_cpu_and_fp32_on_eager_path() -> None:
+    bf16_norm = _BagelRMSNorm(512, eps=1e-6).to(torch.bfloat16)
+    fp32_norm = _BagelRMSNorm(512, eps=1e-6)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.rmsnorm_hf"
+    ) as rmsnorm_kernel:
+        bf16_norm(torch.randn(2, 512, dtype=torch.bfloat16))
+        fp32_norm(torch.randn(2, 512))
+
+    rmsnorm_kernel.assert_not_called()
+
+
 def test_bagel_qk_norm_requests_hf_cast_order_on_fallback() -> None:
     query = torch.randn(3, 2, 4)
     key = torch.randn(3, 1, 4)
