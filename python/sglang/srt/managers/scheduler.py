@@ -3469,10 +3469,7 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
-            elif (
-                not batch.spec_algorithm.is_none()
-                and self.model_worker.draft_worker.draft_worker.pp_group.is_last_rank
-            ):
+            elif not batch.spec_algorithm.is_none() and self.pp_group.is_last_rank:
                 kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
