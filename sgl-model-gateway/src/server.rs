@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -11,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
@@ -33,7 +34,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
-    middleware::{self, AuthConfig, QueuedRequest},
+    middleware::{self, AuthConfig},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -71,7 +72,6 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
@@ -218,8 +218,31 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
+    request_id: Option<Extension<middleware::RequestId>>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    if body.background.unwrap_or(false) {
+        if let Some(admission_limiter) = &state.context.admission_limiter {
+            let request_id = request_id
+                .as_ref()
+                .map(|Extension(request_id)| request_id.0.as_str())
+                .unwrap_or("unknown");
+            return middleware::admission_error_response(
+                middleware::AdmissionRejection::BackgroundAdmissionUnsupported,
+                middleware::AdmissionErrorContext {
+                    request_id,
+                    max_concurrent_requests: state
+                        .context
+                        .router_config
+                        .max_concurrent_requests
+                        .max(0) as usize,
+                    queue_size: state.context.router_config.queue_size,
+                    queue_timeout_secs: state.context.router_config.queue_timeout_secs,
+                    snapshot: admission_limiter.snapshot(),
+                },
+            );
+        }
+    }
     state
         .router
         .route_responses(Some(&headers), &body, Some(&body.model))
@@ -541,7 +564,7 @@ pub fn build_app(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
 ) -> Router {
-    let protected_routes = Router::new()
+    let authenticated_inference_routes = Router::new()
         .route("/generate", post(generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
@@ -549,6 +572,20 @@ pub fn build_app(
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::inference_guard_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
+    let authenticated_control_routes = Router::new()
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -579,22 +616,24 @@ pub fn build_app(
         .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
-            middleware::concurrency_limit_middleware,
+            middleware::wasm_middleware,
         ))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
-        ))
+        ));
+
+    let public_inference_routes = Router::new()
+        .route("/health_generate", get(health_generate))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
-            middleware::wasm_middleware,
+            middleware::inference_guard_middleware,
         ));
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
         .route("/readiness", get(readiness))
         .route("/health", get(health))
-        .route("/health_generate", get(health_generate))
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/model_info", get(get_model_info))
@@ -674,7 +713,9 @@ pub fn build_app(
         ));
 
     Router::new()
-        .merge(protected_routes)
+        .merge(authenticated_inference_routes)
+        .merge(authenticated_control_routes)
+        .merge(public_inference_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
@@ -694,6 +735,40 @@ pub fn build_app(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    startup_with_shutdown(config, shutdown_signal()).await
+}
+
+pub async fn startup_with_shutdown<S>(
+    config: ServerConfig,
+    shutdown_signal: S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    startup_with_shutdown_inner(config, shutdown_signal, None).await
+}
+
+#[doc(hidden)]
+pub async fn startup_with_shutdown_on_listener<S>(
+    config: ServerConfig,
+    shutdown_signal: S,
+    listener: std::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    startup_with_shutdown_inner(config, shutdown_signal, Some(listener)).await
+}
+
+async fn startup_with_shutdown_inner<S>(
+    config: ServerConfig,
+    shutdown_signal: S,
+    listener: Option<std::net::TcpListener>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     if let Some(trace_config) = &config.router_config.trace_config {
@@ -931,32 +1006,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         debug!("Started LoadMonitor for PowerOfTwo policies");
     }
 
-    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
-        app_context.rate_limiter.clone(),
-        config.router_config.queue_size,
-        Duration::from_secs(config.router_config.queue_timeout_secs),
-    );
-
-    if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
-    }
-
-    match processor {
-        Some(proc) => {
-            spawn(proc.run());
-            debug!(
-                "Started request queue (size: {}, timeout: {}s)",
-                config.router_config.queue_size, config.router_config.queue_timeout_secs
-            );
-        }
-        None => {
-            debug!(
-                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-                config.router_config.max_concurrent_requests
-            );
-        }
-    }
-
     // Set mesh sync manager to worker registry and policy registry if mesh is enabled
     // This allows these components to sync state across mesh nodes when mesh is enabled,
     // but they work independently without mesh when mesh is disabled.
@@ -983,7 +1032,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
         mesh_sync_manager,
@@ -1059,8 +1107,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
+    let admission_limiter = app_context.admission_limiter.clone();
     spawn(async move {
-        shutdown_signal().await;
+        shutdown_signal.await;
+        if let Some(admission_limiter) = admission_limiter {
+            admission_limiter.begin_shutdown();
+        }
         handle_clone.graceful_shutdown(Some(grace_period));
     });
 
@@ -1077,13 +1129,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
-        axum_server::bind_rustls(addr, tls_config)
+        let server = match listener {
+            Some(listener) => axum_server::from_tcp_rustls(listener, tls_config)?,
+            None => axum_server::bind_rustls(addr, tls_config),
+        };
+        server
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
-        axum_server::bind(addr)
+        let server = match listener {
+            Some(listener) => axum_server::from_tcp(listener)?,
+            None => axum_server::bind(addr),
+        };
+        server
             .handle(handle)
             .serve(app.into_make_service())
             .await

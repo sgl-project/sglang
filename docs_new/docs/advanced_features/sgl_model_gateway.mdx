@@ -69,7 +69,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 - **Inference Gateway Mode (`--enable-igw`)** dynamically instantiates multiple router stacks (HTTP regular/PD, gRPC) and applies per-model policies for multi-tenant deployments.
 - **Conversation & responses connectors** centralize chat history inside the router so the same context can be reused across models and MCP loops without leaking data to upstream vendors (memory, none, Oracle ATP, PostgreSQL).
 - **Enterprise privacy**: agentic multi-turn `/v1/responses`, native MCP client (STDIO/HTTP/SSE/Streamable), and history storage all operate within the router boundary.
-- **Reliability core**: retries with jitter, worker-scoped circuit breakers, token-bucket rate limiting with queuing, background health checks, and cache-aware load monitoring.
+- **Reliability core**: retries with jitter, worker-scoped circuit breakers, lifecycle-based admission control, independent token-bucket rate limiting, background health checks, and cache-aware load monitoring.
 - **Comprehensive observability**: 40+ Prometheus metrics, OpenTelemetry distributed tracing, structured logging, and request ID propagation.
 
 ***
@@ -1108,20 +1108,40 @@ python -m sglang_router.launch_router \
 - **Open**: Failing, requests rejected immediately
 - **Half-Open**: Testing recovery, limited requests allowed
 
-### Rate Limiting and Queuing
+### Rate Limiting and Admission
 
 ```bash Command
 python -m sglang_router.launch_router \
   --worker-urls http://worker1:8000 http://worker2:8001 \
-  --max-concurrent-requests 256 \
-  --rate-limit-tokens-per-second 512 \
-  --queue-size 128 \
-  --queue-timeout-secs 30
+  --max-concurrent-requests 8 \
+  --queue-size 4 \
+  --queue-timeout-secs 10 \
+  --rate-limit-tokens-per-second 20
 ```
 
-Requests beyond the concurrency limit wait in a FIFO queue. Returns:
-- `429 Too Many Requests` when queue is full
-- `408 Request Timeout` when queue timeout expires
+Admission control and rate limiting are separate traffic gates:
+
+- `--max-concurrent-requests N` is a hard concurrency limit per Router Pod. An admitted request holds one lease until its complete HTTP response body is consumed or dropped, including the full lifetime of a streaming response. Set `N <= 0` to disable admission control.
+- `--queue-size M` is the hard cap on outstanding admission waiters. Once all `N` leases and all `M` queue slots are occupied, the next protected request is rejected immediately. Set `M = 0` to return `429 queue_full` as soon as concurrency is full.
+- `--queue-timeout-secs T` is an absolute deadline measured from the instant a request enters the admission queue. A waiter that has not acquired a lease by that deadline returns `408 queue_timeout`.
+- `--rate-limit-tokens-per-second R` is the independent local-QPS limit. A positive value creates a local token bucket with capacity and refill rate `R`; unset or `0` disables it. Completing a response does not return a rate token.
+
+For protected routes, traffic gates run in this order: mesh/global QPS, local QPS, then admission. Authentication and WASM run before these gates on authenticated routes.
+
+The admission gate protects inference requests such as `/generate`, chat/completions, completions, responses, embeddings, rerank, classify, and `/health_generate`. Control and observability endpoints bypass it. In particular, response cancellation bypasses admission so overload cannot prevent cancelling existing work. Background responses fail with `503 background_admission_unsupported` while admission control is enabled because the HTTP request lease cannot currently be transferred to the background job lifetime.
+
+During graceful shutdown, queued waiters are released with `503 shutting_down`; already admitted responses may finish during the configured grace period.
+
+| HTTP status | Error code | Meaning |
+|-------------|------------|---------|
+| 429 | `queue_full` | All concurrency leases and queue slots are occupied |
+| 429 | `rate_limited` | Local QPS token bucket rejected the request |
+| 429 | `global_rate_limited` | Mesh/global QPS rejected the request |
+| 408 | `queue_timeout` | The request reached its absolute queue deadline |
+| 503 | `shutting_down` | The Router stopped accepting admission work |
+| 503 | `background_admission_unsupported` | Background Responses cannot preserve the lease lifetime |
+
+Admission control exports `smg_admission_inflight`, `smg_admission_queued`, `smg_admission_queue_wait_seconds`, and `smg_admission_total{decision="..."}`. Limits are local to each Router Pod; replicas do not share their semaphores.
 
 ### Health Checks
 
@@ -2308,13 +2328,18 @@ python -m sglang_router.launch_router \
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrent-requests`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2-4x worker count</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prevent overload while maximizing throughput</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Measured downstream lifecycle capacity per Router Pod</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Bound active inference work without treating concurrency as QPS</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--queue-size`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x max-concurrent</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Buffer for burst traffic</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Only the burst backlog that can meet the deadline</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Bound outstanding waiters and avoid stale work</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--queue-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum useful admission wait</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Reject work that cannot start within its latency budget</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-timeout-secs`</td>
@@ -2605,7 +2630,25 @@ groups:
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrent-requests`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Concurrency limit (-1 disables)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hard inference request-lifecycle limit per Router Pod (`&lt;= 0` disables admission)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--queue-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hard cap on outstanding admission waiters</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--queue-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>60</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Absolute admission wait deadline in seconds</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--rate-limit-tokens-per-second`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Independent local QPS; unset or `0` disables</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-timeout-secs`</td>
@@ -2789,7 +2832,7 @@ Increase `--cb-failure-threshold` or extend the timeout/window durations. Consid
 
 ### Queue Overflow (429)
 
-Increase `--queue-size` or reduce client concurrency. Ensure `--max-concurrent-requests` matches downstream capacity.
+Inspect the response `error.code` before tuning. `queue_full` means the Pod has used all lifecycle leases and queue slots; `rate_limited` and `global_rate_limited` are QPS decisions and are not fixed by enlarging the admission queue. Check `smg_admission_inflight`, `smg_admission_queued`, and queue-wait latency before increasing `--queue-size`.
 
 ### Memory Growth
 
