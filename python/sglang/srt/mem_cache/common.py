@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+
+
+def new_tokens_for_alloc(
+    allocated_len: int, next_alloc_len: int, page_size: int
+) -> int:
+    return ceil_align(allocated_len + next_alloc_len, page_size) - ceil_align(
+        allocated_len, page_size
+    )
+
+
 # Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
