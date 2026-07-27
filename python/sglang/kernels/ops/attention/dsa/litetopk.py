@@ -81,6 +81,31 @@ def _pad_scales_for_tma(kv_scales: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(kv_scales, (0, 4 - rem))
 
 
+def _tma_aligned_scales(kv_scales: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    """``kv_scales[lo:hi]`` with a 16B-aligned base, copying only when needed.
+
+    deep_gemm builds the calibration KV-scale TMA descriptor straight off the
+    tensor's ``data_ptr`` (``make_tma_2d_desc`` -> ``cuTensorMapEncodeTiled``),
+    which requires a 16B-aligned global address, and reads the scale dim rounded
+    up to 16B. fp8 KV rows are 128B so any per-request slice stays aligned, but
+    the fp32 scales are 4B-granular: a request whose gathered KV starts at a
+    position that is not a multiple of 4 hands the driver a misaligned
+    descriptor and it fails with CUDA_ERROR_INVALID_VALUE. Materialize such a
+    slice into a fresh buffer (allocator-aligned, padded to a multiple of 4 so
+    the rounded-up tail read stays in bounds); the same copy covers a slice
+    whose rounded-up tail would run past the end of ``kv_scales`` itself. Slices
+    that are aligned and have a readable tail pass through as views, so the
+    common shapes -- and single-request prefill -- never copy.
+    """
+    width = hi - lo
+    tail = (hi + 3) // 4 * 4
+    if lo % 4 == 0 and tail <= kv_scales.shape[0]:
+        return kv_scales[lo:hi]
+    buf = kv_scales.new_empty((width + 3) // 4 * 4)
+    buf[:width] = kv_scales[lo:hi]
+    return buf[:width]
+
+
 def _pad_sample_logits_for_vec4(slog: torch.Tensor) -> torch.Tensor:
     """seed_prep reads each row with 16B float4 loads, so the row stride must
     be a multiple of 4 floats or every odd row is misaligned (CUDA fault). The
@@ -167,7 +192,7 @@ def dsa_litetopk_indexer(
                 q_fp8[rows],
                 (
                     kv_fp8[kv_start : kv_start + sl],
-                    kv_scales[kv_start : kv_start + sl],
+                    _tma_aligned_scales(kv_scales, kv_start, kv_start + sl),
                 ),
                 weights[rows],
                 ks0,

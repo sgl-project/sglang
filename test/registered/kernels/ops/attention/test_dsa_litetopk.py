@@ -154,6 +154,9 @@ def _check_topk_indices(out_idx, scores, valid, topk, eps_rel=1e-3):
         # gives the calibration sample logits an odd row stride, which the
         # seed kernel's float4 row loads only tolerate via the -inf width
         # padding; 9+5 rows also exercises the ragged final q-block padding.
+        # The second request also starts at kv 4099, so its fp32 scale slice
+        # is only 4B-aligned -- deep_gemm's calibration TMA descriptor rejects
+        # that base address unless the slice is realigned.
         ([(9, 4099), (5, 1023)], 512),
     ],
 )
