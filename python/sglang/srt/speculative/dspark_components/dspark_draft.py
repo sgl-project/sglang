@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -82,6 +83,9 @@ class DsparkDraftSampler:
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        # Resolved once: this sampler runs inside cuda-graph capture, so the
+        # branch below is baked into the captured graph anyway.
+        self._fused_greedy = envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
         if out is not None:
             assert out.shape == (int(max_bs) * self.gamma,) and out.dtype == torch.int64
             self.out = out
@@ -101,12 +105,21 @@ class DsparkDraftSampler:
         base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
-        draft_tokens, _ = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=greedy_step_sampler,
-        )
+        draft_tokens = None
+        if self._fused_greedy and isinstance(self.markov_head, VanillaMarkov):
+            # Gated/RNN subclasses return None (hidden-state-dependent bias);
+            # fall through to the eager block sampler.
+            draft_tokens = self.markov_head.sample_block_greedy_fused(
+                base_logits, first_prev_tokens=anchor
+            )
+        if draft_tokens is None:
+            draft_tokens, _ = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=greedy_step_sampler,
+                collect_corrected=False,
+            )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
@@ -256,6 +269,9 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
+        # token) changes per step, so avoid a fresh torch.full every decode.
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -373,9 +389,13 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        draft_block_ids = torch.full(
-            (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
-        )
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
+            buf = torch.full(
+                (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
+            )
+            self._draft_block_ids_buf = buf
+        draft_block_ids = buf[:bs]
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
