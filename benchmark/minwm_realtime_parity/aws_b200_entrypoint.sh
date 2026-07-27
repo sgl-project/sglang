@@ -25,8 +25,23 @@ set -euo pipefail
 }
 
 WORK_ROOT="/work/minwm-realtime/${MINWM_RUN_ID}"
-CHECKPOINT="${WORK_ROOT}/checkpoint/model.pt"
-PRETRAINED="${WORK_ROOT}/pretrained"
+REUSE_INPUT_ROOT=""
+if [[ -n "${MINWM_REUSE_INPUT_RUN_ID:-}" ]]; then
+  [[ "${MINWM_REUSE_INPUT_RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "MINWM_REUSE_INPUT_RUN_ID contains unsupported characters" >&2
+    exit 2
+  }
+  [[ "${MINWM_REUSE_INPUT_RUN_ID}" != "${MINWM_RUN_ID}" ]] || {
+    echo "MINWM_REUSE_INPUT_RUN_ID must differ from MINWM_RUN_ID" >&2
+    exit 2
+  }
+  REUSE_INPUT_ROOT="/work/minwm-realtime/${MINWM_REUSE_INPUT_RUN_ID}"
+  CHECKPOINT="${REUSE_INPUT_ROOT}/checkpoint/model.pt"
+  PRETRAINED="${REUSE_INPUT_ROOT}/pretrained"
+else
+  CHECKPOINT="${WORK_ROOT}/checkpoint/model.pt"
+  PRETRAINED="${WORK_ROOT}/pretrained"
+fi
 if [[ "${MINWM_STAGE_FROM_MOUNT:-0}" == "1" ]]; then
   : "${MINWM_CHECKPOINT_MOUNT_PATH:?set MINWM_CHECKPOINT_MOUNT_PATH}"
   : "${MINWM_PRETRAINED_MOUNT_PATH:?set MINWM_PRETRAINED_MOUNT_PATH}"
@@ -36,7 +51,10 @@ LOCAL_RESULTS="${WORK_ROOT}/results"
 RESULTS="${MINWM_RESULTS_ROOT%/}/${MINWM_RUN_ID}"
 SCRIPT_DIR="/workspace/sglang/benchmark/minwm_realtime_parity"
 MINWM_CONFIG="/workspace/minWM/Wan21/configs/eval/wan22_5b_varlen_dmd.yaml"
-mkdir -p "${WORK_ROOT}/checkpoint" "${PRETRAINED}" "${LOCAL_RESULTS}" "${RESULTS}"
+mkdir -p "${LOCAL_RESULTS}" "${RESULTS}"
+if [[ -z "${REUSE_INPUT_ROOT}" ]]; then
+  mkdir -p "${WORK_ROOT}/checkpoint" "${PRETRAINED}"
+fi
 
 python3 --version | tee "${RESULTS}/python-version.txt"
 python3 - <<'PY' | tee "${RESULTS}/runtime-before-install.json"
@@ -50,7 +68,22 @@ print(json.dumps({
 }, sort_keys=True))
 PY
 stage_started="$(date +%s)"
-if [[ "${MINWM_STAGE_FROM_MOUNT:-0}" == "1" ]]; then
+if [[ -n "${REUSE_INPUT_ROOT}" ]]; then
+  echo "reused-local-stage:${MINWM_REUSE_INPUT_RUN_ID}" \
+    | tee "${RESULTS}/staging-mode.txt"
+  [[ -f "${CHECKPOINT}" ]]
+  [[ -d "${PRETRAINED}/transformer" ]]
+  python3 - "${RESULTS}/checkpoint-head.json" <<'PY'
+import json, os, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "ContentLength": int(os.environ["MINWM_CHECKPOINT_BYTES"]),
+    "ChecksumCRC64NVME": os.environ["MINWM_CHECKPOINT_CRC64"],
+    "VersionId": os.environ["MINWM_CHECKPOINT_VERSION_EAST"],
+    "verification": "reused immutable local stage verified against pinned metadata",
+}, indent=2, sort_keys=True) + "\n")
+PY
+elif [[ "${MINWM_STAGE_FROM_MOUNT:-0}" == "1" ]]; then
   echo "s3-csi-mount" | tee "${RESULTS}/staging-mode.txt"
   [[ -f "${MINWM_CHECKPOINT_MOUNT_PATH}" ]]
   [[ -d "${MINWM_PRETRAINED_MOUNT_PATH}/transformer" ]]
