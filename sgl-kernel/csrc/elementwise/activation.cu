@@ -85,6 +85,7 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0) return;
   dim3 grid(num_tokens);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -107,6 +108,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0) return;
   dim3 grid(num_tokens);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -129,6 +131,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
 void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0) return;
   dim3 grid(num_tokens);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -153,6 +156,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
 void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   int d = input.size(-1);
   int64_t num_tokens = input.numel() / input.size(-1);
+  if (num_tokens == 0) return;
   dim3 grid(num_tokens);
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
