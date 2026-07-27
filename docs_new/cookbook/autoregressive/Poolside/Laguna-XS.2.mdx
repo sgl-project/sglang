@@ -62,9 +62,8 @@ python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
 python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu129 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 
-# Or use Docker (multi-arch amd64/arm64)
-docker pull lmsysorg/sglang:dev-cu13-laguna-xs2 # CUDA 13 (H200 / B200)
-docker pull lmsysorg/sglang:dev-cu12-laguna-xs2 # CUDA 12 (H200)
+# Or use Docker (multi-arch amd64/arm64; CUDA 13, H200 / B200)
+docker pull lmsysorg/sglang:latest
 ```
 
 For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).

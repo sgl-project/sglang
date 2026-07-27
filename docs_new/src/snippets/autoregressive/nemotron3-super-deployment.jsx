@@ -43,7 +43,7 @@ export const Nemotron3SuperDeployment = () => {
       // trtllm_mha is Blackwell-only; on B200 it replaces the flashinfer default,
       // whose per-step plan() host-sync breaks the spec-v2 overlap scheduler. H200
       // defaults to fa3 (no such sync), so no override is needed there.
-      commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-scheduler-strategy extra_buffer' + (state.hardware === 'b200' ? ' \\\n  --attention-backend trtllm_mha' : '') : null
+      commandRule: (value, state) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --mamba-radix-cache-strategy extra_buffer' + (state.hardware === 'b200' ? ' \\\n  --attention-backend trtllm_mha' : '') : null
     },
     kvcache: {
       name: 'kvcache',
@@ -79,8 +79,7 @@ export const Nemotron3SuperDeployment = () => {
 
     const modelPath = MODEL_PATHS[model] || MODEL_PATHS['bf16'];
 
-    const specV2Env = values.mtp === 'enabled' ? 'SGLANG_ENABLE_SPEC_V2=1 ' : '';
-    let cmd = `${specV2Env}sglang serve \\\n`;
+    let cmd = `sglang serve \\\n`;
     cmd += `  --model-path ${modelPath} \\\n`;
     cmd += `  --trust-remote-code \\\n`;
     cmd += `  --tp ${tp} \\\n`;
