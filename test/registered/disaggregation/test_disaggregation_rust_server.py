@@ -14,7 +14,6 @@ Usage:
 python3 -m unittest test_disaggregation_rust_server.TestDisaggregationRustServer
 """
 
-import importlib.util
 import json
 import unittest
 from types import SimpleNamespace
@@ -26,14 +25,14 @@ from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, is_rust_server_built
 
 register_cuda_ci(est_time=500, stage="base-b", runner_config="2-gpu-large")
 
 
-@unittest.skipIf(
-    importlib.util.find_spec("sglang_server") is None,
-    "sglang_server wheel not installed",
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
 )
 class TestDisaggregationRustServer(PDDisaggregationServerBase):
     extra_prefill_env = {"SGLANG_RUST_SERVER": "1"}
