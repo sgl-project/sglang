@@ -115,7 +115,9 @@ def match_prefix_for_req(
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(tree_cache, match_result)
+        match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
     (
         req.prefix_indices,
         req.last_node,
@@ -290,7 +292,7 @@ class SchedulePolicy:
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
                     match_result = zero_match_result(
-                        self.waiting_queue_radix_tree, match_result
+                        self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
@@ -328,7 +330,8 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            last_node = tree_cache.resolve_node_handle(req.last_node)
+            last_node_to_reqs[last_node].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:
@@ -620,7 +623,7 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
-        self, extend_input_len: int, swa_host_hit_length: int = 0
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
@@ -629,17 +632,70 @@ class PrefillAdder:
           + chunk N+1 (new allocation)
         Since chunk N and locked tokens are already excluded from
         swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation. We floor at sliding_window_size to reserve
-        room for the decode phase.
+        chunk N+1 allocation plus decode headroom:
+
+          budget = max(alloc - window, 0) + min(extend + max_new_tokens, window) + page
+
+        where alloc = min(extend, rem_chunk); the min() cap keeps the two terms
+        from double-counting extend, so budget <= extend + max_new_tokens + page.
         """
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        window = self.tree_cache.sliding_window_size
+        return max(alloc - window, 0) + self._swa_reserved_tokens(
+            extend_input_len, max_new_tokens, swa_host_hit_length
+        )
+
+    def _swa_reserved_tokens(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> int:
+        """SWA slots a request adds to its own sliding window + page slack + the
+        load-back charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap.
+
+        The headroom is min(extend + decode, window), not a constant window: a
+        request contributes only extend + decode fresh tokens to its window and
+        a cached SWA prefix funds the rest. Charging a full window double-counted
+        a short cached-prefix resume and livelocked admission at a ~2-window
+        pool; keeping extend in the min() holds the reservation >= the prefill
+        allocation so an admitted request cannot OOM."""
+        window = self.tree_cache.sliding_window_size
+        headroom = min(extend_input_len + max_new_tokens, window)
+        reserved = headroom + self.page_size
         if swa_host_hit_length > 0:
-            budget += self.ceil_paged_tokens(swa_host_hit_length)
-        return budget
+            reserved += self.ceil_paged_tokens(swa_host_hit_length)
+        return reserved
+
+    def _swa_new_tokens(self, req: Req) -> int:
+        """Tokens a request may still decode, for SWA headroom sizing. Mirrors
+        the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
+        would zero out a request that has already generated >= CLIP tokens but
+        still has a long decode ahead, under-reserving its window."""
+        return min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
+        )
+
+    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
+        """Largest page-aligned extend chunk the SWA pool can admit right now,
+        keeping a sliding window of headroom below rem_swa_tokens; 0 if not
+        even one page fits. Only valid when is_hybrid_swa is True.
+
+        Escape hatch for a request whose budget can never pass the
+        _swa_budget_for_req gate (extend near/above the pool size, or a large
+        load-back charge): without shrinking its chunk it would be rejected
+        forever (head-of-line livelock). Shrinking is sound because past a
+        chunk boundary only the sliding window stays locked — the rest turns
+        evictable — so each pass's transient footprint fits the pool."""
+        # extend_input_len=0: this solves for the extend chunk itself, so the
+        # reserved headroom is the post-chunk decode window only.
+        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
+            0, max_new_tokens, swa_host_hit_length
+        )
+        if cap <= 0:
+            return 0
+        return cap // self.page_size * self.page_size
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
         """Shared-gap reservation (full-token-equivalents) for a request's new
@@ -712,7 +768,9 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += self._swa_budget_for_req(
+                extend_input_len, max_new_tokens
+            )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -776,6 +834,8 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
+            return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -819,6 +879,17 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+        # A mid-chunk rank prefills this pass regardless of the delayer
+        # verdict, so report prefillable=True and ignore the result.
+        if self.prefill_delayer_single_pass is not None:
+            self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
+            )
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -870,7 +941,12 @@ class PrefillAdder:
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
-            if self._swa_budget_for_req(cand_extend_input_len) > self.rem_swa_tokens:
+            if (
+                self._swa_budget_for_req(
+                    cand_extend_input_len, self._swa_new_tokens(req)
+                )
+                > self.rem_swa_tokens
+            ):
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -924,7 +1000,11 @@ class PrefillAdder:
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True
+                local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
             )
         ):
             return AddReqResult.OTHER
@@ -976,16 +1056,6 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
-                max_prefill_bs=self.max_prefill_bs,
-                max_running_requests=self.max_running_requests,
-                waiting_queue_len=self.waiting_queue_len,
-            )
-        ):
-            return AddReqResult.OTHER
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
@@ -1021,12 +1091,23 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        chunk_tokens_limit = self.rem_chunk_tokens
         if self.is_hybrid_swa:
+            # host-hit prefix is loaded back, not re-prefilled, so the SWA peak is
+            # driven only by the freshly-prefilled tail (the loaded window is
+            # charged separately via swa_host_hit_length).
             swa_needed = self._swa_budget_for_req(
-                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                real_input_tokens,
+                self._swa_new_tokens(req),
+                swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+                swa_cap = self._swa_chunk_cap(
+                    self._swa_new_tokens(req), req.swa_host_hit_length
+                )
+                if self.rem_chunk_tokens is None or swa_cap <= 0:
+                    return AddReqResult.NO_TOKEN
+                chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
         if (
             self.rem_chunk_tokens is None
@@ -1044,11 +1125,33 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
+                # self.rem_swa_tokens may decrease after the lock acquisition
                 swa_needed = self._swa_budget_for_req(
-                    cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                    real_input_tokens,
+                    self._swa_new_tokens(req),
+                    swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
-                    return AddReqResult.NO_TOKEN
+                    swa_cap = self._swa_chunk_cap(
+                        self._swa_new_tokens(req), req.swa_host_hit_length
+                    )
+                    if self.rem_chunk_tokens is None or swa_cap <= 0:
+                        return AddReqResult.NO_TOKEN
+                    chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
+
+            # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
+            # report not-prefillable via finalize()) and before init_load_back
+            # (a delay verdict must not start KV load-back).
+            if (self.prefill_delayer_single_pass is not None) and (
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True,
+                    running_batch=self.running_batch.batch_size(),
+                    max_prefill_bs=self.max_prefill_bs,
+                    max_running_requests=self.max_running_requests,
+                    waiting_queue_len=self.waiting_queue_len,
+                )
+            ):
+                return AddReqResult.OTHER
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -1086,7 +1189,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1106,7 +1209,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

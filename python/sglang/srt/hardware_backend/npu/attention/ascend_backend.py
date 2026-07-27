@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
 
 
+def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Expand [T, K] to [T, 1, K] for NPU sparse attention."""
+    if topk_indices.dim() == 2:
+        return topk_indices.unsqueeze(-2)
+    return topk_indices
+
+
 def _reshape_kv_for_fia_nz(
     tensor: torch.Tensor, num_heads: int, head_dim: int, page_size: int
 ) -> torch.Tensor:
@@ -842,7 +849,10 @@ class AscendAttnBackend(AttentionBackend):
         q_nope_next = q_nope_next.contiguous()
         q_rope_prev = q_rope_prev.contiguous()
         q_rope_next = q_rope_next.contiguous()
-        topk_indices_prev, topk_indices_next = topk_indices
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        topk_indices_prev, topk_indices_next = torch.split(
+            topk_indices, split_len, dim=0
+        )
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
@@ -1053,6 +1063,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
