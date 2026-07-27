@@ -1187,6 +1187,12 @@ class Envs:
     # serves equivalent shapes at ~8 us in the same graphs.
     SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES = EnvInt(0)
 
+    # Keep the multimem (symmetric-memory) all-gather enabled when the TP
+    # group spans nodes that form one NVLink clique (MNNVL fabric), where
+    # cross-node multicast works. Default off preserves the conservative
+    # single-node-only behavior.
+    SGLANG_MULTIMEM_AG_CROSS_NODE = EnvBool(False)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
