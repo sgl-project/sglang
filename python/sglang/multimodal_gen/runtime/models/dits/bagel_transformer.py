@@ -1,12 +1,13 @@
 # Copyright 2024 The Qwen Team and The Hugging Face Inc. team.
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""BAGEL's Qwen2 mixture-of-transformers model for text-to-image denoising.
+"""BAGEL's Qwen2 mixture-of-transformers model for image generation.
 
-This module implements only the Apache-2.0 T2I path from BAGEL.  In
-particular, it does not copy ``modeling/bagel/modeling_utils.py`` because that
-file is CC BY-NC 4.0.  Timestep embeddings reuse SGLang's Apache-2.0 layer and
-the positional table is loaded directly from the checkpoint.
+This module implements BAGEL's Apache-2.0 image-generation paths, including
+request-local text planning. In particular, it does not copy
+``modeling/bagel/modeling_utils.py`` because that file is CC BY-NC 4.0.
+Timestep embeddings reuse SGLang's Apache-2.0 layer and the positional table
+is loaded directly from the checkpoint.
 
 Sources:
   - https://github.com/ByteDance-Seed/Bagel/blob/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f/modeling/bagel/bagel.py
@@ -16,6 +17,7 @@ Sources:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -69,7 +71,9 @@ class BagelContext:
 
     For T2I, ``conditional`` is text and ``unconditional`` is empty. For
     Editing, they are ``image + text`` and ``image-only`` respectively, while
-    ``image_unconditional`` is the text-only baseline used by image CFG.
+    ``secondary_unconditional`` is the text-only baseline used by image CFG.
+    Thinking uses ``system + user + thought``, ``system``, and
+    ``system + user`` for those same three branches.
     """
 
     conditional_kv: BagelKVCache
@@ -82,14 +86,25 @@ class BagelContext:
     width: int
     start_of_image_token_id: int
     end_of_image_token_id: int
-    image_unconditional_kv: BagelKVCache | None = None
-    image_unconditional_kv_lens: Tensor | None = None
-    image_unconditional_rope_offset: int | None = None
+    secondary_unconditional_kv: BagelKVCache | None = None
+    secondary_unconditional_kv_lens: Tensor | None = None
+    secondary_unconditional_rope_offset: int | None = None
+    three_way_cfg_kind: str | None = None
+
+    @property
+    def has_three_way_cfg(self) -> bool:
+        """Return whether this context contains a complete third CFG branch."""
+        return self.secondary_unconditional_kv is not None
 
     @property
     def is_editing(self) -> bool:
         """Return whether this context contains the third Editing CFG branch."""
-        return self.image_unconditional_kv is not None
+        return self.three_way_cfg_kind == "editing"
+
+    @property
+    def is_thinking(self) -> bool:
+        """Return whether this context contains the third Thinking CFG branch."""
+        return self.three_way_cfg_kind == "thinking"
 
     @classmethod
     def from_prefixes(
@@ -101,9 +116,18 @@ class BagelContext:
         width: int,
         start_of_image_token_id: int,
         end_of_image_token_id: int,
-        image_unconditional: BagelPrefixContext | None = None,
+        secondary_unconditional: BagelPrefixContext | None = None,
+        three_way_cfg_kind: str | None = None,
     ) -> BagelContext:
         """Build a denoising context from separately prepared prefixes."""
+        if (secondary_unconditional is None) != (three_way_cfg_kind is None):
+            raise ValueError(
+                "BAGEL third CFG prefix and its semantic kind must be set together"
+            )
+        if three_way_cfg_kind not in {None, "editing", "thinking"}:
+            raise ValueError(
+                f"unsupported BAGEL three-way CFG kind: {three_way_cfg_kind}"
+            )
         return cls(
             conditional_kv=conditional.kv_cache,
             unconditional_kv=unconditional.kv_cache,
@@ -115,15 +139,22 @@ class BagelContext:
             width=width,
             start_of_image_token_id=start_of_image_token_id,
             end_of_image_token_id=end_of_image_token_id,
-            image_unconditional_kv=(
-                None if image_unconditional is None else image_unconditional.kv_cache
+            secondary_unconditional_kv=(
+                None
+                if secondary_unconditional is None
+                else secondary_unconditional.kv_cache
             ),
-            image_unconditional_kv_lens=(
-                None if image_unconditional is None else image_unconditional.kv_lens
+            secondary_unconditional_kv_lens=(
+                None
+                if secondary_unconditional is None
+                else secondary_unconditional.kv_lens
             ),
-            image_unconditional_rope_offset=(
-                None if image_unconditional is None else image_unconditional.rope_offset
+            secondary_unconditional_rope_offset=(
+                None
+                if secondary_unconditional is None
+                else secondary_unconditional.rope_offset
             ),
+            three_way_cfg_kind=three_way_cfg_kind,
         )
 
 
@@ -618,7 +649,7 @@ class _BagelMoTLayer(nn.Module):
 
 
 class BagelTransformer(BaseDiT):
-    """Stateless BAGEL T2I denoiser with request-owned prefix caches.
+    """Stateless BAGEL image generator with request-owned prefix caches.
 
     Args:
         config: SGLang BAGEL DiT configuration.
@@ -647,7 +678,7 @@ class BagelTransformer(BaseDiT):
     ) -> None:
         config = config or BagelDiTConfig()
         if quant_config is not None:
-            raise ValueError("BAGEL T2I supports unquantized BF16 weights only")
+            raise ValueError("BAGEL image generation supports unquantized BF16 only")
         super().__init__(config, hf_config or {})
         arch = config.arch_config
         selected_attention_backend = self._resolve_attention_backend(attention_backend)
@@ -673,6 +704,11 @@ class BagelTransformer(BaseDiT):
         )
         self.und_final_norm = _BagelRMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
         self.gen_final_norm = _BagelRMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
+        self.lm_head = (
+            nn.Linear(arch.hidden_size, arch.vocab_size, bias=False)
+            if config.load_lm_head
+            else None
+        )
 
         patch_dim = arch.latent_patch_size**2 * arch.latent_channel
         self.vae2llm = nn.Linear(patch_dim, arch.hidden_size)
@@ -778,6 +814,13 @@ class BagelTransformer(BaseDiT):
         self, prefix: BagelPrefixContext, input_ids: Tensor
     ) -> BagelPrefixContext:
         """Append a causal text block to one request-owned prefix."""
+        updated_prefix, _ = self._append_text_block(prefix, input_ids)
+        return updated_prefix
+
+    def _append_text_block(
+        self, prefix: BagelPrefixContext, input_ids: Tensor
+    ) -> tuple[BagelPrefixContext, Tensor]:
+        """Append text and return both the updated prefix and final hidden states."""
         device = self.device
         input_ids = input_ids.to(device=device, dtype=torch.long)
         if input_ids.ndim != 1:
@@ -786,7 +829,7 @@ class BagelTransformer(BaseDiT):
                 f"got shape {tuple(input_ids.shape)}"
             )
         if input_ids.numel() == 0:
-            return prefix
+            return prefix, self.embed_tokens.weight.new_empty((0, self.hidden_size))
 
         hidden_states = self.embed_tokens(input_ids)
         sequence_length = int(input_ids.numel())
@@ -814,11 +857,190 @@ class BagelTransformer(BaseDiT):
                 causal=True,
             )
         updated_lens = prefix.kv_lens + sequence_length
-        return BagelPrefixContext(
-            cache,
-            updated_lens,
-            prefix.rope_offset + sequence_length,
+        return (
+            BagelPrefixContext(
+                cache,
+                updated_lens,
+                prefix.rope_offset + sequence_length,
+            ),
+            hidden_states,
         )
+
+    @torch.no_grad()
+    def prepare_thinking_prefixes(
+        self, system_input_ids: Tensor, user_input_ids: Tensor
+    ) -> tuple[BagelPrefixContext, BagelPrefixContext]:
+        """Prefill official Thinking system and user messages.
+
+        Args:
+            system_input_ids: Wrapped system message token IDs.
+            user_input_ids: Wrapped user prompt token IDs.
+
+        Returns:
+            ``(system_prefix, user_prefix)`` where the latter contains both
+            messages and owns only newly appended cache-list entries.
+
+        Raises:
+            RuntimeError: If this transformer was created without ``lm_head``.
+        """
+        self._require_lm_head()
+        system_prefix = self.prefill_context(system_input_ids)
+        user_prefix = self._append_text_prefix(
+            self._fork_prefix(system_prefix), user_input_ids
+        )
+        return system_prefix, user_prefix
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        prefix: BagelPrefixContext,
+        *,
+        bos_token_id: int,
+        eos_token_id: int,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 0.3,
+        seed: int = 0,
+    ) -> Tensor:
+        """Generate one request-local BAGEL planning message.
+
+        The returned sequence matches official BAGEL: its first token is BOS,
+        a predicted EOS is excluded, and ``max_length`` counts the BOS decode
+        iteration. Text sampling uses an isolated device generator so it does
+        not consume either global RNG state or the CPU diffusion-noise stream.
+
+        Args:
+            prefix: Immutable ``system + user`` request prefix.
+            bos_token_id: Message-start token ID used for the first iteration.
+            eos_token_id: Predicted message-end token that stops decoding.
+            max_length: Maximum decode iterations, including BOS.
+            do_sample: Sample from logits instead of greedy argmax.
+            temperature: Positive sampling temperature when sampling is enabled.
+            seed: Seed for the request-local text generator.
+
+        Returns:
+            One-dimensional generated token IDs, including BOS and excluding
+            the predicted EOS.
+
+        Raises:
+            RuntimeError: If the optional language head was not loaded.
+            ValueError: If token IDs or decoding parameters are invalid.
+        """
+        lm_head = self._require_lm_head()
+        if (
+            not isinstance(max_length, int)
+            or isinstance(max_length, bool)
+            or max_length <= 0
+        ):
+            raise ValueError("BAGEL max_length must be a positive integer")
+        if (
+            prefix.rope_offset + max_length
+            > self.config.arch_config.max_position_embeddings
+        ):
+            raise ValueError("BAGEL Thinking would exceed max_position_embeddings")
+        if not isinstance(do_sample, bool):
+            raise ValueError("BAGEL do_sample must be a boolean")
+        if do_sample and (
+            not isinstance(temperature, (int, float))
+            or isinstance(temperature, bool)
+            or not math.isfinite(float(temperature))
+            or temperature <= 0
+        ):
+            raise ValueError("BAGEL sampling temperature must be finite and positive")
+        if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+            raise ValueError("BAGEL text seed must be a non-negative integer")
+        vocab_size = self.config.arch_config.vocab_size
+        if not 0 <= int(bos_token_id) < vocab_size:
+            raise ValueError("BAGEL BOS token ID is outside the vocabulary")
+        if not 0 <= int(eos_token_id) < vocab_size:
+            raise ValueError("BAGEL EOS token ID is outside the vocabulary")
+
+        device = self.device
+        decode_prefix = self._fork_prefix(prefix)
+        current = torch.tensor([int(bos_token_id)], dtype=torch.long, device=device)
+        generated: list[Tensor] = []
+        text_generator = None
+        if do_sample:
+            text_generator = torch.Generator(device=device)
+            text_generator.manual_seed(int(seed))
+
+        for _ in range(max_length):
+            generated.append(current)
+            decode_prefix, hidden_states = self._append_text_block(
+                decode_prefix, current
+            )
+            logits = lm_head(self.und_final_norm(hidden_states[-1]))
+            if do_sample:
+                probabilities = torch.softmax(logits.float() / temperature, dim=-1)
+                next_token = torch.multinomial(
+                    probabilities,
+                    num_samples=1,
+                    generator=text_generator,
+                )
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            if int(next_token.item()) == int(eos_token_id):
+                break
+            current = next_token.to(dtype=torch.long)
+        return torch.cat(generated)
+
+    @torch.no_grad()
+    def build_thinking_context(
+        self,
+        system_prefix: BagelPrefixContext,
+        user_prefix: BagelPrefixContext,
+        thought_input_ids: Tensor,
+        *,
+        height: int,
+        width: int,
+        start_of_image_token_id: int,
+        end_of_image_token_id: int,
+    ) -> BagelContext:
+        """Build official three-way CFG prefixes after planning.
+
+        Args:
+            system_prefix: Prefix containing only the wrapped system message.
+            user_prefix: Prefix containing system and wrapped user messages.
+            thought_input_ids: Clean generated thought rewrapped with BOS/EOS.
+            height: Requested output image height.
+            width: Requested output image width.
+            start_of_image_token_id: Tokenizer-validated vision-start ID.
+            end_of_image_token_id: Tokenizer-validated vision-end ID.
+
+        Returns:
+            Thinking context whose branches are ``system + user + thought``,
+            ``system``, and ``system + user``.
+
+        Raises:
+            ValueError: If geometry, token IDs, or thought input is invalid.
+        """
+        self._validate_image_size(height, width)
+        self._validate_special_token_ids(
+            int(start_of_image_token_id), int(end_of_image_token_id)
+        )
+        if thought_input_ids.ndim != 1 or thought_input_ids.numel() < 2:
+            raise ValueError("BAGEL Thinking requires one wrapped thought message")
+        conditional = self._append_text_prefix(
+            self._fork_prefix(user_prefix), thought_input_ids
+        )
+        return BagelContext.from_prefixes(
+            conditional,
+            system_prefix,
+            height=height,
+            width=width,
+            start_of_image_token_id=int(start_of_image_token_id),
+            end_of_image_token_id=int(end_of_image_token_id),
+            secondary_unconditional=user_prefix,
+            three_way_cfg_kind="thinking",
+        )
+
+    def _require_lm_head(self) -> nn.Linear:
+        """Return the loaded language head or reject non-Thinking pipelines."""
+        if self.lm_head is None:
+            raise RuntimeError(
+                "BAGEL text generation requires a transformer with load_lm_head=True"
+            )
+        return self.lm_head
 
     def _append_image_prefix(
         self,
@@ -1053,7 +1275,8 @@ class BagelTransformer(BaseDiT):
             width=width,
             start_of_image_token_id=start_of_image_token_id,
             end_of_image_token_id=end_of_image_token_id,
-            image_unconditional=text_only_prefix,
+            secondary_unconditional=text_only_prefix,
+            three_way_cfg_kind="editing",
         )
 
     def forward(
@@ -1080,7 +1303,8 @@ class BagelTransformer(BaseDiT):
             encoder_hidden_states: Unused standard DiT compatibility argument.
             bagel_context: Explicit request-owned prefix and image state.
             guidance_scale: Text classifier-free guidance strength.
-            image_guidance_scale: Editing image classifier-free guidance strength.
+            image_guidance_scale: Secondary three-way CFG strength for Editing
+                or Thinking.
             cfg_interval: Open/closed sigma interval ``(low, high]``.
             cfg_renorm_min: Lower clamp for BAGEL's CFG norm correction.
             cfg_renorm_type: ``global`` or ``channel``.
@@ -1096,7 +1320,9 @@ class BagelTransformer(BaseDiT):
         had_batch_dimension = hidden_states.ndim == 3
         if had_batch_dimension:
             if hidden_states.shape[0] != 1:
-                raise ValueError("BAGEL T2I does not support dynamic batching")
+                raise ValueError(
+                    "BAGEL image generation does not support dynamic batching"
+                )
             hidden_states = hidden_states[0]
         if hidden_states.ndim != 2:
             raise ValueError(
@@ -1130,32 +1356,34 @@ class BagelTransformer(BaseDiT):
                 bagel_context.unconditional_rope_offset,
                 bagel_context,
             )
-            if bagel_context.is_editing:
-                image_unconditional_kv = bagel_context.image_unconditional_kv
-                image_unconditional_lens = bagel_context.image_unconditional_kv_lens
-                image_unconditional_offset = (
-                    bagel_context.image_unconditional_rope_offset
+            if bagel_context.has_three_way_cfg:
+                secondary_unconditional_kv = bagel_context.secondary_unconditional_kv
+                secondary_unconditional_lens = (
+                    bagel_context.secondary_unconditional_kv_lens
+                )
+                secondary_unconditional_offset = (
+                    bagel_context.secondary_unconditional_rope_offset
                 )
                 if (
-                    image_unconditional_kv is None
-                    or image_unconditional_lens is None
-                    or image_unconditional_offset is None
+                    secondary_unconditional_kv is None
+                    or secondary_unconditional_lens is None
+                    or secondary_unconditional_offset is None
                 ):
-                    raise ValueError("incomplete BAGEL Editing image-CFG context")
-                image_unconditional = None
+                    raise ValueError("incomplete BAGEL three-way CFG context")
+                secondary_unconditional = None
                 if image_scale > 1.0:
-                    image_unconditional = self._generation_step(
+                    secondary_unconditional = self._generation_step(
                         hidden_states,
                         timestep,
-                        image_unconditional_kv,
-                        image_unconditional_lens,
-                        image_unconditional_offset,
+                        secondary_unconditional_kv,
+                        secondary_unconditional_lens,
+                        secondary_unconditional_offset,
                         bagel_context,
                     )
                 conditional = self._apply_cfg_three_way(
                     conditional,
                     unconditional,
-                    image_unconditional,
+                    secondary_unconditional,
                     scale,
                     image_scale,
                     renorm_min=cfg_renorm_min,
@@ -1339,13 +1567,13 @@ class BagelTransformer(BaseDiT):
         renorm_min: float,
         renorm_type: str,
     ) -> Tensor:
-        """Combine BAGEL Editing's main, image-only, and text-only predictions.
+        """Combine BAGEL's main and two baseline predictions.
 
         Args:
-            main: Prediction conditioned on source image and instruction.
-            image_only: Prediction conditioned only on the source image.
-            text_only: Prediction conditioned only on the instruction, or
-                ``None`` when image CFG is disabled.
+            main: Fully conditioned prediction.
+            image_only: First CFG baseline prediction.
+            text_only: Second CFG baseline prediction, or ``None`` when the
+                secondary CFG scale is disabled.
             text_scale: Text CFG scale.
             image_scale: Image CFG scale.
             renorm_min: Lower clamp for norm correction.
@@ -1398,7 +1626,7 @@ class BagelTransformer(BaseDiT):
         *,
         strict: bool = True,
     ) -> set[str]:
-        """Stream the T2I subset of ``ema.safetensors`` into this model.
+        """Stream the selected image-generation weights into this model.
 
         Args:
             weights: Iterator of ``(checkpoint_name, tensor)`` pairs.
@@ -1409,21 +1637,18 @@ class BagelTransformer(BaseDiT):
 
         Raises:
             ValueError: If required weights are missing, shapes mismatch, or a
-                checkpoint key is outside the explicit non-T2I allowlist.
+                checkpoint key is outside the explicit component allowlist.
         """
         params = dict(self.named_parameters())
         required = set(params)
         loaded: set[str] = set()
         unexpected: list[str] = []
-        skipped_prefixes = (
-            "connector.",
-            "vit_model.",
-            "vit_pos_embed.",
-            "language_model.lm_head.",
-        )
+        skipped_prefixes = ["connector.", "vit_model.", "vit_pos_embed."]
+        if self.lm_head is None:
+            skipped_prefixes.append("language_model.lm_head.")
 
         for source_name, tensor in weights:
-            if source_name.startswith(skipped_prefixes):
+            if source_name.startswith(tuple(skipped_prefixes)):
                 continue
             target_name = self._map_checkpoint_name(source_name)
             parameter = params.get(target_name)
@@ -1437,7 +1662,7 @@ class BagelTransformer(BaseDiT):
         if strict and (missing or unexpected):
             details = []
             if missing:
-                details.append(f"missing T2I weights: {missing}")
+                details.append(f"missing BAGEL weights: {missing}")
             if unexpected:
                 details.append(f"unclassified checkpoint weights: {sorted(unexpected)}")
             raise ValueError("; ".join(details))

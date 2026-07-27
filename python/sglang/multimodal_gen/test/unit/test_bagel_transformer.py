@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.models.dits.bagel import (
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     BagelTransformer,
+    _sdpa_attention,
 )
 
 
@@ -49,6 +50,17 @@ def _build_context(model: BagelTransformer, token_ids: list[int]):
         start_of_image_token_id=3,
         end_of_image_token_id=4,
     )
+
+
+def _build_thinking_transformer(
+    tiny_transformer: BagelTransformer,
+) -> BagelTransformer:
+    config = BagelDiTConfig(
+        arch_config=tiny_transformer.config.arch_config,
+        load_lm_head=True,
+    )
+    torch.manual_seed(0)
+    return BagelTransformer(config).eval()
 
 
 def test_timestep_embedder_reuses_upstream_class_and_maps_keys(
@@ -241,11 +253,11 @@ def test_editing_context_has_three_request_owned_prefixes_with_shared_image_stor
     assert context.is_editing
     assert context.conditional_kv.sequence_length == 13
     assert context.unconditional_kv.sequence_length == 11
-    assert context.image_unconditional_kv is not None
-    assert context.image_unconditional_kv.sequence_length == 2
+    assert context.secondary_unconditional_kv is not None
+    assert context.secondary_unconditional_kv.sequence_length == 2
     assert context.conditional_rope_offset == 4
     assert context.unconditional_rope_offset == 2
-    assert context.image_unconditional_rope_offset == 2
+    assert context.secondary_unconditional_rope_offset == 2
     assert context.conditional_kv is not context.unconditional_kv
     main_key = context.conditional_kv.key_cache[0]
     image_key = context.unconditional_kv.key_cache[0]
@@ -321,3 +333,129 @@ def test_generation_qk_stays_fp32_until_attention_cast(
         guidance_scale=1.0,
     )
     assert prediction.dtype == torch.float32
+
+
+def test_prefix_decode_uses_bottom_right_causal_mask() -> None:
+    query = torch.zeros(1, 1, 1)
+    key = torch.zeros(3, 1, 1)
+    value = torch.tensor([[[1.0]], [[2.0]], [[3.0]]])
+
+    output = _sdpa_attention(query, key, value, causal=True)
+
+    torch.testing.assert_close(output, torch.tensor([[[2.0]]]))
+
+
+def test_optional_lm_head_is_strictly_mapped_and_loaded(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    assert tiny_transformer.lm_head is None
+    thinking = _build_thinking_transformer(tiny_transformer)
+    assert thinking.lm_head is not None
+    head_weight = torch.randn_like(thinking.lm_head.weight)
+
+    loaded = thinking.load_weights(
+        [("language_model.lm_head.weight", head_weight)], strict=False
+    )
+
+    assert loaded == {"lm_head.weight"}
+    torch.testing.assert_close(thinking.lm_head.weight, head_weight)
+
+    with torch.device("meta"):
+        meta_model = BagelTransformer(thinking.config)
+    weights_without_head = [
+        (name, torch.zeros(parameter.shape, dtype=parameter.dtype))
+        for name, parameter in meta_model.named_parameters()
+        if name != "lm_head.weight"
+    ]
+    with pytest.raises(ValueError, match="lm_head.weight"):
+        meta_model.load_weights(iter(weights_without_head))
+
+
+def test_text_generation_matches_official_eos_and_max_length_semantics(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    model = _build_thinking_transformer(tiny_transformer)
+    assert model.lm_head is not None
+    model.lm_head.weight.data.zero_()
+    prefix = model.prefill_context(torch.tensor([1, 2]))
+
+    stopped = model.generate_text(
+        prefix,
+        bos_token_id=5,
+        eos_token_id=0,
+        max_length=4,
+    )
+    capped = model.generate_text(
+        prefix,
+        bos_token_id=5,
+        eos_token_id=31,
+        max_length=3,
+    )
+
+    assert stopped.tolist() == [5]
+    assert capped.tolist() == [5, 0, 0]
+    assert prefix.kv_cache.sequence_length == 2
+    assert prefix.rope_offset == 2
+
+
+def test_sampled_text_generation_is_request_local_and_deterministic(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    model = _build_thinking_transformer(tiny_transformer)
+    prefix = model.prefill_context(torch.tensor([1, 2]))
+    torch.manual_seed(1234)
+    global_state = torch.random.get_rng_state().clone()
+    diffusion_generator = torch.Generator("cpu").manual_seed(77)
+    diffusion_state = diffusion_generator.get_state().clone()
+
+    first = model.generate_text(
+        prefix,
+        bos_token_id=5,
+        eos_token_id=31,
+        max_length=4,
+        do_sample=True,
+        temperature=0.7,
+        seed=9,
+    )
+    second = model.generate_text(
+        prefix,
+        bos_token_id=5,
+        eos_token_id=31,
+        max_length=4,
+        do_sample=True,
+        temperature=0.7,
+        seed=9,
+    )
+
+    assert first.tolist() == second.tolist()
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+    assert torch.equal(diffusion_generator.get_state(), diffusion_state)
+
+
+def test_thinking_context_has_official_three_request_owned_prefixes(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    model = _build_thinking_transformer(tiny_transformer)
+    system_prefix, user_prefix = model.prepare_thinking_prefixes(
+        torch.tensor([5, 1, 6]), torch.tensor([5, 2, 6])
+    )
+
+    context = model.build_thinking_context(
+        system_prefix,
+        user_prefix,
+        torch.tensor([5, 7, 8, 6]),
+        height=4,
+        width=4,
+        start_of_image_token_id=3,
+        end_of_image_token_id=4,
+    )
+
+    assert context.is_thinking
+    assert not context.is_editing
+    assert context.has_three_way_cfg
+    assert context.conditional_kv.sequence_length == 10
+    assert context.unconditional_kv.sequence_length == 3
+    assert context.secondary_unconditional_kv is not None
+    assert context.secondary_unconditional_kv.sequence_length == 6
+    assert system_prefix.kv_cache.sequence_length == 3
+    assert user_prefix.kv_cache.sequence_length == 6

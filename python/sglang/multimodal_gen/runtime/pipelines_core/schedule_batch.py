@@ -457,6 +457,7 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    revised_prompts: list[str | None] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -474,5 +475,6 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.revised_prompts = None
         self.raw_frame_batches = None
         self.noise_pred = None

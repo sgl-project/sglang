@@ -1,6 +1,6 @@
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""Native pipelines for BAGEL text-to-image generation and image editing.
+"""Native pipelines for BAGEL T2I, Thinking, and image editing.
 
 Source: https://github.com/ByteDance-Seed/Bagel/blob/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f/inferencer.py
 """
@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.b
     BagelEditBeforeDenoisingStage,
     BagelEditInputValidationStage,
     BagelInputValidationStage,
+    BagelThinkingBeforeDenoisingStage,
     validate_bagel_special_tokens,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -394,17 +395,19 @@ class BagelPipeline(ComposedPipelineBase):
                     hf_config=checkpoint_config,
                     attention_backend=attention_backend,
                 )
+            transformer_skip_prefixes = [
+                "connector.",
+                "vit_model.",
+                "vit_pos_embed.",
+            ]
+            if not server_args.pipeline_config.dit_config.load_lm_head:
+                transformer_skip_prefixes.append("language_model.lm_head.")
             self._stream_weights(
                 transformer,
                 os.path.join(checkpoint_path, "ema.safetensors"),
                 "transformer",
                 key_filter=lambda name: not name.startswith(
-                    (
-                        "connector.",
-                        "vit_model.",
-                        "vit_pos_embed.",
-                        "language_model.lm_head.",
-                    )
+                    tuple(transformer_skip_prefixes)
                 ),
             )
             modules["transformer"] = transformer.to(device=device, dtype=dtype).eval()
@@ -544,4 +547,34 @@ class BagelEditPipeline(BagelPipeline):
         self.add_standard_decoding_stage()
 
 
-EntryClass = [BagelPipeline, BagelEditPipeline]
+class BagelThinkingPipeline(BagelPipeline):
+    """Load the language head and plan before generating each image."""
+
+    pipeline_name = "BagelThinkingPipeline"
+
+    from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+        BagelThinkingPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.bagel import (
+        BagelThinkingSamplingParams,
+    )
+
+    pipeline_config_cls = BagelThinkingPipelineConfig
+    sampling_params_cls = BagelThinkingSamplingParams
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        """Build validation -> planning/prefill -> denoise -> decode."""
+        self.add_stage(BagelInputValidationStage(), "input_validation_stage")
+        self.add_stage(
+            BagelThinkingBeforeDenoisingStage(
+                transformer=self.get_module("transformer"),
+                tokenizer=self.get_module("tokenizer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+            "bagel_thinking_before_denoising_stage",
+        )
+        self.add_standard_denoising_stage(vae_key=None)
+        self.add_standard_decoding_stage()
+
+
+EntryClass = [BagelPipeline, BagelEditPipeline, BagelThinkingPipeline]

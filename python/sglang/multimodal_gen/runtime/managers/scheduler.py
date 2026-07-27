@@ -805,6 +805,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
+                revised_prompts=self._slice_batched_value(
+                    output_batch.revised_prompts, start, end, total_items
+                ),
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items

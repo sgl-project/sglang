@@ -464,6 +464,12 @@ class DiffGenerator:
             size = (req.height, req.width, req.num_frames)
         return dict(
             prompt=req.prompt,
+            revised_prompt=(
+                output_batch.revised_prompts[output_index or 0]
+                if output_batch.revised_prompts
+                and (output_index or 0) < len(output_batch.revised_prompts)
+                else None
+            ),
             size=size,
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,

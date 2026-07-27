@@ -1,20 +1,22 @@
 ---
 title: "BAGEL"
-description: "Serve BAGEL-7B-MoT for text-to-image generation and single-image editing."
+description: "Serve BAGEL-7B-MoT for text-to-image generation, Thinking, and single-image editing."
 ---
 
 ## Overview
 
 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a
 multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
-native integration supports text-to-image generation and single-image editing
-on NVIDIA CUDA.
+native integration supports text-to-image generation, model-generated planning
+before image generation (Thinking), and single-image editing on NVIDIA CUDA.
 
 <Warning>
-Run text-to-image generation and editing as separate pipeline processes. The
-current integration does not support image understanding, editing masks,
-multiple input images, multi-output requests, dynamic batching, tensor or
-sequence parallelism, Cache-DiT, or layer-wise offload.
+Run text-to-image generation, Thinking, and editing as separate pipeline
+processes. Thinking is selected when the process starts; it is not a
+per-request toggle. The current integration does not support image
+understanding, editing masks, multiple input images, multi-output requests,
+dynamic batching, tensor or sequence parallelism, Cache-DiT, or layer-wise
+offload.
 </Warning>
 
 ## Prerequisites
@@ -56,6 +58,24 @@ sglang serve \
 
 One process serves one BAGEL capability. Restart with `BagelPipeline`, or omit
 `--pipeline-class-name`, to return to text-to-image generation.
+
+## Start a Thinking server
+
+Select `BagelThinkingPipeline` explicitly. This process loads the checkpoint's
+language head, generates a request-local plan, and adds that clean plan to the
+image-conditioning context before denoising:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelThinkingPipeline \
+  --port 30020
+```
+
+The baseline T2I and Editing processes do not load the language head. Keeping
+Thinking as a separate process therefore avoids adding its roughly 1 GiB BF16
+weight to those pipelines.
 
 ## Generate an image
 
@@ -106,6 +126,59 @@ sglang generate \
 The default BAGEL flow shift is `3.0`. The images API accepts `flow_shift` as a
 request field; the offline CLI uses the model default. The fixed-seed example
 uses the CPU generator to match the official BAGEL noise initialization.
+
+## Generate an image with Thinking
+
+Send the same Images API request to the Thinking server and optionally control
+the planning decode through `extra_body`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30020/v1")
+
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "max_think_tokens": 1000,
+        "think_do_sample": False,
+        "think_temperature": 0.3,
+    },
+)
+
+print(response.data[0].revised_prompt)
+```
+
+`revised_prompt` contains the original prompt, a newline, and BAGEL's generated
+planning text—the text actually added to the image-conditioning context. The
+default decode is greedy, so `think_temperature` is used only when
+`think_do_sample=true`. `max_think_tokens` counts the initial
+`<|im_start|>` iteration, matching the official BAGEL implementation.
+
+For offline generation, select the same pipeline explicitly:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelThinkingPipeline \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --max-think-tokens 1000 \
+  --think-temperature 0.3 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --save-output
+```
 
 ## Edit an image
 
@@ -167,6 +240,10 @@ white background before encoding, matching the official application path.
   implement negative-prompt conditioning.
 - Use `num_inference_steps=50` to execute 50 denoising updates.
 - Keep `guidance_scale=4.0` and `flow_shift=3.0` for the official default path.
+- Thinking uses the official three-way context: system + prompt + plan, system
+  only, and system + prompt. Its secondary CFG scale is fixed at `1.5`.
+- Thinking defaults to greedy planning. Add `think_do_sample=true` in HTTP or
+  `--think-do-sample` offline to use request-local seeded sampling.
 - Editing accepts exactly one source image and no mask. Omit `size` for
   automatic official resizing; if supplied, it must equal the calculated
   preprocessed size.

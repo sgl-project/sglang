@@ -7,10 +7,12 @@ from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
     BagelEditPipelineConfig,
     BagelPipelineConfig,
+    BagelThinkingPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.bagel import (
     BagelEditSamplingParams,
     BagelSamplingParams,
+    BagelThinkingSamplingParams,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -137,6 +139,13 @@ class TestBagelRegistryConfig(unittest.TestCase):
         self.assertIsNotNone(config_classes)
         self.assertIs(config_classes[0], BagelEditPipelineConfig)
         self.assertIs(config_classes[1], BagelEditSamplingParams)
+
+    def test_explicit_thinking_pipeline_registers_its_config_classes(self):
+        config_classes = get_pipeline_config_classes("BagelThinkingPipeline")
+
+        self.assertIsNotNone(config_classes)
+        self.assertIs(config_classes[0], BagelThinkingPipelineConfig)
+        self.assertIs(config_classes[1], BagelThinkingSamplingParams)
 
 
 if __name__ == "__main__":

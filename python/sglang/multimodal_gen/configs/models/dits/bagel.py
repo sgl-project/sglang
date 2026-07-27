@@ -1,10 +1,11 @@
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for the BAGEL text-to-image denoiser.
+"""Configuration for BAGEL image generation and optional text planning.
 
 The architecture values follow the official BAGEL implementation and the
 ``ByteDance-Seed/BAGEL-7B-MoT`` checkpoint. This integration intentionally
-exposes only the text-to-image subset of the model.
+exposes BAGEL's image-generation subset, with an optional language head for
+Thinking.
 
 Source: https://github.com/ByteDance-Seed/Bagel/tree/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f
 """
@@ -59,6 +60,7 @@ class BagelDiTArchConfig(DiTArchConfig):
             r"^language_model\.model\.layers\.(\d+)\.mlp\.(gate|up|down)_proj\.(.*)$": r"layers.\1.mlp.und_\2.\3",
             r"^language_model\.model\.norm_moe_gen\.(.*)$": r"gen_final_norm.\1",
             r"^language_model\.model\.norm\.(.*)$": r"und_final_norm.\1",
+            r"^language_model\.lm_head\.(.*)$": r"lm_head.\1",
             # Reuse SGLang's Apache-2.0 TimestepEmbedder.  Its MLP names are
             # fc_in/fc_out rather than the checkpoint's Sequential indices.
             r"^time_embedder\.mlp\.0\.(.*)$": r"time_embedder.mlp.fc_in.\1",
@@ -95,7 +97,12 @@ class BagelDiTArchConfig(DiTArchConfig):
 
 @dataclass
 class BagelDiTConfig(DiTConfig):
-    """Runtime configuration for the BAGEL denoiser."""
+    """Runtime configuration for the BAGEL denoiser.
+
+    ``load_lm_head`` is opt-in so the baseline T2I and Editing pipelines do
+    not keep the checkpoint's roughly 1 GiB language head resident.
+    """
 
     arch_config: BagelDiTArchConfig = field(default_factory=BagelDiTArchConfig)
     prefix: str = "bagel"
+    load_lm_head: bool = False

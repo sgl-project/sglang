@@ -26,6 +26,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _BAGEL_CONTEXT_KEY = "bagel_context"
+_REVISED_PROMPT_KEY = "revised_prompt"
+GEN_THINK_SYSTEM_PROMPT = (
+    "You should first think about the planning process in the mind and then "
+    "generate the image.\n"
+    "The planning process is enclosed within <think> </think> tags, i.e. "
+    "<think> planning process here </think> image here"
+)
 _SPECIAL_TOKENS = (
     "<|im_start|>",
     "<|im_end|>",
@@ -450,6 +457,84 @@ class BagelBeforeDenoisingStage(PipelineStage):
         batch.negative_prompt_embeds = []
         batch.do_classifier_free_guidance = False
         return batch
+
+
+class BagelThinkingBeforeDenoisingStage(BagelBeforeDenoisingStage):
+    """Generate a plan, rewrap it, and build official three-way T2I context."""
+
+    @staticmethod
+    def _decode_thought(
+        tokenizer,
+        generated_ids: torch.Tensor,
+        special_token_ids: dict[str, int],
+    ) -> str:
+        """Decode official BOS-prefixed, EOS-excluded planning tokens.
+
+        Args:
+            tokenizer: BAGEL checkpoint tokenizer.
+            generated_ids: One-dimensional IDs returned by ``generate_text``.
+            special_token_ids: Validated BAGEL token mapping.
+
+        Returns:
+            Clean planning text without message-boundary tokens.
+
+        Raises:
+            ValueError: If the generated sequence violates the BOS contract.
+        """
+        if generated_ids.ndim != 1 or generated_ids.numel() == 0:
+            raise ValueError("BAGEL Thinking returned an empty token sequence")
+        bos_token_id = special_token_ids["<|im_start|>"]
+        if int(generated_ids[0].item()) != bos_token_id:
+            raise ValueError("BAGEL Thinking output must begin with <|im_start|>")
+        decoded = tokenizer.decode(
+            generated_ids.detach().cpu().tolist(), skip_special_tokens=False
+        )
+        if "<|im_start|>" in decoded:
+            decoded = decoded.split("<|im_start|>", 1)[1]
+        return decoded.split("<|im_end|>", 1)[0]
+
+    def _build_request_context(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        transformer,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+        **_context_inputs,
+    ):
+        """Plan in a forked cache, then append the clean thought as a message."""
+        system_ids = self._tokenize_prompt(
+            GEN_THINK_SYSTEM_PROMPT, special_token_ids
+        ).to(device)
+        user_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(device)
+        system_prefix, user_prefix = transformer.prepare_thinking_prefixes(
+            system_ids, user_ids
+        )
+        # Startup warmup should exercise text decode without paying the public
+        # 1000-token cap. This is request-local and does not mutate defaults.
+        max_length = 2 if batch.is_warmup else int(batch.max_think_tokens)
+        generated_ids = transformer.generate_text(
+            user_prefix,
+            bos_token_id=special_token_ids["<|im_start|>"],
+            eos_token_id=special_token_ids["<|im_end|>"],
+            max_length=max_length,
+            do_sample=bool(batch.think_do_sample),
+            temperature=float(batch.think_temperature),
+            seed=int(batch.seed),
+        )
+        thought = self._decode_thought(self.tokenizer, generated_ids, special_token_ids)
+        thought_ids = self._tokenize_prompt(thought, special_token_ids).to(device)
+        context = transformer.build_thinking_context(
+            system_prefix,
+            user_prefix,
+            thought_ids,
+            height=int(batch.height),
+            width=int(batch.width),
+            start_of_image_token_id=special_token_ids["<|vision_start|>"],
+            end_of_image_token_id=special_token_ids["<|vision_end|>"],
+        )
+        batch.extra[_REVISED_PROMPT_KEY] = f"{batch.prompt}\n{thought}"
+        return context
 
 
 class BagelEditBeforeDenoisingStage(BagelBeforeDenoisingStage):

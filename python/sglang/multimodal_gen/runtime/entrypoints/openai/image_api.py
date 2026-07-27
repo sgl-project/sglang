@@ -177,6 +177,13 @@ def _build_image_response_kwargs(
     For url: uses cloud_url or fallback_url.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
+    revised_prompts = result.revised_prompts or []
+
+    def revised_prompt_at(index: int) -> str:
+        if index < len(revised_prompts) and revised_prompts[index] is not None:
+            return revised_prompts[index]
+        return prompt
+
     ret = None
     if resp_format == "b64_json":
         if not b64_list:
@@ -184,10 +191,10 @@ def _build_image_response_kwargs(
         data = [
             ImageResponseData(
                 b64_json=b64,
-                revised_prompt=prompt,
+                revised_prompt=revised_prompt_at(index),
                 file_path=os.path.abspath(path) if is_persistent else None,
             )
-            for b64, path in zip(b64_list, save_file_path_list)
+            for index, (b64, path) in enumerate(zip(b64_list, save_file_path_list))
         ]
         ret = {"data": data}
     elif resp_format == "url":
@@ -208,7 +215,7 @@ def _build_image_response_kwargs(
             data.append(
                 ImageResponseData(
                     url=url,
-                    revised_prompt=prompt,
+                    revised_prompt=revised_prompt_at(idx),
                     file_path=os.path.abspath(path) if is_persistent else None,
                 )
             )
@@ -270,6 +277,9 @@ async def generations(
                 if request.flow_shift is not None
                 else _get_extra_field(request, "flow_shift")
             ),
+            max_think_tokens=request.max_think_tokens,
+            think_do_sample=request.think_do_sample,
+            think_temperature=request.think_temperature,
             use_duration_template=_get_extra_field(request, "use_duration_template"),
             use_resolution_template=_get_extra_field(
                 request, "use_resolution_template"

@@ -100,6 +100,7 @@ class _ExpandedOutputParts:
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
     noise_preds: list[torch.Tensor] = field(default_factory=list)
     output_file_paths: list[str] = field(default_factory=list)
+    revised_prompts: list[str | None] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
@@ -725,6 +726,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _req_to_output_batch(result: Req) -> OutputBatch:
         return OutputBatch(
             output=result.output,
+            revised_prompts=(
+                [result.extra["revised_prompt"]]
+                if result.extra.get("revised_prompt") is not None
+                else None
+            ),
             audio=getattr(result, "audio", None),
             audio_sample_rate=getattr(result, "audio_sample_rate", None),
             metrics=result.metrics,
@@ -782,6 +788,20 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.output_file_paths:
             parts.output_file_paths.extend(output_batch.output_file_paths)
         if isinstance(output_batch.output, torch.Tensor):
+            output_count = int(output_batch.output.shape[0])
+        elif output_batch.output is not None:
+            output_count = len(output_batch.output)
+        else:
+            output_count = len(output_batch.output_file_paths or [])
+        if output_batch.revised_prompts is None:
+            parts.revised_prompts.extend([None] * output_count)
+        elif len(output_batch.revised_prompts) != output_count:
+            raise ValueError(
+                "revised_prompts must align one-to-one with expanded outputs"
+            )
+        else:
+            parts.revised_prompts.extend(output_batch.revised_prompts)
+        if isinstance(output_batch.output, torch.Tensor):
             parts.tensor_outputs.append(output_batch.output)
         elif output_batch.output is not None:
             parts.list_outputs.extend(output_batch.output)
@@ -817,6 +837,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if parts.output_file_paths:
             merged.output_file_paths = parts.output_file_paths
+        if any(prompt is not None for prompt in parts.revised_prompts):
+            merged.revised_prompts = parts.revised_prompts
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(

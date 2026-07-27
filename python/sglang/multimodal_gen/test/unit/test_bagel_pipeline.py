@@ -12,6 +12,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
     BagelEditPipelineConfig,
     BagelPipelineConfig,
+    BagelThinkingPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 from sglang.multimodal_gen.runtime.pipelines.bagel_pipeline import (
     BagelEditPipeline,
     BagelPipeline,
+    BagelThinkingPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel import (
@@ -284,6 +286,27 @@ class TestBagelLoaderContract(unittest.TestCase):
             set(pipeline.memory_usages),
             {"transformer", "vae", "image_encoder", "tokenizer", "scheduler"},
         )
+
+    def test_thinking_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
+        pipeline = BagelThinkingPipeline.__new__(BagelThinkingPipeline)
+        pipeline.model_path = "must-not-be-resolved"
+        modules = {
+            "transformer": _FakeTransformer(),
+            "vae": torch.nn.Identity(),
+            "tokenizer": _FakeTokenizer(),
+            "scheduler": FlowMatchEulerDiscreteScheduler(shift=1.0),
+        }
+        args = _server_args(BagelThinkingPipelineConfig())
+
+        with patch.object(
+            BagelThinkingPipeline,
+            "_resolve_checkpoint",
+            side_effect=AssertionError("snapshot resolution must not run"),
+        ):
+            loaded = pipeline.load_modules(args, modules)
+
+        self.assertEqual(set(loaded), set(modules))
+        self.assertTrue(args.pipeline_config.dit_config.load_lm_head)
 
     def test_runtime_capability_gates_report_all_invalid_modes(self) -> None:
         args = _server_args()

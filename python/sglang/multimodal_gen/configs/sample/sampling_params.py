@@ -936,6 +936,21 @@ class SamplingParams:
             help="Number of denoising steps",
         )
         add_argument(
+            "--max-think-tokens",
+            type=int,
+            help="Maximum BAGEL planning decode iterations, including BOS",
+        )
+        add_argument(
+            "--think-do-sample",
+            action="store_true",
+            help="Sample BAGEL planning text instead of greedy decoding",
+        )
+        add_argument(
+            "--think-temperature",
+            type=float,
+            help="Sampling temperature for BAGEL planning text",
+        )
+        add_argument(
             "--guidance-scale",
             type=float,
             help="Classifier-free guidance scale",

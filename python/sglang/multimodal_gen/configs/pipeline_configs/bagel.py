@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for BAGEL text-to-image generation and image editing."""
+"""Pipeline configuration for BAGEL generation, planning, and image editing."""
 
 import math
 from dataclasses import dataclass, field
@@ -216,6 +216,28 @@ class BagelPipelineConfig(ImagePipelineConfig):
 def _editing_vae_config() -> BagelVAEConfig:
     """Create the full VAE required by image editing without changing T2I."""
     return BagelVAEConfig(load_encoder=True, load_decoder=True)
+
+
+def _thinking_dit_config() -> BagelDiTConfig:
+    """Create the transformer variant that strictly loads the language head."""
+    return BagelDiTConfig(load_lm_head=True)
+
+
+@dataclass
+class BagelThinkingPipelineConfig(BagelPipelineConfig):
+    """Configure text planning followed by official three-way T2I CFG."""
+
+    dit_config: DiTConfig = field(default_factory=_thinking_dit_config)
+    thinking_image_guidance_scale: float = 1.5
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Pass the three request-owned Thinking branches to the denoiser."""
+        kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+        context = kwargs["bagel_context"]
+        if not context.is_thinking:
+            raise RuntimeError("BAGEL Thinking requires a three-way request context")
+        kwargs["image_guidance_scale"] = self.thinking_image_guidance_scale
+        return kwargs
 
 
 @dataclass

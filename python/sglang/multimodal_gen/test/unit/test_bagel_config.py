@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,12 +12,15 @@ from torch import nn
 from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
     BagelEditPipelineConfig,
     BagelPipelineConfig,
+    BagelThinkingPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.bagel import (
     BagelEditSamplingParams,
     BagelSamplingParams,
+    BagelThinkingSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 
 
@@ -35,6 +39,44 @@ class TestBagelSamplingParams(unittest.TestCase):
         params = BagelEditSamplingParams(prompt="make the sky blue")
         self.assertIsNone(params.true_cfg_scale)
         self.assertEqual(params.guidance_scale, 4.0)
+
+    def test_thinking_defaults_are_greedy_and_load_language_head(self) -> None:
+        params = BagelThinkingSamplingParams(prompt="a cat")
+        config = BagelThinkingPipelineConfig()
+
+        self.assertEqual(params.max_think_tokens, 1000)
+        self.assertFalse(params.think_do_sample)
+        self.assertEqual(params.think_temperature, 0.3)
+        self.assertEqual(params.guidance_scale, 4.0)
+        self.assertTrue(config.dit_config.load_lm_head)
+        self.assertEqual(config.thinking_image_guidance_scale, 1.5)
+
+    def test_thinking_sampling_controls_are_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_think_tokens"):
+            BagelThinkingSamplingParams(prompt="a cat", max_think_tokens=0)
+        with self.assertRaisesRegex(ValueError, "think_temperature"):
+            BagelThinkingSamplingParams(
+                prompt="a cat", think_do_sample=True, think_temperature=0.0
+            )
+
+    def test_thinking_controls_are_available_to_offline_cli(self) -> None:
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--max-think-tokens",
+                "12",
+                "--think-do-sample",
+                "--think-temperature",
+                "0.8",
+            ]
+        )
+
+        cli_args = BagelThinkingSamplingParams.get_cli_args(args)
+
+        self.assertEqual(cli_args["max_think_tokens"], 12)
+        self.assertTrue(cli_args["think_do_sample"])
+        self.assertEqual(cli_args["think_temperature"], 0.8)
 
 
 class TestBagelPipelineConfig(unittest.TestCase):
@@ -174,6 +216,26 @@ class TestBagelPipelineConfig(unittest.TestCase):
         self.assertEqual(kwargs["image_guidance_scale"], 2.0)
         self.assertEqual(kwargs["cfg_interval"], (0.0, 1.0))
         self.assertEqual(kwargs["cfg_renorm_type"], "text_channel")
+
+    def test_thinking_prepare_kwargs_selects_official_three_way_defaults(self) -> None:
+        config = BagelThinkingPipelineConfig()
+        context = SimpleNamespace(is_thinking=True)
+        batch = SimpleNamespace(
+            guidance_scale=4.0,
+            extra={"bagel_context": context},
+        )
+
+        kwargs = config.prepare_pos_cond_kwargs(
+            batch,
+            torch.device("cpu"),
+            rotary_emb=None,
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(kwargs["guidance_scale"], 4.0)
+        self.assertEqual(kwargs["image_guidance_scale"], 1.5)
+        self.assertEqual(kwargs["cfg_interval"], (0.4, 1.0))
+        self.assertEqual(kwargs["cfg_renorm_type"], "global")
 
     def test_unpatchify_uses_request_shape_and_releases_context(self) -> None:
         config = BagelPipelineConfig()
