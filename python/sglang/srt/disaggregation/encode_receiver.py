@@ -1289,6 +1289,12 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 self.embeddings_buffer = None
                 buffer_address = 0
 
+            # Abort/timeout may latch _terminal after commit; do not start
+            # RDMA into a buffer the main thread is about to release.
+            with self._buffer_lock:
+                if self._terminal:
+                    return
+
             # Phase 2 cont: POST /send with RDMA info.
             offset = 0
             send_tasks = []
@@ -1452,6 +1458,28 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             except Exception:
                 logger.exception("Failed to deregister GPU buffer for rid=%s", self.rid)
             self.embeddings_buffer = None
+
+    def release_resources(self):
+        """
+        Ensures an in-flight RDMA write cannot land in a recycled pool slot.
+        Idempotent.
+        """
+        with self._buffer_lock:
+            self._terminal = True
+        encode_thread = getattr(self, "_encode_thread", None)
+        if (
+            encode_thread is not None
+            and encode_thread.is_alive()
+            and threading.current_thread() is not encode_thread
+        ):
+            # Bound by the same HTTP timeout the encode path uses for /send.
+            encode_thread.join(timeout=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
+            if encode_thread.is_alive():
+                logger.warning(
+                    "Encode thread still alive after join timeout; "
+                    f"releasing buffer anyway. rid={self.rid}"
+                )
+        super().release_resources()
 
 
 def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts):
@@ -1750,23 +1778,23 @@ class MMReceiverBase(ABC):
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
-            # Bound the GPU footprint of received embeddings with the same
-            # pool mechanism as the mooncake backend: a request whose
-            # embeddings cannot get a pool slot stays PENDING instead of
-            # growing GPU memory without limit. Set
-            # SGLANG_EMBEDDING_POOL_SIZE_MB=0 to disable (unpooled CPU
-            # receive).
-            pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
-            if pool_mb and pool_mb > 0 and scheduler is not None:
-                gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", 0)
-                try:
-                    self.embedding_pool = EmbeddingPool(gpu_id, pool_mb * 1024 * 1024)
-                except Exception:
-                    logger.exception(
-                        "Failed to allocate EmbeddingPool, "
-                        "falling back to unpooled receive"
-                    )
-                    self.embedding_pool = None
+            # Unlike mooncake, do NOT apply the 4096MB default.
+            # Explicitly set SGLANG_EMBEDDING_POOL_SIZE_MB=<MB>
+            # to bound received embeddings; unset/0 keeps unpooled receive.
+            if envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set() and scheduler is not None:
+                pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
+                if pool_mb and pool_mb > 0 and scheduler is not None:
+                    gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", 0)
+                    try:
+                        self.embedding_pool = EmbeddingPool(
+                            gpu_id, pool_mb * 1024 * 1024
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to allocate EmbeddingPool, "
+                            "falling back to unpooled receive"
+                        )
+                        self.embedding_pool = None
             if hf_config is not None:
                 self._init_mm_processor(
                     server_args,
@@ -1856,6 +1884,7 @@ class MMReceiverBase(ABC):
                 waiting_req.error_msg = "Aborted by user"
                 waiting_req.error_code = 400
                 waiting_req.recv_socket.close()
+                waiting_req.release_resources()
                 logger.info(f"Abort waiting mm request. rid={waiting_req.rid}")
 
     async def recv_mm_data(
