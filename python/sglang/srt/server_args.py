@@ -3674,14 +3674,17 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
                 # CUDA-graph sizing has already run by this point. With
                 # chunked prefill disabled its generic default is -1, which
-                # otherwise leaves BCG with no shapes to capture. Use the
-                # model's maximum request length as the safe default; callers
-                # can still raise it for larger aggregate prefill batches.
+                # otherwise leaves BCG with no shapes to capture. On the
+                # Hopper/Blackwell FA raw-K/V path, capture a full eight-way
+                # 2K embedding batch by default; callers can still override
+                # this for larger aggregate prefills.
                 if (self.cuda_graph_config.prefill.max_bs or 0) <= 0:
-                    self.cuda_graph_config.prefill.max_bs = model_config.context_len
+                    self.cuda_graph_config.prefill.max_bs = max(
+                        model_config.context_len, 16384
+                    )
                     self.cuda_graph_config.prefill.bs = (
                         self._generate_prefill_cuda_graph_batch_sizes(
-                            model_config.context_len
+                            self.cuda_graph_config.prefill.max_bs
                         )
                     )
             elif not is_cuda():

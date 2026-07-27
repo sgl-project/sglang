@@ -28,29 +28,28 @@ pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 ## Start the server
 
-The standard configuration uses BCG automatically on CUDA:
+The standard configuration detects EmbeddingGemma and enables embedding mode,
+BCG, and the checkpoint's BF16 dtype automatically:
 
 ```bash
 sglang serve \
   --model-path google/embeddinggemma-300m \
-  --is-embedding \
   --host 0.0.0.0 \
   --port 30000
 ```
 
-### Recommended Hopper / Blackwell performance configuration
+### Hopper performance defaults
 
-For H100, H200, B200, and newer NVIDIA GPUs, explicitly select FA3 and
-capture the 16,384-token BCG tier. This is the recommended command for
-high-throughput, long embedding batches:
+On H100 and H200, SGLang automatically selects FA3 and captures BCG through
+16,384 tokens, covering eight 2K embedding requests in one replay. No extra
+performance flags are required for this workload.
+
+To capture larger aggregate prefills, raise the BCG tier explicitly:
 
 ```bash
 sglang serve \
   --model-path google/embeddinggemma-300m \
-  --is-embedding \
-  --dtype bfloat16 \
-  --attention-backend fa3 \
-  --cuda-graph-max-bs-prefill 16384 \
+  --cuda-graph-max-bs-prefill 32768 \
   --host 0.0.0.0 \
   --port 30000
 ```
