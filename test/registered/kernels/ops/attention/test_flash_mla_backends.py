@@ -560,15 +560,32 @@ class TestTouchedPageSplit(CustomTestCase):
             device=self.device,
         )
         buffers[split_key] = dst
-        # Nonzero mask storage: the call must zero it before marking.
-        buffers[mask_key] = torch.full(
-            (num_pages,), -7, dtype=torch.int8, device=self.device
-        )
+        # The mask is deliberately not preseeded: production allocates it on the
+        # first call, which happens during inference-mode autotune.
 
         # Two tokens in source page 0, one in page 2, one invalid; page 1 idle.
         token_ids = torch.tensor(
             [0, 5, 2 * _PBS_SRC + 3, -1], dtype=torch.int32, device=self.device
         )
+
+        # Autotune-like first call: allocates the persistent mask under
+        # inference mode. It must still be a normal tensor, or the later
+        # zero_() (CUDA graph capture, outside inference mode) would fail.
+        with torch.inference_mode():
+            _split_kv_pages_to_64(
+                k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
+            )
+        torch.cuda.synchronize()
+        self.assertFalse(
+            buffers[mask_key].is_inference(),
+            "persistent mask must not be an inference tensor",
+        )
+
+        # Restore the pre-step state: sentinel destination and nonzero mask
+        # storage that the call must zero before marking.
+        dst.fill_(sentinel)
+        buffers[mask_key].fill_(-7)
+
         out_pages = _split_kv_pages_to_64(
             k_cache.view(torch.uint8), _PBS_SRC, touched_indices=token_ids
         )
