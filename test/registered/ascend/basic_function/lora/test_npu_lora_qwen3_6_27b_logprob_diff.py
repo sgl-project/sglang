@@ -14,14 +14,14 @@
 
 """
 GPU test is test_lora_qwen3_5_4b_logprob_diff
-NPU regression test for Qwen3.5-4B LoRA logprob accuracy.
+NPU regression test for Qwen3.6-27B LoRA logprob accuracy.
 
 Compares SGLang LoRA logprobs against reference training logprobs from a
 pre-computed dataset. The LoRA adapter and reference data are downloaded from:
 https://huggingface.co/datasets/opherlie/lora-test-case-Qwen3.5-4B
 
 Usage:
-    python -m unittest test_npu_lora_qwen3_5_4b_logprob_diff
+    python -m unittest test_npu_lora_qwen3_6_27b_logprob_diff
 """
 
 import multiprocessing as mp
@@ -73,9 +73,9 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
-class TestLoRAQwen3_5_4BLogprobDiff(CustomTestCase):
+class TestLoRAQwen3_6_27BLogprobDiff(CustomTestCase):
 
-    def test_lora_qwen3_5_4b_logprob_accuracy(self):
+    def test_lora_qwen3_6_27b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,
             repo_type="dataset",
