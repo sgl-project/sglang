@@ -2,6 +2,7 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import base64
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -12,6 +13,7 @@ import uuid
 from unittest.mock import MagicMock, Mock
 
 import jinja2
+import numpy as np
 
 
 # Stub out sgl_kernel (and all submodules) before any sglang import so
@@ -338,6 +340,29 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             self.serving_embedding._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
+
+    def test_build_response_float_returns_list(self):
+        embedding = [0.1, 0.2, 0.3, 0.4, 0.5]
+        ret = [{"embedding": embedding, "meta_info": {"prompt_tokens": 5}}]
+        response = self.serving_embedding._build_embedding_response(ret, "float")
+        self.assertEqual(response.data[0].embedding, embedding)
+
+    def test_build_response_base64_round_trips(self):
+        embedding = [0.1, 0.2, 0.3, 0.4, 0.5]
+        ret = [{"embedding": embedding, "meta_info": {"prompt_tokens": 5}}]
+
+        response = self.serving_embedding._build_embedding_response(ret, "base64")
+
+        encoded = response.data[0].embedding
+        self.assertIsInstance(encoded, str)
+        decoded = np.frombuffer(base64.b64decode(encoded), dtype="<f4")
+        np.testing.assert_allclose(decoded, embedding, rtol=1e-6)
+
+    def test_validate_request_rejects_unsupported_encoding_format(self):
+        err = self.serving_embedding._validate_request(
+            EmbeddingRequest(input="x", encoding_format="int8")
+        )
+        self.assertIn("encoding_format", err)
 
 
 if __name__ == "__main__":
