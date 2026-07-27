@@ -9,6 +9,9 @@ continuous primitive weights.
 For an architecture-first review of the implementation, numerical-parity
 decisions, sequence-parallel status, and the required comprehension quiz, read
 [`CHANGE_GUIDE.zh-CN.md`](CHANGE_GUIDE.zh-CN.md).
+The 0724 same-session prompt-switch bitwise run, boundary semantics, event-id
+evidence, and one-time cutover cost are recorded in
+[`PROMPT_SWITCH_PARITY_5S.zh-CN.md`](PROMPT_SWITCH_PARITY_5S.zh-CN.md).
 
 ## Inputs
 

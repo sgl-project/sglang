@@ -231,6 +231,21 @@ action 的服务端动态路径则没有复现“不生效”。如果重新部�
 可见响应，需要保留 `keydown → event send → sampled event ID → first rendered frame`
 四段时间和对应录屏继续定位，不能把服务端 hash 变化直接等同于交互手感已经通过。
 
+### 5.3 18/9 KV、5 秒 raw RGB 正式 parity
+
+后续正式补跑了 1 个静态 control 加 4 个同 session prompt-switch case。每个 case
+均为 832×480、24 FPS、129 帧，MinWM V3 与 SGLang 都使用 window=18/sink=9。
+prompt event 从 chunk 1（pixel frame 17 / latent frame 5）生效。
+
+结果为 5/5 bitwise exact，且 4/4 case 同时满足：
+
+- frame header 与 chunk stats 的 event ID 首次命中 chunk 1；
+- 切换前与静态 control bitwise exact；
+- 切换后与静态 control 产生像素差异。
+
+完整设计、性能和证据路径见
+[`PROMPT_SWITCH_PARITY_5S.zh-CN.md`](PROMPT_SWITCH_PARITY_5S.zh-CN.md)。
+
 ## 6. 部署影响
 
 需要重新部署。原因有两个：
