@@ -104,12 +104,26 @@ async fn main() -> Result<()> {
     // `cache_aware_zmq`, the index is still constructed (cheap) but no
     // subscribers are ever added.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+    // Peer bootstrap is enabled only when a peer selector is configured. Without
+    // one there is nobody to pull a snapshot from, so the tracker is pre-settled
+    // and `/readyz` behaves exactly as it did before this feature existed.
+    let kv_peer_selector = match &cfg.discovery {
+        sgl_router::config::DiscoveryBackend::K8s(k) => k.peer_selector.clone(),
+        _ => None,
+    };
+    let kv_bootstrap = Arc::new(match (&cfg.model.cache_aware, &kv_peer_selector) {
+        (Some(ca), Some(_)) => sgl_router::policies::kv_events::BootstrapTracker::new(
+            std::time::Duration::from_millis(ca.bootstrap_timeout_ms),
+        ),
+        _ => sgl_router::policies::kv_events::BootstrapTracker::disabled(),
+    });
+    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_bootstrap(
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("default http client builds"),
         Arc::clone(&block_size_oracle),
+        Arc::clone(&kv_bootstrap),
     );
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
@@ -164,6 +178,37 @@ async fn main() -> Result<()> {
     // protocol from its `/server_info` and stamps it onto the registered
     // worker; the proxy holds a client per protocol and selects by the worker's
     // protocol per request, so the manager needs no proxy handle.
+    // Start the peer watch BEFORE worker discovery: `add_worker` consults the
+    // peer set the moment the first worker appears, and an empty set there means
+    // that worker's ranks skip bootstrap entirely and run cold.
+    if let (Some(selector), sgl_router::config::DiscoveryBackend::K8s(k8s)) =
+        (kv_peer_selector.as_ref(), &cfg.discovery)
+    {
+        // Peers are only usable on the family this router actually listens on.
+        let want_ipv6 = cfg
+            .server
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_ipv6());
+        match sgl_router::discovery::k8s::spawn_peer_watch(
+            k8s.namespace.clone(),
+            selector.clone(),
+            kv_index.peers(),
+            want_ipv6,
+        )
+        .await
+        {
+            Ok(_handle) => {}
+            // Non-fatal: routing does not depend on peer discovery. Losing it
+            // means replicas boot cold, which is the pre-existing behaviour.
+            Err(e) => tracing::error!(
+                error = %e,
+                "kv-bootstrap: peer watch failed to start; replicas will boot with a cold \
+                 cache-aware tree (check RBAC for endpointslices on the router's own Service)",
+            ),
+        }
+    }
+
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
@@ -200,6 +245,9 @@ async fn main() -> Result<()> {
             itl,
         ),
     );
+    // `/readyz` needs the index to know whether peer bootstrap has settled, and
+    // `/internal/kv_snapshot` needs it to serve siblings.
+    ctx.attach_kv_index(Arc::clone(&kv_index));
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());

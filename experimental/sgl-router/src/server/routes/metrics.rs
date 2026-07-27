@@ -55,11 +55,98 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
     // ITL sample emits no series).
     let itl_samples = ctx.itl.snapshot_fresh(std::time::Instant::now());
     body.push_str(&ctx.metrics.render_worker_itl(&itl_samples));
+    // Cache-aware bootstrap, same pull-on-scrape model. Emitted only when the
+    // KV index exists, so a router without cache-aware-zmq shows no series.
+    if let Some(index) = ctx.kv_index() {
+        body.push_str(&render_kv_bootstrap(index));
+    }
     (
         StatusCode::OK,
         [(CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+/// Render the cache-aware bootstrap series.
+///
+/// `sgl_router_kv_tree_nodes` makes a cold or leaking tree visible, and the
+/// bootstrap gauges make "this replica is serving cache-blind" alertable.
+/// Without them both conditions are only inferable from a hit-rate dip.
+fn render_kv_bootstrap(index: &Arc<crate::policies::kv_events::KvEventIndex>) -> String {
+    use crate::server::metrics::escape_label;
+
+    let mut out = String::new();
+    out.push_str("# HELP sgl_router_kv_tree_nodes Nodes in the cache-aware KV hash tree.\n");
+    out.push_str("# TYPE sgl_router_kv_tree_nodes gauge\n");
+    out.push_str(&format!(
+        "sgl_router_kv_tree_nodes {}\n",
+        index.tree().node_count()
+    ));
+
+    let tracker = index.bootstrap();
+    out.push_str(
+        "# HELP sgl_router_kv_bootstrap_settled 1 when initial peer bootstrap has settled.\n",
+    );
+    out.push_str("# TYPE sgl_router_kv_bootstrap_settled gauge\n");
+    out.push_str(&format!(
+        "sgl_router_kv_bootstrap_settled {}\n",
+        u8::from(tracker.settled())
+    ));
+
+    out.push_str("# HELP sgl_router_kv_peers Sibling replicas available to bootstrap from.\n");
+    out.push_str("# TYPE sgl_router_kv_peers gauge\n");
+    out.push_str(&format!("sgl_router_kv_peers {}\n", index.peers().len()));
+
+    let states = tracker.states();
+    if !states.is_empty() {
+        out.push_str(
+            "# HELP sgl_router_kv_bootstrap_state Per-rank bootstrap state \
+             (0=pending, 1=recovered, 2=failed).\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_bootstrap_state gauge\n");
+        for (id, state) in states {
+            out.push_str(&format!(
+                "sgl_router_kv_bootstrap_state{{worker=\"{}\",dp_rank=\"{}\"}} {}\n",
+                escape_label(&id.url),
+                id.dp_rank,
+                state.as_metric(),
+            ));
+        }
+    }
+
+    // Two counters, deliberately not one: this counts FETCHES against peers,
+    // the next counts RANKS. One accepted fetch can settle several ranks and one
+    // rank can outlive many rejected fetches, so a shared counter would be
+    // divisible by nothing.
+    let peer_outcomes = tracker.peer_outcome_counts();
+    if !peer_outcomes.is_empty() {
+        out.push_str(
+            "# HELP sgl_router_kv_peer_snapshot_total Peer snapshot fetches by outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_peer_snapshot_total counter\n");
+        for (outcome, count) in peer_outcomes {
+            out.push_str(&format!(
+                "sgl_router_kv_peer_snapshot_total{{outcome=\"{outcome}\"}} {count}\n",
+            ));
+        }
+    }
+
+    // Recorded once per rank, at the point its verdict is final — so `warm`
+    // lags the state gauge by the splice proof, and the labels sum to the number
+    // of ranks that finished bootstrapping.
+    let rank_outcomes = tracker.rank_outcome_counts();
+    if !rank_outcomes.is_empty() {
+        out.push_str(
+            "# HELP sgl_router_kv_bootstrap_rank_total Ranks by final bootstrap outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_kv_bootstrap_rank_total counter\n");
+        for (outcome, count) in rank_outcomes {
+            out.push_str(&format!(
+                "sgl_router_kv_bootstrap_rank_total{{outcome=\"{outcome}\"}} {count}\n",
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

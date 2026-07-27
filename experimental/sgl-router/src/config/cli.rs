@@ -96,6 +96,15 @@ pub struct Cli {
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
+    /// How long `/readyz` may stay 503 while this replica bootstraps its
+    /// cache-aware tree from a warm sibling. Defaults to 5000.
+    #[arg(long)]
+    pub kv_bootstrap_timeout_ms: Option<u64>,
+    /// Label selector matching this router's own pods, so a booting replica can
+    /// find siblings to pull a tree snapshot from. Unset disables peer
+    /// bootstrap and every replica starts cold.
+    #[arg(long)]
+    pub kv_peer_selector: Option<String>,
     /// Absolute load spread above which the cache check is skipped.
     #[arg(long)]
     pub balance_abs_threshold: Option<usize>,
@@ -274,12 +283,39 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+            || self.balance_rel_threshold.is_some()
+            || self.kv_bootstrap_timeout_ms.is_some()
+            || self.kv_peer_selector.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "cache-aware tuning (--cache-threshold / --balance-abs-threshold / \
+                 --balance-rel-threshold / --kv-bootstrap-timeout-ms / --kv-peer-selector) \
+                 requires --policy cache_aware_zmq"
             ));
+        }
+        // `peer_selector` is only carried on the k8s discovery backend (it needs a
+        // namespace to watch), so with any other backend it would be accepted and
+        // then silently ignored — the operator would see cold boots with no
+        // explanation.
+        if self.kv_peer_selector.is_some() && !self.service_discovery {
+            return Err(anyhow!(
+                "--kv-peer-selector requires --service-discovery (peer replicas are \
+                 found via Kubernetes EndpointSlices)"
+            ));
+        }
+        // `Instant::now() + Duration::from_millis(timeout)` panics on overflow, so
+        // an absurd value would abort the process at startup rather than being
+        // rejected here. The ceiling is also well past any sane readinessProbe
+        // budget.
+        const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 600_000;
+        if let Some(ms) = self.kv_bootstrap_timeout_ms {
+            if ms > MAX_KV_BOOTSTRAP_TIMEOUT_MS {
+                return Err(anyhow!(
+                    "--kv-bootstrap-timeout-ms {ms} exceeds the {MAX_KV_BOOTSTRAP_TIMEOUT_MS}ms \
+                     ceiling; /readyz stays 503 for this long, so a larger value would \
+                     outlast any reasonable readinessProbe"
+                ));
+            }
         }
 
         let tuned_sticky = self.routing_key_header.is_some()
@@ -374,6 +410,9 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                bootstrap_timeout_ms: self
+                    .kv_bootstrap_timeout_ms
+                    .unwrap_or(d.bootstrap_timeout_ms),
             })
         } else {
             None
@@ -482,6 +521,7 @@ impl Cli {
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
                     namespace: self.service_discovery_namespace.clone().unwrap_or_default(),
                     mode,
+                    peer_selector: self.kv_peer_selector.clone(),
                 })
             }
         };
@@ -1059,6 +1099,52 @@ mod tests {
     }
 
     #[test]
+    fn rejects_peer_selector_without_service_discovery() {
+        let err = Cli::parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--tokenizer-path",
+            "t",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-urls",
+            "http://w:1",
+            "--kv-peer-selector",
+            "app=router",
+        ])
+        .into_config()
+        .expect_err("peer bootstrap needs k8s discovery to find siblings");
+        assert!(
+            err.to_string().contains("requires --service-discovery"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn rejects_absurd_kv_bootstrap_timeout() {
+        let err = Cli::parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--tokenizer-path",
+            "t",
+            "--policy",
+            "cache_aware_zmq",
+            "--worker-urls",
+            "http://w:1",
+            "--kv-bootstrap-timeout-ms",
+            &u64::MAX.to_string(),
+        ])
+        .into_config()
+        .expect_err("an unbounded timeout would overflow Instant at startup");
+        assert!(
+            err.to_string().contains("ceiling"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn rejects_cache_aware_knob_without_cache_aware_policy() {
         // Default policy is round_robin, so a cache knob has no effect —
         // reject rather than silently ignore it.
@@ -1071,7 +1157,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("require --policy cache_aware_zmq"),
+            err.contains("requires --policy cache_aware_zmq"),
             "got: {err}"
         );
     }

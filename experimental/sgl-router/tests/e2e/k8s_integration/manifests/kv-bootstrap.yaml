@@ -1,0 +1,156 @@
+# Fixture for the cache-aware peer-bootstrap tests.
+#
+# Deliberately a SEPARATE worker Service + router Deployment from the ones in
+# router.yaml / setup.sh, so these tests cannot perturb (or be perturbed by) the
+# discovery / lifecycle / reconciliation suites that share the namespace.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-kv-worker
+  namespace: sgl-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-kv
+  template:
+    metadata:
+      labels:
+        app: sglang-kv
+    spec:
+      containers:
+        - name: worker
+          image: sgl-router-fake-kv-worker:e2e
+          imagePullPolicy: Never
+          env:
+            # The worker advertises this as `kv_events.endpoint_host`, so the
+            # router connects to a concrete address rather than a wildcard.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MODEL_ID
+              value: "tiny"
+            - name: BLOCK_SIZE
+              value: "4"
+            - name: DP_SIZE
+              value: "1"
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 5557
+              name: kv-events
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-kv-worker
+  namespace: sgl-router-test
+  # Copied onto the generated EndpointSlice, which is what the router's
+  # `--selector app=sglang-kv` matches.
+  labels:
+    app: sglang-kv
+spec:
+  selector:
+    app: sglang-kv
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router-kv
+  namespace: sgl-router-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sgl-router-kv
+  # Surge-only so a rolling update always keeps the warm replicas serving while
+  # the new ones bootstrap — the configuration the peer-bootstrap design assumes.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sgl-router-kv
+    spec:
+      serviceAccountName: sgl-router
+      containers:
+        - name: router
+          image: sgl-router:e2e
+          imagePullPolicy: Never
+          env:
+            # Lets a replica exclude itself from its own peer list.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8090"
+            - "--model-id"
+            - "tiny"
+            - "--tokenizer-path"
+            - "/etc/tokenizer/tiny.json"
+            - "--policy"
+            - "cache_aware_zmq"
+            - "--service-discovery"
+            - "--service-discovery-namespace"
+            - "sgl-router-test"
+            - "--selector"
+            - "app=sglang-kv"
+            # Find sibling replicas via this Deployment's own Service.
+            - "--kv-peer-selector"
+            - "kubernetes.io/service-name=sgl-router-kv"
+            # Generous relative to a loopback fetch inside kind, so a slow CI
+            # node cannot turn a working bootstrap into a cold one and make the
+            # view assertions flaky.
+            - "--kv-bootstrap-timeout-ms"
+            - "20000"
+          ports:
+            - containerPort: 8090
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8090
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            # Must outlast --kv-bootstrap-timeout-ms: /readyz stays 503 for the
+            # whole bootstrap window by design, and a tighter budget here would
+            # restart the pod mid-bootstrap.
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router-kv
+  namespace: sgl-router-test
+spec:
+  selector:
+    app: sgl-router-kv
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090

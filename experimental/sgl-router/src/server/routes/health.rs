@@ -13,7 +13,7 @@ pub async fn healthz() -> StatusCode {
 
 /// Readiness probe — 200 only when the pod can actually serve traffic.
 ///
-/// Requires BOTH:
+/// Requires ALL of:
 /// 1. `AppContext::mark_ready()` was called by main (process bootstrap
 ///    finished — config loaded, tokenizers built, server bound), AND
 /// 2. At least one worker is registered. Without this second check,
@@ -21,8 +21,17 @@ pub async fn healthz() -> StatusCode {
 ///    has been processed — the Service starts sending traffic to a
 ///    pod whose registry is empty, and every request returns 503
 ///    `no_healthy_workers`.
+/// 3. Cache-aware peer bootstrap has settled. A replica with an empty KV tree
+///    routes cache-blind AND scatters prefixes the warm replicas were keeping
+///    consolidated, so it is held out of the Service until it has pulled a
+///    snapshot from a sibling — or until `--kv-bootstrap-timeout-ms` gives up.
+///    Always true unless BOTH cache-aware-zmq and `--kv-peer-selector` are
+///    configured; that pair is what enables the gate at all.
+///
+/// Condition 3 latches once satisfied (see `BootstrapTracker::settled`): a
+/// later scale-up must never drag an already-serving replica back to 503.
 pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
-    if ctx.is_ready() && !ctx.registry.is_empty() {
+    if ctx.is_ready() && !ctx.registry.is_empty() && ctx.kv_bootstrap_settled() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -102,6 +111,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A KV index whose bootstrap is deliberately unsettled: one rank
+    /// registered, deadline far out.
+    fn unsettled_kv_index() -> Arc<crate::policies::kv_events::KvEventIndex> {
+        use crate::policies::kv_events::bootstrap::BootstrapTracker;
+        use crate::policies::kv_events::{BlockSizeOracle, KvEventIndex, KvWorkerId};
+        let tracker = Arc::new(BootstrapTracker::new(std::time::Duration::from_secs(3600)));
+        tracker.register(&[KvWorkerId::new("http://w1".into(), 0)]);
+        KvEventIndex::new_with_bootstrap(reqwest::Client::new(), BlockSizeOracle::new(), tracker)
+    }
+
+    async fn readyz_status(ctx: Arc<AppContext>) -> StatusCode {
+        crate::server::app::build_router(ctx)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A replica that is otherwise serviceable is still held out
+    /// while its cache-aware tree is cold, so it cannot scatter prefixes the
+    /// warm replicas were consolidating.
+    #[tokio::test]
+    async fn readyz_503_while_kv_bootstrap_pending() {
+        let ctx = test_ctx(true, true);
+        ctx.attach_kv_index(unsettled_kv_index());
+        assert_eq!(
+            readyz_status(ctx).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ready + workers + cold KV tree must still be 503",
+        );
+    }
+
+    /// Once every rank reaches a terminal state the gate opens — including when
+    /// the outcome was Failed, because cold-but-known is a valid outcome.
+    #[tokio::test]
+    async fn readyz_200_once_kv_bootstrap_settles_even_if_failed() {
+        use crate::policies::kv_events::bootstrap::BootstrapState;
+        use crate::policies::kv_events::KvWorkerId;
+
+        let ctx = test_ctx(true, true);
+        let index = unsettled_kv_index();
+        ctx.attach_kv_index(index.clone());
+        assert_eq!(
+            readyz_status(ctx.clone()).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+
+        index.bootstrap().set(
+            &KvWorkerId::new("http://w1".into(), 0),
+            BootstrapState::Failed,
+        );
+        assert_eq!(readyz_status(ctx).await, StatusCode::OK);
+    }
+
+    /// The latch: a worker discovered after settlement must not drag a serving
+    /// replica back to 503. Without this, a routine scale-up would look like an
+    /// availability incident.
+    #[tokio::test]
+    async fn readyz_stays_200_when_a_worker_appears_after_settling() {
+        use crate::policies::kv_events::bootstrap::BootstrapState;
+        use crate::policies::kv_events::KvWorkerId;
+
+        let ctx = test_ctx(true, true);
+        let index = unsettled_kv_index();
+        ctx.attach_kv_index(index.clone());
+        index.bootstrap().set(
+            &KvWorkerId::new("http://w1".into(), 0),
+            BootstrapState::Recovered,
+        );
+        assert_eq!(readyz_status(ctx.clone()).await, StatusCode::OK);
+
+        // Scale-up: a brand-new pending rank shows up.
+        index
+            .bootstrap()
+            .register(&[KvWorkerId::new("http://w2".into(), 0)]);
+        assert_eq!(
+            readyz_status(ctx).await,
+            StatusCode::OK,
+            "a later pending rank must not un-ready a serving replica",
+        );
+    }
+
+    /// A router without cache-aware-zmq has no tree to warm, so the gate must
+    /// be completely inert for it.
+    #[tokio::test]
+    async fn readyz_200_when_no_kv_index_attached() {
+        let ctx = test_ctx(true, true);
+        assert!(ctx.kv_bootstrap_settled(), "absent index means settled");
+        assert_eq!(readyz_status(ctx).await, StatusCode::OK);
     }
 
     fn test_ctx(ready: bool, with_worker: bool) -> Arc<AppContext> {

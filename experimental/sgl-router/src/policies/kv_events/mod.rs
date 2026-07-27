@@ -9,6 +9,8 @@
 //!
 //! - [`wire`] — msgpack types and [`decode_event_batch`]; the contract
 //!   with the SGLang publisher. Pure decoding; no I/O.
+//! - [`bootstrap`] — peer-snapshot bootstrap so a newly started replica
+//!   inherits a warm tree instead of routing cache-blind.
 //! - [`hash`] — block-hash compute mirroring SGLang `RadixKey.hash_page`.
 //! - [`tree`] — hash-keyed radix tree consumed by the routing path.
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
@@ -16,6 +18,7 @@
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
 
 pub mod block_size_oracle;
+pub mod bootstrap;
 pub mod discovery;
 pub mod hash;
 pub mod index;
@@ -24,12 +27,16 @@ pub mod tree;
 pub mod wire;
 
 pub use block_size_oracle::BlockSizeOracle;
+pub use bootstrap::{
+    BootstrapState, BootstrapTracker, PeerRegistry, PeerSnapshot, SnapshotOutcome, VettedSnapshot,
+    WireWorker,
+};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
-pub use tree::{HashTree, KvWorkerId, MatchResult};
+pub use tree::{HashTree, KvWorkerId, MatchResult, RestoreError, SnapshotNode};
 pub use wire::{
     decode_event_batch, BlockRemoved, BlockStored, DecodeError, KvCacheEvent, KvEventBatch,
 };

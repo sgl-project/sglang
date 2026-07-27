@@ -375,6 +375,14 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
+    /// How long a freshly started replica may hold `/readyz` at 503 while it
+    /// pulls a cache-aware tree snapshot from a warm sibling.
+    ///
+    /// The deadline runs from the first worker discovery, not process start, so
+    /// slow worker discovery does not eat the budget. On expiry the replica
+    /// serves anyway with whatever it has — a cold fleet has no warm sibling to
+    /// ask, so a gate without a deadline would never open.
+    pub bootstrap_timeout_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -383,6 +391,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
+            bootstrap_timeout_ms: default_bootstrap_timeout_ms(),
         }
     }
 }
@@ -395,6 +404,12 @@ fn default_balance_abs() -> usize {
 }
 fn default_balance_rel() -> f32 {
     1.1
+}
+
+/// 5s: long enough for a peer fetch plus a multi-MB snapshot graft, short
+/// enough to sit inside a normal readinessProbe budget.
+fn default_bootstrap_timeout_ms() -> u64 {
+    5_000
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
@@ -507,6 +522,16 @@ pub struct K8sDiscoveryConfig {
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,
+    /// Label selector matching this router's OWN pods, so a booting replica can
+    /// find sibling replicas to pull a cache-aware tree snapshot from.
+    ///
+    /// `None` disables peer bootstrap and every replica starts cold — the
+    /// pre-existing behaviour. Watched in the same namespace as `namespace`,
+    /// which is why this lives here rather than on `CacheAwareConfig`.
+    ///
+    /// Requires the router's ServiceAccount to have `get`/`list`/`watch` on
+    /// EndpointSlices for its own Service, in addition to the worker ones.
+    pub peer_selector: Option<String>,
 }
 
 /// Resolved discovery mode, produced by [`resolve_mode`] from the CLI

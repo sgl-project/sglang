@@ -1523,7 +1523,7 @@ fn render_histogram(out: &mut String, name: &str, label_body: &str, hist: &Histo
 /// https://prometheus.io/docs/instrumenting/exposition_formats/.
 /// We only escape `\`, `"`, and newline — the three characters the
 /// reference parser rejects unescaped.
-fn escape_label(s: &str) -> String {
+pub(crate) fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

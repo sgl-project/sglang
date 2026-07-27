@@ -71,6 +71,41 @@ impl FlushCacheResult {
     }
 }
 
+/// `GET /internal/kv_snapshot` — serve this replica's cache-aware tree so a
+/// newly started sibling can bootstrap from it instead of routing cache-blind.
+///
+/// `404 NOT_FOUND` when cache-aware-zmq routing is disabled (no tree to
+/// share). The consumer treats that identically to an unreachable peer, which
+/// is also what an older router image returns for an unknown path — so a mixed
+/// -version fleet degrades to cold boots rather than errors.
+///
+/// The body always reports `producer_ready`, so a peer that is itself still
+/// bootstrapping is skipped by the consumer rather than propagating a cold
+/// tree. Snapshot construction is single-flighted and briefly cached; see
+/// [`crate::policies::kv_events::index::KvEventIndex::peer_snapshot`].
+///
+/// # Exposure
+///
+/// Unauthenticated, on the main listener, like `/flush_cache` and the
+/// pprof endpoint — the router has no auth middleware, so reachability is
+/// already the trust boundary for its admin surface. The body is block hashes
+/// and worker URLs: no prompt text and no token ids.
+pub async fn kv_snapshot(State(ctx): State<Arc<AppContext>>) -> Response {
+    match ctx.kv_index() {
+        Some(index) => {
+            let snap = index.peer_snapshot().await;
+            (StatusCode::OK, Json(&*snap)).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "cache-aware KV indexing is not enabled on this router",
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /flush_cache` — fan SGLang's `/flush_cache` admin call out to every
 /// registered worker and report a per-worker breakdown.
 ///

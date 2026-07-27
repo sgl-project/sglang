@@ -418,6 +418,7 @@ mod tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            ..Default::default()
         }
     }
 
@@ -572,6 +573,7 @@ mod tests {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -609,6 +611,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -654,6 +657,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             toks,
@@ -705,6 +709,7 @@ mod tests {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             toks,
@@ -788,6 +793,7 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    ..Default::default()
                 },
                 tree,
                 Arc::clone(&registry),
@@ -827,6 +833,7 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    ..Default::default()
                 },
                 tree,
                 Arc::clone(&registry),
@@ -892,6 +899,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -978,6 +986,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1016,6 +1025,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1119,6 +1129,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1154,6 +1165,7 @@ mod tests {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1200,6 +1212,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1247,6 +1260,7 @@ mod tests {
                 // 2) and selection reaches the matched-set tiebreak.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1297,6 +1311,7 @@ mod tests {
                 // matched-set tiebreak, which also uses `load_of`.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1403,6 +1418,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,
@@ -1529,6 +1545,7 @@ mod tests {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1612,6 +1629,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree.clone(),
             registry,
@@ -1767,6 +1785,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                ..Default::default()
             },
             tree,
             registry,

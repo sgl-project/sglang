@@ -5,6 +5,7 @@ use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::itl::ItlTable;
+use crate::policies::kv_events::KvEventIndex;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::admission::AdmissionQueue;
@@ -13,7 +14,7 @@ use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub struct AppContext {
@@ -46,6 +47,14 @@ pub struct AppContext {
     /// unset. The chat/completions handler offers to it after tokenizing;
     /// see [`crate::server::cache_sim_tee`].
     pub cache_sim_tee: Option<Arc<CacheSimTee>>,
+    /// KV-event index, when cache-aware-zmq routing is active.
+    ///
+    /// Injected rather than constructed here for the same reason as the
+    /// `attach_metrics` wire-ins above: `main` builds the index before the
+    /// worker manager is spawned, which happens before this context exists.
+    /// `/readyz` reads it to decide whether peer bootstrap has settled, and
+    /// `/internal/kv_snapshot` reads it to serve sibling replicas.
+    kv_index: OnceLock<Arc<KvEventIndex>>,
     ready: AtomicBool,
 }
 
@@ -145,8 +154,31 @@ impl AppContext {
             admission,
             itl,
             cache_sim_tee,
+            kv_index: OnceLock::new(),
             ready: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the KV-event index. Called once by `main`; later calls are
+    /// ignored so a mis-wire cannot swap the index out from under `/readyz`.
+    pub fn attach_kv_index(&self, index: Arc<KvEventIndex>) {
+        if self.kv_index.set(index).is_err() {
+            tracing::warn!("kv index already attached to AppContext; ignoring");
+        }
+    }
+
+    pub fn kv_index(&self) -> Option<&Arc<KvEventIndex>> {
+        self.kv_index.get()
+    }
+
+    /// Whether initial cache-aware bootstrap has settled.
+    ///
+    /// `true` when there is no KV index at all (cache-aware-zmq disabled), so
+    /// routers that never bootstrap are unaffected by the readiness gate.
+    pub fn kv_bootstrap_settled(&self) -> bool {
+        self.kv_index
+            .get()
+            .is_none_or(|idx| idx.bootstrap().settled())
     }
 
     pub fn mark_ready(&self) {
@@ -214,6 +246,10 @@ impl AppContext {
             metrics,
             itl: ItlTable::new(),
             cache_sim_tee: None,
+            // Unset: a stub has no KV index, so `kv_bootstrap_settled()`
+            // reports true and the readiness gate is inert unless a test
+            // attaches one.
+            kv_index: OnceLock::new(),
             ready: AtomicBool::new(false),
         }
     }

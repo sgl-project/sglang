@@ -118,13 +118,30 @@ def _port_forward_start(
     local_port: int,
     remote_port: int,
 ) -> subprocess.Popen:
-    """Start kubectl port-forward and wait until the port is reachable."""
+    """Start kubectl port-forward to a Service and wait until it is reachable."""
+    return _port_forward_target_start(
+        namespace, f"svc/{service}", local_port, remote_port
+    )
+
+
+def _port_forward_target_start(
+    namespace: str,
+    target: str,
+    local_port: int,
+    remote_port: int,
+) -> subprocess.Popen:
+    """As `_port_forward_start`, but for any kubectl target (`svc/x`, `pod/y`).
+
+    Per-pod forwarding matters for tests that compare replicas against each
+    other: a Service target load-balances, so "read replica A then replica B"
+    would silently read the same pod twice.
+    """
     cmd = [
         "kubectl",
         "--context",
         KUBECTL_CONTEXT,
         "port-forward",
-        f"svc/{service}",
+        target,
         f"{local_port}:{remote_port}",
         "-n",
         namespace,
