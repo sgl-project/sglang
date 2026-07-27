@@ -89,6 +89,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -1793,6 +1796,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
+            # The attention-core break ends the segment between the alt-stream
+            # event record and the o_proj-side wait, so under breakable capture
+            # the wait would cross graph segments; use the lazy path instead.
+            and not is_in_breakable_cuda_graph()
             and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
         ):
             alt = self._gate_alt_stream
