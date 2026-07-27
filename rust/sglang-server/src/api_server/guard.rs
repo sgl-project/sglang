@@ -62,9 +62,26 @@ impl Drop for AbortGuard {
     fn drop(&mut self) {
         // Best-effort non-blocking abort per rid; a full/closed channel just drops
         // it (the request then finishes at EOS, only later).
+        // A rid whose abort could NOT be queued must stay held. The inbox is
+        // bounded and this send is best-effort, so under load the abort is dropped
+        // while the scheduler keeps generating and the detok entry stays live —
+        // releasing the rid there would let a resubmit pass the duplicate check and
+        // overwrite that entry, which is the cross-client delivery the registry
+        // exists to prevent. Holding it costs the client a 400 on retry; releasing
+        // it costs another client's tokens.
+        let mut undelivered = Vec::new();
         for (_, rid) in self.rids.drain(..) {
-            let _ = self.senders.tm.try_send(TmEvent::Abort(rid));
+            if self
+                .senders
+                .tm
+                .try_send(TmEvent::Abort(rid.clone()))
+                .is_err()
+            {
+                tracing::warn!(%rid, "abort could not be queued; holding the rid");
+                undelivered.push(rid);
+            }
         }
+        self.owned.retain(|rid| !undelivered.contains(rid));
         // Release the in-flight rids so the client can reuse them. Every rid the
         // guard covered, disarmed or not — a disarmed one finished, which is
         // exactly when it stops being in flight.

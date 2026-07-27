@@ -540,7 +540,7 @@ const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u'];
 /// nested group exhausts memory at compile time (`(?:a*){4294967294}` → several GB,
 /// then `MemoryError`). Neither is an `re.error`, so neither is caught downstream.
 /// A stop-string window this long is meaningless anyway.
-const MAX_REPEAT_COUNT: u64 = 4096;
+const MAX_REPEAT_COUNT: u64 = 256;
 
 /// Longest `stop_regex` accepted. A 1 MB literal pattern takes ~677 ms just to
 /// compile, and that cost lands on the scheduler.
@@ -736,7 +736,27 @@ fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
              `re` rejects, or a repetition count Python cannot honour"
         )));
     }
-    Ok(hir_max_len(&hir))
+    let bound = hir_max_len(&hir);
+    // Every stop_regex must be BOUNDED. An unbounded one gets the full-scan
+    // sentinel, which makes the scheduler match against the entire accumulated
+    // output — growing one token per step — so any ambiguity in the pattern turns
+    // into super-linear backtracking that nothing can interrupt: `(?:.|.)*Z` is
+    // 9 bytes and takes 4.5 s at 26 characters of ordinary model prose, never
+    // returning past ~35. The cost is inside `re`'s C loop with the GIL held, so
+    // no timeout, seatbelt or signal can reach it.
+    //
+    // Structural rules cannot catch this family — `(?:.|.)*Z` has a single
+    // repetition and no nesting; the ambiguity is inside the body. Bounding the
+    // window is what actually removes it: with a finite bound the scheduler
+    // matches a fixed-size tail, so the work per step stops growing.
+    if bound >= STOP_REGEX_MAX_LEN {
+        return Err(bad(format!(
+            "stop_regex {pattern:?} is unbounded (`*`, `+`, or `{{n,}}`); it would be \
+             matched against the whole accumulated output on every decode step. Give \
+             it a bounded repetition, e.g. `a{{0,32}}` instead of `a*`"
+        )));
+    }
+    Ok(bound)
 }
 
 /// Reject repetitions whose cost compounds down the nesting.
@@ -1287,7 +1307,12 @@ mod tests {
     /// ordinary as a stop_regex gets — a 400.
     #[test]
     fn leading_inline_flags_are_accepted() {
-        for pattern in ["(?i)[a-z]+", r"(?i)\d{4}-\d{2}", "(?imsx)a-b", "(?i)abc"] {
+        for pattern in [
+            "(?i)[a-z]{1,8}",
+            r"(?i)\d{4}-\d{2}",
+            "(?imsx)a-b",
+            "(?i)abc",
+        ] {
             assert!(
                 stop_regex_bound(pattern).is_ok(),
                 "{pattern} is valid Python and must not be rejected"
@@ -1322,7 +1347,7 @@ mod tests {
             );
         }
         // An ordinary count still works, and still yields a finite bound.
-        assert_eq!(stop_regex_bound("a{1000}").unwrap(), 1000);
+        assert_eq!(stop_regex_bound("a{200}").unwrap(), 200);
     }
 
     /// `\b{start}` is one zero-width assertion to Rust (bound 0) but `\b` plus the
@@ -1409,9 +1434,14 @@ mod tests {
         assert_eq!(len("a|bbb"), 3); // alternation → max branch
         assert_eq!(len(r"(ab){3}"), 6);
         assert_eq!(len(r"a\d{2,5}"), 6);
-        assert_eq!(len(r"\d+"), STOP_REGEX_MAX_LEN);
-        assert_eq!(len(".*"), STOP_REGEX_MAX_LEN);
-        assert_eq!(len(r"a{3,}"), STOP_REGEX_MAX_LEN);
+        // Unbounded patterns are now REJECTED, not sentinel-bounded: the sentinel
+        // made the scheduler re-match the whole accumulated output every step.
+        for unbounded in [r"\d+", ".*", r"a{3,}", "(?:.|.)*Z", "(a|a)*b"] {
+            assert!(
+                stop_regex_bound(unbounded).is_err(),
+                "{unbounded} is unbounded and must be rejected"
+            );
+        }
         // End to end, through the path `/generate` takes.
         assert_eq!(norm(r#"{"stop_regex": "\\d{6}"}"#).stop_regex_max_len, 6);
         assert_eq!(norm(r#"{"temperature": 0.7}"#).stop_regex_max_len, 0);
