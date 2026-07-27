@@ -3672,21 +3672,24 @@ class ServerArgs:
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                 self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
-                # CUDA-graph sizing has already run by this point. With
-                # chunked prefill disabled its generic default is -1, which
-                # otherwise leaves BCG with no shapes to capture. On the
-                # Hopper/Blackwell FA raw-K/V path, capture a full eight-way
-                # 2K embedding batch by default; callers can still override
-                # this for larger aggregate prefills.
-                if (self.cuda_graph_config.prefill.max_bs or 0) <= 0:
-                    self.cuda_graph_config.prefill.max_bs = max(
-                        model_config.context_len, 16384
+                # CUDA-graph sizing has already run by this point and derives
+                # its generic maximum from the 8K chunked-prefill default.
+                # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
+                # default to a full eight-way 2K embedding batch; callers can
+                # still override this for larger aggregate prefills.
+                prefill_config = self.cuda_graph_config.prefill
+                if (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked:
+                    prefill_config.max_bs = max(
+                        prefill_config.max_bs or 0,
+                        model_config.context_len,
+                        16384,
                     )
-                    self.cuda_graph_config.prefill.bs = (
-                        self._generate_prefill_cuda_graph_batch_sizes(
-                            self.cuda_graph_config.prefill.max_bs
+                    if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                        prefill_config.bs = (
+                            self._generate_prefill_cuda_graph_batch_sizes(
+                                prefill_config.max_bs
+                            )
                         )
-                    )
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
