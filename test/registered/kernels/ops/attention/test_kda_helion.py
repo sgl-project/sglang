@@ -26,13 +26,20 @@ def test_public_signatures_match_triton() -> None:
     helion_decode_signature = inspect.signature(
         helion_fused_recurrent_kda_packed_decode
     )
-    for name, parameter in decode_signature.parameters.items():
-        assert helion_decode_signature.parameters[name].default == parameter.default
-    extra_decode_parameters = set(helion_decode_signature.parameters) - set(
-        decode_signature.parameters
-    )
-    assert extra_decode_parameters <= {"lower_bound"}
-    assert helion_decode_signature.parameters["lower_bound"].default is None
+    decode_parameters = list(decode_signature.parameters.values())
+    helion_decode_parameters = list(helion_decode_signature.parameters.values())
+    assert [parameter.name for parameter in helion_decode_parameters] == [
+        parameter.name for parameter in decode_parameters
+    ] + ["lower_bound"]
+    assert [parameter.kind for parameter in helion_decode_parameters[:-1]] == [
+        parameter.kind for parameter in decode_parameters
+    ]
+    assert [parameter.default for parameter in helion_decode_parameters[:-1]] == [
+        parameter.default for parameter in decode_parameters
+    ]
+    lower_bound_parameter = helion_decode_parameters[-1]
+    assert lower_bound_parameter.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert lower_bound_parameter.default is None
 
     prefill_signature = inspect.signature(triton_chunk_kda)
     helion_prefill_signature = inspect.signature(helion_chunk_kda)
