@@ -23,7 +23,6 @@ use crate::ids::RidHash;
 use crate::message::DetokMsg;
 use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::TmEvent;
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in
@@ -134,9 +133,9 @@ pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
     backend: DetokenizerBackend,
-    /// TokenizerManager inbox, used to abort a request the shard had to drop
-    /// (client backpressure/disconnect) so the scheduler stops generating for it.
-    tm: flume::Sender<TmEvent>,
+    /// Unbounded abort lane, used to abort a request the shard had to drop
+    /// (client backpressure) so the scheduler stops generating for it.
+    abort: flume::Sender<String>,
 }
 
 impl DetokenizerWorker {
@@ -144,13 +143,13 @@ impl DetokenizerWorker {
         shard: usize,
         rx: flume::Receiver<DetokMsg>,
         backend: DetokenizerBackend,
-        tm: flume::Sender<TmEvent>,
+        abort: flume::Sender<String>,
     ) -> Self {
         Self {
             shard,
             rx,
             backend,
-            tm,
+            abort,
         }
     }
 }
@@ -189,14 +188,14 @@ impl Runnable for DetokenizerWorker {
                 // One decode step's chunks for this shard, batched by tm-egress.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
-                        handle_chunk(&mut table, ev, &self.backend, &self.tm);
+                        handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
                 DetokMsg::Result { rid_hash, payload } => {
                     handle_result(&mut table, rid_hash, payload)
                 }
                 DetokMsg::Fail { rid_hash, message } => {
-                    handle_fail(&mut table, rid_hash, message, &self.tm)
+                    handle_fail(&mut table, rid_hash, message, &self.abort)
                 }
                 DetokMsg::Deregister { rid_hash } => {
                     table.remove(&rid_hash);
@@ -227,12 +226,12 @@ fn handle_fail(
     table: &mut HashMap<RidHash, DetokState>,
     id: RidHash,
     message: String,
-    tm: &flume::Sender<TmEvent>,
+    abort: &flume::Sender<String>,
 ) {
     if let Some(mut st) = table.remove(&id) {
         // Abort first: `try_send` on the sink can release the handler, which frees
         // the rid for reuse (same ordering hazard as the disconnect path).
-        let _ = tm.try_send(TmEvent::Abort(st.rid.clone()));
+        let _ = abort.send(st.rid.clone());
         let _ = st
             .sink
             .try_send(EgressItem::Error(Error::Internal(message)));
@@ -244,7 +243,7 @@ fn handle_chunk(
     table: &mut HashMap<RidHash, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
-    tm: &flume::Sender<TmEvent>,
+    abort: &flume::Sender<String>,
 ) {
     let id = RidHash(ev.rid_hash); // raw u64 from the wire — no parse
 
@@ -286,7 +285,7 @@ fn handle_chunk(
                 // scheduler keeps generating for a connection that is already gone
                 // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
-                let _ = tm.try_send(TmEvent::Abort(st.rid.clone()));
+                let _ = abort.send(st.rid.clone());
                 let _ = st.sink.try_send(EgressItem::Error(e));
                 table.remove(&id);
                 return;
@@ -351,13 +350,16 @@ fn handle_chunk(
                 }
             }
             let _ = st.fsm.apply(Event::Disconnect);
-            let rid = st.rid.clone();
-            // Queue the abort BEFORE dropping the sink. `table.remove` releases the
-            // handler, which drops its `AbortGuard`, which frees the rid for reuse —
-            // all of which can happen before this thread queues the abort, so a
-            // resubmitted request would then be deregistered by our stale abort.
-            // Same cross-wiring the rid registry exists to prevent.
-            let _ = tm.try_send(TmEvent::Abort(rid));
+            // Abort ONLY when the sink is full. `Closed` means the handler future is
+            // already gone, so its `AbortGuard` has run: it aborted and released the
+            // rid. A second abort from here is unordered with respect to that
+            // release, so it lands after a resubmit of the same rid has registered
+            // and deregisters the NEW request — the cross-wiring the rid registry
+            // exists to prevent, reached through the one abort producer that
+            // bypasses the guard's ordering.
+            if matches!(e, SinkError::Full) {
+                let _ = abort.send(st.rid.clone());
+            }
             table.remove(&id);
         }
     }
@@ -366,7 +368,10 @@ fn handle_chunk(
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
 fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
-    if !no_stop_trim && matches!(matched, Some(Matched::Token(_))) {
+    // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
+    // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
+    // for any model whose stop id happens to be 0.
+    if !no_stop_trim && matches!(matched, Some(Matched::Token(t)) if *t != 0) {
         token_ids.pop();
     }
 }
@@ -411,7 +416,7 @@ mod tests {
             },
         );
 
-        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let (tm_tx, tm_rx) = flume::unbounded::<String>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: vec![5],
@@ -424,7 +429,7 @@ mod tests {
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),
-            Ok(TmEvent::Abort(rid)) if rid == "1"
+            Ok(rid) if rid == "1"
         ));
     }
 
@@ -476,7 +481,7 @@ mod tests {
                 fsm: RequestState::Queued,
             },
         );
-        let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
+        let (tm_tx, _tm_rx) = flume::unbounded::<String>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: ids,
@@ -492,6 +497,20 @@ mod tests {
             Ok(EgressItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    /// Token id 0 is not a match: Python's `trim_matched_stop` guards with
+    /// `if not matched`, and 0 is falsy there. Trimming on it drops a real
+    /// generated token for any model whose stop id is 0.
+    #[test]
+    fn matched_token_zero_does_not_trim() {
+        let mut ids = vec![1, 2, 0];
+        trim_stop_token(&mut ids, &Some(Matched::Token(0)), false);
+        assert_eq!(ids, vec![1, 2, 0], "id 0 is not a matched stop");
+        // A real stop id still trims.
+        let mut ids = vec![1, 2, 3];
+        trim_stop_token(&mut ids, &Some(Matched::Token(3)), false);
+        assert_eq!(ids, vec![1, 2]);
     }
 
     /// A matched stop TOKEN is dropped from the surfaced `output_ids` by default

@@ -38,4 +38,7 @@ itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
-regex-syntax = "0.8"
+# Pinned EXACTLY: this crate's accepted grammar defines the
+# "anything Rust admits, Python can compile" invariant in `message::sampling`.
+# A minor bump can widen it and silently reopen a scheduler-killing hole.
+regex-syntax = "=0.8.11"
