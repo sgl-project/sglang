@@ -678,7 +678,10 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+        with (
+            envs.SGLANG_DSA_FUSE_TOPK.override(True),
+            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+        ):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
                 topk,
@@ -956,13 +959,6 @@ class TestDSAIndexer(CustomTestCase):
                 TopkTransformMethod.RAGGED,
             ]:
                 for with_row_starts in [False, True]:
-                    if (
-                        topk_transform_method == TopkTransformMethod.PAGED
-                        and with_row_starts
-                    ):
-                        # The synthetic paged fixture uses the decode-like row mapping.
-                        # Ragged fused and unfused cases cover shifted row windows.
-                        continue
                     with self.subTest(
                         tie_break=tie_break,
                         topk_transform_method=topk_transform_method.name,
@@ -991,6 +987,21 @@ class TestDSAIndexer(CustomTestCase):
                         topk=topk,
                         topk_transform_method=TopkTransformMethod.PAGED,
                         with_row_starts=False,
+                        query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
+                    )
+            with self.subTest(
+                tie_break=tie_break,
+                topk_transform_method=TopkTransformMethod.PAGED.name,
+                with_row_starts=True,
+                query_lens="multi",
+            ):
+                with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break):
+                    self._run_fused_topk_backend_equivalence_test(
+                        batch_size=batch_size,
+                        max_score_len=max_score_len,
+                        topk=topk,
+                        topk_transform_method=TopkTransformMethod.PAGED,
+                        with_row_starts=True,
                         query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
                     )
 

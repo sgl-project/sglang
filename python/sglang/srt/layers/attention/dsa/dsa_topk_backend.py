@@ -154,6 +154,26 @@ class DSATopKBackend(Enum):
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
+                if row_starts is not None:
+                    # Packed PAGED extend uses batch-global score offsets with
+                    # request-local page tables. FlashInfer applies row_starts
+                    # to both, so reuse the SGL transform.
+                    from sgl_kernel import fast_topk_transform_fused
+
+                    page_table_size_1 = (
+                        attn_metadata.page_table_1[batch_idx_list]
+                        if batch_idx_list is not None
+                        else attn_metadata.page_table_1
+                    )
+                    return fast_topk_transform_fused(
+                        score=logits,
+                        lengths=lengths,
+                        page_table_size_1=page_table_size_1,
+                        cu_seqlens_q=cu_seqlens_q_topk,
+                        topk=topk,
+                        row_starts=row_starts,
+                    )
+
                 row_to_batch, local_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
                     row_starts=row_starts,
