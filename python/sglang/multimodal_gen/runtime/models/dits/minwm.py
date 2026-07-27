@@ -210,6 +210,11 @@ def _minwm_layer_norm(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Match ``WanLayerNorm._norm`` from minWM main."""
+    # minWM casts the entire generator to BF16 before inference. Keep that cast
+    # outside the compiled function so its graph and operand dtypes match
+    # WanLayerNorm._norm exactly.
+    weight = weight.to(hidden_states.dtype) if weight is not None else None
+    bias = bias.to(hidden_states.dtype) if bias is not None else None
     return _MinWMSegmentCompile.get(_minwm_layer_norm_op, hidden_states.is_cuda)(
         hidden_states, weight, bias, eps
     )
@@ -221,19 +226,11 @@ def _minwm_layer_norm_op(
     bias: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
-    # minWM's inference loader casts the entire generator to BF16 before moving
-    # it to CUDA. SGLang keeps the generic affine LayerNorm parameters in FP32,
-    # so reproduce that model-wide cast at the operation boundary before doing
-    # the actual normalization in FP32.
-    weight_float = (
-        weight.to(hidden_states.dtype).float() if weight is not None else None
-    )
-    bias_float = bias.to(hidden_states.dtype).float() if bias is not None else None
     return F.layer_norm(
         hidden_states.float(),
         (hidden_states.shape[-1],),
-        weight_float,
-        bias_float,
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
         eps,
     ).type_as(hidden_states)
 
@@ -716,6 +713,16 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             m_gate=modulation[:, 2],
             e_gate=timestep_modulation.select(-2, 2),
         )
+        parity_dump_dir = getattr(self, "_minwm_parity_dump_dir", None)
+        parity_index = getattr(self, "_minwm_parity_forward_index", 0)
+        if parity_dump_dir is not None:
+            if parity_index < 2:
+                torch.save(
+                    hidden_states.detach().cpu(),
+                    parity_dump_dir
+                    / f"self_residual_norm_input_{parity_index:03d}.pt",
+                )
+            self._minwm_parity_forward_index = parity_index + 1
 
         affine_norm = self.self_attn_residual_norm.norm
         norm_hidden_states = _minwm_layer_norm(
@@ -724,6 +731,11 @@ class MinWMCausalTransformerBlock(CausalWanTransformerBlock):
             weight=affine_norm.weight,
             bias=affine_norm.bias,
         )
+        if parity_dump_dir is not None and parity_index < 2:
+            torch.save(
+                norm_hidden_states.detach().cpu(),
+                parity_dump_dir / f"self_residual_norm_{parity_index:03d}.pt",
+            )
         cross_output = self.attn2(
             norm_hidden_states,
             context=encoder_hidden_states,
@@ -1055,6 +1067,8 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
             module.register_forward_hook(hook)
 
         block0 = self.blocks[0]
+        block0._minwm_parity_dump_dir = dump_dir
+        block0._minwm_parity_forward_index = 0
         detail_modules = {
             "time_embed": self.condition_embedder.time_embedder,
             "time_projection": self.condition_embedder.time_modulation,

@@ -46,7 +46,19 @@ if [[ "${MINWM_STAGE_FROM_MOUNT:-0}" == "1" ]]; then
   : "${MINWM_CHECKPOINT_MOUNT_PATH:?set MINWM_CHECKPOINT_MOUNT_PATH}"
   : "${MINWM_PRETRAINED_MOUNT_PATH:?set MINWM_PRETRAINED_MOUNT_PATH}"
 fi
-MODEL_DIR="${WORK_ROOT}/sglang-model"
+if [[ -n "${MINWM_REUSE_MODEL_RUN_ID:-}" ]]; then
+  [[ "${MINWM_REUSE_MODEL_RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    echo "MINWM_REUSE_MODEL_RUN_ID contains unsupported characters" >&2
+    exit 2
+  }
+  [[ "${MINWM_REUSE_MODEL_RUN_ID}" != "${MINWM_RUN_ID}" ]] || {
+    echo "MINWM_REUSE_MODEL_RUN_ID must differ from MINWM_RUN_ID" >&2
+    exit 2
+  }
+  MODEL_DIR="/work/minwm-realtime/${MINWM_REUSE_MODEL_RUN_ID}/sglang-model"
+else
+  MODEL_DIR="${WORK_ROOT}/sglang-model"
+fi
 LOCAL_RESULTS="${WORK_ROOT}/results"
 RESULTS="${MINWM_RESULTS_ROOT%/}/${MINWM_RUN_ID}"
 SCRIPT_DIR="/workspace/sglang/benchmark/minwm_realtime_parity"
@@ -173,15 +185,22 @@ print(json.dumps({
 }, sort_keys=True))
 PY
 
-python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
-  --minwm-checkpoint "${CHECKPOINT}" \
-  --donor-diffusers-dir "${PRETRAINED}" \
-  --output-dir "${MODEL_DIR}" \
-  --link-donor \
-  --source-uri "${MINWM_CHECKPOINT_SOURCE_URI}" \
-  --source-version-id "${MINWM_CHECKPOINT_SOURCE_VERSION}" \
-  --source-etag "${MINWM_CHECKPOINT_SOURCE_ETAG}" \
-  | tee "${RESULTS}/conversion.log"
+if [[ -n "${MINWM_REUSE_MODEL_RUN_ID:-}" ]]; then
+  [[ -f "${MODEL_DIR}/transformer/diffusion_pytorch_model.safetensors.index.json" ]]
+  [[ -f "${MODEL_DIR}/minwm_conversion_manifest.json" ]]
+  echo "reused-local-model:${MINWM_REUSE_MODEL_RUN_ID}" \
+    | tee "${RESULTS}/conversion.log"
+else
+  python3 /workspace/sglang/python/sglang/multimodal_gen/tools/convert_minwm_checkpoint.py \
+    --minwm-checkpoint "${CHECKPOINT}" \
+    --donor-diffusers-dir "${PRETRAINED}" \
+    --output-dir "${MODEL_DIR}" \
+    --link-donor \
+    --source-uri "${MINWM_CHECKPOINT_SOURCE_URI}" \
+    --source-version-id "${MINWM_CHECKPOINT_SOURCE_VERSION}" \
+    --source-etag "${MINWM_CHECKPOINT_SOURCE_ETAG}" \
+    | tee "${RESULTS}/conversion.log"
+fi
 cp "${MODEL_DIR}/minwm_conversion_manifest.json" "${RESULTS}/"
 
 export MINWM_PARITY_DETERMINISTIC=1

@@ -216,7 +216,7 @@ def main() -> None:
                         value.detach().cpu(),
                         dump_dir / f"{name}_{index:03d}.pt",
                     )
-                    if name in {"self_q", "cross_q"}:
+                    if name in {"self_q", "cross_q", "self_residual_norm"}:
                         torch.save(
                             hook_args[0].detach().cpu(),
                             dump_dir / f"{name}_input_{index:03d}.pt",
@@ -234,6 +234,7 @@ def main() -> None:
             "self_k": block0.self_attn.k,
             "self_v": block0.self_attn.v,
             "self_out": block0.self_attn.o,
+            "self_residual_norm": block0.norm3,
             "cross_q": block0.cross_attn.q,
             "cross_k": block0.cross_attn.k,
             "cross_v": block0.cross_attn.v,
