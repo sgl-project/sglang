@@ -90,6 +90,31 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
         )
         self.assertEqual(parser, "interns1")
 
+    def test_poolside_v1_detects_variant_template_defaults(self):
+        tool_format = """
+        return an unescaped XML-like object with function name and arguments
+        within '<tool_call>' and '</tool_call>' tags
+        <tool_call>function-name
+        <arg_key>argument-key</arg_key>
+        <arg_value>value-of-argument-key</arg_value>
+        </tool_call>
+        """
+        for default, expected in (("false", False), ("true", True)):
+            with self.subTest(default=default):
+                template = (
+                    "{%- set enable_thinking = enable_thinking | default("
+                    f"{default}) -%}}\n{tool_format}"
+                )
+                _, config, parser = self._detect(template, ["<tool_call>"])
+
+                self.assertEqual(
+                    config,
+                    ReasoningToggleConfig(
+                        toggle_param="enable_thinking", default_enabled=expected
+                    ),
+                )
+                self.assertEqual(parser, "poolside_v1")
+
     def test_nemotron_detects_uppercase_true_assignment(self):
         template = """
         {% set enable_thinking = enable_thinking if enable_thinking is defined else True %}
@@ -225,7 +250,7 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "</tool_call>",
             ["<tool_call>"],
             "poolside_v1",
-            None,
+            "enable_thinking",
         ),
         (
             "lfm2_not_deepseek_r1_from_history_cleanup",

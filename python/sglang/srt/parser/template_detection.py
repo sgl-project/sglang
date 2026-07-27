@@ -103,6 +103,10 @@ REASONING_MODE_RULES = (
             r"{%\s*if\s+not\s+enable_thinking\s+is\s+defined\s*%}.*?"
             r"{%\s*set\s+enable_thinking\s*=\s*(?:false|False)\s*%}",
             re.DOTALL,
+        )
+        or ctx.has_pattern(
+            r"set\s+enable_thinking\s*=\s*enable_thinking\s*\|\s*"
+            r"default\(\s*(?:false|False)\s*\)"
         ),
     ),
     DetectionRule(
@@ -134,7 +138,11 @@ REASONING_MODE_RULES = (
         or ctx.has_pattern(
             r"enable_thinking\s+is\s+not\s+defined\s+or\s+enable_thinking"
         )
-        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true"),
+        or ctx.has_pattern(r"namespace\([^)]*enable_thinking\s*=\s*true")
+        or ctx.has_pattern(
+            r"set\s+enable_thinking\s*=\s*enable_thinking\s*\|\s*"
+            r"default\(\s*(?:true|True)\s*\)"
+        ),
     ),
     DetectionRule(
         name="explicit_thinking_default_false",
