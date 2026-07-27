@@ -57,6 +57,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -986,10 +987,31 @@ class KimiK3MoE(nn.Module):
             return _add3(out, shared_output, prefix_sum)
         return out if prefix_sum is None else out + prefix_sum
 
+    @cached_property
+    def _route_quant_fuse_eligible(self) -> bool:
+        """Whether to stage routed_input for the fused route+pack+quant launch
+        (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
+        activations consumes the staged quant, so only that runner stages."""
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = self.experts.quant_method
+        return (
+            isinstance(method, Mxfp4MoEMethod)
+            and method.use_flashinfer
+            and not method.use_marlin
+            and method.flashinfer_mxfp4_moe_precision == "default"
+            and self.experts.moe_runner_config.activation == "situ"
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        topk_output = self.topk(hidden_states, router_logits)
-        with zero_copy_context.set_moe_output(latent):
-            expert_output = self.experts(routed_input, topk_output)
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        try:
+            topk_output = self.topk(hidden_states, router_logits)
+            with zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(routed_input, topk_output)
+        finally:
+            route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
@@ -998,8 +1020,13 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        topk_output = self.topk(hidden_states, router_logits)
-        return self.experts.forward_deferred_finalize(routed_input, topk_output)
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        try:
+            topk_output = self.topk(hidden_states, router_logits)
+            return self.experts.forward_deferred_finalize(routed_input, topk_output)
+        finally:
+            route_quant_handoff.clear()
 
     def _forward_shared(self, gate_up, shared_output):
         shared = self.shared_experts
