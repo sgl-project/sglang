@@ -24,6 +24,11 @@ def _manager():
 
 
 def test_lora_tensor_chunks_register_only_after_final_chunk():
+    """A chunked tensor load stays in ``pending_tensor_loras`` until the last
+    chunk arrives; only then is the adapter published to ``loras`` / ``configs``
+    / ``lora_refs``. Publishing earlier makes a half-transferred adapter
+    servable, which produces garbage output rather than an error.
+    """
     manager = _manager()
     lora_ref = LoRARef(
         lora_id="adapter-id",
@@ -69,23 +74,21 @@ def test_lora_tensor_chunks_register_only_after_final_chunk():
     assert adapter.load_weights_from_tensors_chunk.call_count == 2
     adapter.finalize_weights_from_tensors.assert_called_once_with()
 
-
-def test_lora_tensor_chunk_requires_a_pending_transfer():
-    manager = _manager()
-    lora_ref = LoRARef(
-        lora_id="adapter-id",
-        lora_name="adapter",
-        lora_path="__tensor__",
-        pinned=False,
-    )
-
-    result = manager.load_lora_adapter_from_tensors(
-        lora_ref,
+    # Negative branch: a continuation chunk with no pending transfer (dropped
+    # first chunk, or a retry after a failed one) must fail rather than start a
+    # fresh adapter from a mid-stream chunk.
+    orphan = manager.load_lora_adapter_from_tensors(
+        LoRARef(
+            lora_id="orphan-id",
+            lora_name="orphan",
+            lora_path="__tensor__",
+            pinned=False,
+        ),
         {},
-        {"r": 32},
+        config_dict,
         is_first_chunk=False,
         is_last_chunk=True,
     )
 
-    assert not result.success
-    assert "no pending tensor transfer" in result.error_message
+    assert not orphan.success
+    assert "no pending tensor transfer" in orphan.error_message

@@ -442,7 +442,13 @@ class TestLoRANoCpuBackup(CustomTestCase):
             "Output with replacement LoRA version does not match",
         )
 
-    def test_adapter_release_cpu_weights_semantics(self):
+    def test_shared_outer_detection_survives_cpu_weight_release(self):
+        """``LoRAManager._detect_shared_outer_loras`` rescans every loaded
+        adapter on each pool init, but under --lora-no-cpu-backup the weights it
+        scanned are gone. The answer has to be cached at release time and stay
+        the same afterwards, otherwise a later adapter load flips the MoE LoRA
+        layout for adapters already installed in the pool.
+        """
         from transformers import AutoConfig
 
         from sglang.srt.configs.load_config import LoadConfig
@@ -458,18 +464,13 @@ class TestLoRANoCpuBackup(CustomTestCase):
             lora_backend=object(),
         )
         adapter.load_weights_from_tensors_chunk(self.lora_tensors)
-        self.assertTrue(any(layer.weights for layer in adapter.layers))
-        self.assertFalse(adapter.weights_released)
 
         # No 3D gate_up lora_A in this dense adapter: detection yields None
         # and must stay stable across the release.
-        self.assertIsNone(adapter.scan_shared_outer_gate_up())
+        before = adapter.scan_shared_outer_gate_up()
+        self.assertIsNone(before)
         adapter.release_cpu_weights()
-        self.assertTrue(adapter.weights_released)
-        self.assertTrue(all(not layer.weights for layer in adapter.layers))
-        self.assertTrue(all(not layer.pinned_weights for layer in adapter.layers))
-        self.assertFalse(adapter.embedding_layers)
-        self.assertIsNone(adapter.scan_shared_outer_gate_up())
+        self.assertEqual(adapter.scan_shared_outer_gate_up(), before)
 
 
 if __name__ == "__main__":

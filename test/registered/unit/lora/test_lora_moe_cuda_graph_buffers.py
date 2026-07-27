@@ -11,6 +11,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_moe_cuda_graph_buffers_use_logical_marlin_dimensions():
+    """The cuda-graph MoE scratch buffers must be sized from the logical
+    ``moe_runner_config`` dims, not from the Marlin ``quant_info`` weight
+    shapes: Marlin tile-pads the packed weights, so deriving N from
+    ``w13_weight.shape`` yields buffers of the wrong size. Under-sized buffers
+    corrupt memory during graph replay instead of failing at capture.
+    """
     config = MoeRunnerConfig(
         num_experts=8,
         num_local_experts=8,

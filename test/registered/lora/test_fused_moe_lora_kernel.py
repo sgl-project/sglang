@@ -381,6 +381,11 @@ def test_fused_moe_lora_kernel(
 
 
 def test_fused_moe_lora_kernel_padded_output_slices():
+    """Above TP8 the per-rank Marlin MoE intermediate is tile-padded, so the
+    gate and up LoRA deltas must be scattered at the padded stride while
+    keeping their own (unpadded) width. With the stride defaulted to N the up
+    slice lands on top of the gate slice.
+    """
     device = "cuda:0"
     set_random_seed(42)
     num_tokens = 8

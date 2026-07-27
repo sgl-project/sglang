@@ -22,14 +22,19 @@ def _config():
     )
 
 
-def test_kimi_num_shared_experts_is_detected():
-    assert _has_shared_experts(_config())
-
-
-def test_kimi_shared_expert_lora_dimensions():
+def test_kimi_lora_dimensions_follow_the_k3_moe_config():
+    """K3 names its shared-expert count ``num_shared_experts`` (not DeepSeek's
+    ``n_shared_experts``) and feeds its routed experts from a 3584-wide latent
+    (``routed_expert_hidden_size``) rather than the 7168 hidden size. Reading
+    either from the DeepSeek field sizes the adapter buffers wrong, which shows
+    up as a shape mismatch deep inside the memory pool at adapter-load time.
+    """
     config = _config()
     model = torch.nn.Linear(1, 1)
 
+    assert _has_shared_experts(config)
+
+    # Shared experts: 2 experts x 3072 intermediate, gate+up fused, over hidden.
     assert get_hidden_dim("gate_up_proj", config, model, layer_idx=1) == (
         7168,
         2 * 3072 * 2,
@@ -39,11 +44,7 @@ def test_kimi_shared_expert_lora_dimensions():
         7168,
     )
 
-
-def test_kimi_latent_routed_expert_lora_dimensions():
-    config = _config()
-    model = torch.nn.Linear(1, 1)
-
+    # Routed experts: same intermediate, but against the 3584 latent.
     assert get_hidden_dim("gate_up_proj_moe", config, model, layer_idx=1) == (
         3584,
         2 * 3072,
@@ -55,6 +56,11 @@ def test_kimi_latent_routed_expert_lora_dimensions():
 
 
 def test_shared_gate_up_a_does_not_block_per_expert_b():
+    """K3 mixes layouts within one target module: gate_up lora_A is a single
+    shared-outer 3D tensor while lora_B is per-expert. The per-expert branch
+    used to initialize the A and B dicts together, so loading the first
+    per-expert B wiped the already-loaded shared A.
+    """
     shared_a = torch.ones(1, 16, 7168)
     expert_b = torch.ones(6144, 16)
     a_buffers = {"gate_up_proj_moe": shared_a}

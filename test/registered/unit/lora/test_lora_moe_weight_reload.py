@@ -51,6 +51,12 @@ def _make_lora_moe_wrapper():
 
 
 def test_lora_moe_parameters_follow_quantized_weight_reload():
+    """A LoRA MoE wrapper mirrors its base layer's parameters. On a weight
+    reload the quant method rebinds those parameters, so the wrapper must drop
+    its references *before* the hook runs (the fake asserts this) and re-adopt
+    them after. Stale references keep the pre-reload storage alive and make the
+    LoRA path serve the old weights.
+    """
     wrapper = _make_lora_moe_wrapper()
 
     restore_weight(wrapper, torch.device("cpu"))
@@ -76,6 +82,11 @@ def test_lora_moe_parameters_follow_quantized_weight_reload():
 def test_moe_lora_gate_up_layout_follows_runner_config(
     gemm1_alpha, gate_up_interleaved, expected_rows
 ):
+    """Whether gate/up rows are interleaved is a property of the layout
+    (``gate_up_interleaved``), not of the activation (``gemm1_alpha`` was the
+    old proxy for it). K3 sets gemm1_alpha without interleaving, so the proxy
+    slices gate and up rows swapped -- wrong output, no error.
+    """
     base_layer = torch.nn.Module()
     base_layer.quant_method = SimpleNamespace(
         get_marlin_quant_info=lambda _: SimpleNamespace()

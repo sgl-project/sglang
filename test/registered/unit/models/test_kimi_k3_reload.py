@@ -12,12 +12,13 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_attn_res_combined_weight_refreshes_every_cached_dtype_in_place():
-    """A weight reload re-runs post_load_weights, but cuda graph capture has
-    already baked in the cached cw address, so the refresh has to write through
-    the existing tensors -- for every cached dtype, since the fast kernel reads
-    the bf16 slot and the triton fallback the fp32 one. Rebinding a cache entry,
-    or refreshing only one dtype, leaves replays reading the weights from before
-    the reload."""
+    """``get_cw`` caches norm*proj on the proj module, per dtype, and the cuda
+    graph captures those tensors' addresses. A weight reload has to refresh the
+    values without rebinding: returning a fresh tensor, or refreshing only one
+    dtype, leaves the captured graph replaying against the pre-reload weights.
+    The fast kernel reads the bf16 slot and the triton fallback the fp32 one, so
+    both are live.
+    """
     proj = SimpleNamespace(weight=nn.Parameter(torch.tensor([[1.0, 2.0, 3.0]])))
     norm = SimpleNamespace(weight=nn.Parameter(torch.tensor([4.0, 5.0, 6.0])))
 
@@ -49,17 +50,19 @@ def test_attn_res_refresh_before_first_get_is_a_noop():
     torch.testing.assert_close(get_cw(proj, norm), torch.tensor([4.0, 10.0, 18.0]))
 
 
-def test_kimi_k3_patch_embed_disables_bias():
+def test_kimi_k3_vision_modules_match_checkpoint_structure():
+    """K3's vision tower carries no biases where K2.5's did. Every extra
+    parameter here is a tensor the checkpoint does not provide, so the guarded
+    failure is "someone added a bias/norm and the weight loader now has an
+    unfilled parameter".
+    """
     patch_embed = MoonVision3dPatchEmbed(
         out_dim=4,
         patch_size=2,
         patch_embed_proj_bias=False,
     )
-
     assert patch_embed.proj.bias is None
 
-
-def test_kimi_k3_projector_matches_checkpoint_structure():
     config = SimpleNamespace(
         merge_kernel_size=(2, 2),
         vt_hidden_size=2,
