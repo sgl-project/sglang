@@ -277,6 +277,8 @@ class DiffusionTestCase:
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
+    # Reject the Images API's plain-prompt fallback when plan metadata is required.
+    run_revised_prompt_check: bool = False
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False

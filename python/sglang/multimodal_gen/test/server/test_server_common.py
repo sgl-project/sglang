@@ -1434,6 +1434,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             model_path=case.server_args.model_path,
             modality=case.server_args.modality,
             sampling_params=case.sampling_params,
+            run_revised_prompt_check=case.run_revised_prompt_check,
         )
 
         # Single generation - output is reused for both validations

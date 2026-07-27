@@ -551,6 +551,41 @@ if current_platform.is_cuda():
             run_t2v_input_reference_check=False,
         )
     )
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_thinking_t2i",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="image",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--pipeline-class-name",
+                    "BagelThinkingPipeline",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="A small blue robot holding a red flower.",
+                output_size="512x512",
+                output_format="png",
+                extras={
+                    "seed": 42,
+                    "num_inference_steps": 2,
+                    "guidance_scale": 4.0,
+                    "max_think_tokens": 16,
+                    "think_do_sample": False,
+                    "think_temperature": 0.3,
+                    "generator_device": "cpu",
+                },
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
+            run_revised_prompt_check=True,
+        )
+    )
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
