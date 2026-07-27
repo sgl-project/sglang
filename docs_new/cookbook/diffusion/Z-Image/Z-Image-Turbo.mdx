@@ -254,13 +254,13 @@ Test Environment:
 
     ```shell Command
     #One A3 card has 2 npu chips
-    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2 --port 30069
+    sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -333,7 +333,7 @@ Test Environment:
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30069 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
