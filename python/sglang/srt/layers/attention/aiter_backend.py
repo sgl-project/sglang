@@ -34,7 +34,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -2336,30 +2336,38 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            # FMHA fp8 per-tensor ASM prefill fast-path (ROCm/aiter PR #3732),
-            # ahead of the slow Triton / CK mha_batch_prefill_func path. When
-            # opted in, route pure prefill (no cached prefix, no sliding window,
-            # no sink, no soft cap) through aiter's hand-written fmha_v3_varlen_fwd.
-            # q/k/v are quantized to fp8 with per-tensor descales (amax / fp8_max)
-            # so the kernel can recover true magnitudes.
-            # ASM coverage (is_fmha_v3_fp8): hd128 on gfx950/gfx942, hd256 on
-            # gfx950 only. All other shapes fall through to the path below.
+            # FMHA fp8 per-tensor hd256 ASM prefill fast-path (ROCm/aiter PR
+            # #3732), ahead of the slow Triton / CK mha_batch_prefill_func path.
+            # Scoped to Qwen3.5 (head_dim 256) on gfx950. When opted in, route
+            # pure prefill (no cached prefix, no sliding window, no sink, no soft
+            # cap) through aiter's hand-written fmha_v3_varlen_fwd. q/k/v are
+            # quantized to fp8 with per-tensor descales (amax / fp8_max) so the
+            # kernel can recover true magnitudes.
+            #
+            # NOTE: aiter's is_fmha_v3_fp8 ASM also covers fp8 hd128 on
+            # gfx950/gfx942, but that targets *other* models and is deferred to
+            # the follow-up PR (see the commented bf16 fast-paths below). For
+            # this PR the gate stays hd256/gfx950 only. The follow-up would
+            # generalize the arch/head-dim check, e.g.:
+            #     and layer.qk_head_dim == layer.v_head_dim
+            #     and (
+            #         (layer.qk_head_dim == 256 and is_gfx95_supported())
+            #         or (
+            #             layer.qk_head_dim == 128
+            #             and (is_gfx95_supported() or is_gfx942_supported())
+            #         )
+            #     )
             use_fp8_asm = (
                 get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
+                and is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
                 and forward_batch.extend_prefix_lens_cpu is not None
                 and not any(forward_batch.extend_prefix_lens_cpu)
                 and window_size == (-1, -1)
                 and sinks is None
                 and self.logits_soft_cap == 0.0
-                and layer.qk_head_dim == layer.v_head_dim
-                and (
-                    (layer.qk_head_dim == 256 and is_gfx95_supported())
-                    or (
-                        layer.qk_head_dim == 128
-                        and (is_gfx95_supported() or is_gfx942_supported())
-                    )
-                )
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
             )
 
             if use_fp8_asm:
