@@ -995,6 +995,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self._rec_track_idx_buf: Optional[torch.Tensor] = None
         self._rec_track_steps_buf: Optional[torch.Tensor] = None
         self._rec_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Per-bucket graphs for the boundary pass, captured alongside _rec_graphs
+        # only when mamba radix tracking is enabled. Empty when tracking is off or
+        # capture failed, in which case the boundary runs eager on the side stream.
+        self._rec_boundary_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         # Sorted bucket sizes for which a recovery graph was captured at warmup.
         # None until capture_recovery_graphs() succeeds; while None, recovery runs
         # eagerly on the side stream (the known-good overlap path).
@@ -1376,7 +1380,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             self._rec_acc_steps_buf if acc_steps_buf is None else acc_steps_buf
         )
         _init_idx = init_idx_buf[:n]
-        _out_idx = out_idx_buf[:n]
+        # Reuse the SAME slice object when read and write indices alias: the FI
+        # kernel picks its single-pool fast path via an identity check
+        # (`output_state_indices is initial_state_indices`), and a second
+        # `buf[:n]` would be a distinct view object that silently forces the
+        # slower split-pool codegen (extra index LDG + separate write-side STGs).
+        _out_idx = _init_idx if out_idx_buf is init_idx_buf else out_idx_buf[:n]
         _acc_steps = acc_steps_buf[:n]
         _T = self.linear_attn_backend._no_cache_draft_token_num
         for layer_id, stash in stash_per_layer.items():
@@ -1471,6 +1480,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         # per-step indices are copied in before each replay).
         self._rec_state_idx_buf.fill_(0)
         self._rec_acc_steps_buf.fill_(0)
+        self._rec_track_idx_buf.fill_(0)
+        self._rec_track_steps_buf.fill_(0)
+
+        # Capture the interval-checkpoint boundary pass too when mamba radix
+        # tracking is on. Tracking is a server-level setting, so this is decided
+        # once here; batches that carry no track indices simply skip the replay.
+        capture_boundary = get_server_args().enable_mamba_extra_buffer()
 
         if self._recovery_stream is None:
             self._recovery_stream = torch.cuda.Stream()
@@ -1503,11 +1519,49 @@ class HybridLinearAttnBackend(AttentionBackend):
                         B, stash_per_layer, pool, gated_delta_rule_mtp
                     )
                 self._rec_graphs[B] = g
+
+                if capture_boundary:
+                    # Boundary variant: reads h_0 from the working slots, writes to
+                    # the ping-pong track slots. Distinct output indices select the
+                    # kernel's split-pool codegen, so this is a separate compiled
+                    # variant -- warm-compile it outside capture as well (all index
+                    # buffers hold 0 here, so it only touches the discard slot).
+                    with torch.cuda.stream(self._recovery_stream):
+                        self._fi_recovery_launch(
+                            B,
+                            stash_per_layer,
+                            pool,
+                            gated_delta_rule_mtp,
+                            init_idx_buf=self._rec_state_idx_buf,
+                            out_idx_buf=self._rec_track_idx_buf,
+                            acc_steps_buf=self._rec_track_steps_buf,
+                        )
+                    self._recovery_stream.synchronize()
+
+                    gb = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        gb,
+                        pool=shared_pool,
+                        stream=self._recovery_stream,
+                        capture_error_mode="thread_local",
+                    ):
+                        self._fi_recovery_launch(
+                            B,
+                            stash_per_layer,
+                            pool,
+                            gated_delta_rule_mtp,
+                            init_idx_buf=self._rec_state_idx_buf,
+                            out_idx_buf=self._rec_track_idx_buf,
+                            acc_steps_buf=self._rec_track_steps_buf,
+                        )
+                    self._rec_boundary_graphs[B] = gb
             self._rec_capture_bs = buckets
             logger.info(
-                "[gdn_recovery] captured %d recovery cuda graphs (buckets=%s)",
+                "[gdn_recovery] captured %d recovery cuda graphs (buckets=%s, "
+                "boundary=%s)",
                 len(buckets),
                 buckets,
+                capture_boundary,
             )
         except Exception as e:
             logger.warning(
@@ -1516,6 +1570,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 e,
             )
             self._rec_graphs.clear()
+            self._rec_boundary_graphs.clear()
             self._rec_capture_bs = None
 
     def _no_cache_mtp_recompute(
@@ -1625,8 +1680,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 # Boundary pass output slots come from mamba_track_indices, its
                 # fold count from mamba_steps_to_track. Requests crossing no
                 # boundary carry step == -1 → redirect to reserved slot 0 / step 0
-                # (folds 0 steps, writing h_0 to the discard slot). The boundary
-                # always runs eager at exact size B, so no bucket padding.
+                # (folds 0 steps, writing h_0 to the discard slot).
                 _fi_track_idx_i32 = mamba_track_indices.to(torch.int32).contiguous()
                 _fi_track_steps_i32 = mamba_steps_to_track.to(torch.int32).contiguous()
                 crossed = _fi_track_steps_i32 >= 0
@@ -1636,6 +1690,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 self._rec_track_steps_buf[:B].copy_(
                     torch.where(crossed, _fi_track_steps_i32, 0)
                 )
+                if B_bucket is not None and B_bucket > B:
+                    # The boundary graph is captured at bucket size, so its pad
+                    # rows need a destination too → reserved slot 0.
+                    self._rec_track_idx_buf[B:B_bucket].fill_(0)
+                    self._rec_track_steps_buf[B:B_bucket].fill_(0)
         elif do_boundary:
             # Triton boundary: per-step regular tensors (no stable buffers). The
             # recover kernel already skips rows with a negative output index, so
@@ -1735,12 +1794,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         if use_fi_recovery and B_bucket is not None:
             # Replay the warmup-captured graph for this bucket on the side stream
             # (pure async launch — overlaps draft_extend + next draft). No capture
-            # ever happens on the live path. The boundary pass runs eager (not
-            # captured), before the working replay, so it reads h_0 before the
-            # graph overwrites it with h_K.
+            # ever happens on the live path. The boundary pass replays its own
+            # captured graph (falling back to eager launches if it was not
+            # captured) BEFORE the working replay, so it reads h_0 before the
+            # working graph overwrites it with h_K.
             with torch.cuda.stream(self._recovery_stream):
                 if do_boundary:
-                    _run_boundary()
+                    boundary_graph = self._rec_boundary_graphs.get(B_bucket)
+                    if boundary_graph is not None:
+                        boundary_graph.replay()
+                    else:
+                        _run_boundary()
                 self._rec_graphs[B_bucket].replay()
         else:
             # No warmup graph (Triton fallback, B beyond the largest captured
