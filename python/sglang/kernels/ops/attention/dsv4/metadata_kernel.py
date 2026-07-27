@@ -66,7 +66,8 @@ def _init_compressed_attn_metadata_kernel(
             page_idx = offsets // c128_page_size
             offset_in_page = offsets % c128_page_size
 
-            page_mask = mask & (page_idx < max_pages)
+            valid_mask = mask & (offsets < c128_seq_lens_raw)
+            page_mask = valid_mask & (page_idx < max_pages)
             page_table_vals = tl.load(
                 page_table_ptr + batch_id * max_pages + page_idx,
                 mask=page_mask,
@@ -74,8 +75,6 @@ def _init_compressed_attn_metadata_kernel(
             )
 
             c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page
-
-            valid_mask = offsets < c128_seq_lens_raw
             c_page_indices_vals = tl.where(valid_mask, c_page_indices_vals, -1)
 
             tl.store(
@@ -85,6 +84,95 @@ def _init_compressed_attn_metadata_kernel(
             )
 
 
+@triton.jit(do_not_specialize=["bs", "c128_cur_max_seq_len"])
+def _init_compressed_attn_metadata_live_prefix_kernel(
+    seq_lens_ptr,
+    positions_ptr,
+    raw_out_loc_ptr,
+    page_table_ptr,
+    c4_out_loc_ptr,
+    c4_positions_ptr,
+    c4_seq_lens_raw_ptr,
+    c4_seq_lens_clamp1_ptr,
+    c128_out_loc_ptr,
+    c128_positions_ptr,
+    c128_seq_lens_raw_ptr,
+    c128_seq_lens_clamp1_ptr,
+    c128_page_indices_ptr,
+    bs,
+    max_pages,
+    c128_cur_max_seq_len,
+    c128_page_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    COMPUTE_PAGE_INDICES: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    column_block = tl.program_id(1)
+    if batch_id >= bs:
+        return
+
+    seq_len = tl.load(seq_lens_ptr + batch_id)
+    c4_seq_lens_raw = seq_len // 4
+    c128_seq_lens_raw = seq_len // 128
+
+    # Scalar metadata has one writer per row. The remaining column blocks only
+    # materialize their disjoint C128 page-index slices.
+    if column_block == 0:
+        position = tl.load(positions_ptr + batch_id)
+        raw_out_loc = tl.load(raw_out_loc_ptr + batch_id)
+
+        c4_should_compress = (seq_len % 4) == 0
+        c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
+        c4_positions = position & (~3)
+        c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
+
+        tl.store(c4_out_loc_ptr + batch_id, c4_out_loc)
+        tl.store(c4_positions_ptr + batch_id, c4_positions)
+        tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
+        tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
+
+        c128_should_compress = (seq_len % 128) == 0
+        c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
+        c128_positions = position & (~127)
+        c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
+
+        tl.store(c128_out_loc_ptr + batch_id, c128_out_loc)
+        tl.store(c128_positions_ptr + batch_id, c128_positions)
+        tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
+        tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
+
+    if COMPUTE_PAGE_INDICES:
+        block_start = column_block * BLOCK_SIZE
+        # FlashMLA clamps c128 lengths to one. Preserve one explicit sentinel
+        # for empty/negative raw lengths and cap live writes to output capacity.
+        live_bound = tl.maximum(c128_seq_lens_raw, 1)
+        write_bound = tl.minimum(live_bound, c128_cur_max_seq_len)
+        if block_start >= write_bound:
+            return
+
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < write_bound
+        page_idx = offsets // c128_page_size
+        offset_in_page = offsets % c128_page_size
+
+        valid_mask = mask & (offsets < c128_seq_lens_raw)
+        page_mask = valid_mask & (page_idx < max_pages)
+        page_table_vals = tl.load(
+            page_table_ptr + batch_id * max_pages + page_idx,
+            mask=page_mask,
+            other=0,
+        )
+        c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page
+        c_page_indices_vals = tl.where(valid_mask, c_page_indices_vals, -1)
+
+        page_indices_base = batch_id * c128_cur_max_seq_len
+        tl.store(
+            c128_page_indices_ptr + page_indices_base + offsets,
+            c_page_indices_vals,
+            mask=mask,
+        )
+
+
 def _init_compressed_attn_metadata_triton(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
@@ -92,6 +180,7 @@ def _init_compressed_attn_metadata_triton(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    live_prefix_only: bool = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -139,8 +228,7 @@ def _init_compressed_attn_metadata_triton(
         if page_table is None:
             page_table = torch.empty(0, dtype=torch.int32, device=device)
 
-    grid = (bs,)
-    _init_compressed_attn_metadata_kernel[grid](
+    args = (
         seq_lens,
         positions,
         raw_out_loc,
@@ -162,9 +250,21 @@ def _init_compressed_attn_metadata_triton(
         max_pages,
         c128_cur_max_seq_len,
         c128_page_size,
-        BLOCK_SIZE,
-        compute_page_indices,
     )
+    if live_prefix_only:
+        live_block_size = 256
+        num_column_blocks = max(triton.cdiv(c128_cur_max_seq_len, live_block_size), 1)
+        _init_compressed_attn_metadata_live_prefix_kernel[(bs, num_column_blocks)](
+            *args,
+            BLOCK_SIZE=live_block_size,
+            COMPUTE_PAGE_INDICES=compute_page_indices,
+        )
+    else:
+        _init_compressed_attn_metadata_kernel[(bs,)](
+            *args,
+            BLOCK_SIZE=BLOCK_SIZE,
+            COMPUTE_PAGE_INDICES=compute_page_indices,
+        )
 
     return (
         c4_out_loc,
@@ -186,6 +286,7 @@ def init_compression_metadata(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    live_prefix_only: bool = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -197,6 +298,13 @@ def init_compression_metadata(
     torch.Tensor,
     Optional[torch.Tensor],
 ]:
+    """Build compressed-attention metadata.
+
+    ``live_prefix_only`` is an internal CUDA-graph optimization. When enabled,
+    only each row's live C128 prefix is refreshed; the remaining capacity may
+    retain values from an earlier replay. The default initializes the full
+    output exactly as before.
+    """
     return _init_compressed_attn_metadata_triton(
         seq_lens,
         positions,
@@ -204,4 +312,5 @@ def init_compression_metadata(
         page_table,
         page_size,
         compute_page_indices,
+        live_prefix_only,
     )

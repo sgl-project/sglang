@@ -69,7 +69,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_sm100 = is_sm100_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -275,7 +276,7 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self):
+    def init_compression_metadata(self, live_prefix_only: bool = False):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -298,6 +299,7 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            live_prefix_only=live_prefix_only,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -568,6 +570,23 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self.cuda_graph_custom_mask = None
+
+    def _can_use_live_prefix_target_verify_metadata(self) -> bool:
+        """Whether raw verify consumers bound every metadata read by live length.
+
+        The default SM100 DeepGEMM indexer and native FlashMLA path do. The
+        alternative indexers below may gather the full capture-capacity table,
+        so they must retain fully initialized tails.
+        """
+        return (
+            _is_cuda
+            and _is_sm100
+            and not _is_xpu
+            and not self.enable_deepseek_v4_fp4_indexer
+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -986,6 +1005,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            live_prefix_only=self._can_use_live_prefix_target_verify_metadata(),
         )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
@@ -1934,6 +1954,7 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        live_prefix_only: bool = False,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -1944,6 +1965,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max_seq_len,
             page_size=self.page_size,
             swa_window=SWA_WINDOW,
+            live_prefix_only=live_prefix_only,
         )
         seq_lens_casual = prep.seq_lens_casual
 
@@ -1990,7 +2012,9 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata()
+            core_attn_metadata.init_compression_metadata(
+                live_prefix_only=live_prefix_only
+            )
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
