@@ -124,7 +124,7 @@ def run_baseline(inp):
 
 def run_packed(inp):
     """Packed path: single fused kernel directly on mixed_qkv."""
-    B, HV, V = inp["B"], inp["HV"], inp["V"]
+    B, HV, K, V = inp["B"], inp["HV"], inp["K"], inp["V"]
     ssm_states = inp["ssm_states"].clone()
     out = inp["mixed_qkv"].new_empty(B, 1, HV, V)
 
@@ -482,8 +482,8 @@ def run_benchmark(device, dtype, state_dtype, helion_decode, args):
             f"{'base (us)':>10} | "
             f"{'packed (us)':>10} | "
             f"{'Helion (us)':>10} | "
-            f"{'H/packed':>11} | "
-            f"{'H/base':>12}"
+            f"{'packed/H':>11} | "
+            f"{'base/H':>12}"
         )
         print("  " + "-" * 108)
 
@@ -539,7 +539,7 @@ def main():
     parser.add_argument(
         "--helion",
         action="store_true",
-        help="Include SGLang's optional Helion packed KDA backend.",
+        help="Include SGLang's Helion packed KDA backend.",
     )
     parser.add_argument("--head-size-k", type=int, default=128)
     parser.add_argument("--head-size-v", type=int, default=128)

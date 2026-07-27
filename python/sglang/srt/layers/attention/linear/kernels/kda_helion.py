@@ -1,4 +1,4 @@
-"""Optional Helion backend for Kimi Delta Attention."""
+"""Helion backend for Kimi Delta Attention."""
 
 from __future__ import annotations
 
@@ -12,19 +12,12 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 
 
-def _missing_helion_error() -> ImportError:
-    return ImportError(
-        "The Helion KDA backend requires the optional 'helion' package. "
-        'Install it with `pip install "sglang[helion]"`.'
-    )
-
-
 class HelionKDAKernel(LinearAttnKernelBase):
-    """KDA packed decode and prefill implemented with optional Helion kernels.
+    """KDA packed decode and prefill implemented with Helion kernels.
 
     Triton remains the fallback for the generic decode interface and speculative
-    target verification. The production one-token decode path uses
-    :meth:`packed_decode`, while prefill uses :meth:`extend`.
+    target verification. The one-token decode path uses :meth:`packed_decode`,
+    while prefill uses :meth:`extend`.
     """
 
     supports_packed_decode = True
@@ -37,24 +30,18 @@ class HelionKDAKernel(LinearAttnKernelBase):
         enable_prefill: bool = True,
     ) -> None:
         self.supports_packed_decode = enable_decode
-        try:
-            if enable_decode:
-                from sglang.kernels.ops.attention.helion.kda_decode import (
-                    helion_fused_recurrent_kda_packed_decode,
-                )
-            if enable_prefill:
-                from sglang.kernels.ops.attention.helion.kda_prefill import chunk_kda
-        except ModuleNotFoundError as error:
-            if error.name == "helion" or (
-                error.name is not None and error.name.startswith("helion.")
-            ):
-                raise _missing_helion_error() from error
-            raise
+        self._packed_decode = None
+        self._chunk_kda = None
+        if enable_decode:
+            from sglang.kernels.ops.attention.helion.kda_decode import (
+                helion_fused_recurrent_kda_packed_decode,
+            )
 
-        self._packed_decode = (
-            helion_fused_recurrent_kda_packed_decode if enable_decode else None
-        )
-        self._chunk_kda = chunk_kda if enable_prefill else None
+            self._packed_decode = helion_fused_recurrent_kda_packed_decode
+        if enable_prefill:
+            from sglang.kernels.ops.attention.helion.kda_prefill import chunk_kda
+
+            self._chunk_kda = chunk_kda
         self._triton = triton_fallback or TritonKDAKernel()
 
     def packed_decode(

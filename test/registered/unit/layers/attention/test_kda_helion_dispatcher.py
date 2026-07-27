@@ -1,4 +1,3 @@
-import sys
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -76,16 +75,6 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
-
-    def test_optional_dependency_error_has_install_command(self):
-        decode_module = "sglang.kernels.ops.attention.helion.kda_decode"
-        prefill_module = "sglang.kernels.ops.attention.helion.kda_prefill"
-        with patch.dict(sys.modules):
-            sys.modules.pop(decode_module, None)
-            sys.modules.pop(prefill_module, None)
-            sys.modules["helion"] = None
-            with self.assertRaisesRegex(ImportError, r"sglang\[helion\]"):
-                HelionKDAKernel()
 
     def test_enum_recognizes_helion(self):
         backend = LinearAttnKernelBackend("helion")

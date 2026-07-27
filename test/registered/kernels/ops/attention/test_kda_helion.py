@@ -6,21 +6,17 @@ import sys
 import pytest
 import torch
 
-pytest.importorskip("helion")
-
-from sglang.kernels.ops.attention.fla.fused_recurrent import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.kda import (  # noqa: E402
-    chunk_kda as triton_chunk_kda,
-)
-from sglang.kernels.ops.attention.helion.kda_decode import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
+from sglang.kernels.ops.attention.helion.kda_decode import (
     helion_fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.helion.kda_prefill import (  # noqa: E402
+from sglang.kernels.ops.attention.helion.kda_prefill import (
     chunk_kda as helion_chunk_kda,
 )
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -226,6 +222,39 @@ def test_packed_varlen_safe_gate_contract(newton_schulz: bool) -> None:
         A_log=a_log,
         lower_bound=-0.01,
         newton_schulz=newton_schulz,
+    )
+
+
+def test_newton_schulz_uses_stable_subchunk_gates() -> None:
+    torch.manual_seed(1117)
+    tokens, heads, key_dim, value_dim = 64, 1, 32, 32
+    q = torch.nn.functional.normalize(
+        torch.randn(1, tokens, heads, key_dim, device="cuda"), dim=-1
+    ).bfloat16()
+    k = torch.nn.functional.normalize(
+        torch.randn(1, tokens, heads, key_dim, device="cuda"), dim=-1
+    ).bfloat16()
+    v = torch.randn(1, tokens, heads, value_dim, device="cuda").bfloat16()
+    # A chunk-global reference would form exp2(63 * 2 * RCP_LN2), which
+    # overflows FP32. The 16-token anchors keep every matrix factor finite.
+    gate = torch.full(
+        (1, tokens, heads, key_dim), -2.0, device="cuda", dtype=torch.float32
+    )
+    beta = torch.full((1, tokens, heads), 0.5, device="cuda")
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    indices = torch.zeros(1, device="cuda", dtype=torch.int32)
+    state = torch.zeros(1, heads, value_dim, key_dim, device="cuda")
+
+    _compare_prefill(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        indices,
+        cu_seqlens=cu_seqlens,
+        newton_schulz=True,
     )
 
 
