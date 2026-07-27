@@ -260,7 +260,6 @@ class InklingDecoderLayer(nn.Module):
         # layer's deferred mlp_sconv after the layer loop.
         self._breakable_attn_group = eager_on_graph(True)(self._attn_group_impl)
         self._breakable_mlp_sconv = eager_on_graph(True)(self._mlp_sconv_impl)
-        self.capture_prev_layer_output = False
 
     def _attn_block(
         self,
@@ -442,7 +441,6 @@ class InklingDecoderLayer(nn.Module):
         prev_mlp_partial: bool = False,
         fuse_ar_sconv: bool = False,
         fuse_attn_ar: bool = False,
-        aux_sink: _AuxCaptureSink | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """mlp_sconv is DEFERRED: this layer applies the *previous* layer's
         mlp_sconv (`prev_mlp_sconv`) at the head of its eager region, and its own
@@ -491,8 +489,6 @@ class InklingDecoderLayer(nn.Module):
                 prev_mlp_sconv,
                 log_scaling_tau,
             )
-            if aux_sink is not None and self.capture_prev_layer_output:
-                aux_sink.append(residual_out)
             hidden_states, residual = self.mlp_norm(attn_out, residual_out)
             del attn_out
             del residual_out
@@ -513,8 +509,6 @@ class InklingDecoderLayer(nn.Module):
             prev_mlp_partial=prev_mlp_partial,
             fuse_attn_ar=fuse_attn,
         )
-        if aux_sink is not None and self.capture_prev_layer_output:
-            aux_sink.append(residual)
         if fuse_attn and self.scattered_sconv:
             fm = forward_batch.forward_mode
             if fm.is_decode() or fm.is_target_verify():
@@ -568,32 +562,6 @@ class InklingDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual
-
-
-class _AuxCaptureSink:
-    """Collects per-layer aux hiddens directly into one [T, n*H] buffer,
-    replacing per-layer clone() + a final torch.cat (halves the copies and
-    removes the prefill-time concat transient). When static_buf is set (full
-    prefill CUDA-graph capture), rows are written into that stable-address
-    buffer instead of a fresh allocation, so graph replays refresh it."""
-
-    def __init__(self, num_layers: int, static_buf: torch.Tensor | None = None) -> None:
-        self.num_layers = num_layers
-        self.static_buf = static_buf
-        self.buf: torch.Tensor | None = None
-        self._idx = 0
-
-    def append(self, hidden: torch.Tensor) -> None:
-        if self.buf is None:
-            if self.static_buf is not None:
-                self.buf = self.static_buf[: hidden.shape[0]]
-            else:
-                self.buf = hidden.new_empty(
-                    hidden.shape[0], self.num_layers * hidden.shape[-1]
-                )
-        width = hidden.shape[-1]
-        self.buf[:, self._idx * width : (self._idx + 1) * width].copy_(hidden)
-        self._idx += 1
 
 
 class InklingCausalLLM(nn.Module):
@@ -709,36 +677,32 @@ class InklingCausalLLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
-        self.aux_capture_enabled = False
-        self.num_aux_capture_layers = 0
-        self._aux_hidden_states: torch.Tensor | None = None
-        self._aux_capture_static_buf: torch.Tensor | None = None
+        self._dflash_layers_to_capture: set[int] = set()
 
-    def set_aux_capture_layers(self, layer_ids: list[int]) -> None:
-        for lid in layer_ids:
-            assert 0 <= lid + 1 < len(self.layers), (
-                f"aux capture layer {lid} needs an interior successor layer "
-                f"(model has {len(self.layers)} layers)"
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Capture post-layer hidden states consumed by a DFLASH drafter."""
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit target layer IDs.")
+        if len(layer_ids) != len(set(layer_ids)):
+            raise ValueError(f"DFLASH target layer IDs must be unique: {layer_ids}")
+        if layer_ids != sorted(layer_ids):
+            raise ValueError(f"DFLASH target layer IDs must be sorted: {layer_ids}")
+        invalid = [idx for idx in layer_ids if idx < 0 or idx >= len(self.layers)]
+        if invalid:
+            raise ValueError(
+                f"DFLASH target layer IDs out of range [0, {len(self.layers)}): {invalid}"
             )
-            self.layers[lid + 1].capture_prev_layer_output = True
-        self.num_aux_capture_layers = len(layer_ids)
-        self.aux_capture_enabled = True
 
-    def set_aux_capture_static_buffer(self, buf: torch.Tensor | None) -> None:
-        """Route aux capture into a caller-owned stable-address buffer; the
-        full prefill CUDA-graph runner sets it around capture."""
-        self._aux_capture_static_buf = buf
-
-    def stash_aux_hidden_states(self, aux_hidden_states: torch.Tensor) -> None:
-        """Re-arm the one-shot aux stash; graph replay skips forward()'s
-        Python, so the prefill CUDA-graph runner arms it before the eager
-        tail pops."""
-        self._aux_hidden_states = aux_hidden_states
-
-    def pop_aux_hidden_states(self) -> torch.Tensor | None:
-        aux_hidden_states = self._aux_hidden_states
-        self._aux_hidden_states = None
-        return aux_hidden_states
+        self._dflash_layers_to_capture = set(layer_ids)
+        # Inkling can defer an MoE all-reduce into the next layer. A tapped
+        # layer must instead materialize a complete hidden state at its tap.
+        for layer in self.layers:
+            if not hasattr(layer, "_mlp_ar_fusable_without_dflash"):
+                layer._mlp_ar_fusable_without_dflash = layer.mlp_ar_fusable
+            layer.mlp_ar_fusable = (
+                layer._mlp_ar_fusable_without_dflash
+                and layer.layer_id not in self._dflash_layers_to_capture
+            )
 
     def get_input_embeddings(self):
         # Fold embed_norm into the embedding so general_mm_embed_routine norms the text
@@ -768,14 +732,6 @@ class InklingCausalLLM(nn.Module):
             # embed_norm was already applied during the MM embed; don't re-norm here.
             hidden_states = input_embeds
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        aux_sink = (
-            _AuxCaptureSink(
-                num_layers=self.num_aux_capture_layers,
-                static_buf=self._aux_capture_static_buf,
-            )
-            if self.aux_capture_enabled
-            else None
-        )
 
         log_scaling_tau = (
             compute_log_scaling_tau(
@@ -848,6 +804,12 @@ class InklingCausalLLM(nn.Module):
             fuse_ar_sconv = True
             fuse_attn_ar = True
         prev_mlp_partial = False
+        aux_hidden_states: Optional[list[torch.Tensor]] = (
+            []
+            if self._dflash_layers_to_capture
+            and not forward_batch.forward_mode.is_idle()
+            else None
+        )
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states,
@@ -859,13 +821,21 @@ class InklingCausalLLM(nn.Module):
                 prev_mlp_partial=prev_mlp_partial,
                 fuse_ar_sconv=fuse_ar_sconv,
                 fuse_attn_ar=fuse_attn_ar,
-                aux_sink=aux_sink,
             )
             prev_mlp_sconv = layer.mlp_sconv
             prev_mlp_partial = fuse_ar_sconv and layer.mlp_ar_fusable
-        # All capture layers are interior (id+1 <= last layer), so the sink is
-        # complete here; the deferred-sconv tail below has early returns.
-        self._aux_hidden_states = aux_sink.buf if aux_sink is not None else None
+            if (
+                aux_hidden_states is not None
+                and layer.layer_id in self._dflash_layers_to_capture
+            ):
+                # The trained taps are post-layer and precede the deferred
+                # mlp_sconv belonging to this layer.
+                tap_hidden = hidden_states
+                if layer.scattered_sconv:
+                    tap_hidden = all_gather_hidden(tap_hidden, layer.attn_tp_group)
+                aux_hidden_states.append(
+                    tap_hidden if residual is None else tap_hidden + residual
+                )
         # The final layer's mlp_sconv was deferred; run it now — as an eager break
         # under BCG (so it re-reads live per-seq metadata at replay), else inline.
         if prev_mlp_sconv is not None and not forward_batch.forward_mode.is_idle():
@@ -882,7 +852,11 @@ class InklingCausalLLM(nn.Module):
                         norm=self.norm,
                         norm_residual=residual,
                     )
-                    return hidden_states
+                    return (
+                        (hidden_states, aux_hidden_states)
+                        if self._dflash_layers_to_capture
+                        else hidden_states
+                    )
                 # Fused extend tail: {AR + scattered sconv}, then the final
                 # norm unfused on the gathered [T, H].
                 hidden_states = ar_scattered_sconv_fused(
@@ -892,7 +866,11 @@ class InklingCausalLLM(nn.Module):
                     get_tensor_model_parallel_group(),
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return hidden_states
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if self._dflash_layers_to_capture
+                    else hidden_states
+                )
             if prev_mlp_partial:
                 fm = forward_batch.forward_mode
                 if fm.is_decode() or fm.is_target_verify():
@@ -906,7 +884,11 @@ class InklingCausalLLM(nn.Module):
                         forward_batch,
                         get_tensor_model_parallel_group(),
                     )
-                    return hidden_states
+                    return (
+                        (hidden_states, aux_hidden_states)
+                        if self._dflash_layers_to_capture
+                        else hidden_states
+                    )
                 # Fused extend tail: {AR + full-width sconv + cache update}
                 # (non-scattered), then the final norm unfused.
                 hidden_states = ar_fullwidth_sconv_fused(
@@ -916,7 +898,11 @@ class InklingCausalLLM(nn.Module):
                     get_tensor_model_parallel_group(),
                 )
                 hidden_states, _ = self.norm(hidden_states, residual)
-                return hidden_states
+                return (
+                    (hidden_states, aux_hidden_states)
+                    if self._dflash_layers_to_capture
+                    else hidden_states
+                )
             # Same gate as the per-layer group: the eager break needs the tc_piecewise
             # context (installed only by the prefill BCG runner) to read the live
             # forward_batch at replay; else run inline with the passed forward_batch.
@@ -944,7 +930,11 @@ class InklingCausalLLM(nn.Module):
                         hidden_states, self.layers[-1].attn_tp_group
                     )
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return (
+            (hidden_states, aux_hidden_states)
+            if self._dflash_layers_to_capture
+            else hidden_states
+        )
 
 
 class InklingAudio(nn.Module):
@@ -1061,7 +1051,6 @@ class InklingForConditionalGeneration(nn.Module):
             else None
         )
         self.mm_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        self.capture_aux_hidden_states = False
 
     @property
     def model(self) -> nn.Module:
@@ -1135,20 +1124,19 @@ class InklingForConditionalGeneration(nn.Module):
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.
         return self.mm_pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    @property
-    def lm_head(self):
-        # The DSpark worker resolves the shared head via getattr(target, "lm_head").
-        return self.llm.lm_head
-
-    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        self.capture_aux_hidden_states = True
-        self.llm.set_aux_capture_layers(layer_ids)
-
     def get_input_embeddings(self) -> nn.Module:
         return self.llm.embed_tokens
 
     def get_embed_and_head(self):
         return self.llm.embed_tokens.weight, self.llm.lm_head.weight
+
+    @property
+    def lm_head(self) -> nn.Module:
+        """Expose the target head through the common speculative API."""
+        return self.llm.lm_head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.llm.set_dflash_layers_to_capture(layer_ids)
 
     def get_num_kv_cache_layers(self) -> int:
         return self.text_config.num_hidden_layers
@@ -1185,6 +1173,9 @@ class InklingForConditionalGeneration(nn.Module):
             data_embedding_funcs=data_embedding_funcs,
             positions=positions,
         )
+        aux_hidden_states = None
+        if self.llm._dflash_layers_to_capture:
+            hidden_states, aux_hidden_states = hidden_states
         mup_width_multiplier = self.config.text_config.logits_mup_width_multiplier
         hidden_states_for_logits = (
             hidden_states
@@ -1194,24 +1185,17 @@ class InklingForConditionalGeneration(nn.Module):
         # The MTP chain needs the undivided hidden (the mup division is
         # lm_head-only); passed unconditionally because the target
         # verify/prefill forwards never set return_hidden_states_before_norm.
-        aux_hidden_states = self.llm.pop_aux_hidden_states()
-        if aux_hidden_states is not None:
-            # dflash-family aux capture: the aux concat must be what the store
-            # keeps, and before_norm would override it (the logits processor
-            # prefers before_norm when both are provided).
-            return self.llm.logits_processor(
-                input_ids,
-                hidden_states_for_logits,
-                self.llm.lm_head,
-                forward_batch,
-                aux_hidden_states,
-            )
         return self.llm.logits_processor(
             input_ids,
             hidden_states_for_logits,
             self.llm.lm_head,
             forward_batch,
-            hidden_states_before_norm=hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            # DFLASH needs the concatenated tap states. LogitsProcessor gives
+            # hidden_states_before_norm precedence, so omit it in this mode.
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else hidden_states
+            ),
         )
 
     def update_conv_state_after_mtp_verify(
