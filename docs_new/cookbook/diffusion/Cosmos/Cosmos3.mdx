@@ -1,0 +1,256 @@
+---
+title: Cosmos3
+metatags:
+    description: "Serve NVIDIA Cosmos3 image, video, sound, and action generation with SGLang Diffusion."
+---
+
+## 1. Model Introduction
+
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with the native `Cosmos3OmniDiffusersPipeline`.
+
+| Model | Status | Notes |
+| --- | --- | --- |
+| `nvidia/Cosmos3-Nano` | Supported | T2I, T2V, I2V, V2V, joint sound, and action |
+| `nvidia/Cosmos3-Super` | Supported | T2I, T2V, I2V, and V2V; use multi-GPU for the 32B checkpoint |
+| `nvidia/Cosmos3-Super-Text2Image` | Supported | T2I-specialized checkpoint |
+| `nvidia/Cosmos3-Super-Image2Video` | Supported | I2V-specialized checkpoint |
+| `nvidia/Cosmos3-Nano-Policy-DROID` | Supported | DROID policy action generation |
+
+Sound and action generation require the corresponding checkpoint heads. SGLang uses the flow-native `FlowUniPCMultistepScheduler` for Cosmos3 even if the checkpoint metadata names another scheduler. The default `flow_shift` is `3.0` for T2I and `10.0` for video and action modes.
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+pip install -e "python[diffusion]"
+```
+
+Cosmos3 guardrails are enabled by default when the package is available:
+
+```bash Command
+pip install "cosmos-guardrail==0.3.1"
+```
+
+`cosmos-guardrail` downloads gated NVIDIA guardrail weights, so pass a Hugging Face token if your environment needs one. If the package is not installed, SGLang skips Cosmos3 guardrails and logs a warning. To disable Cosmos3 guardrails for local experiments, set `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` before starting the server.
+
+## 3. Serve Cosmos3
+
+Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano \
+  --num-gpus 1
+```
+
+For `Cosmos3-Super`, split the model across multiple GPUs:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Super \
+  --num-gpus 4
+```
+
+The server also accepts the specialized `nvidia/Cosmos3-Super-Text2Image` and `nvidia/Cosmos3-Super-Image2Video` checkpoint IDs.
+
+## 4. OpenAI-Compatible Requests
+
+### Text to image
+
+Cosmos3 text-to-image uses `/v1/images/generations`. The default Cosmos3 image response is `b64_json`, matching vLLM-Omni's examples.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
+    "size": "1280x720",
+    "n": 1,
+    "num_inference_steps": 35,
+    "guidance_scale": 6.0,
+    "flow_shift": 3.0,
+    "seed": 0,
+    "extra_args": {
+      "use_resolution_template": false,
+      "guardrails": true
+    }
+  }'
+```
+
+### Text to video with sound
+
+Use `/v1/videos` to create an asynchronous job, then poll the job and download the completed MP4. Set `generate_sound=true` to generate and mux a stereo 48 kHz audio track; omit it for a silent video.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=A small warehouse robot moves a blue box across a clean floor." \
+  --form-string "negative_prompt=blurry, distorted, low quality" \
+  --form-string "size=1280x720" \
+  --form-string "num_frames=81" \
+  --form-string "fps=24" \
+  --form-string "num_inference_steps=35" \
+  --form-string "guidance_scale=4.0" \
+  --form-string "flow_shift=10.0" \
+  --form-string "generate_sound=true" \
+  --form-string "seed=42" \
+  --form-string 'extra_params={"guardrails":true,"use_resolution_template":false,"use_duration_template":false}' \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+
+while true; do
+  status=$(curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
+    | python -c 'import json, sys; print(json.load(sys.stdin)["status"])')
+  [ "$status" = "completed" ] && break
+  [ "$status" = "failed" ] && exit 1
+  sleep 1
+done
+
+curl -sS -L "http://127.0.0.1:30010/v1/videos/${job_id}/content" \
+  -o cosmos3_t2v.mp4
+```
+
+### Image to video
+
+This mirrors the official `nvidia/Cosmos3-Nano` Hugging Face image-to-video example:
+
+```python Python
+import json
+import time
+from pathlib import Path
+
+import requests
+from huggingface_hub import snapshot_download
+
+base_url = "http://127.0.0.1:30010"
+model_dir = Path(snapshot_download("nvidia/Cosmos3-Nano"))
+asset_dir = model_dir / "assets"
+
+prompt = json.dumps(json.loads((asset_dir / "example_i2v_prompt.json").read_text()))
+negative_prompt = json.dumps(
+    json.loads((asset_dir / "negative_prompt.json").read_text())
+)
+
+data = {
+    "prompt": prompt,
+    "negative_prompt": negative_prompt,
+    "size": "1280x720",
+    "num_frames": "189",
+    "fps": "24",
+    "num_inference_steps": "35",
+    "guidance_scale": "6.0",
+    "max_sequence_length": "4096",
+    "flow_shift": "10.0",
+    "seed": "1111",
+    "extra_params": json.dumps(
+        {
+            "use_resolution_template": False,
+            "use_duration_template": False,
+            "guardrails": True,
+        }
+    ),
+}
+
+with (asset_dir / "example_i2v_input.jpg").open("rb") as image:
+    response = requests.post(
+        f"{base_url}/v1/videos",
+        data=data,
+        files={"input_reference": ("example_i2v_input.jpg", image, "image/jpeg")},
+        timeout=60,
+    )
+response.raise_for_status()
+video_id = response.json()["id"]
+
+while True:
+    job = requests.get(f"{base_url}/v1/videos/{video_id}", timeout=30).json()
+    if job["status"] == "completed":
+        break
+    if job["status"] == "failed":
+        raise RuntimeError(job.get("error") or "Video generation failed")
+    time.sleep(1)
+
+response = requests.get(f"{base_url}/v1/videos/{video_id}/content", timeout=300)
+response.raise_for_status()
+Path("cosmos3_i2v.mp4").write_bytes(response.content)
+```
+
+### Video to video
+
+Upload a source video with `video_reference`. Cosmos3 keeps latent frames `[0, 1]` by default and generates the remaining frames. Use `condition_frame_indexes` to select different latent frames, and `condition_video_keep` to take conditioning frames from the start or end of the source.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=A robotic arm pours liquid into a glass on a white tabletop." \
+  --form "video_reference=@robot_pouring.mp4;type=video/mp4" \
+  --form-string "size=1280x704" \
+  --form-string "num_frames=45" \
+  --form-string "fps=24" \
+  --form-string "num_inference_steps=35" \
+  --form-string "guidance_scale=6.0" \
+  --form-string 'condition_frame_indexes=[0,1]' \
+  --form-string "condition_video_keep=first" \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+```
+
+Poll and download this job with the same status and content endpoints used by the T2V example.
+
+### Action generation
+
+For DROID policy generation, start a single-GPU server with the policy checkpoint. Cosmos3 action generation does not currently support CFG or sequence parallelism.
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano-Policy-DROID \
+  --num-gpus 1
+```
+
+The following request predicts a 16-step action chunk from one observation. The chunk length is `num_frames - 1`, and the completed job's `action` field contains the tensor data, shape, mode, and active action dimension.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=Put the pot to the left of the purple item." \
+  --form "input_reference=@observation.png;type=image/png" \
+  --form-string "size=832x480" \
+  --form-string "num_frames=17" \
+  --form-string "fps=5" \
+  --form-string "num_inference_steps=30" \
+  --form-string "guidance_scale=1.0" \
+  --form-string "action_mode=policy" \
+  --form-string "domain_name=droid_lerobot" \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+
+# After the job reaches "completed":
+curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
+  | python -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["action"], indent=2))'
+```
+
+The other action modes are `forward_dynamics` (condition on an observation and an `action` JSON array to generate video) and `inverse_dynamics` (condition on a full video to predict action). Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
+
+## 5. Cosmos3 Parameters
+
+Cosmos3 supports the standard SGLang video and image fields such as `size`, `num_frames`, `fps`, `num_inference_steps`, `guidance_scale`, `negative_prompt`, and `seed`.
+
+Top-level Cosmos3 request fields:
+
+- `max_sequence_length`: maximum text token length used by the Cosmos3 tokenizer.
+- `flow_shift`: per-request scheduler shift. If omitted, SGLang uses `--flow-shift`, then the mode default (`3.0` for T2I and `10.0` for video/action).
+
+Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fields:
+
+- `generate_sound`: generate a sound track whose duration follows `num_frames / fps`.
+- `sound_duration`: explicit sound duration in seconds; takes precedence over the derived duration.
+- `condition_frame_indexes`: V2V latent-frame indexes to keep from the source video; defaults to `[0, 1]`.
+- `condition_video_keep`: use the `first` or `last` source frames for V2V conditioning.
+- `action_mode`: `policy`, `forward_dynamics`, or `inverse_dynamics`.
+- `domain_name` / `domain_id`: select the action embodiment head.
+- `raw_action_dim`: number of active action dimensions; inferred for known domain names.
+- `action`: action array with shape `[T, D]`, required by `forward_dynamics`.
+- `action_fps`: action-token frame rate for temporal mRoPE; defaults to the video FPS.
+- `action_view_point`: viewpoint used in the structured action caption.
+- `action_normalization`: dataset normalization mode, such as `quantile`, `meanstd`, or `minmax`.
+
+Put model-specific compatibility knobs in `extra_params` for video requests, or `extra_args` for image requests:
+
+- `use_duration_template`: whether to append SGLang's generated duration suffix to video prompts.
+- `use_resolution_template`: accepted for vLLM-Omni request compatibility.
+- `use_system_prompt`: whether to add the Cosmos3 system prompt to the chat template.
+- `guardrails` or `use_guardrails`: per-request guardrail toggle when the server started with guardrails enabled.

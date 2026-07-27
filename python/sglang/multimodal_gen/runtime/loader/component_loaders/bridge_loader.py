@@ -8,13 +8,14 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -62,7 +63,9 @@ class BridgeLoader(ComponentLoader):
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {component_model_path}")
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, component_name, precision_attr="dit_precision"
+        )
 
         logger.info(
             "Loading %s from %s safetensors files, default_dtype: %s",
@@ -71,18 +74,18 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
-        # Check if FSDP loading is available
-        if (
-            server_args.hsdp_shard_dim is not None
-            and hasattr(model_cls, "_fsdp_shard_conditions")
-            and model_cls._fsdp_shard_conditions
+        # Use the FSDP loader when FSDP is requested or shard rules are declared.
+        fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
+        if server_args.use_fsdp_inference or (
+            server_args.hsdp_shard_dim is not None and fsdp_shard_conditions
         ):
+            local_torch_device = get_local_torch_device()
             # Load with FSDP support
             model = maybe_load_fsdp_model(
                 model_cls=model_cls,
                 init_params={"config": bridge_config, "hf_config": hf_config},
                 weight_dir_list=safetensors_list,
-                device=get_local_torch_device(),
+                device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
                 cpu_offload=server_args.dit_cpu_offload,
@@ -92,6 +95,9 @@ class BridgeLoader(ComponentLoader):
                 reduce_dtype=torch.float32,
                 output_dtype=None,
                 strict=False,
+                weight_load_plan=WeightLoadPlan(
+                    checkpoint_load_device=local_torch_device
+                ),
             )
         else:
             # Fallback to simple loading (for non-FSDP or legacy models)

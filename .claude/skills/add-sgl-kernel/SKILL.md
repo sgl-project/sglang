@@ -18,7 +18,7 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 
 ## Two rules of thumb (must follow)
 
-1. **Prefer `python/sglang/jit_kernel` first** when the kernel does **not** depend on CUTLASS or another large C++ project. This is the default path for lightweight kernels that benefit from rapid iteration.
+1. **Prefer `python/sglang/kernels/jit` first** when the kernel does **not** depend on CUTLASS or another large C++ project. This is the default path for lightweight kernels that benefit from rapid iteration.
 2. **Prefer `sgl-kernel`** when the kernel **does** depend on CUTLASS or another large C++ project, or when it should be part of the AOT wheel / torch op registration flow.
 3. **Exception**: if the dependency is `flashinfer`, or CUTLASS that is already provided through `flashinfer`, the kernel can still be implemented as `jit_kernel`.
 
@@ -327,6 +327,10 @@ After building successfully, run the test and benchmark:
 pytest sgl-kernel/tests/test_scale.py -q
 python sgl-kernel/benchmark/bench_scale.py
 ```
+
+PR CI also runs `pr-test-sgl-kernel.yml`, including the B200 job
+`sgl-kernel-b200-test` when kernel changes are detected. Use that job as the
+Blackwell coverage signal for AOT `sgl-kernel` changes.
 
 ---
 

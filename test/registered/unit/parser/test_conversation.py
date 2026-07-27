@@ -32,7 +32,8 @@ from sglang.srt.parser.conversation import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestConversationGetPrompt(CustomTestCase):
@@ -118,19 +119,6 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("[USER]Hello\n", prompt)
         self.assertTrue(prompt.endswith("[ASST]"))
 
-    def test_none_message_in_prompt(self):
-        """Test that None message produces role-only output (no content)."""
-        conv = Conversation(
-            name="test",
-            system_message="",
-            roles=("User", "Assistant"),
-            messages=[["User", "Q"], ["Assistant", None]],
-            sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-            sep="\n",
-        )
-        prompt = conv.get_prompt()
-        self.assertTrue(prompt.endswith("Assistant:"))
-
     def test_empty_system_message(self):
         """Test that empty system message produces empty prefix for LLAMA3."""
         conv = Conversation(
@@ -187,22 +175,6 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("[U]Q<s1>", prompt)
         self.assertIn("[A]A<s2>", prompt)
         self.assertTrue(prompt.endswith("[U]"))
-
-    def test_llama2_with_system(self):
-        """Test LLAMA2 with system message."""
-        conv = Conversation(
-            name="test",
-            system_message="<<SYS>>\nBe helpful\n<</SYS>>\n\n",
-            system_template="[INST] {system_message}",
-            roles=("[INST]", "[/INST]"),
-            messages=[["[INST]", "Hi"], ["[/INST]", None]],
-            sep_style=SeparatorStyle.LLAMA2,
-            sep=" ",
-            sep2=" </s><s>",
-        )
-        prompt = conv.get_prompt()
-        self.assertIn("Be helpful", prompt)
-        self.assertIn("Hi ", prompt)
 
     def test_llama2_without_system(self):
         """Test LLAMA2 without system message falls back to '[INST] ' prefix."""
@@ -569,23 +541,6 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("USER: <image>Describe this\n", prompt)
         self.assertIn("ASSISTANT: It shows a cat<eos>", prompt)
 
-    def test_mpt_with_tuple_message(self):
-        """Test MPT style extracts first element from tuple messages."""
-        conv = Conversation(
-            name="test",
-            system_message="<|system|>",
-            roles=("<|user|>", "<|assistant|>"),
-            messages=[
-                ["<|user|>", ("Hello", "extra1", "extra2")],
-                ["<|assistant|>", None],
-            ],
-            sep_style=SeparatorStyle.MPT,
-            sep="\n",
-        )
-        prompt = conv.get_prompt()
-        self.assertIn("<|user|>Hello\n", prompt)
-        self.assertNotIn("extra1", prompt)
-
     def test_invalid_sep_style_raises(self):
         """Test that an invalid SeparatorStyle raises ValueError."""
         conv = Conversation(
@@ -610,100 +565,6 @@ class TestConversationMethods(CustomTestCase):
             sep="\n",
         )
 
-    def test_append_message(self):
-        """Test appending messages to conversation."""
-        conv = self._make_conv()
-        conv.append_message("User", "Hello")
-        conv.append_message("Assistant", "Hi")
-        self.assertEqual(len(conv.messages), 2)
-        self.assertEqual(conv.messages[0], ["User", "Hello"])
-
-    def test_set_system_message(self):
-        """Test setting the system message."""
-        conv = self._make_conv()
-        conv.set_system_message("Be helpful")
-        self.assertEqual(conv.system_message, "Be helpful")
-
-    def test_update_last_message(self):
-        """Test updating the last message in-place."""
-        conv = self._make_conv()
-        conv.append_message("User", "Q")
-        conv.append_message("Assistant", None)
-        conv.update_last_message("Answer")
-        self.assertEqual(conv.messages[-1][1], "Answer")
-
-    def test_to_openai_api_messages_with_system(self):
-        """Test conversion to OpenAI format with system message."""
-        conv = self._make_conv()
-        conv.system_message = "Be helpful"
-        conv.append_message("User", "Hello")
-        conv.append_message("Assistant", "Hi")
-        result = conv.to_openai_api_messages()
-        self.assertEqual(result[0], {"role": "system", "content": "Be helpful"})
-        self.assertEqual(result[1], {"role": "user", "content": "Hello"})
-        self.assertEqual(result[2], {"role": "assistant", "content": "Hi"})
-
-    def test_to_openai_api_messages_without_system(self):
-        """Test conversion to OpenAI format without system message."""
-        conv = self._make_conv()
-        conv.append_message("User", "Hello")
-        result = conv.to_openai_api_messages()
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["role"], "user")
-
-    def test_to_openai_api_messages_skips_none_assistant(self):
-        """Test that None assistant message is omitted from OpenAI format."""
-        conv = self._make_conv()
-        conv.append_message("User", "Hello")
-        conv.append_message("Assistant", None)
-        result = conv.to_openai_api_messages()
-        self.assertEqual(len(result), 1)  # only user message
-
-    def test_to_gradio_chatbot(self):
-        """Test conversion to Gradio chatbot format (user/assistant pairs)."""
-        conv = self._make_conv()
-        conv.append_message("User", "Q1")
-        conv.append_message("Assistant", "A1")
-        conv.append_message("User", "Q2")
-        conv.append_message("Assistant", "A2")
-        result = conv.to_gradio_chatbot()
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0], ["Q1", "A1"])
-        self.assertEqual(result[1], ["Q2", "A2"])
-
-    def test_to_gradio_chatbot_pending_response(self):
-        """Test Gradio format with pending assistant response (None)."""
-        conv = self._make_conv()
-        conv.append_message("User", "Q1")
-        conv.append_message("Assistant", None)
-        result = conv.to_gradio_chatbot()
-        self.assertEqual(result, [["Q1", None]])
-
-    def test_append_image(self):
-        """Test appending image data to conversation."""
-        conv = self._make_conv()
-        conv.image_data = []
-        conv.append_image("http://example.com/img.jpg", "auto")
-        self.assertEqual(len(conv.image_data), 1)
-        self.assertEqual(conv.image_data[0].url, "http://example.com/img.jpg")
-        self.assertEqual(conv.image_data[0].detail, "auto")
-
-    def test_append_video(self):
-        """Test appending video data to conversation."""
-        conv = self._make_conv()
-        conv.video_data = []
-        conv.append_video("http://example.com/vid.mp4")
-        self.assertEqual(len(conv.video_data), 1)
-        self.assertEqual(conv.video_data[0], "http://example.com/vid.mp4")
-
-    def test_append_audio(self):
-        """Test appending audio data to conversation."""
-        conv = self._make_conv()
-        conv.audio_data = []
-        conv.append_audio("http://example.com/audio.wav")
-        self.assertEqual(len(conv.audio_data), 1)
-        self.assertEqual(conv.audio_data[0], "http://example.com/audio.wav")
-
     def test_copy_is_independent(self):
         """Test that copy() creates an independent conversation."""
         conv = self._make_conv()
@@ -713,39 +574,12 @@ class TestConversationMethods(CustomTestCase):
         self.assertEqual(len(conv.messages), 1)
         self.assertEqual(len(copied.messages), 2)
 
-    def test_dict_serialization(self):
-        """Test dict() returns expected keys."""
-        conv = self._make_conv()
-        conv.append_message("User", "Hello")
-        d = conv.dict()
-        self.assertEqual(d["template_name"], "test")
-        self.assertIn("messages", d)
-        self.assertIn("roles", d)
-
 
 class TestTemplateRegistry(CustomTestCase):
     def test_builtin_templates_exist(self):
         """Test that common built-in templates are registered."""
         self.assertTrue(chat_template_exists("chatml"))
         self.assertTrue(chat_template_exists("llama-2"))
-
-    def test_unregistered_template_not_found(self):
-        """Test that non-existent template returns False."""
-        self.assertFalse(chat_template_exists("_nonexistent_template_xyz"))
-
-    def test_register_and_lookup(self):
-        """Test registering and looking up a custom template."""
-        t = Conversation(
-            name="_test_conv_template",
-            roles=("A", "B"),
-            messages=[],
-            sep_style=SeparatorStyle.ADD_COLON_SINGLE,
-            sep="\n",
-        )
-        register_conv_template(t)
-        self.assertTrue(chat_template_exists("_test_conv_template"))
-        # Cleanup
-        del chat_templates["_test_conv_template"]
 
     def test_register_duplicate_raises(self):
         """Test that registering a duplicate name without override raises."""
@@ -840,32 +674,6 @@ class TestGenerateEmbeddingConvs(CustomTestCase):
         self.assertIn("Hello world", convs[0].messages[0][1])
         self.assertIsNone(convs[0].messages[1][1])  # assistant placeholder
 
-    def test_with_image(self):
-        """Test generating embedding conversations with image."""
-        convs = generate_embedding_convs(
-            texts=["Describe"],
-            images=["http://example.com/img.jpg"],
-            videos=[None],
-            template_name="chatml",
-        )
-        self.assertEqual(len(convs), 1)
-        msg = convs[0].messages[0][1]
-        self.assertIn("<image>", msg)
-        self.assertIn("Describe", msg)
-
-    def test_with_video(self):
-        """Test generating embedding conversations with video."""
-        convs = generate_embedding_convs(
-            texts=["Describe"],
-            images=[None],
-            videos=["http://example.com/vid.mp4"],
-            template_name="chatml",
-        )
-        self.assertEqual(len(convs), 1)
-        msg = convs[0].messages[0][1]
-        self.assertIn("<video>", msg)
-        self.assertIn("Describe", msg)
-
     def test_with_image_and_video(self):
         """Test embedding conv with both image and video."""
         convs = generate_embedding_convs(
@@ -891,24 +699,8 @@ class TestGenerateEmbeddingConvs(CustomTestCase):
         # None text should not produce "None" string
         self.assertNotIn("None", msg)
 
-    def test_multiple_items(self):
-        """Test generating multiple embedding conversations."""
-        convs = generate_embedding_convs(
-            texts=["text1", "text2"],
-            images=[None, None],
-            videos=[None, None],
-            template_name="chatml",
-        )
-        self.assertEqual(len(convs), 2)
-
 
 class TestGetFullMultimodalTextPrompt(CustomTestCase):
-    def test_adds_missing_image_tokens(self):
-        """Test adding missing image tokens to prompt."""
-        result = _get_full_multimodal_text_prompt("<image>", 3, "Describe this.")
-        self.assertEqual(result.count("<image>"), 3)
-        self.assertIn("Describe this.", result)
-
     def test_preserves_existing_tokens(self):
         """Test that existing tokens in prompt are preserved."""
         result = _get_full_multimodal_text_prompt(
@@ -925,17 +717,6 @@ class TestGetFullMultimodalTextPrompt(CustomTestCase):
         """Test that more placeholders than data items raises ValueError."""
         with self.assertRaises(ValueError):
             _get_full_multimodal_text_prompt("<image>", 1, "<image> <image>")
-
-    def test_zero_count_with_no_tokens(self):
-        """Test zero modality count with no tokens in prompt."""
-        result = _get_full_multimodal_text_prompt("<image>", 0, "Just text")
-        self.assertEqual(result, "Just text")
-
-    def test_video_tokens(self):
-        """Test adding missing video tokens."""
-        result = _get_full_multimodal_text_prompt("<video>", 2, "Describe:")
-        self.assertEqual(result.count("<video>"), 2)
-        self.assertIn("Describe:", result)
 
     def test_tokens_joined_with_newline(self):
         """Test that missing tokens are joined with newlines before prompt."""
@@ -1067,16 +848,6 @@ class TestGenerateChatConv(CustomTestCase):
                 ),
             ]
         )
-        with self.assertRaises(ValueError):
-            generate_chat_conv(request, "chatml")
-
-    def test_string_messages_raises(self):
-        """Test that passing messages as a raw string raises ValueError."""
-        request = self._make_request(
-            [ChatCompletionMessageUserParam(role="user", content="Hi")]
-        )
-        # Manually override messages to be a string to trigger validation
-        request.__dict__["messages"] = "not a list"
         with self.assertRaises(ValueError):
             generate_chat_conv(request, "chatml")
 

@@ -27,6 +27,9 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import (
@@ -39,10 +42,8 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
-
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import torch
 import uvloop
@@ -55,6 +56,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
+    SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -69,6 +71,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    ProfileReq,
+    ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -78,15 +82,23 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_recv,
+    sock_send,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.parser.template_detection import resolve_auto_parsers
+from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    SerializedTensorPayload,
     assert_pkg_version,
     configure_logger,
     get_bool_env_var,
@@ -94,11 +106,18 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    normalize_serialized_named_tensor_payloads,
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.utils.network import get_zmq_socket, is_port_available
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port,
+    get_zmq_socket,
+    is_port_available,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -114,6 +133,7 @@ class SchedulerInitResult:
     """Result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
+    all_child_pids: List[int] = dataclasses.field(default_factory=list)
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
@@ -136,6 +156,33 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+
+    # Resolve any remaining auto parsers using template manager's detection results
+    for attr, suggested, label in (
+        (
+            "reasoning_parser",
+            template_manager.suggested_reasoning_parser,
+            "reasoning parser",
+        ),
+        (
+            "tool_call_parser",
+            template_manager.suggested_tool_call_parser,
+            "tool-call parser",
+        ),
+    ):
+        if getattr(server_args, attr) != "auto":
+            continue
+        if suggested is not None:
+            server_args.override(source="template-detection", **{attr: suggested})
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
+            )
+        else:
+            logger.warning(
+                f"--{attr.replace('_', '-')}=auto specified but could not detect "
+                f"{label} from chat template. Disabling {label}."
+            )
+            server_args.override(source="template-detection", **{attr: None})
 
     return tokenizer_manager, template_manager
 
@@ -167,6 +214,10 @@ class Engine(EngineScoreMixin, EngineBase):
         Please refer to `ServerArgs` for the documentation.
         """
 
+        # Ensure plugins are loaded before ServerArgs construction,
+        # so hooks on ServerArgs.__post_init__ fire correctly.
+        load_plugins()
+
         # Parse server_args
         if "server_args" in kwargs:
             # Directly load server_args
@@ -194,6 +245,7 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args,
             scheduler_init_result,
             subprocess_watchdog,
+            weight_cache_daemon_procs,
         ) = self._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -203,14 +255,13 @@ class Engine(EngineScoreMixin, EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        # Engine-spawned weight cache daemons owned by *this* instance (empty
+        # unless --weight-cache-mode daemon). Kept per-instance so two Engines
+        # in one process each reap only their own daemons in shutdown().
+        self._weight_cache_daemon_procs = weight_cache_daemon_procs
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap_server is not None:
-            self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
-            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -223,7 +274,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
@@ -236,6 +291,10 @@ class Engine(EngineScoreMixin, EngineBase):
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+
+    def get_all_child_pids(self) -> List[int]:
+        """Returns a list of all child process PIDs."""
+        return self._scheduler_init_result.all_child_pids
 
     def _resolve_routed_dp_rank(
         self,
@@ -256,7 +315,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
                 return None
@@ -286,14 +345,18 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # See GenerateReqInput.mm_hashes / async_generate for the contract.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -306,6 +369,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -322,14 +386,17 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -338,6 +405,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -376,14 +444,23 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # Optional per-image hashes the caller has already computed (hex strings,
+        # one per image in `image_data`). When supplied, each MultimodalDataItem's
+        # `hash` is initialised from this list and `set_pad_value` skips the
+        # internal `hash_feature()` recompute. Intended for external KV routers
+        # that compute their own per-image hash for routing decisions and need
+        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -396,6 +473,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -412,13 +490,16 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -428,6 +509,7 @@ class Engine(EngineScoreMixin, EngineBase):
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_id=session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -519,6 +601,208 @@ class Engine(EngineScoreMixin, EngineBase):
         return ret
 
     @classmethod
+    def _launch_weight_cache_daemons(cls, server_args: ServerArgs):
+        """Launch weight cache daemon processes for this node's PP×TP ranks.
+
+        All daemon processes join the same NCCL distributed group so that
+        TP-sharded model loading works correctly. Each daemon holds its
+        rank's weight shard in GPU memory and serves IPC handles.
+
+        Lifecycle: these daemons are *co-terminal* with the engine. They are
+        children of this process (kill_itself_when_parent_died installs
+        PR_SET_PDEATHSIG) and are gracefully reaped in ``shutdown()``. They do
+        NOT persist across engine restarts, so ``--weight-cache-mode daemon``
+        on its own does not deliver a faster restart -- the first start is in
+        fact slower (disk-load into the daemon plus the IPC handshake). The
+        fast-recovery story is the standalone launcher
+        (``python -m sglang.srt.weight_cache.daemon``) plus
+        ``--weight-cache-mode client``, where the daemon outlives the engine.
+        """
+        if server_args.dp_size > 1:
+            raise ValueError(
+                "Weight cache daemon mode does not support dp_size > 1. "
+                "Please set --dp-size 1 when using --weight-cache-mode daemon."
+            )
+
+        # Multi-node needs an explicit rendezvous address; otherwise each node
+        # picks its own local 127.0.0.1 port (below) and the per-node daemons
+        # can never form the joint process group.
+        if server_args.nnodes > 1 and not server_args.dist_init_addr:
+            raise ValueError(
+                "Multi-node weight cache daemons (nnodes > 1) require "
+                "--dist-init-addr so all nodes rendezvous at the same endpoint."
+            )
+
+        tp_size = server_args.tp_size
+
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            _calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                tp_size,
+                server_args.node_rank,
+            )
+        )
+
+        # Build the distributed init method (multi-node uses the user-provided
+        # dist_init_addr so all nodes reach the same endpoint).
+        if server_args.dist_init_addr:
+            host, port = server_args.dist_init_addr.rsplit(":", 1)
+            dist_init_method = f"tcp://{host}:{port}"
+        else:
+            # Fresh free port for the daemons' own rendezvous, not the engine's
+            # nccl_port: a pinned --nccl-port would otherwise collide with the
+            # engine's own NCCL TCPStore.
+            dist_init_method = NetworkAddress("127.0.0.1", get_free_port()).to_tcp()
+
+        num_daemons = len(pp_rank_range) * len(tp_rank_range)
+        daemon_procs = []
+        logger.info(
+            f"Launching {num_daemons} weight cache daemon(s) on node "
+            f"{server_args.node_rank} for model={server_args.model_path}, "
+            f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
+            f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
+            f"dist_init_method={dist_init_method}"
+        )
+
+        # Validate and clean up stale .ready/.sock files from prior runs.
+        # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.weight_cache.protocol import (
+            cleanup_stale_daemon_files,
+            compute_global_rank,
+            compute_local_gpu_id,
+            get_ready_path,
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                cleanup_stale_daemon_files(global_rank)
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "sglang.srt.weight_cache.daemon",
+                    "--model-path",
+                    server_args.model_path,
+                    "--gpu-id",
+                    str(gpu_id),
+                    "--tp-size",
+                    str(tp_size),
+                    "--tp-rank",
+                    str(tp_rank),
+                    "--pp-size",
+                    str(server_args.pp_size),
+                    "--pp-rank",
+                    str(pp_rank),
+                    "--dp-size",
+                    "1",
+                    "--ep-size",
+                    str(server_args.ep_size),
+                    "--load-format",
+                    server_args.load_format,
+                    "--dtype",
+                    server_args.dtype,
+                    "--dist-init-method",
+                    dist_init_method,
+                ]
+                if server_args.quantization:
+                    cmd += ["--quantization", server_args.quantization]
+                if (
+                    server_args.model_loader_extra_config
+                    and server_args.model_loader_extra_config != "{}"
+                ):
+                    cmd += [
+                        "--model-loader-extra-config",
+                        server_args.model_loader_extra_config,
+                    ]
+                if server_args.trust_remote_code:
+                    cmd += ["--trust-remote-code"]
+                if server_args.revision:
+                    cmd += ["--revision", server_args.revision]
+
+                proc = subprocess.Popen(cmd)
+                daemon_procs.append(proc)
+
+        # Wait for all daemons to be ready (ready file exists). On any failure
+        # (readiness timeout or a daemon exiting early) terminate the siblings
+        # we already spawned before propagating, so a partial launch does not
+        # leak GPU-resident daemons.
+        timeout = server_args.weight_cache_timeout
+        check_interval = 2
+        start_time = time.time()
+        try:
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                    ready_path = get_ready_path(global_rank)
+                    while not os.path.exists(ready_path):
+                        time.sleep(check_interval)
+                        if time.time() - start_time > timeout:
+                            raise TimeoutError(
+                                f"Weight cache daemon for pp_rank={pp_rank} "
+                                f"tp_rank={tp_rank} did not become ready "
+                                f"within {timeout}s"
+                            )
+                        # Check if daemon process is still alive
+                        for p in daemon_procs:
+                            if p.poll() is not None:
+                                raise RuntimeError(
+                                    f"Weight cache daemon (pid={p.pid}) exited prematurely "
+                                    f"with code {p.returncode}"
+                                )
+                    logger.info(
+                        f"Weight cache daemon for pp_rank={pp_rank} "
+                        f"tp_rank={tp_rank} is ready"
+                    )
+        except BaseException:
+            cls._terminate_weight_cache_daemons(daemon_procs)
+            raise
+
+        logger.info(
+            f"All {num_daemons} weight cache daemons on node "
+            f"{server_args.node_rank} are ready"
+        )
+        return daemon_procs
+
+    @staticmethod
+    def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
+        """Gracefully stop engine-spawned weight cache daemons.
+
+        Send SIGTERM first so each daemon's signal handler can unlink its
+        ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
+        because ``shutdown()`` otherwise reaps children via
+        ``kill_process_tree`` (SIGKILL), which would skip that cleanup and
+        leave stale files that make the next client-mode boot fail with a
+        confusing "socket exists but connection refused" instead of a clean
+        "no daemon" path.
+        """
+        if not procs:
+            return
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()  # SIGTERM -> daemon cleanup handler runs
+        for p in procs:
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    f"Weight cache daemon (pid={p.pid}) did not exit within "
+                    f"{timeout}s of SIGTERM; sending SIGKILL."
+                )
+                p.kill()
+
+    @classmethod
     def _launch_scheduler_processes(
         cls,
         server_args: ServerArgs,
@@ -533,8 +817,11 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        use_dp_controller = (
+            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+        )
 
-        if server_args.dp_size == 1:
+        if not use_dp_controller:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
@@ -578,8 +865,9 @@ class Engine(EngineScoreMixin, EngineBase):
                                 writer,
                             ),
                         )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
 
@@ -601,11 +889,16 @@ class Engine(EngineScoreMixin, EngineBase):
             proc.start()
             scheduler_procs.append(proc)
 
+        all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
+            if use_dp_controller:
+                for info in infos:
+                    if SCHEDULER_PIDS_ARG in info:
+                        all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def wait_for_completion():
             for proc in scheduler_procs:
@@ -618,11 +911,69 @@ class Engine(EngineScoreMixin, EngineBase):
         return (
             SchedulerInitResult(
                 scheduler_infos=scheduler_infos,
+                all_child_pids=all_child_pids,
                 wait_for_ready=wait_for_ready,
                 wait_for_completion=wait_for_completion,
             ),
             scheduler_procs,
         )
+
+    @classmethod
+    def _launch_detokenizer_subprocesses(
+        cls,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_detokenizer_process_func: Callable,
+    ) -> Tuple[List[mp.Process], List[str]]:
+        """Launch detokenizer worker(s).
+
+        - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
+          ``port_args.detokenizer_ipc_name`` (the original behavior).
+        - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
+          private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
+          original ``port_args.detokenizer_ipc_name`` and fans out to them.
+
+        Returns (processes, names) for SubprocessWatchdog.
+        """
+        processes: List[mp.Process] = []
+        names: List[str] = []
+
+        if server_args.detokenizer_worker_num <= 1:
+            proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, port_args),
+            )
+            proc.start()
+            processes.append(proc)
+            names.append("detokenizer")
+            return processes, names
+
+        router_ipc_name = port_args.detokenizer_ipc_name
+        worker_ipc_names: List[str] = []
+        try:
+            for i in range(server_args.detokenizer_worker_num):
+                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                port_args.detokenizer_ipc_name = worker_ipc
+                proc = mp.Process(
+                    target=run_detokenizer_process_func,
+                    args=(server_args, port_args),
+                )
+                proc.start()
+                processes.append(proc)
+                names.append(f"detokenizer_{i}")
+                worker_ipc_names.append(worker_ipc)
+        finally:
+            port_args.detokenizer_ipc_name = router_ipc_name
+
+        router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(worker_ipc_names, server_args, port_args),
+        )
+        router_proc.start()
+        processes.append(router_proc)
+        names.append("detokenizer_router")
+
+        return processes, names
 
     @classmethod
     def _launch_subprocesses(
@@ -642,11 +993,16 @@ class Engine(EngineScoreMixin, EngineBase):
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
         Returns:
-            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
+            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog, weight_cache_daemon_procs).
         """
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
+
+        # Defensive: ensure plugins loaded (may already be loaded by
+        # Engine.__init__ or CLI entry).
+        load_plugins()
+
         server_args.check_server_args()
         _set_gc(server_args)
 
@@ -672,6 +1028,19 @@ class Engine(EngineScoreMixin, EngineBase):
                 host=server_args.host, port=bootstrap_port
             )
 
+        if (
+            server_args.reasoning_parser == "auto"
+            or server_args.tool_call_parser == "auto"
+        ):
+            resolve_auto_parsers(server_args)
+
+        # Launch daemons (daemon mode only). Handles are threaded back to the
+        # owning Engine instance (not a class attr) so two Engines in one process
+        # don't clobber each other's daemon list.
+        weight_cache_daemon_procs: List = []
+        if server_args.weight_cache_mode == "daemon":
+            weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
@@ -687,8 +1056,7 @@ class Engine(EngineScoreMixin, EngineBase):
             run_expert_backup_manager(server_args, port_args)
 
         if server_args.node_rank >= 1:
-            # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-            # so they can just wait here.
+            # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -699,6 +1067,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     port_args,
                     scheduler_init_result,
                     None,
+                    weight_cache_daemon_procs,
                 )
 
             launch_dummy_health_check_server(
@@ -712,17 +1081,18 @@ class Engine(EngineScoreMixin, EngineBase):
                 port_args,
                 scheduler_init_result,
                 None,
+                weight_cache_daemon_procs,
             )
 
-        # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
+        # Launch detokenizer process(es) — optionally fronted by a router when
+        # detokenizer_worker_num > 1.
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+            server_args=server_args,
+            port_args=port_args,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
-        detoken_proc.start()
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
@@ -746,8 +1116,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.append(detoken_proc)
-        names.append("detokenizer")
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )
@@ -759,16 +1129,33 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args,
             scheduler_init_result,
             subprocess_watchdog,
+            weight_cache_daemon_procs,
         )
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine; block until the scheduler subprocess releases
+        its GPU context so the caller can immediately reallocate on the same
+        device."""
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False)
+
+        send_to_rpc = getattr(self, "send_to_rpc", None)
+        if send_to_rpc is not None:
+            send_to_rpc.close(linger=0)
+            self.send_to_rpc = None
+
+        # Gracefully stop weight cache daemons *before* the blanket
+        # kill_process_tree below, so their SIGTERM handlers can unlink the
+        # .sock/.ready files instead of being SIGKILLed and leaving stale state.
+        daemon_procs = getattr(self, "_weight_cache_daemon_procs", None)
+        if daemon_procs:
+            self._terminate_weight_cache_daemons(daemon_procs)
+            self._weight_cache_daemon_procs = []
+
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
@@ -820,7 +1207,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
-        self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
+        req = ProfileReq(req_type=ProfileReqType.START_PROFILE, **kwargs)
+        self.loop.run_until_complete(self.tokenizer_manager.start_profile(req))
 
     def stop_profile(self):
         self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
@@ -844,12 +1232,14 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-        return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
-            **self._scheduler_init_result.scheduler_infos[0],
-            "internal_states": internal_states,
-            "version": __version__,
-        }
+        return msgspec_to_builtins(
+            {
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self._scheduler_init_result.scheduler_infos[0],
+                "internal_states": internal_states,
+                "version": __version__,
+            }
+        )
 
     def init_weights_update_group(
         self,
@@ -909,14 +1299,19 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: Union[
+            List[Tuple[str, torch.Tensor]],
+            List[SerializedTensorPayload],
+        ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         if load_format == "flattened_bucket":
-            serialized_named_tensors = named_tensors
+            serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                cast(List[SerializedTensorPayload], named_tensors)
+            )
         else:
             serialized_named_tensors = [
                 MultiprocessingSerializer.serialize(named_tensors)
@@ -1078,8 +1473,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
+        sock_send(self.send_to_rpc, obj)
+        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 
@@ -1104,6 +1499,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
+        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
+        if server_args.dcp_size > 1:
+            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
@@ -1136,7 +1536,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.7.post3",
+                "0.6.15.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1144,7 +1544,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.1",
+                "0.4.5",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

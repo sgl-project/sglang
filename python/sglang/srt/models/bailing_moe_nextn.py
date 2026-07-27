@@ -26,7 +26,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -43,7 +42,7 @@ from sglang.srt.models.bailing_moe_linear import (
     BailingMoeV2_5ForCausalLM,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 LoraConfig = None
@@ -195,7 +194,7 @@ class BailingMoeForCausalLMNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         if hasattr(self, "determine_num_fused_shared_experts"):
             # Asystem has determine_num_fused_shared_experts but theta does not.
@@ -209,7 +208,7 @@ class BailingMoeForCausalLMNextN(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         if hasattr(self.config, "model_type") and config.model_type == "bailing_hybrid":
@@ -217,7 +216,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
             self.post_load_weights_func = BailingMoeV2_5ForCausalLM.post_load_weights
         else:
             self.base_load_weights_func = BailingMoEForCausalLM.load_weights
-            self.post_load_weights_func = BailingMoEForCausalLM.post_load_weights
+            # V1 BailingMoeAttention is standard QKV (no kv_b_proj), no fixup needed.
+            self.post_load_weights_func = None
 
     @torch.no_grad()
     def forward(
@@ -243,8 +243,13 @@ class BailingMoeForCausalLMNextN(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)
 
-    def post_load_weights(self, is_nextn=False, weight_names=None):
-        self.post_load_weights_func(self, is_nextn=is_nextn, weight_names=weight_names)
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # `is_nextn` is pinned to True for the NextN subclass; the parameter is kept
+        # only because the underlying `load_weights` flow calls `self.post_load_weights`
+        # with `is_nextn=...` as a kwarg.
+        if self.post_load_weights_func is None:
+            return
+        self.post_load_weights_func(self, is_nextn=True, weight_names=weight_names)
 
 
 EntryClass = [BailingMoeForCausalLMNextN]

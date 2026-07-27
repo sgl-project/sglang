@@ -17,6 +17,7 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 import json
 import unittest
 
+import anthropic
 import requests
 
 from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
@@ -31,7 +32,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=39, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -226,6 +227,27 @@ class TestAnthropicServer(CustomTestCase):
         body = resp.json()
         self.assertEqual(body["type"], "message")
         self.assertTrue(len(body["content"]) > 0)
+
+    def test_in_messages_system_role(self):
+        """A ``role: "system"`` turn inside ``messages`` (emitted by some
+        clients, e.g. Claude Code) must be accepted — not rejected with 400.
+        Uses the Anthropic SDK the way a real client would."""
+        client = anthropic.Anthropic(
+            base_url=self.base_url,
+            auth_token=self.api_key,  # Bearer header — SGLang's --api-key checks Authorization
+        )
+        message = client.messages.create(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "system", "content": "Always respond in French."},
+                {"role": "user", "content": "Answer in a few words."},
+            ],
+        )
+        self.assertEqual(message.role, "assistant")
+        self.assertTrue(len(message.content) > 0)
+        self.assertEqual(message.content[0].type, "text")
 
     def test_max_tokens(self):
         """Test max_tokens limits output length."""

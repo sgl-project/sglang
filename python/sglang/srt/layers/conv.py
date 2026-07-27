@@ -14,7 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+if _is_cpu and _is_cpu_amx_available:
+    conv3d_embed = torch.ops.sgl_kernel.conv3d_embed_cpu
 
 _VALID_PADDING_STRINGS = {"same", "valid"}
 _VALID_PADDING_MODES = {"zeros", "reflect", "replicate", "circular"}
@@ -251,6 +258,8 @@ class Conv3dLayer(MultiPlatformOp):
         else:
             self.register_parameter("bias", None)
 
+        if _is_cpu and _is_cpu_amx_available and self.bias is not None:
+            self.quant_method = PackWeightMethod(weight_names=["weight"])
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -288,6 +297,16 @@ class Conv3dLayer(MultiPlatformOp):
             self.dilation,
             self.groups,
         )
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if use_intel_amx_backend(self):
+            return conv3d_embed(
+                x,
+                self.weight,
+                self.bias,
+                is_vnni=True,
+            )
+        return self.forward_native(x)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         if self.enable_linear:

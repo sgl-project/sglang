@@ -39,8 +39,24 @@ class RolloutDebugTensors:
 
 
 @dataclass
-class RolloutTrajectoryData:
-    """Container for rollout-specific trajectory outputs."""
+class RolloutDenoisingEnv:
+    image_kwargs: dict[str, Any] | None = None
+    pos_cond_kwargs: dict[str, Any] | None = None
+    neg_cond_kwargs: dict[str, Any] | None = None
+    guidance: torch.Tensor | None = None
 
+
+@dataclass
+class RolloutDitTrajectory:
+    # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
+    # final denoised latent x_{t_T} (last scheduler.step output).
+    latents: torch.Tensor | None = None
+    timesteps: torch.Tensor | None = None  # [T]
+
+
+@dataclass
+class RolloutTrajectoryData:
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
+    denoising_env: RolloutDenoisingEnv | None = None
+    dit_trajectory: RolloutDitTrajectory | None = None

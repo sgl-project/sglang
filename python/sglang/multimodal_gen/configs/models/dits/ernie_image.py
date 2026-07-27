@@ -4,10 +4,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 
 
 @dataclass
@@ -34,9 +31,7 @@ class ErnieImageArchConfig(DiTArchConfig):
         }
     )
 
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
 
     def __post_init__(self):
         super().__post_init__()

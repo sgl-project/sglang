@@ -53,7 +53,6 @@ class TestAscendDeepSeekMTP(CustomTestCase):
         ]
 
         envs.SGLANG_NPU_USE_MLAPO.set(True)
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
     def test_a_gsm8k(self):

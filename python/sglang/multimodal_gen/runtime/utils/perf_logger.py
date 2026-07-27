@@ -53,6 +53,7 @@ class RequestMetrics:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -62,13 +63,19 @@ class RequestMetrics:
 
     def record_stage(self, stage_name: str, duration_s: float):
         """Records the duration of a pipeline stage"""
+        if self.suppress_stage_breakdown:
+            return
         self.stages[stage_name] = duration_s * 1000  # Store as milliseconds
 
     def record_step(self, duration_s: float):
         """Records the duration of a denoising step in execution order."""
+        if self.suppress_stage_breakdown:
+            return
         self.steps.append(duration_s * 1000)
 
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
+        if self.suppress_stage_breakdown:
+            return
         self.memory_snapshots[checkpoint_name] = snapshot
 
     def to_dict(self) -> Dict[str, Any]:
@@ -209,7 +216,13 @@ class StageProfiler:
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
-                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
+                # This debug-only memory log runs at every stage boundary in CI.
+                # Keep it observational; cache cleanup is handled at explicit
+                # failure and component-release points.
+                available_memory = current_platform.get_available_gpu_memory(
+                    empty_cache=False
+                )
+                msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:

@@ -24,10 +24,16 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=700, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
-KIMI_K25_MXFP4_REVISION = "b071bc6f8eb042e093e14f3b8bdbad71c18e09d3"
+# Bumped from b071bc6f -> 419004c8 (HF main HEAD as of 2026-05-18). The pinned
+# b071bc6f revision keeps shared_experts unquantized (bf16), which is
+# incompatible with the shared-experts fusion path enabled for Kimi-K2.5
+# (n_routed_experts=384) in #25390. Revisions from 94d8c1bd onward quantize
+# shared_experts to MXFP4 so the fusion can copy weights between routed and
+# shared experts without a dtype/shape mismatch.
+KIMI_K25_MXFP4_REVISION = "419004c8716cf22c929aa15d39b85e09a8a2091a"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 

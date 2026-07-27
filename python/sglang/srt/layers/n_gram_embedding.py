@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from sglang.jit_kernel.ngram_embedding import compute_n_gram_ids
+from sglang.kernels.ops.speculative.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -17,6 +17,7 @@ class NgramEmbedding(torch.nn.Module):
         over_embedding_m: int,
         over_embedding_k: int,
         over_embedding_n: int,
+        eos_token_id: int,
     ):
         super().__init__()
         assert (
@@ -27,11 +28,13 @@ class NgramEmbedding(torch.nn.Module):
         self.over_embedding_m = over_embedding_m
         self.over_embedding_k = over_embedding_k
         self.over_embedding_n = over_embedding_n
+        self.eos_token_id = eos_token_id
 
+        use_attn_tp_group = is_dp_attention_enabled()
         self.word_embeder = VocabParallelEmbedding(
             num_embeddings,
             embedding_dim,
-            enable_tp=is_dp_attention_enabled(),
+            use_attn_tp_group=use_attn_tp_group,
         )
         self.n_grams = (over_embedding_n - 1) * over_embedding_k
         oe_hidden_dim = embedding_dim // (over_embedding_k * (over_embedding_n - 1))
@@ -48,7 +51,7 @@ class NgramEmbedding(torch.nn.Module):
         self.oe_embeder = VocabParallelEmbedding(
             num_embeddings=self.exclusive_oe_embedder_size_sums[-1],
             embedding_dim=oe_hidden_dim,
-            enable_tp=is_dp_attention_enabled(),
+            use_attn_tp_group=use_attn_tp_group,
         )
 
         self.oe_projection = nn.Parameter(
@@ -135,11 +138,20 @@ class NgramEmbedding(torch.nn.Module):
             or forward_batch.forward_mode.is_decode()
         ):
             ngram_embedding_info = forward_batch.ngram_embedding_info
+            # NGRAM_BS_GUARD: the ngram_info arrays can be shorter than
+            # forward_batch.batch_size in mixed/overlap batches; drive the req loop
+            # off the array length so the kernel never reads column_starts/req_lens
+            # out of bounds (cudaErrorIllegalAddress).
+            _ng_bs = min(
+                forward_batch.batch_size,
+                ngram_embedding_info.req_lens.shape[0],
+                ngram_embedding_info.column_starts.shape[0],
+            )
             torch.cumsum(
-                ngram_embedding_info.req_lens,
+                ngram_embedding_info.req_lens[:_ng_bs],
                 dim=0,
                 dtype=torch.int32,
-                out=self.exclusive_req_len_sums[1 : 1 + forward_batch.batch_size],
+                out=self.exclusive_req_len_sums[1 : 1 + _ng_bs],
             )
             compute_n_gram_ids(
                 ne_n=self.over_embedding_n,
@@ -148,13 +160,12 @@ class NgramEmbedding(torch.nn.Module):
                 ne_mods=self.oe_mods,
                 tokens=input_ids.to(torch.int32),
                 exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
-                exclusive_req_len_sums=self.exclusive_req_len_sums[
-                    : forward_batch.batch_size + 1
-                ],
+                exclusive_req_len_sums=self.exclusive_req_len_sums[: _ng_bs + 1],
                 ne_token_table=ngram_embedding_info.token_table,
-                row_indices=forward_batch.req_pool_indices,
-                column_starts=ngram_embedding_info.column_starts,
+                row_indices=forward_batch.req_pool_indices[:_ng_bs],
+                column_starts=ngram_embedding_info.column_starts[:_ng_bs],
                 n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                eos_token_id=self.eos_token_id,
             )
 
         # [13, seq_len, hidden_dim]

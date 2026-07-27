@@ -19,6 +19,10 @@ class TorchFlexAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.flex_attention = torch.compile(flex_attention, dynamic=True)
         torch._dynamo.config.cache_size_limit = 1024
         torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -66,10 +70,12 @@ class TorchFlexAttnBackend(AttentionBackend):
                     )
                 )
 
-    def _causal_mask(self, b, h, q_idx, kv_idx):
+    @staticmethod
+    def _causal_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 
-    def _decode_mask(self, b, h, q_idx, kv_idx):
+    @staticmethod
+    def _decode_mask(b, h, q_idx, kv_idx):
         return q_idx <= kv_idx
 
     def _run_flex_forward_extend(
@@ -248,7 +254,7 @@ class TorchFlexAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
@@ -266,9 +272,9 @@ class TorchFlexAttnBackend(AttentionBackend):
         self._run_flex_forward_extend(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
@@ -298,7 +304,7 @@ class TorchFlexAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
@@ -309,9 +315,9 @@ class TorchFlexAttnBackend(AttentionBackend):
         self._run_flex_forward_decode(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             scaling=layer.scaling,

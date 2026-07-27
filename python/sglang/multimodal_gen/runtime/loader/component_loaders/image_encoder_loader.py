@@ -2,6 +2,7 @@ from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import finalize_encoder_folding
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -30,7 +31,11 @@ class ImageEncoderLoader(TextEncoderLoader):
         return use_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str = "image_encoder",
+        cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -45,6 +50,9 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = server_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
+        # Keep the proposed fold group only if the encoder is wide enough
+        # (image encoders are small, so this normally reverts to replicated).
+        finalize_encoder_folding(encoder_config)
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
@@ -53,5 +61,9 @@ class ImageEncoderLoader(TextEncoderLoader):
             encoder_config,
             server_args,
             server_args.pipeline_config.image_encoder_precision,
-            cpu_offload_flag=server_args.image_encoder_cpu_offload,
+            cpu_offload_flag=(
+                cpu_offload_flag
+                if cpu_offload_flag is not None
+                else server_args.image_encoder_cpu_offload
+            ),
         )

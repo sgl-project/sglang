@@ -1,23 +1,21 @@
 from __future__ import annotations
 
-import functools
 import logging
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
     get_attn_cp_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
+)
+from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -26,6 +24,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -39,9 +38,29 @@ if TYPE_CHECKING:
 
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
-_LOCAL_ATTN_DP_SIZE: Optional[int] = None
-_LOCAL_ATTN_DP_RANK: Optional[int] = None
-_ENABLE_DP_ATTENTION_FLAG: bool = False
+
+
+def world_dp_gather_enabled() -> bool:
+    """Whether DP gathers should use expanded WORLD after joiner admission."""
+    dp = get_flags().dp
+    return dp.use_world_group_for_gather and not dp.joiner_skip_all_gather
+
+
+def enable_joiner_all_gather():
+    get_flags().dp.joiner_skip_all_gather = False
+
+
+def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK
+    _ATTN_DP_SIZE = new_dp_size
+    _ATTN_DP_RANK = new_dp_rank
+    get_flags().dp.use_world_group_for_gather = True
+    logger.debug(
+        "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
+        new_dp_size,
+        new_dp_rank,
+    )
+
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -69,8 +88,12 @@ class DpPaddingMode(IntEnum):
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
-        # to enable symmetric memory optimization (needed for NSA CP, etc.).
+        # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+            # fabricated-row conversion; other models keep mainline SUM_LEN.
+            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
+                return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -93,21 +116,35 @@ class DpPaddingMode(IntEnum):
 
 
 class _DpGatheredBufferWrapper:
+    """Facade for the DP gathered-buffer state: allocation metadata lives on
+    ``flags.dp`` (set once at initialize_dp_attention). The per-forward
+    sizing quartet stays as class attributes: the values are read inside
+    torch.compile-traced model code, and attribute-source ints get dynamo's
+    automatic-dynamic treatment, while contextvars are untraceable and dict
+    slots value-guard into the recompile limit (one recompile per distinct
+    size)."""
 
-    _hidden_size: int
-    _dtype: torch.dtype
-    _device: torch.device
-    _global_dp_buffer_len: int
-    _local_dp_buffer_len: int
-    _dp_max_padding: bool
-    _global_num_tokens: Optional[List[int]]
-    _is_extend_in_batch: bool
+    # Real defaults (not bare annotations): the sizing quartet is overwritten
+    # per-forward by set_dp_buffer_len, but callers that run before the first
+    # forward — notably the load-time mhc_pre prewarm, which has no ForwardBatch
+    # yet — read _dp_max_padding via is_allocation_symmetric(). A bare
+    # annotation creates no class attribute, so those reads raised
+    # AttributeError. Defaulting _dp_max_padding to False (non-symmetric) is
+    # safe for prewarm: it only JIT-compiles kernels and never enters a real
+    # all-reduce, so the symmetric pool is not needed there.
+    _global_dp_buffer_len: int = 0
+    _local_dp_buffer_len: int = 0
+    _dp_max_padding: bool = False
+    _global_num_tokens: Optional[List[int]] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-        cls._hidden_size = hidden_size
-        cls._dtype = dtype
-        cls._device = device
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        dp.buffer_hidden_size = hidden_size
+        dp.buffer_dtype = dtype
+        dp.buffer_device = device
 
     @classmethod
     def set_dp_buffer_len(
@@ -123,22 +160,28 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._global_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
+    def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
+        from sglang.srt.runtime_context import get_flags
+
+        dp = get_flags().dp
+        with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
@@ -151,28 +194,30 @@ class _DpGatheredBufferWrapper:
         return cls._local_dp_buffer_len
 
     @classmethod
+    def set_local_dp_buffer_len(cls, local_dp_buffer_len: int) -> None:
+        cls._local_dp_buffer_len = local_dp_buffer_len
+
+    @classmethod
     def get_dp_global_num_tokens(cls) -> List[int]:
         return cls._global_num_tokens
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
-        return cls._hidden_size
+        from sglang.srt.runtime_context import get_flags
+
+        return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-        return cls._dtype
+        from sglang.srt.runtime_context import get_flags
+
+        return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-        return cls._device
+        from sglang.srt.runtime_context import get_flags
 
-    @classmethod
-    def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
-        cls._is_extend_in_batch = is_extend_in_batch
-
-    @classmethod
-    def get_is_extend_in_batch(cls) -> bool:
-        return cls._is_extend_in_batch
+        return get_flags().dp.buffer_device
 
     @classmethod
     def is_dp_max_padding(cls) -> bool:
@@ -190,12 +235,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(group=group)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(group=group)
 
 
 def get_global_dp_buffer_len() -> int:
@@ -204,6 +249,10 @@ def get_global_dp_buffer_len() -> int:
 
 def get_local_dp_buffer_len() -> int:
     return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+
+
+def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
+    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
 
 
 def get_dp_global_num_tokens() -> List[int]:
@@ -223,11 +272,18 @@ def get_dp_device() -> torch.device:
 
 
 def set_is_extend_in_batch(is_extend_in_batch: bool):
-    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
+    # Sticky within the thread: every ForwardBatch construction writes it,
+    # graph runners force False around capture; readers are the EP
+    # dispatchers on the same (single) forward thread.
+    from sglang.srt.runtime_context import get_forward
+
+    get_forward().set("is_extend_in_batch", is_extend_in_batch)
 
 
 def get_is_extend_in_batch() -> bool:
-    return _DpGatheredBufferWrapper.get_is_extend_in_batch()
+    from sglang.srt.runtime_context import get_forward
+
+    return get_forward().is_extend_in_batch
 
 
 def is_dp_max_padding() -> bool:
@@ -248,24 +304,7 @@ def compute_dp_attention_world_info(
         # tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank
         attn_dp_rank = tp_rank // (attn_tp_size * attn_cp_size)
 
-    return attn_tp_rank, attn_tp_size, attn_dp_rank
-
-
-def compute_dp_attention_local_info(
-    enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
-):
-    if not enable_dp_attention:
-        return tp_rank, tp_size, 0
-
-    local_tp_size = moe_dense_tp_size if moe_dense_tp_size else tp_size
-    local_tp_rank = tp_rank % local_tp_size
-    local_dp_size = max(1, dp_size // (tp_size // local_tp_size))
-
-    local_attn_tp_size = local_tp_size // local_dp_size
-    local_attn_dp_rank = local_tp_rank // local_attn_tp_size
-    local_attn_tp_rank = local_tp_rank % local_attn_tp_size
-
-    return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
+    return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
 def initialize_dp_attention(
@@ -273,33 +312,28 @@ def initialize_dp_attention(
     model_config: ModelConfig,
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
-    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    dp = get_flags().dp
+    dp.max_len_with_idle = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
-    moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
-    _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    dp.enabled = enable_dp_attention
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
-    )
+    _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if enable_dp_attention:
-        _ATTN_DP_SIZE = dp_size
-        if moe_dense_tp_size is None:
-            _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
-        else:
-            _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
-    else:
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_SIZE = 1
+    if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
+        _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
+        if server_args.is_ep_scale_joiner:
+            dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
@@ -309,35 +343,11 @@ def initialize_dp_attention(
 
 
 def is_dp_attention_enabled() -> bool:
-    return _ENABLE_DP_ATTENTION_FLAG
+    return get_flags().dp.enabled
 
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
-
-
-def get_attention_tp_group() -> GroupCoordinator:
-    return get_attn_tp_group()
-
-
-def get_attention_tp_rank() -> int:
-    return get_attn_tensor_model_parallel_rank()
-
-
-def get_attention_tp_size() -> int:
-    return get_attn_tensor_model_parallel_world_size()
-
-
-def get_attention_cp_group() -> GroupCoordinator:
-    return get_attn_cp_group()
-
-
-def get_attention_cp_rank() -> int:
-    return get_attn_context_model_parallel_rank()
-
-
-def get_attention_cp_size() -> int:
-    return get_attn_context_model_parallel_world_size()
 
 
 def get_attention_dp_rank() -> int:
@@ -348,16 +358,6 @@ def get_attention_dp_rank() -> int:
 def get_attention_dp_size() -> int:
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
-
-
-def get_local_attention_dp_rank() -> int:
-    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_RANK
-
-
-def get_local_attention_dp_size() -> int:
-    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_SIZE
 
 
 @contextmanager
@@ -399,45 +399,24 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 
 
-@triton.jit
-def memcpy_triton_kernel(
-    dst_ptr,
-    src_ptr,
-    offset_ptr,
-    sz_ptr,
-    offset_src: tl.constexpr,
-    chunk_size,  # multiplied for offset and sz
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0).to(tl.int64)
-    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
-    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
-
-    start_index = pid * BLOCK_SIZE
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = start_index + offs < sz
-
-    if offset_src:
-        data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
-        tl.store(dst_ptr + start_index + offs, data, mask=mask)
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
     else:
-        data = tl.load(src_ptr + start_index + offs, mask=mask)
-        tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
 
 
-def prod(x):
-    return functools.reduce(lambda a, b: a * b, x, 1)
-
-
-def memcpy_triton(dst, src, dim, offset, sz, offset_src):
-    max_size = min(src.numel(), dst.numel())
-    assert dim == 0, "dim != 0 unsupported"
-    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
-    chunk_size = prod(src.shape[1:])
-    BLOCK_SIZE = 8192
-    grid = (triton.cdiv(max_size, BLOCK_SIZE),)
-
-    memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
 
 
 def _dp_gather_via_all_reduce(
@@ -452,7 +431,9 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+    if local_tokens.shape[0] > 0 and (
+        is_partial or get_attn_tensor_model_parallel_rank() == 0
+    ):
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
@@ -462,17 +443,24 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    NUM_GPUS_PER_NODE = 8
-    if (
-        not local_tokens.dtype.is_floating_point
-        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-    ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+    if world_dp_gather_enabled():
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        NUM_GPUS_PER_NODE = 8
+        if (
+            not local_tokens.dtype.is_floating_point
+            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+        ):
+            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -481,18 +469,106 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if get_attention_tp_size() == 1:
-        get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+    use_world = world_dp_gather_enabled()
+
+    if get_attn_tensor_model_parallel_world_size() == 1:
+        if use_world:
+            torch.distributed.all_gather_into_tensor(
+                global_tokens,
+                local_tokens,
+                group=torch.distributed.group.WORLD,
+            )
+        else:
+            get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
-        if get_attention_tp_rank() != 0:
+        if get_attn_tensor_model_parallel_rank() != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
-        get_attention_tp_rank()
-    ]
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    scattered_local_tokens = local_tokens.tensor_split(
+        get_attn_tensor_model_parallel_world_size()
+    )[get_attn_tensor_model_parallel_rank()]
+    get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if use_world:
+        torch.distributed.all_gather_into_tensor(
+            global_tokens,
+            scattered_local_tokens,
+            group=torch.distributed.group.WORLD,
+        )
+    else:
+        get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+
+
+# Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
+# rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
+# gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
+# tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
+_USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
+
+
+def is_dp_gatherv_active() -> bool:
+    """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
+    enabled and applicable to the CURRENT forward. Requires:
+      - env SGLANG_DP_USE_GATHERV (default off),
+      - supported layout (attn_tp_size==1, tp_size==dp_size),
+      - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
+        only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
+        gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
+        per-forward padding via _DpGatheredBufferWrapper.is_dp_max_padding() (set by
+        set_dp_buffer_len) keeps callers that lack a ForwardBatch (e.g.
+        dp_reduce_scatter_tensor) consistent."""
+    return (
+        _USE_DP_GATHERV
+        and not world_dp_gather_enabled()
+        and get_attn_tensor_model_parallel_world_size() == 1
+        and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and not _DpGatheredBufferWrapper.is_dp_max_padding()
+    )
+
+
+def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
+    """Per-rank CPU token counts for the buffer being gathered. The MoE gather
+    passes a ForwardBatch (global_num_tokens_cpu); the logits gather passes a
+    LogitsMetadata (global_num_tokens_for_logprob_cpu). Return the sizes that
+    match the LOCAL tensor for this context, or None to fall back."""
+    sizes = getattr(forward_batch, "global_num_tokens_for_logprob_cpu", None)
+    if sizes is None:
+        sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if sizes is None:
+        return None
+    try:
+        return [int(x) for x in sizes]
+    except (TypeError, ValueError):
+        return None
+
+
+def _dp_gather_via_all_gatherv(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    is_partial: bool,
+    sizes: List[int],
+):
+    # attn_tp_size == 1: each DP rank contributes exactly `sizes[rank]` rows.
+    # CRITICAL: the MoE downstream runs on the WHOLE `global_tokens` buffer
+    # (M = global_tokens.shape[0]), so the gather MUST fill every row. We pad
+    # each rank's local tensor up to sizes[rank] with zeros (matching the
+    # buffer's reserved per-rank slot) so sum(sizes) == buffer rows and there
+    # is no uninitialized tail for the MoE to read.
+    rank = get_attention_dp_rank()
+    local_rows = sizes[rank]
+    if local_tokens.shape[0] == local_rows:
+        local_real = local_tokens
+    elif local_tokens.shape[0] > local_rows:
+        local_real = local_tokens[:local_rows]
+    else:
+        local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
+        local_real[: local_tokens.shape[0]].copy_(local_tokens)
+    # sum(sizes) == global_tokens.shape[0] is guaranteed by the caller (else it
+    # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
+    # the gather writes directly into it -- avoids the previous extra full-buffer
+    # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
 def _dp_gather(
@@ -501,7 +577,33 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    if (
+        is_dp_gatherv_active()
+        and forward_batch.dp_padding_mode is not None
+        and not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
+        # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
+        # The buffer was sized from the ceil_align'd global_num_tokens stored via
+        # set_dp_buffer_len (forward_batch_info), so the authoritative sizes are
+        # get_dp_global_num_tokens() — the SAME source the reduce_scatterv combine
+        # uses (symmetric). _dp_gatherv_sizes() reads the raw (un-aligned, and for
+        # the MoE-gather context the logprob-token) counts, which do NOT match the
+        # buffer for prefill steps -> would force an all_reduce fallback.
+        # Prefer the buffer-aligned sizes; fall back to the per-batch sizes only
+        # if they happen to match (e.g. the logits gather path).
+        _gatherv_sizes = get_dp_global_num_tokens()
+        if _gatherv_sizes is None or sum(_gatherv_sizes) != global_tokens.shape[0]:
+            _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
+        if _gatherv_sizes is not None and sum(_gatherv_sizes) == global_tokens.shape[0]:
+            _dp_gather_via_all_gatherv(
+                global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
+            )
+            return
+    if (
+        forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+    ):
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -550,6 +652,14 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if is_dp_gatherv_active():
+        # Variable-length combine matching all_gatherv dispatch: scatter the
+        # global (sum_len) tensor back to per-rank token counts. Fall through to
+        # the default reduce-scatter path if per-rank sizes are unavailable.
+        sizes = get_dp_global_num_tokens()
+        if sizes is not None:
+            get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+            return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
@@ -557,28 +667,155 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
             get_tensor_model_parallel_world_size()
         )[get_tensor_model_parallel_rank()]
         get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
-        get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+        get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Two-batch-overlap (non-EP / DP TP-MoE) async gather + combine.
+#
+# The DP TP-MoE path (deepseek_v4) gathers local hidden -> a global buffer
+# before the experts and reduce-scatters back after. For TBO we run those two
+# collectives on a single shared comm stream (mirroring the mori dispatcher's
+# _comm_stream) and return a CUDA event, so the op engine can yield and let the
+# OTHER ubatch's attn+MoE compute run on the compute stream while this ubatch's
+# gather/combine proceeds on the comm stream. Both ubatches share ONE comm
+# stream -> their collectives serialize in-order (no concurrent-collective
+# deadlock on the RCCL communicator), each overlapping the other's compute.
+# ---------------------------------------------------------------------------
+def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
+    from sglang.srt.runtime_context import get_stream
+
+    return get_stream("dp_tbo_comm")
+
+
+# Persistent reusable CUDA events for non-EP DP TBO, keyed by (kind, subbatch).
+# CRITICAL: do NOT create a fresh event per gather/combine -- that is ~244 new
+# torch.cuda.Event per forward (61 layers x 2 ubatches x 2), and the HSA signal
+# pool is exhausted after a few hundred forwards -> HSA_STATUS_ERROR_OUT_OF_RESOURCES
+# ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
+# and just re-record it (mirrors the mori CommStreamPool event reuse).
+def _tbo_event(key) -> torch.cuda.Event:
+    from sglang.srt.runtime_context import get_resources
+
+    pool = get_resources().tbo_event_pool
+    ev = pool.get(key)
+    if ev is None:
+        ev = torch.cuda.Event()
+        pool[key] = ev
+    return ev
+
+
+def dp_gather_partial_async(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    event_key=("gather", 0),
+) -> torch.cuda.Event:
+    """Launch `dp_gather_partial` (all_gatherv) on the shared DP TBO comm stream;
+    re-record + return a PERSISTENT event (keyed by `event_key`) that fires when
+    the gather completes. Caller yields, then `compute_stream.wait_event(ev)`
+    before reading `global_tokens`."""
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    # Keep buffers alive across streams (caching allocator).
+    local_tokens.record_stream(comm)
+    global_tokens.record_stream(comm)
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)  # inputs were produced on the compute stream
+        dp_gather_partial(global_tokens, local_tokens, forward_batch)
+        ev.record(comm)
+    return ev
+
+
+# Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).
+# Reused across ALL layers (and forwards) so the caching allocator does not churn
+# a fresh per-layer `torch.empty` for the 8x DP-gather / combine buffers. That
+# churn (different sizes per forward x 2 ubatches x 61 layers, kept alive by the
+# comm-stream record_stream) ballooned `reserved` to ~270GB and tripped
+# HSA_STATUS_ERROR_OUT_OF_RESOURCES at large prefill chunks, even though the live
+# (allocated) working set was only ~10GB.
+_TBO_PERSIST_BUF: dict = {}
+
+
+def get_tbo_persistent_buffer(
+    key, rows: int, hidden: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """Return a [rows, hidden] view of a grow-only persistent buffer for `key`.
+    Reallocates only when the request exceeds the cached capacity / changes
+    dtype|hidden. Caller must treat the returned view as scratch (overwritten)."""
+    buf = _TBO_PERSIST_BUF.get(key)
+    cap = 0 if buf is None else buf.shape[0]
+    if buf is None or rows > cap or buf.shape[1] != hidden or buf.dtype != dtype:
+        new_rows = max(rows, cap)
+        buf = torch.empty((new_rows, hidden), dtype=dtype, device=device)
+        _TBO_PERSIST_BUF[key] = buf
+    return buf[:rows]
+
+
+def dp_reduce_scatterv_async(
+    output_local: torch.Tensor,
+    global_tokens: torch.Tensor,
+    sizes: List[int],
+    event_key=("combine", 0),
+) -> torch.cuda.Event:
+    """Launch the variable-length reduce_scatterv (combine) on the shared DP TBO
+    comm stream; re-record + return a PERSISTENT event (keyed by `event_key`).
+    Matches the gatherv (SUM_LEN) path."""
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)
+        get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)
+        ev.record(comm)
+    return ev
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attention_tp_group().reduce_scatter_tensor(output, input)
+    return get_attn_tp_group().reduce_scatter_tensor(output, input)
 
 
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attention_cp_group().reduce_scatter_tensor(output, input)
+    return get_attn_cp_group().reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
-    return get_attention_tp_group().all_reduce(input)
+    return get_attn_tp_group().all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attention_tp_group().all_gather_into_tensor(output, input)
+    return get_attn_tp_group().all_gather_into_tensor(output, input)
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_attention_cp_group().all_gather_into_tensor(output, input)
+    return get_attn_cp_group().all_gather_into_tensor(output, input)
+
+
+def get_moe_cp_group() -> GroupCoordinator:
+    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
+    return _get_moe_dp_group()
+
+
+def get_moe_cp_rank() -> int:
+    return _get_moe_dp_group().rank_in_group
+
+
+def get_moe_cp_size() -> int:
+    return _get_moe_dp_group().world_size
+
+
+def is_enable_moe_cp_allgather() -> bool:
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
+    from sglang.srt.runtime_context import get_server_args
+
+    sa = get_server_args()
+    return sa.attn_cp_size > sa.moe_dp_size
+
+
+def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return _get_moe_dp_group().all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-    return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)

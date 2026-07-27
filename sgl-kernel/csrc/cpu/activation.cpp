@@ -25,13 +25,8 @@ void act_and_mul_kernel_impl(
       int64_t d;
 #pragma GCC unroll 4
       for (d = 0; d <= dim - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        bVec y_bvec = bVec::loadu(input_other_ptr + d);
-        fVec y_fvec0, y_fvec1;
-        std::tie(y_fvec0, y_fvec1) = at::vec::convert_to_float(y_bvec);
+        auto [x_fvec0, x_fvec1] = load_float_vec2(input_ptr + d);
+        auto [y_fvec0, y_fvec1] = load_float_vec2(input_other_ptr + d);
 
         x_fvec0 = vf(x_fvec0);
         x_fvec1 = vf(x_fvec1);
@@ -39,8 +34,7 @@ void act_and_mul_kernel_impl(
         x_fvec0 = x_fvec0 * y_fvec0;
         x_fvec1 = x_fvec1 * y_fvec1;
 
-        x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_bvec.store(output_ptr + d);
+        convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(output_ptr + d);
       }
 #pragma GCC unroll 4
       for (; d < dim; ++d) {
@@ -52,12 +46,59 @@ void act_and_mul_kernel_impl(
   });
 }
 
+// input : [num_tokens, dim] contiguous
+// gate : [num_tokens, num_heads, head_dim] 2d or 3d, maybe strided
+template <typename scalar_t>
+void fused_sigmoid_mul_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ gate,
+    int64_t num_tokens,
+    int64_t dim,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t g_strideT,
+    int64_t g_strideH) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int64_t kVecSize = bVec::size();
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      const scalar_t* __restrict__ i_ptr = input + i * dim;
+      const scalar_t* __restrict__ g_ptr = gate + i * g_strideT;
+      scalar_t* __restrict__ o_ptr = output + i * dim;
+
+      for (int64_t h = 0; h < num_heads; ++h) {
+        const scalar_t* __restrict__ attn_ptr = i_ptr + h * head_dim;
+        const scalar_t* __restrict__ gate_ptr = g_ptr + h * g_strideH;
+        scalar_t* __restrict__ out_ptr = o_ptr + h * head_dim;
+
+        int64_t d = 0;
+#pragma GCC unroll 4
+        for (; d <= head_dim - kVecSize; d += kVecSize) {
+          auto [x_fvec0, x_fvec1] = load_float_vec2(attn_ptr + d);
+          auto [g_fvec0, g_fvec1] = load_float_vec2(gate_ptr + d);
+          x_fvec0 = x_fvec0 * fast_sigmoid(g_fvec0);
+          x_fvec1 = x_fvec1 * fast_sigmoid(g_fvec1);
+          convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1).store(out_ptr + d);
+        }
+#pragma GCC unroll 4
+        for (; d < head_dim; ++d) {
+          float x_val = static_cast<float>(attn_ptr[d]);
+          float g_val = static_cast<float>(gate_ptr[d]);
+          out_ptr[d] = static_cast<scalar_t>(x_val / (1.f + std::exp(-g_val)));
+        }
+      }
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
 at::Tensor silu_and_mul_cpu(at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -73,13 +114,12 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
         num_tokens,
         d,
         [](float x) { return x / (1.f + std::exp(-x)); },
-        [](Vec x) { return x / (Vec(1.f) + x.neg().exp()); });
+        [](Vec x) { return fast_silu(x); });
   });
   return out;
 }
 
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_tanh_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -111,7 +151,6 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input) {
 }
 
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
-  RECORD_FUNCTION("sgl-kernel::gelu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto sizes = input.sizes().vec();
   int64_t last_dim = input.ndimension() - 1;
   int64_t d = sizes[last_dim] / 2;
@@ -131,5 +170,43 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
         [inv_sqrt2](Vec x) { return Vec(0.5f) * x * (Vec(1.f) + (x * Vec(inv_sqrt2)).erf()); });
   });
 
+  return out;
+}
+
+at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace) {
+  CHECK_DIM(2, input);
+  const int64_t gate_dim = gate.dim();
+  TORCH_CHECK(gate_dim == 2 || gate_dim == 3, "gate must be a 2D or 3D tensor");
+  CHECK_CONTIGUOUS(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gate);
+
+  const auto st = input.scalar_type();
+  CHECK_EQ(gate.scalar_type(), st);
+
+  int64_t num_tokens = input.size(0);
+  int64_t d = input.size(1);
+
+  const bool is_gate_3d = gate_dim == 3;
+  int64_t num_heads = is_gate_3d ? gate.size(1) : 1;
+  int64_t head_dim = gate.size(-1);
+  CHECK_EQ(gate.size(0), num_tokens);
+  CHECK_EQ(d, num_heads * head_dim);
+
+  int64_t g_strideT = gate.stride(0);
+  int64_t g_strideH = is_gate_3d ? gate.stride(1) : 0;
+
+  at::Tensor out = inplace ? input : at::empty_like(input);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_sigmoid_mul", [&] {
+    fused_sigmoid_mul_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        gate.data_ptr<scalar_t>(),
+        num_tokens,
+        d,
+        num_heads,
+        head_dim,
+        g_strideT,
+        g_strideH);
+  });
   return out;
 }

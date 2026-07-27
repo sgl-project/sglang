@@ -106,22 +106,10 @@ def process_routed_experts_from_ret(
     return ret_item["meta_info"].get("routed_experts", None)
 
 
-def process_cached_tokens_details_from_ret(
-    ret_item: Dict[str, Any],
-    request: Union[
-        ChatCompletionRequest,
-        CompletionRequest,
-    ],
-) -> Optional[CachedTokensDetails]:
-    """Process cached tokens details from a ret item in non-streaming response."""
-    if not getattr(request, "return_cached_tokens_details", False):
-        return None
-
-    details = ret_item["meta_info"].get("cached_tokens_details", None)
-    if details is None:
-        return None
-
-    # Check if L3 storage fields are present
+def cached_tokens_details_from_dict(
+    details: Dict[str, Any],
+) -> CachedTokensDetails:
+    """Convert a raw cached_tokens_details dict to a CachedTokensDetails object."""
     if "storage" in details:
         return CachedTokensDetails(
             device=details.get("device", 0),
@@ -134,6 +122,24 @@ def process_cached_tokens_details_from_ret(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def process_cached_tokens_details_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[CachedTokensDetails]:
+    """Process cached tokens details from a ret item in non-streaming response."""
+    if not request.return_cached_tokens_details:
+        return None
+
+    details = ret_item["meta_info"].get("cached_tokens_details", None)
+    if details is None:
+        return None
+
+    return cached_tokens_details_from_dict(details)
 
 
 def convert_embeds_to_tensors(

@@ -57,8 +57,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             kwargs["videos"] = videos
         if audios:
             kwargs["audio"] = audios
-            kwargs["audio_kwargs"] = {}
+            kwargs.setdefault("audio_kwargs", {})
             kwargs["audio_kwargs"].setdefault("truncation", False)
+            if self.audio_config:
+                kwargs["audio_kwargs"].update(self.audio_config)
 
         processor = self._processor
         result = processor.__call__(
@@ -68,7 +70,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not getattr(self.server_args, "keep_mm_feature_on_device", False):
+        if not self.keep_mm_feature_on_device and not self.use_cuda_ipc:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
@@ -101,7 +103,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             input_text = f"{self.AUDIO_TOKEN}{input_text}"
             logger.info("Auto-prepended audio token")
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,

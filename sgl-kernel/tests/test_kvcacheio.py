@@ -13,7 +13,14 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
 )
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_cuda_version, is_hip
+
+# Skip entire module on CUDA 13.x — segfaults in transfer_kv kernel.
+# Reference failure: https://github.com/sgl-project/sglang/actions/runs/24600433057/job/71938317621?pr=23119
+pytestmark = pytest.mark.skipif(
+    get_cuda_version()[0] >= 13,
+    reason="test_kvcacheio segfaults on CUDA 13.x (sgl-kernel bug)",
+)
 
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):

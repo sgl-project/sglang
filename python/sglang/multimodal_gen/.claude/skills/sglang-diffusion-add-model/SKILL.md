@@ -31,7 +31,7 @@ This style is appropriate when:
 - **The new model's pre-processing can largely reuse existing stages** — e.g., a model that uses standard CLIP/T5 text encoding + standard latent preparation with minimal customization. In this case, `add_standard_t2i_stages()` or `add_standard_ti2i_stages()` may be all you need.
 - **A model-specific optimization needs to be extracted as a standalone stage** — e.g., a specialized encoding or conditioning step that benefits from being a separate stage for profiling, parallelism control, or reuse across multiple pipeline variants.
 
-See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stages`), `FluxPipeline`, `WanPipeline`.
+See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stages`), `FluxPipeline`, `WanPipeline`, `SanaPipeline`, `StableDiffusion3Pipeline`, and `ZImagePipeline`.
 
 ### How to Choose
 
@@ -64,6 +64,8 @@ See existing Modular examples: `QwenImagePipeline` (uses `add_standard_t2i_stage
 | Scheduler implementations | `python/sglang/multimodal_gen/runtime/models/schedulers/` |
 | Model/VAE/DiT configs | `python/sglang/multimodal_gen/configs/models/dits/`, `vaes/`, `encoders/` |
 | Central registry | `python/sglang/multimodal_gen/registry.py` |
+| Model component registry | `python/sglang/multimodal_gen/runtime/models/registry.py` |
+| Current support list | `docs_new/docs/sglang-diffusion/compatibility_matrix.mdx` |
 
 ---
 
@@ -92,7 +94,7 @@ Once you have the reference code, study it thoroughly:
 **Before creating any new files, check whether an existing pipeline or stage can be reused or extended.** Only create new pipelines/stages when the existing ones would require extensive modifications or when no similar implementation exists.
 
 Specifically:
-1. **Compare the new model's architecture against existing pipelines** (Flux, Wan, Qwen-Image, GLM-Image, HunyuanVideo, LTX, etc.). If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
+1. **Compare the new model's architecture against existing pipelines** before creating files. Current native families include LTX-2/2.3, HunyuanVideo/FastHunyuan, Wan/FastWan/TurboWan/LingBot World, MOVA, FLUX/FLUX.2/Klein, Z-Image, Qwen-Image/edit/layered, GLM-Image, SD3, Hunyuan3D, Helios, Cosmos3, SANA/SANA-WM, FireRed, ERNIE-Image, JoyAI, and Ideogram4. If the new model shares most of its structure with an existing one (e.g., same text encoders, similar latent format, compatible denoising loop), prefer:
    - Adding a new config variant to the existing pipeline rather than creating a new pipeline class
    - Reusing the existing `BeforeDenoisingStage` with minor parameter differences
    - Using `add_standard_t2i_stages()` / `add_standard_ti2i_stages()` / `add_standard_ti2v_stages()` if the model fits standard patterns
@@ -246,10 +248,14 @@ The `PipelineConfig` holds static model configuration and defines callback metho
 
 from dataclasses import dataclass, field
 
+import torch
+
+from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,      # for image generation
-    # SpatialImagePipelineConfig,  # alternative base
-    # VideoPipelineConfig,         # for video generation
+    ImagePipelineConfig,
+    ModelTaskType,
+    # PipelineConfig,              # common base for many video pipelines
+    # SpatialImagePipelineConfig,  # alternative base for spatial image models
 )
 from sglang.multimodal_gen.configs.models.dits.mymodel import MyModelDitConfig
 from sglang.multimodal_gen.configs.models.vaes.mymodel import MyModelVAEConfig
@@ -313,6 +319,11 @@ class MyModelPipelineConfig(ImagePipelineConfig):
         """Optional post-processing after VAE decoding."""
         return frames
 ```
+
+There is no separate `VideoPipelineConfig` base class. For video models, choose
+`ModelTaskType.T2V`, `ModelTaskType.I2V`, or `ModelTaskType.TI2V`, and follow
+existing video configs such as Wan, LTX, Hunyuan, Helios, or MOVA when deciding
+whether to subclass `PipelineConfig` directly or use a model-specific base.
 
 **Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods define what the DiT receives at each denoising step. These must match the DiT's `forward()` signature.
 
@@ -502,14 +513,22 @@ In `python/sglang/multimodal_gen/registry.py`, register your configs:
 
 ```python
 register_configs(
-    model_family="my_model",
     sampling_param_cls=MyModelSamplingParams,
     pipeline_config_cls=MyModelPipelineConfig,
     hf_model_paths=[
         "org/my-model-name",  # HuggingFace model ID(s)
     ],
+    model_detectors=[
+        lambda path: "my-model" in path.lower(),
+    ],
 )
 ```
+
+`register_configs()` does not take a `model_family` argument. It registers the
+sampling and pipeline config classes, then resolves models by exact
+`hf_model_paths` or optional detector predicates. Prefer exact `hf_model_paths`
+for public checkpoints used in docs or tests; use detector predicates only for
+families where local mirrors, renamed repos, or generated paths are common.
 
 The `EntryClass` in your pipeline file is automatically discovered by the registry's `_discover_and_register_pipelines()` function -- no additional registration needed for the pipeline class itself.
 
@@ -537,6 +556,11 @@ After implementation, **you must verify that the generated output is not noise**
 |-------|----------|---------------------|----------------|
 | GLM-Image | `runtime/pipelines/glm_image.py` | `stages/model_specific_stages/glm_image.py` | `configs/pipeline_configs/glm_image.py` |
 | Qwen-Image-Layered | `runtime/pipelines/qwen_image.py` (`QwenImageLayeredPipeline`) | `stages/model_specific_stages/qwen_image_layered.py` | `configs/pipeline_configs/qwen_image.py` (`QwenImageLayeredPipelineConfig`) |
+| Cosmos3 | `runtime/pipelines/cosmos3_pipeline.py` | `stages/model_specific_stages/cosmos3.py` | `configs/pipeline_configs/cosmos3.py` |
+| ErnieImage | `runtime/pipelines/ernie_image.py` | `stages/model_specific_stages/ernie_image_pe.py` | `configs/pipeline_configs/ernie_image.py` |
+| Hunyuan3D | `runtime/pipelines/hunyuan3d_pipeline.py` | `stages/model_specific_stages/hunyuan3d/` | `configs/pipeline_configs/hunyuan3d.py` |
+| SANA-WM | `runtime/pipelines/sana_wm_pipeline.py`, `sana_wm_realtime_pipeline.py` | `stages/model_specific_stages/sana_wm/` | `configs/pipeline_configs/sana_wm.py` |
+| LingBot World realtime | `runtime/pipelines/lingbot_world_causal_dmd_pipeline.py` | `stages/model_specific_stages/lingbot_world/` | `configs/pipeline_configs/lingbot_world.py` |
 
 ### Modular Style (when standard stages fit well)
 
@@ -545,6 +569,14 @@ After implementation, **you must verify that the generated output is not noise**
 | Qwen-Image (T2I) | `runtime/pipelines/qwen_image.py` | Uses `add_standard_t2i_stages()` — standard text encoding + latent prep fits this model |
 | Qwen-Image-Edit | `runtime/pipelines/qwen_image.py` | Uses `add_standard_ti2i_stages()` — standard image-to-image flow |
 | Flux | `runtime/pipelines/flux.py` | Uses `add_standard_t2i_stages()` with custom `prepare_mu` |
+| FLUX.2 / FLUX.2 Klein | `runtime/pipelines/flux_2.py`, `flux_2_klein.py` | Reuses FLUX.2 stages; Klein differences live in config and sampling params |
+| Z-Image | `runtime/pipelines/zimage_pipeline.py` | Uses standard image pipeline stages plus Z-Image-specific config/model code |
+| Ideogram4 | `runtime/pipelines/ideogram.py` | Uses dedicated text encoding and denoising stages while keeping standard latent prep |
+| SANA | `runtime/pipelines/sana.py` | Spatial image pipeline; reuse the spatial image config pattern |
+| Stable Diffusion 3/3.5 | `runtime/pipelines/stable_diffusion_3.py` | Spatial image pipeline; compare scheduler, VAE scale, and conditioning layout |
+| LTX-2 / LTX-2.3 | `runtime/pipelines/ltx_2_pipeline.py` | Video pipeline family with one-stage, two-stage, and HQ variants |
+| Helios | `runtime/pipelines/helios_pipeline.py` | Video pipeline family with custom denoising and decoding stages |
+| FireRed/JoyAI image edit | `runtime/pipelines/qwen_image.py`, `runtime/pipelines/joy_image.py` | FireRed reuses Qwen edit-plus config; JoyAI has its own edit pipeline |
 | Wan | `runtime/pipelines/wan_pipeline.py` | Uses `add_standard_ti2v_stages()` |
 
 ---
@@ -586,55 +618,9 @@ Before submitting, verify:
 
 ## After Implementation: Tests and Performance Data
 
-### Component Accuracy When Adding a New Testcase Config
-
-If you add a new entry to `python/sglang/multimodal_gen/test/server/testcase_configs.py`, you must treat component accuracy as part of the model-adding workflow. Do not assume the new testcase will automatically fit the existing component-accuracy harness.
-
-The component-accuracy harness compares SGLang components against Diffusers/HF reference components. This is stricter than pipeline-level inference. New testcase configs commonly fail here for one of three reasons:
-
-1. **The model family needs explicit hook wiring** in `python/sglang/multimodal_gen/test/server/accuracy_hooks.py`.
-   - Add hook logic only when the harness cannot call the raw component correctly without it.
-   - Valid examples:
-     - required forward arguments are missing from the synthetic input bundle
-     - a known runtime execution context must be matched for the component to run at all, such as transformer autocast
-     - the reference and SGLang expose the same component contract, but the harness needs family-specific input preparation to reach it
-   - Invalid examples:
-     - changing the compared output mode just to make shapes or values line up
-     - adding a harness-side behavior override that changes the component contract instead of matching it
-
-2. **The component is already covered by another testcase with the same source component and topology**.
-   - In that case, do not add redundant component-accuracy coverage.
-   - Add a skip entry in `python/sglang/multimodal_gen/test/server/accuracy_config.py` with a concrete reason such as:
-     - `Representative VAE accuracy is already covered by ... for the same source component and topology`
-   - This is the preferred path for variant-only cases such as LoRA, cache-dit, upscaling, or other testcases that reuse the same underlying component weights and topology.
-
-3. **The HF/Diffusers reference component cannot be loaded or compared faithfully in the harness**.
-   - Add a skip entry in `python/sglang/multimodal_gen/test/server/accuracy_config.py` with the exact technical failure.
-   - Good reasons include:
-     - missing or unsupported HF component layout
-     - incomplete or partially initialized HF checkpoint
-     - unsupported raw component contract for trustworthy comparison
-     - proven divergence after matched weight transfer and matching output shape
-   - Keep the skip reason concrete and technical. Do not write vague reasons like "component accuracy flaky" or "needs investigation."
-
-When adding a new testcase config, make this decision explicitly:
-- if the model family needs minimal harness wiring, add the smallest possible change in `accuracy_hooks.py`
-- if the testcase is only a variant of an already covered source component and topology, add a skip in `accuracy_config.py`
-- if the HF/Diffusers reference component cannot be compared faithfully, add a skip in `accuracy_config.py`
-
-Do not add a new testcase config and wait for CI to discover missing component-accuracy wiring. Do not use `accuracy_hooks.py` to change the compared component contract just to make the test pass.
-
-Once the model is working and output quality is verified, **ask the user** whether they would like to:
-
-1. **Add tests** — Create unit tests and/or integration tests for the new model. Tests should cover:
-   - Pipeline construction and stage wiring
-   - Single-GPU inference producing non-noise output
-   - Multi-GPU inference (TP/SP) if supported
-   - See the `write-sglang-test` skill for test conventions and placement guidelines
-
-2. **Generate performance data** — Run benchmarks and collect perf metrics:
-   - Single-GPU latency and throughput (look for `Pixel data generated successfully in xxxx seconds` in console output; use the `warmup excluded` line for accurate timing)
-   - Multi-GPU scaling (TP/SP) throughput comparison
-   - Use `python/sglang/multimodal_gen/benchmarks/bench_serving.py` for serving benchmarks
-
-Do not skip this step — always ask the user before proceeding, as test and benchmark requirements vary per model.
+After the model produces non-noise output, read
+[references/testing-and-accuracy.md](references/testing-and-accuracy.md) before
+adding GPU cases, component-accuracy skips/hooks, suite entries, or benchmark
+claims. That reference tracks the current `gpu_cases.py` / `testcase_configs.py`
+/ `accuracy_testcase_configs.py` / `run_suite.py` split and the component-accuracy
+decision rules.

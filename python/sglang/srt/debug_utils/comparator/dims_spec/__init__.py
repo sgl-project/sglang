@@ -7,8 +7,9 @@ from sglang.srt.debug_utils.comparator.dims_spec.dims_parser import (
 from sglang.srt.debug_utils.comparator.dims_spec.tensor_naming import (
     apply_dim_names,
     find_dim_index,
+    get_dim_names,
     resolve_dim_by_name,
-    strip_dim_names,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.dims_spec.types import (
     _FUSED_NAME_SEP,
@@ -41,9 +42,10 @@ __all__ = [
     "_SingletonDimUtil",
     "apply_dim_names",
     "find_dim_index",
+    "get_dim_names",
     "parse_dim",
     "parse_dims",
     "resolve_dim_by_name",
     "resolve_dim_names",
-    "strip_dim_names",
+    "without_dim_names",
 ]

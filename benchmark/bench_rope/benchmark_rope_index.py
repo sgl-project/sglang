@@ -269,7 +269,7 @@ def benchmark_rope_index(
         seed=seed,
     )
 
-    # Smoke test
+    # Validate output shapes before benchmarking.
     has_mm = (image_grid_thw is not None) or (video_grid_thw is not None)
     if has_mm:
         pos, delta = MRotaryEmbedding.get_rope_index_glm4v(

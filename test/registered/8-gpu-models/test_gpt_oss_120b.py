@@ -26,14 +26,14 @@ class TestGptOss120B(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=200",
+            "--cuda-graph-max-bs-decode=200",
             "--mem-fraction-static=0.93",
         ]
         # Lower batch size for EAGLE3 variants to avoid OOM
         base_args_eagle3 = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=100",
+            "--cuda-graph-max-bs-decode=100",
             "--mem-fraction-static=0.85",
         ]
         parser_args = [
@@ -48,7 +48,6 @@ class TestGptOss120B(unittest.TestCase):
             "--speculative-num-draft-tokens=4",
         ]
         eagle3_env = {
-            "SGLANG_ENABLE_SPEC_V2": "1",
             "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
         }
 

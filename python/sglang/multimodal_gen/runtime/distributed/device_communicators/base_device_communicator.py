@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/base_device_communicator.py
 
 from typing import Any
@@ -133,6 +134,10 @@ class DistributedAutograd:
 
             if scatter_dim == 2 and gather_dim == 1:
                 bs, shard_seqlen, hn, hd = input_.shape
+                assert hn % world_size == 0, (
+                    f"head dimension ({hn}) must be divisible by sequence "
+                    f"parallel world size ({world_size})"
+                )
                 seqlen = shard_seqlen * world_size
                 shard_hn = hn // world_size
 
@@ -154,6 +159,10 @@ class DistributedAutograd:
                 return output
             elif scatter_dim == 1 and gather_dim == 2:
                 bs, seqlen, shard_hn, hd = input_.shape
+                assert seqlen % world_size == 0, (
+                    f"sequence dimension ({seqlen}) must be divisible by sequence "
+                    f"parallel world size ({world_size})"
+                )
                 hn = shard_hn * world_size
                 shard_seqlen = seqlen // world_size
 

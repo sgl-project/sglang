@@ -6,10 +6,6 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -22,7 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -45,9 +41,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         self.pp_group = get_pp_group()
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -73,7 +69,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -87,7 +83,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.capture_aux_hidden_states = False
 
     def determine_num_fused_shared_experts(self):
-        if get_global_server_args().disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
@@ -97,13 +93,18 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_moe_expert_parallel_world_size() > 1:
+        elif get_parallel().moe_ep_size > 1:
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
 
         if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
+            from sglang.srt.arg_groups.overrides import declare_load_time_override
+
+            declare_load_time_override(
+                "Glm4vMoeForConditionalGeneration.determine_num_fused_shared_experts",
+                {"disable_shared_experts_fusion": True},
+            )
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

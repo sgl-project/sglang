@@ -30,7 +30,7 @@ class TestNpuApi(CustomTestCase):
     """Testcase: Verify that the basic functions of the API interfaces work properly and the returned parameters are consistent with the configurations.
 
     [Test Category] Interface
-    [Test Target] /health; /health_generate; /ping; /model_info; /server_info; /get_load; /v1/models; /v1/models/{model:path}; /generate
+    [Test Target] /health; /health_generate; /ping; /model_info; /server_info; /v1/loads; /v1/models; /v1/models/{model:path}; /generate
     """
 
     @classmethod
@@ -90,15 +90,18 @@ class TestNpuApi(CustomTestCase):
         self.assertEqual(response.json()["model_path"], self.model)
         self.assertEqual(response.json()["tokenizer_path"], self.model)
 
-    def test_api_get_load(self):
-        response = requests.get(f"{self.base_url}/get_load")
+    def test_api_v1_loads(self):
+        response = requests.get(f"{self.base_url}/v1/loads")
         self.assertEqual(response.status_code, 200)
-        self.assertIsNone(response.json()[0]["rid"])
-        self.assertIsNone(response.json()[0]["http_worker_ipc"])
-        self.assertIsNone(response.json()[0]["dp_rank"])
-        self.assertGreaterEqual(response.json()[0]["num_reqs"], 0)
-        self.assertGreaterEqual(response.json()[0]["num_waiting_reqs"], 0)
-        self.assertGreaterEqual(response.json()[0]["num_tokens"], 0)
+        body = response.json()
+        self.assertIn("loads", body)
+        self.assertIn("aggregate", body)
+        self.assertGreaterEqual(len(body["loads"]), 1)
+        load = body["loads"][0]
+        self.assertGreaterEqual(load["num_running_reqs"], 0)
+        self.assertGreaterEqual(load["num_waiting_reqs"], 0)
+        self.assertGreaterEqual(load["num_used_tokens"], 0)
+        self.assertGreaterEqual(load["num_total_tokens"], 0)
 
     def test_api_v1_models(self):
         response = requests.get(f"{self.base_url}/v1/models")

@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smg-gateway-pd
+  namespace: smg-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smg-gateway-pd
+  template:
+    metadata:
+      labels:
+        app: smg-gateway-pd
+    spec:
+      serviceAccountName: smg-gateway
+      containers:
+        - name: gateway
+          image: smg-gateway:test
+          imagePullPolicy: Never
+          args:
+            - "--service-discovery"
+            - "--pd-disaggregation"
+            - "--prefill-selector"
+            - "role=prefill"
+            - "--decode-selector"
+            - "role=decode"
+            - "--service-discovery-port"
+            - "8000"
+            - "--service-discovery-namespace"
+            - "smg-test"
+            - "--port"
+            - "30001"
+            - "--prometheus-port"
+            - "29001"
+            - "--disable-health-check"
+            - "--worker-startup-timeout-secs"
+            - "30"
+            - "--log-level"
+            - "debug"
+          ports:
+            - containerPort: 30001
+              name: http
+            - containerPort: 29001
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /liveness
+              port: 30001
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 30001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smg-gateway-pd
+  namespace: smg-test
+spec:
+  type: NodePort
+  selector:
+    app: smg-gateway-pd
+  ports:
+    - name: http
+      port: 30001
+      targetPort: 30001
+    - name: metrics
+      port: 29001
+      targetPort: 29001

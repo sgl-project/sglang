@@ -57,7 +57,6 @@ class TestQwen35(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args + dp_args + mtp_args,
                 variant="TP8+DP8+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

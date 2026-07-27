@@ -1,5 +1,10 @@
 import sys
 from io import StringIO
+from pathlib import Path
+
+_TEST_ROOT: Path = Path(__file__).resolve().parents[3]
+if str(_TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TEST_ROOT))
 
 import pytest
 from registered.debug_utils.comparator.testing_helpers import (
@@ -55,7 +60,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 
 
 def _render_rich(renderable: object) -> str:

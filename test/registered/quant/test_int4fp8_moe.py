@@ -9,7 +9,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_amd_ci(est_time=313, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=313, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestMixtralAccuracy(CustomTestCase):
@@ -27,7 +27,6 @@ class TestMixtralAccuracy(CustomTestCase):
             "38768",
             "--quantization",
             "quark_int4fp8_moe",
-            # The default aiter attention backend raises segmentation faults and other errors - as quark_int4fp8_moe is not related to attention, let's just use triton here.
             "--attention-backend",
             "triton",
         ]
@@ -57,3 +56,9 @@ class TestMixtralAccuracy(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.56)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

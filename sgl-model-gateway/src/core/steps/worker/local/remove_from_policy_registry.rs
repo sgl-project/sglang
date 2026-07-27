@@ -38,10 +38,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             let model_id = worker.model_id().to_string();
             let worker_url = worker.url();
 
-            // Remove from cache-aware policy
+            // Remove from cache-aware policy (model_policies; covers the regular Router)
             app_context
                 .policy_registry
                 .remove_worker_from_cache_aware(&model_id, worker_url);
+
+            // PD mode keeps prefill/decode cache-aware policies separate from
+            // model_policies, so also drop the worker from the matching pool's policy.
+            app_context
+                .policy_registry
+                .remove_pd_worker_from_cache_aware(worker.as_ref());
 
             // Notify policy registry
             app_context.policy_registry.on_worker_removed(&model_id);
