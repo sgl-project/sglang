@@ -66,6 +66,7 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     generate_name_candidates,
     initialize_parallel_runtime,
     load_checkpoint_weights,
+    load_param_with_weight_loader,
     materialize_module,
     read_json_file,
     resolve_text_encoder_forward_module,
@@ -498,7 +499,13 @@ class AccuracyEngine:
                 shard_context.world_size if shard_context is not None else tp_world
             )
             shard_rank = shard_context.rank if shard_context is not None else rank
-            if copy_tensor(tensor, src_tensor, shard_world_size, shard_rank):
+            # TP-sharded params must load via their own weight_loader; the
+            # generic narrow mis-slices fused QKV/gate_up projections.
+            if shard_world_size > 1 and load_param_with_weight_loader(
+                tensor, name, lookup, reverse_mapping
+            ):
+                matched += 1
+            elif copy_tensor(tensor, src_tensor, shard_world_size, shard_rank):
                 matched += 1
             else:
                 unmatched_details.append(

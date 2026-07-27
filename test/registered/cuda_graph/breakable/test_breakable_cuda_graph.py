@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 # CI Registration — large suite to fit the integration test's server startup.
 register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
 class TestBreakableCUDAGraphBasic(CustomTestCase):
@@ -167,6 +167,28 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
+
+    def test_eager_output_is_held_strongly_for_replay_bridge(self):
+        """The replay closure must keep the eager output bridge buffer alive."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def scale(src):
+            return src * 3.0
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream):
+            t = x + 1.0
+            broken = scale(t)
+            y.copy_(broken)
+
+        replay_closure = graph._break_fns[0].__closure__ or ()
+        self.assertTrue(
+            any(cell.cell_contents is broken for cell in replay_closure),
+            "eager output bridge buffer must be strongly captured",
+        )
 
 
 class TestCopyOutput(CustomTestCase):

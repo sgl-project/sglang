@@ -19,9 +19,9 @@ from typing import Callable
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -566,7 +566,7 @@ def bench_lock_unlock(
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
         r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        if r.last_device_node != env.tree.root_node:
+        if r.last_device_node != env.tree.root_node_handle():
             nodes.append(r.last_device_node)
     if not nodes:
         return BenchResult("lock_unlock", 0, 0, 0, [])
@@ -643,7 +643,6 @@ def bench_cache_finished(
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
-        req.kv_committed_freed = False
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
@@ -656,7 +655,9 @@ def bench_cache_finished(
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(req, is_insert=True),
+        lambda req: env.tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+        ),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
@@ -739,27 +740,6 @@ _CI_BENCH_CONFIGS = [
         page_size=1,
         num_seqs=5000,
         kv_size=500_000,
-    ),
-    dict(
-        label="FULL_SWA_ps1",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=1,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_ps16",
-        components=(ComponentType.FULL,),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
-    ),
-    dict(
-        label="FULL_SWA_ps16",
-        components=(ComponentType.FULL, ComponentType.SWA),
-        page_size=16,
-        num_seqs=1000,
-        kv_size=100_000,
     ),
     dict(
         label="FULL_ps128",

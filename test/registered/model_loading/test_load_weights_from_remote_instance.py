@@ -302,7 +302,7 @@ def test_load_weights_from_remote_instance(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 

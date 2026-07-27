@@ -24,6 +24,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+
 # Detect whether the current forward pass is in capture mode.
 is_capture_mode = False
 
@@ -33,7 +37,7 @@ _capture_lora_variant: Optional[str] = None
 
 
 def get_is_capture_mode() -> bool:
-    return is_capture_mode
+    return is_capture_mode or is_in_breakable_cuda_graph()
 
 
 def compile_in_capture_mode(func):
@@ -62,8 +66,13 @@ def _set_capture_lora_variant(variant: Optional[str]) -> None:
 @contextmanager
 def model_capture_mode():
     global is_capture_mode
+    from sglang.srt.runtime_context import get_flags
+
+    # Disable dispose_tensor() during capture: freeing mid-capture records data_ptr()==0 into the graph.
     is_capture_mode = True
+    get_flags().capture.disable_dispose_tensor = True
     try:
         yield
     finally:
         is_capture_mode = False
+        get_flags().capture.disable_dispose_tensor = False

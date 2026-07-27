@@ -1,4 +1,4 @@
-"""Stage-a basic sanity: small-but-broad server smoke that downstream
+"""Stage-a basic sanity: small-but-broad server coverage that downstream
 stages depend on. Multiple sanity-kit mixins driving one shared server,
 covering protocol, decode correctness, scheduler stress, occupancy, and
 hellaswag accuracy."""

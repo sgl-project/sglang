@@ -112,6 +112,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
 
+    # Slot-conservation views for the leak invariant. On the non-shared allocator
+    # the static budget IS physical (conserve == physical); the shared composite
+    # overrides these with the static-cap view.
+    def _conserve_full_available_size(self):
+        return self.full_available_size()
+
+    def _conserve_swa_available_size(self):
+        return self.swa_available_size()
+
     @property
     def size(self):
         return min(self._size_full, self._size_swa)
@@ -366,6 +375,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(state) == 2
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
+
+    def resize(self, config) -> None:
+        size_full = int(config.full_max_total_num_tokens)
+        size_swa = int(config.swa_max_total_num_tokens)
+        self._size_full = size_full
+        self._size_swa = size_swa
+        for alloc, sz in (
+            (self.full_attn_allocator, size_full),
+            (self.swa_attn_allocator, size_swa),
+        ):
+            alloc.size = int(sz)
+            if self.page_size > 1:
+                alloc.num_pages = int(sz) // self.page_size
+        self.clear()
 
     def clear(self):
         self.swa_attn_allocator.clear()
