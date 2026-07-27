@@ -16,6 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from functools import cache
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -44,6 +45,26 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+@cache
+def _timing_events_supported() -> bool:
+    try:
+        device_module.Event(enable_timing=True)
+        return True
+    except (TypeError, NotImplementedError):
+        logger.warning(
+            "%s.Event does not support enable_timing=True; load-back "
+            "duration metric will be skipped on this backend.",
+            device_module.__name__,
+        )
+        return False
+
+
+def make_timing_event_pair():
+    timing_enabled = _timing_events_supported()
+    kwargs = {"enable_timing": True} if timing_enabled else {}
+    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
 
 
 class LayerLoadingEvent:
@@ -140,6 +161,8 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
+    num_tokens: int = 0
+    timing_enabled: bool = False
 
 
 class StorageOperation:
@@ -147,7 +170,7 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
@@ -171,7 +194,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -180,9 +202,10 @@ class PrefetchOperation(StorageOperation):
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -351,6 +374,7 @@ class HiCacheController:
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
 
+        self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
         self.prefetch_revoke_queue: Queue[str] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
@@ -629,6 +653,7 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
@@ -767,8 +792,11 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            ack_start_event.record()
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
@@ -786,6 +814,7 @@ class HiCacheController:
                         self.io_backend,
                     )
                 producer_event.complete(i)
+            ack_finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -796,9 +825,11 @@ class HiCacheController:
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=producer_event.start_event,
-                finish_event=producer_event.finish_event,
+                start_event=ack_start_event,
+                finish_event=ack_finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=timing_enabled,
             )
         )
         return producer_id
@@ -869,7 +900,6 @@ class HiCacheController:
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -878,7 +908,7 @@ class HiCacheController:
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1028,7 +1058,10 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
+                if operation.is_terminated():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1040,23 +1073,16 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    # Record hit count, so the scheduler thread will know the exact memory to allocate
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
-                    self.prefetch_buffer.put(operation)
+                    operation.storage_hit_count = storage_hit_count
+                    self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue

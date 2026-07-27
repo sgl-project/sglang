@@ -52,6 +52,7 @@ def _make_sampling_info(batch_size, vocab_size, device="cuda"):
         top_ks=torch.zeros(batch_size, device=device, dtype=torch.int32),
         min_ps=torch.zeros(batch_size, device=device),
         is_all_greedy=True,
+        is_any_greedy=True,
         need_top_p_sampling=False,
         need_top_k_sampling=False,
         need_min_p_sampling=False,

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
@@ -69,7 +70,6 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
