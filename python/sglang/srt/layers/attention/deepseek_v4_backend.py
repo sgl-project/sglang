@@ -582,20 +582,14 @@ class DeepseekV4AttnBackend(
     def _compute_live_prefix_metadata_supported(self) -> bool:
         """Whether this backend's verify consumers bound metadata reads.
 
-        The default DeepGEMM indexer and JIT top-k v1/v2 paths bound page-table
-        reads by the live C4 length. Native FlashMLA bounds C128 address
-        generation by ``extra_topk_length``. The nonpaged indexer only serves
-        ordinary EXTEND batches, while alternative target-verify consumers are
-        excluded below until their undefined-tail behavior is verified.
-
-        Every term here is frozen for the backend's lifetime, so this resolves
-        once in ``__init__`` rather than re-reading four env vars per forward.
+        The DeepGEMM indexer and top-k v1/v2 bound page-table reads by the live
+        C4 length, native FlashMLA bounds C128 addresses by ``extra_topk_length``,
+        and the nonpaged indexer is EXTEND-only; consumers that may not are
+        excluded below. All terms are frozen, so this resolves once in
+        ``__init__``.
         """
         return (
-            # No _is_cuda term: is_sm100_supported() short-circuits to False
-            # when is_cuda() is False, so _is_sm100 already implies it. _is_xpu
-            # is not implied -- it reports process capability, not the selected
-            # device, so a dual-stack host can satisfy both.
+            # _is_sm100 implies _is_cuda; _is_xpu is process-wide, so it doesn't.
             _is_sm100
             and not _is_xpu
             and self.hisparse_coordinator is None
