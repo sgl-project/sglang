@@ -1032,7 +1032,7 @@ class TestChunkedSGMV(unittest.TestCase):
         backend = ChunkedSgmvLoRABackend(
             max_loras_per_batch=5, device=self.device, server_args=mock_server_args
         )
-        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_bs=1)
+        backend.init_cuda_graph_batch_info(max_bs_in_cuda_graph=8, num_tokens_per_req=1)
 
         lora_ranks = [8] * 5
         scalings = [1.0] * 5
