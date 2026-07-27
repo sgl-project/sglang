@@ -92,13 +92,15 @@ sgl-eval run mmmu_pro \\
   ],
 
   dockerImages: {
-    // lmsysorg/sglang:latest (cu13, multi-arch amd64+arm64) covers H200 + all
-    // Blackwell (incl. sm_103 B300/GB300 and Grace arm64).
-    b200: "lmsysorg/sglang:latest",
-    b300: "lmsysorg/sglang:latest",
-    gb200: "lmsysorg/sglang:latest",
-    gb300: "lmsysorg/sglang:latest",
-    h200: "lmsysorg/sglang:latest",
+    // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
+    // (B300/GB300) + Grace arm64 builds; cu12 is the Hopper/CUDA-12 build;
+    // dev-minimax-m3 is the rolling default. M3 model support is not yet in a
+    // tagged release, so :latest cannot serve it.
+    b200: "lmsysorg/sglang:dev-minimax-m3",
+    b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    gb300: "lmsysorg/sglang:dev-cu13-minimax-m3",
+    h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
@@ -198,7 +200,7 @@ sgl-eval run mmmu_pro \\
   // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
   // SM100 auto-defaults on current main, so this is also the bare-launch
   // behavior; they engage MiniMax's MSA sparse-attention kernel (fmha_sm100,
-  // pre-installed in lmsysorg/sglang:latest; see Configuration Tips), Triton
+  // pre-installed in the dev-minimax-m3 images; see Configuration Tips), Triton
   // fallback otherwise.
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
