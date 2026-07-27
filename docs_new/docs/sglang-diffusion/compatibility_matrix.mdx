@@ -184,9 +184,9 @@ non-streaming Chat Completions API or offline `GenerationResult.text`. Masks,
 multiple image inputs, sequence/CFG parallelism, Cache-DiT, and layer-wise
 offload are not supported. Dynamic batching supports compatible single-output
 pure T2I requests on the baseline `BagelPipeline`; Thinking, editing, and
-Understanding remain singleton-only. TP=2 shards the BAGEL attention, MLP,
-token embedding, and optional language head; the VAE, vision encoder, and small
-auxiliary projections remain replicated. BAGEL's request-level native
+Understanding remain singleton-only. BAGEL is supported and validated only
+with TP=1; multi-GPU tensor parallelism is outside the current support scope.
+BAGEL's request-level native
 TaylorSeer is available for T2I, Thinking, and editing, but not Understanding;
 it is independent of the unsupported generic Cache-DiT path. On SM100, the
 vision encoder uses FA4 for inputs with at least 2,500 patches when FA4 CUTE is

@@ -22,7 +22,8 @@ offload. Dynamic batching is supported only for compatible pure T2I requests on
 the baseline `BagelPipeline`; Thinking, Editing, and Understanding remain
 singleton-only. Native TaylorSeer is separate from Cache-DiT and is supported by
 T2I, Thinking, and Editing; Understanding rejects it because that pipeline does
-not denoise images. Transformer tensor parallelism is validated at TP=2.
+not denoise images. This integration is supported and validated only with TP=1;
+multi-GPU tensor parallelism is outside the current support scope.
 </Warning>
 
 <Note>
@@ -45,7 +46,7 @@ supported.
 - Install SGLang Diffusion by following the
   [installation guide](/docs/sglang-diffusion/installation).
 - Use one NVIDIA CUDA GPU with enough memory for the BF16 checkpoint and the
-  requested image resolution, or two GPUs with TP=2.
+  requested image resolution.
 - Use the official `ByteDance-Seed/BAGEL-7B-MoT` checkpoint. The examples pin a
   checkpoint revision for reproducibility.
 
@@ -142,19 +143,18 @@ a one-time compilation cost. Repeated requests reuse the compiled kernel. The
 component override affects only the vision encoder; the BAGEL transformer keeps
 its independently selected attention backend.
 
-## Use tensor parallelism
+## Single-GPU execution
 
-All four BAGEL pipeline variants support TP=2. Transformer attention, MLP, token
-embedding, and the optional language head are sharded; the VAE, vision encoder,
-and small auxiliary projections remain replicated. Add the same flags to any
-server command above:
+All four BAGEL pipeline variants are supported with TP=1. Multi-GPU tensor
+parallelism is not part of the current validated support scope. The explicit
+equivalent of the default server configuration is:
 
 ```bash
 sglang serve \
   --model-path ByteDance-Seed/BAGEL-7B-MoT \
   --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
-  --num-gpus 2 \
-  --tp-size 2 \
+  --num-gpus 1 \
+  --tp-size 1 \
   --port 30000
 ```
 
@@ -567,8 +567,8 @@ if __name__ == "__main__":
     main()
 ```
 
-`input.png` is required only for Editing and Understanding. To use TP=2, set
-both `num_gpus=2` and `tp_size=2`. Set
+`input.png` is required only for Editing and Understanding. Keep
+`num_gpus=1` and `tp_size=1`. Set
 `REQUESTS[MODE]["enable_taylorseer"] = True` for a selected T2I, Thinking, or
 Editing request when native TaylorSeer acceleration is wanted.
 
