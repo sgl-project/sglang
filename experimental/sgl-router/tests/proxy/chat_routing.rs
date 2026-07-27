@@ -43,6 +43,7 @@ fn config_for(_worker_url: &str) -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     }
 }
 
