@@ -236,6 +236,28 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     decoded.rids = h.rids.iter().map(|r| RidHash::from_rid(r)).collect();
 
     let n = h.rids.len();
+    // Every column must agree with `rids`. A SHORT column contributes nothing to
+    // `base`, so the `base != data.len()` check below cannot see it: a short
+    // `tok_lens` delivered a 200 with an empty completion, and a short
+    // `finish_reasons` dropped the terminal marker so the request never completed
+    // and its unary drain pended forever. The producer already asserts this for the
+    // extras columns; the four core ones were unchecked.
+    if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+        return decoded;
+    }
+    // The per-request extras columns are either absent (no request asked) or one
+    // entry per request — never partial.
+    let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
+    if !per_req_ok(&h.out_lp_lens)
+        || !per_req_ok(&h.in_lp_lens)
+        || !per_req_ok(&h.out_top_reqlens)
+        || !per_req_ok(&h.in_top_reqlens)
+        || !per_req_ok(&h.out_tid_reqlens)
+        || !per_req_ok(&h.in_tid_reqlens)
+        || !per_req_ok(&h.hidden_reqlens)
+    {
+        return decoded;
+    }
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
 
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
