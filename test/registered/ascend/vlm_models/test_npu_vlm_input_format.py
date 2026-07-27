@@ -24,7 +24,7 @@ from sglang.test.ascend.test_ascend_utils import (
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
@@ -44,7 +44,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_npu, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
-register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
+register_npu_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = IMAGE_MAN_IRONING_PATH
 IMAGE_SGL_LOGO_URL = IMAGE_SGL_LOGO_PATH
