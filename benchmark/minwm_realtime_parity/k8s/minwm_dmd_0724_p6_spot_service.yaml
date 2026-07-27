@@ -119,7 +119,7 @@ metadata:
     seedleap.ai/checkpoint-source: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-    seedleap.ai/sglang-git-ref: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
+    seedleap.ai/sglang-git-ref: 58ba27529903c4b62f3a32a80b50878c8b674922
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -146,7 +146,7 @@ spec:
         instrumentation.opentelemetry.io/inject-python: "false"
         seedleap.ai/checkpoint: global_step_011000
         seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-        seedleap.ai/sglang-git-ref: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
+        seedleap.ai/sglang-git-ref: 58ba27529903c4b62f3a32a80b50878c8b674922
     spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 60
@@ -185,7 +185,7 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
+              value: 58ba27529903c4b62f3a32a80b50878c8b674922
             - name: MINWM_CHECKPOINT
               value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
             - name: MINWM_CHECKPOINT_SOURCE
@@ -257,7 +257,6 @@ spec:
               mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
               WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
-              sed -i '/const server = params.get("server");/{n;s|if (server) $("serverUrl").value = server;|if (server) $("serverUrl").value = server; else $("serverUrl").value = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:30000/v1/realtime_video/generate`;|;}' "${WEBUI_DIR}/app.js"
               # sink=9/window=18 is a bounded serving preset supported by both
               # LingBot and MinWM. Exact MinWM full-history parity tests omit
               # these request overrides in the benchmark harness.
@@ -275,8 +274,7 @@ spec:
                 -e 's/<b>25 fps<\/b> target/<b>24 fps<\/b> target/' \
                 -e 's/<div class="section-title">LingBot<\/div>/<div class="section-title">MinWM<\/div>/' \
                 "${WEBUI_DIR}/index.html"
-              python3 -m http.server 18080 --bind 0.0.0.0 \
-                --directory "${WEBUI_DIR}" >/tmp/minwm-webui.log 2>&1 &
+              python3 "${WEBUI_DIR}/server.py" >/tmp/minwm-webui.log 2>&1 &
 
               # Keep Bash as PID 1. SGLang's worker orphan guard intentionally
               # SIGKILLs itself when its parent PID is 1, so `exec sglang`
@@ -382,12 +380,6 @@ spec:
   type: LoadBalancer
   loadBalancerClass: eks.amazonaws.com/nlb
   allocateLoadBalancerNodePorts: false
-  loadBalancerSourceRanges:
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-    # Company egress ranges, aligned with lingbot2-h200-public.
-    - 5.34.217.44/32
-    - 45.8.204.4/32
   selector:
     app: minwm-dmd-0724-p6
   ports:
@@ -398,4 +390,76 @@ spec:
     - name: api
       port: 30000
       targetPort: api
+      protocol: TCP
+---
+# Open internal entry point. There is intentionally no
+# loadBalancerSourceRanges: routability to the VPC remains the access boundary.
+# This separate Service avoids mutating the legacy NLB security group, because
+# the EKS Auto Mode load-balancing role currently lacks ec2:DeleteTags.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-dmd-0724-p6-open
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0b6a784859ea30d13,subnet-02296f99e90de96b2,subnet-05f94519b218b0f37
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-dmd-0724-open
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app: minwm-dmd-0724-p6
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
+      protocol: TCP
+    - name: api
+      port: 30000
+      targetPort: api
+      protocol: TCP
+---
+# Public fallback for clients whose corporate proxy cannot route to the
+# internal NLB. There is intentionally no loadBalancerSourceRanges.
+# The inference API currently has no application-level authentication, so this
+# endpoint should be treated as temporary unless auth is added separately.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minwm-dmd-0724-p6-public
+  namespace: default
+  labels:
+    app: minwm-dmd-0724-p6
+    seedleap.ai/owner: chenshengdong
+    seedleap.ai/task: minwm-realtime-serving
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-0b6a784859ea30d13,subnet-02296f99e90de96b2,subnet-05f94519b218b0f37
+    service.beta.kubernetes.io/aws-load-balancer-attributes: load_balancing.cross_zone.enabled=true
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: project=seed-leap,environment=dev,managed_by=kubernetes,service=minwm-dmd-0724-public
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: HTTP
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "30000"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /health
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  allocateLoadBalancerNodePorts: false
+  selector:
+    app: minwm-dmd-0724-p6
+  ports:
+    - name: webui
+      port: 80
+      targetPort: webui
       protocol: TCP
