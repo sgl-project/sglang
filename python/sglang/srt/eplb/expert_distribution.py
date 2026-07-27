@@ -874,7 +874,7 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().__init__(*args, **kwargs)
         self._lock = threading.Lock()
         self._record_batches = self._init_record_batches()
-        self._current_batch = self._record_batches[0]
+        self._current_idx = 0
 
     # ------------------------------------------------------------------
     # Accumulator API
@@ -899,15 +899,19 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
 
+        record = dict(
+            forward_pass_id=forward_pass_id,
+            rank=self._rank,
+            gatherer_key=gatherer_key,
+            **single_pass_data,
+        )
+
         with self._lock:
-            self._current_batch = self._current_batch.append(
-                dict(
-                    forward_pass_id=forward_pass_id,
-                    rank=self._rank,
-                    gatherer_key=gatherer_key,
-                    **single_pass_data,
-                )
-            )
+            num = len(self._record_batches)
+            # Advance past full batches and evict as we go
+            while not self._record_batches[self._current_idx].append(record):
+                self._current_idx = (self._current_idx + 1) % num
+                self._record_batches[self._current_idx].reset()
 
     def reset(self):
         super().reset()
@@ -919,11 +923,12 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
         assert output_mode == "file"
 
         with self._lock:
+            num = len(self._record_batches)
             records = []
-            batch = self._current_batch.get_next()
-            for _ in range(len(self._record_batches)):
+            # Walk ring from oldest (idx+1) to newest (idx)
+            for offset in range(1, num + 1):
+                batch = self._record_batches[(self._current_idx + offset) % num]
                 records.extend(batch.get_records())
-                batch = batch.get_next()
 
         output = dict(
             records=records,
@@ -934,24 +939,39 @@ class _BufferedDetailAccumulator(_UtilizationRateAccumulatorMixin):
             f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
         )
 
+    def _get_batch_layout(self, num_records):
+        MAX_RECORDS_PER_BATCH = 16  # cap for bounded async-D2H batch latency
+        MIN_BATCHES = 4             # ring buffer needs ≥4 for meaningful rotation
+        MIN_RECORDS_PER_BATCH = 2   # each batch must hold ≥2 for progress
+
+        # Primary constraint: records per batch; then derive batch count
+        records_per_batch = max(
+            MIN_RECORDS_PER_BATCH,
+            min(MAX_RECORDS_PER_BATCH, math.ceil(num_records / MIN_BATCHES)),
+        )
+        num_batches = max(MIN_BATCHES, math.ceil(num_records / records_per_batch))
+
+        # Per-record byte estimate (matches _BufferedDetailSinglePassGatherer tensors):
+        L = self._expert_location_metadata.num_layers
+        E = self._expert_location_metadata.num_physical_experts
+        N = self._server_args.chunked_prefill_size * 8  # max tokens per forward pass
+        topk_bytes = L * N * 8 * 4          # topk_ids_of_layer (int32)
+        meta_bytes = N * (4 + 8)            # input_ids (int32) + positions (int64)
+        gpc_bytes = L * E * 4               # global_physical_count (int32)
+        bytes_per_record = topk_bytes + meta_bytes + gpc_bytes
+
+        return num_batches, (records_per_batch * bytes_per_record)
+
     def _init_record_batches(self) -> List[_RecordBatch]:
-        max_records = self._server_args.expert_distribution_recorder_buffer_size
+        num_records = self._server_args.expert_distribution_recorder_buffer_size
+        num_batches, batch_size = self._get_batch_layout(
+            self._server_args.expert_distribution_recorder_buffer_size
+        )
 
-        # Split capacity into batches: ≤16 records/batch, ≥4 batches, ≥2 records/batch
-        num_batches = max(4, math.ceil(max_records / 16))
-        records_per_batch = max(2, math.ceil(max_records / num_batches))
-
-        # Per-record byte estimate mirrors _BufferedDetailSinglePassGatherer tensor shapes:
-        #   topk_ids:   layers × (P*8) × 8 × 4
-        #   metadata:   (P*8) × 2 × 4
-        P8 = self._server_args.chunked_prefill_size * 8
-        bytes_per_record = 4 * P8 * (self._expert_location_metadata.num_layers * 8 + 2)
-
-        buffer_size = records_per_batch * bytes_per_record
-        batches = [_RecordBatch(buffer_size) for _ in range(num_batches)]
-        for i in range(num_batches):
-            batches[i].set_next(batches[(i + 1) % num_batches])
-        return batches
+        if num_records >= 0:
+            return [_RecordBatch(batch_size) for _ in range(num_batches)]
+        else:
+            return [_RecordBatch(batch_size)]   # infinite batch
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -1141,19 +1161,13 @@ class _RecordBatch:
 
         self._stream = torch.cuda.Stream()
         self._event = torch.cuda.Event()
-
         self._records: List[Dict[str, Any]] = []
-        self._next: Optional["_RecordBatch"] = None
 
-    def append(self, record: Dict[str, Any], evict: bool = False) -> _RecordBatch:
-        if not evict and not self._segment_fits(record):
-            return self._next.append(record, True)
+    def append(self, record: Dict[str, Any]) -> bool:
+        record_size = self._get_record_size(record)
+        if self._segment_head + record_size >= self._segment_size:
+            return False
 
-        # Eviction (TODO: lock check here)
-        if evict and len(self._records) > 0:
-            self._evict_all()
-
-        # Store each tensor sequentially into the underlying segment
         processed: Dict[str, Any] = {}
         for k, v in record.items():
             if not isinstance(v, torch.Tensor):
@@ -1164,53 +1178,42 @@ class _RecordBatch:
                     .view(-1)
                     .view(torch.uint8)
                 )
-                processed[k] = _Record(
-                    loc=self._segment_append(t),
-                    shape=tuple(v.shape),
-                    dtype=v.dtype,
+
+                loc = _RecordLoc(
+                    segment=self._segment,
+                    offset=self._segment_head,
+                    length=t.numel()
                 )
 
+                t.record_stream(self._stream)
+                self._event.record()
+                with torch.cuda.stream(self._stream):
+                    self._event.wait(self._stream)
+                    self._segment[loc.offset : loc.offset + loc.length].copy_(
+                        t, non_blocking=True
+                    )
+
+                self._segment_head += loc.length
+                processed[k] = _Record(loc, tuple(v.shape), v.dtype)
+
         self._records.append(processed)
-        return self
+        return True
 
     def get_records(self):
-        # TODO: invoked by dump, need to lock check
         if len(self._records) > 0:
             self._stream.synchronize()
         return self._records
 
     def reset(self):
-        self._evict_all()
-
-    def set_next(self, next_batch: _RecordBatch):
-        self._next = next_batch
-
-    def get_next(self) -> _RecordBatch:
-        return self._next
-
-    def _evict_all(self):
         self._records.clear()
         self._segment_head = 0
 
-    def _segment_fits(self, record: Dict[str, Any]):
+    def _get_record_size(self, record: Dict[str, Any]):
         total_bytes = 0
         for v in record.values():
             if isinstance(v, torch.Tensor) and v.numel() > 0:
                 total_bytes += v.numel() * v.element_size()
-        return self._segment_head + total_bytes < self._segment_size
-
-    def _segment_append(self, t: torch.Tensor) -> _RecordLoc:
-        start = self._segment_head
-        nbytes = t.numel()
-        end = start + nbytes
-
-        t.record_stream(self._stream)
-        self._event.record()
-        with torch.cuda.stream(self._stream):
-            self._event.wait(self._stream)
-            self._segment[start:end].copy_(t, non_blocking=True)
-        self._segment_head = end
-        return _RecordLoc(self._segment, start, nbytes)
+        return total_bytes
 
 
 class _Buffer:
