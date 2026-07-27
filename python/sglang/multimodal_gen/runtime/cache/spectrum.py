@@ -92,7 +92,7 @@ class ChebyshevForecaster(nn.Module):
         device = self.device_ref or h.device
         t_tensor = torch.as_tensor(t, dtype=torch.float32, device=device)
         h_flat, shape = _flatten(h)
-        h_flat = h_flat.to(device)
+        h_flat = h_flat.to(device).to(torch.float32)
         if self._shape is None:
             self._shape = shape
         else:
@@ -126,7 +126,7 @@ class ChebyshevForecaster(nn.Module):
         # torch.cholesky_solve dtype requirements.
         with torch.autocast(device_type=self._H_buf.device.type, enabled=False):
             x = self._build_design(taus).to(torch.float32)
-            h = self._H_buf.to(torch.float32)
+            h = self._H_buf
             p = x.shape[1]
             lam_i = self.lam * torch.eye(p, device=x.device, dtype=x.dtype)
             xt = x.transpose(0, 1)
@@ -138,7 +138,7 @@ class ChebyshevForecaster(nn.Module):
                 chol = torch.linalg.cholesky(
                     xtx + jitter * torch.eye(p, device=x.device, dtype=x.dtype)
                 )
-            xth = (xt @ h).to(torch.float32)
+            xth = xt @ h
             self._coef = torch.cholesky_solve(xth, chol).to(feature_dtype)
 
     @torch.no_grad()
