@@ -205,9 +205,12 @@ class SpectrumForecaster(nn.Module):
         """Blend Chebyshev regression and local Taylor predictions."""
         device = self.cheb.t_buf.device
         t_star = torch.as_tensor(t_star, dtype=torch.float32, device=device)
-        h_cheb = self.cheb.predict(t_star)
-        h_taylor = self._local_taylor_discrete(t_star)
-        return (1.0 - self.w) * h_taylor + self.w * h_cheb
+        if self.w >= 1.0:
+            return self.cheb.predict(t_star)
+        elif self.w <= 0.0:
+            return self._local_taylor_discrete(t_star)
+        return torch.lerp(self._local_taylor_discrete(t_star), self.cheb.predict(t_star), self.w)
+        
 
     def update(self, t, h) -> None:
         self.cheb.update(t, h)
