@@ -1373,10 +1373,11 @@ class Engine(EngineScoreMixin, EngineBase):
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
-        return [
-            MultiprocessingSerializer.serialize(tensors)
-            for _ in range(self.server_args.tp_size)
-        ]
+        else:
+            return [
+                MultiprocessingSerializer.serialize(tensors)
+                for _ in range(self.server_args.tp_size)
+            ]
 
     def load_lora_adapter_from_tensors(
         self,
