@@ -1405,12 +1405,19 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        m3_fuseep_normal: bool = False,
+        m3_fuseep_num_input_tokens: Optional[int] = None,
     ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
-            return forward_fuseep(self, hidden_states, topk_output)
+            return forward_fuseep(
+                self,
+                hidden_states,
+                topk_output,
+                m3_fuseep_normal=m3_fuseep_normal,
+                m3_fuseep_num_input_tokens=m3_fuseep_num_input_tokens,
+            )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
