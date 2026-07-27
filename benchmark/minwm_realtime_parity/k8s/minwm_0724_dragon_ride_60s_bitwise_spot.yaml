@@ -1,21 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-0724-dragon60-unipc-20260727-01
+  name: minwm-0724-dragon60-unipc-native-20260727-01
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-0724-dragon60-unipc-20260727-01
+    app.kubernetes.io/name: minwm-0724-dragon60-unipc-native-20260727-01
     seedleap.ai/task: minwm-realtime-parity
     seedleap.ai/run-id: 0724-dragon-ride-60s-main-unipc-bitwise-attempt01
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: 9e07a506c363c050a2460ab1691181656420cf08
+    seedleap.ai/sglang-git-ref: 35d9b9ccb10c5085042b40b6e2c1ebd7228ecc4d
     seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     seedleap.ai/config-sha256: a5eac8a1478a5c9da63494439302f26671636b44445b0b9fd1496d59d8d2546d
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/capacity-type: spot
     seedleap.ai/kv-contract: unbounded-local-attn-sink4
-    seedleap.ai/retry-of: minwm-0724-dragon60-bitwise-20260727-03
+    seedleap.ai/retry-of: minwm-0724-dragon60-unipc-20260727-01
 spec:
   completionMode: Indexed
   completions: 1
@@ -25,12 +25,12 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-0724-dragon60-unipc-20260727-01
+        app.kubernetes.io/name: minwm-0724-dragon60-unipc-native-20260727-01
         seedleap.ai/task: minwm-realtime-parity
         seedleap.ai/run-id: 0724-dragon-ride-60s-main-unipc-bitwise-attempt01
         seedleap.ai/owner: chenshengdong
       annotations:
-        seedleap.ai/sglang-git-ref: 9e07a506c363c050a2460ab1691181656420cf08
+        seedleap.ai/sglang-git-ref: 35d9b9ccb10c5085042b40b6e2c1ebd7228ecc4d
         seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     spec:
       restartPolicy: Never
@@ -57,7 +57,7 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: 9e07a506c363c050a2460ab1691181656420cf08
+              value: 35d9b9ccb10c5085042b40b6e2c1ebd7228ecc4d
             - name: MINWM_GIT_REF
               value: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
             - name: MINWM_BENCHMARK_MODE
@@ -118,6 +118,19 @@ spec:
                 /workspace/minWM/Wan21/configs/exp/wan22_5b_varlen60s_artf_v2.yaml
               echo "${MINWM_CONFIG_SHA256}  ${MINWM_CONFIG_PATH}" \
                 | sha256sum --check -
+              source_result=/work/parity-results/0724-dragon-ride-60s-main-unipc-bitwise-attempt01
+              mismatch_result=/work/parity-results/0724-dragon-ride-60s-main-unipc-gpu-numerics-mismatch
+              if [[ -f "${source_result}/dragon60-summary.json" \
+                    && ! -e "${mismatch_result}" ]]; then
+                mkdir -p "${mismatch_result}"
+                cp "${source_result}"/dragon60-*.json "${mismatch_result}/"
+                cp "${source_result}"/dragon60-*.log "${mismatch_result}/"
+                case_dir="${source_result}/dragon-ride-60s-bitwise/cases/00_dragon_ride_wsws_idle_60s"
+                cp "${case_dir}/baseline.mp4" "${mismatch_result}/"
+                cp "${case_dir}/sglang.mp4" "${mismatch_result}/"
+                cp -a "${source_result}/dragon-ride-60s-bitwise/player" \
+                  "${mismatch_result}/player"
+              fi
               exec bash /workspace/sglang/benchmark/minwm_realtime_parity/aws_b200_entrypoint.sh
           resources:
             requests:
