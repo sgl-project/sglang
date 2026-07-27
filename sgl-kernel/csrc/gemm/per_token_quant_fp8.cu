@@ -96,7 +96,7 @@ __global__ void per_token_quant_fp8_kernel(
       input_vec.cast_load(token_input + i * kVecSize);
     }
 
-    DST_DTYPE output_arr[kVecSize];
+    alignas(sizeof(DST_DTYPE) * kVecSize) DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = static_cast<float>(input_vec[j]) * scale_inv;
@@ -111,8 +111,9 @@ __global__ void per_token_quant_fp8_kernel(
     }
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
+    } else if constexpr (kVecSize == 8) {
+      *(uint64_t*)(token_output + i * kVecSize) = *(uint64_t*)output_arr;
     } else {
-      // Use element-wise copy for vector size 8 to ensure correctness
       for (int k = 0; k < kVecSize; ++k) {
         token_output[i * kVecSize + k] = output_arr[k];
       }
@@ -173,7 +174,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
     vec_t input_vec;
     input_vec.cast_load(token_input + i * kVecSize);
 
-    DST_DTYPE output_arr[kVecSize];
+    alignas(sizeof(DST_DTYPE) * kVecSize) DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       float val = fmaxf(fminf(static_cast<float>(input_vec[j]) * scale_inv, FP8_E4M3_MAX), -FP8_E4M3_MAX);
@@ -188,8 +189,9 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
 
     if constexpr (kVecSize == 16) {
       *(uint4*)(token_output + i * kVecSize) = *(uint4*)output_arr;
+    } else if constexpr (kVecSize == 8) {
+      *(uint64_t*)(token_output + i * kVecSize) = *(uint64_t*)output_arr;
     } else {
-      // Use element-wise copy for vector size 8 to ensure correctness
       for (int k = 0; k < kVecSize; ++k) {
         token_output[i * kVecSize + k] = output_arr[k];
       }
@@ -252,8 +254,8 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
-  const bool use_vec16 = (hidden_dim % 16 == 0);
-  const bool use_vec8 = (hidden_dim % 8 == 0);
+  const bool use_vec16 = (hidden_dim % 16 == 0) && (reinterpret_cast<uint64_t>(output_q.data_ptr()) % alignof(uint4) == 0);
+  const bool use_vec8 = (hidden_dim % 8 == 0) && (reinterpret_cast<uint64_t>(output_q.data_ptr()) % alignof(uint64_t) == 0);
 
   const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
   const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
