@@ -2398,7 +2398,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev[0], topk_indices_next[0]
+        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
 
 
 @register_custom_op(mutates_args=["topk_result"])
