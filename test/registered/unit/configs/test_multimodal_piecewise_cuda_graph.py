@@ -100,6 +100,32 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertFalse(runner.can_run_graph(forward_batch))
 
+    def test_embedding_gemma_forces_breakable_prefill(self):
+        args = ServerArgs(model_path="dummy")
+        args.model_config = SimpleNamespace(
+            is_embedding_gemma=True,
+            is_multimodal=False,
+            context_len=2048,
+            hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE),
+        )
+        args.disable_radix_cache = False
+        args.chunked_prefill_size = 2048
+
+        with (
+            patch.object(args, "get_model_config", return_value=args.model_config),
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+        ):
+            args._handle_model_capability_adjustments()
+
+        self.assertTrue(args.disable_radix_cache)
+        self.assertEqual(args.chunked_prefill_size, -1)
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+
 
 if __name__ == "__main__":
     unittest.main()
