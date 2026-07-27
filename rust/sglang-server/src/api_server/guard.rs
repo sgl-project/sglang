@@ -92,6 +92,26 @@ mod tests {
     /// `/health_generate` probe relies on. It never sees a terminal frame here, so
     /// dropping the guard is the only path that deregisters its detok sink (via the
     /// ingress `on_abort`). Regression for the detok-entry leak per health probe.
+    /// The guard owns the `live_rids` release: without it a finished rid stays "in
+    /// flight" forever and every retry 400s, which defeats client-supplied rids as
+    /// idempotency keys. Disarmed rids count too — disarmed means finished.
+    #[test]
+    fn guard_releases_live_rids_on_drop() {
+        let live: super::super::LiveRids = Default::default();
+        live.lock().unwrap().insert("r1".to_string());
+        live.lock().unwrap().insert("r2".to_string());
+        let (tm_tx, _tm_rx) = flume::unbounded();
+        let id1 = RidHash::from_rid("r1");
+        let mut guard = AbortGuard::new(senders_with_tm(tm_tx), live.clone(), id1, "r1".into());
+        guard.arm(RidHash::from_rid("r2"), "r2".to_string());
+        guard.disarm(id1); // finished naturally — still must be released
+        drop(guard);
+        assert!(
+            live.lock().unwrap().is_empty(),
+            "every rid the guard covered must be released, disarmed or not"
+        );
+    }
+
     #[test]
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();
