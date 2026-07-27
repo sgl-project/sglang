@@ -1060,18 +1060,20 @@ class HiCacheController:
         )
 
         # Read from KV-derived sidecar pools, if any.
-        current_kv_derived_transfers = [
-            PoolTransfer(
-                name=transfer.name,
-                host_indices=batch_host_indices,
-                keys=batch_hashes,
+        sidecar_hits: dict[str, int] = {}
+        if len(kv_derived_transfers) > 0:
+            current_kv_derived_transfers = [
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=batch_host_indices,
+                    keys=batch_hashes,
+                )
+                for transfer in kv_derived_transfers
+            ]
+            sidecar_results = self.storage_backend.batch_get_v2(
+                current_kv_derived_transfers
             )
-            for transfer in kv_derived_transfers
-        ]
-        sidecar_results = self.storage_backend.batch_get_v2(
-            current_kv_derived_transfers
-        )
-        sidecar_hits = count_pool_hits(sidecar_results)
+            sidecar_hits = count_pool_hits(sidecar_results)
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
