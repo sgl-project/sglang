@@ -56,7 +56,7 @@ pub(super) async fn submit(
         // rids as idempotency keys and is drivable by saturating the inbox.
         lease = Some(RidLease {
             live_rids: state.live_rids.clone(),
-            rid: rid.clone(),
+            rid: Some(rid.clone()),
         });
     }
     let id = RidHash::from_rid(&rid);
@@ -97,22 +97,26 @@ pub(super) async fn submit(
 /// being dropped at the `send_async` await — it releases the rid.
 struct RidLease {
     live_rids: super::LiveRids,
-    rid: String,
+    /// `None` once disarmed. An `Option`, not an emptied `String`: a client may
+    /// send `rid: ""`, which is a real (if odd) rid — with a "cleared" sentinel it
+    /// was indistinguishable from a disarmed lease, so the 503 and cancellation
+    /// paths left `""` in the set forever and every later `rid: ""` got a 400.
+    rid: Option<String>,
 }
 
 impl RidLease {
     fn disarm(&mut self) {
-        self.rid.clear();
+        self.rid = None;
     }
 }
 
 impl Drop for RidLease {
     fn drop(&mut self) {
-        if self.rid.is_empty() {
+        let Some(rid) = self.rid.take() else {
             return; // disarmed: the AbortGuard owns it now
-        }
+        };
         if let Ok(mut live) = self.live_rids.lock() {
-            live.remove(&self.rid);
+            live.remove(&rid);
         }
     }
 }
