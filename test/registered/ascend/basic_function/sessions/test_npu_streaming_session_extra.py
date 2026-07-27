@@ -54,7 +54,6 @@ register_npu_ci(est_time=900, suite="full-1-npu-a3", nightly=True)
 # rejects with HTTP 400 ("Requested token count exceeds the model's maximum
 # context length"), causing `KeyError: 'meta_info'`. We override those two
 # methods with a smaller `max_new_tokens` that fits Qwen3-8B's context.
-# See .claude/2.log for the original failure.
 _NPU_ABORT_MAX_NEW_TOKENS = 40000
 
 
