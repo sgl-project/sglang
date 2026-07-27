@@ -97,7 +97,37 @@ def normalize_tool_content(role: str, content):
     if is_openai_text_parts:
         text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
         return " ".join(text_parts)
-    return content
+    return _tool_reference_parts_first(parts)
+
+
+def _tool_reference_parts_first(parts: list) -> list:
+    """Move ``tool_reference`` parts to the front of a tool message.
+
+    The GLM chat template only expands a ``tool_reference`` into the
+    referenced tool's schema when the ``tool_reference`` is the FIRST part
+    of the tool message (it checks ``content[0].type == "tool_reference"``
+    and otherwise falls back to text-only rendering, which silently drops
+    the reference). A tool-search client (e.g. Claude Code) often returns a
+    ``tool_reference`` alongside a text notice such as "Tool loaded: Bash";
+    when that text precedes the reference the schema is never rendered, so
+    the model never sees the tool it just loaded and re-invokes ToolSearch
+    forever. Reordering to reference-first makes the template reliably
+    render the schema regardless of the client's part ordering. Text and
+    other parts keep their relative order after the references.
+    """
+    if not any(
+        isinstance(p, dict) and p.get("type") == "tool_reference" for p in parts
+    ):
+        return parts
+    references = [
+        p for p in parts if isinstance(p, dict) and p.get("type") == "tool_reference"
+    ]
+    rest = [
+        p
+        for p in parts
+        if not (isinstance(p, dict) and p.get("type") == "tool_reference")
+    ]
+    return references + rest
 
 
 def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
