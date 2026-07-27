@@ -5,8 +5,8 @@ but only the prefix selected by the current device-side sequence length is
 live. These tests pin the scalar formulas and the live page-table/C128
 prefixes at a fixed 1M-token capture capacity, including replay from a long
 batch to an empty one and back without inspecting intentionally stale tails.
-They also check the production activation gate and that DeepGEMM ignores
-poisoned capture-capacity page-table columns outside the live prefix.
+They also check the production activation gate and that DeepGEMM/FlashMLA
+ignore poisoned capture-capacity metadata outside the live prefix.
 """
 
 from __future__ import annotations
@@ -327,6 +327,95 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             compression_outputs,
         )
 
+    def test_cuda_graph_replay_refreshes_short_prefix_for_new_request(self):
+        long_seq_len = MAX_SEQ_LEN - 1
+        short_seq_len = 129
+        req_to_token = torch.full(
+            (2, MAX_SEQ_LEN),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        page_offsets = torch.arange(NUM_PAGES, dtype=torch.int32, device=self.device)
+        physical_pages = torch.stack(
+            (100 + page_offsets, 100_000 + page_offsets),
+            dim=0,
+        )
+        req_to_token[:, ::PAGE_SIZE] = physical_pages * PAGE_SIZE + 17
+
+        req_pool_indices = torch.tensor([0], dtype=torch.int64, device=self.device)
+        seq_lens = torch.tensor([long_seq_len], dtype=torch.int32, device=self.device)
+        raw_out_loc = torch.tensor([512], dtype=torch.int64, device=self.device)
+
+        self._run_compression_metadata(
+            self._run_page_metadata(req_to_token, req_pool_indices, seq_lens),
+            raw_out_loc,
+        )
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            page_metadata = self._run_page_metadata(
+                req_to_token, req_pool_indices, seq_lens
+            )
+            compression_outputs = self._run_compression_metadata(
+                page_metadata, raw_out_loc
+            )
+
+        graph.replay()
+        torch.cuda.synchronize()
+        self._assert_page_metadata(
+            (long_seq_len,), req_to_token, req_pool_indices, page_metadata
+        )
+        self._assert_compression_metadata(
+            (long_seq_len,),
+            raw_out_loc,
+            page_metadata.page_table,
+            compression_outputs,
+        )
+        long_a_first_page = int(page_metadata.page_table[0, 0])
+        c128_page_indices = compression_outputs[-1]
+        assert c128_page_indices is not None
+        long_a_first_c128 = int(c128_page_indices[0, 0])
+
+        # Keep the captured tensors and output buffers, but switch both the
+        # request identity and its sequence length. The single live page/C128
+        # entry must come from request B; retaining request A's prefix would
+        # still look structurally valid, so distinct mappings make it visible.
+        req_pool_indices.fill_(1)
+        seq_lens.fill_(short_seq_len)
+        graph.replay()
+        torch.cuda.synchronize()
+        self._assert_page_metadata(
+            (short_seq_len,), req_to_token, req_pool_indices, page_metadata
+        )
+        self._assert_compression_metadata(
+            (short_seq_len,),
+            raw_out_loc,
+            page_metadata.page_table,
+            compression_outputs,
+        )
+        short_b_first_page = int(page_metadata.page_table[0, 0])
+        short_b_first_c128 = int(c128_page_indices[0, 0])
+        self.assertNotEqual(short_b_first_page, long_a_first_page)
+        self.assertNotEqual(short_b_first_c128, long_a_first_c128)
+
+        req_pool_indices.fill_(0)
+        seq_lens.fill_(long_seq_len)
+        graph.replay()
+        torch.cuda.synchronize()
+        self._assert_page_metadata(
+            (long_seq_len,), req_to_token, req_pool_indices, page_metadata
+        )
+        self._assert_compression_metadata(
+            (long_seq_len,),
+            raw_out_loc,
+            page_metadata.page_table,
+            compression_outputs,
+        )
+        self.assertEqual(int(page_metadata.page_table[0, 0]), long_a_first_page)
+        self.assertEqual(int(c128_page_indices[0, 0]), long_a_first_c128)
+
     def test_deepgemm_ignores_poisoned_page_table_tail(self):
         """DeepGEMM must consume only pages selected by the live C4 lengths."""
         import deep_gemm
@@ -424,6 +513,135 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
                 atol=0,
             )
 
+    def test_flashmla_ignores_poisoned_c128_suffix(self):
+        """Native FlashMLA must bound C128 reads by the live top-k length."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (
+            DSV4_PAGE_SIZE,
+            DSV4AttentionCase,
+            _populate_extra_kv_cache,
+            _populate_swa_kv_cache,
+            build_dsv4_attention_fixture,
+        )
+        from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+            _make_eagle_verify_input,
+            _prepare_target_verify_batch,
+        )
+
+        num_extra_entries = 32
+        case = DSV4AttentionCase(
+            name="dsv4_target_verify_c128_live_prefix_consumer",
+            backend="dsv4",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=64,
+            page_size=DSV4_PAGE_SIZE,
+            prefix_lens=(128,),
+            extend_lens=(4,),
+            compress_ratio=128,
+        )
+        fixture = build_dsv4_attention_fixture(self, case, device=str(self.device))
+        max_context_len = fixture.runner.req_to_token_pool.req_to_token.shape[1]
+        self.assertEqual(fixture.backend.max_context_len, max_context_len)
+        _populate_swa_kv_cache(
+            fixture,
+            max_context_len=max_context_len,
+            device=str(self.device),
+        )
+        _populate_extra_kv_cache(
+            fixture,
+            layer_id=0,
+            num_entries=num_extra_entries,
+        )
+        _prepare_target_verify_batch(fixture.forward_batch, case, str(self.device))
+        fixture.forward_batch.spec_info = _make_eagle_verify_input(
+            case,
+            fixture.forward_batch,
+            topk=1,
+            device=str(self.device),
+        )
+        q_input, _ = fixture.actual_module.project(fixture.input_hidden)
+
+        with torch.no_grad(), forward_context(
+            ForwardContext(attn_backend=fixture.backend)
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            core_metadata = fixture.backend.forward_metadata.core_attn_metadata
+            c128_indices = core_metadata.c128_page_indices
+            c128_lengths = core_metadata.c128_topk_lengths_clamp1
+            self.assertIsNotNone(c128_indices)
+            self.assertIsNotNone(c128_lengths)
+            assert c128_indices is not None
+            assert c128_lengths is not None
+
+            self.assertEqual(c128_indices.shape[0], case.num_input_tokens)
+            self.assertGreater(c128_indices.shape[1], 1)
+            self.assertTrue(torch.all(c128_lengths >= 1).item())
+            self.assertTrue(
+                torch.all(c128_lengths < c128_indices.shape[1]).item(),
+                "the case must leave a non-live C128 capacity suffix",
+            )
+            live_mask = torch.arange(
+                c128_indices.shape[1], device=c128_indices.device
+            ).unsqueeze(0).expand_as(c128_indices) < c128_lengths.unsqueeze(1)
+
+            baseline_indices = torch.where(
+                live_mask,
+                c128_indices,
+                c128_indices.new_full((), 0),
+            )
+            core_metadata.c128_page_indices = baseline_indices
+            baseline_output = fixture.backend.forward(
+                q=q_input,
+                k=q_input,
+                v=q_input,
+                layer=fixture.actual_module.attn,
+                forward_batch=fixture.forward_batch,
+                compress_ratio=case.compress_ratio,
+                save_kv_cache=False,
+                attn_sink=fixture.actual_module.attn_sink,
+            )
+
+            # Both suffix values name populated cache entries. A regressed
+            # consumer that reads beyond c128_lengths sees different keys
+            # without risking an illegal cache access.
+            poisoned_indices = baseline_indices.clone()
+            poisoned_indices.masked_fill_(~live_mask, num_extra_entries - 1)
+            torch.testing.assert_close(
+                poisoned_indices[live_mask],
+                baseline_indices[live_mask],
+                rtol=0,
+                atol=0,
+            )
+            self.assertTrue(
+                torch.all(
+                    poisoned_indices[~live_mask] != baseline_indices[~live_mask]
+                ).item()
+            )
+            core_metadata.c128_page_indices = poisoned_indices
+            poisoned_output = fixture.backend.forward(
+                q=q_input,
+                k=q_input,
+                v=q_input,
+                layer=fixture.actual_module.attn,
+                forward_batch=fixture.forward_batch,
+                compress_ratio=case.compress_ratio,
+                save_kv_cache=False,
+                attn_sink=fixture.actual_module.attn_sink,
+            )
+
+        torch.cuda.synchronize()
+        self.assertTrue(torch.isfinite(poisoned_output).all().item())
+        torch.testing.assert_close(
+            poisoned_output,
+            baseline_output,
+            rtol=0,
+            atol=0,
+        )
+
     def test_production_activation_gate_is_fail_closed(self):
         from sglang.srt.layers.attention import deepseek_v4_backend
 
@@ -438,8 +656,12 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             tilelang=False,
             aiter=False,
             torch_fallback=False,
+            topk_torch=False,
+            topk_v2=False,
+            hisparse=False,
         ):
             backend.enable_deepseek_v4_fp4_indexer = fp4
+            backend.hisparse_coordinator = object() if hisparse else None
             with (
                 mock.patch.object(deepseek_v4_backend, "_is_cuda", cuda),
                 mock.patch.object(deepseek_v4_backend, "_is_sm100", sm100),
@@ -459,10 +681,22 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
                     "get",
                     return_value=torch_fallback,
                 ),
+                mock.patch.object(
+                    deepseek_v4_backend.envs.SGLANG_TOPK_TRANSFORM_512_TORCH,
+                    "get",
+                    return_value=topk_torch,
+                ),
+                mock.patch.object(
+                    deepseek_v4_backend.envs.SGLANG_OPT_USE_TOPK_V2,
+                    "get",
+                    return_value=topk_v2,
+                ),
             ):
                 return backend._can_use_live_prefix_target_verify_metadata()
 
         self.assertTrue(gate())
+        self.assertTrue(gate(topk_v2=True))
+
         for override in (
             {"cuda": False},
             {"sm100": False},
@@ -471,6 +705,8 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             {"tilelang": True},
             {"aiter": True},
             {"torch_fallback": True},
+            {"topk_torch": True},
+            {"hisparse": True},
         ):
             with self.subTest(override=override):
                 self.assertFalse(gate(**override))

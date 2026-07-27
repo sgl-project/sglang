@@ -572,20 +572,22 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_custom_mask = None
 
     def _can_use_live_prefix_target_verify_metadata(self) -> bool:
-        """Whether raw verify consumers bound every metadata read by live length.
+        """Whether the default SM100 verify pipeline bounds reads by live length.
 
-        The default SM100 DeepGEMM indexer and native FlashMLA path do. The
-        alternative indexers below may gather the full capture-capacity table,
-        so they must retain fully initialized tails.
+        All current alternative indexer/top-k consumers are excluded below.
+        Keep any new consumer disabled until its stale-tail behavior is
+        explicitly verified.
         """
         return (
             _is_cuda
             and _is_sm100
             and not _is_xpu
+            and self.hisparse_coordinator is None
             and not self.enable_deepseek_v4_fp4_indexer
             and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
         )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:

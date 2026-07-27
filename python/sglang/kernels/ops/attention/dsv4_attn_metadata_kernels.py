@@ -344,64 +344,41 @@ def _page_table_positions_kernel(
     page_size,
     swa_window,
     BLOCK_P: tl.constexpr,
-):
-    row = tl.program_id(0)
-    seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
-    tl.store(seq_lens_out_ptr + row, seq_len)
-    tl.store(positions_out_ptr + row, seq_len - 1)
-    tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
-
-    rp = tl.load(req_pool_ptr + row).to(tl.int64)
-    base = req_to_token_ptr + rp * rt_stride
-    out_base = page_table_ptr + row.to(tl.int64) * num_pages
-    for p0 in range(0, num_pages, BLOCK_P):
-        p = p0 + tl.arange(0, BLOCK_P)
-        pmask = p < num_pages
-        tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(
-            tl.int32
-        )
-        tl.store(out_base + p, tok // page_size, mask=pmask)
-
-
-@triton.jit
-def _page_table_positions_live_prefix_kernel(
-    req_to_token_ptr,
-    req_pool_ptr,
-    seq_lens_ptr,
-    seq_lens_out_ptr,
-    positions_out_ptr,
-    page_table_ptr,
-    topk_out_ptr,
-    rt_stride,
-    num_pages,
-    page_size,
-    swa_window,
-    BLOCK_P: tl.constexpr,
+    LIVE_PREFIX_ONLY: tl.constexpr,
 ):
     row = tl.program_id(0)
     page_block = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
 
-    # Every row has a static 2-D launch grid. Only its first column block owns
-    # scalar metadata; all other blocks solely gather page-table columns.
-    if page_block == 0:
+    # Full-tail launches one column program per row; live-prefix launches a
+    # graph-static column grid whose first program exclusively owns scalars.
+    if (not LIVE_PREFIX_ONLY) or page_block == 0:
         tl.store(seq_lens_out_ptr + row, seq_len)
         tl.store(positions_out_ptr + row, seq_len - 1)
         tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
 
-    page_start = page_block * BLOCK_P
-    live_pages = tl.cdiv(tl.maximum(seq_len, 0), page_size)
-    page_bound = tl.minimum(live_pages, num_pages)
+    page_start = 0
+    page_bound = num_pages
+    if LIVE_PREFIX_ONLY:
+        page_start = page_block * BLOCK_P
+        live_pages = tl.cdiv(tl.maximum(seq_len, 0), page_size)
+        page_bound = tl.minimum(live_pages, num_pages)
     if page_start >= page_bound:
         return
 
-    p = page_start + tl.arange(0, BLOCK_P)
-    pmask = p < page_bound
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
     out_base = page_table_ptr + row.to(tl.int64) * num_pages
-    tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(tl.int32)
-    tl.store(out_base + p, tok // page_size, mask=pmask)
+    page_end = page_bound
+    if LIVE_PREFIX_ONLY:
+        page_end = tl.minimum(page_start + BLOCK_P, page_bound)
+    for p0 in tl.range(page_start, page_end, BLOCK_P):
+        p = p0 + tl.arange(0, BLOCK_P)
+        pmask = p < page_bound
+        tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(
+            tl.int32
+        )
+        tl.store(out_base + p, tok // page_size, mask=pmask)
 
 
 def build_page_table_positions_triton(
@@ -443,14 +420,12 @@ def build_page_table_positions_triton(
         page_size,
         swa_window,
     )
-    if live_prefix_only:
-        num_page_blocks = max(triton.cdiv(num_pages, BLOCK_P), 1)
-        _page_table_positions_live_prefix_kernel[(num_q, num_page_blocks)](
-            *args,
-            BLOCK_P=BLOCK_P,
-        )
-    else:
-        _page_table_positions_kernel[(num_q,)](*args, BLOCK_P=BLOCK_P)
+    num_page_blocks = max(triton.cdiv(num_pages, BLOCK_P), 1) if live_prefix_only else 1
+    _page_table_positions_kernel[(num_q, num_page_blocks)](
+        *args,
+        BLOCK_P=BLOCK_P,
+        LIVE_PREFIX_ONLY=live_prefix_only,
+    )
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_out,
         positions_casual=positions_out,
