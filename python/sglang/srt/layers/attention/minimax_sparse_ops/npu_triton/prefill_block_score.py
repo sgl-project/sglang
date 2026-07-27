@@ -843,8 +843,10 @@ def _prefill_topk_from_score_kernel(
 
     # Append the causal local block at slot TOPK: -1 if it is already among the
     # selected TOPK (dedup, avoids double-counting in the main-attention online
-    # softmax), else local_blk. Reload the just-written TOPK slots to test
-    # membership (small [BSQ, TOPK] load).
+    # softmax), else local_blk. NOTE: dedup via reloading the just-written
+    # [BSQ, TOPK] slots is FASTER than in-loop local_hit accumulation (A/B
+    # test_topk_dedup_ab.py: reload 400us vs register 464us, 0.86x) -- the
+    # per-iteration compare+OR over TOPK=17 steps costs more than one reload.
     rank_off = tl.arange(0, TOPK)  # [TOPK]
     sel_offsets = (
         pid_h * stride_o_h

@@ -168,6 +168,8 @@ def flash_prefill_bnsd_blockq_sparse_fia(
     num_pages: int,
     max_num_blocks: int,
     use_prep_kernel: bool = True,   # False -> torch prep (A/B / correctness cross-check)
+    block_table_out: Optional[torch.Tensor] = None,  # reuse buffer (skip per-call empty)
+    actual_kvlen_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-pass FIA sparse+causal prefill attention. Returns [total_q, QH, D]."""
     assert q.dtype in (torch.float16, torch.bfloat16)
@@ -192,8 +194,19 @@ def flash_prefill_bnsd_blockq_sparse_fia(
     if use_prep_kernel:
         # FUSED prep: one triton kernel (reorder + page gather + actual_kvlen),
         # replacing ~10 torch ops incl. the 989us AI_CPU aclnnIndex page gather.
-        block_table = torch.empty((total_q, topk1), dtype=torch.int32, device=device)
-        actual_kvlen = torch.empty((total_q,), dtype=torch.int32, device=device)
+        # Reuse caller-provided workspace buffers when available to skip the per-call
+        # torch.empty (hoisted to per-forward _build_prefill_meta, shared across the
+        # 57 sparse layers -- a prefill device-idle / host-dispatch source).
+        block_table = (
+            block_table_out
+            if block_table_out is not None
+            else torch.empty((total_q, topk1), dtype=torch.int32, device=device)
+        )
+        actual_kvlen = (
+            actual_kvlen_out
+            if actual_kvlen_out is not None
+            else torch.empty((total_q,), dtype=torch.int32, device=device)
+        )
         ti = topk_idx[0].contiguous()  # [T, topk1]
         # seq_lens / per_query_req arrive pre-cast to int32 (hoisted to
         # _build_prefill_meta as per_query_seq_lens / per_query_req_i32, shared

@@ -1453,10 +1453,13 @@ def _decode_bnsd_score_topk_chunk_kernel(
     sm_scale_log2e = sm_scale * 1.4426950409
     local_start = tl.maximum(0, num_blocks - local_blocks)
     num_steps = chunk_end_block - chunk_start_block
+    # F5: req_idx is loop-invariant (pid_b is the program id, constant) -- hoist
+    # the scalar load out of the per-step loop instead of reloading it each iter.
+    if USE_DIRECT_PAGE_LOOKUP:
+        req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
     for step in tl.range(num_steps):
         logical_block = chunk_start_block + step
         if USE_DIRECT_PAGE_LOOKUP:
-            req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
             token_col = tl.minimum(
                 logical_block * block_size, max_req_to_token_cols - 1
             )

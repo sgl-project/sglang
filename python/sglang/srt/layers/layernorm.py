@@ -1012,17 +1012,17 @@ class GemmaRMSNorm(BaseFusedOp):
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
-            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                # MiniMax-M3 hidden_size=6144 overflows UB in sgl_kernel_npu's
-                # Triton fused residual+GemmaRMSNorm kernel on Ascend.
-                return self._forward_npu_unfused_residual(
-                    x, residual, post_residual_addition
-                )
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            norm_out, residual = add_gemma_rms_norm(
-                x, self.weight, residual, self.variance_epsilon
-            )
+            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
+                gamma = self.gemma_weight.to(x.dtype)
+                norm_out, _, residual = torch_npu.npu_add_rms_norm(
+                    residual, x, gamma, self.variance_epsilon
+                )
+            else:
+                norm_out, residual = add_gemma_rms_norm(
+                    x, self.weight, residual, self.variance_epsilon
+                )
             return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)

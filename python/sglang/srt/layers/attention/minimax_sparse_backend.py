@@ -1640,6 +1640,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             device,
         )
 
+        # FIA prep workspace buffers (layer-invariant shape: [total_q, topk+1] and
+        # [total_q]). Pre-allocated once per forward and reused across all 57 sparse
+        # layers to avoid the per-layer torch.empty inside the FIA wrapper (a
+        # host-dispatch source in the prefill device-idle budget). Safe to reuse:
+        # layers run serially, each prep writes -> FIA reads before the next layer.
+        topk1 = self.topk_blocks + 1
+        fia_block_table_ws = torch.empty(
+            (total_q, topk1), dtype=torch.int32, device=device
+        )
+        fia_actual_kvlen_ws = torch.empty(
+            (total_q,), dtype=torch.int32, device=device
+        )
+
         return SimpleNamespace(
             per_query_req=per_query_req,
             # Pre-cast int32 for the FIA prep kernel (layer-invariant; avoids a
@@ -1650,6 +1663,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             max_blocks=max_blocks,
             block_size_q=block_size_q,
             qblock_mappings=qblock_mappings,
+            fia_block_table_ws=fia_block_table_ws,
+            fia_actual_kvlen_ws=fia_actual_kvlen_ws,
         )
 
     def _build_pack_group_meta(self, meta, pack_q: int, device):
@@ -1997,6 +2012,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 sm_scale=head_dim**-0.5,
                 num_pages=num_pages,
                 max_num_blocks=max_blocks,
+                block_table_out=meta.fia_block_table_ws,
+                actual_kvlen_out=meta.fia_actual_kvlen_ws,
             )
 
         from sglang.srt.environ import envs

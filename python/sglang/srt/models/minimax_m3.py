@@ -124,7 +124,9 @@ if _is_hip:
         _has_rocm_qk_norm_rope = False
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+        split_qkv_rmsnorm_rope_pos_cache_half_npu,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1044,6 +1046,48 @@ class MiniMaxM3Attention(nn.Module):
             and not self.attention_output_gate
         )
 
+    def _can_use_npu_fused_qkv_norm_rope(self) -> bool:
+        # Reuse sgl_kernel_npu's per-head GemmaRMSNorm + partial NeoX RoPE + QKV
+        # split fusion (split_qkv_rmsnorm_rope_pos_cache_half_npu) for M3's
+        # per_head norm -- replaces the unfused _qk_norm_rope (q_norm + k_norm +
+        # rotary_emb) on both dense and sparse layers' MAIN qkv. Bit-exact vs the
+        # split path (gemma_weight = weight + 1 supplies the Gemma +1).
+        return (
+            _is_npu
+            and self.use_qk_norm
+            and self.qk_norm_type == "per_head"
+            and self.use_gemma_norm
+            and self.head_dim == 128
+            and self.rotary_dim == 64
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
+            # cos_sin_cache is cast to bf16 when the model is loaded with
+            # --dtype bfloat16; the fused kernel upcasts to fp32 in-kernel
+            # (tl.load(...).to(fp32)), so bf16 is accepted -- it reads the same
+            # cos/sin values the unfused rope path already uses (no precision
+            # regression, only sub-ULP rotation-arithmetic noise vs that path).
+            and self.rotary_emb.cos_sin_cache.dtype
+            in (torch.float32, torch.bfloat16)
+        )
+
+    def _can_use_npu_fused_index_qkv_norm_rope(self) -> bool:
+        # Sparse index branch reuses the SAME fusion as the main branch. It is
+        # only reached inside the main fused branch (_can_use_npu_fused_qkv_norm_rope
+        # already True), so the model-level guards (per_head / gemma / neox_style /
+        # cos_sin_cache) carry over -- index_rotary_emb IS self.rotary_emb, so the
+        # cache, is_neox_style and rotary_dim are identical. The fused kernel's
+        # q|k|v split matches idx_qkv only when the index V head is enabled (it is
+        # laid out [idx_q | idx_k | idx_v]); when the V head is disabled the input
+        # has no v slot and we fall back to _split_index_qkv + _index_qk_norm_rope.
+        # M3 never disables the index V (sparse_disable_index_value is absent ->
+        # disable_value_layer_ids empty), so every sparse layer fuses here.
+        return (
+            self.is_sparse_attention_layer
+            and not self.disable_index_value
+            and self.num_idx_heads >= 1
+            and (self.idx_head_dim & (self.idx_head_dim - 1)) == 0  # power of 2
+        )
+
     def forward_prepare_npu(
         self,
         positions: torch.Tensor,
@@ -1056,8 +1100,56 @@ class MiniMaxM3Attention(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, forward_batch, None
 
-        if not self._can_use_npu_split_qkv_tp_rmsnorm_rope():
-            return self.forward_prepare(positions, hidden_states, forward_batch)
+        if self._can_use_npu_fused_qkv_norm_rope():
+            # Per-head GemmaRMSNorm + partial NeoX RoPE + QKV split fused into
+            # one sgl_kernel_npu op (reused from GLM4-MoE/Qwen3). cos_sin_cache
+            # is read in-kernel by position; gemma_weight (= weight + 1) supplies
+            # the Gemma +1; cast_norm_to_bf16=True matches the split path's
+            # norm->bf16->RoPE flow (bit-exact, see test_qkv_fuse_npu.py).
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                input_tensor=qkv,
+                positions=positions.reshape(-1),
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+                q_weight=self.q_norm.gemma_weight,
+                k_weight=self.k_norm.gemma_weight,
+                rope_dim=self.rotary_dim,
+                cast_norm_to_bf16=True,
+            )
+            if self.is_sparse_attention_layer:
+                idx_qkv, _ = self.index_qkv_proj(hidden_states)
+                if self._can_use_npu_fused_index_qkv_norm_rope():
+                    # Same fused op as the main branch: split [q|k|v] + per-head
+                    # GemmaRMSNorm on idx_q/idx_k (shared gemma_weight buffers) +
+                    # partial NeoX RoPE in one launch. index_rotary_emb ==
+                    # rotary_emb, so cos_sin_cache / rotary_dim are identical to
+                    # the main call. Bit-exact vs _split_index_qkv +
+                    # _index_qk_norm_rope (same per-head norm, same rope, same
+                    # cast_norm_to_bf16=True).
+                    idx_q, idx_k, idx_v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                        input_tensor=idx_qkv,
+                        positions=positions.reshape(-1),
+                        cos_sin_cache=self.index_rotary_emb.cos_sin_cache,
+                        q_hidden_size=self.num_idx_heads * self.idx_head_dim,
+                        kv_hidden_size=self.idx_head_dim,
+                        head_dim=self.idx_head_dim,
+                        eps=self.index_q_norm.variance_epsilon,
+                        q_weight=self.index_q_norm.gemma_weight,
+                        k_weight=self.index_k_norm.gemma_weight,
+                        rope_dim=self.rotary_dim,
+                        cast_norm_to_bf16=True,
+                    )
+                else:
+                    idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                    idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)
+                inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
+            else:
+                inner_state = (q, k, v, forward_batch)
+            return None, forward_batch, inner_state
 
         qkv, _ = self.qkv_proj(hidden_states)
         cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
