@@ -119,7 +119,7 @@ metadata:
     seedleap.ai/checkpoint-source: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-    seedleap.ai/sglang-git-ref: 58ba27529903c4b62f3a32a80b50878c8b674922
+    seedleap.ai/sglang-git-ref: 94d76bba471cd8fd62fd7984c53c041cdbe11942
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -146,7 +146,7 @@ spec:
         instrumentation.opentelemetry.io/inject-python: "false"
         seedleap.ai/checkpoint: global_step_011000
         seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-        seedleap.ai/sglang-git-ref: 58ba27529903c4b62f3a32a80b50878c8b674922
+        seedleap.ai/sglang-git-ref: 94d76bba471cd8fd62fd7984c53c041cdbe11942
     spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 60
@@ -185,7 +185,7 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: 58ba27529903c4b62f3a32a80b50878c8b674922
+              value: 94d76bba471cd8fd62fd7984c53c041cdbe11942
             - name: MINWM_CHECKPOINT
               value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
             - name: MINWM_CHECKPOINT_SOURCE
