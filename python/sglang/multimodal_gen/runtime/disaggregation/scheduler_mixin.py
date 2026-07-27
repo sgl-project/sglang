@@ -19,6 +19,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import zmq
 
@@ -137,13 +138,17 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, (list, tuple)):
         converted = []
         for item in value:
-            if isinstance(item, torch.Tensor):
+            if isinstance(item, (torch.Tensor, np.ndarray)):
                 converted.append(item.tolist())
+            elif isinstance(item, np.generic):
+                converted.append(item.item())
             else:
                 converted.append(item)
         return converted
@@ -152,7 +157,17 @@ def _to_json_serializable(value):
 
 def _is_default(value, field_info) -> bool:
     if field_info.default is not dataclasses.MISSING:
-        return value == field_info.default
+        # ``value == default`` may be element-wise for array/tensor-valued
+        # fields (numpy ndarray, torch.Tensor) or even raise for list-of-array
+        # values. Only treat the field as default when the comparison reduces
+        # to a real boolean; otherwise it is not equal to a scalar default.
+        try:
+            eq = value == field_info.default
+            if isinstance(eq, (bool, np.bool_)):
+                return bool(eq)
+        except (ValueError, RuntimeError):
+            pass
+        return False
     if field_info.default_factory is not dataclasses.MISSING:
         if isinstance(value, (list, dict)) and len(value) == 0:
             return True
@@ -171,10 +186,7 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             pass
 
 
-def _init_request_scheduler_from_template(
-    scheduler_template: Any, req: Req, device: torch.device
-) -> None:
-    scheduler = clone_scheduler_runtime(scheduler_template)
+def _init_request_scheduler(scheduler: Any, req: Req, device: torch.device) -> None:
     extra_kwargs = {}
     mu = req.extra.get("mu") if hasattr(req, "extra") else None
     if mu is not None:
@@ -202,12 +214,33 @@ def _init_request_scheduler_from_template(
     req.timesteps = scheduler.timesteps
 
 
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    _init_request_scheduler(scheduler, req, device)
+
+
 def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
-    scheduler_template = self.worker.pipeline.get_module("scheduler")
-    if scheduler_template is None:
+    serving_scheduler = self.worker.pipeline.get_module("scheduler")
+    if serving_scheduler is None:
         return
     device = torch.device(f"{current_platform.device_type}:{self.worker.local_rank}")
-    _init_request_scheduler_from_template(scheduler_template, req, device)
+
+    if not req.rollout:
+        _init_request_scheduler_from_template(serving_scheduler, req, device)
+        return
+
+    from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        get_or_create_rollout_request_scheduler,
+    )
+
+    scheduler = get_or_create_rollout_request_scheduler(
+        req,
+        serving_scheduler,
+        isolate=True,
+    )
+    _init_request_scheduler(scheduler, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:
