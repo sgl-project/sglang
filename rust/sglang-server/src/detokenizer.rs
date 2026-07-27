@@ -195,7 +195,9 @@ impl Runnable for DetokenizerWorker {
                 DetokMsg::Result { rid_hash, payload } => {
                     handle_result(&mut table, rid_hash, payload)
                 }
-                DetokMsg::Fail { rid_hash, message } => handle_fail(&mut table, rid_hash, message),
+                DetokMsg::Fail { rid_hash, message } => {
+                    handle_fail(&mut table, rid_hash, message, &self.tm)
+                }
                 DetokMsg::Deregister { rid_hash } => {
                     table.remove(&rid_hash);
                 }
@@ -217,11 +219,23 @@ fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload:
 
 /// Terminal per-request failure (bad request header): send an `Error` to the sink
 /// (the api-server turns it into an HTTP 400) and drop the request.
-fn handle_fail(table: &mut HashMap<RidHash, DetokState>, id: RidHash, message: String) {
+/// Terminal per-request failure. `Internal` (500), not `Validation` (400): the
+/// producers of this message are server faults — a malformed scheduler output
+/// frame — not bad client input. Also aborts the request on the scheduler, which
+/// otherwise keeps generating tokens for a connection that will never read them.
+fn handle_fail(
+    table: &mut HashMap<RidHash, DetokState>,
+    id: RidHash,
+    message: String,
+    tm: &flume::Sender<TmEvent>,
+) {
     if let Some(mut st) = table.remove(&id) {
+        // Abort first: `try_send` on the sink can release the handler, which frees
+        // the rid for reuse (same ordering hazard as the disconnect path).
+        let _ = tm.try_send(TmEvent::Abort(st.rid.clone()));
         let _ = st
             .sink
-            .try_send(EgressItem::Error(Error::Validation(message)));
+            .try_send(EgressItem::Error(Error::Internal(message)));
         st.fsm = RequestState::Completed;
     }
 }

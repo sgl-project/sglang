@@ -96,9 +96,11 @@ impl Runnable for Egress {
                             b.clear();
                         }
                         for id in decoded.rids {
+                            // 500, not 400: the client's request was fine — the
+                            // scheduler's own output frame was not.
                             let _ = self.senders.detok[id.shard(shards)].send(DetokMsg::Fail {
                                 rid_hash: id,
-                                message: "malformed scheduler output frame".into(),
+                                message: "internal error: malformed scheduler output frame".into(),
                             });
                         }
                         continue;
