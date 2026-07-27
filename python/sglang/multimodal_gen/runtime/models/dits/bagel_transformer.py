@@ -65,7 +65,12 @@ class BagelPrefixContext:
 
 @dataclass(frozen=True)
 class BagelContext:
-    """All request-local state consumed by BAGEL denoising."""
+    """All request-local state consumed by BAGEL denoising.
+
+    For T2I, ``conditional`` is text and ``unconditional`` is empty. For
+    Editing, they are ``image + text`` and ``image-only`` respectively, while
+    ``image_unconditional`` is the text-only baseline used by image CFG.
+    """
 
     conditional_kv: BagelKVCache
     unconditional_kv: BagelKVCache
@@ -77,6 +82,14 @@ class BagelContext:
     width: int
     start_of_image_token_id: int
     end_of_image_token_id: int
+    image_unconditional_kv: BagelKVCache | None = None
+    image_unconditional_kv_lens: Tensor | None = None
+    image_unconditional_rope_offset: int | None = None
+
+    @property
+    def is_editing(self) -> bool:
+        """Return whether this context contains the third Editing CFG branch."""
+        return self.image_unconditional_kv is not None
 
     @classmethod
     def from_prefixes(
@@ -88,6 +101,7 @@ class BagelContext:
         width: int,
         start_of_image_token_id: int,
         end_of_image_token_id: int,
+        image_unconditional: BagelPrefixContext | None = None,
     ) -> BagelContext:
         """Build a denoising context from separately prepared prefixes."""
         return cls(
@@ -101,6 +115,15 @@ class BagelContext:
             width=width,
             start_of_image_token_id=start_of_image_token_id,
             end_of_image_token_id=end_of_image_token_id,
+            image_unconditional_kv=(
+                None if image_unconditional is None else image_unconditional.kv_cache
+            ),
+            image_unconditional_kv_lens=(
+                None if image_unconditional is None else image_unconditional.kv_lens
+            ),
+            image_unconditional_rope_offset=(
+                None if image_unconditional is None else image_unconditional.rope_offset
+            ),
         )
 
 
@@ -193,8 +216,25 @@ def _sdpa_attention(query: Tensor, key: Tensor, value: Tensor, causal: bool) -> 
     query = query.transpose(0, 1).unsqueeze(0)
     key = key.transpose(0, 1).unsqueeze(0)
     value = value.transpose(0, 1).unsqueeze(0)
+    attention_mask = None
+    if causal and query.shape[-2] != key.shape[-2]:
+        # SDPA's built-in non-square causal mask is upper-left aligned. Prefix
+        # decoding needs a bottom-right aligned mask so every new query can see
+        # the complete immutable prefix plus preceding queries in this block.
+        query_length = query.shape[-2]
+        key_length = key.shape[-2]
+        prefix_length = key_length - query_length
+        query_positions = torch.arange(query_length, device=query.device).unsqueeze(1)
+        key_positions = torch.arange(key_length, device=query.device).unsqueeze(0)
+        attention_mask = key_positions <= prefix_length + query_positions
+        causal = False
     output = F.scaled_dot_product_attention(
-        query, key, value, dropout_p=0.0, is_causal=causal
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=causal,
     )
     return output.squeeze(0).transpose(0, 1)
 
@@ -691,18 +731,74 @@ class BagelTransformer(BaseDiT):
                 f"got shape {tuple(input_ids.shape)}"
             )
         device = self.device
+        empty = BagelPrefixContext(
+            BagelKVCache.empty(self.num_layers),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            0,
+        )
+        return self._append_text_prefix(empty, input_ids)
+
+    @staticmethod
+    def _fork_prefix(prefix: BagelPrefixContext) -> BagelPrefixContext:
+        """Create a cache object that shares immutable per-layer KV tensors.
+
+        Appending replaces each list entry with a newly concatenated tensor, so
+        the source prefix remains unchanged without a costly deep KV copy.
+        """
+        cache = BagelKVCache(
+            list(prefix.kv_cache.key_cache),
+            list(prefix.kv_cache.value_cache),
+        )
+        return BagelPrefixContext(cache, prefix.kv_lens.clone(), prefix.rope_offset)
+
+    @staticmethod
+    def _prefix_view(
+        prefix: BagelPrefixContext,
+        *,
+        sequence_length: int,
+        rope_offset: int,
+    ) -> BagelPrefixContext:
+        """Create an immutable leading-prefix view without copying KV tensors."""
+        if sequence_length < 0 or sequence_length > prefix.kv_cache.sequence_length:
+            raise ValueError("BAGEL prefix view length is outside the source cache")
+        key_cache = [
+            None if tensor is None else tensor[:sequence_length]
+            for tensor in prefix.kv_cache.key_cache
+        ]
+        value_cache = [
+            None if tensor is None else tensor[:sequence_length]
+            for tensor in prefix.kv_cache.value_cache
+        ]
+        lengths = prefix.kv_lens.new_tensor([sequence_length])
+        return BagelPrefixContext(
+            BagelKVCache(key_cache, value_cache), lengths, rope_offset
+        )
+
+    def _append_text_prefix(
+        self, prefix: BagelPrefixContext, input_ids: Tensor
+    ) -> BagelPrefixContext:
+        """Append a causal text block to one request-owned prefix."""
+        device = self.device
         input_ids = input_ids.to(device=device, dtype=torch.long)
-        cache = BagelKVCache.empty(self.num_layers)
-        prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
+        if input_ids.ndim != 1:
+            raise ValueError(
+                "BAGEL text prefix expects one token sequence, "
+                f"got shape {tuple(input_ids.shape)}"
+            )
         if input_ids.numel() == 0:
-            return BagelPrefixContext(cache, prefix_lens, 0)
+            return prefix
 
         hidden_states = self.embed_tokens(input_ids)
         sequence_length = int(input_ids.numel())
-        position_ids = torch.arange(sequence_length, device=device)
+        position_ids = torch.arange(
+            prefix.rope_offset,
+            prefix.rope_offset + sequence_length,
+            device=device,
+        )
         cosine, sine = self.rotary_emb(hidden_states, position_ids)
         text_indexes = torch.arange(sequence_length, device=device)
         latent_indexes = torch.empty(0, dtype=torch.long, device=device)
+        cache = prefix.kv_cache
 
         for layer in self.layers:
             hidden_states, cache = layer(
@@ -713,12 +809,91 @@ class BagelTransformer(BaseDiT):
                 latent_indexes,
                 mode="und",
                 prefix_cache=cache,
-                prefix_lens=prefix_lens,
+                prefix_lens=prefix.kv_lens,
                 update_cache=True,
                 causal=True,
             )
-        prefix_lens = torch.tensor([sequence_length], dtype=torch.int32, device=device)
-        return BagelPrefixContext(cache, prefix_lens, sequence_length)
+        updated_lens = prefix.kv_lens + sequence_length
+        return BagelPrefixContext(
+            cache,
+            updated_lens,
+            prefix.rope_offset + sequence_length,
+        )
+
+    def _append_image_prefix(
+        self,
+        prefix: BagelPrefixContext,
+        image_embeddings: Tensor,
+        *,
+        mode: str,
+        start_of_image_token_id: int,
+        end_of_image_token_id: int,
+    ) -> BagelPrefixContext:
+        """Append one VAE-generation or ViT-understanding image block."""
+        if image_embeddings.ndim != 2:
+            raise ValueError(
+                "BAGEL image embeddings must be a 2D token matrix, "
+                f"got shape {tuple(image_embeddings.shape)}"
+            )
+        if image_embeddings.shape[1] != self.hidden_size:
+            raise ValueError(
+                "BAGEL image embedding width must equal hidden_size; "
+                f"got {image_embeddings.shape[1]} and {self.hidden_size}"
+            )
+        if mode not in {"gen", "und"}:
+            raise ValueError(f"unsupported BAGEL image-prefix mode: {mode}")
+
+        device = self.device
+        boundary_ids = torch.tensor(
+            [start_of_image_token_id, end_of_image_token_id],
+            dtype=torch.long,
+            device=device,
+        )
+        boundary_embeddings = self.embed_tokens(boundary_ids)
+        image_embeddings = image_embeddings.to(
+            device=device, dtype=boundary_embeddings.dtype
+        )
+        sequence_length = image_embeddings.shape[0] + 2
+        hidden_states = boundary_embeddings.new_zeros(sequence_length, self.hidden_size)
+        boundary_indexes = torch.tensor(
+            [0, sequence_length - 1], dtype=torch.long, device=device
+        )
+        image_indexes = torch.arange(1, sequence_length - 1, device=device)
+        hidden_states[boundary_indexes] = boundary_embeddings
+        hidden_states[image_indexes] = image_embeddings
+
+        if mode == "gen":
+            text_indexes = boundary_indexes
+            latent_indexes = image_indexes
+        else:
+            text_indexes = torch.arange(sequence_length, device=device)
+            latent_indexes = torch.empty(0, dtype=torch.long, device=device)
+        position_ids = torch.full(
+            (sequence_length,),
+            prefix.rope_offset,
+            dtype=torch.long,
+            device=device,
+        )
+        cosine, sine = self.rotary_emb(hidden_states, position_ids)
+        cache = prefix.kv_cache
+        for layer in self.layers:
+            hidden_states, cache = layer(
+                hidden_states,
+                cosine,
+                sine,
+                text_indexes,
+                latent_indexes,
+                mode=mode,
+                prefix_cache=cache,
+                prefix_lens=prefix.kv_lens,
+                update_cache=True,
+                causal=False,
+            )
+        return BagelPrefixContext(
+            cache,
+            prefix.kv_lens + sequence_length,
+            prefix.rope_offset + 1,
+        )
 
     @torch.no_grad()
     def build_context(
@@ -766,6 +941,121 @@ class BagelTransformer(BaseDiT):
             end_of_image_token_id=end_of_image_token_id,
         )
 
+    @torch.no_grad()
+    def build_editing_context(
+        self,
+        vae_patches: Tensor,
+        vae_position_ids: Tensor,
+        vision_embeddings: Tensor,
+        text_input_ids: Tensor,
+        *,
+        height: int,
+        width: int,
+        start_of_image_token_id: int,
+        end_of_image_token_id: int,
+    ) -> BagelContext:
+        """Build main, image-only, and text-only prefixes for one edit.
+
+        Args:
+            vae_patches: Sampled source-image latents patchified to
+                ``[tokens, latent_patch_size**2 * latent_channel]``.
+            vae_position_ids: Source-image latent position IDs.
+            vision_embeddings: ViT + connector + position embeddings shaped
+                ``[tokens, hidden_size]``.
+            text_input_ids: Editing instruction wrapped in message boundaries.
+            height: Output image height.
+            width: Output image width.
+            start_of_image_token_id: Tokenizer-validated vision-start ID.
+            end_of_image_token_id: Tokenizer-validated vision-end ID.
+
+        Returns:
+            A request-owned three-way denoising context.
+
+        Raises:
+            ValueError: If image-token shapes, positions, or output geometry do
+                not match checkpoint constraints.
+        """
+        self._validate_image_size(height, width)
+        start_of_image_token_id = int(start_of_image_token_id)
+        end_of_image_token_id = int(end_of_image_token_id)
+        self._validate_special_token_ids(start_of_image_token_id, end_of_image_token_id)
+
+        expected_patch_width = self.latent_patch_size**2 * self.latent_channel
+        if vae_patches.ndim != 2 or vae_patches.shape[1] != expected_patch_width:
+            raise ValueError(
+                "BAGEL Editing VAE patches must have shape [tokens, "
+                f"{expected_patch_width}], got {tuple(vae_patches.shape)}"
+            )
+        if (
+            vae_position_ids.ndim != 1
+            or vae_position_ids.shape[0] != vae_patches.shape[0]
+        ):
+            raise ValueError("BAGEL Editing VAE patch and position counts must match")
+        if vae_position_ids.numel() and (
+            int(vae_position_ids.min()) < 0
+            or int(vae_position_ids.max()) >= self.max_latent_size**2
+        ):
+            raise ValueError(
+                "BAGEL Editing VAE position ID is outside the checkpoint table"
+            )
+        if text_input_ids.ndim != 1 or text_input_ids.numel() == 0:
+            raise ValueError("BAGEL Editing requires one non-empty text token sequence")
+
+        device = self.device
+        vae_patches = vae_patches.to(device=device, dtype=self.vae2llm.weight.dtype)
+        vae_position_ids = vae_position_ids.to(device=device, dtype=torch.long)
+        clean_timestep = torch.zeros(
+            vae_patches.shape[0], device=device, dtype=torch.float32
+        )
+        vae_embeddings = (
+            self.vae2llm(vae_patches)
+            + self.time_embedder(clean_timestep)
+            + self.latent_pos_embed(vae_position_ids)
+        )
+
+        empty = BagelPrefixContext(
+            BagelKVCache.empty(self.num_layers),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            0,
+        )
+        image_prefix = self._append_image_prefix(
+            empty,
+            vae_embeddings,
+            mode="gen",
+            start_of_image_token_id=start_of_image_token_id,
+            end_of_image_token_id=end_of_image_token_id,
+        )
+        image_prefix = self._append_image_prefix(
+            image_prefix,
+            vision_embeddings,
+            mode="und",
+            start_of_image_token_id=start_of_image_token_id,
+            end_of_image_token_id=end_of_image_token_id,
+        )
+
+        image_prefix_length = image_prefix.kv_cache.sequence_length
+        image_rope_offset = image_prefix.rope_offset
+        main_prefix = self._append_text_prefix(
+            self._fork_prefix(image_prefix), text_input_ids
+        )
+        # Slice image-only views from the completed main cache. These views
+        # share storage with main instead of retaining a second full image KV.
+        image_only_prefix = self._prefix_view(
+            main_prefix,
+            sequence_length=image_prefix_length,
+            rope_offset=image_rope_offset,
+        )
+        text_only_prefix = self.prefill_context(text_input_ids)
+        return BagelContext.from_prefixes(
+            main_prefix,
+            image_only_prefix,
+            height=height,
+            width=width,
+            start_of_image_token_id=start_of_image_token_id,
+            end_of_image_token_id=end_of_image_token_id,
+            image_unconditional=text_only_prefix,
+        )
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -774,13 +1064,14 @@ class BagelTransformer(BaseDiT):
         *,
         bagel_context: BagelContext,
         guidance_scale: float | Tensor = 4.0,
+        image_guidance_scale: float | Tensor = 1.0,
         cfg_interval: tuple[float, float] = (0.4, 1.0),
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
         guidance: Tensor | None = None,
         **_: object,
     ) -> Tensor:
-        """Predict flow velocity with BAGEL's internal two-way CFG.
+        """Predict flow velocity with BAGEL's internal two- or three-way CFG.
 
         Args:
             hidden_states: Patchified latents shaped ``[tokens, patch_dim]`` or
@@ -789,6 +1080,7 @@ class BagelTransformer(BaseDiT):
             encoder_hidden_states: Unused standard DiT compatibility argument.
             bagel_context: Explicit request-owned prefix and image state.
             guidance_scale: Text classifier-free guidance strength.
+            image_guidance_scale: Editing image classifier-free guidance strength.
             cfg_interval: Open/closed sigma interval ``(low, high]``.
             cfg_renorm_min: Lower clamp for BAGEL's CFG norm correction.
             cfg_renorm_type: ``global`` or ``channel``.
@@ -826,6 +1118,7 @@ class BagelTransformer(BaseDiT):
         )
 
         scale = self._as_float(guidance_scale)
+        image_scale = self._as_float(image_guidance_scale)
         sigma = float(timestep[0].item())
         cfg_enabled = cfg_interval[0] < sigma <= cfg_interval[1] and scale > 1.0
         if cfg_enabled:
@@ -837,13 +1130,45 @@ class BagelTransformer(BaseDiT):
                 bagel_context.unconditional_rope_offset,
                 bagel_context,
             )
-            conditional = self._apply_cfg(
-                conditional,
-                unconditional,
-                scale,
-                renorm_min=cfg_renorm_min,
-                renorm_type=cfg_renorm_type,
-            )
+            if bagel_context.is_editing:
+                image_unconditional_kv = bagel_context.image_unconditional_kv
+                image_unconditional_lens = bagel_context.image_unconditional_kv_lens
+                image_unconditional_offset = (
+                    bagel_context.image_unconditional_rope_offset
+                )
+                if (
+                    image_unconditional_kv is None
+                    or image_unconditional_lens is None
+                    or image_unconditional_offset is None
+                ):
+                    raise ValueError("incomplete BAGEL Editing image-CFG context")
+                image_unconditional = None
+                if image_scale > 1.0:
+                    image_unconditional = self._generation_step(
+                        hidden_states,
+                        timestep,
+                        image_unconditional_kv,
+                        image_unconditional_lens,
+                        image_unconditional_offset,
+                        bagel_context,
+                    )
+                conditional = self._apply_cfg_three_way(
+                    conditional,
+                    unconditional,
+                    image_unconditional,
+                    scale,
+                    image_scale,
+                    renorm_min=cfg_renorm_min,
+                    renorm_type=cfg_renorm_type,
+                )
+            else:
+                conditional = self._apply_cfg(
+                    conditional,
+                    unconditional,
+                    scale,
+                    renorm_min=cfg_renorm_min,
+                    renorm_type=cfg_renorm_type,
+                )
         # Official BAGEL keeps the Euler state in FP32 even though each model
         # evaluation runs in BF16. The standard FlowMatch scheduler preserves
         # the model-output dtype, so return FP32 velocity to retain that state.
@@ -995,6 +1320,70 @@ class BagelTransformer(BaseDiT):
             guided_norm = torch.linalg.vector_norm(guided)
         elif renorm_type == "channel":
             original_norm = torch.linalg.vector_norm(conditional, dim=-1, keepdim=True)
+            guided_norm = torch.linalg.vector_norm(guided, dim=-1, keepdim=True)
+        else:
+            raise ValueError(f"unsupported BAGEL CFG renorm type: {renorm_type}")
+        correction = (original_norm / (guided_norm + 1e-8)).clamp(
+            min=renorm_min, max=1.0
+        )
+        return guided * correction
+
+    @staticmethod
+    def _apply_cfg_three_way(
+        main: Tensor,
+        image_only: Tensor,
+        text_only: Tensor | None,
+        text_scale: float,
+        image_scale: float,
+        *,
+        renorm_min: float,
+        renorm_type: str,
+    ) -> Tensor:
+        """Combine BAGEL Editing's main, image-only, and text-only predictions.
+
+        Args:
+            main: Prediction conditioned on source image and instruction.
+            image_only: Prediction conditioned only on the source image.
+            text_only: Prediction conditioned only on the instruction, or
+                ``None`` when image CFG is disabled.
+            text_scale: Text CFG scale.
+            image_scale: Image CFG scale.
+            renorm_min: Lower clamp for norm correction.
+            renorm_type: ``text_channel`` (official Editing default), ``global``,
+                or ``channel``.
+
+        Returns:
+            Three-way guided flow prediction.
+
+        Raises:
+            ValueError: If ``renorm_type`` is unsupported or image CFG is
+                enabled without a text-only prediction.
+        """
+        text_guided = image_only + text_scale * (main - image_only)
+        if renorm_type == "text_channel":
+            original_norm = torch.linalg.vector_norm(main, dim=-1, keepdim=True)
+            guided_norm = torch.linalg.vector_norm(text_guided, dim=-1, keepdim=True)
+            correction = (original_norm / (guided_norm + 1e-8)).clamp(
+                min=renorm_min, max=1.0
+            )
+            text_guided = text_guided * correction
+            if image_scale <= 1.0:
+                return text_guided
+            if text_only is None:
+                raise ValueError("BAGEL image CFG requires a text-only prediction")
+            return text_only + image_scale * (text_guided - text_only)
+
+        if image_scale > 1.0:
+            if text_only is None:
+                raise ValueError("BAGEL image CFG requires a text-only prediction")
+            guided = text_only + image_scale * (text_guided - text_only)
+        else:
+            guided = text_guided
+        if renorm_type == "global":
+            original_norm = torch.linalg.vector_norm(main)
+            guided_norm = torch.linalg.vector_norm(guided)
+        elif renorm_type == "channel":
+            original_norm = torch.linalg.vector_norm(main, dim=-1, keepdim=True)
             guided_norm = torch.linalg.vector_norm(guided, dim=-1, keepdim=True)
         else:
             raise ValueError(f"unsupported BAGEL CFG renorm type: {renorm_type}")

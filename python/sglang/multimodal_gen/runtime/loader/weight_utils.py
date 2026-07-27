@@ -40,7 +40,6 @@ temp_dir = tempfile.gettempdir()
 
 
 class DisabledTqdm(tqdm):
-
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)
@@ -188,7 +187,12 @@ def safetensors_weights_iterator(
     clone_streamed_tensors: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over selected weights in model safetensor files.
+
+    ``key_filter`` is evaluated before ``safe_open.get_tensor`` on the standard
+    path, allowing large multi-component checkpoints to be streamed without
+    materializing tensors owned by another component.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -202,6 +206,11 @@ def safetensors_weights_iterator(
         use_runai_model_streamer = (
             HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
         )
+    if key_filter is not None:
+        # The RunAI iterator yields materialized tensors and does not expose a
+        # pre-materialization name filter. Use safe_open so large multi-component
+        # checkpoints can skip unowned tensors before get_tensor() is called.
+        use_runai_model_streamer = False
 
     # Validate files before loading
     corrupted_files = [

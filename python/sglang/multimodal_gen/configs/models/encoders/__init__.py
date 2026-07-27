@@ -1,5 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+from sglang.multimodal_gen.configs.models.encoders.bagel_vit import (
+    BagelImageEncoderConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.base import (
     BaseEncoderOutput,
     EncoderConfig,
@@ -30,6 +33,7 @@ __all__ = [
     "TextEncoderConfig",
     "ImageEncoderConfig",
     "BaseEncoderOutput",
+    "BagelImageEncoderConfig",
     "CLIPTextConfig",
     "CLIPVisionConfig",
     "FLUX_2_SYSTEM_MESSAGE",

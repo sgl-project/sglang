@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for the BAGEL text-to-image path."""
+"""Pipeline configuration for BAGEL text-to-image generation and image editing."""
 
+import math
 from dataclasses import dataclass, field
 
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.bagel import BagelDiTConfig
+from sglang.multimodal_gen.configs.models.encoders.bagel_vit import (
+    BagelImageEncoderConfig,
+)
 from sglang.multimodal_gen.configs.models.vaes.bagel import BagelVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -19,9 +24,66 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 _BAGEL_CONTEXT_KEY = "bagel_context"
 
 
+def calculate_bagel_resize_dimensions(
+    width: int,
+    height: int,
+    *,
+    max_size: int,
+    min_size: int,
+    stride: int,
+    max_pixels: int = 14 * 14 * 9 * 1024,
+) -> tuple[int, int]:
+    """Calculate the official BAGEL aspect-preserving image dimensions.
+
+    Args:
+        width: Source image width in pixels.
+        height: Source image height in pixels.
+        max_size: Maximum long-edge size.
+        min_size: Minimum short-edge size.
+        stride: Required divisibility for both dimensions.
+        max_pixels: Upper bound used by BAGEL's ``ImageTransform``.
+
+    Returns:
+        ``(width, height)`` rounded to the requested stride.
+
+    Raises:
+        ValueError: If an input or transform constraint is not positive.
+    """
+    values = (width, height, max_size, min_size, stride, max_pixels)
+    if any(not isinstance(value, int) or value <= 0 for value in values):
+        raise ValueError(
+            "BAGEL image dimensions and resize constraints must be positive"
+        )
+
+    def apply_scale(
+        current_width: int, current_height: int, scale: float
+    ) -> tuple[int, int]:
+        scaled_width = round(current_width * scale)
+        scaled_height = round(current_height * scale)
+        scaled_width = max(stride, int(round(scaled_width / stride) * stride))
+        scaled_height = max(stride, int(round(scaled_height / stride) * stride))
+        return scaled_width, scaled_height
+
+    scale = min(max_size / max(width, height), 1.0)
+    scale = max(scale, min_size / min(width, height))
+    new_width, new_height = apply_scale(width, height, scale)
+
+    # Match the pinned official transform, including its direct area ratio.
+    if new_width * new_height > max_pixels:
+        scale = max_pixels / (new_width * new_height)
+        new_width, new_height = apply_scale(new_width, new_height, scale)
+    if max(new_width, new_height) > max_size:
+        scale = max_size / max(new_width, new_height)
+        new_width, new_height = apply_scale(new_width, new_height, scale)
+
+    if not math.isfinite(float(new_width * new_height)):
+        raise ValueError("BAGEL calculated a non-finite image size")
+    return new_width, new_height
+
+
 @dataclass
 class BagelPipelineConfig(ImagePipelineConfig):
-    """Configure request-local BAGEL conditioning and standard VAE decoding."""
+    """Configure request-local BAGEL text-to-image generation."""
 
     task_type: ModelTaskType = ModelTaskType.T2I
     should_use_guidance: bool = False
@@ -48,6 +110,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
         return ModelDeploymentConfig(
             auto_enable_cfg_parallel=False,
             keep_resident_components=("dit", "vae"),
+            implicit_auxiliary_layerwise_offload_components=(),
         )
 
     def supports_dynamic_batching(self) -> bool:
@@ -78,6 +141,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
         return {
             "bagel_context": context,
             "guidance_scale": float(batch.guidance_scale),
+            "image_guidance_scale": 1.0,
             "cfg_interval": self.cfg_interval,
             "cfg_renorm_min": self.cfg_renorm_min,
             "cfg_renorm_type": self.cfg_renorm_type,
@@ -106,7 +170,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
             if latents.ndim == 3:
                 if latents.shape[0] != 1:
                     raise ValueError(
-                        "BAGEL T2I supports exactly one latent sample per request"
+                        "BAGEL supports exactly one latent sample per request"
                     )
                 latents = latents[0]
             if latents.ndim != 2:
@@ -147,3 +211,85 @@ class BagelPipelineConfig(ImagePipelineConfig):
             # The context owns large KV tensors. Drop the request's reference before
             # VAE decode so those tensors can be reclaimed as soon as denoising ends.
             batch.extra.pop(_BAGEL_CONTEXT_KEY, None)
+
+
+def _editing_vae_config() -> BagelVAEConfig:
+    """Create the full VAE required by image editing without changing T2I."""
+    return BagelVAEConfig(load_encoder=True, load_decoder=True)
+
+
+@dataclass
+class BagelEditPipelineConfig(BagelPipelineConfig):
+    """Configure the explicit BAGEL image-editing pipeline."""
+
+    task_type: ModelTaskType = ModelTaskType.I2I
+    vae_config: VAEConfig = field(default_factory=_editing_vae_config)
+    image_encoder_config: BagelImageEncoderConfig = field(
+        default_factory=BagelImageEncoderConfig
+    )
+    image_encoder_precision: str = "bf16"
+
+    editing_cfg_interval: tuple[float, float] = (0.0, 1.0)
+    editing_cfg_renorm_type: str = "text_channel"
+    editing_image_guidance_scale: float = 2.0
+
+    @staticmethod
+    def condition_image_convert_method(image: Image.Image) -> Image.Image:
+        """Match BAGEL's white-background conversion for transparent inputs."""
+        has_transparency = image.info.get("transparency") is not None
+        if image.mode == "RGBA" or has_transparency:
+            rgba = image.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            return Image.alpha_composite(background, rgba).convert("RGB")
+        return image.convert("RGB")
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        """Keep Editing components resident when the device budget permits."""
+        return ModelDeploymentConfig(
+            auto_enable_cfg_parallel=False,
+            keep_resident_components=("dit", "vae", "image_encoder"),
+            implicit_auxiliary_layerwise_offload_components=(),
+        )
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Pass three-way Editing CFG state to the request-stateless denoiser."""
+        kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+        context = kwargs["bagel_context"]
+        if not context.is_editing:
+            raise RuntimeError("BAGEL Editing requires a three-way request context")
+        kwargs.update(
+            image_guidance_scale=(
+                self.editing_image_guidance_scale
+                if batch.true_cfg_scale is None
+                else float(batch.true_cfg_scale)
+            ),
+            cfg_interval=self.editing_cfg_interval,
+            cfg_renorm_type=self.editing_cfg_renorm_type,
+        )
+        return kwargs
+
+    def calculate_condition_image_size(
+        self, image: Image.Image, width: int, height: int
+    ) -> tuple[int, int]:
+        """Return the official VAE input size for one Editing image."""
+        del image
+        return calculate_bagel_resize_dimensions(
+            width,
+            height,
+            max_size=1024,
+            min_size=512,
+            stride=16,
+        )
+
+    def preprocess_condition_image(
+        self,
+        image: Image.Image,
+        target_width: int,
+        target_height: int,
+        _vae_image_processor,
+    ) -> tuple[Image.Image, tuple[int, int]]:
+        """Convert to RGB and resize once before VAE and ViT preprocessing."""
+        image = image.convert("RGB").resize(
+            (target_width, target_height), Image.Resampling.BICUBIC
+        )
+        return image, (target_width, target_height)

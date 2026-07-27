@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Sampling defaults for BAGEL text-to-image generation."""
+"""Sampling defaults for BAGEL image generation and editing."""
 
 from dataclasses import dataclass
 from typing import ClassVar
@@ -19,3 +19,15 @@ class BagelSamplingParams(SamplingParams):
     guidance_scale: float = 4.0
     negative_prompt: str | None = None
     flow_shift: float | None = 3.0
+
+
+@dataclass
+class BagelEditSamplingParams(BagelSamplingParams):
+    """Sampling parameters for the explicit BAGEL Editing pipeline.
+
+    ``guidance_scale`` controls text CFG. ``true_cfg_scale`` reuses the
+    existing Images API field for BAGEL's image CFG and defaults to the
+    pipeline's official Editing value when omitted.
+    """
+
+    true_cfg_scale: float | None = None

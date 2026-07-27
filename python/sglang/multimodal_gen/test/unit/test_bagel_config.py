@@ -5,10 +5,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from PIL import Image
 from torch import nn
 
-from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
-from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+    BagelEditPipelineConfig,
+    BagelPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.bagel import (
+    BagelEditSamplingParams,
+    BagelSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 
 
@@ -23,6 +31,11 @@ class TestBagelSamplingParams(unittest.TestCase):
         self.assertIsNone(params.negative_prompt)
         self.assertEqual(params.num_outputs_per_prompt, 1)
 
+    def test_editing_reuses_standard_true_cfg_field(self) -> None:
+        params = BagelEditSamplingParams(prompt="make the sky blue")
+        self.assertIsNone(params.true_cfg_scale)
+        self.assertEqual(params.guidance_scale, 4.0)
+
 
 class TestBagelPipelineConfig(unittest.TestCase):
     def test_internal_cfg_and_capability_defaults(self) -> None:
@@ -36,6 +49,45 @@ class TestBagelPipelineConfig(unittest.TestCase):
         deployment = config.get_model_deployment_config()
         self.assertFalse(deployment.auto_enable_cfg_parallel)
         self.assertEqual(deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(deployment.implicit_auxiliary_layerwise_offload_components, ())
+
+    def test_editing_config_is_explicit_and_keeps_t2i_decoder_only(self) -> None:
+        t2i = BagelPipelineConfig()
+        editing = BagelEditPipelineConfig()
+
+        self.assertEqual(t2i.task_type, ModelTaskType.T2I)
+        self.assertFalse(t2i.vae_config.load_encoder)
+        self.assertEqual(editing.task_type, ModelTaskType.I2I)
+        self.assertTrue(editing.vae_config.load_encoder)
+        self.assertEqual(editing.image_encoder_precision, "bf16")
+        self.assertEqual(
+            editing.get_model_deployment_config().keep_resident_components,
+            ("dit", "vae", "image_encoder"),
+        )
+        self.assertEqual(
+            editing.get_model_deployment_config().implicit_auxiliary_layerwise_offload_components,
+            (),
+        )
+
+    def test_editing_resize_matches_official_transform(self) -> None:
+        config = BagelEditPipelineConfig()
+        image = Image.new("RGB", (400, 800))
+
+        width, height = config.calculate_condition_image_size(image, 400, 800)
+        resized, size = config.preprocess_condition_image(image, width, height, None)
+
+        self.assertEqual((width, height), (512, 1024))
+        self.assertEqual(resized.size, (512, 1024))
+        self.assertEqual(size, (512, 1024))
+
+    def test_editing_transparency_is_composited_on_white(self) -> None:
+        config = BagelEditPipelineConfig()
+        image = Image.new("RGBA", (1, 1), (10, 20, 30, 0))
+
+        converted = config.condition_image_convert_method(image)
+
+        self.assertEqual(converted.mode, "RGB")
+        self.assertEqual(converted.getpixel((0, 0)), (255, 255, 255))
 
     def test_decode_scale_and_shift_owned_by_standard_decoding(self) -> None:
         config = BagelPipelineConfig()
@@ -101,6 +153,27 @@ class TestBagelPipelineConfig(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], 6.5)
         self.assertEqual(kwargs["cfg_interval"], (0.4, 1.0))
         self.assertEqual(kwargs["cfg_renorm_type"], "global")
+
+    def test_editing_prepare_kwargs_selects_three_way_defaults(self) -> None:
+        config = BagelEditPipelineConfig()
+        context = SimpleNamespace(is_editing=True)
+        batch = SimpleNamespace(
+            guidance_scale=4.0,
+            true_cfg_scale=None,
+            extra={"bagel_context": context},
+        )
+
+        kwargs = config.prepare_pos_cond_kwargs(
+            batch,
+            torch.device("cpu"),
+            rotary_emb=None,
+            dtype=torch.float32,
+        )
+
+        self.assertEqual(kwargs["guidance_scale"], 4.0)
+        self.assertEqual(kwargs["image_guidance_scale"], 2.0)
+        self.assertEqual(kwargs["cfg_interval"], (0.0, 1.0))
+        self.assertEqual(kwargs["cfg_renorm_type"], "text_channel")
 
     def test_unpatchify_uses_request_shape_and_releases_context(self) -> None:
         config = BagelPipelineConfig()

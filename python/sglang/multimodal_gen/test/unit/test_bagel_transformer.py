@@ -223,6 +223,69 @@ def test_internal_cfg_matches_bagel_global_renorm() -> None:
     torch.testing.assert_close(output, conditional)
 
 
+def test_editing_context_has_three_request_owned_prefixes_with_shared_image_storage(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    torch.manual_seed(2)
+    context = tiny_transformer.build_editing_context(
+        vae_patches=torch.randn(4, 4),
+        vae_position_ids=torch.tensor([0, 1, 2, 3]),
+        vision_embeddings=torch.randn(3, 8),
+        text_input_ids=torch.tensor([1, 2]),
+        height=4,
+        width=4,
+        start_of_image_token_id=3,
+        end_of_image_token_id=4,
+    )
+
+    assert context.is_editing
+    assert context.conditional_kv.sequence_length == 13
+    assert context.unconditional_kv.sequence_length == 11
+    assert context.image_unconditional_kv is not None
+    assert context.image_unconditional_kv.sequence_length == 2
+    assert context.conditional_rope_offset == 4
+    assert context.unconditional_rope_offset == 2
+    assert context.image_unconditional_rope_offset == 2
+    assert context.conditional_kv is not context.unconditional_kv
+    main_key = context.conditional_kv.key_cache[0]
+    image_key = context.unconditional_kv.key_cache[0]
+    assert main_key is not None and image_key is not None
+    assert (
+        main_key.untyped_storage().data_ptr() == image_key.untyped_storage().data_ptr()
+    )
+
+    latents = torch.randn(4, 4)
+    prediction = tiny_transformer(
+        latents,
+        torch.tensor([0.5]),
+        bagel_context=context,
+        guidance_scale=4.0,
+        image_guidance_scale=2.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="text_channel",
+    )
+    assert prediction.shape == latents.shape
+    assert torch.isfinite(prediction).all()
+
+
+def test_three_way_cfg_matches_official_text_channel_order() -> None:
+    main = torch.tensor([[2.0, 0.0]])
+    image_only = torch.tensor([[1.0, 0.0]])
+    text_only = torch.tensor([[0.5, 0.0]])
+
+    output = BagelTransformer._apply_cfg_three_way(
+        main,
+        image_only,
+        text_only,
+        4.0,
+        2.0,
+        renorm_min=0.0,
+        renorm_type="text_channel",
+    )
+
+    torch.testing.assert_close(output, torch.tensor([[3.5, 0.0]]))
+
+
 def test_generation_qk_stays_fp32_until_attention_cast(
     tiny_transformer: BagelTransformer,
 ) -> None:

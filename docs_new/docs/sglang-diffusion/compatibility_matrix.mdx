@@ -38,7 +38,7 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
           </tr>
           <tr>
-            <td>BAGEL (T2I only)</td>
+            <td>BAGEL (T2I + single-image editing)</td>
             <td><div className="sgd-id-list"><code>ByteDance-Seed/BAGEL-7B-MoT</code></div></td>
           </tr>
           <tr>
@@ -176,9 +176,9 @@ Rows are grouped when a family shares the same runtime path or optimization supp
 
 <Note>
 BAGEL currently uses its native, non-Diffusers checkpoint layout and supports
-single-output text-to-image generation on NVIDIA CUDA. Editing, understanding,
-dynamic batching, distributed parallelism, Cache-DiT, and layer-wise offload
-are not supported in the initial integration.
+single-output text-to-image generation and single-image editing on NVIDIA
+CUDA. Understanding, masks, multiple editing inputs, dynamic batching,
+distributed parallelism, Cache-DiT, and layer-wise offload are not supported.
 </Note>
 
 <Note>

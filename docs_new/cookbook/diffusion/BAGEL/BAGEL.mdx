@@ -1,17 +1,19 @@
 ---
 title: "BAGEL"
-description: "Serve the BAGEL-7B-MoT text-to-image checkpoint with SGLang Diffusion."
+description: "Serve BAGEL-7B-MoT for text-to-image generation and single-image editing."
 ---
 
 ## Overview
 
 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a
 multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
-initial BAGEL integration supports its text-to-image path on NVIDIA CUDA.
+native integration supports text-to-image generation and single-image editing
+on NVIDIA CUDA.
 
 <Warning>
-This integration is text-to-image only. It does not support image editing,
-image understanding, multi-output requests, dynamic batching, tensor or
+Run text-to-image generation and editing as separate pipeline processes. The
+current integration does not support image understanding, editing masks,
+multiple input images, multi-output requests, dynamic batching, tensor or
 sequence parallelism, Cache-DiT, or layer-wise offload.
 </Warning>
 
@@ -24,7 +26,7 @@ sequence parallelism, Cache-DiT, or layer-wise offload.
 - Use the official `ByteDance-Seed/BAGEL-7B-MoT` checkpoint. The examples pin a
   checkpoint revision for reproducibility.
 
-## Start the server
+## Start a text-to-image server
 
 Start the OpenAI-compatible image server:
 
@@ -38,6 +40,22 @@ sglang serve \
 You can also pass a local checkpoint directory. SGLang identifies an arbitrary
 local directory as BAGEL only when it contains all four root-level files:
 `config.json`, `llm_config.json`, `ema.safetensors`, and `ae.safetensors`.
+
+## Start an editing server
+
+Select `BagelEditPipeline` explicitly. This process additionally loads the VAE
+encoder and BAGEL vision encoder required for image conditioning:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelEditPipeline \
+  --port 30010
+```
+
+One process serves one BAGEL capability. Restart with `BagelPipeline`, or omit
+`--pipeline-class-name`, to return to text-to-image generation.
 
 ## Generate an image
 
@@ -89,6 +107,59 @@ The default BAGEL flow shift is `3.0`. The images API accepts `flow_shift` as a
 request field; the offline CLI uses the model default. The fixed-seed example
 uses the CPU generator to match the official BAGEL noise initialization.
 
+## Edit an image
+
+Send one source image to the editing server through the OpenAI-compatible
+images edits API. Omit `size` to preserve the source aspect ratio with BAGEL's
+official resize policy:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30010/v1")
+
+with open("input.png", "rb") as input_image:
+    response = client.images.edit(
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        image=input_image,
+        prompt="Turn the background into a blue sky",
+        n=1,
+        response_format="b64_json",
+        extra_body={
+            "seed": 42,
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "true_cfg_scale": 2.0,
+        },
+    )
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("bagel-edit.png", "wb") as output_file:
+    output_file.write(image_bytes)
+```
+
+For an offline edit, use the same explicit pipeline selection:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelEditPipeline \
+  --image-path input.png \
+  --prompt "Turn the background into a blue sky" \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --true-cfg-scale 2.0 \
+  --save-output
+```
+
+`guidance_scale` controls text CFG. `true_cfg_scale` controls BAGEL's image CFG
+and defaults to `2.0` when omitted. Transparent inputs are composited on a
+white background before encoding, matching the official application path.
+
 ## Current request contract
 
 - Send one prompt and request one output (`n=1`).
@@ -96,6 +167,9 @@ uses the CPU generator to match the official BAGEL noise initialization.
   implement negative-prompt conditioning.
 - Use `num_inference_steps=50` to execute 50 denoising updates.
 - Keep `guidance_scale=4.0` and `flow_shift=3.0` for the official default path.
+- Editing accepts exactly one source image and no mask. Omit `size` for
+  automatic official resizing; if supplied, it must equal the calculated
+  preprocessed size.
 
 See the [BAGEL repository](https://github.com/ByteDance-Seed/Bagel) for the
 upstream model implementation and the

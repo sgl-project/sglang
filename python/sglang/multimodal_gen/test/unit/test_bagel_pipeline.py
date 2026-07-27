@@ -9,12 +9,18 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+    BagelEditPipelineConfig,
+    BagelPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines.bagel_pipeline import BagelPipeline
+from sglang.multimodal_gen.runtime.pipelines.bagel_pipeline import (
+    BagelEditPipeline,
+    BagelPipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel import (
     BagelBeforeDenoisingStage,
@@ -253,6 +259,31 @@ class TestBagelLoaderContract(unittest.TestCase):
             {"transformer", "vae", "tokenizer", "scheduler"},
         )
         self.assertEqual(pipeline.memory_usages["transformer"], 0.0)
+
+    def test_editing_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
+        pipeline = BagelEditPipeline.__new__(BagelEditPipeline)
+        pipeline.model_path = "must-not-be-resolved"
+        modules = {
+            "transformer": _FakeTransformer(),
+            "vae": torch.nn.Identity(),
+            "image_encoder": torch.nn.Identity(),
+            "tokenizer": _FakeTokenizer(),
+            "scheduler": FlowMatchEulerDiscreteScheduler(shift=1.0),
+        }
+        args = _server_args(BagelEditPipelineConfig())
+
+        with patch.object(
+            BagelEditPipeline,
+            "_resolve_checkpoint",
+            side_effect=AssertionError("snapshot resolution must not run"),
+        ):
+            loaded = pipeline.load_modules(args, modules)
+
+        self.assertEqual(set(loaded), set(modules))
+        self.assertEqual(
+            set(pipeline.memory_usages),
+            {"transformer", "vae", "image_encoder", "tokenizer", "scheduler"},
+        )
 
     def test_runtime_capability_gates_report_all_invalid_modes(self) -> None:
         args = _server_args()

@@ -1,7 +1,7 @@
 # Copyright 2024 Black Forest Labs and contributors.
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for BAGEL's decoder-only FLUX-style autoencoder.
+"""Configuration for BAGEL's FLUX-style autoencoder.
 
 Source: https://github.com/ByteDance-Seed/Bagel/blob/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f/modeling/autoencoder.py
 """
@@ -31,7 +31,7 @@ class BagelVAEArchConfig(VAEArchConfig):
 
 @dataclass
 class BagelVAEConfig(VAEConfig):
-    """Decoder-only lifecycle configuration for BAGEL T2I."""
+    """Configurable encoder/decoder lifecycle for BAGEL generation and editing."""
 
     arch_config: BagelVAEArchConfig = field(default_factory=BagelVAEArchConfig)
 

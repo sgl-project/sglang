@@ -4,12 +4,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.cli.utils import get_is_diffusion_model
-from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
-from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+    BagelEditPipelineConfig,
+    BagelPipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.bagel import (
+    BagelEditSamplingParams,
+    BagelSamplingParams,
+)
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_model_info,
     get_non_diffusers_pipeline_name,
+    get_pipeline_config_classes,
     has_registered_diffusion_model_path,
     is_known_non_diffusers_multimodal_model,
 )
@@ -123,6 +130,13 @@ class TestBagelRegistryConfig(unittest.TestCase):
         self.assertEqual(model_info.pipeline_cls.__name__, BAGEL_PIPELINE_NAME)
         self.assertIs(model_info.pipeline_config_cls, BagelPipelineConfig)
         self.assertIs(model_info.sampling_param_cls, BagelSamplingParams)
+
+    def test_explicit_editing_pipeline_registers_its_config_classes(self):
+        config_classes = get_pipeline_config_classes("BagelEditPipeline")
+
+        self.assertIsNotNone(config_classes)
+        self.assertIs(config_classes[0], BagelEditPipelineConfig)
+        self.assertIs(config_classes[1], BagelEditSamplingParams)
 
 
 if __name__ == "__main__":

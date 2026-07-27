@@ -1,6 +1,6 @@
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""Native hybrid pipeline for the official BAGEL T2I checkpoint.
+"""Native pipelines for BAGEL text-to-image generation and image editing.
 
 Source: https://github.com/ByteDance-Seed/Bagel/blob/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f/inferencer.py
 """
@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from fnmatch import fnmatch
 from typing import Any
 
@@ -34,6 +35,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel import (
     BagelBeforeDenoisingStage,
+    BagelEditBeforeDenoisingStage,
+    BagelEditInputValidationStage,
     BagelInputValidationStage,
     validate_bagel_special_tokens,
 )
@@ -133,9 +136,20 @@ class BagelPipeline(ComposedPipelineBase):
             unsupported.append("non-BF16 DiT precision")
         if getattr(pipeline_config, "vae_precision", None) != "bf16":
             unsupported.append("non-BF16 VAE precision")
+        if (
+            getattr(
+                getattr(pipeline_config, "image_encoder_config", None),
+                "prefix",
+                None,
+            )
+            == "vit_model"
+            and pipeline_config.image_encoder_precision != "bf16"
+        ):
+            unsupported.append("non-BF16 image encoder precision")
         if unsupported:
             raise ValueError(
-                "BAGEL T2I does not support: " + ", ".join(sorted(set(unsupported)))
+                "BAGEL pipeline does not support: "
+                + ", ".join(sorted(set(unsupported)))
             )
 
     @staticmethod
@@ -288,11 +302,19 @@ class BagelPipeline(ComposedPipelineBase):
         return resolved, self._validate_checkpoint(resolved)
 
     @staticmethod
-    def _stream_weights(module, weight_file: str, component_name: str) -> None:
+    def _stream_weights(
+        module,
+        weight_file: str,
+        component_name: str,
+        *,
+        key_filter: Callable[[str], bool] | None = None,
+    ) -> None:
         """Stream one safetensors file through a component's strict loader."""
         try:
             loaded = module.load_weights(
-                safetensors_weights_iterator([weight_file], to_cpu=True)
+                safetensors_weights_iterator(
+                    [weight_file], to_cpu=True, key_filter=key_filter
+                )
             )
         except (OSError, RuntimeError) as error:
             message = str(error).lower()
@@ -324,7 +346,7 @@ class BagelPipeline(ComposedPipelineBase):
             loaded_modules: Optional injected modules, primarily for tests.
 
         Returns:
-            All four required BAGEL modules.
+            All modules required by the selected BAGEL pipeline.
 
         Raises:
             ValueError: If runtime capabilities or checkpoint architecture are invalid.
@@ -337,13 +359,16 @@ class BagelPipeline(ComposedPipelineBase):
         if "scheduler" not in modules:
             modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=1.0)
 
-        weight_backed_missing = {"transformer", "vae", "tokenizer"} - modules.keys()
+        weight_backed_components = {"transformer", "vae", "tokenizer"}
+        if "image_encoder" in self._required_config_modules:
+            weight_backed_components.add("image_encoder")
+        weight_backed_missing = weight_backed_components - modules.keys()
         checkpoint_path: str | None = None
         checkpoint_config: dict[str, Any] | None = None
         if weight_backed_missing:
             checkpoint_path, checkpoint_config = self._resolve_checkpoint(server_args)
             self.model_path = checkpoint_path
-            for component_name in ("transformer", "vae", "tokenizer"):
+            for component_name in weight_backed_components:
                 server_args.model_paths[component_name] = checkpoint_path
 
         device = get_local_torch_device()
@@ -373,8 +398,46 @@ class BagelPipeline(ComposedPipelineBase):
                 transformer,
                 os.path.join(checkpoint_path, "ema.safetensors"),
                 "transformer",
+                key_filter=lambda name: not name.startswith(
+                    (
+                        "connector.",
+                        "vit_model.",
+                        "vit_pos_embed.",
+                        "language_model.lm_head.",
+                    )
+                ),
             )
             modules["transformer"] = transformer.to(device=device, dtype=dtype).eval()
+
+        if (
+            "image_encoder" in weight_backed_components
+            and "image_encoder" not in modules
+        ):
+            assert checkpoint_path is not None
+            from sglang.multimodal_gen.runtime.models.encoders.bagel_vit import (
+                BagelImageEncoder,
+            )
+
+            dtype = resolve_precision(
+                server_args,
+                "image_encoder",
+                precision_attr="image_encoder_precision",
+            )
+            with set_default_torch_dtype(dtype), torch.device("meta"):
+                image_encoder = BagelImageEncoder(
+                    server_args.pipeline_config.image_encoder_config
+                )
+            self._stream_weights(
+                image_encoder,
+                os.path.join(checkpoint_path, "ema.safetensors"),
+                "image encoder",
+                key_filter=lambda name: name.startswith(
+                    ("connector.", "vit_model.", "vit_pos_embed.")
+                ),
+            )
+            modules["image_encoder"] = image_encoder.to(
+                device=device, dtype=dtype
+            ).eval()
 
         if "vae" not in modules:
             assert checkpoint_path is not None
@@ -388,7 +451,16 @@ class BagelPipeline(ComposedPipelineBase):
             self._stream_weights(
                 vae,
                 os.path.join(checkpoint_path, "ae.safetensors"),
-                "VAE decoder",
+                "VAE",
+                key_filter=lambda name: (
+                    name.startswith("encoder.")
+                    and server_args.pipeline_config.vae_config.load_encoder
+                )
+                or (
+                    name.startswith("decoder.")
+                    and server_args.pipeline_config.vae_config.load_decoder
+                )
+                or name.startswith("reg."),
             )
             modules["vae"] = vae.to(device=device, dtype=dtype).eval()
 
@@ -435,4 +507,41 @@ class BagelPipeline(ComposedPipelineBase):
         self.add_standard_decoding_stage()
 
 
-EntryClass = BagelPipeline
+class BagelEditPipeline(BagelPipeline):
+    """Load and execute BAGEL's explicit single-image Editing path."""
+
+    pipeline_name = "BagelEditPipeline"
+
+    from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+        BagelEditPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.bagel import BagelEditSamplingParams
+
+    pipeline_config_cls = BagelEditPipelineConfig
+    sampling_params_cls = BagelEditSamplingParams
+    _required_config_modules = [
+        "transformer",
+        "vae",
+        "image_encoder",
+        "tokenizer",
+        "scheduler",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        """Build validation -> image prefill -> standard denoise/decode."""
+        self.add_stage(BagelEditInputValidationStage(), "input_validation_stage")
+        self.add_stage(
+            BagelEditBeforeDenoisingStage(
+                transformer=self.get_module("transformer"),
+                vae=self.get_module("vae"),
+                image_encoder=self.get_module("image_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+            "bagel_edit_before_denoising_stage",
+        )
+        self.add_standard_denoising_stage(vae_key=None)
+        self.add_standard_decoding_stage()
+
+
+EntryClass = [BagelPipeline, BagelEditPipeline]

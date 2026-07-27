@@ -8,6 +8,8 @@ Source: https://github.com/ByteDance-Seed/Bagel/blob/a2fa77dd8caeefc41e6607ae0ec
 import math
 
 import torch
+from PIL import Image
+from torchvision.transforms import functional as TF
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -47,6 +49,55 @@ class BagelInputValidationStage(InputValidationStage):
         # fixes the official CPU noise stream for reproducibility.
         batch.generator_device = server_args.pipeline_config.generator_device
         super()._generate_seeds(batch, server_args)
+
+
+class BagelEditInputValidationStage(BagelInputValidationStage):
+    """Validate and resize exactly one BAGEL Editing source image."""
+
+    def preprocess_condition_image(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        condition_image_width,
+        condition_image_height,
+    ):
+        """Reject multi-image requests before applying the official resize."""
+        images = (
+            batch.condition_image
+            if isinstance(batch.condition_image, list)
+            else [batch.condition_image]
+        )
+        if len(images) != 1:
+            raise ValueError(
+                f"BAGEL Editing supports exactly one input image; got {len(images)}"
+            )
+        return super().preprocess_condition_image(
+            batch,
+            server_args,
+            condition_image_width,
+            condition_image_height,
+        )
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Run generic loading, then enforce official output-size parity."""
+        batch = super().forward(batch, server_args)
+        if (
+            not isinstance(batch.condition_image, list)
+            or len(batch.condition_image) != 1
+        ):
+            raise ValueError("BAGEL Editing requires exactly one decoded input image")
+        image = batch.condition_image[0]
+        if not isinstance(image, Image.Image):
+            raise ValueError("BAGEL Editing input must decode to a PIL image")
+        explicit_fields = set(batch.extra.get("explicit_fields", []))
+        if {"width", "height"} & explicit_fields:
+            if (int(batch.width), int(batch.height)) != image.size:
+                raise ValueError(
+                    "BAGEL Editing size must match the official preprocessed input "
+                    f"size {image.width}x{image.height}; got "
+                    f"{batch.width}x{batch.height}"
+                )
+        return batch
 
 
 def validate_bagel_special_tokens(tokenizer) -> dict[str, int]:
@@ -141,8 +192,9 @@ class BagelBeforeDenoisingStage(PipelineStage):
             dtype=torch.long,
         )
 
-    @staticmethod
-    def _validate_request(batch: Req, server_args: ServerArgs) -> None:
+    requires_image: bool = False
+
+    def _validate_request(self, batch: Req, server_args: ServerArgs) -> None:
         """Reject request features outside the current BAGEL T2I contract."""
         if not isinstance(batch.prompt, str) or not batch.prompt.strip():
             raise ValueError("BAGEL T2I requires exactly one non-empty string prompt")
@@ -172,12 +224,28 @@ class BagelBeforeDenoisingStage(PipelineStage):
             raise ValueError(
                 "BAGEL T2I does not accept precomputed negative_prompt_embeds"
             )
-        if batch.true_cfg_scale is not None:
-            raise ValueError(
-                "BAGEL T2I uses guidance_scale; true_cfg_scale is not supported"
+        if self.requires_image:
+            if batch.true_cfg_scale is not None and (
+                not math.isfinite(float(batch.true_cfg_scale))
+                or float(batch.true_cfg_scale) < 0
+            ):
+                raise ValueError(
+                    "BAGEL Editing true_cfg_scale must be a finite non-negative value"
+                )
+            images = (
+                batch.condition_image
+                if isinstance(batch.condition_image, list)
+                else [batch.condition_image]
             )
-        if batch.image_path is not None or batch.condition_image is not None:
-            raise ValueError("BAGEL supports text-to-image requests only")
+            if batch.image_path is None or len(images) != 1 or images[0] is None:
+                raise ValueError("BAGEL Editing requires exactly one input image")
+        else:
+            if batch.true_cfg_scale is not None:
+                raise ValueError(
+                    "BAGEL T2I uses guidance_scale; true_cfg_scale is not supported"
+                )
+            if batch.image_path is not None or batch.condition_image is not None:
+                raise ValueError("BAGEL T2I does not accept image input")
         if batch.extra.get("dynamic_batch_seeds") is not None:
             raise ValueError("BAGEL dynamic batching is not supported")
         if batch.rollout:
@@ -204,7 +272,7 @@ class BagelBeforeDenoisingStage(PipelineStage):
         max_output_size = latent_downsample * max_latent_size
         if height > max_output_size or width > max_output_size:
             raise ValueError(
-                f"BAGEL T2I supports dimensions up to {max_output_size}; "
+                f"BAGEL supports dimensions up to {max_output_size}; "
                 f"got {width}x{height}"
             )
 
@@ -214,6 +282,40 @@ class BagelBeforeDenoisingStage(PipelineStage):
             )
         if not math.isfinite(float(batch.guidance_scale)) or batch.guidance_scale < 0:
             raise ValueError("BAGEL guidance_scale must be a finite non-negative value")
+
+    def _build_request_context(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        transformer,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+        **_context_inputs,
+    ):
+        """Build the two-way T2I context for one request."""
+        del server_args
+        conditional_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(
+            device
+        )
+        return transformer.build_context(
+            conditional_ids,
+            None,
+            height=int(batch.height),
+            width=int(batch.width),
+            start_of_image_token_id=special_token_ids["<|vision_start|>"],
+            end_of_image_token_id=special_token_ids["<|vision_end|>"],
+        )
+
+    def _prepare_context_inputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+    ) -> dict[str, object]:
+        """Return no extra inputs for the text-only T2I context."""
+        del batch, server_args, special_token_ids, device
+        return {}
 
     @staticmethod
     def build_shifted_schedule(
@@ -275,6 +377,13 @@ class BagelBeforeDenoisingStage(PipelineStage):
         if generator.initial_seed() != int(batch.seed):
             raise ValueError("BAGEL request generator seed does not match batch.seed")
 
+        special_token_ids = self._ensure_special_tokens()
+        context_inputs = self._prepare_context_inputs(
+            batch,
+            server_args,
+            special_token_ids,
+            device,
+        )
         with self.use_declared_component(
             component_name="transformer",
             module=self.transformer,
@@ -282,17 +391,13 @@ class BagelBeforeDenoisingStage(PipelineStage):
         ) as transformer:
             assert transformer is not None
             self.transformer = transformer
-            special_token_ids = self._ensure_special_tokens()
-            conditional_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(
-                device
-            )
-            context = transformer.build_context(
-                conditional_ids,
-                None,
-                height=int(batch.height),
-                width=int(batch.width),
-                start_of_image_token_id=special_token_ids["<|vision_start|>"],
-                end_of_image_token_id=special_token_ids["<|vision_end|>"],
+            context = self._build_request_context(
+                batch,
+                server_args,
+                transformer,
+                special_token_ids,
+                device,
+                **context_inputs,
             )
 
         arch = server_args.pipeline_config.dit_config.arch_config
@@ -345,3 +450,179 @@ class BagelBeforeDenoisingStage(PipelineStage):
         batch.negative_prompt_embeds = []
         batch.do_classifier_free_guidance = False
         return batch
+
+
+class BagelEditBeforeDenoisingStage(BagelBeforeDenoisingStage):
+    """Encode one source image and build BAGEL's three Editing CFG prefixes."""
+
+    requires_image = True
+
+    def __init__(
+        self,
+        transformer,
+        vae,
+        image_encoder,
+        tokenizer,
+        scheduler,
+    ) -> None:
+        """Initialize the Editing stage with immutable model components.
+
+        Args:
+            transformer: Request-stateless BAGEL mixture-of-transformers.
+            vae: Full BAGEL VAE with encoder and decoder.
+            image_encoder: SigLIP NaViT, connector, and LLM position table.
+            tokenizer: Official checkpoint tokenizer.
+            scheduler: Scheduler template cloned for every request.
+        """
+        super().__init__(transformer, tokenizer, scheduler)
+        self.vae = vae
+        self.image_encoder = image_encoder
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        """Declare VAE/ViT encoding followed by Transformer prefill."""
+        component_stage = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                component_stage,
+                "vae",
+                phase="encode",
+                target_dtype=torch.bfloat16,
+                memory_intensive=True,
+            ),
+            ComponentUse(
+                component_stage,
+                "image_encoder",
+                phase="encode",
+                target_dtype=torch.bfloat16,
+                memory_intensive=True,
+            ),
+            ComponentUse(
+                component_stage,
+                "transformer",
+                phase="prefill",
+                target_dtype=torch.bfloat16,
+                memory_intensive=True,
+            ),
+        ]
+
+    @staticmethod
+    def _patchify_vae_latents(
+        latents: torch.Tensor,
+        *,
+        patch_size: int,
+        max_latent_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Patchify one encoded source image and build its 2D position IDs."""
+        if latents.ndim != 4 or latents.shape[0] != 1:
+            raise ValueError(
+                "BAGEL Editing VAE must return one NCHW latent; "
+                f"got shape {tuple(latents.shape)}"
+            )
+        _, channels, latent_height, latent_width = latents.shape
+        if latent_height % patch_size or latent_width % patch_size:
+            raise ValueError(
+                "BAGEL Editing VAE latent dimensions must be divisible by "
+                f"patch_size={patch_size}"
+            )
+        token_height = latent_height // patch_size
+        token_width = latent_width // patch_size
+        if token_height > max_latent_size or token_width > max_latent_size:
+            raise ValueError(
+                "BAGEL Editing source image exceeds the latent position table"
+            )
+        patches = latents[0].reshape(
+            channels,
+            token_height,
+            patch_size,
+            token_width,
+            patch_size,
+        )
+        patches = torch.einsum("chpwq->hwpqc", patches).reshape(
+            -1, patch_size * patch_size * channels
+        )
+        rows = torch.arange(token_height, device=latents.device).unsqueeze(1)
+        columns = torch.arange(token_width, device=latents.device).unsqueeze(0)
+        position_ids = (rows * max_latent_size + columns).reshape(-1)
+        return patches, position_ids
+
+    def _prepare_context_inputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+    ) -> dict[str, object]:
+        """Encode the source image before the Transformer prefill phase."""
+        image = batch.condition_image[0]
+        if not isinstance(image, Image.Image):
+            raise ValueError("BAGEL Editing requires one PIL source image")
+
+        with self.use_declared_component(
+            component_name="vae",
+            module=self.vae,
+            phase="encode",
+        ) as vae:
+            assert vae is not None
+            self.vae = vae
+            pixels = TF.to_tensor(image.convert("RGB")).mul_(2.0).sub_(1.0)
+            pixels = pixels.unsqueeze(0).to(device=vae.device, dtype=vae.dtype)
+            posterior_generator = torch.Generator(device=vae.device).manual_seed(
+                int(batch.seed)
+            )
+            encoded_latents = vae.encode(
+                pixels,
+                generator=posterior_generator,
+            )
+
+        arch = server_args.pipeline_config.dit_config.arch_config
+        vae_patches, vae_position_ids = self._patchify_vae_latents(
+            encoded_latents,
+            patch_size=int(arch.latent_patch_size),
+            max_latent_size=int(arch.max_latent_size),
+        )
+        with self.use_declared_component(
+            component_name="image_encoder",
+            module=self.image_encoder,
+            phase="encode",
+        ) as image_encoder:
+            assert image_encoder is not None
+            self.image_encoder = image_encoder
+            vision_embeddings = image_encoder.encode_image(image)
+
+        text_input_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(
+            device
+        )
+        return {
+            "vae_patches": vae_patches,
+            "vae_position_ids": vae_position_ids,
+            "vision_embeddings": vision_embeddings,
+            "text_input_ids": text_input_ids,
+        }
+
+    def _build_request_context(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        transformer,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+        *,
+        vae_patches: torch.Tensor,
+        vae_position_ids: torch.Tensor,
+        vision_embeddings: torch.Tensor,
+        text_input_ids: torch.Tensor,
+    ):
+        """Construct request-owned three-way prefixes during Transformer use."""
+        del server_args, device
+        return transformer.build_editing_context(
+            vae_patches,
+            vae_position_ids,
+            vision_embeddings,
+            text_input_ids,
+            height=int(batch.height),
+            width=int(batch.width),
+            start_of_image_token_id=special_token_ids["<|vision_start|>"],
+            end_of_image_token_id=special_token_ids["<|vision_end|>"],
+        )

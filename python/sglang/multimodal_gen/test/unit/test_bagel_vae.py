@@ -29,6 +29,26 @@ def tiny_vae() -> BagelVAE:
     return BagelVAE(BagelVAEConfig(arch_config=arch)).eval()
 
 
+@pytest.fixture
+def tiny_full_vae() -> BagelVAE:
+    arch = BagelVAEArchConfig(
+        resolution=8,
+        ch=32,
+        ch_mult=(1,),
+        num_res_blocks=1,
+        z_channels=4,
+        spatial_compression_ratio=1,
+    )
+    torch.manual_seed(0)
+    return BagelVAE(
+        BagelVAEConfig(
+            arch_config=arch,
+            load_encoder=True,
+            load_decoder=True,
+        )
+    ).eval()
+
+
 def test_attention_uses_nchw_to_sequence_permutation() -> None:
     torch.manual_seed(1)
     block = _AttnBlock(32).eval()
@@ -103,6 +123,60 @@ def test_decoder_weight_loader_is_streaming_and_strict(tiny_vae: BagelVAE) -> No
 def test_decode_validates_nchw_rank(tiny_vae: BagelVAE) -> None:
     with pytest.raises(ValueError, match="expects NCHW"):
         tiny_vae.decode(torch.zeros(4, 2, 3))
+
+
+def test_encode_uses_request_generator_without_global_rng(
+    tiny_full_vae: BagelVAE,
+) -> None:
+    images = torch.randn(1, 3, 4, 4)
+    global_state = torch.random.get_rng_state()
+
+    first = tiny_full_vae.encode(
+        images, generator=torch.Generator("cpu").manual_seed(123)
+    )
+    second = tiny_full_vae.encode(
+        images, generator=torch.Generator("cpu").manual_seed(123)
+    )
+
+    torch.testing.assert_close(first, second)
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+
+
+def test_encode_applies_posterior_and_scale_shift_once(
+    tiny_full_vae: BagelVAE,
+) -> None:
+    class FixedEncoder(nn.Module):
+        def forward(self, images: torch.Tensor) -> torch.Tensor:
+            batch, _, height, width = images.shape
+            mean = images.new_full((batch, 4, height, width), 0.25)
+            log_variance = images.new_full((batch, 4, height, width), -100.0)
+            return torch.cat((mean, log_variance), dim=1)
+
+    tiny_full_vae.encoder = FixedEncoder()
+    images = torch.zeros(1, 3, 2, 2)
+    output = tiny_full_vae.encode(
+        images, generator=torch.Generator("cpu").manual_seed(0)
+    )
+    expected = torch.full_like(
+        output,
+        tiny_full_vae.scaling_factor * (0.25 - tiny_full_vae.shift_factor),
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=1e-6)
+
+
+def test_full_vae_loader_requires_encoder_and_decoder(
+    tiny_full_vae: BagelVAE,
+) -> None:
+    expected = [
+        (name, torch.zeros_like(parameter))
+        for name, parameter in tiny_full_vae.named_parameters()
+    ]
+    loaded = tiny_full_vae.load_weights(iter(expected))
+    assert loaded == {name for name, _ in expected}
+
+    decoder_only = [item for item in expected if item[0].startswith("decoder.")]
+    with pytest.raises(ValueError, match="missing VAE weights"):
+        tiny_full_vae.load_weights(iter(decoder_only))
 
 
 def test_meta_initialization_materializes_decoder_for_streaming_load(

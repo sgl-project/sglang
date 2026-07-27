@@ -394,6 +394,11 @@ async def edits(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    if mask is not None and server_args.pipeline_class_name == "BagelEditPipeline":
+        raise HTTPException(
+            status_code=400,
+            detail="Image edit masks are not supported by the current endpoint",
+        )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
