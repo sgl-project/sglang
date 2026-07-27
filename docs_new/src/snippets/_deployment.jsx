@@ -8,12 +8,29 @@
 //   supportedHardware  hw ids shown in the catalog (subset of HARDWARE_CATALOG ∪ config.hardware)
 //   hardware           optional — per-model GPUs the shared HARDWARE_CATALOG lacks:
 //                      {id, label, vram, vendor}[] merged into the catalog at render
-//                      (so a model-specific GPU never needs an engine-catalog edit)
-//   variants/quantizations/strategies/nodesOptions  the 5-dim option lists
-//                      (nodesOptions id is `single` or `multi-N` → --nnodes N)
-//   cells              {match, verified?, env, flags}[] — one per
-//                      (hw × variant × quant × strategy × nodes); env/flags are
-//                      flat literals, only {{PLACEHOLDER}} subst applied
+//                      (so a model-specific GPU never needs an engine-catalog edit);
+//                      vendor picks the selector group: blackwell | hopper | amd
+//   variants/quantizations/strategies/nodesOptions  LEGACY 4-dim option lists,
+//                      used when `matchDims` is absent (nodesOptions id is
+//                      `single` or `multi-N` → --nnodes N)
+//   matchDims          optional — replaces the legacy four. {id, title, options}[]
+//                      where each option is {id, label, showWhen?(sel), disabled?,
+//                      disableReason?}. `hw` is always the implicit first dim.
+//                      Cells are then keyed on (hw × <these ids>).
+//   overlayDims        optional — rows that do NOT participate in cell lookup; the
+//                      picked option layers onto the matched cell, so an orthogonal
+//                      knob does not multiply the cell count. Same option shape plus
+//                      `flags` / `env` / `hints` (each a literal array or a function
+//                      of the whole selection), and a row-level `default` / `showWhen`.
+//                      `hints` render as `# ...` lines above the command.
+//   cells              {match, verified?, nnodes?, warn?, redirect?, env, flags}[] — one per
+//                      (hw × match dims); env/flags are flat literals, only
+//                      {{PLACEHOLDER}} subst applied. `nnodes` supplies the node
+//                      count for configs with no `nodes` dim (default 1). `warn`
+//                      renders as a ⚠️ banner under the cell's command; it may
+//                      embed [label](#anchor) links. `redirect: true` renders the
+//                      banner ALONE — no command, header, or copy buttons — for
+//                      cells that only point somewhere else.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
@@ -31,6 +48,8 @@
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by `hw|quant`
 //                      then `hw`; falls back to `lmsysorg/sglang:dev`
+//   runModes           optional — command output tabs to show (`python` and/or
+//                      `docker`); defaults to both, in that order
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -49,13 +68,15 @@ export const Deployment = ({ config, benchmarks }) => {
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
   const HARDWARE_CATALOG = {
-    nvidia: [
-      { id: "h100",  label: "H100",  vram: "80GB"  },
-      { id: "h200",  label: "H200",  vram: "141GB" },
-      { id: "b200",  label: "B200",  vram: "192GB" },
+    blackwell: [
       { id: "b300",  label: "B300",  vram: "288GB" },
-      { id: "gb200", label: "GB200", vram: "192GB" },
       { id: "gb300", label: "GB300", vram: "288GB" },
+      { id: "b200",  label: "B200",  vram: "192GB" },
+      { id: "gb200", label: "GB200", vram: "192GB" },
+    ],
+    hopper: [
+      { id: "h200",  label: "H200",  vram: "141GB" },
+      { id: "h100",  label: "H100",  vram: "80GB"  },
     ],
     amd: [
       { id: "mi300x", label: "MI300X", vram: "192GB" },
@@ -86,10 +107,12 @@ export const Deployment = ({ config, benchmarks }) => {
     },
     title: { fontSize: "12px", fontWeight: "600", minWidth: "108px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
     vendorRow: { display: "flex", alignItems: "center", gap: "6px" },
+    // Fixed width so every row's chips start at the same x regardless of the
+    // group name ("BLACKWELL" is the widest).
     vendorLabel: {
       fontSize: "10px", fontWeight: "600",
       color: isDark ? "#9ca3af" : "#6b7280",
-      minWidth: "38px", textTransform: "uppercase", letterSpacing: "0.04em",
+      width: "68px", flexShrink: 0, textTransform: "uppercase", letterSpacing: "0.04em",
     },
     // auto-fit + a real min width: columns wrap on narrow screens instead of
     // shrinking below their label (the old minmax(0,1fr) let buttons overlap on
@@ -365,9 +388,72 @@ export const Deployment = ({ config, benchmarks }) => {
   });
 
   // ==== 3. Pure helpers (no React state) ====
+  // Two kinds of selector row:
+  //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
+  //   overlay dims  never touch cell lookup; the picked option contributes flags
+  //                 on top of the matched cell (so an orthogonal knob like
+  //                 speculative decoding does not multiply the cell count)
+  // A config that declares neither keeps the legacy fixed 5-dim shape, so model
+  // pages written before this existed render unchanged.
+  const LEGACY_MATCH_DIMS = [
+    { id: "variant",  title: "Model Variant", optionsKey: "variants" },
+    { id: "quant",    title: "Quantization",  optionsKey: "quantizations" },
+    { id: "strategy", title: "Strategy",      optionsKey: "strategies" },
+    { id: "nodes",    title: "Nodes",         optionsKey: "nodesOptions" },
+  ];
+  // `hw` is always the first match dim; it has its own vendor-grouped renderer.
+  const matchDimSpecs = (config.matchDims || LEGACY_MATCH_DIMS).map((d) => ({
+    ...d,
+    options: d.options || config[d.optionsKey] || [],
+  }));
+  const overlayDimSpecs = config.overlayDims || [];
   // DIMENSIONS is ordered by priority — higher-index dims adapt to lower-index
   // picks, never the reverse. Drives the grey-out/snap logic below.
-  const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
+  const DIMENSIONS = ["hw", ...matchDimSpecs.map((d) => d.id)];
+
+  // An option is visible when it declares no `showWhen`, or its predicate accepts
+  // the current selection. Hidden options are excluded from snapping and from the
+  // grey-out scan, so a stale pick can never survive a dependent-row switch.
+  // ==== MIRROR in _playground.jsx — keep the two copies identical ====
+  // Snippets cannot import each other, so the overlay-resolution rule is written
+  // twice. A divergence makes the Deploy command and the playground base disagree,
+  // which shows up as phantom +/- lines in the diff and no error anywhere.
+  // Guarded by docs_new/scripts/check_cookbook_configs.mjs.
+  const optionVisible = (opt, sel) =>
+    typeof opt.showWhen !== "function" || opt.showWhen(sel);
+  const optionDisabled = (opt, sel) =>
+    typeof opt.disabled === "function" ? opt.disabled(sel) : !!opt.disabled;
+  const visibleOptions = (spec, sel) =>
+    (spec.options || []).filter((o) => optionVisible(o, sel));
+  const rowVisible = (spec, sel) =>
+    (typeof spec.showWhen !== "function" || spec.showWhen(sel)) &&
+    visibleOptions(spec, sel).length > 0;
+  const overlayPick = (sel) => {
+    const picked = [];
+    for (const spec of (config.overlayDims || [])) {
+      if (!rowVisible(spec, sel)) continue;
+      const opt = (spec.options || []).find((o) => o.id === sel[spec.id]);
+      if (opt && !optionDisabled(opt, sel)) picked.push(opt);
+    }
+    return picked;
+  };
+  const overlayPart = (sel, key) => {
+    const out = [];
+    for (const opt of overlayPick(sel)) {
+      const add = typeof opt[key] === "function" ? opt[key](sel) : opt[key];
+      if (add) out.push(...add);
+    }
+    return out;
+  };
+  // An overlay option may also REMOVE cell flags, declared as `stripPrefixes`
+  // (a static list, or a function of the selection). L3 uses it to drop the
+  // whole DCP operating point, which the server rejects with an L3 backend.
+  const overlayStrip = (cellFlags, sel) => {
+    const strip = overlayPart(sel, "stripPrefixes");
+    if (!strip.length) return [...(cellFlags || [])];
+    return (cellFlags || []).filter((f) => !strip.includes(f.split(/[\s=]/)[0]));
+  };
+  // ==== end MIRROR ====
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
@@ -461,37 +547,74 @@ export const Deployment = ({ config, benchmarks }) => {
         valid[dim] = fallback ? fallback.match[dim] : want;
       }
     }
+    // Overlay dims ride along: they never key cells, so snapping must not drop
+    // them (it did — a strict-mode hash round-trip lost the spec default).
+    // Keep the parsed value when it names a real option, else the row default.
+    for (const spec of overlayDimSpecs) {
+      const want = parsed[spec.id];
+      const opts = spec.options || [];
+      valid[spec.id] = opts.some((o) => o.id === want)
+        ? want
+        : spec.default ?? (opts[0] && opts[0].id) ?? "";
+    }
     return valid;
   };
 
+  // Lookup walks most-specific to least so a config that drops the variant/quant
+  // dims can key its HF slug on `hw` alone, or on the single "default" entry.
   const resolveModelName = (sel) => {
-    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
-    const pair = `${sel.variant}|${sel.quant}`;
-    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
+    const keys = [
+      `${sel.hw}|${sel.variant}|${sel.quant}`,
+      `${sel.variant}|${sel.quant}`,
+      sel.hw,
+      "default",
+    ];
+    for (const k of keys) {
+      const hit = config.modelNames[k];
+      if (hit) return hit;
+    }
+    return "";
   };
 
   const interpolate = (text, env, modelName) =>
     text.replace(/{{(\w+)}}/g, (_, key) =>
       key === "MODEL_NAME" ? modelName : (env[key] ?? `{{${key}}}`));
 
+  // Node count comes from the `nodes` dim when the config has one; without that
+  // dim it is a property of the cell itself (`nnodes`), since the deployment
+  // shape is then fixed by the hardware rather than picked by the reader.
   const parseNnodes = (id) => {
     if (id === "single") return 1;
-    const m = /^multi-(\d+)$/.exec(id);
+    const m = /^multi-(\d+)$/.exec(id || "");
     return m ? parseInt(m[1], 10) : 1;
   };
+  const cellNnodes = (cell, sel) =>
+    sel.nodes !== undefined ? parseNnodes(sel.nodes) : (cell.nnodes || 1);
+
+  // Role-specific serving ports for PD deployments — keep in sync with PD_PORTS
+  // in _playground.jsx, which the generated router command targets. Each role
+  // derives 5 ZMQ/dist ports from its --port, so the serve ports are spaced 100
+  // apart to keep those ranges from overlapping on a same-host deployment.
+  const PD_SERVE_PORTS = { prefill: 30000, decode: 30100 };
+
+  // `flags` / `env` / `hints` may each be a function of the whole selection, so an
+  // "Auto" option can resolve against another row (draft tokens per strategy).
+  const overlayFlags = (sel) => overlayPart(sel, "flags");
+  const overlayEnv = (sel) => overlayPart(sel, "env");
+  const overlayHints = (sel) => overlayPart(sel, "hints");
 
   // python mode → bare `sglang serve`; docker mode → wrapped in `docker run`.
   const renderCommand = (cell, sel, envValues, mode = "python") => {
     if (!cell) return "# No command available for the current selection.";
     const modelName = resolveModelName(sel);
-    const nnodes = parseNnodes(sel.nodes);
+    const nnodes = cellNnodes(cell, sel);
     const multinode = nnodes > 1;
-    const cellEnv = cell.env || [];
-    const flags = [...(cell.flags || [])];
+    const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
+    const flags = [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)];
     if (multinode) {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
-      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp-size", "--tp"];
       let i = -1;
       for (const anchor of PARALLELISM_ANCHORS) {
         i = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
@@ -502,6 +625,15 @@ export const Deployment = ({ config, benchmarks }) => {
         `--nnodes ${nnodes}`,
         `--node-rank {{NODE_RANK}}`,
         `--dist-init-addr {{NODE0_IP}}:20000`);
+    }
+
+    const pdServePort = PD_SERVE_PORTS[sel.pdMode];
+    if (pdServePort !== undefined) {
+      for (let j = 0; j < flags.length; j++) {
+        if (flags[j].split(/[\s=]/)[0] === "--port") {
+          flags[j] = `--port ${pdServePort}`;
+        }
+      }
     }
 
     let cmd;
@@ -553,8 +685,14 @@ export const Deployment = ({ config, benchmarks }) => {
       cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
     }
 
-    if (multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]) {
-      const hint = config.multiNodeHints[sel.hw]
+    const hintLines = [
+      ...overlayHints(sel),
+      ...(multinode && config.multiNodeHints && config.multiNodeHints[sel.hw]
+        ? config.multiNodeHints[sel.hw]
+        : []),
+    ];
+    if (hintLines.length) {
+      const hint = hintLines
         .map((line) => (line.length ? "# " + line : "#")).join("\n");
       cmd = `${hint}\n${cmd}`;
     }
@@ -836,13 +974,19 @@ export const Deployment = ({ config, benchmarks }) => {
     return groups;
   };
 
+  // Match dims seed from the first cell (authoring convention: put the flagship
+  // verified cell first). Overlay dims seed from their own `default`, or the
+  // first option, since no cell carries them.
   const initialSelectionFromCells = () => {
     const first = config.cells[0];
-    if (!first) return Object.fromEntries(DIMENSIONS.map((d) => [d, ""]));
-    return {
-      hw: first.match.hw, variant: first.match.variant, quant: first.match.quant,
-      strategy: first.match.strategy, nodes: first.match.nodes,
-    };
+    const sel = Object.fromEntries(
+      DIMENSIONS.map((d) => [d, first ? first.match[d] : ""]),
+    );
+    for (const spec of overlayDimSpecs) {
+      const opts = spec.options || [];
+      sel[spec.id] = spec.default ?? (opts[0] && opts[0].id) ?? "";
+    }
+    return sel;
   };
 
   const placeholderDefaults = (schema) => {
@@ -888,6 +1032,8 @@ export const Deployment = ({ config, benchmarks }) => {
   };
 
   const [sel, setSel] = useState(() => initialSelectionFromCells());
+  const INTERNAL_HASH_STATE_KEY = "__sglangDeployInternalHash";
+  const DEPLOYMENT_COMPONENT_ID = "deployment-configurator";
   useEffect(() => {
     const hydrate = () => {
       const raw = window.location.hash.replace(/^#/, "");
@@ -902,10 +1048,15 @@ export const Deployment = ({ config, benchmarks }) => {
       if (!touched) return;
       // Snap to a real cell if the hash named an impossible combo (stale link).
       setSel(validateSelection(config.cells, parsed));
-      // Scroll the Deploy section into view. Heading slugs to "deployment" or
-      // "deploy"; only fires on hash navigation (not replaceState chip clicks).
-      const el = document.getElementById("deployment")
-        || document.getElementById("deploy");
+      const historyState = window.history.state;
+      const isInternalHash =
+        historyState &&
+        typeof historyState === "object" &&
+        historyState[INTERNAL_HASH_STATE_KEY] === `#${raw}`;
+      if (isInternalHash) return;
+      // External selection hashes land on the interactive configurator. Hashes
+      // written internally while initializing or changing chips do not scroll.
+      const el = document.getElementById(DEPLOYMENT_COMPONENT_ID);
       if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     };
     hydrate();
@@ -917,7 +1068,15 @@ export const Deployment = ({ config, benchmarks }) => {
   useEffect(() => {
     const target = "#" + new URLSearchParams(sel).toString();
     if (window.location.hash !== target) {
-      window.history.replaceState(null, "", target);
+      const historyState =
+        window.history.state && typeof window.history.state === "object"
+          ? window.history.state
+          : {};
+      window.history.replaceState(
+        { ...historyState, [INTERNAL_HASH_STATE_KEY]: target },
+        "",
+        target
+      );
     }
     window.dispatchEvent(new CustomEvent("sglang-deploy-sel", { detail: sel }));
   }, [sel]);
@@ -943,29 +1102,123 @@ export const Deployment = ({ config, benchmarks }) => {
   const [benchConc, setBenchConc] = useState(null);
   const [benchAcc, setBenchAcc] = useState(null);
   const [benchCopied, setBenchCopied] = useState(null);
-  const [runMode, setRunMode] = useState("python"); // "python" | "docker"
+  const runModes = config.runModes || ["python", "docker"];
+  const [runMode, setRunMode] = useState(runModes[0]); // "python" | "docker"
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
+
+  // Live --mamba-full-memory-ratio from the ratio calculator (K3 pages):
+  // pool sizing is consolidated into this one flag, computed from the
+  // calculator's request length plus the current panel selection.
+  const [mambaRatio, setMambaRatio] = useState(null);
+  useEffect(() => {
+    // Deploy shows base flags only, so it takes the base-config ratio (the
+    // effective one belongs to the playground's composed command).
+    const onRatio = (e) =>
+      setMambaRatio((e.detail && (e.detail.baseRatio || e.detail.ratio)) || null);
+    window.addEventListener("sglang-k3-mamba-ratio", onRatio);
+    return () => window.removeEventListener("sglang-k3-mamba-ratio", onRatio);
+  }, []);
 
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
-  const command = renderCommand(cell, sel, env, runMode);
-  // MTP hint: fire on the actual command (speculative decoding ON) — NOT on
-  // strategy=low-latency, since a low-latency cell may not enable MTP. SGLang
-  // resets --max-running-requests to 48 when spec is on and it's unset.
+  // Pin the calculator-computed ratio into the rendered command (before the
+  // host/port tail); cells themselves stay ratio-free.
+  const cellWithRatio = (() => {
+    if (!cell || !mambaRatio) return cell;
+    if (cell.flags.some((f) => f.startsWith("--mamba-full-memory-ratio"))) return cell;
+    const flags = [...cell.flags];
+    const line = `--mamba-full-memory-ratio ${mambaRatio}`;
+    const i = flags.findIndex((f) => f.startsWith("--host"));
+    if (i >= 0) flags.splice(i, 0, line);
+    else flags.push(line);
+    return { ...cell, flags };
+  })();
+  const command = renderCommand(cellWithRatio, sel, env, runMode);
+  // MTP hint on the EFFECTIVE flags — speculation arrives via the Spec Decode
+  // overlay, never the cell. SGLang resets --max-running-requests to 48 when
+  // spec is on and it's unset.
+  const effFlags = cell ? [...overlayStrip(cell.flags, sel), ...overlayFlags(sel)] : [];
   const mtpHint =
-    !!cell &&
-    (cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
-    !(cell.flags || []).some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+    effFlags.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !effFlags.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
+  // cell.warn may embed [label](#anchor) links — rendered as scrollIntoView
+  // buttons, not hrefs, so the hash (which carries the selection) isn't overwritten.
+  const renderWarn = (text) => {
+    const out = [];
+    const re = /\[([^\]]+)\]\(#([^)]+)\)/g;
+    let last = 0;
+    for (let m; (m = re.exec(text)); last = m.index + m[0].length) {
+      if (m.index > last) out.push(text.slice(last, m.index));
+      const anchor = m[2];
+      out.push(
+        <button
+          key={m.index}
+          type="button"
+          onClick={() => {
+            const el = document.getElementById(anchor);
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            color: isDark ? "#FDBA74" : "#C2410C",
+            cursor: "pointer",
+            font: "inherit",
+            fontWeight: 600,
+            textDecoration: "underline",
+            textUnderlineOffset: "2px",
+          }}
+        >
+          {m[1]}
+        </button>
+      );
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  };
   const modelName = resolveModelName(sel);
   const curlText = interpolate(config.curl || "", env, modelName);
   const hwGroups = buildHardwareGroups();
   const benchEntry = benchmarks ? findBenchmark(benchmarks, sel) : null;
 
-  const isEnabled = (dim, value) => isOptionAvailable(config.cells, sel, dim, value);
+  // Overlay dims have no cells to constrain them, so an option is selectable
+  // unless it says otherwise; only match dims get the grey-out scan.
+  const isOverlayDim = (dim) => overlayDimSpecs.some((d) => d.id === dim);
+  const findOption = (dim, value) => {
+    const spec = [...matchDimSpecs, ...overlayDimSpecs].find((d) => d.id === dim);
+    return spec && (spec.options || []).find((o) => o.id === value);
+  };
+  const isEnabled = (dim, value) => {
+    const opt = findOption(dim, value);
+    if (opt && optionDisabled(opt, sel)) return false;
+    return isOverlayDim(dim) || isOptionAvailable(config.cells, sel, dim, value);
+  };
+
+  // Switching a match dim can hide the option a dependent row currently holds
+  // (Strategy's option set differs per PD mode). Re-seat any overlay/match pick
+  // that just became invisible onto the first visible option of its row.
+  const reseatHiddenPicks = (next) => {
+    let out = next;
+    for (const spec of [...matchDimSpecs, ...overlayDimSpecs]) {
+      const opts = visibleOptions(spec, out).filter((o) => !optionDisabled(o, out));
+      if (!opts.length) continue;
+      if (!opts.some((o) => o.id === out[spec.id])) {
+        out = { ...out, [spec.id]: opts[0].id };
+      }
+    }
+    return out;
+  };
 
   const handleSelect = (dim, value) => {
-    setSel((prev) => snapToValidCell(config.cells, prev, dim, value));
+    setSel((prev) =>
+      reseatHiddenPicks(
+        isOverlayDim(dim)
+          ? { ...prev, [dim]: value }
+          : snapToValidCell(config.cells, prev, dim, value),
+      ),
+    );
   };
 
   const handleCopy = () => {
@@ -1006,7 +1259,11 @@ export const Deployment = ({ config, benchmarks }) => {
           ...(checked ? s.checked : {}),
           ...(disabled ? s.disabled : {}),
         }}
-        title={disabled ? "Not supported for current selection" : ""}
+        title={
+          disabled
+            ? item.disableReason || "Not supported for current selection"
+            : ""
+        }
         onClick={(e) => {
           if (disabled) { e.preventDefault(); return; }
           handleSelect(dim, item.id);
@@ -1035,7 +1292,11 @@ export const Deployment = ({ config, benchmarks }) => {
   const maxHwCols = Math.max(...hwGroups.map((x) => x.items.length));
 
   return (
-    <div style={s.container} className="not-prose">
+    <div
+      id={DEPLOYMENT_COMPONENT_ID}
+      style={{ ...s.container, scrollMarginTop: "104px" }}
+      className="not-prose"
+    >
       {/* Hardware section (2 vendor rows in one card, equal-width grid) */}
       <div style={s.cardColumn}>
         <div style={{ ...s.title, marginBottom: "2px" }}>Hardware Platform</div>
@@ -1052,54 +1313,69 @@ export const Deployment = ({ config, benchmarks }) => {
         ))}
       </div>
 
-      {renderFlatSection("Model Variant", config.variants,        "variant",  sel.variant)}
-      {renderFlatSection("Quantization",  config.quantizations,   "quant",    sel.quant)}
-      {renderFlatSection("Strategy",      config.strategies,      "strategy", sel.strategy)}
-      {renderFlatSection("Nodes",         config.nodesOptions,    "nodes",    sel.nodes)}
+      {matchDimSpecs
+        .filter((d) => rowVisible(d, sel))
+        .map((d) => (
+          <div key={d.id}>
+            {renderFlatSection(d.title, visibleOptions(d, sel), d.id, sel[d.id])}
+          </div>
+        ))}
+      {overlayDimSpecs
+        .filter((d) => rowVisible(d, sel))
+        .map((d) => (
+          <div key={d.id}>
+            {renderFlatSection(d.title, visibleOptions(d, sel), d.id, sel[d.id])}
+          </div>
+        ))}
 
       {/* Command box */}
       <div style={s.card}>
-        <div style={s.title}>Run this Command:</div>
+        <div style={s.title}>Command:</div>
         <div style={s.commandWrap}>
-          <div style={s.commandHeader}>
-            <div style={s.headerLeft}>
-              <div style={s.badge(Boolean(cell && cell.verified))}>
-                <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-                {cell && cell.verified ? "Verified" : "Not Verified"}
+          {cell && cell.redirect ? (
+            cell.warn && <div style={s.mtpWarn}>⚠️ {renderWarn(cell.warn)}</div>
+          ) : (<>
+            <div style={s.commandHeader}>
+              <div style={s.headerLeft}>
+                <div style={s.badge(Boolean(cell && cell.verified))}>
+                  <span style={s.badgeDot(Boolean(cell && cell.verified))} />
+                  {cell && cell.verified ? "Verified" : "Not Verified"}
+                </div>
+                <div style={s.runModeWrap} role="tablist" aria-label="Output format">
+                  {runModes.map((mode, index) => (
+                    <span
+                      key={mode}
+                      style={{
+                        ...(index === runModes.length - 1
+                          ? s.runModeChipLast(runMode === mode)
+                          : s.runModeChip(runMode === mode)),
+                        ...(runModes.length === 1 ? { borderRadius: 7 } : {}),
+                      }}
+                      onClick={() => setRunMode(mode)}
+                      role="tab"
+                      aria-selected={runMode === mode}
+                    >
+                      {mode === "docker" ? "Docker" : "Python"}
+                    </span>
+                  ))}
+                </div>
               </div>
-              <div style={s.runModeWrap} role="tablist" aria-label="Output format">
-                <span
-                  style={s.runModeChip(runMode === "python")}
-                  onClick={() => setRunMode("python")}
-                  role="tab"
-                  aria-selected={runMode === "python"}
-                >
-                  Python
-                </span>
-                <span
-                  style={s.runModeChipLast(runMode === "docker")}
-                  onClick={() => setRunMode("docker")}
-                  role="tab"
-                  aria-selected={runMode === "docker"}
-                >
-                  Docker
-                </span>
+              <div style={s.iconRow}>
+                <button style={s.iconButton} onClick={handleCopy}>
+                  {copied ? "✓ Copied" : "⧉ Copy"}
+                </button>
+                <button style={s.iconButton} onClick={() => setModal("curl")}>$ cURL</button>
+                <button style={s.iconButton} onClick={() => setModal("env")}>⚙ Env</button>
               </div>
             </div>
-            <div style={s.iconRow}>
-              <button style={s.iconButton} onClick={handleCopy}>
-                {copied ? "✓ Copied" : "⧉ Copy"}
-              </button>
-              <button style={s.iconButton} onClick={() => setModal("curl")}>$ cURL</button>
-              <button style={s.iconButton} onClick={() => setModal("env")}>⚙ Env</button>
-            </div>
-          </div>
-          <pre style={s.commandPre}>{command}</pre>
-          {mtpHint && (
-            <div style={s.mtpWarn}>
-              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
-            </div>
-          )}
+            <pre style={s.commandPre}>{command}</pre>
+            {cell && cell.warn && <div style={s.mtpWarn}>⚠️ {renderWarn(cell.warn)}</div>}
+            {mtpHint && (
+              <div style={s.mtpWarn}>
+                ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+              </div>
+            )}
+          </>)}
         </div>
       </div>
 

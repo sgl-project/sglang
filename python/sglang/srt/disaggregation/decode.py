@@ -86,7 +86,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -451,6 +451,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids()
+            if self.draft_token_to_kv_pool is None
+            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            else []
+        )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -1172,6 +1178,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            if (
+                self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
+                and decode_req.kv_receiver.require_staging
+            ):
+                # Register before send_metadata, which triggers the STAGING_REQ
+                # prefetch (dropped for an unregistered room); tiny race, correct order.
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1182,14 +1198,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
                     decode_req.req.build_rebootstrap_payload(),
-                )
-            if (
-                self.transfer_queue.enable_staging
-                and hasattr(decode_req.kv_receiver, "require_staging")
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1659,13 +1667,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
-        if self.enable_staging:
-            for dr in decode_reqs:
-                if (
-                    hasattr(dr.kv_receiver, "require_staging")
-                    and dr.kv_receiver.require_staging
-                ):
-                    self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
@@ -2151,7 +2152,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
+                if self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
@@ -2191,7 +2192,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
-        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
@@ -2203,7 +2204,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
-            self.polling_interval = get_disagg().disaggregation_decode_polling_interval
+            self.polling_interval = (
+                self.server_args.disaggregation_decode_polling_interval
+            )
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 

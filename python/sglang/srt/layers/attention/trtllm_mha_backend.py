@@ -30,6 +30,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -77,6 +78,12 @@ class TRTLLMMHAMetadata:
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     is_ragged_verify: bool = False
+    # ENCODER_ONLY target-verify (bidirectional attention over the window):
+    # bs*L single-token decode rows whose kv length spans the whole window,
+    # so each token attends the full window despite the causal decode kernel.
+    encoder_cache_seqlens: torch.Tensor = None
+    encoder_page_table: torch.Tensor = None
+    encoder_row_map: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -157,6 +164,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
+        )
+        # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
+        # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
+        self.expand_encoder_only_verify = any(
+            getattr(module, "attn_type", None) == AttentionType.ENCODER_ONLY
+            for module in model_runner.model.modules()
         )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
@@ -414,6 +427,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self.expand_encoder_only_verify:
+                max_verify_rows = max_bs * self.speculative_num_draft_tokens
+                self.target_verify_metadata["encoder_cache_seqlens"] = torch.zeros(
+                    max_verify_rows, dtype=torch.int32, device=self.device
+                )
+                self.target_verify_metadata["encoder_page_table"] = torch.zeros(
+                    max_verify_rows,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -516,6 +540,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table",
                 bs,
             )
+            if self._needs_encoder_only_expand(forward_mode, metadata):
+                verify_rows = bs * metadata.max_seq_len_q
+                # Static per-capture row map (expanded row i -> request i // L);
+                # the recorded refresh in _apply_cuda_graph_metadata uses it.
+                metadata.encoder_row_map = (
+                    torch.arange(verify_rows, device=self.device)
+                    // metadata.max_seq_len_q
+                )
+                metadata.encoder_cache_seqlens = self.target_verify_metadata[
+                    "encoder_cache_seqlens"
+                ][:verify_rows]
+                metadata.encoder_page_table = self.target_verify_metadata[
+                    "encoder_page_table"
+                ][:verify_rows, :]
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = spec_info.num_tokens_per_req
@@ -539,6 +577,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
 
         return metadata
+
+    def _needs_encoder_only_expand(
+        self, forward_mode: ForwardMode, metadata: TRTLLMMHAMetadata
+    ) -> bool:
+        # The single gate for building the expanded ENCODER_ONLY verify
+        # metadata; forward() consumes it per-layer where attn_type is ENCODER_ONLY.
+        return (
+            self.expand_encoder_only_verify
+            and forward_mode.is_target_verify()
+            and not metadata.is_ragged_verify
+        )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -633,6 +682,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             q_stride=q_stride,
             q_mode=q_mode,
         )
+
+        if self._needs_encoder_only_expand(forward_mode, metadata):
+            # Recorded into the graph: refresh the expanded rows from the
+            # freshly rebuilt base metadata.
+            metadata.encoder_cache_seqlens.copy_(
+                metadata.cache_seqlens_int32[metadata.encoder_row_map]
+            )
+            metadata.encoder_page_table.copy_(
+                metadata.page_table[metadata.encoder_row_map]
+            )
 
         self.forward_metadata = metadata
 
@@ -880,6 +939,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata, forward_batch.req_pool_indices, metadata.cache_seqlens_int32
         )
 
+        if self._needs_encoder_only_expand(forward_batch.forward_mode, metadata):
+            row_map = (
+                torch.arange(batch_size * metadata.max_seq_len_q, device=device)
+                // metadata.max_seq_len_q
+            )
+            metadata.encoder_row_map = row_map
+            metadata.encoder_cache_seqlens = metadata.cache_seqlens_int32[row_map]
+            metadata.encoder_page_table = metadata.page_table[row_map]
+
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             metadata.swa_out_cache_loc = (
@@ -1112,7 +1180,38 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            if self.forward_metadata.is_ragged_verify:
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and layer.attn_type == AttentionType.ENCODER_ONLY
+            ):
+                # ENCODER_ONLY layers need bidirectional attention over the
+                # verify window; the spec-decode kernel is causal in-window, so
+                # run bs*L single-token rows over the full window instead (the
+                # window's K/V are already in the pool).
+                assert not self.forward_metadata.is_ragged_verify, (
+                    "ENCODER_ONLY target_verify does not support ragged "
+                    "verify layouts"
+                )
+                assert self.forward_metadata.encoder_cache_seqlens is not None, (
+                    "ENCODER_ONLY target_verify requires the expanded decode "
+                    "metadata (built only on the draft worker)"
+                )
+                o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=self.forward_metadata.encoder_page_table,
+                    seq_lens=self.forward_metadata.encoder_cache_seqlens,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=attention_sink,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out_dtype=self.q_data_type,
+                    q_len_per_req=1,
+                )
+            elif self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
