@@ -13,12 +13,11 @@ separate region at the end of each page.
 
 import logging
 import math
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
-from typing import Optional
 
 from sglang.srt.environ import envs
 
