@@ -34,11 +34,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import (
-    is_gfx942_supported,
-    is_gfx95_supported,
-    is_gfx1250_supported,
-)
+from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -2425,77 +2421,91 @@ class AiterAttnBackend(AttentionBackend):
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-            # bf16 hd128 ASM prefill fast-path (ahead of mha_batch_prefill_func).
-            # gfx950/gfx942 route to fmha_v3_varlen_fwd; gfx1250 routes to
-            # fmha_fwd_with_sink_varlen_asm. The gfx1250 D128 ASM binaries ignore
-            # the sink buffer, so they are only eligible when sinks is None
-            # (matches aiter's per-hdim sink contract in _flash_attn_varlen_forward).
-            use_hd128_asm = (
-                (
-                    is_gfx95_supported()
-                    or is_gfx942_supported()
-                    or (is_gfx1250_supported() and sinks is None)
-                )
-                and forward_batch.forward_mode.is_extend()
-                and forward_batch.extend_prefix_lens_cpu is not None
-                and not any(forward_batch.extend_prefix_lens_cpu)
-                and window_size == (-1, -1)
-                and layer.qk_head_dim == 128
-                and layer.v_head_dim == 128
-            )
-            if use_hd128_asm:
-                cu_seqlens_q = self.qo_indptr[:bs0]
-                max_q_len = self.forward_metadata.max_q_len
-                o = flash_attn_varlen_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
-                    cu_seqlens_q,
-                    cu_seqlens_q,
-                    max_q_len,
-                    max_q_len,
-                    softmax_scale=layer.scaling,
-                    logits_soft_cap=self.logits_soft_cap,
-                    causal=True,
-                    sink_ptr=sinks,
-                )
-                if o.dtype != self.input_dtype:
-                    o = o.to(self.input_dtype)
-                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-            # gfx1250 bf16 hd64 sink ASM prefill fast-path. The D64 ASM binaries
-            # compile ENABLE_SINK=1 and always dereference the sink buffer, so this
-            # path only applies when an attention sink is present (sinks is not
-            # None) — mirrors aiter's per-hdim (D64 -> sink required) contract.
-            use_hd64_sink_asm = (
-                is_gfx1250_supported()
-                and sinks is not None
-                and forward_batch.forward_mode.is_extend()
-                and forward_batch.extend_prefix_lens_cpu is not None
-                and not any(forward_batch.extend_prefix_lens_cpu)
-                and window_size == (-1, -1)
-                and layer.qk_head_dim == 64
-                and layer.v_head_dim == 64
-            )
-            if use_hd64_sink_asm:
-                cu_seqlens_q = self.qo_indptr[:bs0]
-                max_q_len = self.forward_metadata.max_q_len
-                o = flash_attn_varlen_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
-                    cu_seqlens_q,
-                    cu_seqlens_q,
-                    max_q_len,
-                    max_q_len,
-                    softmax_scale=layer.scaling,
-                    logits_soft_cap=self.logits_soft_cap,
-                    causal=True,
-                    sink_ptr=sinks,
-                )
-                if o.dtype != self.input_dtype:
-                    o = o.to(self.input_dtype)
-                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            # ================================================================
+            # DEFERRED TO A FOLLOW-UP PR — intentionally disabled here.
+            #
+            # This PR is scoped to the Qwen3.5 (head_dim 256) prefill
+            # optimization, handled by `use_fp8_asm` above. The bf16 ASM
+            # prefill fast-paths below (bf16 hd128 on gfx950/gfx942/gfx1250,
+            # and the gfx1250 hd64 sink case) target *other* models / head
+            # dims and are a separate optimization. Bundling them here would
+            # solve two problems in one PR, so they are left commented out to
+            # discuss scope and coverage with the reviewer before splitting
+            # them into their own PR. See aiter's `_flash_attn_varlen_forward`
+            # for the per-arch / per-hdim ASM dispatch contract.
+            #
+            # # bf16 hd128 ASM prefill fast-path (ahead of mha_batch_prefill_func).
+            # # gfx950/gfx942 route to fmha_v3_varlen_fwd; gfx1250 routes to
+            # # fmha_fwd_with_sink_varlen_asm. The gfx1250 D128 ASM binaries ignore
+            # # the sink buffer, so they are only eligible when sinks is None
+            # # (matches aiter's per-hdim sink contract in _flash_attn_varlen_forward).
+            # use_hd128_asm = (
+            #     (
+            #         is_gfx95_supported()
+            #         or is_gfx942_supported()
+            #         or (is_gfx1250_supported() and sinks is None)
+            #     )
+            #     and forward_batch.forward_mode.is_extend()
+            #     and forward_batch.extend_prefix_lens_cpu is not None
+            #     and not any(forward_batch.extend_prefix_lens_cpu)
+            #     and window_size == (-1, -1)
+            #     and layer.qk_head_dim == 128
+            #     and layer.v_head_dim == 128
+            # )
+            # if use_hd128_asm:
+            #     cu_seqlens_q = self.qo_indptr[:bs0]
+            #     max_q_len = self.forward_metadata.max_q_len
+            #     o = flash_attn_varlen_func(
+            #         q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            #         k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+            #         v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+            #         cu_seqlens_q,
+            #         cu_seqlens_q,
+            #         max_q_len,
+            #         max_q_len,
+            #         softmax_scale=layer.scaling,
+            #         logits_soft_cap=self.logits_soft_cap,
+            #         causal=True,
+            #         sink_ptr=sinks,
+            #     )
+            #     if o.dtype != self.input_dtype:
+            #         o = o.to(self.input_dtype)
+            #     return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            #
+            # # gfx1250 bf16 hd64 sink ASM prefill fast-path. The D64 ASM binaries
+            # # compile ENABLE_SINK=1 and always dereference the sink buffer, so this
+            # # path only applies when an attention sink is present (sinks is not
+            # # None) — mirrors aiter's per-hdim (D64 -> sink required) contract.
+            # use_hd64_sink_asm = (
+            #     is_gfx1250_supported()
+            #     and sinks is not None
+            #     and forward_batch.forward_mode.is_extend()
+            #     and forward_batch.extend_prefix_lens_cpu is not None
+            #     and not any(forward_batch.extend_prefix_lens_cpu)
+            #     and window_size == (-1, -1)
+            #     and layer.qk_head_dim == 64
+            #     and layer.v_head_dim == 64
+            # )
+            # if use_hd64_sink_asm:
+            #     cu_seqlens_q = self.qo_indptr[:bs0]
+            #     max_q_len = self.forward_metadata.max_q_len
+            #     o = flash_attn_varlen_func(
+            #         q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            #         k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+            #         v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+            #         cu_seqlens_q,
+            #         cu_seqlens_q,
+            #         max_q_len,
+            #         max_q_len,
+            #         softmax_scale=layer.scaling,
+            #         logits_soft_cap=self.logits_soft_cap,
+            #         causal=True,
+            #         sink_ptr=sinks,
+            #     )
+            #     if o.dtype != self.input_dtype:
+            #         o = o.to(self.input_dtype)
+            #     return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            # ================================================================
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
