@@ -310,6 +310,18 @@ SP2/SP4。MinWM 有 24 个 attention heads；未来 Ulysses degree 还必须满�
 10. `benchmark/minwm_realtime_parity/`：怎样生成 baseline/API、比较 lossless arrays、
     汇总吞吐并生成同步播放器？
 
+阅读时可以用下面这张表核对答案：
+
+| 问题 | 当前实现 |
+| --- | --- |
+| native component | exact lane 默认使用 minWM 的 HF UMT5 和 residual Wan VAE；两者细小的 BF16 kernel 差异都会被 causal rollout 放大。可用 `MINWM_NATIVE_COMPONENTS` 做消融，但这会改变 parity 合同。 |
+| 默认采样合同 | `832x480`、24 FPS、4 个 DMD step、每次生成一个 realtime chunk。公开 API 的 resolution allowlist 目前只包含横竖两个原生 480p shape；`1248x704` 的“720p”实验由 benchmark 显式配置，并不表示 API 或模型结构永远不能扩展到该 shape。 |
+| action 转换 | adapter 将 WebSocket 的离散 key/label 或八维 `action_weights` 归一化成每个 latent frame 的 condition；action encoder 再把 label 或连续幅度映射为 token residual。 |
+| 状态归属 | `MinWMChunkLatentPreparationStage` 负责与 baseline 相同顺序的 BFCHW RNG；`MinWMCausalDMDDenoisingStage` 负责 DMD、self/cross-attention cache 和 action history；`MinWMCausalVaeDecodingStage` 负责 reference-seeded causal VAE cache。 |
+| parity operator boundary | 覆盖 FP64 timestep sinusoid、patch embedding、RMSNorm/QK norm、RoPE、LayerNorm/AdaLN，以及 packed self/cross attention；排错时还要核对输入 shape、dtype、stride 和 kernel 路径，不能只看算子名称。 |
+| stage 顺序 | validation → text encoding → first-frame VAE encoding → DMD timestep preparation → chunk latent preparation → causal DMD denoising → causal VAE decoding。 |
+| 并行限制 | SP1 是默认路径；多卡目前只接受 `sp_degree == ulysses_degree > 1` 且 `ring_degree == 1`，attention head 数必须可整除。Ulysses 暂不能与 TP、FSDP inference 或 whole-DiT compile 组合。 |
+
 ## 11. 变更边界和后续工作
 
 这次 PR 已覆盖 checkpoint 转换、模型注册、realtime adapter、action conditioning、
