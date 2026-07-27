@@ -703,7 +703,8 @@ class Envs:
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
-    # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
+    # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
+    # FlashInfer TRT-LLM or CuTe DSL MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.

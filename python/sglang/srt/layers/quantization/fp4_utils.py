@@ -19,12 +19,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-NVFP4_SF_VEC_SIZE = 16
 fp4_quantize = None
 try:
-    from flashinfer import SfLayout
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
-    from flashinfer import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
     _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
 
@@ -34,7 +31,7 @@ try:
     def _flashinfer_fp4_quantize_impl(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
-        sf_vec_size: int = NVFP4_SF_VEC_SIZE,
+        sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
@@ -54,7 +51,7 @@ try:
     def _flashinfer_fp4_quantize_fake(
         input: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
-        sf_vec_size: int = NVFP4_SF_VEC_SIZE,
+        sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
@@ -84,98 +81,11 @@ try:
             sf = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
         return x_q, sf
 
-    def _flashinfer_nvfp4_quantize_per_token_impl(
-        input: torch.Tensor,
-        global_scale: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
-        is_sf_8x4_layout: bool = False,
-        enable_pdl: Optional[bool] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not is_sf_swizzled_layout:
-            sf_layout = SfLayout.layout_linear
-        elif is_sf_8x4_layout:
-            sf_layout = SfLayout.layout_8x4
-        else:
-            sf_layout = SfLayout.layout_128x4
-        return _flashinfer_nvfp4_quantize(
-            input,
-            global_scale,
-            sfLayout=sf_layout,
-            sf_vec_size=NVFP4_SF_VEC_SIZE,
-            enable_pdl=enable_pdl,
-            backend=_flashinfer_fp4_quantize_backend,
-            per_token_activation=True,
-        )
-
-    def _flashinfer_nvfp4_quantize_per_token_fake(
-        input: torch.Tensor,
-        global_scale: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
-        is_sf_8x4_layout: bool = False,
-        enable_pdl: Optional[bool] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_q, sf = _flashinfer_fp4_quantize_fake(
-            input,
-            global_scale,
-            sf_vec_size=NVFP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            enable_pdl=enable_pdl,
-        )
-        per_token_scale = input.new_empty((input.shape[0],), dtype=torch.float32)
-        return x_q, sf, per_token_scale
-
-    _fp4_quantize = register_custom_op_from_extern(
+    fp4_quantize = register_custom_op_from_extern(
         _flashinfer_fp4_quantize_impl,
         op_name="flashinfer_fp4_quantize",
         fake_impl=_flashinfer_fp4_quantize_fake,
     )
-    _nvfp4_quantize_per_token = register_custom_op_from_extern(
-        _flashinfer_nvfp4_quantize_per_token_impl,
-        op_name="flashinfer_nvfp4_quantize_per_token",
-        fake_impl=_flashinfer_nvfp4_quantize_per_token_fake,
-    )
-
-    def fp4_quantize(
-        input: torch.Tensor,
-        global_scale: Optional[torch.Tensor] = None,
-        sf_vec_size: int = NVFP4_SF_VEC_SIZE,
-        sf_use_ue8m0: bool = False,
-        is_sf_swizzled_layout: bool = True,
-        is_sf_8x4_layout: bool = False,
-        enable_pdl: Optional[bool] = None,
-        per_token_activation: bool = False,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
-        if per_token_activation:
-            if global_scale is None:
-                raise ValueError(
-                    "Per-token NVFP4 quantization requires a global scale."
-                )
-            if sf_vec_size != NVFP4_SF_VEC_SIZE or sf_use_ue8m0:
-                raise ValueError(
-                    "Per-token NVFP4 quantization requires sf_vec_size=16 "
-                    "and sf_use_ue8m0=False."
-                )
-            return _nvfp4_quantize_per_token(
-                input,
-                global_scale,
-                is_sf_swizzled_layout,
-                is_sf_8x4_layout,
-                enable_pdl,
-            )
-        return _fp4_quantize(
-            input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
-        )
-
 except ImportError:
     fp4_quantize = None
 

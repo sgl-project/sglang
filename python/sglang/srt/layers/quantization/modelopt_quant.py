@@ -31,7 +31,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
-    NVFP4_SF_VEC_SIZE,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
@@ -2474,10 +2473,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-        if (
-            self.enable_flashinfer_cutedsl_moe
-            and self.quant_config.use_per_token_activation
-        ):
+        if self._is_cutedsl_v2_standard and self.quant_config.use_per_token_activation:
             from flashinfer.quantization.nvfp4_quantization_utils import (
                 current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
@@ -2529,10 +2525,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
             else None
         )
-        if (
-            self.enable_flashinfer_cutedsl_moe
-            and self.quant_config.use_per_token_activation
-        ):
+        if self._is_cutedsl_v2_standard and self.quant_config.use_per_token_activation:
             # FlashInfer A2A can pre-quantize with only a scalar scale. Keep the
             # payload in BF16 so the CuteDSL runner can compute and forward the
             # per-token row scale required by FlashInfer's per-token contract.
@@ -2670,9 +2663,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    _FP4_SF_VEC_SIZE,
                     refresh_cutedsl_standard_scales_for_weight_update,
                 )
 
+                sf_vec_size = _FP4_SF_VEC_SIZE
                 num_local_experts = layer.w13_weight.shape[0]
                 w13_m = layer.w13_weight.shape[1]
                 w13_k = layer.w13_weight.shape[2] * 2
@@ -2688,7 +2683,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         m=w13_m,
                         k=w13_k,
                         num_groups=num_local_experts,
-                        sf_vec_size=NVFP4_SF_VEC_SIZE,
+                        sf_vec_size=sf_vec_size,
                     ),
                 )
                 copy_or_rebind_param(
@@ -2701,7 +2696,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         m=w2_m,
                         k=w2_k,
                         num_groups=num_local_experts,
-                        sf_vec_size=NVFP4_SF_VEC_SIZE,
+                        sf_vec_size=sf_vec_size,
                     ),
                 )
                 if layer._cutedsl_wrapper is not None:
@@ -2854,7 +2849,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     a1_scale=layer.w13_input_scale_quant,
                     a2_scale=layer.w2_input_scale_quant,
                     use_nvfp4_dispatch=MOE_NVFP4_DISPATCH,
-                    use_per_token_activation=self.quant_config.use_per_token_activation,
                     down_gemm_overlap_args=getattr(
                         self.runner, "down_gemm_overlap_args", None
                     ),
