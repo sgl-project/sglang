@@ -26,6 +26,7 @@ class TestQwenVLPPAccuracy(CustomTestCase):
     Using a multimodal language model,
     configure the pp-size and evaluate GSM8K accuracy as well as the correctness of image reasoning.
     """
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_VL_8B_THINKING_MODEL_PATH

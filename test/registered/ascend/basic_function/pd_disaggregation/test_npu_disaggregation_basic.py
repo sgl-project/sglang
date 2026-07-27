@@ -327,6 +327,7 @@ class TestDisaggregationMooncakeSpec(
     ]
     prefill_extra_args = spec_args
     decode_extra_args = spec_args
+
     def test_gsm8k(self):
         self.run_gsm8k()
 
@@ -660,11 +661,13 @@ _CHUNKED_ABORT_LONG_PROMPT = (
     "Sphinx of black quartz, judge my vow. "
 ) * 900
 
+
 def _decode_response(response: requests.Response) -> Any:
     try:
         return response.json()
     except ValueError:
         return response.text
+
 
 def _is_abort_result(status_code: int, body: Any) -> bool:
     if status_code == 200:
