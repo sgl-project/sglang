@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     registered_tree_core_backends,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )

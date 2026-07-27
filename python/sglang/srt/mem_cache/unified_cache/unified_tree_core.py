@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
-from sglang.srt.mem_cache.unified_cache_components import (
+from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,

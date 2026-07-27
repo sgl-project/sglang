@@ -106,7 +106,7 @@ if TYPE_CHECKING:
         StorageBackupSpec,
         UnifiedTreeNode,
     )
-    from sglang.srt.mem_cache.unified_cache_components import (
+    from sglang.srt.mem_cache.unified_cache.components import (
         CacheTransferPhase,
         ComponentType,
     )
