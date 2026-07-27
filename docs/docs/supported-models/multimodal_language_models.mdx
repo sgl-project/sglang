@@ -46,6 +46,12 @@ in the GitHub search bar.
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Apertus 1.5</strong> (8B, 70B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>swiss-ai/Apertus-v1.5-8B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Apertus multimodal models accept interleaved image, audio, and text inputs and generate text.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer has been tested on NVIDIA CUDA.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Qwen-VL</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-VL-235B-A22B-Instruct</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Alibaba's vision-language extension of Qwen; for example, Qwen2.5-VL (7B and larger variants) can analyze and converse about image content.</td>
@@ -215,6 +221,55 @@ in the GitHub search bar.
     </tr>
 </tbody>
 </table>
+
+## Apertus 1.5
+
+The Apertus v1.5 model repositories require you to accept their access conditions on Hugging Face before downloading the weights. Set `HF_TOKEN` if your environment does not already have access to the model.
+
+### Serve on NVIDIA CUDA
+
+```bash
+HF_TOKEN=<your-hugging-face-token> \
+python3 -m sglang.launch_server \
+  --model-path swiss-ai/Apertus-v1.5-8B \
+  --attention-backend flashinfer \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### Image request
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "swiss-ai/Apertus-v1.5-8B",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image."},
+        {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"}}
+      ]
+    }]
+  }'
+```
+
+### Audio request
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "swiss-ai/Apertus-v1.5-8B",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Summarize this audio clip."},
+        {"type": "audio_url", "audio_url": {"url": "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"}}
+      ]
+    }]
+  }'
+```
 
 ## Audio Transcription
 
