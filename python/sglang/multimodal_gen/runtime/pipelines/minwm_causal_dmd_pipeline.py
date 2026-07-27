@@ -2,7 +2,7 @@
 """Realtime API pipeline for the MinWM Wan2.2-5B DMD student."""
 
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
-    FlowUniPCMultistepScheduler,
+    MinWMFlowUniPCParityScheduler,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_self_forcing_flow_match import (
     SelfForcingFlowMatchScheduler,
@@ -129,7 +129,7 @@ class MinWMCausalUniPCPipeline(MinWMCausalDMDPipeline):
         # Native V3 constructs the scheduler at shift=1, then supplies the
         # configured shift to set_timesteps. Applying it in both places changes
         # all four timesteps.
-        self.modules["scheduler"] = FlowUniPCMultistepScheduler(
+        self.modules["scheduler"] = MinWMFlowUniPCParityScheduler(
             num_train_timesteps=1000,
             shift=1.0,
             use_dynamic_shifting=False,

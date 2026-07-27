@@ -17,7 +17,6 @@ from diffusers.schedulers.scheduling_utils import (
     SchedulerOutput,
 )
 from diffusers.utils import deprecate
-
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
 
 
@@ -173,8 +172,8 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         num_inference_steps: int | None = None,
         device: str | torch.device = None,
         sigmas: list[float] | None = None,
-        mu: float | None | None = None,
-        shift: float | None | None = None,
+        mu: float | None = None,
+        shift: float | None = None,
     ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
@@ -194,9 +193,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             assert num_inference_steps is not None
             sigmas = np.linspace(
                 self.sigma_max, self.sigma_min, num_inference_steps + 1
-            ).copy()[
-                :-1
-            ]  # pyright: ignore
+            ).copy()[:-1]  # pyright: ignore
 
         if self.config.use_dynamic_shifting:
             assert mu is not None
@@ -217,9 +214,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             )
 
         timesteps = sigmas * self.config.num_train_timesteps
-        sigmas = np.concatenate([sigmas, [sigma_last]]).astype(
-            np.float32
-        )  # pyright: ignore
+        sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)  # pyright: ignore
 
         self.sigmas = torch.from_numpy(sigmas).to(device=device)
         self.timesteps = torch.from_numpy(timesteps).to(
@@ -476,18 +471,14 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
             if D1s is not None:
-                pred_res = torch.einsum(
-                    "k,bkc...->bc...", rhos_p, D1s
-                )  # pyright: ignore
+                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
             else:
                 pred_res = 0
             x_t = x_t_ - alpha_t * B_h * pred_res
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
-                pred_res = torch.einsum(
-                    "k,bkc...->bc...", rhos_p, D1s
-                )  # pyright: ignore
+                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)  # pyright: ignore
             else:
                 pred_res = 0
             x_t = x_t_ - sigma_t * B_h * pred_res
@@ -838,6 +829,223 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
         noisy_samples = alpha_t * original_samples + sigma_t * noise
         return noisy_samples
+
+
+class MinWMFlowUniPCParityScheduler(FlowUniPCMultistepScheduler):
+    """UniPC arithmetic matching minWM V3 main for exact parity.
+
+    The generic SGLang scheduler deliberately keeps scalar math on the GPU and
+    uses a closed-form order-2 corrector. minWM V3 instead stores sigmas on the
+    CPU, materializes scalar lists with ``torch.tensor``, and calls
+    ``torch.linalg.solve``. Those choices are mathematically equivalent but not
+    bitwise equivalent, and the difference compounds across causal chunks.
+    """
+
+    def set_timesteps(self, *args, **kwargs) -> None:
+        super().set_timesteps(*args, **kwargs)
+        self.sigmas = self.sigmas.to("cpu")
+
+    def multistep_uni_p_bh_update(
+        self,
+        model_output: torch.Tensor,
+        *args,
+        sample: torch.Tensor = None,
+        order: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        prev_timestep = args[0] if args else kwargs.pop("prev_timestep", None)
+        if sample is None:
+            sample = args[1] if len(args) > 1 else None
+        if order is None:
+            order = args[2] if len(args) > 2 else None
+        if sample is None or order is None:
+            raise ValueError("sample and order are required")
+        if prev_timestep is not None:
+            deprecate(
+                "prev_timestep",
+                "1.0.0",
+                "Passing `prev_timestep` is deprecated and has no effect.",
+            )
+
+        model_output_list = self.model_outputs
+        s0 = self.timestep_list[-1]
+        m0 = model_output_list[-1]
+        x = sample
+        if self.solver_p:
+            return self.solver_p.step(model_output, s0, x).prev_sample
+        assert m0 is not None
+        assert self.step_index is not None
+
+        sigma_t = self.sigmas[self.step_index + 1]
+        sigma_s0 = self.sigmas[self.step_index]
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+        h = lambda_t - lambda_s0
+        device = sample.device
+
+        rks = []
+        d1s = []
+        for i in range(1, order):
+            si = self.step_index - i
+            mi = model_output_list[-(i + 1)]
+            assert mi is not None
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+            d1s.append((mi - m0) / rk)
+        rks.append(1.0)
+        rks_tensor = torch.tensor(rks, device=device)
+
+        matrix_rows = []
+        rhs = []
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+        factorial_i = 1
+        if self.config.solver_type == "bh1":
+            b_h = hh
+        elif self.config.solver_type == "bh2":
+            b_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError()
+        for i in range(1, order + 1):
+            matrix_rows.append(torch.pow(rks_tensor, i - 1))
+            rhs.append(h_phi_k * factorial_i / b_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        matrix = torch.stack(matrix_rows)
+        rhs_tensor = torch.tensor(rhs, device=device)
+
+        if d1s:
+            d1s_tensor = torch.stack(d1s, dim=1)
+            if order == 2:
+                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
+            else:
+                rhos_p = (
+                    torch.linalg.solve(matrix[:-1, :-1], rhs_tensor[:-1])
+                    .to(device)
+                    .to(x.dtype)
+                )
+            pred_res = torch.einsum("k,bkc...->bc...", rhos_p, d1s_tensor)
+        else:
+            pred_res = 0
+
+        if self.predict_x0:
+            x_t = (
+                sigma_t / sigma_s0 * x
+                - alpha_t * h_phi_1 * m0
+                - alpha_t * b_h * pred_res
+            )
+        else:
+            x_t = (
+                alpha_t / alpha_s0 * x
+                - sigma_t * h_phi_1 * m0
+                - sigma_t * b_h * pred_res
+            )
+        return x_t.to(x.dtype)
+
+    def multistep_uni_c_bh_update(
+        self,
+        this_model_output: torch.Tensor,
+        *args,
+        last_sample: torch.Tensor = None,
+        this_sample: torch.Tensor = None,
+        order: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        this_timestep = args[0] if args else kwargs.pop("this_timestep", None)
+        if last_sample is None:
+            last_sample = args[1] if len(args) > 1 else None
+        if this_sample is None:
+            this_sample = args[2] if len(args) > 2 else None
+        if order is None:
+            order = args[3] if len(args) > 3 else None
+        if last_sample is None or this_sample is None or order is None:
+            raise ValueError("last_sample, this_sample, and order are required")
+        if this_timestep is not None:
+            deprecate(
+                "this_timestep",
+                "1.0.0",
+                "Passing `this_timestep` is deprecated and has no effect.",
+            )
+
+        model_output_list = self.model_outputs
+        m0 = model_output_list[-1]
+        assert m0 is not None
+        assert self.step_index is not None
+        x = last_sample
+        model_t = this_model_output
+
+        sigma_t = self.sigmas[self.step_index]
+        sigma_s0 = self.sigmas[self.step_index - 1]
+        alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
+        h = lambda_t - lambda_s0
+        device = this_sample.device
+
+        rks = []
+        d1s = []
+        for i in range(1, order):
+            si = self.step_index - (i + 1)
+            mi = model_output_list[-(i + 1)]
+            assert mi is not None
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            rk = (lambda_si - lambda_s0) / h
+            rks.append(rk)
+            d1s.append((mi - m0) / rk)
+        rks.append(1.0)
+        rks_tensor = torch.tensor(rks, device=device)
+
+        matrix_rows = []
+        rhs = []
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
+        factorial_i = 1
+        if self.config.solver_type == "bh1":
+            b_h = hh
+        elif self.config.solver_type == "bh2":
+            b_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError()
+        for i in range(1, order + 1):
+            matrix_rows.append(torch.pow(rks_tensor, i - 1))
+            rhs.append(h_phi_k * factorial_i / b_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        matrix = torch.stack(matrix_rows)
+        rhs_tensor = torch.tensor(rhs, device=device)
+        d1s_tensor = torch.stack(d1s, dim=1) if d1s else None
+
+        if order == 1:
+            rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+        else:
+            rhos_c = torch.linalg.solve(matrix, rhs_tensor).to(device).to(x.dtype)
+        if d1s_tensor is not None:
+            corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], d1s_tensor)
+        else:
+            corr_res = 0
+        d1_t = model_t - m0
+
+        if self.predict_x0:
+            x_t = (
+                sigma_t / sigma_s0 * x
+                - alpha_t * h_phi_1 * m0
+                - alpha_t * b_h * (corr_res + rhos_c[-1] * d1_t)
+            )
+        else:
+            x_t = (
+                alpha_t / alpha_s0 * x
+                - sigma_t * h_phi_1 * m0
+                - sigma_t * b_h * (corr_res + rhos_c[-1] * d1_t)
+            )
+        return x_t.to(x.dtype)
 
 
 EntryClass = FlowUniPCMultistepScheduler
