@@ -2,12 +2,14 @@
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising import (
     MinWMCausalDMDDenoisingStage,
+    MinWMCausalUniPCDenoisingStage,
     MinWMCausalVaeDecodingStage,
     MinWMChunkLatentPreparationStage,
 )
 
 __all__ = [
     "MinWMCausalDMDDenoisingStage",
+    "MinWMCausalUniPCDenoisingStage",
     "MinWMCausalVaeDecodingStage",
     "MinWMChunkLatentPreparationStage",
 ]

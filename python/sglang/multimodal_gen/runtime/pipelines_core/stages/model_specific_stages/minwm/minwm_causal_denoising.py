@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
-
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
@@ -26,8 +26,8 @@ from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
-    CausalDMDDenoisingStage,
     CausalDMDCachePolicy,
+    CausalDMDDenoisingStage,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
 )
@@ -526,6 +526,77 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         result.add_check("scheduler", batch.scheduler, V.not_none)
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
         return result
+
+
+class MinWMCausalUniPCDenoisingStage(MinWMCausalDMDDenoisingStage):
+    """Run minWM V3's per-chunk UniPC loop while retaining realtime KV state."""
+
+    def _denoise_causal_dmd_chunk(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        chunk_latents: torch.Tensor,
+        scheduler,
+        timesteps: torch.Tensor,
+        prompt_embeds,
+        kv_cache,
+        crossattn_cache,
+        current_start_tokens: int,
+        start_frame: int,
+        image_kwargs: dict,
+        pos_cond_kwargs: dict,
+        target_dtype: torch.dtype,
+        autocast_enabled: bool,
+        device: torch.device,
+        attn_raw_latent_shape: tuple[int, int, int],
+        prepare_model_input: Callable[[torch.Tensor], torch.Tensor],
+        progress_bar=None,
+    ) -> tuple[torch.Tensor, object | None]:
+        # Native V3 applies UniPC to BFCHW tensors. Keep the same layout at the
+        # scheduler boundary; the transformer still consumes BCFHW.
+        latents_btchw = chunk_latents.permute(0, 2, 1, 3, 4).contiguous()
+        attn_metadata = None
+        for i, timestep in enumerate(timesteps):
+            current_latents = latents_btchw.permute(0, 2, 1, 3, 4)
+            latent_model_input = prepare_model_input(current_latents).to(target_dtype)
+            attn_metadata = self._build_causal_attn_metadata(
+                batch,
+                server_args,
+                current_timestep=i,
+                raw_latent_shape=attn_raw_latent_shape,
+                device=device,
+            )
+            timestep_2d = self._expand_timestep(
+                timestep, latent_model_input.shape[0], latent_model_input.device
+            )
+            flow_prediction = self._forward_causal_transformer(
+                batch,
+                latent_model_input=latent_model_input,
+                prompt_embeds=prompt_embeds,
+                timestep=timestep_2d.unsqueeze(1),
+                kv_cache=kv_cache,
+                crossattn_cache=crossattn_cache,
+                current_start_tokens=current_start_tokens,
+                start_frame=start_frame,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                current_timestep=i,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                autocast_enabled=autocast_enabled,
+            )
+            flow_prediction_btchw = flow_prediction.permute(0, 2, 1, 3, 4)
+            latents_btchw = scheduler.step(
+                flow_prediction_btchw,
+                timestep,
+                latents_btchw,
+                return_dict=False,
+            )[0]
+            if progress_bar is not None:
+                progress_bar.update()
+
+        return latents_btchw.permute(0, 2, 1, 3, 4), attn_metadata
 
 
 class MinWMCausalVaeDecodingStage(CausalVaeDecodingStage):

@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
@@ -14,12 +13,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     minwm_t5_postprocess_text,
 )
 from sglang.multimodal_gen.configs.sample.minwm import MinWMSamplingParams
-from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
-    PrimitiveTokenResidualActionEncoder,
-    action_labels_to_primitive_bits,
-    key_state_to_action_label,
-    validate_action_labels,
-    validate_action_weights,
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.minwm_realtime_adapter import (
+    MinWMRealtimeAdapter,
+    MinWMRealtimeState,
 )
 from sglang.multimodal_gen.runtime.models.dits.minwm import (
     MinWMCausalSelfAttention,
@@ -28,23 +24,28 @@ from sglang.multimodal_gen.runtime.models.dits.minwm import (
     MinWMRMSNorm,
     _frame_gate,
     _frame_modulation,
-    _minwm_adaln_op,
     _minwm_adaln_modulation,
+    _minwm_adaln_op,
     _minwm_frame_indices,
     _minwm_layer_norm,
     _minwm_packed_attention_backend,
     _minwm_qk_norm_rope_op,
     apply_minwm_rotary_embedding,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.minwm_realtime_adapter import (
-    MinWMRealtimeAdapter,
-    MinWMRealtimeState,
+from sglang.multimodal_gen.runtime.models.dits.minwm_action import (
+    PrimitiveTokenResidualActionEncoder,
+    action_labels_to_primitive_bits,
+    key_state_to_action_label,
+    validate_action_labels,
+    validate_action_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines.minwm_causal_dmd_pipeline import (
     MinWMCausalDMDPipeline,
+    MinWMCausalUniPCPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising import (
     MinWMCausalDMDDenoisingStage,
+    MinWMCausalUniPCDenoisingStage,
     MinWMChunkLatentPreparationStage,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
@@ -362,6 +363,68 @@ def test_minwm_unbounded_kv_policy_reaches_cache_allocation():
     assert len(stage.causal_kv_cache) == 2
     assert all(cache.allow_growth for cache in stage.causal_kv_cache)
     assert stage.causal_kv_cache[0].k.shape == (1, 15, 2, 4)
+
+
+def test_minwm_unipc_scheduler_matches_native_shift_contract():
+    pipeline = MinWMCausalUniPCPipeline.__new__(MinWMCausalUniPCPipeline)
+    pipeline.modules = {}
+    pipeline.initialize_pipeline(
+        SimpleNamespace(pipeline_config=SimpleNamespace(flow_shift=5.0))
+    )
+    scheduler = pipeline.modules["scheduler"]
+
+    assert scheduler.config.shift == 1.0
+    scheduler.set_timesteps(4, device="cpu", shift=5.0)
+    assert scheduler.timesteps.tolist() == [999, 936, 832, 624]
+
+
+def test_minwm_unipc_stage_steps_in_native_bfchw_layout():
+    stage = MinWMCausalUniPCDenoisingStage.__new__(MinWMCausalUniPCDenoisingStage)
+    stage._build_causal_attn_metadata = lambda *args, **kwargs: None
+    transformer_inputs = []
+
+    def fake_transformer(_batch, **kwargs):
+        transformer_inputs.append(kwargs["latent_model_input"].clone())
+        return torch.ones_like(kwargs["latent_model_input"])
+
+    stage._forward_causal_transformer = fake_transformer
+
+    class Scheduler:
+        def __init__(self):
+            self.sample_shapes = []
+
+        def step(self, model_output, _timestep, sample, return_dict):
+            assert return_dict is False
+            assert model_output.shape == (1, 2, 3, 1, 1)
+            self.sample_shapes.append(sample.shape)
+            return (sample + 1,)
+
+    scheduler = Scheduler()
+    chunk_latents = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2, 1, 1)
+    output, metadata = stage._denoise_causal_dmd_chunk(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        chunk_latents=chunk_latents,
+        scheduler=scheduler,
+        timesteps=torch.tensor([999, 624]),
+        prompt_embeds=None,
+        kv_cache=None,
+        crossattn_cache=None,
+        current_start_tokens=0,
+        start_frame=0,
+        image_kwargs={},
+        pos_cond_kwargs={},
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+        device=torch.device("cpu"),
+        attn_raw_latent_shape=(2, 1, 1),
+        prepare_model_input=lambda value: value,
+    )
+
+    assert scheduler.sample_shapes == [(1, 2, 3, 1, 1)] * 2
+    assert len(transformer_inputs) == 2
+    torch.testing.assert_close(output, chunk_latents + 2, rtol=0, atol=0)
+    assert metadata is None
 
 
 def test_minwm_fractional_action_windows_reach_denoiser_unchanged():

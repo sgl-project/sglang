@@ -239,6 +239,7 @@ if [[ "${MINWM_BENCHMARK_MODE}" == "dragon60s" ]]; then
   DRAGON_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_dragon_ride_60s_832x480.json}"
   DRAGON_RESULTS="${RESULTS}/dragon-ride-60s-bitwise"
   DRAGON_SINK_SIZE="${MINWM_SINK_SIZE:-4}"
+  DRAGON_PIPELINE_CLASS_NAME="${MINWM_PIPELINE_CLASS_NAME:-MinWMCausalDMDPipeline}"
   ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
   if ! [[ "${ARTIFACT_HOLD_SECONDS}" =~ ^[0-9]+$ ]]; then
     echo "MINWM_ARTIFACT_HOLD_SECONDS must be a non-negative integer" >&2
@@ -320,7 +321,7 @@ PY
   MINWM_SEGMENT_COMPILE=true \
   sglang serve \
     --model-path "${MODEL_DIR}" \
-    --pipeline-class-name MinWMCausalDMDPipeline \
+    --pipeline-class-name "${DRAGON_PIPELINE_CLASS_NAME}" \
     --attention-backend fa \
     --performance-mode speed \
     --enable-torch-compile false \
@@ -379,7 +380,8 @@ PY
   fi
 
   python3 - "${DRAGON_RESULTS}" "${RESULTS}/dragon60-summary.json" \
-    "${bitwise_status}" "${numeric_status}" "${DRAGON_SINK_SIZE}" <<'PY'
+    "${bitwise_status}" "${numeric_status}" "${DRAGON_SINK_SIZE}" \
+    "${DRAGON_PIPELINE_CLASS_NAME}" <<'PY'
 import json
 import statistics
 import sys
@@ -416,6 +418,7 @@ summary = {
         "sglang_runtime_sink": case["request"].get(
             "realtime_causal_sink_size"
         ),
+        "sglang_pipeline_class": sys.argv[6],
         "effective_cache_semantics": (
             "unbounded local_attn_size=-1; YAML window_size is not consumed "
             "by minWM main causal inference"
