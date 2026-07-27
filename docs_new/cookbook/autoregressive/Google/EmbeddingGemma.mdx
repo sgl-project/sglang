@@ -34,8 +34,7 @@ BCG, and the checkpoint's BF16 dtype automatically:
 ```bash
 sglang serve \
   --model-path google/embeddinggemma-300m \
-  --host 0.0.0.0 \
-  --port 30000
+  --host 0.0.0.0
 ```
 
 ### Hopper performance defaults
@@ -50,8 +49,7 @@ To capture larger aggregate prefills, raise the BCG tier explicitly:
 sglang serve \
   --model-path google/embeddinggemma-300m \
   --cuda-graph-max-bs-prefill 32768 \
-  --host 0.0.0.0 \
-  --port 30000
+  --host 0.0.0.0
 ```
 
 EmbeddingGemma automatically enables batch tokenization for list-valued
