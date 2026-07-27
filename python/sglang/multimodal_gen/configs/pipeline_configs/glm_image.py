@@ -48,6 +48,9 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
+    def supports_dynamic_batching(self):
+        return True
+
     def supports_native_grouped_requests(self):
         return True
 
