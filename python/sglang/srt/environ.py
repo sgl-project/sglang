@@ -1034,6 +1034,12 @@ class Envs:
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
+    # Keep the multimem (symmetric-memory) all-gather enabled when the TP
+    # group spans nodes that form one NVLink clique (MNNVL fabric), where
+    # cross-node multicast works. Default off preserves the conservative
+    # single-node-only behavior.
+    SGLANG_MULTIMEM_AG_CROSS_NODE = EnvBool(False)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
