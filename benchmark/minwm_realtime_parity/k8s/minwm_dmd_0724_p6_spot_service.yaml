@@ -89,7 +89,7 @@ volumeBindingMode: WaitForFirstConsumer
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: minwm-dmd-0724-p6-work
+  name: minwm-dmd-0724-p6-work-v2
   namespace: default
   labels:
     app: minwm-dmd-0724-p6
@@ -119,7 +119,7 @@ metadata:
     seedleap.ai/checkpoint-source: s3://leap-world-us-west-2/world-model/minwm/checkpoints/run-archive/rolling/Wan21/Action2V/bidirectional/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-    seedleap.ai/sglang-git-ref: 8de158c6e9d4fae849cc15cc77b1185db1d20511
+    seedleap.ai/sglang-git-ref: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -146,7 +146,7 @@ spec:
         instrumentation.opentelemetry.io/inject-python: "false"
         seedleap.ai/checkpoint: global_step_011000
         seedleap.ai/minwm-git-ref: c6432ac1ef5ecadf04cb772394e5bef06d0ef4a8
-        seedleap.ai/sglang-git-ref: 8de158c6e9d4fae849cc15cc77b1185db1d20511
+        seedleap.ai/sglang-git-ref: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
     spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 60
@@ -354,7 +354,7 @@ spec:
             readOnly: true
         - name: work
           persistentVolumeClaim:
-            claimName: minwm-dmd-0724-p6-work
+            claimName: minwm-dmd-0724-p6-work-v2
         - name: shm
           emptyDir:
             medium: Memory
