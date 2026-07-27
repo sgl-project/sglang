@@ -406,11 +406,7 @@ GDN models are hybrid: the full-attention layers still require a standard `--att
 
 ### KDA Helion backend
 
-Kimi Delta Attention (KDA) models can use the optional Helion backend for packed decode and prefill/extend on NVIDIA CUDA GPUs. Install the extra before selecting it:
-
-```bash
-pip install "sglang[helion]"
-```
+Kimi Delta Attention (KDA) models can use the Helion backend for packed decode and prefill/extend on NVIDIA CUDA GPUs. Helion is included in the standard SGLang installation.
 
 Use Helion for both phases with `--linear-attn-backend helion`. To test one phase independently, use the phase-specific flags, for example:
 

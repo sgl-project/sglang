@@ -1,1 +1,1 @@
-"""Optional Helion attention kernels."""
+"""Helion attention kernels."""

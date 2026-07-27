@@ -35,7 +35,7 @@ _L2_NORM_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_L2_NORM_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -48,16 +48,17 @@ def _l2norm_qk(
     T = q.size(1)
     H = hl.specialize(q.size(2))
     K = hl.specialize(q.size(3))
-    hl.specialize(
-        (
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         q.stride(1),
+    #         q.stride(2),
+    #         q.stride(3),
+    #         k.stride(1),
+    #         k.stride(2),
+    #         k.stride(3),
+    #     )
+    # )
 
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
@@ -103,19 +104,19 @@ def _activate_gate(
     lower_bound: float,
     use_lower_bound: hl.constexpr,
 ) -> torch.Tensor:
-    a = torch.exp(a_log.float())
+    a = torch.exp2(a_log.float() * RCP_LN2)
     if use_lower_bound:
         return lower_bound * torch.sigmoid(a * raw_gate)
     softplus = torch.where(
         raw_gate < SOFTPLUS_THRESHOLD,
-        torch.log(1.0 + torch.exp(raw_gate)),
+        torch.log(1.0 + torch.exp2(raw_gate * RCP_LN2)),
         raw_gate,
     )
     return -a * softplus
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_GATE_FIXED_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -145,23 +146,24 @@ def _gate_cumsum_operands_fixed(
     H = hl.specialize(g.size(2))
     K = hl.specialize(g.size(3))
     chunks = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
-    hl.specialize(
-        (
-            g.stride(1),
-            g.stride(2),
-            g.stride(3),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            beta.stride(1),
-            beta.stride(2),
-            a_log.stride(0),
-            dt_bias.stride(0),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         g.stride(1),
+    #         g.stride(2),
+    #         g.stride(3),
+    #         q.stride(1),
+    #         q.stride(2),
+    #         q.stride(3),
+    #         k.stride(1),
+    #         k.stride(2),
+    #         k.stride(3),
+    #         beta.stride(1),
+    #         beta.stride(2),
+    #         a_log.stride(0),
+    #         dt_bias.stride(0),
+    #     )
+    # )
 
     out = torch.empty_like(g, dtype=torch.float32)
     qg = torch.empty_like(q)
@@ -254,7 +256,7 @@ def _gate_cumsum_operands_fixed(
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_GATE_VARLEN_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -285,26 +287,27 @@ def _gate_cumsum_operands_varlen(
     H = hl.specialize(g.size(2))
     K = hl.specialize(g.size(3))
     chunks = chunk_indices.size(0)
-    hl.specialize(
-        (
-            g.stride(1),
-            g.stride(2),
-            g.stride(3),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            beta.stride(1),
-            beta.stride(2),
-            a_log.stride(0),
-            dt_bias.stride(0),
-            cu_seqlens.stride(0),
-            chunk_indices.stride(0),
-            chunk_indices.stride(1),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         g.stride(1),
+    #         g.stride(2),
+    #         g.stride(3),
+    #         q.stride(1),
+    #         q.stride(2),
+    #         q.stride(3),
+    #         k.stride(1),
+    #         k.stride(2),
+    #         k.stride(3),
+    #         beta.stride(1),
+    #         beta.stride(2),
+    #         a_log.stride(0),
+    #         dt_bias.stride(0),
+    #         cu_seqlens.stride(0),
+    #         chunk_indices.stride(0),
+    #         chunk_indices.stride(1),
+    #     )
+    # )
 
     out = torch.empty_like(g, dtype=torch.float32)
     qg = torch.empty_like(q)
@@ -492,7 +495,7 @@ _INTRA_MATRIX_FORWARD_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_INTRA_MATRIX_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -515,21 +518,22 @@ def _intra_matrices_wide(
     K = hl.specialize(q.size(3))
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
-    hl.specialize(
-        (
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            g.stride(1),
-            g.stride(2),
-            g.stride(3),
-            beta.stride(1),
-            beta.stride(2),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         q.stride(1),
+    #         q.stride(2),
+    #         q.stride(3),
+    #         k.stride(1),
+    #         k.stride(2),
+    #         k.stride(3),
+    #         g.stride(1),
+    #         g.stride(2),
+    #         g.stride(3),
+    #         beta.stride(1),
+    #         beta.stride(2),
+    #     )
+    # )
 
     aqk = torch.empty([B, T, H, CHUNK_SIZE], dtype=q.dtype, device=q.device)
     akk = torch.empty([B, T, H, CHUNK_SIZE], dtype=torch.float32, device=q.device)
@@ -612,12 +616,9 @@ def _intra_matrices_wide(
                     g_anchor[None, :] - g_col,
                     0.0,
                 )
-                q_off = (q_row * torch.exp2(g_row - g_anchor[None, :])).to(
-                    torch.bfloat16
-                )
-                k_off = (k_row * torch.exp2(g_row - g_anchor[None, :])).to(
-                    torch.bfloat16
-                )
+                off_row_factor = torch.exp2(g_row - g_anchor[None, :])
+                q_off = (q_row * off_row_factor).to(torch.bfloat16)
+                k_off = (k_row * off_row_factor).to(torch.bfloat16)
                 k_col_off = (k_col * torch.exp2(off_col_delta)).to(torch.bfloat16)
                 aqk_off = hl.dot(
                     q_off,
@@ -637,8 +638,9 @@ def _intra_matrices_wide(
                 -126.0,
                 126.0,
             )
-            q_diag = q_row * torch.exp2(diag_delta)
-            k_diag_fwd = k_row * torch.exp2(diag_delta)
+            diag_forward_factor = torch.exp2(diag_delta)
+            q_diag = q_row * diag_forward_factor
+            k_diag_fwd = k_row * diag_forward_factor
             k_diag_bwd = k_row * torch.exp2(-diag_delta)
             aqk_diag = hl.dot(
                 q_diag,
@@ -706,7 +708,7 @@ def _intra_matrices_wide(
 
 
 _intra_matrices_wide_forward = helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_INTRA_MATRIX_FORWARD_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_intra_matrices_wide.fn)
@@ -770,8 +772,17 @@ _NEWTON_SOLVE_RECOMPUTE_CONFIG = helion.Config(
 )
 
 
+_NEWTON_SOLVE_RECOMPUTE_LONG_CONFIG = helion.Config(
+    block_sizes=[64, 64],
+    loop_orders=[[0, 1]],
+    num_warps=1,
+    num_stages=3,
+    indexing="pointer",
+)
+
+
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_FORWARD_SOLVE_RECOMPUTE_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -789,7 +800,8 @@ def _intra_solve_recompute(
     """Solve the 64x64 system and emit W and U from pre-scaled operands.
 
     Forward substitution preserves the Triton baseline's floating-point order.
-    Newton-Schulz is an explicitly selected, algebraically equivalent fast path.
+    Newton-Schulz is an opt-in algebraically equivalent inverse with a different
+    floating-point operation order.
     """
     B = wk.size(0)
     T = wk.size(1)
@@ -1083,8 +1095,14 @@ def _intra_solve_recompute(
 
 
 _intra_solve_recompute_newton = helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_NEWTON_SOLVE_RECOMPUTE_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)(_intra_solve_recompute.fn)
+
+_intra_solve_recompute_newton_long = helion.kernel(
+    static_shapes=True,
+    config=_NEWTON_SOLVE_RECOMPUTE_LONG_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_intra_solve_recompute.fn)
 
@@ -1128,9 +1146,14 @@ def chunk_kda_fwd_intra(
         preinvert_diagonal,
         newton_schulz,
     )
-    solve_kernel = (
-        _intra_solve_recompute_newton if newton_schulz else _intra_solve_recompute
-    )
+    if newton_schulz:
+        solve_kernel = (
+            _intra_solve_recompute_newton_long
+            if q.size(1) * q.size(2) >= 65536
+            else _intra_solve_recompute_newton
+        )
+    else:
+        solve_kernel = _intra_solve_recompute
     w, u = solve_kernel(
         akk,
         wk,
@@ -1154,19 +1177,48 @@ _STATE_FIXED_CONFIG = helion.Config(
 
 
 _STATE_VARLEN_CONFIG = helion.Config(
-    block_sizes=[32],
-    load_eviction_policies=["", "", "", "", "first", "", "", "", ""],
-    loop_orders=[[1, 2, 0]],
-    range_flattens=[None, False],
-    range_multi_buffers=[None, True],
-    num_warps=4,
+    atomic_indexing=[],
+    block_sizes=[64],
+    indexing=[
+        "pointer",
+        "pointer",
+        "pointer",
+        "tensor_descriptor",
+        "tensor_descriptor",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "tensor_descriptor",
+        "pointer",
+        "pointer",
+    ],
+    l2_groupings=[4],
+    load_eviction_policies=[
+        "",
+        "",
+        "",
+        "last",
+        "last",
+        "first",
+        "first",
+        "first",
+        "first",
+    ],
+    loop_orders=[[0, 2, 1]],
     num_stages=2,
-    indexing="pointer",
+    num_warps=4,
+    pid_type="flat",
+    range_flattens=[None, None],
+    range_multi_buffers=[None, False],
+    range_num_stages=[],
+    range_unroll_factors=[0, 2],
+    range_warp_specializes=[None, False],
 )
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_STATE_FIXED_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -1191,27 +1243,28 @@ def _chunk_state(
     N = cu_seqlens.size(0) - 1 if is_varlen else B
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else chunks_per_batch
-    hl.specialize(
-        (
-            kg.stride(1),
-            kg.stride(2),
-            kg.stride(3),
-            w.stride(1),
-            w.stride(2),
-            w.stride(3),
-            u.stride(1),
-            u.stride(2),
-            u.stride(3),
-            chunk_decay.stride(0),
-            chunk_decay.stride(1),
-            chunk_decay.stride(2),
-            initial_state.stride(0),
-            initial_state.stride(1),
-            initial_state.stride(2),
-            initial_state.stride(3),
-            initial_state_indices.stride(0),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         kg.stride(1),
+    #         kg.stride(2),
+    #         kg.stride(3),
+    #         w.stride(1),
+    #         w.stride(2),
+    #         w.stride(3),
+    #         u.stride(1),
+    #         u.stride(2),
+    #         u.stride(3),
+    #         chunk_decay.stride(0),
+    #         chunk_decay.stride(1),
+    #         chunk_decay.stride(2),
+    #         initial_state.stride(0),
+    #         initial_state.stride(1),
+    #         initial_state.stride(2),
+    #         initial_state.stride(3),
+    #         initial_state_indices.stride(0),
+    #     )
+    # )
 
     h = torch.empty(
         [B, total_chunks, H, V, K],
@@ -1294,11 +1347,10 @@ def _chunk_state(
 
 
 _chunk_state_varlen = helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_STATE_VARLEN_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_chunk_state.fn)
-
 
 _OUTPUT_CONFIG = helion.Config(
     block_sizes=[128],
@@ -1311,7 +1363,7 @@ _OUTPUT_CONFIG = helion.Config(
 
 
 @helion.kernel(
-    static_shapes=False,
+    static_shapes=True,
     config=_OUTPUT_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
@@ -1334,26 +1386,27 @@ def _chunk_output(
     chunks_per_batch = (T + CHUNK_SIZE - 1) // CHUNK_SIZE
     total_chunks = chunk_indices.size(0) if is_varlen else B * chunks_per_batch
     h_chunks = h.size(1)
-    hl.specialize(
-        (
-            qg.stride(1),
-            qg.stride(2),
-            qg.stride(3),
-            v_new.stride(1),
-            v_new.stride(2),
-            v_new.stride(3),
-            aqk.stride(1),
-            aqk.stride(2),
-            aqk.stride(3),
-            h.stride(1),
-            h.stride(2),
-            h.stride(3),
-            h.stride(4),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         qg.stride(1),
+    #         qg.stride(2),
+    #         qg.stride(3),
+    #         v_new.stride(1),
+    #         v_new.stride(2),
+    #         v_new.stride(3),
+    #         aqk.stride(1),
+    #         aqk.stride(2),
+    #         aqk.stride(3),
+    #         h.stride(1),
+    #         h.stride(2),
+    #         h.stride(3),
+    #         h.stride(4),
+    #         out.stride(1),
+    #         out.stride(2),
+    #         out.stride(3),
+    #     )
+    # )
 
     qg_rows = qg.view(B * T * H, K)
     v_rows = v_new.view(B * T * H, V)
@@ -1443,9 +1496,9 @@ def chunk_kda(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Match the public forward contract of SGLang's Triton ``chunk_kda``.
 
-    ``newton_schulz=True`` in ``kwargs`` enables a faster inverse with a
-    different floating-point operation order. The default uses Triton's
-    forward-substitution order.
+    ``newton_schulz=True`` in ``kwargs`` selects an algebraically equivalent
+    inverse with a different floating-point operation order. The default uses
+    Triton's forward-substitution order.
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5

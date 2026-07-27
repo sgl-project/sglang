@@ -337,19 +337,16 @@ def run(task, fi, tri, device, dtype, args):
                         inp["ssm"].clone(),
                         inp["intermediate_states"].clone(),
                     )
-
-                    def timed(kern):
-                        return call_verify(kern, inp, ssm_t, intermediate_states_t)
-
+                    timed = lambda kern: call_verify(
+                        kern, inp, ssm_t, intermediate_states_t
+                    )  # noqa: E731
                 else:
                     inp = make_decode_inputs(B, H, HV, K, V, pool, device, dtype)
                     corr = lambda kern: call_decode(
                         kern, inp, inp["ssm"].clone()
                     )  # noqa: E731
                     ssm_t = inp["ssm"].clone()
-
-                    def timed(kern):
-                        return call_decode(kern, inp, ssm_t)
+                    timed = lambda kern: call_decode(kern, inp, ssm_t)  # noqa: E731
 
                 o_tri = corr(tri)
                 diff = "n/a"
@@ -403,7 +400,7 @@ def main():
     p.add_argument(
         "--helion",
         action="store_true",
-        help="Include SGLang's optional Helion packed KDA backend.",
+        help="Include SGLang's Helion packed KDA backend.",
     )
     args = p.parse_args()
     args.helion_decode = load_helion_decode(args.helion)

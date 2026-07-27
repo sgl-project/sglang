@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import functools
-
 import helion
 import helion.language as hl
 import torch
 
 # SGLang initializes torch.distributed, but this kernel has no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
+_LOG2_E = 1.4426950408889634
 
-# FP32 state: CUDA x traverses V tiles, keeping the x grid at 16 across all
-# supported TP sizes.
+# Tile V on the CUDA x axis so tensor-parallel head counts do not change the
+# grid width.
 _KDA_CONFIG = helion.Config(
     block_sizes=[8],
     loop_orders=[[2, 1, 0]],
@@ -25,24 +24,21 @@ _KDA_CONFIG = helion.Config(
 _KDA_BF16_CONFIG = helion.Config(
     atomic_indexing=[],
     block_sizes=[16],
-    indexing=[
-        "tensor_descriptor",
-        "pointer",
-        "tensor_descriptor",
-        "pointer",
-        "tensor_descriptor",
-        "tensor_descriptor",
-        "tensor_descriptor",
-        "pointer",
-        "tensor_descriptor",
-        "tensor_descriptor",
-        "pointer",
-        "tensor_descriptor",
-    ],
+    indexing="pointer",
     l2_groupings=[16],
-    load_eviction_policies=["last", "", "last", "last", "", "", "", "last", "first"],
-    loop_orders=[[2, 1, 0]],
-    num_stages=4,
+    load_eviction_policies=[
+        "",
+        "last",
+        "first",
+        "last",
+        "first",
+        "first",
+        "last",
+        "",
+        "last",
+    ],
+    loop_orders=[[1, 2, 0]],
+    num_stages=1,
     num_warps=1,
     pid_type="flat",
     range_flattens=[None],
@@ -64,6 +60,7 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    use_fast_rsqrt: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused packed KDA decode body; mutates ``initial_state`` and ``out``."""
     B = mixed_qkv.size(0)
@@ -73,27 +70,28 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     H = hl.specialize((mixed_qkv.size(1) - HV * V) // (2 * K))
     heads_per_q = HV // H
 
-    hl.specialize(
-        (
-            mixed_qkv.stride(0),
-            mixed_qkv.stride(1),
-            a.stride(0),
-            a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            A_log.stride(0),
-            dt_bias.stride(0),
-            initial_state.stride(0),
-            initial_state.stride(1),
-            initial_state.stride(2),
-            initial_state.stride(3),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            ssm_state_indices.stride(0),
-        )
-    )
+    # Explicit stride specialization requires a newer Helion release.
+    # hl.specialize(
+    #     (
+    #         mixed_qkv.stride(0),
+    #         mixed_qkv.stride(1),
+    #         a.stride(0),
+    #         a.stride(1),
+    #         b.stride(0),
+    #         b.stride(1),
+    #         A_log.stride(0),
+    #         dt_bias.stride(0),
+    #         initial_state.stride(0),
+    #         initial_state.stride(1),
+    #         initial_state.stride(2),
+    #         initial_state.stride(3),
+    #         out.stride(0),
+    #         out.stride(1),
+    #         out.stride(2),
+    #         out.stride(3),
+    #         ssm_state_indices.stride(0),
+    #     )
+    # )
 
     block_v = hl.register_block_size(1, V)
 
@@ -113,24 +111,28 @@ def _helion_fused_recurrent_kda_packed_decode_body(
 
             gate_input = a[i_b, i_hv * K + k_offsets].float()
             gate_input = gate_input + dt_bias[i_hv * K + k_offsets].float()
-            gate_exp = torch.exp(gate_input)
+            gate_exp = torch.exp2(gate_input * _LOG2_E)
             softplus = torch.where(
                 gate_input <= 20.0,
                 torch.log(1.0 + gate_exp),
                 gate_input,
             )
             A_log_value = A_log[i_hv].float()
-            A = torch.exp(A_log_value)
+            A = torch.exp2(A_log_value * _LOG2_E)
             beta = torch.sigmoid(b[i_b, i_hv].float())
             log_decay = -A * softplus
 
             state = initial_state[state_index, i_hv, tile_v.index, k_offsets].float()
-            decay = torch.exp(log_decay)
+            decay = torch.exp2(log_decay * _LOG2_E)
             state = state * decay[None, :]
 
             k = mixed_qkv[i_b, k_input_offsets].float()
             if use_qk_l2norm_in_kernel:
-                k = k / torch.sqrt((k * k).sum() + 1e-6)
+                k_norm = (k * k).sum() + 1e-6
+                if use_fast_rsqrt:
+                    k = k * torch.rsqrt(k_norm)
+                else:
+                    k = k / torch.sqrt(k_norm)
             v = mixed_qkv[i_b, v_offsets].float()
             value_residual = v - (state * k[None, :]).sum(-1)
             value_residual = value_residual * beta
@@ -138,7 +140,11 @@ def _helion_fused_recurrent_kda_packed_decode_body(
 
             q = mixed_qkv[i_b, q_offsets].float()
             if use_qk_l2norm_in_kernel:
-                q = q / torch.sqrt((q * q).sum() + 1e-6)
+                q_norm = (q * q).sum() + 1e-6
+                if use_fast_rsqrt:
+                    q = q * torch.rsqrt(q_norm)
+                else:
+                    q = q / torch.sqrt(q_norm)
             q = q * scale
             output = (state * q[None, :]).sum(-1)
 
@@ -150,21 +156,16 @@ def _helion_fused_recurrent_kda_packed_decode_body(
 
 _helion_fused_recurrent_kda_packed_decode = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
-    static_shapes=False,
+    static_shapes=True,
     config=_KDA_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
 _helion_fused_recurrent_kda_packed_decode_bf16 = helion.kernel(
     _helion_fused_recurrent_kda_packed_decode_body,
-    static_shapes=False,
+    static_shapes=True,
     config=_KDA_BF16_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
-
-
-@functools.cache
-def _supports_tensor_descriptors(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device)[0] >= 9
 
 
 def _validate_packed_decode_inputs(
@@ -313,10 +314,10 @@ def helion_fused_recurrent_kda_packed_decode(
         out,
         ssm_state_indices,
     )
+    is_bf16_state = initial_state.dtype is torch.bfloat16
     kernel = (
         _helion_fused_recurrent_kda_packed_decode_bf16
-        if initial_state.dtype is torch.bfloat16
-        and _supports_tensor_descriptors(initial_state.device)
+        if is_bf16_state
         else _helion_fused_recurrent_kda_packed_decode
     )
     result = kernel(
@@ -330,5 +331,6 @@ def helion_fused_recurrent_kda_packed_decode(
         out,
         ssm_state_indices,
         use_qk_l2norm_in_kernel,
+        is_bf16_state,
     )
     return result, initial_state

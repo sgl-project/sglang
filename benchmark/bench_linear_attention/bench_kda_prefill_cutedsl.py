@@ -1,20 +1,18 @@
 """
-Benchmark & Correctness: Triton, CuTeDSL, and optional Helion KDA prefill.
+Benchmark & Correctness: Triton KDA vs CuTeDSL KDA (prefill, SM100 Blackwell).
 
-Compares with --helion:
-  - Triton: SGLang's full packed-varlen chunk_kda production operator
-  - CuTeDSL core: kda_blackwell pipeline with preprocessing outside the timer
-  - Helion: SGLang's full packed-varlen optional Helion production operator
+Compares:
+  - Triton:  sglang's chunk_kda (FLA chunkwise gated delta rule, per-channel gate)
+  - CuteDSL: kda_blackwell pipeline (fused Triton prologue -> kkt_inv_uw -> h -> o)
+  - Helion:  enabled with --helion and given the same preprocessed operands
 
 KDA differs from GDN by a PER-CHANNEL decay gate (g is [T, H, K], not scalar).
-Triton and Helion receive raw q/k and gate tensors, and include q/k L2
-normalization and gate activation in the timed region just as the serving
-adapter does. The cutedsl pipeline receives normalized q/k and an activated
-gate because its current public entry point externalizes that preprocessing.
-Its result is therefore a core-kernel ceiling, not an end-to-end comparison.
-Packed-varlen metadata is precomputed for all paths, matching serving where it
-is supplied by the scheduler. Without --helion, the script retains its original
-preactivated Triton and CuTeDSL core comparison.
+The cutedsl pipeline externalizes the per-channel decay into five pre-scaled
+key/query tensors computed by a fused Triton prologue; the chunk metadata is
+computed once and shared across layers in a real forward, so the benchmarked
+cutedsl path precomputes it outside the timed region (the realistic ceiling).
+The optional ``--newton-schulz`` benchmark flag changes only Helion's
+intra-chunk inverse.
 
 Correctness is checked against the token-by-token fused_recurrent_kda ground
 truth. Reports performance (ms, approx TFLOPS, TB/s, speedup).
@@ -95,36 +93,18 @@ def kda_bytes(total_seq_len, num_heads, head_k, head_v, num_seqs, dtype):
 
 def make_inputs(T, H, K, V, device, dtype, seed=42):
     torch.manual_seed(seed)
-    q_raw = torch.randn(1, T, H, K, device=device, dtype=dtype)
-    k_raw = torch.randn(1, T, H, K, device=device, dtype=dtype)
-    q = _l2norm(q_raw).to(dtype)
-    k = _l2norm(k_raw).to(dtype)
-    v = torch.randn(1, T, H, V, device=device, dtype=dtype)
+    q = _l2norm(torch.randn(1, T, H, K, device=device)).to(dtype)
+    k = _l2norm(torch.randn(1, T, H, K, device=device)).to(dtype)
+    v = torch.randn(1, T, H, V, device=device).to(dtype)
     # Mild per-channel gate (real Kimi-Linear regime; keeps exp() in fp32 range).
     A_log = torch.randn(H, device=device) * 0.5 - 1.5
     dt_bias = torch.randn(H, K, device=device) * 0.1
-    g_raw = torch.randn(1, T, H, K, device=device, dtype=dtype)
+    g_raw = torch.randn(1, T, H, K, device=device)
     g_act = (
-        -A_log.exp().view(1, 1, H, 1)
-        * F.softplus(g_raw.float() + dt_bias.view(1, 1, H, K))
+        -A_log.exp().view(1, 1, H, 1) * F.softplus(g_raw + dt_bias.view(1, 1, H, K))
     ).float()
     beta = torch.sigmoid(torch.randn(1, T, H, device=device)).float()
-    return dict(
-        q_raw=q_raw,
-        k_raw=k_raw,
-        q=q,
-        k=k,
-        v=v,
-        g_raw=g_raw,
-        g_act=g_act,
-        beta=beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-    )
+    return dict(q=q, k=k, v=v, g_act=g_act, beta=beta, T=T, H=H, K=K, V=V)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +227,6 @@ def check_shape(
     scale = K**-0.5
     inp = make_inputs(T, H, K, V, device, dtype)
     o_ref, state_ref = run_recurrent(inp, scale)
-    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=device)
 
     try:
         buf = cutedsl_buffers(inp, num_sms, device)
@@ -273,18 +252,18 @@ def check_shape(
         helion_state = torch.zeros(1, H, V, K, device=device, dtype=torch.float32)
         state_indices = torch.zeros(1, device=device, dtype=torch.int32)
         helion_o, _ = helion_chunk_kda(
-            q=inp["q_raw"],
-            k=inp["k_raw"],
+            q=inp["q"],
+            k=inp["k"],
             v=helion_v,
-            g=inp["g_raw"],
+            g=inp["g_act"],
             beta=inp["beta"],
             scale=scale,
             initial_state=helion_state,
             initial_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-            A_log=inp["A_log"],
-            dt_bias=inp["dt_bias"],
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=None,
+            A_log=None,
+            dt_bias=None,
             lower_bound=None,
             output_intermediate_states=True,
             newton_schulz=newton_schulz,
@@ -330,47 +309,30 @@ def bench_shape(
 
     scale = K**-0.5
     inp = make_inputs(T, H, K, V, device, dtype)
-    v, beta = inp["v"], inp["beta"]
+    q, k, v = inp["q"], inp["k"], inp["v"]
+    g_act, beta = inp["g_act"], inp["beta"]
 
-    triton_v = v.clone()
-    h0f = torch.zeros(1, H, V, K, device=device, dtype=torch.float32)
+    h0f = torch.zeros(1, H, K, V, device=device, dtype=torch.float32)
     idx = torch.zeros(1, dtype=torch.int32, device=device)
-    buf = cutedsl_buffers(inp, num_sms, device)
-    cu_seqlens = buf["cu"]
-
-    if helion_chunk_kda is None:
-        triton_q, triton_k, triton_g = inp["q"], inp["k"], inp["g_act"]
-        triton_cu_seqlens = None
-        triton_a_log = None
-        triton_dt_bias = None
-        triton_l2norm = False
-    else:
-        triton_q, triton_k, triton_g = (
-            inp["q_raw"],
-            inp["k_raw"],
-            inp["g_raw"],
-        )
-        triton_cu_seqlens = cu_seqlens
-        triton_a_log = inp["A_log"]
-        triton_dt_bias = inp["dt_bias"]
-        triton_l2norm = True
 
     def fn_triton():
         chunk_kda(
-            q=triton_q,
-            k=triton_k,
-            v=triton_v,
-            g=triton_g,
+            q=q,
+            k=k,
+            v=v,
+            g=g_act,
             beta=beta,
             scale=scale,
             initial_state=h0f,
             initial_state_indices=idx,
-            use_qk_l2norm_in_kernel=triton_l2norm,
-            cu_seqlens=triton_cu_seqlens,
-            A_log=triton_a_log,
-            dt_bias=triton_dt_bias,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=None,
+            A_log=None,
+            dt_bias=None,
             lower_bound=None,
         )
+
+    buf = cutedsl_buffers(inp, num_sms, device)
 
     def fn_cutedsl():
         run_cutedsl_pipeline(inp, buf, scale)
@@ -381,18 +343,18 @@ def bench_shape(
 
         def fn_helion():
             helion_chunk_kda(
-                q=inp["q_raw"],
-                k=inp["k_raw"],
+                q=inp["q"],
+                k=inp["k"],
                 v=helion_v,
-                g=inp["g_raw"],
+                g=inp["g_act"],
                 beta=beta,
                 scale=scale,
                 initial_state=helion_state,
                 initial_state_indices=idx,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                A_log=inp["A_log"],
-                dt_bias=inp["dt_bias"],
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=None,
+                A_log=None,
+                dt_bias=None,
                 lower_bound=None,
                 newton_schulz=newton_schulz,
             )
@@ -424,10 +386,11 @@ def bench_shape(
         f"{speedup:>7.2f}x"
     )
     if ms_helion is not None:
+        comparison = ms_cutedsl / ms_helion if newton_schulz else ms_triton / ms_helion
         line += (
             f" | {ms_helion:>8.3f}  {flops / ms_helion / 1e9:>7.2f}  "
             f"{mem_bytes / ms_helion / 1e9:>7.2f} | "
-            f"{ms_triton / ms_helion:>7.2f}x"
+            f"{comparison:>7.2f}x"
         )
     print(line)
 
@@ -479,7 +442,7 @@ def run_benchmark(
     if helion_chunk_kda is None:
         print("Benchmark: Triton chunk_kda vs CuTeDSL pipeline  (do_bench_cudagraph)")
     else:
-        print("Benchmark: full KDA operators and CuTeDSL core  (do_bench_cudagraph)")
+        print("Benchmark: preprocessed KDA operators  (do_bench_cudagraph)")
     print("=" * 92)
     if helion_chunk_kda is None:
         print(f"  Device SMs={num_sms}, K=V=128, dtype={dtype}, metadata precomputed")
@@ -491,16 +454,19 @@ def run_benchmark(
     else:
         print(
             f"  Device SMs={num_sms}, K=V=128, dtype={dtype}, "
-            "packed-varlen metadata precomputed; "
-            "CuTe excludes q/k + gate preprocessing"
+            "q/k and gate preprocessing excluded"
         )
         header = (
             f"  {'H':>3}  {'T':>7} | "
-            f"{'tri-full':>8}  {'TFLOP':>7}  {'TB/s':>7} | "
+            f"{'tri-core':>8}  {'TFLOP':>7}  {'TB/s':>7} | "
             f"{'cute-core':>9}  {'TFLOP':>7}  {'TB/s':>7} | {'tri/cute':>8}"
         )
-        helion_label = "hel-ns-full" if newton_schulz else "hel-full"
-        header += f" | {helion_label:>10}  {'TFLOP':>7}  {'TB/s':>7} | {'tri/hel':>8}"
+        helion_label = "hel-ns-core" if newton_schulz else "hel-core"
+        comparison_label = "cute/hel" if newton_schulz else "tri/hel"
+        header += (
+            f" | {helion_label:>10}  {'TFLOP':>7}  {'TB/s':>7} | "
+            f"{comparison_label:>8}"
+        )
     print(header)
     print("  " + "-" * (124 if helion_chunk_kda is not None else 84))
     for H in args.num_heads:
@@ -533,7 +499,7 @@ def main():
     parser.add_argument(
         "--helion",
         action="store_true",
-        help="Include SGLang's optional Helion KDA prefill backend.",
+        help="Include SGLang's Helion KDA prefill backend.",
     )
     parser.add_argument(
         "--newton-schulz",
