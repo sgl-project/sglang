@@ -34,7 +34,7 @@ export const QwenImageDeployment = () => {
       }
     },
 
-    generateCommand: function(values) {
+    generateCommand: function (values) {
       if (values.hardware === 'a2') {
         return `sglang serve \\
   --model-path Qwen/Qwen-Image \\
@@ -47,7 +47,6 @@ sglang serve \\
   --model-path Qwen/Qwen-Image \\
   --tp-size 1 \\
   --sp-degree 2 \\
-  --port 8764 \\
   --num-gpus 2`;
       }
 
