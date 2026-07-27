@@ -1,21 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-0724-dragon60-bitwise-20260727-03
+  name: minwm-0724-dragon60-unipc-20260727-01
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-03
+    app.kubernetes.io/name: minwm-0724-dragon60-unipc-20260727-01
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: 0724-dragon-ride-60s-main-bitwise-attempt02
+    seedleap.ai/run-id: 0724-dragon-ride-60s-main-unipc-bitwise-attempt01
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
+    seedleap.ai/sglang-git-ref: 9e07a506c363c050a2460ab1691181656420cf08
     seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     seedleap.ai/config-sha256: a5eac8a1478a5c9da63494439302f26671636b44445b0b9fd1496d59d8d2546d
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/capacity-type: spot
     seedleap.ai/kv-contract: unbounded-local-attn-sink4
-    seedleap.ai/retry-of: minwm-0724-dragon60-bitwise-20260727-02
+    seedleap.ai/retry-of: minwm-0724-dragon60-bitwise-20260727-03
 spec:
   completionMode: Indexed
   completions: 1
@@ -25,12 +25,12 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-03
+        app.kubernetes.io/name: minwm-0724-dragon60-unipc-20260727-01
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: 0724-dragon-ride-60s-main-bitwise-attempt02
+        seedleap.ai/run-id: 0724-dragon-ride-60s-main-unipc-bitwise-attempt01
         seedleap.ai/owner: chenshengdong
       annotations:
-        seedleap.ai/sglang-git-ref: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
+        seedleap.ai/sglang-git-ref: 9e07a506c363c050a2460ab1691181656420cf08
         seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     spec:
       restartPolicy: Never
@@ -57,13 +57,13 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
+              value: 9e07a506c363c050a2460ab1691181656420cf08
             - name: MINWM_GIT_REF
               value: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
             - name: MINWM_BENCHMARK_MODE
               value: dragon60s
             - name: MINWM_RUN_ID
-              value: 0724-dragon-ride-60s-main-bitwise-attempt02
+              value: 0724-dragon-ride-60s-main-unipc-bitwise-attempt01
             - name: MINWM_REUSE_INPUT_RUN_ID
               value: 0724-window18-sink9-5s-b200-attempt01
             - name: MINWM_REUSE_MODEL_RUN_ID
@@ -76,6 +76,8 @@ spec:
               value: a5eac8a1478a5c9da63494439302f26671636b44445b0b9fd1496d59d8d2546d
             - name: MINWM_SINK_SIZE
               value: "4"
+            - name: MINWM_PIPELINE_CLASS_NAME
+              value: MinWMCausalUniPCPipeline
             - name: MINWM_CHECKPOINT_S3_EAST
               value: s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
             - name: MINWM_CHECKPOINT_VERSION_EAST
