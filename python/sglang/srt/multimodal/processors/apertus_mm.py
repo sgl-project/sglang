@@ -378,6 +378,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
                 image_data=image_data,
                 audio_data=audio_data,
                 multimodal_tokens=self.mm_tokens,
+                audio_sample_rate=24_000,
             )
             images = base_output.images or []
             audios = base_output.audios or []
