@@ -75,6 +75,49 @@ class TestMlxRunnerPoolContract(unittest.TestCase):
                 f"optional MemoryPoolConfig argument: {exc}"
             )
 
+    def test_initialize_sets_dp_size_for_max_running_requests(self):
+        """Regression: serving with ``--max-running-requests`` crashed with
+        ``AttributeError: 'MlxModelRunnerStub' object has no attribute
+        'dp_size'``.
+
+        ``_resolve_max_running_requests`` splits the requested concurrency
+        across dp workers via ``self.dp_size``, but the base ``ModelRunner``
+        only ever sets ``dcp_size`` (never ``dp_size``) and the stub overrides
+        ``initialize()`` without calling ``super().initialize()``, so
+        ``initialize`` must derive ``dp_size`` from ``server_args`` itself.
+        Every MLX e2e correctness test passes ``--max-running-requests 1``,
+        so without this the whole MLX serving lane is broken.
+        """
+        import inspect
+        from unittest.mock import MagicMock, patch
+
+        import sglang.srt.configs.hybrid_arch as hybrid_arch
+
+        init_src = inspect.getsource(MlxModelRunnerStub.initialize)
+        self.assertIn(
+            "self.dp_size = self.server_args.dp_size",
+            init_src,
+            msg=(
+                "MlxModelRunnerStub.initialize must set self.dp_size from "
+                "server_args before _resolve_max_running_requests runs. The "
+                "base ModelRunner never sets dp_size (only dcp_size) and "
+                "this override skips super().initialize()."
+            ),
+        )
+
+        # The split must divide the requested cap across dp workers without
+        # touching the missing attribute.
+        stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
+        stub.max_total_num_tokens = 10000
+        stub.dp_size = 2
+        stub.server_args = MagicMock(
+            max_running_requests=4, dp_size=2, max_mamba_cache_size=None
+        )
+        stub.model_config = MagicMock()
+        with patch.object(hybrid_arch, "mambaish_config", return_value=None):
+            # 4 // dp_size(2) = 2; capacity_cap = 10000 // 2 = 5000; -> 2
+            self.assertEqual(stub._resolve_max_running_requests(), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -236,6 +236,12 @@ class MlxModelRunnerStub(ModelRunner):
             self.max_total_num_tokens = self._mlx_pool_size
         else:
             self.max_total_num_tokens = self.model_config.context_len
+        # The base ModelRunner only ever sets `dcp_size`, never `dp_size`, and
+        # this lightweight override skips base.initialize() -- so derive it from
+        # server_args here. _resolve_max_running_requests splits the requested
+        # concurrency across dp workers, mirroring how the CUDA-side runners
+        # read `server_args.dp_size` (e.g. base_runner.py / cpu_graph_runner.py).
+        self.dp_size = self.server_args.dp_size
         self.max_running_requests = self._resolve_max_running_requests()
         self.is_hybrid_swa = False
 
