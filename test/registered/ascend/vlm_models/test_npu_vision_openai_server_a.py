@@ -27,9 +27,9 @@ from sglang.test.ascend.vlm_utils import (
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
+register_npu_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
