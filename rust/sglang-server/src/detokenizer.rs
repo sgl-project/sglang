@@ -282,7 +282,11 @@ fn handle_chunk(
         Some(decoder) => match decoder.step(&ev.token_ids) {
             Ok(delta) => delta,
             Err(e) => {
+                // Abort too: this is terminal for the request, and without it the
+                // scheduler keeps generating for a connection that is already gone
+                // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
+                let _ = tm.try_send(TmEvent::Abort(st.rid.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
                 table.remove(&id);
                 return;
