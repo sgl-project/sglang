@@ -38,6 +38,10 @@ fn routes_at(route: &str) -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 struct VertexGenerateRequest {
     instances: Vec<VertexInstance>,
+    /// Vertex `parameters` uses the native generation parameter schema, so reuse
+    /// `GenerateBody` to share its serde validation and defaults instead of
+    /// duplicating every generation field. `TryFrom` supplies instance-owned
+    /// inputs separately and rejects input fields placed here.
     #[serde(default)]
     parameters: Option<GenerateBody>,
 }
