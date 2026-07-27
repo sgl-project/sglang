@@ -70,7 +70,7 @@ impl Runnable for Egress {
                     for b in buckets.iter_mut() {
                         b.clear();
                     }
-                    let ok = for_each_chunk(body, |ev| {
+                    let decoded = for_each_chunk(body, |ev| {
                         buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
                     });
                     // Routing only fills the buckets; nothing is delivered until the
@@ -79,21 +79,27 @@ impl Runnable for Egress {
                     // requests decoded before the bad one, carrying another request's
                     // logprobs — the corruption the decoder's bounds checks exist to
                     // prevent. Better a lost frame than a silently wrong one.
-                    if !ok {
+                    if !decoded.ok {
                         // Dropping the frame keeps wrong data off the wire, but a
                         // request whose chunk was in it would otherwise wait forever:
                         // mid-stream it gets a hole, and if its FINAL chunk was here
                         // it never sees `Done` and the connection hangs — there is no
-                        // server-side timeout. The rids are already bucketed, so fail
-                        // each one explicitly.
-                        tracing::warn!("egress: bad batch frame; failing its requests");
-                        for (i, b) in buckets.iter_mut().enumerate() {
-                            for ev in b.drain(..) {
-                                let _ = self.senders.detok[i].send(DetokMsg::Fail {
-                                    rid_hash: RidHash(ev.rid_hash),
-                                    message: "malformed scheduler output frame".into(),
-                                });
-                            }
+                        // server-side timeout. Fail from the HEADER's rids, not the
+                        // buckets: a frame that fails at request 0 buckets nothing,
+                        // so bucket-driven cleanup would leave every request in it
+                        // hanging.
+                        tracing::warn!(
+                            rids = decoded.rids.len(),
+                            "egress: bad batch frame; failing its requests"
+                        );
+                        for b in buckets.iter_mut() {
+                            b.clear();
+                        }
+                        for id in decoded.rids {
+                            let _ = self.senders.detok[id.shard(shards)].send(DetokMsg::Fail {
+                                rid_hash: id,
+                                message: "malformed scheduler output frame".into(),
+                            });
                         }
                         continue;
                     }
