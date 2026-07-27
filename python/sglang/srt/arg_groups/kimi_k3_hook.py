@@ -39,3 +39,22 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             "Kimi hybrid DSPARK: defaulting "
             "--speculative-draft-attention-backend to trtllm_mha."
         )
+
+
+def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
+    """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
+    from sglang.srt.utils import is_sm100_supported
+
+    # Pre-empts the generic SM100+bf16 flashinfer switch (a GDN default): on
+    # KDA shapes the triton packed decode measures ~35% faster than
+    # recurrent_kda across bs 1-256, and ReplaySSM requires triton.
+    if (
+        server_args.linear_attn_decode_backend is None
+        and server_args.mamba_ssm_dtype == "bfloat16"
+        and is_sm100_supported()
+    ):
+        server_args.linear_attn_decode_backend = "triton"
+        logger.info(
+            "Kimi hybrid model with bf16 SSM state: defaulting "
+            "--linear-attn-decode-backend to triton."
+        )

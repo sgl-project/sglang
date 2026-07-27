@@ -4940,9 +4940,11 @@ class ServerArgs:
             "KimiK3ForConditionalGeneration",
         ):
             from sglang.srt.arg_groups.kimi_k3_hook import (
+                apply_kimi_k3_linear_attn_defaults,
                 apply_kimi_k3_spec_backend_defaults,
             )
 
+            apply_kimi_k3_linear_attn_defaults(self)
             apply_kimi_k3_spec_backend_defaults(self)
 
         if model_arch in [
