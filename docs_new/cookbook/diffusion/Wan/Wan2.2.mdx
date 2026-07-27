@@ -73,7 +73,7 @@ curl http://127.0.0.1:3000/v1/images/generations \
   }'
 ```
 
-### 4.1.2 Generate a video without launching a server
+#### 4.1.2 Generate a video without launching a server
 
 ```shell Command
 SERVER_ARGS=(
@@ -93,6 +93,7 @@ SAMPLING_ARGS=(
 )
 
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+
 ```
 
 ### 4.2 Advanced Usage
@@ -193,7 +194,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-D
   </tbody>
 </table>
 
-Combined Configuration Example:
+ Combined Configuration Example:
 
 ```shell Command
 SGLANG_CACHE_DIT_ENABLED=true \
