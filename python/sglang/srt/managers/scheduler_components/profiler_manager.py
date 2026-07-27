@@ -99,6 +99,11 @@ class SchedulerProfilerManager:
         record_execution_trace: bool = False,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
+            if record_execution_trace:
+                return ProfileReqOutput(
+                    success=False,
+                    message="Execution trace recording is not supported with SGLANG_PROFILE_V2 yet.",
+                )
             return self._profile_manager.configure(
                 output_dir=output_dir,
                 start_step=start_step,
@@ -271,6 +276,9 @@ class SchedulerProfilerManager:
             try:
                 self.torch_profiler.start()
             except RuntimeError as e:
+                if self._et_observer is not None:
+                    self._et_observer.unregister_callback()
+                    self._et_observer = None
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
