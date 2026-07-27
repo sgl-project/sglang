@@ -361,6 +361,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        # One-shot; emitted at the first fused-decode interception below.
+        self._fused_override_notice = (
+            "K3 fused KDA decode engaged: --linear-attn-decode-backend "
+            f"{decode_backend} only picks the fallback kernel for shapes "
+            "the fused kernel does not cover."
+        )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -434,6 +440,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     onorm_gate,
                 )
             ):
+                if self._fused_override_notice is not None:
+                    rank0_log(self._fused_override_notice)
+                    self._fused_override_notice = None
                 w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
                 core_attn_out = kda_fused_decode.kda_fused_decode(
                     mixed_qkv,
