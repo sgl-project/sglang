@@ -57,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -118,6 +119,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
+    ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
 
 
@@ -140,6 +142,23 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+        primary_group_control = (
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
+        )
+        if primary_group_control:
+            control_fan_out = (
+                worker_count + self.server_args.tp_size - 1
+            ) // self.server_args.tp_size
+        else:
+            control_fan_out = worker_count
+
+        for spec in _COMMUNICATOR_SPECS:
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+
+        self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -821,7 +840,9 @@ class TokenizerControlMixin:
             List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.server_args.dp_size):
+        if dp_rank is not None and (
+            dp_rank < 0 or dp_rank >= self.elastic_worker_count
+        ):
             return []
 
         reader = self.load_snapshot_reader
