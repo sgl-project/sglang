@@ -62,7 +62,7 @@ def generate_topk_ids(
 
     ``no_local`` draws only experts outside the locally owned interval
     ``[owned_expert_start, owned_expert_start + num_local_experts)`` so the
-    rank's factor map resolves every pair to the ``-1`` sentinel — correct
+    rank's LoRA expert map resolves every pair to the ``-1`` sentinel — correct
     for any EP rank, not only rank 0.  ``iid_with_sentinels`` additionally
     replaces a seeded quarter of the pairs with literal ``-1`` inputs, the
     standard-dispatcher form for non-owned routes in the local ID domain.
@@ -185,40 +185,42 @@ def resolve_route_stats(
     *,
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
-    factor_expert_count: int,
+    lora_experts_per_adapter: int,
     max_loras: int,
     block_size: int,
-    routed_expert_to_factor_id: torch.Tensor | None = None,
+    lora_expert_map: torch.Tensor | None = None,
 ) -> RouteStats:
     """Compute the plan §5 route symbols for the case record (host-side)."""
     num_tokens, top_k = topk_ids.shape
     ids = topk_ids.to(torch.int64)
-    if routed_expert_to_factor_id is None:
-        factor_ids = ids.clone()
+    if lora_expert_map is None:
+        lora_expert_ids = ids.clone()
     else:
-        factor_map = routed_expert_to_factor_id.to(torch.int64)
-        in_map = (ids >= 0) & (ids < factor_map.numel())
-        factor_ids = torch.where(
-            in_map, factor_map[ids.clamp(min=0, max=factor_map.numel() - 1)], -1
+        lora_expert_map = lora_expert_map.to(torch.int64)
+        in_map = (ids >= 0) & (ids < lora_expert_map.numel())
+        lora_expert_ids = torch.where(
+            in_map,
+            lora_expert_map[ids.clamp(min=0, max=lora_expert_map.numel() - 1)],
+            -1,
         )
     adapters = token_lora_mapping.to(torch.int64)[:, None].expand_as(ids)
     valid = (
         (adapters >= 0)
         & (adapters < max_loras)
-        & (factor_ids >= 0)
-        & (factor_ids < factor_expert_count)
+        & (lora_expert_ids >= 0)
+        & (lora_expert_ids < lora_experts_per_adapter)
     )
     virtual_ids = torch.where(
-        valid, adapters * factor_expert_count + factor_ids, torch.tensor(-1)
+        valid, adapters * lora_experts_per_adapter + lora_expert_ids, torch.tensor(-1)
     )
 
-    routed_valid = (factor_ids >= 0) & (factor_ids < factor_expert_count)
+    routed_valid = (lora_expert_ids >= 0) & (lora_expert_ids < lora_experts_per_adapter)
     p_valid_routed = int(routed_valid.sum())
     e_hit_routed = (
-        int(factor_ids[routed_valid].unique().numel()) if p_valid_routed else 0
+        int(lora_expert_ids[routed_valid].unique().numel()) if p_valid_routed else 0
     )
     p_valid = int(valid.sum())
-    hit_factors = factor_ids[valid]
+    hit_factors = lora_expert_ids[valid]
     e_hit = int(hit_factors.unique().numel()) if p_valid else 0
     groups = virtual_ids[valid]
     if p_valid:

@@ -270,7 +270,7 @@ class TestSglLoraFromRealLayer(CustomTestCase):
             self.assertEqual(cutedsl_runner.provider.contract.key, "cutedsl_bf16")
 
         self.assertEqual(from_layer_runner.top_k, self.top_k)
-        self.assertEqual(from_layer_runner.factor_experts, self.num_experts)
+        self.assertEqual(from_layer_runner.provider.num_local_experts, self.num_experts)
         self.assertEqual(from_layer_runner.routed_scaling_factor, self.routed_scale)
 
         explicit_runner = SglMoeLoraRunner(
@@ -285,10 +285,6 @@ class TestSglLoraFromRealLayer(CustomTestCase):
             ),
             top_k=self.top_k,
             routed_scaling_factor=self.routed_scale,
-            factor_experts=self.num_experts,
-            shared_factor_map=torch.zeros(
-                self.num_experts, dtype=torch.int32, device=self.device
-            ),
         )
 
         outputs = {

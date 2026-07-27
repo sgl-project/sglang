@@ -10,7 +10,24 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["OUTPUT_DIM"])
+    # Every codegen-affecting parameter must be in the key (see the shrink
+    # sibling): MAX_RANK feeds constexpr strides, so two LoRA max-ranks in
+    # one process would otherwise reuse a binary with the wrong x layout.
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["OUTPUT_DIM"],
+        kwargs["MAX_RANK"],
+        kwargs["BLOCK_M"],
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+        kwargs.get("num_warps"),
+        kwargs.get("num_stages"),
+        kwargs.get("maxnreg"),
+        # Pointer dtypes specialize the binary (x.dtype.element_ty casts).
+        kwargs["x"].dtype,
+        kwargs["weights"].dtype,
+        kwargs["output"].dtype,
+    )
 )
 @triton.jit(do_not_specialize=["num_segs", "output_stride_0", "output_stride_1"])
 def _chunked_lora_expand_kernel(
@@ -168,6 +185,16 @@ def chunked_sgmv_lora_expand_forward(
     assert weights.is_contiguous()
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
+    # Metadata dtypes enforced instead of keyed (see the shrink sibling);
+    # a base_output must match x's dtype — the kernel reads and re-stores
+    # it through the same typed pointer as the computed partials.
+    assert batch_info.seg_indptr.dtype == torch.int32
+    assert batch_info.weight_indices.dtype == torch.int32
+    assert batch_info.lora_ranks.dtype == torch.int32
+    assert batch_info.permutation.dtype == torch.int32
+    assert batch_info.scalings.dtype == torch.float32
+    assert slice_offsets.dtype == torch.int32
+    assert base_output is None or base_output.dtype == x.dtype
 
     # Get dims
     M = x.shape[0]

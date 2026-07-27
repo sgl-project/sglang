@@ -59,43 +59,46 @@ def _expert_routing(case: MoeLoraBenchCase, tensors: CaseTensors) -> RouteView:
     return build_virtual_expert_routing(
         tensors.topk_ids,
         tensors.token_lora_mapping,
-        factor_expert_count=case.num_experts_local,
+        lora_experts_per_adapter=case.num_experts_local,
         max_loras=case.slot_capacity,
         block_size=case.routing_block_size,
-        routed_expert_to_factor_id=tensors.routed_expert_to_factor_id,
+        lora_expert_map=tensors.lora_expert_map,
     )
 
 
 def _shared_routing(case: MoeLoraBenchCase, tensors: CaseTensors) -> RouteView:
-    """Adapter-only factor route (shared-outer control form).
+    """Adapter-only factor route (shared-outer, the section 60.5 form).
 
-    EP ownership is preserved: every locally owned expert maps to shared
-    factor 0; non-owned IDs stay ``-1``.
+    Global-domain ids are LOCALIZED FIRST — production's convention, where
+    the dispatcher hands the runner local ids — and every owned expert then
+    maps to the adapter's single LoRA expert (id 0) via the constexpr form; no map tensor
+    exists on the shared route anymore.
     """
-    if tensors.routed_expert_to_factor_id is None:
-        domain = case.num_experts_local
-        owned = torch.arange(domain, device=tensors.topk_ids.device)
-        shared_map = torch.zeros(domain, dtype=torch.int32, device=owned.device)
-    else:
-        base_map = tensors.routed_expert_to_factor_id
-        shared_map = torch.where(base_map >= 0, torch.zeros_like(base_map), base_map)
+    topk_ids = tensors.topk_ids
+    table = tensors.lora_expert_map
+    if table is not None:
+        in_map = (topk_ids >= 0) & (topk_ids < table.numel())
+        localized = table[topk_ids.clamp(min=0, max=table.numel() - 1).long()]
+        topk_ids = torch.where(
+            in_map, localized.to(topk_ids.dtype), torch.full_like(topk_ids, -1)
+        )
     return build_virtual_expert_routing(
-        tensors.topk_ids,
+        topk_ids,
         tensors.token_lora_mapping,
-        factor_expert_count=1,
+        lora_experts_per_adapter=1,
         max_loras=case.slot_capacity,
         block_size=case.routing_block_size,
-        routed_expert_to_factor_id=shared_map,
+        shared_outer_local_expert_count=case.num_experts_local,
     )
 
 
 def _pair_expert_ids(case: MoeLoraBenchCase, tensors: CaseTensors) -> torch.Tensor:
     """Local expert per pair (``-1`` non-owned), independent of adapters."""
     ids = tensors.topk_ids.to(torch.int64).reshape(-1)
-    factor_map = tensors.routed_expert_to_factor_id
-    if factor_map is None:
+    lora_expert_map = tensors.lora_expert_map
+    if lora_expert_map is None:
         return ids
-    table = factor_map.to(torch.int64)
+    table = lora_expert_map.to(torch.int64)
     in_map = (ids >= 0) & (ids < table.numel())
     return torch.where(
         in_map,
@@ -181,6 +184,17 @@ def run_serial_materialized_control(
             case.intermediate_size_physical,
             case.intermediate_size_local,
         ),
+        # K1 axes: the control materializes BF16 bridges; staged-rounding
+        # arms get their execution with P6 (plan §63.1) and must not
+        # silently ride this path.
+        "bridge_gate_a_out": (case.bridge_gate_a_out, "bf16"),
+        "bridge_gate_up_delta": (case.bridge_gate_up_delta, "bf16"),
+        "bridge_activation_lora_input": (
+            case.bridge_activation_lora_input,
+            "bf16",
+        ),
+        "bridge_down_a_out": (case.bridge_down_a_out, "bf16"),
+        "bridge_down_delta": (case.bridge_down_delta, "bf16"),
     }
     for field_name, (declared, supported) in unsupported.items():
         if declared != supported:

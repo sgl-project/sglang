@@ -65,6 +65,14 @@ def production_runner_skip_reason(case: MoeLoraBenchCase) -> str | None:
     """None if the production runner can execute this case; else the reason."""
     if case.activation != "silu_glu":
         return "production runner supports canonical gated SiLU only"
+    if "fp32" in (
+        case.bridge_gate_a_out,
+        case.bridge_gate_up_delta,
+        case.bridge_activation_lora_input,
+        case.bridge_down_a_out,
+        case.bridge_down_delta,
+    ):
+        return "production runner materializes BF16 bridges only"
     return None
 
 
@@ -76,7 +84,7 @@ def _localized_topk_ids(tensors: CaseTensors) -> torch.Tensor:
     the lab does the same rather than teaching the runner a second domain.
     """
     ids = tensors.topk_ids
-    table = tensors.routed_expert_to_factor_id
+    table = tensors.lora_expert_map
     if table is None:
         return ids
     in_map = (ids >= 0) & (ids < table.numel())
@@ -101,7 +109,18 @@ def prepare_production_forward(
     providers' LAB hooks (expected_m_hint / force_token_width) so a candidate
     arm can be measured at the complete-pipeline boundary; production passes
     nothing here.
+
+    Fails CLOSED at the executor entry (first S3 review): a case this runner
+    cannot honor raises here rather than silently executing the grouped/BF16
+    path under a different declaration. Candidate executors that intend a
+    different semantics run their own entry points, not this one.
     """
+    skip_reason = production_runner_skip_reason(case)
+    if skip_reason is not None:
+        raise ValueError(
+            f"case {case.case_id} declares semantics the production runner "
+            f"does not execute: {skip_reason}"
+        )
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -139,10 +158,6 @@ def prepare_production_forward(
         ),
         top_k=top_k,
         routed_scaling_factor=case.routed_scaling_factor,
-        factor_experts=case.num_experts_local,
-        shared_factor_map=torch.zeros(
-            case.num_experts_local, dtype=torch.int32, device=device
-        ),
     )
     token_slots = dt.token_lora_mapping.to(torch.int32)
     if disable_lora:

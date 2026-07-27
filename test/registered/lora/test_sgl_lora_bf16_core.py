@@ -47,18 +47,18 @@ class TestSglLoraBf16Core(CustomTestCase):
         topk_ids,
         adapters,
         *,
-        factor_count,
+        lora_experts_per_adapter,
         max_loras,
-        factor_map,
+        lora_expert_map,
     ):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=torch.int32, device=self.device),
             torch.tensor(adapters, dtype=torch.int32, device=self.device),
-            factor_expert_count=factor_count,
+            lora_experts_per_adapter=lora_experts_per_adapter,
             max_loras=max_loras,
             block_size=self.config["BLOCK_SIZE_M"],
-            routed_expert_to_factor_id=torch.tensor(
-                factor_map, dtype=torch.int32, device=self.device
+            lora_expert_map=torch.tensor(
+                lora_expert_map, dtype=torch.int32, device=self.device
             ),
         )
 
@@ -83,8 +83,8 @@ class TestSglLoraBf16Core(CustomTestCase):
         )
         virtual_ids = route.virtual_topk_ids.reshape(-1).cpu().tolist()
         host_row_map = None if input_row_map is None else input_row_map.cpu().tolist()
-        for pair_id, factor_id in enumerate(virtual_ids):
-            if factor_id < 0:
+        for pair_id, lora_expert_id in enumerate(virtual_ids):
+            if lora_expert_id < 0:
                 continue
             if host_row_map is not None:
                 input_row = host_row_map[pair_id]
@@ -96,7 +96,7 @@ class TestSglLoraBf16Core(CustomTestCase):
                 result[pair_id].zero_()
                 continue
             result[pair_id] = torch.mv(
-                weight[factor_id].float(), input[input_row].float()
+                weight[lora_expert_id].float(), input[input_row].float()
             ).to(torch.bfloat16)
         return result
 
@@ -114,31 +114,33 @@ class TestSglLoraBf16Core(CustomTestCase):
         num_slices = len(destination_offsets)
         rank = weight.shape[2]
         width = weight.shape[1] // num_slices
-        for pair_id, factor_id in enumerate(virtual_ids):
+        for pair_id, lora_expert_id in enumerate(virtual_ids):
             for slice_id, destination_offset in enumerate(destination_offsets):
                 output_slice = result[
                     pair_id, destination_offset : destination_offset + width
                 ]
-                if factor_id < 0:
+                if lora_expert_id < 0:
                     output_slice.zero_()
                     continue
                 a = intermediate[
                     pair_id, slice_id * rank : (slice_id + 1) * rank
                 ].float()
-                b = weight[factor_id, slice_id * width : (slice_id + 1) * width].float()
+                b = weight[
+                    lora_expert_id, slice_id * width : (slice_id + 1) * width
+                ].float()
                 output_slice.copy_(torch.mv(b, a).to(torch.bfloat16))
         return result
 
     def test_half_distinct_gate_up_a_and_b_with_provider_order(self):
         topk_ids = [[4, 5], [6, 9], [4, 7], [5, 6]]
         adapters = [0, 1, -1, 0]
-        factor_map = [-1, -1, -1, -1, 0, 1, 2, 3, -1, -1]
+        lora_expert_map = [-1, -1, -1, -1, 0, 1, 2, 3, -1, -1]
         route = self._routing(
             topk_ids,
             adapters,
-            factor_count=4,
+            lora_experts_per_adapter=4,
             max_loras=2,
-            factor_map=factor_map,
+            lora_expert_map=lora_expert_map,
         )
         hidden = torch.randn(4, 32, dtype=torch.bfloat16, device=self.device)
         rank = 16
@@ -214,9 +216,9 @@ class TestSglLoraBf16Core(CustomTestCase):
         route = self._routing(
             [[4, 5], [6, 7], [5, 4]],
             [0, 1, 0],
-            factor_count=4,
+            lora_experts_per_adapter=4,
             max_loras=2,
-            factor_map=[-1, -1, -1, -1, 0, 1, 2, 3],
+            lora_expert_map=[-1, -1, -1, -1, 0, 1, 2, 3],
         )
         provider_input = torch.randn(8, 32, dtype=torch.bfloat16, device=self.device)
         row_map = torch.tensor(
@@ -251,9 +253,9 @@ class TestSglLoraBf16Core(CustomTestCase):
         route = self._routing(
             [[4, 5], [5, 4]],
             [0, -1],
-            factor_count=2,
+            lora_experts_per_adapter=2,
             max_loras=2,
-            factor_map=[-1, -1, -1, -1, 0, 1],
+            lora_expert_map=[-1, -1, -1, -1, 0, 1],
         )
         rank, width = 16, 20
         intermediate = torch.randn(4, rank, dtype=torch.bfloat16, device=self.device)
@@ -311,7 +313,7 @@ class TestSglLoraBf16Core(CustomTestCase):
             device=self.device,
         )
         adapters = torch.tensor([0, -1, 1, 0], dtype=torch.int32, device=self.device)
-        factor_map = torch.tensor(
+        lora_expert_map = torch.tensor(
             [-1, -1, -1, -1, 0, 1, 2, 3, -1],
             dtype=torch.int32,
             device=self.device,
@@ -319,10 +321,10 @@ class TestSglLoraBf16Core(CustomTestCase):
         route = build_virtual_expert_routing(
             topk_ids,
             adapters,
-            factor_expert_count=4,
+            lora_experts_per_adapter=4,
             max_loras=2,
             block_size=16,
-            routed_expert_to_factor_id=factor_map,
+            lora_expert_map=lora_expert_map,
         )
         hidden = torch.randn(4, 32, dtype=torch.bfloat16, device=self.device)
         a_weight = torch.randn(8, 32, 32, dtype=torch.bfloat16, device=self.device)

@@ -28,9 +28,9 @@ class TestSglLoraRouting(CustomTestCase):
         topk_ids,
         adapters,
         *,
-        factor_count,
+        lora_experts_per_adapter,
         max_loras=2,
-        factor_map=None,
+        lora_expert_map=None,
         block_size=16,
         dtype=torch.int32,
         view=ROUTE_ALIGNED,
@@ -38,13 +38,13 @@ class TestSglLoraRouting(CustomTestCase):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
             torch.tensor(adapters, dtype=dtype, device=self.device),
-            factor_expert_count=factor_count,
+            lora_experts_per_adapter=lora_experts_per_adapter,
             max_loras=max_loras,
             block_size=block_size,
-            routed_expert_to_factor_id=(
+            lora_expert_map=(
                 None
-                if factor_map is None
-                else torch.tensor(factor_map, dtype=dtype, device=self.device)
+                if lora_expert_map is None
+                else torch.tensor(lora_expert_map, dtype=dtype, device=self.device)
             ),
             view=view,
         )
@@ -58,11 +58,15 @@ class TestSglLoraRouting(CustomTestCase):
         launch and fail somewhere unrelated -- or, worse, index a stale buffer.
         """
         ids, adapters = [[0, 1]], [0]
-        aligned = self._build(ids, adapters, factor_count=2, view=ROUTE_ALIGNED)
+        aligned = self._build(
+            ids, adapters, lora_experts_per_adapter=2, view=ROUTE_ALIGNED
+        )
         self.assertEqual(aligned.virtual_topk_ids.numel(), 2)
         self.assertGreater(aligned.sorted_pair_ids.numel(), 0)
 
-        fused = self._build(ids, adapters, factor_count=2, view=ROUTE_FUSED_IDS)
+        fused = self._build(
+            ids, adapters, lora_experts_per_adapter=2, view=ROUTE_FUSED_IDS
+        )
         self.assertTrue(
             torch.equal(fused.virtual_topk_ids, aligned.virtual_topk_ids),
             "fused_ids must agree bitwise with the aligned view it is a prefix of",
@@ -71,21 +75,21 @@ class TestSglLoraRouting(CustomTestCase):
             with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
                 getattr(fused, field)
 
-        raw = self._build(ids, adapters, factor_count=2, view=ROUTE_RAW)
+        raw = self._build(ids, adapters, lora_experts_per_adapter=2, view=ROUTE_RAW)
         with self.assertRaisesRegex(ValueError, ROUTE_FUSED_IDS):
             raw.virtual_topk_ids
         with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
             raw.sorted_pair_ids
         # A raw consumer fuses the key computation into its own kernel, so the
         # sources must survive on the view.
-        self.assertEqual(raw.factor_expert_count, 2)
+        self.assertEqual(raw.lora_experts_per_adapter, 2)
         self.assertEqual(raw.token_slots.numel(), 1)
 
     def test_unknown_view_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
-            self._build([[0, 1]], [0], factor_count=2, view="grouped")
+            self._build([[0, 1]], [0], lora_experts_per_adapter=2, view="grouped")
 
-    def test_identity_and_explicit_factor_maps(self):
+    def test_identity_and_explicit_lora_expert_maps(self):
         cases = (
             ("local_identity", [[0, 1], [2, 3]], None, 4, [[0, 1], [6, 7]]),
             (
@@ -110,13 +114,19 @@ class TestSglLoraRouting(CustomTestCase):
                 [[4, 5], [14, 15]],
             ),
         )
-        for name, topk_ids, factor_map, factor_count, expected in cases:
+        for (
+            name,
+            topk_ids,
+            lora_expert_map,
+            lora_experts_per_adapter,
+            expected,
+        ) in cases:
             with self.subTest(name=name):
                 route = self._build(
                     topk_ids,
                     [0, 1],
-                    factor_count=factor_count,
-                    factor_map=factor_map,
+                    lora_experts_per_adapter=lora_experts_per_adapter,
+                    lora_expert_map=lora_expert_map,
                 )
                 self.assertEqual(route.virtual_topk_ids.cpu().tolist(), expected)
 
@@ -124,7 +134,7 @@ class TestSglLoraRouting(CustomTestCase):
         route = self._build(
             [[-2], [-1], [3], [4], [99], [0], [0]],
             [0, 0, 0, 0, 0, 2, 3],
-            factor_count=4,
+            lora_experts_per_adapter=4,
         )
         self.assertEqual(
             route.virtual_topk_ids.flatten().cpu().tolist(),
@@ -134,8 +144,8 @@ class TestSglLoraRouting(CustomTestCase):
         mapped = self._build(
             [[0, 1, 2, 3]],
             [0],
-            factor_count=3,
-            factor_map=[0, -1, 3, 99],
+            lora_experts_per_adapter=3,
+            lora_expert_map=[0, -1, 3, 99],
         )
         self.assertEqual(mapped.virtual_topk_ids.cpu().tolist(), [[0, -1, -1, -1]])
 
@@ -156,8 +166,8 @@ class TestSglLoraRouting(CustomTestCase):
         route = self._build(
             [[0, 3], [4, -2]],
             [0, 1],
-            factor_count=4,
-            factor_map=[0, 1, 2, 3, -1],
+            lora_experts_per_adapter=4,
+            lora_expert_map=[0, 1, 2, 3, -1],
             dtype=torch.int64,
         )
         self.assertEqual(route.virtual_topk_ids.cpu().tolist(), [[0, 3], [-1, -1]])
@@ -167,7 +177,7 @@ class TestSglLoraRouting(CustomTestCase):
         route = self._build(
             [[0], [1], [2], [3], [0], [1], [2], [3], [-1]],
             [0, 0, 0, 0, 1, 1, 1, 1, 0],
-            factor_count=4,
+            lora_experts_per_adapter=4,
             block_size=4,
         )
         self.assertEqual(route.num_pairs_post_padded.item(), 9 * 4)
@@ -208,11 +218,11 @@ class TestSglLoraRouting(CustomTestCase):
         )
         original = fused_align.fused_align_block_size
         for num_virtual, num_tokens, expects_fused in cases:
-            factor_experts = num_virtual // 32
+            lora_experts_per_adapter = num_virtual // 32
             with self.subTest(V=num_virtual, P=num_tokens * 8):
                 ids = torch.randint(
                     0,
-                    factor_experts,
+                    lora_experts_per_adapter,
                     (num_tokens, 8),
                     dtype=torch.int32,
                     device=self.device,
@@ -231,7 +241,7 @@ class TestSglLoraRouting(CustomTestCase):
                     route = build_virtual_expert_routing(
                         ids,
                         slots,
-                        factor_expert_count=factor_experts,
+                        lora_experts_per_adapter=lora_experts_per_adapter,
                         max_loras=32,
                         block_size=16,
                         view=ROUTE_ALIGNED,
@@ -261,14 +271,14 @@ class TestSglLoraRouting(CustomTestCase):
         policy paths — V=256 (ID pass + JIT) and V=12288 (fused) — since the
         two implement the contract independently.
         """
-        for factor_experts, slot_capacity in ((8, 32), (384, 32)):
-            num_virtual = factor_experts * slot_capacity
+        for lora_experts_per_adapter, slot_capacity in ((8, 32), (384, 32)):
+            num_virtual = lora_experts_per_adapter * slot_capacity
             with self.subTest(V=num_virtual):
                 generator = torch.Generator(device="cpu").manual_seed(23)
                 num_tokens, top_k = 96, 8
                 topk_ids = torch.randint(
                     -1,
-                    factor_experts,
+                    lora_experts_per_adapter,
                     (num_tokens, top_k),
                     generator=generator,
                     dtype=torch.int32,
@@ -283,7 +293,7 @@ class TestSglLoraRouting(CustomTestCase):
                 route = build_virtual_expert_routing(
                     topk_ids,
                     token_slots,
-                    factor_expert_count=factor_experts,
+                    lora_experts_per_adapter=lora_experts_per_adapter,
                     max_loras=slot_capacity,
                     block_size=16,
                     view=ROUTE_ALIGNED,
@@ -292,7 +302,7 @@ class TestSglLoraRouting(CustomTestCase):
                 keys = (
                     torch.where(
                         (token_slots[:, None] >= 0) & (topk_ids >= 0),
-                        token_slots[:, None].to(torch.int64) * factor_experts
+                        token_slots[:, None].to(torch.int64) * lora_experts_per_adapter
                         + topk_ids.to(torch.int64),
                         torch.tensor(-1, dtype=torch.int64, device=self.device),
                     )
@@ -343,21 +353,21 @@ class TestSglLoraRouting(CustomTestCase):
         consumers read only the [T, K] shape), so asserting values through
         `aligned` would couple this test to the dispatch policy.
         """
-        for factor_count in (1023, 1024, 8192):
-            with self.subTest(factor_count=factor_count):
+        for lora_experts_per_adapter in (1023, 1024, 8192):
+            with self.subTest(lora_experts_per_adapter=lora_experts_per_adapter):
                 route = self._build(
-                    [[0], [factor_count - 1], [-1]],
+                    [[0], [lora_experts_per_adapter - 1], [-1]],
                     [0, 0, 0],
-                    factor_count=factor_count,
+                    lora_experts_per_adapter=lora_experts_per_adapter,
                     max_loras=1,
-                    block_size=1 if factor_count > 8191 else 16,
+                    block_size=1 if lora_experts_per_adapter > 8191 else 16,
                     view=ROUTE_FUSED_IDS,
                 )
                 self.assertEqual(
                     route.virtual_topk_ids.flatten().cpu().tolist(),
-                    [0, factor_count - 1, -1],
+                    [0, lora_experts_per_adapter - 1, -1],
                 )
-                self.assertEqual(route.num_virtual_experts, factor_count)
+                self.assertEqual(route.num_virtual_experts, lora_experts_per_adapter)
 
 
 if __name__ == "__main__":

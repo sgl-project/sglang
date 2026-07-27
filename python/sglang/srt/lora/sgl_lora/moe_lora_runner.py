@@ -123,15 +123,11 @@ class SglMoeLoraRunner:
         provider: MoeBaseProvider,
         top_k: int,
         routed_scaling_factor: float | None,
-        factor_experts: int,
-        shared_factor_map: torch.Tensor,
         launch_config: Bf16MoeLaunchConfig = PROVISIONAL_LAUNCH_CONFIG,
     ) -> None:
         self.provider = provider
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
-        self.factor_experts = factor_experts
-        self.shared_factor_map = shared_factor_map
         self.launch_config = launch_config
 
     @classmethod
@@ -144,20 +140,11 @@ class SglMoeLoraRunner:
         """Admit the layer's resident state and bind a base provider to it."""
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
-        factor_experts = int(base_layer.num_local_experts)
         return cls(
             provider=cls._build_provider(base_layer),
             # Layer-static routing scalars, read once rather than per forward.
             top_k=int(config.top_k),
             routed_scaling_factor=config.routed_scaling_factor,
-            factor_experts=factor_experts,
-            # Shared-outer factors are selected by adapter alone: every owned
-            # expert maps to the single shared slot, non-owned IDs stay -1.
-            shared_factor_map=torch.zeros(
-                factor_experts,
-                dtype=torch.int32,
-                device=base_layer.w13_weight.device,
-            ),
             launch_config=launch_config,
         )
 
@@ -297,12 +284,15 @@ class SglMoeLoraRunner:
         down_lora_b: torch.Tensor,
         shared_outer: bool,
     ) -> None:
-        """Check the immutable factor contract once, when factors are bound.
+        """Check the immutable LoRA-weight contract once, when weights bind.
 
         Dtype and expert domain cannot change between forwards, so validating
         per forward would only add launch overhead.
         """
-        expert_count = self.factor_experts
+        # Eleventh S3 review: the provider is the single source of truth
+        # for the local expert count; the constructor used to take a
+        # duplicate that was always this same value.
+        expert_count = self.provider.num_local_experts
         outer_count = 1 if shared_outer else expert_count
         expected = (outer_count, expert_count, expert_count, outer_count)
         factors = (gate_up_lora_a, gate_up_lora_b, down_lora_a, down_lora_b)
@@ -424,20 +414,23 @@ class SglMoeLoraRunner:
         expert = build_virtual_expert_routing(
             topk_ids,
             token_slots,
-            factor_expert_count=self.provider.num_local_experts,
+            lora_experts_per_adapter=self.provider.num_local_experts,
             max_loras=batch.slot_capacity,
             block_size=self.launch_config.routing_block_size,
             view=ROUTE_ALIGNED,
         )
         outer = expert
         if batch.shared_outer:
+            # Section 60.5 form: the shared factor is slot 0 for every
+            # EP-owned routed expert — a constexpr in the key derivation,
+            # not a map gather (admission guarantees local-domain ids).
             outer = build_virtual_expert_routing(
                 topk_ids,
                 token_slots,
-                factor_expert_count=1,
+                lora_experts_per_adapter=1,
                 max_loras=batch.slot_capacity,
                 block_size=self.launch_config.routing_block_size,
-                routed_expert_to_factor_id=self.shared_factor_map,
+                shared_outer_local_expert_count=self.provider.num_local_experts,
             )
         return expert, outer
 

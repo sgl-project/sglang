@@ -38,6 +38,7 @@ from collections import defaultdict
 
 import torch
 
+from benchmark.kernels.lora_moe.crossover_ledger import decide_cell
 from benchmark.kernels.lora_moe.timing import (
     BOUNDARY_ROUTE_INCLUSIVE,
     measure,
@@ -54,7 +55,6 @@ from sglang.srt.lora.sgl_lora.routing import (
 BLOCK_SIZE_M = 16
 TOP_K = 8
 SLOT_CAPACITY = 32
-MIN_MARGIN = 1.05  # unlocked clocks; below this geo-mean ratio a cell is a tie
 
 # All multiples of 32 (E = V / 32 with L_cap = 32, so bucket occupancy is
 # comparable across cells). Flanking pairs per threshold — see module docstring.
@@ -83,12 +83,14 @@ HOTSET_EXPERTS = 8
 HOTSET_FRACTION = 0.8
 
 
-def _route(family: str, factor_experts: int, num_tokens: int, seed: int, device):
+def _route(
+    family: str, lora_experts_per_adapter: int, num_tokens: int, seed: int, device
+):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     if family == "iid":
         topk_ids = torch.randint(
             0,
-            factor_experts,
+            lora_experts_per_adapter,
             (num_tokens, TOP_K),
             generator=generator,
             dtype=torch.int32,
@@ -96,14 +98,14 @@ def _route(family: str, factor_experts: int, num_tokens: int, seed: int, device)
     elif family == "hotset":
         hot = torch.randint(
             0,
-            min(HOTSET_EXPERTS, factor_experts),
+            min(HOTSET_EXPERTS, lora_experts_per_adapter),
             (num_tokens, TOP_K),
             generator=generator,
             dtype=torch.int32,
         )
         cold = torch.randint(
             0,
-            factor_experts,
+            lora_experts_per_adapter,
             (num_tokens, TOP_K),
             generator=generator,
             dtype=torch.int32,
@@ -122,16 +124,14 @@ def _route(family: str, factor_experts: int, num_tokens: int, seed: int, device)
 
 def _verdict(jit_samples: list[float], fused_samples: list[float]) -> str:
     """Decided only on unanimous sign with margin; otherwise tied."""
-    ratios = [j / f for j, f in zip(jit_samples, fused_samples)]
-    geo = 1.0
-    for r in ratios:
-        geo *= r
-    geo **= 1 / len(ratios)
-    if all(r > 1 for r in ratios) and geo >= MIN_MARGIN:
-        return f"FUSED {geo:.2f}x"
-    if all(r < 1 for r in ratios) and 1 / geo >= MIN_MARGIN:
-        return f"JIT {1 / geo:.2f}x"
-    return f"tied ({geo:.2f}x)"
+    decision = decide_cell(
+        arm_a="jit", samples_a=jit_samples, arm_b="fused", samples_b=fused_samples
+    )
+    if decision.winner == "fused":
+        return f"FUSED {decision.geo_a_over_b:.2f}x"
+    if decision.winner == "jit":
+        return f"JIT {1 / decision.geo_a_over_b:.2f}x"
+    return f"tied ({decision.geo_a_over_b:.2f}x)"
 
 
 def main() -> int:
@@ -148,7 +148,7 @@ def main() -> int:
     samples: dict[tuple, list[float]] = defaultdict(list)
 
     for v_total in V_GRID:
-        factor_experts = v_total // SLOT_CAPACITY
+        lora_experts_per_adapter = v_total // SLOT_CAPACITY
         for num_pairs in P_GRID:
             num_tokens = num_pairs // TOP_K
             capacity = _routing_capacity(num_pairs, BLOCK_SIZE_M, v_total)
@@ -156,21 +156,25 @@ def main() -> int:
             for family in families:
                 for seed in SEEDS:
                     topk_ids, token_slots = _route(
-                        family, factor_experts, num_tokens, seed, device
+                        family, lora_experts_per_adapter, num_tokens, seed, device
                     )
                     params = {
                         "V": v_total,
                         "P": num_pairs,
                         "family": family,
                         "seed": seed,
-                        "factor_experts": factor_experts,
+                        "lora_experts_per_adapter": lora_experts_per_adapter,
                         "slot_capacity": SLOT_CAPACITY,
                         "block_size": BLOCK_SIZE_M,
                     }
 
                     def jit_arm():
                         virtual_ids = _build_virtual_topk_ids(
-                            topk_ids, token_slots, factor_experts, SLOT_CAPACITY, None
+                            topk_ids,
+                            token_slots,
+                            lora_experts_per_adapter,
+                            SLOT_CAPACITY,
+                            None,
                         )
                         return _align_block_size_jit(virtual_ids, BLOCK_SIZE_M, v_total)
 
@@ -178,7 +182,7 @@ def main() -> int:
                         return fused_align_block_size(
                             topk_ids,
                             token_slots,
-                            factor_expert_count=factor_experts,
+                            lora_experts_per_adapter=lora_experts_per_adapter,
                             max_loras=SLOT_CAPACITY,
                             block_size=BLOCK_SIZE_M,
                             capacity=capacity,

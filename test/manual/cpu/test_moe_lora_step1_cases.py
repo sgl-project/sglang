@@ -241,10 +241,10 @@ class TestRoutes(unittest.TestCase):
         stats = resolve_route_stats(
             topk_ids=ids,
             token_lora_mapping=mapping,
-            factor_expert_count=4,
+            lora_experts_per_adapter=4,
             max_loras=2,
             block_size=4,
-            routed_expert_to_factor_id=None,
+            lora_expert_map=None,
         )
         # Tokens 0 and 2 carry adapters -> 4 valid pairs, 4 distinct
         # (adapter, expert) groups over 3 distinct experts {0, 1, 3}.

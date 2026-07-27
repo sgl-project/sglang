@@ -28,6 +28,7 @@ from typing import Any, Callable
 import msgspec
 import torch
 
+from benchmark.kernels.lora_moe.crossover_ledger import CrossoverLedgerEntry
 from sglang.kernels.jit.benchmark.marker import BenchResult, do_bench
 
 # Plan section 10. A comparison may only be made between records that carry the
@@ -101,18 +102,195 @@ class TimingSuite(msgspec.Struct, kw_only=True):
     source_revision: str
     torch_version: str
     host: str
+    # What the running tree resolved to at suite creation (may be
+    # "unknown" on file-synced pod trees) — recorded alongside the
+    # caller's claimed source_revision, never instead of it.
+    observed_revision: str = "unknown"
+    # Content digest of the measuring source files (works on file-synced
+    # trees where git state is absent) — see content_fingerprint().
+    source_digest: str = "unknown"
     records: list[TimingRecord] = []
+    # §31.7 crossover rows found in THIS session; serialized with the suite so
+    # the gate packet's ledger is copied from an archive, not reconstructed.
+    ledger: list[CrossoverLedgerEntry] = []
 
     def add(self, record: TimingRecord) -> TimingRecord:
         self.records.append(record)
         return record
+
+    def site_crossover(
+        self,
+        *,
+        site: str,
+        boundary: str,
+        candidates: tuple[str, ...],
+        axis: str,
+        crossover_location: str,
+        bracketing_low_record_ids: tuple[str, ...],
+        bracketing_high_record_ids: tuple[str, ...],
+        cache_state: str,
+        axis_param: str | None = None,
+        workload_params: tuple[str, ...] | None = None,
+        notes: str = "",
+    ) -> CrossoverLedgerEntry:
+        """Append one evidence-bound §31.7 ledger row.
+
+        Provenance comes from THIS suite; every bracketing record ID must
+        identify a record the suite measured at the declared boundary and
+        cache state; and EVERY declared candidate must have records in
+        BOTH bracketing cells — a crossover between two cells cannot be
+        claimed off a cell that measured only one arm.
+        """
+        if set(bracketing_low_record_ids) == set(bracketing_high_record_ids):
+            raise ValueError(
+                "the low and high bracketing cells cite identical records — "
+                "a crossover needs two DISTINCT cells (fourth S3 review)"
+            )
+        if axis_param is not None:
+            # Fifth S3 review + sixth-review fix: distinct record IDs do not
+            # prove distinct AXIS cells, and comparing EVERY parameter breaks
+            # the real producer (candidates legitimately record their own
+            # tuning configs). The WORKLOAD signature is therefore explicit
+            # and validated separately from candidate-specific configuration:
+            # each cell sits at exactly ONE axis value present on every
+            # record; the two cells differ on the axis; every declared
+            # workload parameter is single-valued across BOTH cells; and one
+            # candidate's records within one cell agree on ALL their
+            # parameters (config drift inside an arm's cell is a bug).
+            if workload_params is None:
+                raise ValueError(
+                    "axis_param validation needs the explicit workload "
+                    "signature — pass workload_params (sixth S3 review: an "
+                    "implicit all-params signature was both fail-open across "
+                    "cells and wrong for per-candidate configs)"
+                )
+            by_id_pre = {record.record_id: record for record in self.records}
+            excluded = {"seed", "repeat", "case_id"}
+
+            def cell_signature(ids, cell_name):
+                axis_values = set()
+                per_candidate: dict[str, bytes] = {}
+                workload: dict[str, set[bytes]] = {}
+                for record_id in ids:
+                    record = by_id_pre.get(record_id)
+                    if record is None:
+                        continue  # the main loop below raises properly
+                    params = dict(record.params)
+                    if axis_param not in params:
+                        raise ValueError(
+                            f"{cell_name} record {record_id!r} lacks the "
+                            f"axis parameter {axis_param!r}"
+                        )
+                    axis_values.add(params.pop(axis_param))
+                    for key in excluded:
+                        params.pop(key, None)
+                    frozen = msgspec.json.encode(
+                        {key: params[key] for key in sorted(params)}
+                    )
+                    prior = per_candidate.setdefault(record.candidate, frozen)
+                    if prior != frozen:
+                        raise ValueError(
+                            f"{cell_name} cell records for candidate "
+                            f"{record.candidate!r} disagree on non-axis "
+                            "parameters"
+                        )
+                    for key in workload_params:
+                        if key == axis_param:
+                            continue
+                        if key not in params:
+                            raise ValueError(
+                                f"{cell_name} record {record_id!r} lacks the "
+                                f"declared workload parameter {key!r}"
+                            )
+                        workload.setdefault(key, set()).add(
+                            msgspec.json.encode(params[key])
+                        )
+                if len(axis_values) != 1:
+                    raise ValueError(
+                        f"the {cell_name} cell must sit at exactly one "
+                        f"{axis_param!r} value; it cites {sorted(map(str, axis_values))}"
+                    )
+                return axis_values, workload
+
+            low_values, low_workload = cell_signature(bracketing_low_record_ids, "low")
+            high_values, high_workload = cell_signature(
+                bracketing_high_record_ids, "high"
+            )
+            if low_values == high_values:
+                raise ValueError(
+                    f"low and high cells sit at the same {axis_param!r} value "
+                    f"{sorted(map(str, low_values))} — a crossover needs two "
+                    "distinct axis cells (fifth S3 review)"
+                )
+            for key in workload_params:
+                if key == axis_param:
+                    continue
+                values = low_workload.get(key, set()) | high_workload.get(key, set())
+                if len(values) != 1:
+                    raise ValueError(
+                        f"workload parameter {key!r} is not single-valued "
+                        "across the two bracketing cells — the cells compare "
+                        "different workloads, not two points on one axis"
+                    )
+        by_id = {record.record_id: record for record in self.records}
+        case_ids: list[str] = []
+        for cell_name, cell_ids in (
+            ("low", bracketing_low_record_ids),
+            ("high", bracketing_high_record_ids),
+        ):
+            cited: set[str] = set()
+            for record_id in cell_ids:
+                record = by_id.get(record_id)
+                if record is None:
+                    raise ValueError(
+                        f"bracketing record {record_id!r} is not in this suite"
+                    )
+                if record.boundary != boundary or record.cache_state != cache_state:
+                    raise ValueError(
+                        f"bracketing record {record_id!r} was measured at "
+                        f"({record.boundary}, {record.cache_state}), not the "
+                        f"declared ({boundary}, {cache_state})"
+                    )
+                if record.candidate not in candidates:
+                    raise ValueError(
+                        f"bracketing record {record_id!r} measured candidate "
+                        f"{record.candidate!r}, which is not one of the "
+                        f"declared {candidates}"
+                    )
+                cited.add(record.candidate)
+                case_id = record.params.get("case_id")
+                if case_id is not None and case_id not in case_ids:
+                    case_ids.append(case_id)
+            missing = set(candidates) - cited
+            if missing:
+                raise ValueError(
+                    f"declared candidates {sorted(missing)} have no records "
+                    f"in the {cell_name} bracketing cell — a crossover "
+                    "claim needs BOTH arms measured in BOTH cells"
+                )
+        entry = CrossoverLedgerEntry(
+            site=site,
+            boundary=boundary,
+            candidates=candidates,
+            axis=axis,
+            crossover_location=crossover_location,
+            bracketing_low_record_ids=tuple(bracketing_low_record_ids),
+            bracketing_high_record_ids=tuple(bracketing_high_record_ids),
+            bracketing_case_ids=tuple(case_ids),
+            device=self.device_name,
+            source_revision=self.source_revision,
+            cache_state=cache_state,
+            notes=notes,
+        )
+        self.ledger.append(entry)
+        return entry
 
 
 def resolve_source_revision() -> str:
     """Best-effort git description of the tree that produced a measurement."""
     try:
         head = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -128,11 +306,53 @@ def resolve_source_revision() -> str:
     return head.stdout.strip() + suffix
 
 
+def content_fingerprint() -> str:
+    """Digest of the lab + sgl_lora source files actually on disk.
+
+    Ninth S3 review: file-synced pod trees resolve to no git state, so a
+    revision claim was unverifiable there. This hashes the files that
+    produce measurements (sorted relative path + content), giving an
+    identity that is comparable across machines regardless of git.
+    """
+    import pathlib
+
+    # Tenth S3 review: the roots must cover every MEASURED dependency
+    # (the SGMV/sgemm kernels live under kernels/ops), and the digest is
+    # the full sha256 — truncation weakened the identity for no benefit.
+    base = pathlib.Path(__file__).resolve().parents[3]
+    roots = (
+        pathlib.Path(__file__).resolve().parent,
+        base / "python/sglang/srt/lora/sgl_lora",
+        base / "python/sglang/kernels/ops/gemm",
+        base / "python/sglang/kernels/ops/moe",
+    )
+    digest = hashlib.sha256()
+    for root in roots:
+        if not root.is_dir():
+            return "unknown"
+        for file in sorted(root.rglob("*.py")):
+            # macOS AppleDouble stubs ("._foo.py") ride along in tar
+            # archives and extract as real files on Linux — they are
+            # metadata, not source (tenth-review digest-mismatch root
+            # cause, alongside stale overlay files).
+            if file.name.startswith("._"):
+                continue
+            digest.update(str(file.relative_to(root.parent)).encode())
+            digest.update(file.read_bytes())
+    return "files:" + digest.hexdigest()
+
+
 def new_suite(suite: str, *, source_revision: str | None = None) -> TimingSuite:
+    # Eighth S3 review: a caller-supplied revision is a CLAIM; the suite
+    # additionally records what the running tree actually resolves to
+    # (full-format short SHA with -dirty, or "unknown" on a file-synced
+    # tree), so a dirty checkout can never claim a clean revision silently.
     return TimingSuite(
         suite=suite,
         device_name=torch.cuda.get_device_name(),
         source_revision=source_revision or resolve_source_revision(),
+        observed_revision=resolve_source_revision(),
+        source_digest=content_fingerprint(),
         torch_version=str(torch.__version__),
         host=platform.node(),
     )

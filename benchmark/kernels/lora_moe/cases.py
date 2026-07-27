@@ -51,6 +51,13 @@ DETERMINISTIC_POLICIES = ("fixed_order",)
 ROUTE_COEFF_PRECISIONS = ("fp32", "bf16_rounded")
 CACHE_STATES = ("hot", "producer_realistic")
 SLICE_TARGETS = ("both", "gate_only", "up_only")
+# Step-3 K1 per-bridge materialization precision (plan §30). Accumulation is
+# FP32 everywhere regardless; these declare only the dtype each MATERIALIZED
+# bridge is stored in between kernels. The A-schedule candidate identity
+# deliberately does NOT live on the workload case — it is the typed
+# LoraAExecutionSpec (lora_a_execution.py), so different candidates compare
+# against the same workload case_id.
+BRIDGE_PRECISIONS = ("bf16", "fp32")
 
 
 class ModelGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -318,6 +325,19 @@ class MoeLoraBenchCase(msgspec.Struct, frozen=True, kw_only=True):
     data_seed: int
     routing_block_size: int
 
+    # Step-3 K1 axes, one per MATERIALIZED LoRA bridge — all five of them,
+    # including the S3-stage activation copy the down site consumes (plan
+    # §63.1 P1 as amended by the first S3 review). Defaults are the Step-1/2
+    # semantics, so old archive records decode into this struct unchanged;
+    # the fields DO enter the case digest, which opens a new
+    # content-addressing era (§63.2) — cross-era comparison is by
+    # parameters, never by case_id.
+    bridge_gate_a_out: str = "bf16"
+    bridge_gate_up_delta: str = "bf16"
+    bridge_activation_lora_input: str = "bf16"
+    bridge_down_a_out: str = "bf16"
+    bridge_down_delta: str = "bf16"
+
 
 class CaseTensors(msgspec.Struct, kw_only=True):
     """Deterministically materialized inputs for one case (CPU tensors)."""
@@ -326,7 +346,7 @@ class CaseTensors(msgspec.Struct, kw_only=True):
     topk_ids: torch.Tensor  # [T, K] int32, declared domain
     topk_weights: torch.Tensor  # [T, K] FP32 normalized
     token_lora_mapping: torch.Tensor  # [T] int64, -1 = base
-    routed_expert_to_factor_id: torch.Tensor | None  # provider-domain map
+    lora_expert_map: torch.Tensor | None  # provider-domain map
     w13: torch.Tensor  # [E_local, slices*I_local, H_moe] BF16
     w2: torch.Tensor  # [E_local, H_moe, I_local] BF16
     lora_a_gate_up: torch.Tensor  # [L_cap, E_f, slices*R_phys, H_moe] BF16
@@ -361,7 +381,7 @@ def _slice_count(expert_form: str) -> int:
     raise ValueError(f"unknown expert form {expert_form!r}")
 
 
-def _factor_expert_count(shared: str, site: str, num_experts_local: int) -> int:
+def _lora_experts_per_adapter(shared: str, site: str, num_experts_local: int) -> int:
     if site == "gate_up_a":
         return 1 if shared in ("shared_gate_up_a", "shared_both") else num_experts_local
     if site == "down_b":
@@ -402,6 +422,11 @@ def build_case(
     cache_state: str = "hot",
     intermediate_size_physical: int | None = None,
     routing_block_size: int = 16,
+    bridge_gate_a_out: str = "bf16",
+    bridge_gate_up_delta: str = "bf16",
+    bridge_activation_lora_input: str = "bf16",
+    bridge_down_a_out: str = "bf16",
+    bridge_down_delta: str = "bf16",
     seed: int = 0,
     source_revision: str | None = None,
 ) -> MoeLoraBenchCase:
@@ -430,6 +455,14 @@ def build_case(
         overlap_strategy=(overlap_strategy, OVERLAP_STRATEGIES),
         output_dtype=(output_dtype, ("bfloat16", "float32")),
         cache_state=(cache_state, CACHE_STATES),
+        bridge_gate_a_out=(bridge_gate_a_out, BRIDGE_PRECISIONS),
+        bridge_gate_up_delta=(bridge_gate_up_delta, BRIDGE_PRECISIONS),
+        bridge_activation_lora_input=(
+            bridge_activation_lora_input,
+            BRIDGE_PRECISIONS,
+        ),
+        bridge_down_a_out=(bridge_down_a_out, BRIDGE_PRECISIONS),
+        bridge_down_delta=(bridge_down_delta, BRIDGE_PRECISIONS),
     )
     geometry = MODEL_PRESETS[model_preset]
     if geometry.top_k > 0 and num_tokens <= 0:
@@ -504,7 +537,7 @@ def build_case(
         include_base_rows=adapter_cell.include_base_rows,
         seed=mapping_seed,
     )
-    factor_map = _build_factor_map(
+    lora_expert_map = _build_lora_expert_map(
         expert_id_domain=expert_id_domain,
         route_generator=route_generator,
         num_experts_global=geometry.num_experts_global,
@@ -514,10 +547,10 @@ def build_case(
     stats = resolve_route_stats(
         topk_ids=topk_ids,
         token_lora_mapping=token_lora_mapping,
-        factor_expert_count=num_experts_local,
+        lora_experts_per_adapter=num_experts_local,
         max_loras=adapter_cell.slot_capacity,
         block_size=routing_block_size,
-        routed_expert_to_factor_id=factor_map,
+        lora_expert_map=lora_expert_map,
     )
     if shared_factor_signature == "per_expert":
         shared_group_count = 0
@@ -526,11 +559,11 @@ def build_case(
         shared_stats = resolve_route_stats(
             topk_ids=topk_ids,
             token_lora_mapping=token_lora_mapping,
-            factor_expert_count=1,
+            lora_experts_per_adapter=1,
             max_loras=adapter_cell.slot_capacity,
             block_size=routing_block_size,
-            routed_expert_to_factor_id=_shared_factor_map(
-                factor_map, num_experts_local, topk_ids.device
+            lora_expert_map=_shared_lora_expert_map(
+                lora_expert_map, num_experts_local, topk_ids.device
             ),
         )
         shared_group_count = shared_stats.group_count
@@ -598,6 +631,11 @@ def build_case(
         cache_state=cache_state,
         data_seed=data_seed,
         routing_block_size=routing_block_size,
+        bridge_gate_a_out=bridge_gate_a_out,
+        bridge_gate_up_delta=bridge_gate_up_delta,
+        bridge_activation_lora_input=bridge_activation_lora_input,
+        bridge_down_a_out=bridge_down_a_out,
+        bridge_down_delta=bridge_down_delta,
     )
     digest_source = msgspec.json.encode(
         {key: body[key] for key in sorted(body) if key != "source_revision"}
@@ -606,18 +644,20 @@ def build_case(
     return MoeLoraBenchCase(case_id=case_id, **body)
 
 
-def _shared_factor_map(
-    factor_map: torch.Tensor | None,
+def _shared_lora_expert_map(
+    lora_expert_map: torch.Tensor | None,
     num_experts_local: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Provider-domain IDs -> shared factor slot 0 for owned experts."""
-    if factor_map is None:
+    """Provider-domain IDs -> the adapter's single LoRA expert (id 0) for owned experts."""
+    if lora_expert_map is None:
         return torch.zeros(num_experts_local, dtype=torch.int32, device=device)
-    return torch.where(factor_map >= 0, torch.zeros_like(factor_map), factor_map)
+    return torch.where(
+        lora_expert_map >= 0, torch.zeros_like(lora_expert_map), lora_expert_map
+    )
 
 
-def _build_factor_map(
+def _build_lora_expert_map(
     *,
     expert_id_domain: str,
     route_generator: str,
@@ -625,7 +665,7 @@ def _build_factor_map(
     num_experts_local: int,
     ep_rank: int,
 ) -> torch.Tensor | None:
-    """Provider-domain expert IDs -> local factor slots (``-1`` non-owned)."""
+    """Provider-domain expert IDs -> local LoRA expert ids (``-1`` non-owned)."""
     if expert_id_domain == "ep_local" and route_generator != "no_local":
         return None
     domain = (
@@ -633,21 +673,41 @@ def _build_factor_map(
         if expert_id_domain == "global" or route_generator == "no_local"
         else num_experts_local
     )
-    factor_map = torch.full((domain,), -1, dtype=torch.int32)
+    lora_expert_map = torch.full((domain,), -1, dtype=torch.int32)
     offset = ep_rank * num_experts_local if expert_id_domain == "global" else 0
     owned = torch.arange(num_experts_local, dtype=torch.int32)
-    factor_map[offset : offset + num_experts_local] = owned
-    return factor_map
+    lora_expert_map[offset : offset + num_experts_local] = owned
+    return lora_expert_map
 
 
-def materialize_case_tensors(case: MoeLoraBenchCase) -> CaseTensors:
+def materialize_case_tensors(
+    case: MoeLoraBenchCase,
+    *,
+    poison_inactive_rank_tails: str | None = None,
+) -> CaseTensors:
     """Deterministically build the CPU input tensors for one case.
 
     Scaling keeps the LoRA signal well above the BF16 noise floor of the base
     output; the signal-gate engine still refuses any case that lands below the
     §21 validity floor.  LoRA rank tails beyond ``active_rank`` are ZERO by
     the loader contract (kernels execute the full physical rank).
+
+    ``poison_inactive_rank_tails`` is a Step-3 instrumentation MODE, not a
+    case axis: ``"gate_up_a"`` or ``"down_a"`` fills THAT A factor's rank
+    tails ``[active_rank, physical_rank)`` with NaN while every other factor
+    keeps its contractual zeros, so a schedule CLAIMING active-rank-only
+    execution at that site proves the claim by staying finite.  Selectivity
+    is the point (first S3 review): poisoning B tails too would fail a
+    COMPLIANT A kernel, because the stock B still multiplies its own NaN
+    tail columns by the zeroed tail outputs (NaN x 0 = NaN).  A
+    full-physical-rank A kernel goes non-finite under this mode by design —
+    the probe's efficacy, not a defect.  Judge the probe at the site's
+    immediate A output, and never use it for timing or archive records.
     """
+    if poison_inactive_rank_tails not in (None, "gate_up_a", "down_a"):
+        raise ValueError(
+            "poison_inactive_rank_tails must be None, 'gate_up_a', or 'down_a'"
+        )
     generator = torch.Generator(device="cpu")
     generator.manual_seed(case.data_seed)
     slices = _slice_count(case.expert_form)
@@ -667,16 +727,25 @@ def materialize_case_tensors(case: MoeLoraBenchCase) -> CaseTensors:
     w13 = randn(e_local, slices * i_local, h, scale=h**-0.5)
     w2 = randn(e_local, h, i_local, scale=i_local**-0.5)
 
-    e_f_gate = _factor_expert_count(case.shared_factor_signature, "gate_up_a", e_local)
-    e_f_down = _factor_expert_count(case.shared_factor_signature, "down_b", e_local)
+    e_f_gate = _lora_experts_per_adapter(
+        case.shared_factor_signature, "gate_up_a", e_local
+    )
+    e_f_down = _lora_experts_per_adapter(
+        case.shared_factor_signature, "down_b", e_local
+    )
 
-    def factor(*shape: int, scale: float, rank_axis: int) -> torch.Tensor:
+    def factor(
+        *shape: int, scale: float, rank_axis: int, poison_site: str | None = None
+    ) -> torch.Tensor:
         tensor = randn(*shape, scale=scale)
         if r_active < r_phys:
+            poisoned = (
+                poison_site is not None and poison_site == poison_inactive_rank_tails
+            )
             index = [slice(None)] * tensor.ndim
             if rank_axis >= 0:
                 index[rank_axis] = slice(r_active, r_phys)
-                tensor[tuple(index)] = 0
+                tensor[tuple(index)] = float("nan") if poisoned else 0
         return tensor
 
     # Gate/up A packs per-slice factors at physical-rank-spaced offsets.
@@ -684,7 +753,15 @@ def materialize_case_tensors(case: MoeLoraBenchCase) -> CaseTensors:
         (l_cap, e_f_gate, slices * r_phys, h), dtype=torch.bfloat16
     )
     for slice_id in range(slices):
-        block = factor(l_cap, e_f_gate, r_phys, h, scale=h**-0.5, rank_axis=2)
+        block = factor(
+            l_cap,
+            e_f_gate,
+            r_phys,
+            h,
+            scale=h**-0.5,
+            rank_axis=2,
+            poison_site="gate_up_a",
+        )
         lora_a_gate_up[:, :, slice_id * r_phys : (slice_id + 1) * r_phys, :] = block
 
     lora_b_gate_up = torch.zeros(
@@ -697,7 +774,13 @@ def materialize_case_tensors(case: MoeLoraBenchCase) -> CaseTensors:
         lora_b_gate_up[:, :, slice_id * i_local : (slice_id + 1) * i_local, :] = block
 
     lora_a_down = factor(
-        l_cap, e_local, r_phys, i_local, scale=i_local**-0.5, rank_axis=2
+        l_cap,
+        e_local,
+        r_phys,
+        i_local,
+        scale=i_local**-0.5,
+        rank_axis=2,
+        poison_site="down_a",
     )
     lora_b_down = factor(
         l_cap, e_f_down, h, r_phys, scale=0.5 * r_phys**-0.5, rank_axis=3
@@ -749,7 +832,7 @@ def materialize_case_tensors(case: MoeLoraBenchCase) -> CaseTensors:
             include_base_rows=case.include_base_rows,
             seed=case.mapping_seed,
         ),
-        routed_expert_to_factor_id=_build_factor_map(
+        lora_expert_map=_build_lora_expert_map(
             expert_id_domain=case.expert_id_domain,
             route_generator=case.route_generator,
             num_experts_global=case.num_experts_global,

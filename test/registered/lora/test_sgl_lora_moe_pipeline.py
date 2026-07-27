@@ -229,9 +229,6 @@ class TestSglLoraMoePipeline(CustomTestCase):
             intermediate_size=self.intermediate,
             hidden_size=self.hidden_size,
         )
-        self.shared_factor_map = torch.zeros(
-            self.num_experts, dtype=torch.int32, device=self.device
-        )
         # Construct the runner directly: `from_layer` needs a full FusedMoE,
         # while this suite exercises the pipeline against a hand-built
         # provider. Serving, lab, and tests share one provisional-tile set.
@@ -240,8 +237,6 @@ class TestSglLoraMoePipeline(CustomTestCase):
             provider=DeepGemmBf16Provider(self.quant_info),
             top_k=self.topk,
             routed_scaling_factor=self.routed_scale,
-            factor_experts=self.num_experts,
-            shared_factor_map=self.shared_factor_map,
             launch_config=self.launch_config,
         )
         self.dispatcher = StandardDispatcher(self.config)

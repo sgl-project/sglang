@@ -156,7 +156,15 @@ def step1_matrix(device: str, source_revision: str) -> list[MoeLoraBenchCase]:
         case(
             **qwen, adapter_cell=cell(1, True, 8), route_generator="iid", num_tokens=1
         ),
-        # Rank 64 at scale.
+        # Rank spread at scale (§14 Step-3 evidence: ranks 32/64/128).
+        case(
+            model_preset="qwen35_35b",
+            topology=EP8,
+            adapter_cell=cell(1, True, 8),
+            route_generator="iid",
+            num_tokens=256,
+            active_rank=32,
+        ),
         case(
             model_preset="qwen35_35b",
             topology=EP8,
@@ -164,6 +172,14 @@ def step1_matrix(device: str, source_revision: str) -> list[MoeLoraBenchCase]:
             route_generator="iid",
             num_tokens=256,
             active_rank=64,
+        ),
+        case(
+            model_preset="qwen35_35b",
+            topology=EP8,
+            adapter_cell=cell(1, True, 8),
+            route_generator="iid",
+            num_tokens=256,
+            active_rank=128,
         ),
         # Caller-selected FP32 destination.
         case(
@@ -309,6 +325,7 @@ def _check_case(
     device: torch.device,
     replays: int,
     deep_replays: int,
+    production_deep_replays: int = 0,
 ) -> CaseResult:
     tensors = materialize_case_tensors(case)
     checks: list[SignalCheckRecord] = []
@@ -488,12 +505,15 @@ def _check_case(
                 label="production zero-LoRA parity",
             )
             bitwise.append("production zero-LoRA bitwise parity")
-        for replay in range(replays):
+        production_replays = max(replays, production_deep_replays)
+        for replay in range(production_replays):
             repeat = run_production_runner(case, tensors, device=device)
             require_bitwise_equal(
                 repeat, production, label=f"production replay {replay}"
             )
-        bitwise.append(f"production runner: {replays} replays bitwise stable")
+        bitwise.append(
+            f"production runner: {production_replays} replays bitwise stable"
+        )
 
     passed = all(record.passed for record in checks)
     return CaseResult(
@@ -517,6 +537,14 @@ def main() -> int:
     parser.add_argument("--filter", default="", help="substring of preset/case_id")
     parser.add_argument("--replays", type=int, default=3)
     parser.add_argument("--deep-replays", type=int, default=100)
+    parser.add_argument(
+        "--production-deep-replays",
+        type=int,
+        default=0,
+        help="when > 0, replay the PRODUCTION runner this many times bitwise "
+        "on every case (Step-3 determinism evidence for schedule arms — the "
+        "default 0 keeps the Step-1/2 matrix cost and semantics)",
+    )
     parser.add_argument("--list", action="store_true")
     parser.add_argument(
         "--source-revision",
@@ -557,6 +585,7 @@ def main() -> int:
                 device=device,
                 replays=arguments.replays,
                 deep_replays=arguments.deep_replays,
+                production_deep_replays=arguments.production_deep_replays,
             )
         except (AssertionError, RuntimeError, ValueError) as error:
             outcome = CaseResult(

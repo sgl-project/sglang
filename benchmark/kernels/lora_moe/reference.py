@@ -16,6 +16,16 @@ or BF16-rounded (provider parity axis; adjudication item A2).  Rounding order
 for ``bf16_rounded`` is declared as ``s x BF16(w)``: the FP32 router weight is
 rounded first and routed scaling multiplies afterward; ``BF16(s x w)``
 pre-folding is a distinct provider lowering compared explicitly in Step 2.
+
+K1 ruling (plan section 63; first S3 review): this oracle stays PURE FP32 and
+deliberately ignores the case's per-bridge ``bridge_*`` precision fields.
+Accuracy adjudication compares every K1 arm against this ONE ideal target —
+the section 30 decision rule ("the output-boundary error must actually move")
+needs a fixed yardstick, and an oracle that rounded along with the candidate
+would define the error away.  Declared staged-rounding SEMANTICS are the
+serial control's job: it materializes real per-bridge buffers and will honor
+the bridge fields when the K1 execution arms land (P6); until then it
+fail-closes on any non-BF16 declaration.
 """
 
 from __future__ import annotations
@@ -34,7 +44,7 @@ class PairStageReference(msgspec.Struct, kw_only=True):
     """
 
     valid_pairs: torch.Tensor  # [P] bool
-    pair_expert: torch.Tensor  # [P] int64 local factor expert, -1 invalid
+    pair_expert: torch.Tensor  # [P] int64 local LoRA expert, -1 invalid
     pair_adapter: torch.Tensor  # [P] int64 adapter slot, -1 base/invalid
     gate_up_lora_a: torch.Tensor  # [P, slices*R_phys]
     gate_up_base: torch.Tensor  # [P, slices*I_local]
@@ -50,11 +60,11 @@ def _resolve_pair_domain(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Map declared-domain expert IDs to (valid, local expert, adapter)."""
     ids = tensors.topk_ids.to(torch.int64).reshape(-1)
-    factor_map = tensors.routed_expert_to_factor_id
-    if factor_map is None:
+    lora_expert_map = tensors.lora_expert_map
+    if lora_expert_map is None:
         expert = ids.clone()
     else:
-        table = factor_map.to(torch.int64)
+        table = lora_expert_map.to(torch.int64)
         in_map = (ids >= 0) & (ids < table.numel())
         expert = torch.where(
             in_map, table[ids.clamp(min=0, max=table.numel() - 1)], torch.tensor(-1)
@@ -227,7 +237,7 @@ def _base_only_stages(
         topk_ids=tensors.topk_ids,
         topk_weights=tensors.topk_weights,
         token_lora_mapping=torch.full_like(tensors.token_lora_mapping, -1),
-        routed_expert_to_factor_id=tensors.routed_expert_to_factor_id,
+        lora_expert_map=tensors.lora_expert_map,
         w13=tensors.w13,
         w2=tensors.w2,
         lora_a_gate_up=tensors.lora_a_gate_up,

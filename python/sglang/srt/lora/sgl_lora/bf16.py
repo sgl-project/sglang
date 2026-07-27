@@ -25,7 +25,7 @@ def _grouped_lora_a_kernel(
     output_ptr,
     input_row_map_ptr,
     sorted_pair_ids_ptr,
-    factor_ids_ptr,
+    block_virtual_expert_ids_ptr,
     num_pairs_post_padded_ptr,
     num_input_rows,
     num_pairs,
@@ -62,8 +62,8 @@ def _grouped_lora_a_kernel(
     pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     pair_ids = tl.load(sorted_pair_ids_ptr + pair_slots).to(tl.int64)
     pair_mask = pair_ids < num_pairs
-    factor_id = tl.load(factor_ids_ptr + pid_m).to(tl.int64)
-    if factor_id == -1:
+    virtual_expert_id = tl.load(block_virtual_expert_ids_ptr + pid_m).to(tl.int64)
+    if virtual_expert_id == -1:
         return
 
     if USE_INPUT_ROW_MAP:
@@ -93,7 +93,7 @@ def _grouped_lora_a_kernel(
         )
         rhs = tl.load(
             weight_ptr
-            + factor_id * stride_we
+            + virtual_expert_id * stride_we
             + n_offsets[None, :] * stride_wn
             + k_offsets[:, None] * stride_wk,
             mask=n_mask[None, :] & k_mask[:, None],
@@ -179,6 +179,7 @@ def stock_grouped_lora_b(
     *,
     destination_offsets: Sequence[int],
     config: Mapping[str, int],
+    intermediate_top_k: int = 1,
 ) -> None:
     """Materialize one slice or matching gate/up slices with the stock GEMM.
 
@@ -187,11 +188,40 @@ def stock_grouped_lora_b(
     directly.  Sentinel route blocks overwrite every targeted destination cell
     with zero, making buffer reuse safe under one CUDA graph. The caller owns
     static shape/layout/config validation.
+
+    ``intermediate_top_k`` selects the intermediate's row domain: the stock
+    kernel reads row ``pair_id // top_k``, so 1 (default) consumes the
+    canonical pair-major ``[P, slices*R]`` bridge and ``top_k`` consumes a
+    TOKEN-major ``[T, slices*R]`` bridge — the shared-outer token-dedup form
+    (plan section 41.1), where every pair of one token reads the single
+    deduplicated A row and no broadcast copy exists.
     """
     num_slices = len(destination_offsets)
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
+    # Fail-closed row-domain contract (third S3 review): exactly the two
+    # shapes that exist. A pair-major bridge passed with top_k=K would
+    # otherwise read row pair//K and SUCCEED with silently wrong results.
+    num_tokens = routing.topk_ids.shape[0]
+    if intermediate_top_k == 1:
+        if intermediate.shape[0] != num_pairs:
+            raise ValueError(
+                f"pair-major intermediate must have {num_pairs} rows, got "
+                f"{intermediate.shape[0]}"
+            )
+    elif intermediate_top_k == routing.topk_ids.shape[1]:
+        if intermediate.shape[0] != num_tokens:
+            raise ValueError(
+                f"token-major intermediate must have {num_tokens} rows, got "
+                f"{intermediate.shape[0]}"
+            )
+    else:
+        raise ValueError(
+            f"intermediate_top_k must be 1 (pair-major) or the route's "
+            f"top_k {routing.topk_ids.shape[1]} (token-major), got "
+            f"{intermediate_top_k}"
+        )
 
     slice_width = weight.shape[1] // num_slices
     rank = weight.shape[2]
@@ -217,7 +247,7 @@ def stock_grouped_lora_b(
             routing.block_virtual_expert_ids,
             routing.num_pairs_post_padded,
             False,
-            1,
+            intermediate_top_k,
             config,
             tl.bfloat16,
             False,

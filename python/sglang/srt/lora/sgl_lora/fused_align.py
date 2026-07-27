@@ -1,6 +1,6 @@
 """Fused ID + histogram + scan + scatter route plan (plan section 7.1 candidate).
 
-Derives the `(adapter, factor expert)` key inline through the SAME device
+Derives the `(adapter, LoRA expert)` key inline through the SAME device
 helper the ``fused_ids`` view uses — so the plan-free and plan-based paths
 cannot disagree — and has no bucket ceiling, unlike the JIT CUDA align whose
 EPT ladder tops out at 32767 virtual experts.
@@ -60,7 +60,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.sgl_lora.routing import virtual_expert_ids_inline
+from sglang.srt.lora.sgl_lora.routing import (
+    validate_shared_outer,
+    virtual_expert_ids_inline,
+)
 
 # Launch tiles, selected by a 64-point sweep over 4 representative cells on
 # GB300 (tune_fused_align.py, 2026-07-25: best 83.45us vs 88-100us untuned).
@@ -78,15 +81,16 @@ SCAN_WARPS = 4
 def _fused_hist_kernel(
     topk_ids_ptr,
     token_slots_ptr,
-    factor_map_ptr,
+    lora_expert_map_ptr,
     counts_ptr,
     num_pairs,
-    factor_map_size,
+    routed_expert_id_bound,
     NUM_BUCKETS: tl.constexpr,
-    FACTOR_EXPERT_COUNT: tl.constexpr,
+    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
-    USE_FACTOR_MAP: tl.constexpr,
+    USE_LORA_EXPERT_MAP: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
@@ -100,14 +104,15 @@ def _fused_hist_kernel(
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_slots_ptr,
-        factor_map_ptr,
+        lora_expert_map_ptr,
         pair_ids,
         pair_mask,
-        factor_map_size,
-        FACTOR_EXPERT_COUNT=FACTOR_EXPERT_COUNT,
+        routed_expert_id_bound,
+        LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_FACTOR_MAP=USE_FACTOR_MAP,
+        USE_LORA_EXPERT_MAP=USE_LORA_EXPERT_MAP,
+        SHARED_OUTER=SHARED_OUTER,
     )
     # Invalid pairs land in the sentinel bucket at NUM_BUCKETS - 1; its blocks
     # are labelled -1 downstream so LoRA-A skips them and B zero-fills them.
@@ -162,22 +167,23 @@ def _padded_scan_kernel(
 def _expand_and_scatter_kernel(
     topk_ids_ptr,
     token_slots_ptr,
-    factor_map_ptr,
+    lora_expert_map_ptr,
     cursor_ptr,
     bucket_end_ptr,
     block_cum_ptr,
     sorted_pair_ids_ptr,
-    block_expert_ids_ptr,
+    block_virtual_expert_ids_ptr,
     num_pairs,
-    factor_map_size,
+    routed_expert_id_bound,
     num_blocks,
     num_block_programs,
     NUM_BUCKETS: tl.constexpr,
     NUM_VIRTUAL: tl.constexpr,
-    FACTOR_EXPERT_COUNT: tl.constexpr,
+    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
-    USE_FACTOR_MAP: tl.constexpr,
+    USE_LORA_EXPERT_MAP: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
@@ -220,7 +226,7 @@ def _expand_and_scatter_kernel(
         in_plan = block_mask & (block_ids < total_blocks)
         labelled = in_plan & (owner < NUM_VIRTUAL)
         tl.store(
-            block_expert_ids_ptr + block_ids,
+            block_virtual_expert_ids_ptr + block_ids,
             tl.where(labelled, owner, -1),
             mask=block_mask,
         )
@@ -240,14 +246,15 @@ def _expand_and_scatter_kernel(
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_slots_ptr,
-        factor_map_ptr,
+        lora_expert_map_ptr,
         pair_ids,
         pair_mask,
-        factor_map_size,
-        FACTOR_EXPERT_COUNT=FACTOR_EXPERT_COUNT,
+        routed_expert_id_bound,
+        LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_FACTOR_MAP=USE_FACTOR_MAP,
+        USE_LORA_EXPERT_MAP=USE_LORA_EXPERT_MAP,
+        SHARED_OUTER=SHARED_OUTER,
     )
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if USE_PDL:
@@ -299,11 +306,12 @@ def fused_align_block_size(
     topk_ids: torch.Tensor,
     token_slots: torch.Tensor,
     *,
-    factor_expert_count: int,
+    lora_experts_per_adapter: int,
     max_loras: int,
     block_size: int,
     capacity: int,
-    routed_expert_to_factor_id: torch.Tensor | None = None,
+    lora_expert_map: torch.Tensor | None = None,
+    shared_outer_local_expert_count: int | None = None,
     use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded)``.
@@ -314,7 +322,7 @@ def fused_align_block_size(
     device = topk_ids.device
     num_pairs = topk_ids.numel()
     top_k = topk_ids.shape[1]
-    num_virtual = factor_expert_count * max_loras
+    num_virtual = lora_experts_per_adapter * max_loras
     num_buckets = num_virtual + 1
     # int32 key math holds only below 2**31; nothing upstream enforces it, and
     # a wrapped key would silently land in a valid-looking bucket.
@@ -323,8 +331,20 @@ def fused_align_block_size(
             f"fused align uses int32 plan math: num_buckets={num_buckets} and "
             f"capacity={capacity} must both be < 2**31"
         )
-    use_map = routed_expert_to_factor_id is not None
-    factor_map = topk_ids if not use_map else routed_expert_to_factor_id
+    validate_shared_outer(
+        shared_outer_local_expert_count=shared_outer_local_expert_count,
+        lora_expert_map=lora_expert_map,
+        lora_experts_per_adapter=lora_experts_per_adapter,
+    )
+    shared_outer = shared_outer_local_expert_count is not None
+    use_map = lora_expert_map is not None
+    # Own name, not a reassignment of the parameter (see routing.py).
+    map_arg = lora_expert_map if use_map else topk_ids
+    routed_expert_id_bound = (
+        shared_outer_local_expert_count
+        if shared_outer
+        else (map_arg.numel() if use_map else 0)
+    )
     num_blocks = capacity // block_size
 
     # Every host-fallible operation happens BEFORE the first launch, so an
@@ -337,15 +357,16 @@ def fused_align_block_size(
     _fused_hist_kernel[(triton.cdiv(max(num_pairs, 1), HIST_BLOCK),)](
         topk_ids,
         token_slots,
-        factor_map,
+        map_arg,
         meta.counts,
         num_pairs,
-        0 if not use_map else factor_map.numel(),
+        routed_expert_id_bound,
         NUM_BUCKETS=num_buckets,
-        FACTOR_EXPERT_COUNT=factor_expert_count,
+        LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        USE_FACTOR_MAP=use_map,
+        USE_LORA_EXPERT_MAP=use_map,
+        SHARED_OUTER=shared_outer,
         BLOCK=HIST_BLOCK,
         USE_PDL=use_pdl,
         num_warps=HIST_WARPS,
@@ -368,22 +389,23 @@ def fused_align_block_size(
     _expand_and_scatter_kernel[(num_block_programs + num_pair_programs,)](
         topk_ids,
         token_slots,
-        factor_map,
+        map_arg,
         meta.cursor,
         meta.bucket_end,
         meta.block_cum,
         sorted_pair_ids,
         block_virtual_expert_ids,
         num_pairs,
-        0 if not use_map else factor_map.numel(),
+        routed_expert_id_bound,
         num_blocks,
         num_block_programs,
         NUM_BUCKETS=num_buckets,
         NUM_VIRTUAL=num_virtual,
-        FACTOR_EXPERT_COUNT=factor_expert_count,
+        LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        USE_FACTOR_MAP=use_map,
+        USE_LORA_EXPERT_MAP=use_map,
+        SHARED_OUTER=shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
         SEARCH_STEPS=max(1, (num_buckets - 1).bit_length()),
