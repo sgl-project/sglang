@@ -362,6 +362,8 @@ def restore_weight(model: nn.Module, target_device) -> None:
 
 def postprocess_weight(model: nn.Module, target_device) -> None:
     _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 

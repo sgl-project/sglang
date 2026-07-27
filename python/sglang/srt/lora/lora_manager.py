@@ -16,7 +16,6 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-import re
 from typing import Dict, Iterable, List, Optional
 
 import torch

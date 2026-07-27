@@ -164,6 +164,11 @@ class Mxfp4MarlinMoEMethod:
         prepare_moe_mxfp4_layer_for_marlin(layer)
         layer._dsv4_mxfp4_backend = "marlin"
 
+    def get_marlin_quant_info(self, layer: Module) -> MarlinMoeQuantInfo:
+        """Marlin quant_info for the LoRA MoE runner, which rebuilds it after a
+        weight reload. Same builder ``apply`` uses, so the two cannot drift."""
+        return build_marlin_moe_quant_info(layer)
+
     def apply(
         self,
         layer: Module,

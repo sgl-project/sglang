@@ -22,7 +22,10 @@ def test_attn_res_combined_weight_refreshes_every_cached_dtype_in_place():
     proj = SimpleNamespace(weight=nn.Parameter(torch.tensor([[1.0, 2.0, 3.0]])))
     norm = SimpleNamespace(weight=nn.Parameter(torch.tensor([4.0, 5.0, 6.0])))
 
-    cached = {dtype: get_cw(proj, norm, dtype=dtype) for dtype in (torch.float32, torch.bfloat16)}
+    cached = {
+        dtype: get_cw(proj, norm, dtype=dtype)
+        for dtype in (torch.float32, torch.bfloat16)
+    }
     data_ptrs = {dtype: cw.data_ptr() for dtype, cw in cached.items()}
 
     proj.weight.data.copy_(torch.tensor([[2.0, 3.0, 4.0]]))
@@ -34,7 +37,9 @@ def test_attn_res_combined_weight_refreshes_every_cached_dtype_in_place():
         refreshed = get_cw(proj, norm, dtype=dtype)
         assert refreshed is previous
         assert refreshed.data_ptr() == data_ptrs[dtype]
-        torch.testing.assert_close(refreshed, torch.tensor([10.0, 18.0, 28.0], dtype=dtype))
+        torch.testing.assert_close(
+            refreshed, torch.tensor([10.0, 18.0, 28.0], dtype=dtype)
+        )
 
 
 def test_attn_res_refresh_before_first_get_is_a_noop():
