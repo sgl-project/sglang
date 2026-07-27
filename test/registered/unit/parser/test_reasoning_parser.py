@@ -19,11 +19,7 @@ from sglang.srt.parser.reasoning_parser import (
     ReasoningParser,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-
-try:
-    from sglang.test.test_utils import CustomTestCase
-except ImportError:
-    CustomTestCase = unittest.TestCase
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
