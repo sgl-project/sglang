@@ -102,6 +102,7 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    psum_layout: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -138,6 +139,22 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
             assert (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
+
+
+def _select_contiguous_gemm_options(
+    runner_input: DeepGemmRunnerInput,
+) -> tuple[torch.Tensor, bool, bool, bool]:
+    use_psum_layout = runner_input.psum_layout is not None
+    grouped_layout = (
+        runner_input.psum_layout if use_psum_layout else runner_input.m_indices
+    )
+    assert grouped_layout is not None
+    return (
+        grouped_layout,
+        use_psum_layout,
+        not use_psum_layout,
+        not use_psum_layout,
+    )
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -198,7 +215,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
-        m_indices = runner_input.m_indices
+        (
+            grouped_layout,
+            use_psum_layout,
+            gemm1_ensure_zero_padding,
+            gemm2_ensure_zero_padding,
+        ) = _select_contiguous_gemm_options(runner_input)
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -233,9 +255,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
             gateup_output,
-            m_indices,
+            grouped_layout,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm1_ensure_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
         dispose_tensor(hidden_states)
@@ -377,9 +404,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
             down_output,
-            m_indices,
+            grouped_layout,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm2_ensure_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
         return down_output
@@ -395,7 +427,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
-        m_indices = runner_input.m_indices
+        (
+            grouped_layout,
+            use_psum_layout,
+            gemm1_ensure_zero_padding,
+            gemm2_ensure_zero_padding,
+        ) = _select_contiguous_gemm_options(runner_input)
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -414,7 +451,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             hidden_states,
             w13_weight,
             gateup_output,
-            m_indices,
+            grouped_layout,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm1_ensure_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
         dispose_tensor(hidden_states)
@@ -447,7 +489,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input,
             w2_weight,
             down_output,
-            m_indices,
+            grouped_layout,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm2_ensure_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
         return down_output
@@ -906,7 +953,9 @@ def _pre_permute_standard_to_deep_gemm_contig(
         hidden_states=input_tensor,
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
+        expected_m=max(1, ceil_div(topk_ids.numel(), num_local_experts)),
         m_indices=m_indices,
+        psum_layout=expert_start_loc,
     )
 
 

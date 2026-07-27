@@ -135,9 +135,12 @@ def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
-    m_indices: torch.Tensor,
+    grouped_layout: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    use_psum_layout: bool = False,
+    ensure_zero_padding: bool = True,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -157,19 +160,40 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            lhs, rhs, out, m_indices, **fp4_kwargs
+            lhs,
+            rhs,
+            out,
+            grouped_layout,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=ensure_zero_padding,
+            expected_m_for_psum_layout=expected_m_for_psum_layout,
+            **fp4_kwargs,
         )
 
 
 def grouped_gemm_nt_bf16_contig(
-    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    grouped_layout: torch.Tensor,
+    use_psum_layout: bool = False,
+    ensure_zero_padding: bool = True,
+    expected_m_for_psum_layout: Optional[int] = None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            a,
+            b,
+            d,
+            grouped_layout,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=ensure_zero_padding,
+            expected_m_for_psum_layout=expected_m_for_psum_layout,
+        )
 
 
 def gemm_nt_f8f8bf16(

@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     _post_permute_deep_gemm_to_standard_masked,
     _pre_permute_standard_to_deep_gemm_contig,
     _pre_permute_standard_to_deep_gemm_masked,
+    _select_contiguous_gemm_options,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -339,8 +340,12 @@ def make_contig_core_stages(core, runner_input, quant_info, state):
     gateup_size = quant_info.w13_weight.size(1)
     scale_block_size = quant_info.block_shape[1]
     recipe = tuple(quant_info.block_shape)
-    grouped_layout = runner_input.m_indices
-    assert grouped_layout is not None
+    (
+        grouped_layout,
+        use_psum_layout,
+        gemm1_zero_padding,
+        gemm2_zero_padding,
+    ) = _select_contiguous_gemm_options(runner_input)
 
     gateup_output = torch.empty(
         (all_tokens, gateup_size),
@@ -356,6 +361,11 @@ def make_contig_core_stages(core, runner_input, quant_info, state):
             grouped_layout,
             recipe_a=recipe,
             recipe_b=recipe,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm1_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
     down_input = torch.empty(
@@ -398,6 +408,11 @@ def make_contig_core_stages(core, runner_input, quant_info, state):
             grouped_layout,
             recipe_a=recipe,
             recipe_b=recipe,
+            use_psum_layout=use_psum_layout,
+            ensure_zero_padding=gemm2_zero_padding,
+            expected_m_for_psum_layout=(
+                runner_input.expected_m if use_psum_layout else None
+            ),
         )
 
     return {"gemm1": gemm1, "act": act_quant, "gemm2": gemm2}, down_output

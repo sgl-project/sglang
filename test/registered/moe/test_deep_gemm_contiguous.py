@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     _post_permute_deep_gemm_to_standard_masked,
     _pre_permute_standard_to_deep_gemm_contig,
     _pre_permute_standard_to_deep_gemm_masked,
+    _select_contiguous_gemm_options,
     _should_use_standard_contiguous_layout,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
@@ -206,6 +207,8 @@ def _run_standard_deep_gemm(
     config: MoeRunnerConfig,
     *,
     contiguous: bool,
+    expected_psum: bool = False,
+    expected_gemm2_zero_padding: bool = True,
 ) -> torch.Tensor:
     running_state = {}
     pre_permute = (
@@ -225,6 +228,21 @@ def _run_standard_deep_gemm(
         running_state,
     )
 
+    if contiguous:
+        (
+            grouped_layout,
+            use_psum_layout,
+            gemm1_zero_padding,
+            gemm2_zero_padding,
+        ) = _select_contiguous_gemm_options(runner_input)
+        expected_layout = (
+            runner_input.psum_layout if expected_psum else runner_input.m_indices
+        )
+        assert grouped_layout is expected_layout
+        assert use_psum_layout is expected_psum
+        assert gemm1_zero_padding is not expected_psum
+        assert gemm2_zero_padding is expected_gemm2_zero_padding
+
     runner_output = DeepGemmRunnerCore(config).run(
         runner_input,
         quant_info,
@@ -239,16 +257,15 @@ def _run_standard_deep_gemm(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] < 10,
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 DeepGEMM requires SM100+",
 )
 @pytest.mark.parametrize(
-    "num_tokens",
+    "num_tokens,expected_psum,expected_gemm2_zero_padding",
     [
-        pytest.param(1, id="baseline"),
-        pytest.param(25, id="presence-bincount"),
-        pytest.param(26, id="atomic-bincount"),
+        pytest.param(1, True, False, id="baseline"),
+        pytest.param(25, True, False, id="presence-bincount"),
+        pytest.param(26, True, False, id="atomic-bincount"),
     ],
 )
 @torch.inference_mode()
@@ -257,6 +274,8 @@ def test_standard_contiguous_deep_gemm_matches_masked(
     m3_quant_info,
     m3_config,
     num_tokens,
+    expected_psum,
+    expected_gemm2_zero_padding,
 ):
     monkeypatch.setattr(
         compile_utils,
@@ -286,6 +305,8 @@ def test_standard_contiguous_deep_gemm_matches_masked(
         m3_quant_info,
         m3_config,
         contiguous=True,
+        expected_psum=expected_psum,
+        expected_gemm2_zero_padding=expected_gemm2_zero_padding,
     )
 
     assert torch.isfinite(masked).all()
