@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -47,9 +48,13 @@ from sglang.multimodal_gen.runtime.models.dits.bagel_taylorseer import (
     TaylorSeerState,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 logger = logging.getLogger(__name__)
+_USE_FUSED_FP32_QK_NORM: bool | None = None
 
 
 class _BagelColumnParallelLinear(ColumnParallelLinear):
@@ -603,6 +608,105 @@ class _BagelRMSNorm(nn.Module):
         normalized = normalized * torch.rsqrt(variance + self.eps)
         return self.weight * normalized.to(input_dtype)
 
+    @property
+    def variance_epsilon(self) -> float:
+        """Expose the epsilon name used by SGLang's fused Q/K helper."""
+        return self.eps
+
+
+def _can_use_fused_fp32_qk_norm(
+    query: Tensor,
+    key: Tensor,
+    query_norm: _BagelRMSNorm,
+    key_norm: _BagelRMSNorm,
+) -> bool:
+    """Return whether the Triton pair kernel preserves BAGEL FP32 semantics."""
+    return (
+        _USE_FUSED_FP32_QK_NORM is not False
+        and current_platform.is_cuda()
+        and query.is_cuda
+        and query.dtype == torch.float32
+        and key.dtype == query.dtype
+        and query.device == key.device
+        and query_norm.weight.device == query.device
+        and key_norm.weight.device == key.device
+        and query_norm.eps == key_norm.eps
+        and query.shape[0] == key.shape[0]
+        and query.shape[-1] == key.shape[-1]
+        and query.numel() > 0
+        and key.numel() > 0
+        and query.is_contiguous()
+        and key.is_contiguous()
+    )
+
+
+def _fused_fp32_qk_norm(
+    query: Tensor,
+    key: Tensor,
+    query_norm: _BagelRMSNorm,
+    key_norm: _BagelRMSNorm,
+) -> tuple[Tensor, Tensor]:
+    """Run the one-launch Triton Q/K RMSNorm used by FP32 generation."""
+    from sglang.srt.layers.fused_qk_norm import fused_qk_norm
+
+    return fused_qk_norm(
+        query,
+        key,
+        query_norm.weight,
+        key_norm.weight,
+        query_norm.eps,
+    )
+
+
+def _apply_bagel_qk_norm(
+    query: Tensor,
+    key: Tensor,
+    query_norm: _BagelRMSNorm,
+    key_norm: _BagelRMSNorm,
+    head_dim: int,
+) -> tuple[Tensor, Tensor]:
+    """Apply one-launch Q/K RMSNorm while preserving BAGEL cast ordering."""
+    if query.shape[0] != key.shape[0]:
+        raise ValueError("BAGEL Q/K normalization requires matching token counts")
+    if query.shape[-1] != head_dim or key.shape[-1] != head_dim:
+        raise ValueError(
+            f"BAGEL Q/K head dimensions must both equal {head_dim}, got "
+            f"{query.shape[-1]} and {key.shape[-1]}"
+        )
+    if _can_use_fused_fp32_qk_norm(query, key, query_norm, key_norm):
+        global _USE_FUSED_FP32_QK_NORM
+        try:
+            output = _fused_fp32_qk_norm(query, key, query_norm, key_norm)
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (ImportError, NotImplementedError, RuntimeError, TypeError) as error:
+            # Backend import/JIT failures are stable for this process. Disable
+            # the optional optimization after its first failed probe, but do
+            # not hide a later runtime error after the kernel has succeeded.
+            if _USE_FUSED_FP32_QK_NORM is True:
+                raise
+            _USE_FUSED_FP32_QK_NORM = False
+            logger.warning(
+                "BAGEL fused FP32 Q/K RMSNorm unavailable; using eager RMSNorm: %s",
+                error,
+            )
+        else:
+            _USE_FUSED_FP32_QK_NORM = True
+            return output
+
+    # The JIT kernel supports FP16/BF16. Request HF ordering so its output
+    # matches `_BagelRMSNorm`; FP32 and unsupported layouts use the exact eager
+    # fallback in `apply_qk_norm`.
+    return apply_qk_norm(
+        q=query,
+        k=key,
+        q_norm=query_norm,
+        k_norm=key_norm,
+        head_dim=head_dim,
+        allow_inplace=True,
+        cast_x_before_out_mul=True,
+    )
+
 
 class _BagelMoTAttention(nn.Module):
     def __init__(
@@ -689,11 +793,14 @@ class _BagelMoTAttention(nn.Module):
         value = self.und_v_proj(hidden_states).view(
             sequence_length, self.num_kv_heads, self.head_dim
         )
-        return (
-            self.und_q_norm(query),
-            self.und_k_norm(key),
-            value,
+        query, key = _apply_bagel_qk_norm(
+            query,
+            key,
+            self.und_q_norm,
+            self.und_k_norm,
+            self.head_dim,
         )
+        return query, key, value
 
     def _project_generation(
         self, hidden_states: Tensor, text_indexes: Tensor, latent_indexes: Tensor
@@ -741,8 +848,15 @@ class _BagelMoTAttention(nn.Module):
                 .view(-1, self.num_kv_heads, self.head_dim)
                 .float()
             )
-            query[text_indexes] = self.und_q_norm(text_query)
-            key[text_indexes] = self.und_k_norm(text_key)
+            text_query, text_key = _apply_bagel_qk_norm(
+                text_query,
+                text_key,
+                self.und_q_norm,
+                self.und_k_norm,
+                self.head_dim,
+            )
+            query[text_indexes] = text_query
+            key[text_indexes] = text_key
             value[text_indexes] = self.und_v_proj(text_states).view(
                 -1, self.num_kv_heads, self.head_dim
             )
@@ -758,8 +872,15 @@ class _BagelMoTAttention(nn.Module):
             .view(-1, self.num_kv_heads, self.head_dim)
             .float()
         )
-        query[latent_indexes] = self.gen_q_norm(latent_query)
-        key[latent_indexes] = self.gen_k_norm(latent_key)
+        latent_query, latent_key = _apply_bagel_qk_norm(
+            latent_query,
+            latent_key,
+            self.gen_q_norm,
+            self.gen_k_norm,
+            self.head_dim,
+        )
+        query[latent_indexes] = latent_query
+        key[latent_indexes] = latent_key
         value[latent_indexes] = self.gen_v_proj(latent_states).view(
             -1, self.num_kv_heads, self.head_dim
         )

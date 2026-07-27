@@ -57,7 +57,7 @@ namespace device::norm {
 
 namespace details {
 
-template <int64_t kDim, bool kUseCTA, typename PackedFloat, std::size_t N>
+template <int64_t kDim, bool kUseCTA, bool kCastXBeforeOutMul, typename PackedFloat, std::size_t N>
 SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
     const AlignedVector<PackedFloat, N> input,
     const AlignedVector<PackedFloat, N> weight,
@@ -99,10 +99,25 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
   for (auto i = 0u; i < N; ++i) {
     const auto fp32_input = cast<fp32x2_t>(input[i]);
     const auto fp32_weight = cast<fp32x2_t>(weight[i]);
-    output[i] = cast<PackedFloat, fp32x2_t>({
-        fp32_input.x * norm_factor * fp32_weight.x,
-        fp32_input.y * norm_factor * fp32_weight.y,
-    });
+    if constexpr (kCastXBeforeOutMul) {
+      // Hugging Face RMSNorm rounds the normalized activation to the input
+      // dtype before applying the learned weight. This ordering is observable
+      // for BF16/FP16 and is required by models such as BAGEL.
+      const auto normalized = cast<PackedFloat, fp32x2_t>({
+          fp32_input.x * norm_factor,
+          fp32_input.y * norm_factor,
+      });
+      const auto fp32_normalized = cast<fp32x2_t>(normalized);
+      output[i] = cast<PackedFloat, fp32x2_t>({
+          fp32_normalized.x * fp32_weight.x,
+          fp32_normalized.y * fp32_weight.y,
+      });
+    } else {
+      output[i] = cast<PackedFloat, fp32x2_t>({
+          fp32_input.x * norm_factor * fp32_weight.x,
+          fp32_input.y * norm_factor * fp32_weight.y,
+      });
+    }
   }
 
   return output;
@@ -119,10 +134,10 @@ SGL_DEVICE AlignedVector<PackedFloat, N> apply_norm_impl(
  * \param eps Epsilon value for numerical stability
  * \return Normalized output vector
  */
-template <int64_t kDim, typename T>
+template <int64_t kDim, bool kCastXBeforeOutMul = false, typename T>
 SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, float eps) {
   static_assert(kDim <= 256, "Warp norm only supports dim <= 256");
-  return details::apply_norm_impl<kDim, false>(input, weight, eps, nullptr, 0);
+  return details::apply_norm_impl<kDim, false, kCastXBeforeOutMul>(input, weight, eps, nullptr, 0);
 }
 
 /**
@@ -136,11 +151,11 @@ SGL_DEVICE T apply_norm_warp(const T& input, const T& weight, float eps) {
  * \param num_warps Number of warps in the CTA
  * \return Normalized output vector
  */
-template <int64_t kDim, typename T>
+template <int64_t kDim, bool kCastXBeforeOutMul = false, typename T>
 SGL_DEVICE T apply_norm_cta(
     const T& input, const T& weight, float eps, float* smem, uint32_t num_warps = blockDim.x / kWarpThreads) {
   static_assert(kDim > 256, "CTA norm only supports dim > 256");
-  return details::apply_norm_impl<kDim, true>(input, weight, eps, smem, num_warps);
+  return details::apply_norm_impl<kDim, true, kCastXBeforeOutMul>(input, weight, eps, smem, num_warps);
 }
 
 /**

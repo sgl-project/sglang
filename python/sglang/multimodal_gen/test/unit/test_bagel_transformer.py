@@ -23,6 +23,8 @@ from sglang.multimodal_gen.runtime.models.dits.bagel_taylorseer import (
 )
 from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     BagelTransformer,
+    _apply_bagel_qk_norm,
+    _BagelRMSNorm,
     _interleave_prefix_and_query,
     _sdpa_attention,
 )
@@ -115,6 +117,21 @@ def _build_context(model: BagelTransformer, token_ids: list[int]):
         start_of_image_token_id=3,
         end_of_image_token_id=4,
     )
+
+
+def _eager_qk_norm_for_test(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: _BagelRMSNorm,
+    k_norm: _BagelRMSNorm,
+    head_dim: int,
+    allow_inplace: bool,
+    cast_x_before_out_mul: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mirror ``apply_qk_norm`` fallback while exposing dispatch arguments."""
+    del head_dim, allow_inplace, cast_x_before_out_mul
+    return q_norm(q), k_norm(k)
 
 
 def _build_thinking_transformer(
@@ -828,6 +845,117 @@ def test_bf16_rms_norm_matches_official_cast_order(
     torch.testing.assert_close(norm(hidden_states), expected, rtol=0, atol=0)
 
 
+def test_bagel_qk_norm_requests_hf_cast_order_on_fallback() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    query_norm = _BagelRMSNorm(4, eps=1e-6)
+    key_norm = _BagelRMSNorm(4, eps=1e-6)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.apply_qk_norm",
+        side_effect=_eager_qk_norm_for_test,
+    ) as qk_norm:
+        actual_query, actual_key = _apply_bagel_qk_norm(
+            query, key, query_norm, key_norm, 4
+        )
+
+    torch.testing.assert_close(actual_query, query_norm(query))
+    torch.testing.assert_close(actual_key, key_norm(key))
+    assert qk_norm.call_args.kwargs["cast_x_before_out_mul"] is True
+    assert qk_norm.call_args.kwargs["allow_inplace"] is True
+
+
+def test_bagel_qk_norm_dispatches_fp32_pair_kernel() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    query_norm = _BagelRMSNorm(4, eps=1e-6)
+    key_norm = _BagelRMSNorm(4, eps=1e-6)
+    expected_query = query + 1
+    expected_key = key + 2
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._USE_FUSED_FP32_QK_NORM",
+            None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_fused_fp32_qk_norm",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._fused_fp32_qk_norm",
+            return_value=(expected_query, expected_key),
+        ) as fused_qk_norm,
+    ):
+        actual_query, actual_key = _apply_bagel_qk_norm(
+            query, key, query_norm, key_norm, 4
+        )
+
+    assert actual_query is expected_query
+    assert actual_key is expected_key
+    fused_qk_norm.assert_called_once_with(query, key, query_norm, key_norm)
+
+
+def test_bagel_qk_norm_falls_back_when_fp32_pair_kernel_is_unavailable() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    query_norm = _BagelRMSNorm(4, eps=1e-6)
+    key_norm = _BagelRMSNorm(4, eps=1e-6)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._USE_FUSED_FP32_QK_NORM",
+            None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_fused_fp32_qk_norm",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._fused_fp32_qk_norm",
+            side_effect=ImportError("Triton backend unavailable"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.apply_qk_norm",
+            side_effect=_eager_qk_norm_for_test,
+        ) as fallback_qk_norm,
+    ):
+        actual_query, actual_key = _apply_bagel_qk_norm(
+            query, key, query_norm, key_norm, 4
+        )
+
+    torch.testing.assert_close(actual_query, query_norm(query))
+    torch.testing.assert_close(actual_key, key_norm(key))
+    fallback_qk_norm.assert_called_once()
+
+
+def test_bagel_qk_norm_rejects_mismatched_tokens() -> None:
+    norm = _BagelRMSNorm(4, eps=1e-6)
+    with pytest.raises(ValueError, match="matching token counts"):
+        _apply_bagel_qk_norm(torch.randn(3, 2, 4), torch.randn(2, 1, 4), norm, norm, 4)
+
+
+def test_understanding_projection_uses_pair_qk_norm(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    attention = tiny_transformer.layers[0].attn
+    hidden_states = torch.randn(3, 8)
+    expected_value = attention.und_v_proj(hidden_states).view(
+        3, attention.num_kv_heads, attention.head_dim
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._apply_bagel_qk_norm",
+        wraps=_apply_bagel_qk_norm,
+    ) as qk_norm:
+        query, key, value = attention._project_understanding(hidden_states)
+
+    qk_norm.assert_called_once()
+    assert query.shape == (3, attention.num_heads, attention.head_dim)
+    assert key.shape == (3, attention.num_kv_heads, attention.head_dim)
+    torch.testing.assert_close(value, expected_value)
+
+
 def test_internal_cfg_matches_bagel_global_renorm() -> None:
     conditional = torch.tensor([[2.0, 0.0]])
     unconditional = torch.tensor([[1.0, 0.0]])
@@ -983,13 +1111,20 @@ def test_generation_qk_stays_fp32_until_attention_cast(
     text_indexes = torch.tensor([0, 3])
     latent_indexes = torch.tensor([1, 2])
 
-    query, key, value = attention._project_generation(
-        hidden_states, text_indexes, latent_indexes
-    )
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._apply_bagel_qk_norm",
+        wraps=_apply_bagel_qk_norm,
+    ) as qk_norm:
+        query, key, value = attention._project_generation(
+            hidden_states, text_indexes, latent_indexes
+        )
 
     assert query.dtype == torch.float32
     assert key.dtype == torch.float32
     assert value.dtype == torch.bfloat16
+    assert qk_norm.call_count == 2
+    assert all(call.args[0].dtype == torch.float32 for call in qk_norm.call_args_list)
+    assert all(call.args[1].dtype == torch.float32 for call in qk_norm.call_args_list)
     expected_text_query = (
         attention.und_q_proj(hidden_states[text_indexes])
         .view(-1, attention.num_heads, attention.head_dim)
