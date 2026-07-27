@@ -60,6 +60,9 @@ class _TargetOwnershipPhase(enum.Enum):
 
 class P2PTransferState(enum.Enum):
     RESERVED = "reserved"
+    LOADING_SOURCE = "loading_source"
+    PREPARING_SOURCE = "preparing_source"
+    SOURCE_SENDER_READY = "source_sender_ready"
     WAIT_SOURCE = "wait_source"
     TRANSFERRING = "transferring"
     CONSENSUS = "consensus"
@@ -94,6 +97,7 @@ class PendingP2PTransfer:
     abort_requested: bool = False
     quarantine_allocation: bool = False
     cleanup_done: bool = False
+    hicache_finish_event: Any = None
 
 
 @dataclasses.dataclass
@@ -787,15 +791,35 @@ class PrefillP2PMooncakeTransferEngine:
         match = self.scheduler.tree_cache.match_prefix(
             MatchPrefixParams(key=_radix_key(req.token_ids[:prefix_len]))
         )
-        match = self._restore_source_prefix_from_hicache(req, match, prefix_len)
-        actual_len = self._align_available_len(
-            req, len(match.device_indices), prefix_len
+        pending = PendingP2PTransfer(
+            req=req,
+            role="source",
+            state=P2PTransferState.LOADING_SOURCE,
+            deadline=time.monotonic() + self._TRANSFER_TIMEOUT_S,
+            kv_manager=kv_manager,
+            match=match,
+            prefix_len=prefix_len,
         )
+        load_back = self._begin_source_prefix_load_back(req, match, prefix_len)
+        if load_back is not None:
+            pending.hicache_finish_event = load_back
+        elif self._align_available_len(req, len(match.device_indices), prefix_len) <= 0:
+            pending.source_error = (
+                f"source cache miss: matched {len(match.device_indices)} "
+                f"< requested {prefix_len}"
+            )
+        return pending
+
+    def _prepare_source_sender(
+        self, pending: PendingP2PTransfer, match, actual_len: int
+    ) -> P2PKVTransferReqOutput | None:
+        req = pending.req
+        kv_manager = pending.kv_manager
         if actual_len <= 0:
             return self._fail(
                 req,
                 f"source cache miss: matched {len(match.device_indices)} "
-                f"< requested {prefix_len}",
+                f"< requested {pending.prefix_len}",
             )
         mamba_index = self._cached_mamba_index_if_needed(req, kv_manager, match)
         if isinstance(mamba_index, P2PKVTransferReqOutput):
@@ -810,6 +834,7 @@ class PrefillP2PMooncakeTransferEngine:
             pp_rank=kv_manager.pp_rank,
             force_cp_rank_transfer=True,
         )
+        pending.sender = sender
         num_pages = len(
             kv_to_page_indices(
                 torch.zeros(actual_len, dtype=torch.int32),
@@ -818,23 +843,126 @@ class PrefillP2PMooncakeTransferEngine:
         )
         sender.init(num_pages, aux_index=0)
         lock_params = self.scheduler.tree_cache.inc_lock_ref(match.last_device_node)
-        return PendingP2PTransfer(
-            req=req,
-            role="source",
-            state=P2PTransferState.RESERVED,
-            deadline=time.monotonic() + self._TRANSFER_TIMEOUT_S,
-            kv_manager=kv_manager,
-            sender=sender,
-            match=match,
-            lock_params=lock_params,
-            actual_len=actual_len,
-        )
+        pending.match = match
+        pending.lock_params = lock_params
+        pending.actual_len = actual_len
+        return None
 
     def _progress_source_transfer(
         self, pending: PendingP2PTransfer
     ) -> P2PKVTransferReqOutput | None:
         req = pending.req
         timed_out = time.monotonic() >= pending.deadline
+
+        if pending.state == P2PTransferState.LOADING_SOURCE:
+            if pending.source_error is not None:
+                local_state = 0
+            elif pending.hicache_finish_event is None:
+                local_state = 2
+            elif timed_out:
+                pending.source_error = "source HiCache load-back timed out"
+                local_state = 0
+            else:
+                try:
+                    local_state = 2 if pending.hicache_finish_event.query() else 1
+                except Exception as exc:  # noqa: BLE001
+                    pending.source_error = (
+                        f"source HiCache load-back poll failed: {exc}"
+                    )
+                    local_state = 0
+
+            load_state = self._progress_world_min(
+                pending, "source-hicache-load", local_state
+            )
+            if load_state is None or load_state == 1:
+                return None
+            if load_state == 0:
+                pending.state = P2PTransferState.FAILED
+                return self._fail(
+                    req,
+                    pending.source_error or "source HiCache load-back failed",
+                )
+
+            try:
+                pending.match = self.scheduler.tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=_radix_key(req.token_ids[: pending.prefix_len])
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                pending.source_error = (
+                    f"source HiCache load-back finalize failed: {exc}"
+                )
+            pending.state = P2PTransferState.PREPARING_SOURCE
+            return None
+
+        if pending.state == P2PTransferState.PREPARING_SOURCE:
+            local_tokens = (
+                0
+                if pending.source_error is not None or timed_out
+                else self._align_available_len(
+                    req,
+                    len(pending.match.device_indices),
+                    pending.prefix_len,
+                )
+            )
+            if timed_out and pending.source_error is None:
+                pending.source_error = "source sender preparation timed out"
+            actual_len = self._progress_world_min(
+                pending, "source-prefix-ready", local_tokens
+            )
+            if actual_len is None:
+                return None
+            if actual_len <= 0:
+                pending.state = P2PTransferState.FAILED
+                return self._fail(
+                    req,
+                    pending.source_error
+                    or "source prefix unavailable on at least one model-parallel rank",
+                )
+
+            try:
+                prepare_error = self._prepare_source_sender(
+                    pending, pending.match, actual_len
+                )
+            except Exception as exc:  # noqa: BLE001
+                pending.source_error = f"source sender preparation failed: {exc}"
+                prepare_error = None
+            if prepare_error is not None:
+                pending.source_error = prepare_error.message
+            pending.state = P2PTransferState.SOURCE_SENDER_READY
+            return None
+
+        if pending.state == P2PTransferState.SOURCE_SENDER_READY:
+            if timed_out and pending.source_error is None:
+                pending.source_error = "source sender preparation timed out"
+            prepare_state = self._progress_world_min(
+                pending,
+                "source-sender-ready",
+                0 if pending.source_error is not None else 2,
+            )
+            if prepare_state is None:
+                return None
+            if prepare_state == 0:
+                pending.state = P2PTransferState.FAILED
+                return self._fail(
+                    req,
+                    pending.source_error
+                    or "source sender preparation failed on another "
+                    "model-parallel rank",
+                )
+            pending.state = P2PTransferState.RESERVED
+            if pending.hicache_finish_event is not None:
+                logger.info(
+                    "p2p_source_hicache_load_back_done: request_id=%s "
+                    "device_match_tokens=%s host_hit_tokens=%s mamba_host_hit=%s",
+                    req.request_id,
+                    len(pending.match.device_indices),
+                    getattr(pending.match, "host_hit_length", 0),
+                    getattr(pending.match, "mamba_host_hit_length", 0),
+                )
+            return None
+
         if timed_out and not pending.abort_requested:
             abort = getattr(pending.sender, "abort", None)
             if callable(abort):
@@ -921,6 +1049,10 @@ class PrefillP2PMooncakeTransferEngine:
         if pending.cleanup_done:
             return
         pending.cleanup_done = True
+        if pending.state == P2PTransferState.FAILED:
+            abort = getattr(pending.sender, "abort", None)
+            if callable(abort):
+                abort()
         if pending.lock_params is not None:
             self.scheduler.tree_cache.dec_lock_ref(
                 pending.match.last_device_node,
@@ -1563,7 +1695,7 @@ class PrefillP2PMooncakeTransferEngine:
             prefix_len,
         )
         try:
-            queued = tree_cache.load_back(best_match_node, req=None)
+            queued = tree_cache.load_back(best_match_node)
             if queued is None or queued is False:
                 logger.warning(
                     "p2p_source_hicache_load_back_rejected: request_id=%s",
@@ -1605,6 +1737,76 @@ class PrefillP2PMooncakeTransferEngine:
             getattr(rematch, "mamba_host_hit_length", 0),
         )
         return rematch
+
+    def _begin_source_prefix_load_back(
+        self, req: P2PKVTransferReqInput, match, prefix_len: int
+    ) -> Any | None:
+        """Queue an L2-only source prefix load without waiting on its GPU event."""
+        tree_cache = self.scheduler.tree_cache
+        device_tokens = len(match.device_indices)
+        host_tokens = int(getattr(match, "host_hit_length", 0) or 0)
+        covered_tokens = self._align_available_len(
+            req, device_tokens + host_tokens, prefix_len
+        )
+        if host_tokens <= 0 or covered_tokens < prefix_len:
+            return None
+
+        required = (
+            "load_back",
+            "ready_to_load_host_cache",
+            "cache_controller",
+        )
+        if any(not hasattr(tree_cache, name) for name in required):
+            logger.warning(
+                "p2p_source_hicache_load_back_unavailable: request_id=%s "
+                "device_tokens=%s host_tokens=%s",
+                req.request_id,
+                device_tokens,
+                host_tokens,
+            )
+            return None
+
+        best_match_node = getattr(match, "best_match_node", None)
+        if best_match_node is None:
+            return None
+
+        logger.info(
+            "p2p_source_hicache_load_back_start: request_id=%s "
+            "device_tokens=%s host_tokens=%s requested_tokens=%s",
+            req.request_id,
+            device_tokens,
+            host_tokens,
+            prefix_len,
+        )
+        try:
+            queued = tree_cache.load_back(best_match_node)
+            if queued is None or queued is False:
+                logger.warning(
+                    "p2p_source_hicache_load_back_rejected: request_id=%s",
+                    req.request_id,
+                )
+                return None
+
+            consumer_index = tree_cache.ready_to_load_host_cache()
+            if not isinstance(consumer_index, int) or consumer_index < 0:
+                logger.warning(
+                    "p2p_source_hicache_load_back_not_started: request_id=%s "
+                    "consumer_index=%s",
+                    req.request_id,
+                    consumer_index,
+                )
+                return None
+
+            finish_event = tree_cache.cache_controller.layer_done_counter.events[
+                consumer_index
+            ].finish_event
+        except Exception:
+            logger.exception(
+                "p2p_source_hicache_load_back_failed: request_id=%s",
+                req.request_id,
+            )
+            return None
+        return finish_event
 
     def _source_send_via_sender(
         self, req: P2PKVTransferReqInput

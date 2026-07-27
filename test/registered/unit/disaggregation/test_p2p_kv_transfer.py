@@ -243,16 +243,233 @@ class TestP2PKVTransferEngine(unittest.TestCase):
                 "sglang.srt.disaggregation.p2p_kv_transfer.time.sleep",
                 side_effect=AssertionError("scheduler progress must never sleep"),
             ),
+            patch.object(
+                engine,
+                "_progress_world_min",
+                wraps=engine._progress_world_min,
+            ) as progress_world_min,
         ):
             self.assertIsNone(engine.start_transfer(req))
             self.assertEqual(engine.progress_transfers(), [])
-            completions = engine.progress_transfers()
+            self.assertEqual(
+                progress_world_min.call_args.args[1], "source-hicache-load"
+            )
+            completions = []
+            for _ in range(8):
+                completions = engine.progress_transfers()
+                if completions:
+                    break
 
         self.assertEqual(len(completions), 1)
         completed_req, output = completions[0]
         self.assertIs(completed_req, req)
         self.assertTrue(output.success)
         self.assertEqual(output.transferred_tokens, 8)
+
+    def test_source_hicache_load_back_progresses_without_blocking_scheduler(self):
+        class FinishEvent:
+            def __init__(self):
+                self.ready = False
+
+            def query(self):
+                return self.ready
+
+            def synchronize(self):
+                raise AssertionError("scheduler progress must never synchronize")
+
+        class HiCacheTree(_FakeTreeCache):
+            def __init__(self):
+                self.cache_node = SimpleNamespace()
+                super().__init__(last_device_node=self.cache_node)
+                self.finish_event = FinishEvent()
+                self.load_back_calls = []
+                self.loading_checks = 0
+                self.cache_controller = SimpleNamespace(
+                    layer_done_counter=SimpleNamespace(
+                        events=[
+                            SimpleNamespace(finish_event=self.finish_event),
+                        ]
+                    )
+                )
+
+            def match_prefix(self, params):
+                restored = self.finish_event.ready
+                return SimpleNamespace(
+                    device_indices=(
+                        torch.arange(10, 18, dtype=torch.int32)
+                        if restored
+                        else torch.empty((0,), dtype=torch.int32)
+                    ),
+                    last_device_node=self.cache_node,
+                    last_host_node=self.cache_node,
+                    best_match_node=self.cache_node,
+                    host_hit_length=0 if restored else 8,
+                    mamba_host_hit_length=0,
+                )
+
+            def load_back(self, node, mem_quota=None):
+                self.load_back_calls.append((node, mem_quota))
+                return True
+
+            def ready_to_load_host_cache(self):
+                return 0
+
+            def loading_check(self):
+                self.loading_checks += 1
+
+        _FakeSender.instances = []
+        kv_manager = _FakeKVManager(state_types=[])
+        tree_cache = HiCacheTree()
+        engine = PrefillP2PMooncakeTransferEngine(
+            self._scheduler(kv_manager, tree_cache=tree_cache)
+        )
+        req = self._req()
+        req.p2p_bootstrap_room = 123
+        req.p2p_source_send = True
+
+        with patch(
+            "sglang.srt.disaggregation.p2p_kv_transfer.get_kv_class",
+            return_value=_FakeSender,
+        ):
+            self.assertIsNone(engine.start_transfer(req))
+            self.assertEqual(engine.progress_transfers(), [])
+            self.assertEqual(_FakeSender.instances, [])
+
+            tree_cache.finish_event.ready = True
+            for _ in range(4):
+                self.assertEqual(engine.progress_transfers(), [])
+                if _FakeSender.instances:
+                    break
+            self.assertEqual(len(_FakeSender.instances), 1)
+            completions = []
+            for _ in range(6):
+                completions = engine.progress_transfers()
+                if completions:
+                    break
+
+        self.assertEqual(len(completions), 1)
+        _, output = completions[0]
+        self.assertTrue(output.success)
+        self.assertEqual(output.transferred_tokens, 8)
+        self.assertEqual(tree_cache.load_back_calls, [(tree_cache.cache_node, None)])
+        self.assertEqual(tree_cache.loading_checks, 0)
+
+    def test_source_hicache_load_back_timeout_falls_back_and_clears_pending(self):
+        class FinishEvent:
+            def query(self):
+                return False
+
+        class HiCacheTree(_FakeTreeCache):
+            def __init__(self):
+                self.cache_node = SimpleNamespace()
+                super().__init__(last_device_node=self.cache_node)
+                self.finish_event = FinishEvent()
+                self.cache_controller = SimpleNamespace(
+                    layer_done_counter=SimpleNamespace(
+                        events=[
+                            SimpleNamespace(finish_event=self.finish_event),
+                        ]
+                    )
+                )
+
+            def match_prefix(self, params):
+                return SimpleNamespace(
+                    device_indices=torch.empty((0,), dtype=torch.int32),
+                    last_device_node=self.cache_node,
+                    last_host_node=self.cache_node,
+                    best_match_node=self.cache_node,
+                    host_hit_length=8,
+                    mamba_host_hit_length=0,
+                )
+
+            def load_back(self, node, mem_quota=None):
+                return True
+
+            def ready_to_load_host_cache(self):
+                return 0
+
+            def loading_check(self):
+                raise AssertionError("an unfinished load must not be finalized")
+
+        _FakeSender.instances = []
+        engine = PrefillP2PMooncakeTransferEngine(
+            self._scheduler(_FakeKVManager(state_types=[]), tree_cache=HiCacheTree())
+        )
+        engine._TRANSFER_TIMEOUT_S = -1
+        req = self._req()
+        req.p2p_bootstrap_room = 123
+        req.p2p_source_send = True
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.p2p_kv_transfer.get_kv_class",
+                return_value=_FakeSender,
+            ),
+            patch.object(
+                engine,
+                "_progress_world_min",
+                wraps=engine._progress_world_min,
+            ) as progress_world_min,
+        ):
+            self.assertIsNone(engine.start_transfer(req))
+            completions = engine.progress_transfers()
+
+        self.assertEqual(len(completions), 1)
+        _, output = completions[0]
+        self.assertFalse(output.success)
+        self.assertTrue(output.fallback_recompute)
+        self.assertIn("load-back timed out", output.message)
+        self.assertFalse(engine.has_pending_transfers())
+        self.assertEqual(_FakeSender.instances, [])
+        progress_world_min.assert_called_once()
+        self.assertEqual(
+            progress_world_min.call_args.args[1:], ("source-hicache-load", 0)
+        )
+
+    def test_source_sender_init_failure_reaches_consensus_and_cleans_up(self):
+        class BrokenSender:
+            instances = []
+
+            def __init__(self, **kwargs):
+                self.aborted = False
+                self.instances.append(self)
+
+            def init(self, num_pages, aux_index=None):
+                raise RuntimeError("sender init failed")
+
+            def abort(self):
+                self.aborted = True
+
+        tree_cache = _FakeTreeCache(
+            matched_indices=torch.arange(10, 18, dtype=torch.int32),
+            last_device_node=SimpleNamespace(),
+        )
+        engine = PrefillP2PMooncakeTransferEngine(
+            self._scheduler(_FakeKVManager(state_types=[]), tree_cache=tree_cache)
+        )
+        req = self._req()
+        req.p2p_bootstrap_room = 123
+        req.p2p_source_send = True
+
+        with patch(
+            "sglang.srt.disaggregation.p2p_kv_transfer.get_kv_class",
+            return_value=BrokenSender,
+        ):
+            self.assertIsNone(engine.start_transfer(req))
+            completions = []
+            for _ in range(8):
+                completions = engine.progress_transfers()
+                if completions:
+                    break
+
+        self.assertEqual(len(completions), 1)
+        _, output = completions[0]
+        self.assertFalse(output.success)
+        self.assertTrue(output.fallback_recompute)
+        self.assertIn("sender init failed", output.message)
+        self.assertFalse(engine.has_pending_transfers())
+        self.assertEqual(len(BrokenSender.instances), 1)
+        self.assertTrue(BrokenSender.instances[0].aborted)
 
     def test_target_transfer_progresses_without_blocking_scheduler(self):
         class ImmediateExecutor:
@@ -1299,8 +1516,8 @@ class TestP2PKVTransferEngine(unittest.TestCase):
                     mamba_host_hit_length=0,
                 )
 
-            def load_back(self, node, mem_quota=None, req=None):
-                self.load_back_calls.append((node, mem_quota, req))
+            def load_back(self, node, mem_quota=None):
+                self.load_back_calls.append((node, mem_quota))
                 self.restored = True
                 return True
 
@@ -1327,9 +1544,7 @@ class TestP2PKVTransferEngine(unittest.TestCase):
 
         self.assertTrue(ret.success)
         self.assertEqual(ret.transferred_tokens, 8)
-        self.assertEqual(
-            tree_cache.load_back_calls, [(tree_cache.cache_node, None, None)]
-        )
+        self.assertEqual(tree_cache.load_back_calls, [(tree_cache.cache_node, None)])
         self.assertEqual(tree_cache.loading_checks, 1)
         sent_kv_indices, sent_state_indices = _FakeSender.instances[0].sent[0]
         self.assertEqual(sent_kv_indices.tolist(), [2, 3])
