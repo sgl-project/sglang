@@ -203,7 +203,10 @@ spec:
             - name: MINWM_NATIVE_COMPONENTS
               value: ""
             - name: TORCHINDUCTOR_CACHE_DIR
-              value: /work/torchinductor
+              # Keep compiler artifacts pod-local. Sharing this directory with
+              # benchmark Pods through the model PVC can relabel the volume and
+              # make a running serving Pod lose access to its compile cache.
+              value: /tmp/torchinductor
             - name: PYTHONUNBUFFERED
               value: "1"
           command:

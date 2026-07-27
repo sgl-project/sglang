@@ -52,6 +52,7 @@ class MinWMRealtimeState(RealtimeCameraControlState):
             "action_weights", max_events=32768, default_item=[0.0] * 8
         )
         self.prompt_queue = ControlSignalQueue(max_events={"prompt": 1})
+        self.prompt_event_id: int | None = None
         self.label_event_id: int | None = None
         self.weight_event_id: int | None = None
         self.action_mode = "camera"
@@ -61,6 +62,7 @@ class MinWMRealtimeState(RealtimeCameraControlState):
         self.action_label_queue.clear()
         self.action_weight_queue.clear()
         self.prompt_queue.clear()
+        self.prompt_event_id = None
         self.label_event_id = None
         self.weight_event_id = None
         self.action_mode = "camera"
@@ -107,6 +109,13 @@ class MinWMRealtimeState(RealtimeCameraControlState):
 
     def receive_prompt(self, prompt: str, *, event_id: int | None = None) -> None:
         self.prompt_queue.replace("prompt", prompt, event_id=event_id)
+
+    def sample_prompt(self) -> str:
+        prompt = self.prompt_queue.pop_latest("prompt")
+        if not isinstance(prompt, str):
+            raise ValueError("prompt event payload must be a string")
+        self.prompt_event_id = self.prompt_queue.last_sampled_seq_id("prompt")
+        return prompt
 
     def sample_action_labels(self, chunk_size: int) -> list[int]:
         if self.action_label_queue.has_script():
@@ -234,7 +243,7 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         prompt_updated = False
         prompt = request.prompt
         if chunk.index > 0 and state.prompt_queue.has_events("prompt"):
-            prompt = state.prompt_queue.pop_latest("prompt")
+            prompt = state.sample_prompt()
             request.prompt = prompt
             prompt_updated = True
         condition_inputs = {}
@@ -280,11 +289,21 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
 
     def get_realtime_event_id(self, session: GenerateSession) -> int | None:
         state = self._state(session)
-        if state.label_event_id is not None:
-            return state.label_event_id
-        if state.weight_event_id is not None:
-            return state.weight_event_id
-        return state.latest_sampled_event_id
+        # Realtime clients issue monotonically increasing event IDs and the
+        # playback cutover waits for frame.event_id >= the pending event.
+        # A chunk can sample prompt and action state together, so report the
+        # newest event that actually influenced it instead of prioritizing one
+        # condition kind and accidentally returning an older ID.
+        sampled_event_ids = (
+            state.prompt_event_id,
+            state.label_event_id,
+            state.weight_event_id,
+            state.latest_sampled_event_id,
+        )
+        return max(
+            (event_id for event_id in sampled_event_ids if event_id is not None),
+            default=None,
+        )
 
     def clear_state(self, session: GenerateSession) -> None:
         state = session.adapter_state

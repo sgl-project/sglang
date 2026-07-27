@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
+    MINWM_ACTION_LABELS_CONDITION,
     MINWM_ACTION_WEIGHTS_CONDITION,
+    MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
     MinWMCausalDMDConfig,
     minwm_t5_postprocess_text,
@@ -108,6 +110,51 @@ def test_minwm_realtime_state_preserves_single_key_direction(key, expected_label
     state.receive_camera_state([key], event_id=17)
     assert state.sample_action_labels(4) == [expected_label] * 4
     assert state.latest_sampled_event_id == 17
+
+
+def test_minwm_realtime_action_switch_reaches_next_chunk():
+    state = MinWMRealtimeState()
+    session = SimpleNamespace(
+        adapter_state=state,
+        request=SimpleNamespace(prompt="street", max_chunks=None),
+    )
+    adapter = MinWMRealtimeAdapter()
+    server_args = SimpleNamespace()
+
+    idle = adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=0), chunk_size=4
+    )
+    assert idle.condition_inputs[MINWM_ACTION_LABELS_CONDITION] == [0, 0, 0, 0]
+
+    state.receive_camera_state(["l"], event_id=21)
+    turning = adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=1), chunk_size=4
+    )
+    assert turning.condition_inputs[MINWM_ACTION_LABELS_CONDITION] == [1, 1, 1, 1]
+    assert adapter.get_realtime_event_id(session) == 21
+
+
+def test_minwm_prompt_switch_reports_prompt_event_after_older_camera_event():
+    state = MinWMRealtimeState()
+    session = SimpleNamespace(
+        adapter_state=state,
+        request=SimpleNamespace(prompt="day", max_chunks=None),
+    )
+    adapter = MinWMRealtimeAdapter()
+    server_args = SimpleNamespace()
+
+    state.receive_camera_state(["w"], event_id=17)
+    adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=0), chunk_size=4
+    )
+    state.receive_prompt("snowy night", event_id=23)
+    switched = adapter.sample_chunk_inputs(
+        session, server_args, SimpleNamespace(index=1), chunk_size=4
+    )
+
+    assert switched.prompt == "snowy night"
+    assert switched.condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] is True
+    assert adapter.get_realtime_event_id(session) == 23
 
 
 def test_minwm_action_validation_is_exact_integer_labels():

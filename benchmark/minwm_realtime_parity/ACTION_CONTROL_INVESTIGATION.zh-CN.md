@@ -2,10 +2,17 @@
 
 更新时间：2026-07-27
 
+> 2026-07-27 纠正：本文最初用“固定 action 的独立 session 会改变视频”
+> 推断 WebSocket 同 session 的动态控制链路也正常，这个推断不成立。静态 case
+> 只能证明 checkpoint 和 action conditioner 有响应，不能证明事件在正在运行的
+> session 中被正确采样、送入目标 chunk，并被 Web UI 切换显示。动态 prompt/action
+> 问题的逐层复现和修复见
+> [`REALTIME_CONTROL_SWITCH_INVESTIGATION.zh-CN.md`](./REALTIME_CONTROL_SWITCH_INVESTIGATION.zh-CN.md)。
+
 ## 1. 结论
 
-目前没有证据支持“WASD 或 IJKL/方向键在 SGLang 中映射反了”。同 prompt、首帧、
-seed、分辨率下的最新 0724 checkpoint 实测显示：
+固定 action 的独立 session 没有证据支持“WASD 或 IJKL/方向键映射反了”。同
+prompt、首帧、seed、分辨率下的最新 0724 checkpoint 实测显示：
 
 - `i/k` 的 pitch 方向相反且符合约定；
 - `j/l` 的 yaw 方向相反且符合约定；
@@ -14,7 +21,8 @@ seed、分辨率下的最新 0724 checkpoint 实测显示：
 - 把幅度统一改成 `0.8` 不是修复：它会明显削弱 yaw，`i=0.8` 在本 case 中几乎
   退化成 idle。
 
-用户在 Web UI 中感觉“控制不符合预期”，更可能来自三件事叠加：
+这些结果不解释 Web UI 中途切换不生效的问题。后者必须按同一 WebSocket session
+逐 chunk 验证；不能归因成下列体验差异：
 
 1. UI 展示的是 LingBot 的确定性几何步长，例如 `0.05/frame`、`4/6 deg/frame`；
    MinWM 的 primitive action 是 learned checkpoint-relative condition，没有这些
@@ -22,13 +30,16 @@ seed、分辨率下的最新 0724 checkpoint 实测显示：
 2. UI 状态事件按 140 ms 合并，MinWM adapter 再按 4 个 latent frame 的 chunk
    采样。短按会折叠成至少一个 latent action；长按最早也只能影响下一个尚未开始
    去噪的 chunk，不会修改正在生成的 chunk。
-3. 模型对平移 primitive 的可控性弱于 yaw/pitch。这个现象在绕过 UI、直接向 API
-   发送恒定 label 时仍存在，因此不是键盘事件或 label 表造成的。
+3. 模型对平移 primitive 的可控性弱于 yaw/pitch。这个现象在绕过 UI、直接以
+   固定 label 启动独立 session 时仍存在，但它不能证明动态事件链路正常。
 
-本次没有反转任何 action mapping。部署 manifest 已把误导性的物理步长改为
-`checkpoint-relative`（尚未滚动更新当前 live Pod）；后续若要改善手感，应先量化
-event-to-render latency 和 checkpoint 的方向响应，再决定是否增加按键幅度/持续
-时间策略。
+本次没有反转 action mapping。动态链路的根因、事件 ID 缺陷和修复验证独立记录在
+上面的调查文档中。
+
+后续同-session GPU 补测已经确认：WASD/IJKL 8 个 state-mode held key 都从首个
+携带事件 ID 的 chunk 开始改变输出；whole-DiT compile off/on 都成立。因此本文
+关于“平移响应弱”的结论是视觉 controllability 结论，不是“action 未进入模型”的
+结论。
 
 ## 2. 核对的参考实现
 
