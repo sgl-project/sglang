@@ -34,7 +34,7 @@ export const QwenImageDeployment = () => {
       }
     },
 
-    generateCommand: function (values) {
+    generateCommand: function(values) {
       if (values.hardware === 'a2') {
         return `sglang serve \\
   --model-path Qwen/Qwen-Image \\
