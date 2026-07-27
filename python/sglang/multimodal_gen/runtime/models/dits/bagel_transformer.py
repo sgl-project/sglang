@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from sglang.jit_kernel.rmsnorm_hf import (
+from sglang.kernels.ops.layernorm.rmsnorm_hf import (
     can_use_rmsnorm_hf,
     is_supported_rmsnorm_hf_hidden_size,
     rmsnorm_hf,
@@ -566,7 +566,7 @@ def _run_bagel_flash_attention(
     version: int,
 ) -> Tensor:
     """Run SGLang's packed FA3/FA4 implementation."""
-    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 
     cu_query = F.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
     cu_key = F.pad(torch.cumsum(key_lens, dim=0), (1, 0)).to(torch.int32)
