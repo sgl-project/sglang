@@ -240,7 +240,7 @@ class StreamingSession(BasePrefixCache):
 
         req = params.req
 
-        # [NPU ascend workaround] Ascend's npu_fused_infer_attention_score_v2
+        # [NPU workaround] npu_fused_infer_attention_score_v2
         # reads KV at page granularity. When prefix_len is not page-aligned,
         # the kernel reads stale/uninitialized KV slots in the partial page
         # tail, corrupting attention output. Floor-align prefix_len to
@@ -277,7 +277,7 @@ class StreamingSession(BasePrefixCache):
             f"{slot.cache_protected_len=}"
         )
 
-        # Floor-align prefix_len to page boundary (NPU ascend workaround).
+        # Floor-align prefix_len to page boundary (NPU workaround).
         if self.page_size > 1:
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv_committed_len = min(req.kv_committed_len, prefix_len)
