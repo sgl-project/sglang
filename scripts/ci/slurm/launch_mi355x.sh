@@ -42,6 +42,11 @@
 #   SLURM_EXCLUSIVE    - request whole nodes (default 1); set 0 to disable
 #   TIME_LIMIT         - salloc time limit, default 02:30:00 (covers server
 #                        load + perf sweep + full GSM8K, under the 180m step cap)
+#   BENCH_PHASE_TIMEOUT - per-phase wall-clock budget in seconds for the GSM8K
+#                        gate and each concurrency point, default 600. Observed
+#                        phases run 50-80s, so this is ~8x headroom; it exists
+#                        so one request that never completes fails its phase in
+#                        minutes instead of holding the sweep until TIME_LIMIT.
 
 set -euo pipefail
 set -x
@@ -57,6 +62,7 @@ set -x
 
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
+BENCH_PHASE_TIMEOUT="${BENCH_PHASE_TIMEOUT:-600}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
 SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
 case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
@@ -828,25 +834,45 @@ $PREFILL_WAIT_ROUTER
       echo "=== GSM8K accuracy gate (num_questions=$ACC_NQ shots=$ACC_SHOTS) ==="
       DP_ARG=""
       [ -s \$CIDIR/gsm8k_test.jsonl ] && DP_ARG="--data-path \$CIDIR/gsm8k_test.jsonl"
+      timeout -k 30 $BENCH_PHASE_TIMEOUT \
       python3 -m sglang.test.few_shot_gsm8k \
         --num-shots $ACC_SHOTS --num-questions $ACC_NQ --parallel $MAXREQ \
         --max-new-tokens 512 --host http://127.0.0.1 --port $LBPORT \
         \$DP_ARG 2>&1 | tee \$CIDIR/gsm8k.log
       ACC=\$(grep -oE "Accuracy: [0-9.]+" \$CIDIR/gsm8k.log | tail -1 | cut -d" " -f2)
-      [ -n "\$ACC" ] || { echo "[gsm8k] could not parse accuracy from harness output"; exit 1; }
+      [ -n "\$ACC" ] || { echo "[gsm8k] no accuracy in harness output -- it crashed or exceeded the ${BENCH_PHASE_TIMEOUT}s phase budget"; exit 1; }
       python3 \$CIDIR/check_acc.py "\$ACC" "$ACC_THR" || { echo "[gsm8k] accuracy below threshold -- failing before sweep"; exit 1; }
     fi
+    # bench_serving waits on each response stream with no per-request deadline,
+    # so a single reply that never terminates parks the sweep here until SLURM
+    # kills the allocation at TIME_LIMIT and every later concurrency point is
+    # lost. Bound each phase instead: a stuck point dies in minutes, the rest of
+    # the sweep still produces numbers, and the leg fails at the end.
+    SWEEP_TIMED_OUT=""
     for C in ${CONCS//,/ }; do
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
+      RC=0
+      timeout -k 30 $BENCH_PHASE_TIMEOUT \
       python3 -m sglang.bench_serving --backend sglang \
         --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \
         --num-prompts \$((C*$NPF)) --warmup-requests \$C \
-        --output-file \$OUT || true
+        --output-file \$OUT || RC=\$?
+      case \$RC in
+        0) ;;
+        # 124 = timeout sent SIGTERM; 137 = the -k SIGKILL was needed.
+        124|137) echo "[bench] concurrency=\$C exceeded the ${BENCH_PHASE_TIMEOUT}s phase budget -- killed"
+                 SWEEP_TIMED_OUT="\$SWEEP_TIMED_OUT \$C" ;;
+        *) echo "[bench] concurrency=\$C failed (rc=\$RC)" ;;
+      esac
     done
+    if [ -n "\$SWEEP_TIMED_OUT" ]; then
+      echo "[bench] FAILED: phase budget exceeded at concurrency:\$SWEEP_TIMED_OUT"
+      exit 1
+    fi
   '
 EOF
 chmod +x "$WORKDIR"/*.sh
