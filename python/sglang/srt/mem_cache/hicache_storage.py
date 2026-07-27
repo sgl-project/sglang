@@ -375,15 +375,19 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
+        self.mla_suffix = f"_{model_name}"
+        self.mha_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
         if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
+            pp_suffix = f"_{pp_size}_{pp_rank}"
+            self.mla_suffix += pp_suffix
+            self.mha_suffix += pp_suffix
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+            cp_suffix = f"_cp{attn_cp_rank}_{attn_cp_size}"
+            self.mla_suffix += cp_suffix
+            self.mha_suffix += cp_suffix
+        self.config_suffix = self.mla_suffix if is_mla_model else self.mha_suffix
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -436,7 +440,21 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        if component_name == PoolName.MAMBA:
+            component_suffix = self.mha_suffix
+        elif component_name in (
+            PoolName.INDEXER,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ):
+            component_suffix = self.mla_suffix
+        else:
+            component_suffix = self.config_suffix
+        return f"{key}.{component_name}{component_suffix}"
 
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
@@ -463,8 +481,9 @@ class HiCacheFile(HiCacheStorage):
         key: str,
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
+        component_name: Optional[str] = None,
     ) -> torch.Tensor | None:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, component_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
@@ -501,12 +520,13 @@ class HiCacheFile(HiCacheStorage):
         value: Optional[Any] = None,
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
+        component_name: Optional[str] = None,
     ) -> bool:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, component_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
-        if self.exists(key):
+        if self.exists(key, component_name):
             logger.debug(f"Key {key} already exists. Skipped.")
             self._evictor.touch(suffixed, tensor_path)
             return True
@@ -556,8 +576,8 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
-    def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
+    def exists(self, key: str, component_name: Optional[str] = None) -> bool:
+        key = self._get_component_key(key, component_name)
         if self.metadata_cache is not None and self.metadata_cache.contains(key):
             return True
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
@@ -647,13 +667,13 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
-    def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
-
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        data_page = self.get(
+            key,
+            host_pool.get_dummy_flat_data_page(),
+            component_name=pool_name,
+        )
         if data_page is None:
             return False
         host_pool.set_from_flat_data_page(page_offset, data_page)
@@ -663,9 +683,8 @@ class HiCacheFile(HiCacheStorage):
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
-        storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(storage_key, data_page)
+        return self.set(key, data_page, component_name=pool_name)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}
