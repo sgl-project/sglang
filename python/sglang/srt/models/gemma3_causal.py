@@ -14,10 +14,12 @@
 # limitations under the License.
 # ==============================================================================
 import copy
+import json
 from typing import Iterable, List, Optional, Set, Tuple
 
 import einops
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,
@@ -46,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
+from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -966,8 +969,49 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         self.model = Gemma3TextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+        # SentenceTransformers applies mean pooling, then its optional Dense
+        # projector modules, then L2 normalization. Keep normalization outside
+        # Pooler so this ordering is preserved.
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+        self.projector = self._build_sentence_transformer_projector(config)
         self.capture_aux_hidden_states = False
+
+    @staticmethod
+    def _build_sentence_transformer_projector(config: Gemma3TextConfig):
+        """Create the checkpoint's SentenceTransformers Dense tail, if present."""
+        model_path = getattr(config, "_name_or_path", "")
+        try:
+            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            with open(modules_path) as f:
+                module_specs = json.load(f)
+
+            layers = []
+            for spec in module_specs:
+                if spec.get("type") != "sentence_transformers.models.Dense":
+                    continue
+                dense_config_path = _resolve_local_or_cached_file(
+                    model_path, f"{spec['path']}/config.json"
+                )
+                with open(dense_config_path) as f:
+                    dense_config = json.load(f)
+                if dense_config.get("activation_function") not in (
+                    None,
+                    "torch.nn.modules.linear.Identity",
+                ):
+                    raise ValueError(
+                        "EmbeddingGemma only supports identity SentenceTransformers "
+                        "Dense activations"
+                    )
+                layers.append(
+                    nn.Linear(
+                        dense_config["in_features"],
+                        dense_config["out_features"],
+                        bias=dense_config.get("bias", True),
+                    )
+                )
+            return nn.Sequential(*layers) if layers else None
+        except (FileNotFoundError, OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
 
     @torch.no_grad()
     def forward(
@@ -983,7 +1027,10 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, **kwargs
         )
-        return self.pooler(hidden_states, forward_batch)
+        pooled = self.pooler(hidden_states, forward_batch).embeddings
+        if self.projector is not None:
+            pooled = self.projector(pooled)
+        return EmbeddingPoolerOutput(embeddings=F.normalize(pooled, p=2, dim=-1))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load both native Gemma3 and Sentence Transformers checkpoints.
@@ -1004,7 +1051,28 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
             for name, weight in weights
             if name.startswith("model.") or name.startswith(backbone_prefixes)
         )
-        return super().load_weights(remapped_weights)
+        loaded_params = super().load_weights(remapped_weights)
+        if self.projector is not None:
+            model_path = getattr(self.config, "_name_or_path", "")
+            modules_path = _resolve_local_or_cached_file(model_path, "modules.json")
+            with open(modules_path) as f:
+                module_specs = json.load(f)
+            dense_specs = [
+                spec
+                for spec in module_specs
+                if spec.get("type") == "sentence_transformers.models.Dense"
+            ]
+            from safetensors.torch import load_file
+
+            for layer, spec in zip(self.projector, dense_specs):
+                weights_path = _resolve_local_or_cached_file(
+                    model_path, f"{spec['path']}/model.safetensors"
+                )
+                weights = load_file(weights_path, device="cpu")
+                layer.weight.data.copy_(weights["weight"].to(layer.weight.device))
+                if layer.bias is not None:
+                    layer.bias.data.copy_(weights["bias"].to(layer.bias.device))
+        return loaded_params
 
 
 EntryClass = [Gemma3ForCausalLM, EmbeddingGemmaModel]
