@@ -139,10 +139,8 @@ PermissionError: [Errno 13] Permission denied: '/work/torchinductor'
 在 B200 容器中执行：
 
 ```text
-pytest test_minwm_realtime.py \
-  -k "action_switch_reaches_next_chunk or
-      prompt_switch_reports_prompt_event or
-      realtime_state_preserves_single_key_direction"
+pytest -q \
+  python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py
 ```
 
 结果：
@@ -185,7 +183,8 @@ prompt event correlation。测试在 B200 serving 容器内执行，并显式移
 
 ### 5.1 whole-DiT compile off
 
-WebP 是无损比较之外的预览传输格式；这里对完整的逐帧 WebP payload 做 SHA-256。
+WebP 是 UI 使用的预览传输格式（默认允许有损编码）；这里对完整的逐帧 WebP payload
+做 SHA-256。
 验收只依赖“相同输入是否得到相同字节”和“事件后是否改变”，不把 WebP hash 当成
 latent/像素 bitwise parity 指标。
 
@@ -225,6 +224,12 @@ latent/像素 bitwise parity 指标。
 
 whole-DiT compile 没有固化 prompt 或 action。prompt switch 第一次会触发额外图形/缓存
 路径，因此测试耗时比普通稳态 chunk 长，但后续输出语义正确。
+
+上述实验已经闭环到 WebSocket 返回帧，但没有把“浏览器实际显示出的第一帧”当成
+GPU 验收信号。prompt 的播放器 cutover 缺陷已由 event ID 机制直接定位并修复；
+action 的服务端动态路径则没有复现“不生效”。如果重新部署后浏览器里 action 仍无
+可见响应，需要保留 `keydown → event send → sampled event ID → first rendered frame`
+四段时间和对应录屏继续定位，不能把服务端 hash 变化直接等同于交互手感已经通过。
 
 ## 6. 部署影响
 
