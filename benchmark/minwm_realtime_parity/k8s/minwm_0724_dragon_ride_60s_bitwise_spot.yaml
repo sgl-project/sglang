@@ -1,35 +1,36 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-0724-dragon60-bitwise-20260727-02
+  name: minwm-0724-dragon60-bitwise-20260727-03
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-02
+    app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-03
     seedleap.ai/task: minwm-realtime-parity
     seedleap.ai/run-id: 0724-dragon-ride-60s-main-bitwise-attempt02
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: 952c67ac3347a17ed4f528e39cb0d4b8550019a5
+    seedleap.ai/sglang-git-ref: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
     seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     seedleap.ai/config-sha256: a5eac8a1478a5c9da63494439302f26671636b44445b0b9fd1496d59d8d2546d
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/capacity-type: spot
     seedleap.ai/kv-contract: unbounded-local-attn-sink4
+    seedleap.ai/retry-of: minwm-0724-dragon60-bitwise-20260727-02
 spec:
   completionMode: Indexed
   completions: 1
   parallelism: 1
-  backoffLimit: 0
+  backoffLimit: 1
   activeDeadlineSeconds: 21600
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-02
+        app.kubernetes.io/name: minwm-0724-dragon60-bitwise-20260727-03
         seedleap.ai/task: minwm-realtime-parity
         seedleap.ai/run-id: 0724-dragon-ride-60s-main-bitwise-attempt02
         seedleap.ai/owner: chenshengdong
       annotations:
-        seedleap.ai/sglang-git-ref: 952c67ac3347a17ed4f528e39cb0d4b8550019a5
+        seedleap.ai/sglang-git-ref: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
         seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
     spec:
       restartPolicy: Never
@@ -56,7 +57,7 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: 952c67ac3347a17ed4f528e39cb0d4b8550019a5
+              value: 19ab48c1bb360c26651a6348fd07bfb109bdb47f
             - name: MINWM_GIT_REF
               value: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
             - name: MINWM_BENCHMARK_MODE
