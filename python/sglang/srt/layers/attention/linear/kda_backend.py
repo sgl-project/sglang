@@ -567,7 +567,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 mixed_qkv=mixed_qkv,
                 conv_weight=layer.conv_weights,
                 conv_bias=layer.bias,
-                conv_state=conv_states,
+                # Same [.., dim, width] view the reference causal_conv1d_update
+                # call below takes: upstream stores the persistent conv state
+                # width-major, and the kernel asserts the dim axis is
+                # contiguous. (intermediate_conv_window is transposed on both
+                # the fork and upstream, so it needs no extra adjustment.)
+                conv_state=conv_states.transpose(-1, -2),
                 conv_state_indices=conv_state_indices,
                 intermediate_conv_window=(
                     intermediate_conv_window_cache.transpose(-1, -2)
