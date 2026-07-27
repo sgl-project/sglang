@@ -2230,10 +2230,8 @@ class BagelTransformer(BaseDiT):
                     renorm_min=cfg_renorm_min,
                     renorm_type=cfg_renorm_type,
                 )
-        # Official BAGEL keeps the Euler state in FP32 even though each model
-        # evaluation runs in BF16. The standard FlowMatch scheduler preserves
-        # the model-output dtype, so return FP32 velocity to retain that state.
-        conditional = conditional.float()
+        # Preserve official BF16 velocity rounding. The BAGEL scheduler keeps
+        # the persistent Euler state in FP32 without upcasting this delta first.
         if hidden_states.shape[0] == 1:
             return conditional.unsqueeze(0) if had_batch_dimension else conditional
         return conditional
@@ -2584,7 +2582,13 @@ class BagelTransformer(BaseDiT):
         correction = (original_norm / (guided_norm + 1e-8)).clamp(
             min=renorm_min, max=1.0
         )
-        return guided * correction
+        output = guided * correction
+        if renorm_type == "global" and conditional.ndim == 3:
+            # CUDA autocast computes norms in FP32. A batched global correction
+            # has shape [B, 1, 1] and would otherwise promote BF16 velocity to
+            # FP32, unlike each equivalent singleton's scalar correction.
+            output = output.to(guided.dtype)
+        return output
 
     @staticmethod
     def _apply_cfg_three_way(

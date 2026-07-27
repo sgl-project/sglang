@@ -375,7 +375,12 @@ class BagelPipeline(ComposedPipelineBase):
 
         required_modules = set(self._required_config_modules)
         if "scheduler" in required_modules and "scheduler" not in modules:
-            modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=1.0)
+            # Official BAGEL rounds each BF16 velocity delta before applying it
+            # to a persistent FP32 Euler state.
+            modules["scheduler"] = FlowMatchEulerDiscreteScheduler(
+                shift=1.0,
+                preserve_sample_dtype=True,
+            )
 
         weight_backed_components = required_modules & {
             "transformer",

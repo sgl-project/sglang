@@ -145,7 +145,10 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         stage = BagelBeforeDenoisingStage.__new__(BagelBeforeDenoisingStage)
         stage.transformer = _FakeTransformer()
         stage.tokenizer = _FakeTokenizer()
-        stage.scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
+        stage.scheduler = FlowMatchEulerDiscreteScheduler(
+            shift=1.0,
+            preserve_sample_dtype=True,
+        )
         stage._special_token_ids = None
         stage._component_residency_manager = None
         stage._registered_stage_name = "bagel_before_denoising_stage"
@@ -163,6 +166,26 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         self.assertEqual(len(batch.generator), 1)
         self.assertEqual(batch.generator[0].device.type, "cpu")
         self.assertEqual(batch.generator[0].initial_seed(), 42)
+
+    def test_scheduler_sample_dtype_preservation_is_opt_in(self) -> None:
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
+        scheduler.set_timesteps(
+            sigmas=[1.0],
+            timesteps=[1.0],
+            device="cpu",
+        )
+        sample = torch.ones(2, dtype=torch.float32)
+        model_output = torch.ones(2, dtype=torch.bfloat16)
+
+        next_latents = scheduler.step(
+            model_output=model_output,
+            timestep=scheduler.timesteps[0],
+            sample=sample,
+            return_dict=False,
+        )[0]
+
+        self.assertFalse(scheduler.config.preserve_sample_dtype)
+        self.assertEqual(next_latents.dtype, torch.bfloat16)
 
     def test_exact_n_step_shifted_schedule_and_request_isolation(self) -> None:
         stage = self._make_stage()
@@ -192,6 +215,7 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         self.assertEqual(len(output_a.scheduler.sigmas), 5)
         self.assertEqual(output_a.scheduler.sigmas[-1].item(), 0.0)
         self.assertEqual(output_a.scheduler.shift, 1.0)
+        self.assertTrue(output_a.scheduler.config.preserve_sample_dtype)
         self.assertIsNot(output_a.scheduler, stage.scheduler)
         self.assertIsNot(output_a.scheduler, output_b.scheduler)
         self.assertIsNot(
@@ -204,13 +228,29 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         context = output_a.extra["bagel_context"]
         self.assertEqual(context.start_of_image_token_id, 151652)
         self.assertEqual(context.end_of_image_token_id, 151653)
+        model_output = torch.full_like(
+            output_a.latents,
+            1.0 / 3.0,
+            dtype=torch.bfloat16,
+        )
+        expected_next_latents = (
+            output_a.latents
+            + (output_a.scheduler.sigmas[1] - output_a.scheduler.sigmas[0])
+            * model_output
+        )
         next_latents = output_a.scheduler.step(
-            model_output=torch.zeros_like(output_a.latents),
+            model_output=model_output,
             timestep=output_a.timesteps[0],
             sample=output_a.latents,
             return_dict=False,
         )[0]
         self.assertEqual(next_latents.dtype, torch.float32)
+        torch.testing.assert_close(
+            next_latents,
+            expected_next_latents,
+            rtol=0,
+            atol=0,
+        )
 
     def test_generator_from_input_validation_is_used_without_replacement(self) -> None:
         stage = self._make_stage()
@@ -404,6 +444,24 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
 
 
 class TestBagelLoaderContract(unittest.TestCase):
+    def test_default_scheduler_preserves_official_fp32_euler_state(self) -> None:
+        pipeline = BagelPipeline.__new__(BagelPipeline)
+        pipeline.model_path = "must-not-be-resolved"
+        modules = {
+            "transformer": _FakeTransformer(),
+            "vae": torch.nn.Identity(),
+            "tokenizer": _FakeTokenizer(),
+        }
+
+        with patch.object(
+            BagelPipeline,
+            "_resolve_checkpoint",
+            side_effect=AssertionError("snapshot resolution must not run"),
+        ):
+            loaded = pipeline.load_modules(_server_args(), modules)
+
+        self.assertTrue(loaded["scheduler"].config.preserve_sample_dtype)
+
     def test_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
         pipeline = BagelPipeline.__new__(BagelPipeline)
         pipeline.model_path = "must-not-be-resolved"

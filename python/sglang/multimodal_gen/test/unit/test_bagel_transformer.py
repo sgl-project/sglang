@@ -340,7 +340,7 @@ def test_disabled_taylorseer_preserves_pre_acceleration_singleton_math(
         2.0,
         renorm_min=0.0,
         renorm_type="global",
-    ).float()
+    )
 
     actual = tiny_transformer(
         latents,
@@ -1498,30 +1498,63 @@ def test_internal_cfg_matches_bagel_global_renorm() -> None:
 
 
 def test_batched_global_cfg_renorm_is_sample_local() -> None:
-    conditional = torch.tensor([[[2.0, 0.0]], [[0.0, 4.0]]])
-    unconditional = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
-
-    batched = BagelTransformer._apply_cfg(
-        conditional,
-        unconditional,
-        4.0,
-        renorm_min=0.0,
-        renorm_type="global",
-    )
-    sequential = torch.stack(
+    conditional = torch.tensor(
         [
-            BagelTransformer._apply_cfg(
-                conditional[index],
-                unconditional[index],
-                4.0,
-                renorm_min=0.0,
-                renorm_type="global",
-            )
-            for index in range(2)
-        ]
+            [[2.0, -0.75, 0.25], [0.5, 1.25, -1.5]],
+            [[-0.5, 4.0, 0.75], [1.5, -2.25, 0.125]],
+        ],
+        dtype=torch.bfloat16,
     )
+    unconditional = torch.tensor(
+        [
+            [[1.0, 0.5, -0.25], [-0.75, 0.25, 1.0]],
+            [[0.25, 1.0, -1.25], [0.5, -0.5, 0.375]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    vector_norm = torch.linalg.vector_norm
 
-    torch.testing.assert_close(batched, sequential)
+    def fp32_vector_norm(
+        value: torch.Tensor,
+        dim: int | tuple[int, ...] | None = None,
+        keepdim: bool = False,
+    ) -> torch.Tensor:
+        return vector_norm(value.float(), dim=dim, keepdim=keepdim)
+
+    # CUDA autocast executes vector_norm in FP32. Emulate that promotion on
+    # CPU so this test protects the batch/sequential velocity dtype contract.
+    with patch.object(torch.linalg, "vector_norm", side_effect=fp32_vector_norm):
+        batched = BagelTransformer._apply_cfg(
+            conditional,
+            unconditional,
+            4.0,
+            renorm_min=0.0,
+            renorm_type="global",
+        )
+        sequential = torch.stack(
+            [
+                BagelTransformer._apply_cfg(
+                    conditional[index],
+                    unconditional[index],
+                    4.0,
+                    renorm_min=0.0,
+                    renorm_type="global",
+                )
+                for index in range(2)
+            ]
+        )
+        channel_output = BagelTransformer._apply_cfg(
+            conditional[0],
+            unconditional[0],
+            4.0,
+            renorm_min=0.0,
+            renorm_type="channel",
+        )
+
+    assert batched.dtype == torch.bfloat16
+    assert sequential.dtype == torch.bfloat16
+    assert channel_output.dtype == torch.float32
+    torch.testing.assert_close(batched, sequential, rtol=0, atol=0)
 
 
 def test_editing_context_has_three_request_owned_prefixes_with_shared_image_storage(
@@ -1666,9 +1699,9 @@ def test_generation_qk_stays_fp32_until_attention_cast(
         torch.randn(4, 4, dtype=torch.bfloat16),
         torch.tensor([0.5]),
         bagel_context=context,
-        guidance_scale=1.0,
+        guidance_scale=2.0,
     )
-    assert prediction.dtype == torch.float32
+    assert prediction.dtype == torch.bfloat16
 
 
 def test_prefix_decode_uses_bottom_right_causal_mask() -> None:

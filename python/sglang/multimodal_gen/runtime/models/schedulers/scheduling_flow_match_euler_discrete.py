@@ -94,6 +94,10 @@ class FlowMatchEulerDiscreteScheduler(
             The type of dynamic resolution-dependent timestep shifting to apply. Either "exponential" or "linear".
         stochastic_sampling (`bool`, defaults to False):
             Whether to use stochastic sampling.
+        preserve_sample_dtype (`bool`, defaults to False):
+            Preserve the input sample dtype after each deterministic Euler step.
+            The default keeps the established behavior of returning the model
+            output dtype.
     """
 
     _compatibles: list[Any] = []
@@ -116,6 +120,7 @@ class FlowMatchEulerDiscreteScheduler(
         use_beta_sigmas: bool | None = False,
         time_shift_type: str = "exponential",
         stochastic_sampling: bool = False,
+        preserve_sample_dtype: bool = False,
     ):
         if (
             sum(
@@ -500,7 +505,10 @@ class FlowMatchEulerDiscreteScheduler(
         if self.step_index is None:
             self._init_step_index(timestep)
 
-        # Upcast to avoid precision issues when computing prev_sample
+        # Upcast the state while retaining its requested output dtype. Some
+        # models intentionally keep a FP32 Euler state with lower-precision
+        # velocity deltas.
+        sample_dtype = sample.dtype
         sample = sample.to(torch.float32)
 
         if per_token_timesteps is not None:
@@ -542,8 +550,12 @@ class FlowMatchEulerDiscreteScheduler(
         assert self._step_index is not None, "_step_index should not be None"
         self._step_index += 1
         if per_token_timesteps is None:
-            # Cast sample back to model compatible dtype
-            prev_sample = prev_sample.to(model_output.dtype)
+            output_dtype = (
+                sample_dtype
+                if self.config.preserve_sample_dtype
+                else model_output.dtype
+            )
+            prev_sample = prev_sample.to(output_dtype)
 
         if isinstance(prev_sample, torch.Tensor | float) and not return_dict:
             return (prev_sample,)
