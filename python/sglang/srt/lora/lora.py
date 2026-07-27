@@ -92,6 +92,14 @@ class LoRAAdapter(nn.Module):
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
         self.pinned_added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
+        # --lora-no-cpu-backup: set once the CPU weight copies have been
+        # released after memory-pool installation. A released adapter can
+        # never be (re)installed into a pool slot.
+        self.weights_released: bool = False
+        # Shared-outer detection result cached before release so
+        # LoRAManager._detect_shared_outer_loras keeps working afterwards.
+        self.shared_outer_gate_up: Optional[bool] = None
+
     @staticmethod
     def _build_moe_gated_map(base_model: torch.nn.Module) -> Dict[int, bool]:
         """Map layer_id -> moe_runner_config.is_gated for FusedMoE base layers.
@@ -156,9 +164,14 @@ class LoRAAdapter(nn.Module):
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        self.load_weights_from_tensors_chunk(tensors)
+        self.finalize_weights_from_tensors()
+
+    def load_weights_from_tensors_chunk(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
+    def finalize_weights_from_tensors(self):
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
@@ -526,6 +539,49 @@ class LoRAAdapter(nn.Module):
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
+
+    def scan_shared_outer_gate_up(self) -> Optional[bool]:
+        """Return whether the adapter's gate_up lora_A is shared-outer
+        (3D expert_dim=1 -> True), per-expert (numbered 2D expert weights ->
+        False), or None if the adapter has no gate_up lora_A. Cached here so
+        LoRAManager._detect_shared_outer_loras still works after the CPU weight
+        copies are freed under --lora-no-cpu-backup."""
+        if self.weights_released:
+            return self.shared_outer_gate_up
+        result: Optional[bool] = None
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                if "gate_up_proj" not in name or "lora_A" not in name:
+                    continue
+                if weight.dim() == 3:
+                    is_shared = weight.shape[0] == 1
+                elif re.search(r"(?:shared_)?experts\.\d+\.", name):
+                    # Per-expert adapters keep numbered 2D expert weights;
+                    # they must count against the layout agreement too.
+                    is_shared = False
+                else:
+                    continue
+                if result is None:
+                    result = is_shared
+                elif result != is_shared:
+                    raise RuntimeError(
+                        "Mixed shared-outer LoRA formats within a single "
+                        "adapter's gate_up lora_A weights."
+                    )
+        return result
+
+    def release_cpu_weights(self):
+        """Free the CPU weight copies after memory-pool installation
+        (--lora-no-cpu-backup). The adapter cannot be installed again."""
+        self.shared_outer_gate_up = self.scan_shared_outer_gate_up()
+        for layer in self.layers:
+            layer.weights.clear()
+            layer.pinned_weights.clear()
+        self.embedding_layers.clear()
+        self.pinned_embedding_layers.clear()
+        self.added_tokens_embeddings.clear()
+        self.pinned_added_tokens_embeddings.clear()
+        self.weights_released = True
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

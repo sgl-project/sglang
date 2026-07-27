@@ -333,6 +333,35 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
+    from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA
+
+    lora_moe_modules = [
+        module for module in model.modules() if isinstance(module, FusedMoEWithLoRA)
+    ]
+    for module in lora_moe_modules:
+        module._clear_base_layer_parameter_references()
+
+    for _, module in model.named_modules():
+        if isinstance(module, BaseLayerWithLoRA):
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and hasattr(quant_method, hook_name):
+            with device_loading_context(module, target_device):
+                getattr(quant_method, hook_name)(module)
+
+    for module in lora_moe_modules:
+        module._sync_base_layer_parameters()
+        if hook_name == "process_weights_after_loading":
+            module._refresh_quant_info()
+
+
+def restore_weight(model: nn.Module, target_device) -> None:
+    _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
+
+
+def postprocess_weight(model: nn.Module, target_device) -> None:
+    _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 

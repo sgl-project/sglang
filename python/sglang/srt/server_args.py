@@ -2847,6 +2847,10 @@ class ServerArgs:
         ),
         NS("lora"),
     ] = False
+    lora_no_cpu_backup: A[
+        bool,
+        "Release each LoRA adapter's CPU weight copy right after it is installed into the GPU memory pool. Saves host memory for very large adapters, but makes re-installation impossible: adapter eviction from the memory pool is rejected with an error, so every loaded adapter must keep its pool slot (no swapping).",
+    ] = False
     lora_drain_wait_threshold: A[
         float,
         "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",

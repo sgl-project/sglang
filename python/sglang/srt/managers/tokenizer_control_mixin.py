@@ -662,6 +662,10 @@ class TokenizerControlMixin:
 
             async with self.lora_update_lock:
                 new_adapter = LoRARef(
+                    lora_id=LoRARef.deterministic_id(
+                        obj.lora_name,
+                        "__tensor__",
+                    ),
                     lora_name=obj.lora_name,
                     lora_path="__tensor__",
                     pinned=obj.pinned,
@@ -669,10 +673,14 @@ class TokenizerControlMixin:
                 obj.lora_id = new_adapter.lora_id
                 result = (await self.update_lora_adapter_communicator(obj))[0]
 
-                if result.success:
+                if result.success and obj.is_last_chunk:
                     await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                if self.server_args.max_loaded_loras is not None:
+                if (
+                    result.success
+                    and obj.is_last_chunk
+                    and self.server_args.max_loaded_loras is not None
+                ):
                     while (
                         self.lora_registry.num_registered_loras
                         > self.server_args.max_loaded_loras

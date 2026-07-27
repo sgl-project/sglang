@@ -23,12 +23,10 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.kernels.ops.activation import silu_and_mul
-    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
-        moe_sum_reduce_triton,
-    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        apply_gated_moe_activation,
+        apply_moe_reduction,
         get_scalar_type,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -69,7 +67,15 @@ class MarlinLoraRunnerCore:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
 
-        assert runner_config.activation == "silu", "Only SiLU activation is supported."
+        if runner_config.is_gated:
+            assert runner_config.activation in {
+                "silu",
+                "situ",
+            }, f"Only gated SiLU/SiTU is supported, got {runner_config.activation}."
+        elif runner_config.activation not in {"silu", "relu2"}:
+            raise ValueError(
+                f"Unsupported Marlin MoE activation: {runner_config.activation}"
+            )
         assert (
             torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
         ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
@@ -80,6 +86,26 @@ class MarlinLoraRunnerCore:
         N = quant_info.w2_qweight.shape[1] * 16
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
+        gemm1_n = 2 * N if runner_config.is_gated else N
+        is_mxfp4_marlin = (
+            num_bits == 4
+            and quant_info.w13_qzeros is None
+            and quant_info.w2_qzeros is None
+            and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
+            and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
+        )
+        if is_mxfp4_marlin:
+            assert hidden_states.dtype == torch.bfloat16, (
+                "MXFP4 Marlin LoRA requires bfloat16 activations, got "
+                f"{hidden_states.dtype}"
+            )
+            if (
+                quant_info.expert_map is not None
+                or runner_config.num_local_experts != runner_config.num_experts
+            ):
+                raise NotImplementedError(
+                    "MXFP4 Marlin MoE LoRA does not support expert parallelism"
+                )
 
         for block_size_m in [8, 16, 32, 48, 64]:
             if M * topk / E / block_size_m < 0.9:
@@ -112,10 +138,16 @@ class MarlinLoraRunnerCore:
             quant_info.w2_scales,
             quant_info.w2_global_scale,
         )
+        use_atomic_add = (
+            hidden_states.dtype == torch.half
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        ) and not is_mxfp4_marlin
 
         # Stage 1: Gate/Up (Marlin)
         intermediate_cache1 = torch.empty(
-            (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+            (M * topk, gemm1_n),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
@@ -138,17 +170,17 @@ class MarlinLoraRunnerCore:
             is_ep=quant_info.expert_map is not None,
             b_q_type=scalar_type1,
             size_m=M,
-            size_n=2 * N,
+            size_n=gemm1_n,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
 
         # Hook: after gate_up
         if hooks.after_gate_up:
-            intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * N)
+            intermediate_cache1_3d = intermediate_cache1.view(M, topk, gemm1_n)
             hooks.after_gate_up(
                 hidden_states, intermediate_cache1_3d, topk_weights, topk_ids
             )
@@ -157,7 +189,20 @@ class MarlinLoraRunnerCore:
         intermediate_cache2 = torch.empty(
             (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+        intermediate_cache2 = apply_gated_moe_activation(
+            intermediate_cache2,
+            intermediate_cache1,
+            activation=runner_config.activation,
+            is_gated=runner_config.is_gated,
+            gemm1_alpha=runner_config.gemm1_alpha,
+            clamp_limit=(
+                runner_config.gemm1_clamp_limit
+                if runner_config.gemm1_alpha is not None
+                else runner_config.swiglu_limit
+            ),
+            gemm1_n=gemm1_n,
+            n=N,
+        )
 
         # Stage 3: Down (Marlin)
         intermediate_cache3 = torch.empty(
@@ -190,7 +235,7 @@ class MarlinLoraRunnerCore:
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
@@ -205,9 +250,11 @@ class MarlinLoraRunnerCore:
         # Stage 4: Reduction. Never alias hidden_states even under inplace: the sink
         # forward still reads it (stock fused_experts_none_to_marlin does the same).
         output = torch.empty_like(hidden_states)
-        if routed_scaling_factor is None:
-            routed_scaling_factor = 1.0
-        # NOTE: fusion opportunity here
-        moe_sum_reduce_triton(intermediate_cache3, output, routed_scaling_factor)
+        apply_moe_reduction(
+            output,
+            intermediate_cache3,
+            is_mxfp4_marlin=is_mxfp4_marlin,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
         return StandardCombineInput(hidden_states=output)

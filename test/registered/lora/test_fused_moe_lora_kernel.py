@@ -141,6 +141,7 @@ def use_fused_moe_lora_kernel(
     mul_routed_weight,
     fully_sharded=False,
     offset=0,
+    output_slice_stride=0,
 ):
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
@@ -221,6 +222,7 @@ def use_fused_moe_lora_kernel(
         mul_routed_weight,
         fully_sharded=fully_sharded,
         offset=offset,
+        output_slice_stride=output_slice_stride,
     )
 
 
@@ -376,6 +378,101 @@ def test_fused_moe_lora_kernel(
     )
 
     torch.testing.assert_close(output, output2, atol=1e-2, rtol=1e-2)
+
+
+def test_fused_moe_lora_kernel_padded_output_slices():
+    device = "cuda:0"
+    set_random_seed(42)
+    num_tokens = 8
+    num_sequences = 2
+    max_loras = 1
+    num_experts = 4
+    top_k_num = 2
+    max_lora_rank = 8
+    logical_output_size = 16
+    physical_output_size = 32
+    hidden_size = 32
+
+    topk_ids, topk_weights, token_lora_mapping, seg_indptr, req_to_lora = sample_data(
+        num_tokens,
+        num_sequences,
+        max_loras,
+        num_experts,
+        top_k_num,
+    )
+    topk_ids = topk_ids.to(device)
+    topk_weights = topk_weights.to(device)
+    token_lora_mapping = token_lora_mapping.to(device)
+    seg_indptr = seg_indptr.to(device)
+    req_to_lora = req_to_lora.to(device)
+
+    lora_a_stacked = [
+        torch.rand(
+            max_loras,
+            num_experts,
+            max_lora_rank,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    lora_b_stacked = [
+        torch.rand(
+            max_loras,
+            num_experts,
+            logical_output_size,
+            max_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    hidden_states = torch.rand(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    output = torch.zeros(
+        num_tokens,
+        top_k_num,
+        2 * physical_output_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    use_fused_moe_lora_kernel(
+        topk_ids,
+        topk_weights,
+        seg_indptr,
+        req_to_lora,
+        max_lora_rank,
+        top_k_num,
+        lora_a_stacked,
+        lora_b_stacked,
+        hidden_states,
+        output,
+        max_loras,
+        num_experts,
+        block_size=16,
+        mul_routed_weight=False,
+        output_slice_stride=physical_output_size,
+    )
+
+    expected = torch.zeros_like(output)
+    for idx in range(2):
+        reference = use_torch(
+            hidden_states,
+            token_lora_mapping,
+            topk_ids,
+            topk_weights,
+            [lora_a_stacked[idx]],
+            [lora_b_stacked[idx]],
+            top_k_num,
+            mul_routed_weight=False,
+        )
+        start = idx * physical_output_size
+        expected[..., start : start + logical_output_size] = reference
+
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

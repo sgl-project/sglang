@@ -131,6 +131,86 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def apply_gated_moe_activation(
+    output: torch.Tensor,
+    gate_up: torch.Tensor,
+    *,
+    activation: str,
+    is_gated: bool,
+    gemm1_alpha: Optional[float],
+    clamp_limit: Optional[float],
+    gemm1_n: int,
+    n: int,
+) -> torch.Tensor:
+    """Stage-2 MoE activation dispatch, shared by ``fused_marlin_moe`` (no-LoRA)
+    and the Marlin LoRA runner so both cover the same activations from one place.
+
+    Gated variants write into ``output`` in place and return it; non-gated ones
+    return a fresh tensor. Callers collapse the two clamp config fields into
+    ``clamp_limit``: ``gemm1_clamp_limit`` for GPT-OSS (``gemm1_alpha`` set),
+    else ``swiglu_limit``.
+    """
+    if activation == "silu" and is_gated and gemm1_alpha is not None:
+        if clamp_limit is None:
+            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        swiglu_gpt_oss_sigmoid_alpha_contiguous(
+            output, gate_up.view(-1, gemm1_n), gemm1_alpha, clamp_limit
+        )
+    elif activation == "silu" and is_gated and clamp_limit is not None:
+        swiglu_limit_func(output, gate_up.view(-1, gemm1_n), clamp_limit)
+    elif activation == "silu" and is_gated:
+        silu_and_mul(gate_up.view(-1, gemm1_n), output)
+    elif activation == "situ" and is_gated:
+        situ_and_mul(
+            output,
+            gate_up.view(-1, gemm1_n),
+            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
+            linear_beta=clamp_limit,
+        )
+    elif activation == "silu" and not is_gated:
+        return F.silu(gate_up.view(-1, n))
+    elif activation == "relu2" and not is_gated:
+        return torch.square(F.relu(gate_up.view(-1, n)))
+    else:
+        raise ValueError(f"Unsupported activation: {activation=}, {is_gated=}")
+    return output
+
+
+def apply_moe_reduction(
+    output: torch.Tensor,
+    intermediate_cache3: torch.Tensor,
+    *,
+    is_mxfp4_marlin: bool,
+    routed_scaling_factor: Optional[float],
+) -> None:
+    """Stage-4 top-k reduction over experts, writing into ``output`` in place.
+    Shared by ``fused_marlin_moe`` (no-LoRA) and the Marlin LoRA runner.
+
+    MXFP4: top-k weights (incl. routed scaling) are already applied upstream via
+    mul_topk_weights, so this is a plain sum over the topk dim -- the JIT vectorized
+    moe_topk_sum (~1.5us at decode) beats sgl_kernel's moe_sum_reduce_kernel_general
+    (~5.7us) and at::native reduce (~6.7us) when the contiguous bf16 layout is
+    eligible; otherwise fall back to moe_sum_reduce. Other quant formats apply the
+    routed scaling factor here via moe_sum_reduce.
+    """
+    if is_mxfp4_marlin:
+        if (
+            intermediate_cache3.dtype == torch.bfloat16
+            and intermediate_cache3.is_contiguous()
+            and output.is_contiguous()
+            and intermediate_cache3.shape[-1] % 8 == 0
+        ):
+            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(intermediate_cache3, output)
+        else:
+            moe_sum_reduce(intermediate_cache3, output, 1.0)
+    else:
+        if routed_scaling_factor is None:
+            routed_scaling_factor = 1.0
+        moe_sum_reduce(intermediate_cache3, output, routed_scaling_factor)
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -324,36 +404,16 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and gemm1_alpha is not None:
-        if clamp_limit is None:
-            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
-            gemm1_alpha,
-            clamp_limit,
-        )
-    elif activation == "silu" and is_gated and clamp_limit is not None:
-        swiglu_limit_func(
-            intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
-            clamp_limit,
-        )
-    elif activation == "silu" and is_gated:
-        silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
-    elif activation == "situ" and is_gated:
-        situ_and_mul(
-            intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
-            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
-            linear_beta=clamp_limit,
-        )
-    elif activation == "silu" and not is_gated:
-        intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
-    elif activation == "relu2" and not is_gated:
-        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
-    else:
-        raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
+    intermediate_cache2 = apply_gated_moe_activation(
+        intermediate_cache2,
+        intermediate_cache1,
+        activation=activation,
+        is_gated=is_gated,
+        gemm1_alpha=gemm1_alpha,
+        clamp_limit=clamp_limit,
+        gemm1_n=gemm1_n,
+        n=N,
+    )
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -391,31 +451,10 @@ def fused_marlin_moe(
     if output is None:
         output = hidden_states if inplace else torch.empty_like(hidden_states)
 
-    if is_mxfp4_marlin:
-        # Top-k weights (incl. routed scaling) are already applied above via
-        # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
-        # vectorized pass (~1.5us at decode shapes) beats sgl_kernel's
-        # moe_sum_reduce_kernel_general (~5.7us) and the generic at::native
-        # reduce_kernel torch.sum dispatches to (~6.7us).
-        if (
-            intermediate_cache3.dtype == torch.bfloat16
-            and intermediate_cache3.is_contiguous()
-            and output.is_contiguous()
-            and intermediate_cache3.shape[-1] % 8 == 0
-        ):
-            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
-
-            moe_topk_sum(intermediate_cache3, output)
-        else:
-            moe_sum_reduce(intermediate_cache3, output, 1.0)
-        return output
-    else:
-        if routed_scaling_factor is None:
-            routed_scaling_factor = 1.0
-
-        moe_sum_reduce(
-            intermediate_cache3,
-            output,
-            routed_scaling_factor,
-        )
-        return output
+    apply_moe_reduction(
+        output,
+        intermediate_cache3,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    return output

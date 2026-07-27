@@ -62,6 +62,22 @@ def get_cw(
     return cw
 
 
+def refresh_cw(proj: ReplicatedLinear, norm: RMSNorm) -> None:
+    """Recompute every already-cached dtype after the weights were reloaded.
+
+    In place, not a rebind: cuda graph capture bakes in the cached tensor's
+    address, so replacing the cache entry would leave every replay reading the
+    buffer combined from the previous weights. A no-op before the first
+    ``get_cw`` -- nothing is cached yet, so the first call already sees the
+    fresh weights."""
+    cache = getattr(proj, "_attn_res_cw_cache", None)
+    if cache is None:
+        return
+    updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+    for dtype, cw in cache.items():
+        cw.copy_(updated.to(dtype))
+
+
 def _aggregate_fast(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,

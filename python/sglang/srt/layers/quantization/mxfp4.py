@@ -40,6 +40,7 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -1151,6 +1152,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # routes through `apply` without a MoeRunner. TODO(cwan): migrate.
             pass
 
+    def get_marlin_quant_info(self, layer: torch.nn.Module) -> MarlinMoeQuantInfo:
+        assert self.use_marlin, "Marlin quant info requires the Marlin backend"
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
+            weight_bits=4,
+            is_k_full=True,
+            w13_bias=getattr(layer, "w13_weight_bias", None),
+            w2_bias=getattr(layer, "w2_weight_bias", None),
+        )
+
     def _apply_sm90_cutlass(self, layer, dispatch_output):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
         path (PR #3084). Routed through the unified ``MoeRunner`` -- this
@@ -1269,7 +1285,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
-            return self._apply_marlin(layer, dispatch_output)
+            if x.shape[-1] == self.hidden_size:
+                x_padded = x
+            else:
+                x_padded = torch.nn.functional.pad(
+                    x, (0, self.hidden_pad), mode="constant", value=0.0
+                )
+            quant_info = self.get_marlin_quant_info(layer)
+            return self.runner.run(
+                dispatch_output._replace(hidden_states=x_padded), quant_info
+            )
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

@@ -36,7 +36,12 @@ from sglang.srt.layers import (
     zero_copy_context,
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.attn_residual import (
+    AttnResidual,
+    aggregate_stream,
+    get_cw,
+    refresh_cw,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -106,7 +111,7 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.utils import is_blackwell_supported, make_layers
+from sglang.srt.utils import bind_or_assign, is_blackwell_supported, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -984,17 +989,28 @@ class KimiK3MoE(nn.Module):
         return self.experts.forward_deferred_finalize(routed_input, topk_output)
 
     def _forward_shared(self, gate_up, shared_output):
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
         shared = self.shared_experts
         if TYPE_CHECKING:
             assert shared is not None and isinstance(
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        shared_act = shared.act_fn(gate_up)
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared_act,
             shared.down_proj.weight,
             out=shared_output,
         )
+        down_proj = shared.down_proj
+        if isinstance(down_proj, BaseLayerWithLoRA) and down_proj.set_lora:
+            # Tail fusion: LoRA B updates the shared down projection in place
+            # on top of the base GEMM, on whichever stream _forward_shared runs.
+            lora_output = down_proj.apply_lora(shared_output, shared_act)
+            assert (
+                lora_output.data_ptr() == shared_output.data_ptr()
+            ), "K3 tail fusion requires LoRA B to update base_output in-place"
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1026,6 +1042,13 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+        gate_up_proj = self.shared_experts.gate_up_proj
+        if isinstance(gate_up_proj, BaseLayerWithLoRA) and gate_up_proj.set_lora:
+            # The fused front GEMM computed the base shared projection; add the
+            # LoRA delta on top before _forward_shared consumes gate_up.
+            gate_up = gate_up_proj.apply_lora(gate_up.contiguous(), hidden_states)
         if num_tokens > 1 and self._moe_front_needs_contiguous:
             routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
@@ -1756,9 +1779,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
-            _orig_o_proj_forward = self.o_proj.forward
+            o_proj = self.o_proj
+            _orig_o_proj_forward = o_proj.forward
 
-            def _gated_o_proj_forward(x, *args, **kwargs):
+            def _apply_output_gate(x):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 precomputed = self._gate_precomputed
@@ -1782,9 +1806,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
-                return _orig_o_proj_forward(x, *args, **kwargs)
+                return x
 
-            self.o_proj.forward = _gated_o_proj_forward
+            def _gated_o_proj_forward(x, *args, **kwargs):
+                return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
+
+            # The LoRA wrapper must see the gated input (its A-side runs on
+            # o_proj's true input), so expose the gate as an input transform.
+            o_proj.lora_input_transform = _apply_output_gate
+            o_proj.forward = _gated_o_proj_forward
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
@@ -2829,16 +2859,32 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc,
+                w_kc.transpose(1, 2).contiguous().transpose(1, 2),
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                self_attn.w_scale = bind_or_assign(
+                    (
+                        self_attn.w_scale
+                        if isinstance(self_attn.w_scale, torch.Tensor)
+                        else None
+                    ),
+                    self_attn.kv_b_proj.weight_scale,
+                )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
         # multiply into every captured graph replay otherwise). Warm both
         # dtypes: the fast kernel consumes bf16, the triton fallback fp32.
+        # refresh_cw first so a re-run of post_load_weights (weight reload)
+        # updates the already-cached tensors in place instead of returning the
+        # values combined from the previous weights.
         def _warm_cw(proj, norm):
+            refresh_cw(proj, norm)
             get_cw(proj, norm, dtype=torch.bfloat16)
             get_cw(proj, norm)
 

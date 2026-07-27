@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -63,6 +64,90 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_LORA_PATTERN = re.compile(r"\.experts\.(\d+)\.")
+
+
+def _select_ranked_lora_payload(serialized_tensors, tp_rank: int, tp_size: int):
+    if isinstance(serialized_tensors, str):
+        return serialized_tensors
+    if len(serialized_tensors) != tp_size:
+        raise ValueError(
+            f"Expected one serialized LoRA payload per TP rank, got "
+            f"{len(serialized_tensors)} payloads for TP size {tp_size}"
+        )
+    return serialized_tensors[tp_rank]
+
+
+def _validate_lora_tensor_checksums(
+    tensors: dict[str, torch.Tensor],
+    expected_checksums: dict[str, str],
+    *,
+    tp_rank: int,
+) -> None:
+    import hashlib
+
+    actual_checksums = {
+        name: hashlib.sha256(
+            tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in tensors.items()
+    }
+    expected_names = set(expected_checksums)
+    actual_names = set(actual_checksums)
+    mismatches = sorted(
+        name
+        for name in expected_names & actual_names
+        if expected_checksums[name] != actual_checksums[name]
+    )
+    missing = sorted(expected_names - actual_names)
+    extra = sorted(actual_names - expected_names)
+    if mismatches or missing or extra:
+        raise RuntimeError(
+            f"[LORA-CHECK] rank{tp_rank} adapter sync mismatch: "
+            f"value_diff={mismatches[:5]}, missing={missing[:5]}, extra={extra[:5]}"
+        )
+    logger.info(
+        "[LORA-CHECK] rank%d adapter sync OK: %d tensors match (sha256)",
+        tp_rank,
+        len(expected_checksums),
+    )
+
+
+def _filter_lora_experts_for_ep_rank(
+    tensors: dict[str, torch.Tensor],
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+) -> dict[str, torch.Tensor]:
+    assert num_experts % ep_size == 0, (
+        f"LoRA expert filtering requires an even EP split, got "
+        f"{num_experts} experts across {ep_size} ranks"
+    )
+    num_local_experts = num_experts // ep_size
+    first_expert = ep_rank * num_local_experts
+    last_expert = first_expert + num_local_experts
+
+    def is_local(name: str) -> bool:
+        match = _EXPERT_LORA_PATTERN.search(name)
+        return match is None or first_expert <= int(match.group(1)) < last_expert
+
+    return {name: tensor for name, tensor in tensors.items() if is_local(name)}
+
+
+def _get_num_experts(hf_config) -> int:
+    if hasattr(hf_config, "num_experts") and hf_config.num_experts is not None:
+        return hf_config.num_experts
+    if (
+        hasattr(hf_config, "n_routed_experts")
+        and hf_config.n_routed_experts is not None
+    ):
+        return hf_config.n_routed_experts
+    raise AttributeError(
+        "Cannot filter expert LoRA tensors because the model config has neither "
+        "num_experts nor n_routed_experts"
+    )
 
 
 class BaseTpWorker(ABC):
@@ -208,55 +293,47 @@ class BaseTpWorker(ABC):
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
+        monkey_patch_torch_reductions()
+        serialized_tensors = _select_ranked_lora_payload(
+            recv_req.serialized_tensors,
+            self.ps.tp_rank,
+            self.ps.tp_size,
+        )
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
         if recv_req.load_format == "flattened_bucket":
-            flattened_data = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_tensors
-            )
+            flattened_data = MultiprocessingSerializer.deserialize(serialized_tensors)
             bucket = FlattenedTensorBucket(
                 flattened_tensor=flattened_data["flattened_tensor"],
                 metadata=flattened_data["metadata"],
             )
             tensors = dict(bucket.reconstruct_tensors())
         else:
-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+            tensors = MultiprocessingSerializer.deserialize(serialized_tensors)
         if recv_req.expected_checksums is not None:
-            import hashlib
-
-            exp = recv_req.expected_checksums
-            mismatch, missing = [], []
-            for name, want in exp.items():
-                if name not in tensors:
-                    missing.append(name)
-                    continue
-                got = hashlib.sha256(
-                    tensors[name]
-                    .detach()
-                    .cpu()
-                    .contiguous()
-                    .flatten()
-                    .view(torch.uint8)
-                    .numpy()
-                    .tobytes()
-                ).hexdigest()
-                if got != want:
-                    mismatch.append(name)
-            extra = [n for n in tensors if n not in exp]
-            if mismatch or missing or extra:
-                raise RuntimeError(
-                    f"[LORA-CHECK] rank{self.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
-                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
-                    f"{len(extra)} extra {extra[:5]}"
-                )
-            logger.info(
-                f"[LORA-CHECK] rank{self.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            _validate_lora_tensor_checksums(
+                tensors,
+                recv_req.expected_checksums,
+                tp_rank=self.ps.tp_rank,
+            )
+        if self.ps.moe_ep_size > 1 and any(
+            _EXPERT_LORA_PATTERN.search(name) for name in tensors
+        ):
+            tensors = _filter_lora_experts_for_ep_rank(
+                tensors,
+                num_experts=_get_num_experts(
+                    self.model_runner.model_config.hf_text_config
+                ),
+                ep_rank=self.ps.moe_ep_rank,
+                ep_size=self.ps.moe_ep_size,
             )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
             recv_req.config_dict,
             recv_req.added_tokens_config,
+            is_first_chunk=recv_req.is_first_chunk,
+            is_last_chunk=recv_req.is_last_chunk,
         )
         return result
 

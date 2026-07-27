@@ -96,6 +96,7 @@ class LoRAManager:
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
+        self.lora_no_cpu_backup: bool = server_args.lora_no_cpu_backup
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -528,6 +529,17 @@ class LoRAManager:
         # LoRA adapter weights cached in CPU memory, indexed by LoRA ID.
         self.loras: Dict[str, LoRAAdapter] = {}
 
+        self.pending_tensor_loras: Dict[
+            str,
+            tuple[
+                LoRARef,
+                LoRAConfig,
+                LoRAAdapter,
+                Dict,
+                Optional[Dict],
+            ],
+        ] = {}
+
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
 
@@ -555,27 +567,18 @@ class LoRAManager:
         """
         shared_outer: Optional[bool] = None
         for adapter_id, adapter in self.loras.items():
-            for layer in adapter.layers:
-                for name, weight in layer.weights.items():
-                    if "gate_up_proj" not in name or "lora_A" not in name:
-                        continue
-                    if weight.dim() == 3:
-                        is_shared = weight.shape[0] == 1
-                    elif re.search(r"(?:shared_)?experts\.\d+\.", name):
-                        # Per-expert adapters keep numbered 2D expert weights;
-                        # they must count against the layout agreement too.
-                        is_shared = False
-                    else:
-                        continue
-                    if shared_outer is None:
-                        shared_outer = is_shared
-                    elif shared_outer != is_shared:
-                        raise RuntimeError(
-                            "Mixed shared-outer LoRA formats detected across "
-                            f"loaded adapters (conflict in adapter '{adapter_id}'). "
-                            "All MoE adapters must either all use shared outer "
-                            "experts (expert_dim=1) or all use per-expert weights."
-                        )
+            is_shared = adapter.scan_shared_outer_gate_up()
+            if is_shared is None:
+                continue
+            if shared_outer is None:
+                shared_outer = is_shared
+            elif shared_outer != is_shared:
+                raise RuntimeError(
+                    "Mixed shared-outer LoRA formats detected across "
+                    f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                    "All MoE adapters must either all use shared outer "
+                    "experts (expert_dim=1) or all use per-expert weights."
+                )
         return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
@@ -737,10 +740,18 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        *,
+        is_first_chunk: bool = True,
+        is_last_chunk: bool = True,
     ) -> LoRAUpdateOutput:
         logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
         result = self._load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            is_first_chunk=is_first_chunk,
+            is_last_chunk=is_last_chunk,
         )
         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
@@ -751,31 +762,78 @@ class LoRAManager:
         tensors: Dict[str, torch.Tensor],
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        *,
+        is_first_chunk: bool = True,
+        is_last_chunk: bool = True,
     ) -> LoRAUpdateOutput:
         """
-        Load a single LoRA adapter from tensors and config dict.
+        Load one chunk of a LoRA adapter from tensors and config dict.
         """
         assert (
             lora_ref.lora_name is not None and lora_ref.lora_path is not None
         ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
-            new_adapter = LoRAConfig.from_dict(
-                config_dict,
-                added_tokens_config,
-                base_vocab_size=self.base_hf_config.vocab_size,
-            )
-            self.validate_new_adapter(new_adapter, lora_ref)
-            self.configs[lora_ref.lora_id] = new_adapter
+            if is_first_chunk:
+                assert lora_ref.lora_id not in self.loras, (
+                    f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. "
+                    "Unload it before starting a replacement transfer."
+                )
+                assert lora_ref.lora_id not in self.pending_tensor_loras, (
+                    f"LoRA adapter with ID {lora_ref.lora_id} already has a "
+                    "pending tensor transfer"
+                )
+                new_adapter_config = LoRAConfig.from_dict(
+                    config_dict,
+                    added_tokens_config,
+                    base_vocab_size=self.base_hf_config.vocab_size,
+                )
+                self.validate_new_adapter(new_adapter_config, lora_ref)
+                lora_adapter = LoRAAdapter(
+                    lora_ref.lora_id,
+                    new_adapter_config,
+                    self.base_hf_config,
+                    self.load_config,
+                    self.lora_backend,
+                    base_model=self.base_model,
+                )
+                self.pending_tensor_loras[lora_ref.lora_id] = (
+                    lora_ref,
+                    new_adapter_config,
+                    lora_adapter,
+                    config_dict,
+                    added_tokens_config,
+                )
+            else:
+                assert lora_ref.lora_id in self.pending_tensor_loras, (
+                    f"LoRA adapter with ID {lora_ref.lora_id} has no pending "
+                    "tensor transfer"
+                )
 
-            self.load_lora_weights_from_tensors(lora_ref, tensors)
+            (
+                pending_ref,
+                new_adapter_config,
+                lora_adapter,
+                expected_config,
+                expected_added_tokens,
+            ) = self.pending_tensor_loras[lora_ref.lora_id]
+            assert (
+                config_dict == expected_config
+            ), "LoRA config changed between tensor chunks"
+            assert (
+                added_tokens_config == expected_added_tokens
+            ), "LoRA added-token config changed between tensor chunks"
+            lora_adapter.load_weights_from_tensors_chunk(tensors)
 
-            self.lora_refs[lora_ref.lora_id] = lora_ref
-            self.num_pinned_loras += int(lora_ref.pinned)
+            if is_last_chunk:
+                lora_adapter.finalize_weights_from_tensors()
+                self.configs[lora_ref.lora_id] = new_adapter_config
+                self.loras[lora_ref.lora_id] = lora_adapter
+                self.lora_refs[lora_ref.lora_id] = pending_ref
+                self.num_pinned_loras += int(pending_ref.pinned)
+                del self.pending_tensor_loras[lora_ref.lora_id]
         except Exception as e:
+            self.pending_tensor_loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
@@ -799,6 +857,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_no_cpu_backup=self.lora_no_cpu_backup,
         )
 
         # Initializing memory pool with base model

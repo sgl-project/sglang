@@ -368,6 +368,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_width: int = 14,
         pos_emb_time: int = 4,
         pos_emb_type: str = "divided_fixed",
+        patch_embed_proj_bias: bool = True,
     ):
         super().__init__()
         assert isinstance(
@@ -381,7 +382,11 @@ class MoonVision3dPatchEmbed(nn.Module):
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
-            in_dim, out_dim, kernel_size=patch_size, stride=patch_size
+            in_dim,
+            out_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=patch_embed_proj_bias,
         )
 
         if pos_emb_type == "divided_fixed":
@@ -512,6 +517,7 @@ class MoonViT3dPretrainedModel(nn.Module):
             pos_emb_width=config.init_pos_emb_width,
             pos_emb_time=config.init_pos_emb_time,
             pos_emb_type=config.pos_emb_type,
+            patch_embed_proj_bias=getattr(config, "patch_embed_proj_bias", True),
         )
 
         qkv_hidden_size = getattr(config, "qkv_hidden_size", None)
