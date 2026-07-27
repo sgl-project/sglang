@@ -100,7 +100,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
-    let _abort_guard = AbortGuard::new(state.senders.clone(), id, rid);
+    let _abort_guard = AbortGuard::new(state.senders.clone(), state.live_rids.clone(), id, rid);
 
     // Watch the heartbeat advance (timeout frozen at router build, default 20s).
     let deadline = tokio::time::Instant::now() + timeout;
@@ -195,7 +195,12 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
-    let mut guard = AbortGuard::new(state.senders.clone(), id, rid_str.clone());
+    let mut guard = AbortGuard::new(
+        state.senders.clone(),
+        state.live_rids.clone(),
+        id,
+        rid_str.clone(),
+    );
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output;
 
@@ -274,7 +279,7 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
 ) -> Response {
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    let mut guard = AbortGuard::new_empty(state.senders.clone(), state.live_rids.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
         match submit(state, RequestKind::Generate(Box::new(req))).await {
@@ -459,8 +464,12 @@ mod tests {
             (RidHash(10), "10".to_string(), rx0),
             (RidHash(11), "11".to_string(), rx1),
         ];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            true,
+        );
         futures::pin_mut!(stream);
 
         // Drive deterministically: exactly one channel has data before each poll.
@@ -499,8 +508,12 @@ mod tests {
             (RidHash(10), "10".to_string(), rx0),
             (RidHash(11), "11".to_string(), rx1),
         ];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            true,
+        );
         futures::pin_mut!(stream);
 
         tx0.send(EgressItem::Error(crate::error::Error::Validation(
@@ -525,8 +538,12 @@ mod tests {
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            true,
+            true,
+        );
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "Hello")).await.unwrap();
@@ -557,8 +574,12 @@ mod tests {
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            false,
+        );
         futures::pin_mut!(stream);
 
         tx.send(done(10, "hi")).await.unwrap();
@@ -577,8 +598,12 @@ mod tests {
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            false,
+        );
         futures::pin_mut!(stream);
 
         // Three chunks queued before the stream is ever polled (a client falling behind).
@@ -604,8 +629,12 @@ mod tests {
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            true,
+            false,
+        );
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "a")).await.unwrap();

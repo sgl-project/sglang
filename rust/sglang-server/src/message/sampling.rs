@@ -514,6 +514,18 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 /// shipped `\p{L}` and `(?<n>a)` to a scheduler that could not compile them: every
 /// escape either side adds lands in the gap by default. Here the default is
 /// "reject", so a new escape is a 400 until someone checks both dialects.
+/// Inline flags both dialects understand. Rust also has `R`/`U`, Python `a`/`L`;
+/// each errors on the other's.
+const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u'];
+
+/// Repetition counts at or above this are refused. `regex-syntax` parses counts as
+/// `u32` and so accepts everything up to `u32::MAX`, while CPython's `MAXREPEAT`
+/// sentinel IS `u32::MAX` (`a{4294967295}` → `OverflowError`) and a large count on a
+/// nested group exhausts memory at compile time (`(?:a*){4294967294}` → several GB,
+/// then `MemoryError`). Neither is an `re.error`, so neither is caught downstream.
+/// A stop-string window this long is meaningless anyway.
+const MAX_REPEAT_COUNT: u32 = 1 << 20;
+
 const SHARED_ESCAPES: &[char] = &[
     'A', 'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'a', 'f', 'n', 'r', 't', 'v',
 ];
@@ -538,18 +550,8 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
     while i < b.len() {
         match b[i] {
             b'\\' => {
-                let Some(&e) = b.get(i + 1) else {
-                    return reject("a trailing backslash".into());
-                };
-                // `\xHH` is shared; Rust's braced `\x{10FFFF}` is not.
-                if e == b'x' && b.get(i + 2) == Some(&b'{') {
-                    return reject("a braced `\\x{…}` escape".into());
-                }
-                // Any letter/digit escape not confirmed in both dialects: `\p`/`\P`
-                // (Python: bad escape), `\u{…}`, `\z` (Rust-only), `\Z` (Python-only),
-                // `\1` (backreference).
-                if e.is_ascii_alphanumeric() && !SHARED_ESCAPES.contains(&(e as char)) {
-                    return reject(format!("the escape `\\{}`", e as char));
+                if let Err(what) = check_escape(b, i) {
+                    return reject(what);
                 }
                 i += 2; // skip the escaped character, so `\(` is not a group open
             }
@@ -562,21 +564,31 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
             {
                 return reject("a `(?<name>…)` group (Python spells it `(?P<name>…)`)".into());
             }
-            // A flag-setting group — `(?i)`, `(?-i)`, `(?imsx)`. Python 3.11+ reads
-            // these as GLOBAL flags: they must sit at position 0, and a clearing
-            // form (`(?-i)`) is invalid entirely — it wants `(?-i:…)`. Rust scopes
-            // them and accepts both anywhere.
-            b'(' if is_flag_group(&b[i..]) && (i > 0 || b[i..].contains(&b'-')) => {
-                return reject(
-                    "inline flags Python reads as global (only a leading `(?flags)` \
-                     without `-` is portable)"
-                        .into(),
-                );
+            // A flag-setting group. Python 3.11+ reads these as GLOBAL flags: they
+            // must sit at position 0, and the clearing form (`(?-i)`) is invalid on
+            // its own — it wants `(?-i:…)`. The flag letters also differ: Rust adds
+            // `R`/`U`, Python adds `a`/`L`, so only their intersection is portable.
+            b'(' if flag_group_bytes(&b[i..]).is_some() => {
+                let flags = flag_group_bytes(&b[i..]).expect("just matched");
+                if i > 0 {
+                    return reject("inline flags after the start of the pattern".into());
+                }
+                if flags.contains(&b'-') {
+                    return reject(
+                        "a clearing `(?-flags)` group (Python wants `(?-flags:…)`)".into(),
+                    );
+                }
+                if let Some(&f) = flags
+                    .iter()
+                    .find(|f| !PORTABLE_FLAGS.contains(&(**f as char)))
+                {
+                    return reject(format!("the inline flag `{}`", f as char));
+                }
+                i += 1;
             }
-            // A `[` inside a character class. Rust reads it as a literal (or a
-            // POSIX class); Python's parser terminates the class differently and
-            // can end up parsing the remainder as a group — `[a[:alpha:](?=-]` is
-            // "unterminated subpattern" there. It also warns "Possible nested set".
+            // A `[` inside a character class. Rust reads it as a literal (or a POSIX
+            // class); Python's parser terminates the class differently and can end up
+            // parsing the remainder as a group.
             b'[' => {
                 let mut j = i + 1;
                 if b.get(j) == Some(&b'^') {
@@ -587,8 +599,19 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
                 }
                 while j < b.len() && b[j] != b']' {
                     match b[j] {
-                        b'\\' => j += 2,
+                        // Escapes inside a class follow the same rules as outside.
+                        b'\\' => {
+                            if let Err(what) = check_escape(b, j) {
+                                return reject(what);
+                            }
+                            j += 2;
+                        }
                         b'[' => return reject("a `[` nested inside a character class".into()),
+                        // `[a--b]` is a class-difference operator in Rust and a bad
+                        // character range in Python.
+                        b'-' if b.get(j + 1) == Some(&b'-') => {
+                            return reject("a `--` class-difference operator".into());
+                        }
                         _ => j += 1,
                     }
                 }
@@ -600,19 +623,38 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Whether `b` opens a flag-setting group: `(?` + flag letters (and `-`) + `)`,
-/// with no `:` (that would be `(?i:…)`, a scoped group Python also accepts).
-fn is_flag_group(b: &[u8]) -> bool {
-    let Some(rest) = b.strip_prefix(b"(?") else {
-        return false;
+/// The flag bytes of a flag-setting group (`(?i)`, `(?-i)`, `(?imsx)`), or `None`
+/// if `b` does not open one. A `(?i:…)` scoped group is not one of these.
+fn flag_group_bytes(b: &[u8]) -> Option<&[u8]> {
+    let rest = b.strip_prefix(b"(?")?;
+    let end = rest.iter().position(|&c| c == b')')?;
+    let flags = &rest[..end];
+    (!flags.is_empty() && flags.iter().all(|&c| c.is_ascii_alphabetic() || c == b'-'))
+        .then_some(flags)
+}
+
+/// Check the escape starting at `b[i]` (a backslash). `Err` names why Python's
+/// `re` would refuse it. Used for escapes both inside and outside character
+/// classes — the class scanner used to skip escapes entirely, which is how
+/// `[\p{L}]` slipped past the very check written for `\p{L}`.
+fn check_escape(b: &[u8], i: usize) -> Result<(), String> {
+    let Some(&e) = b.get(i + 1) else {
+        return Err("a trailing backslash".into());
     };
-    let end = rest.iter().position(|&c| c == b')');
-    match end {
-        Some(end) if end > 0 => rest[..end]
-            .iter()
-            .all(|&c| c.is_ascii_alphabetic() || c == b'-'),
-        _ => false,
+    // `\xHH` is shared; Rust's braced `\x{10FFFF}` is not.
+    if e == b'x' && b.get(i + 2) == Some(&b'{') {
+        return Err("a braced `\\x{…}` escape".into());
     }
+    // `\b{start}` is one zero-width assertion to Rust, but `\b` followed by the
+    // literal "{start}" to Python — 7 characters this side would score as 0, so
+    // the scheduler sizes a 1-token window and the stop silently never fires.
+    if e == b'b' && b.get(i + 2) == Some(&b'{') {
+        return Err("a `\\b{…}` assertion".into());
+    }
+    if e.is_ascii_alphanumeric() && !SHARED_ESCAPES.contains(&(e as char)) {
+        return Err(format!("the escape `\\{}`", e as char));
+    }
+    Ok(())
 }
 
 /// Validate a `stop_regex` and return the strict upper bound on the characters it
@@ -648,10 +690,26 @@ fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
     if repeats_an_assertion(&ast) {
         return Err(bad(format!(
             "stop_regex {pattern:?} quantifies a zero-width assertion, which Python's \
-             `re` rejects (\"nothing to repeat\" / \"multiple repeat\")"
+             `re` rejects, or a repetition count Python cannot honour"
         )));
     }
     Ok(hir_max_len(&hir))
+}
+
+/// Whether a repetition asks for more than [`MAX_REPEAT_COUNT`] — a count Python
+/// either refuses outright (`OverflowError` at `MAXREPEAT`) or tries to honour
+/// until it runs out of memory. Both escape the decode-loop seatbelt, which only
+/// catches `re.error` / `RecursionError`.
+fn repeat_count_too_large(kind: &regex_syntax::ast::RepetitionKind) -> bool {
+    use regex_syntax::ast::{RepetitionKind, RepetitionRange};
+    let RepetitionKind::Range(range) = kind else {
+        return false;
+    };
+    let over = |n: &u32| *n >= MAX_REPEAT_COUNT;
+    match range {
+        RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n) => over(n), // codespell:ignore atleast
+        RepetitionRange::Bounded(lo, hi) => over(lo) || over(hi),
+    }
 }
 
 /// Whether any repetition in `ast` applies to a zero-width assertion — `$*`,
@@ -668,6 +726,7 @@ fn repeats_an_assertion(ast: &regex_syntax::ast::Ast) -> bool {
         // Python calls "multiple repeat"). Both parse fine in Rust.
         Ast::Repetition(rep) => {
             matches!(&*rep.ast, Ast::Assertion(_) | Ast::Repetition(_))
+                || repeat_count_too_large(&rep.op.kind)
                 || repeats_an_assertion(&rep.ast)
         }
         Ast::Group(g) => repeats_an_assertion(&g.ast),
@@ -1112,6 +1171,24 @@ mod tests {
             ("a(?i)b", false),           // inline flags after position 0
             ("(?-i)a", false),           // clearing flags: Python wants `(?-i:…)`
             ("[a[:alpha:](?=-]", false), // `[` nested in a class re-terminates it
+            // Round 4: escapes inside a character class were skipped entirely, so
+            // the check written for `\p{L}` missed it one bracket pair away.
+            (r"[\p{L}]", false),
+            (r"[\pL]", false),
+            (r"[\P{L}]", false),
+            (r"[\x{41}]", false),
+            ("[a--b]", false), // class difference is Rust-only
+            ("(?R)a", false),  // Rust-only inline flag
+            ("(?U)a", false),
+            // `regex-syntax` parses counts as u32 and accepts up to u32::MAX;
+            // CPython's MAXREPEAT *is* u32::MAX, and a big count on a group
+            // exhausts memory. Neither raises `re.error`, so neither is caught
+            // downstream.
+            ("a{4294967295}", false),
+            // Python accepts these; Rust may reject them (a false 400 is safe).
+            ("(?i)[a-z]+", true), // must NOT be rejected: leading flags are fine
+            (r"(?i)\d{4}-\d{2}", true), // …even with a hyphen later in the pattern
+            ("(?imsx)a-b", true),
             // Python accepts these; Rust may reject them (a false 400 is safe).
             (r"\d{6}", true),
             ("abc", true),
@@ -1132,6 +1209,65 @@ mod tests {
                  this reaches `re.search` on the decode path and kills the scheduler"
             );
         }
+    }
+
+    /// The leading-flag check must look at the FLAG BYTES, not the rest of the
+    /// pattern: scanning the whole tail for `-` made `(?i)[a-z]+` — about as
+    /// ordinary as a stop_regex gets — a 400.
+    #[test]
+    fn leading_inline_flags_are_accepted() {
+        for pattern in ["(?i)[a-z]+", r"(?i)\d{4}-\d{2}", "(?imsx)a-b", "(?i)abc"] {
+            assert!(
+                stop_regex_bound(pattern).is_ok(),
+                "{pattern} is valid Python and must not be rejected"
+            );
+        }
+        // …but only leading, only set-flags, and only portable letters.
+        for pattern in ["a(?i)b", "(?-i)a", "(?R)a", "(?U)a"] {
+            assert!(
+                stop_regex_bound(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+    }
+
+    /// A repetition count Python cannot honour: `u32::MAX` is its `MAXREPEAT`
+    /// sentinel (`OverflowError`), and a large count on a group exhausts memory at
+    /// compile time (`MemoryError`). Neither is an `re.error`, so the decode-loop
+    /// seatbelt would not catch either.
+    #[test]
+    fn oversized_repeat_counts_are_rejected() {
+        for pattern in [
+            "a{4294967295}",
+            "a{4294967294}",
+            "(?:a*){4294967294}",
+            "a{1048576}",
+            "a{0,4294967295}",
+            "a{1048576,}",
+        ] {
+            assert!(
+                stop_regex_bound(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+        // An ordinary count still works, and still yields a finite bound.
+        assert_eq!(stop_regex_bound("a{1000}").unwrap(), 1000);
+    }
+
+    /// `\b{start}` is one zero-width assertion to Rust (bound 0) but `\b` plus the
+    /// literal `{start}` to Python (7 characters). Scoring it 0 would size a
+    /// 1-token match window where 7 characters are needed, and the stop would
+    /// silently never fire — an UNDER-estimate, the one failure mode the sentinel
+    /// design exists to prevent.
+    #[test]
+    fn b_brace_assertion_is_rejected_not_under_estimated() {
+        assert!(stop_regex_bound(r"\b{start}xyz").is_err());
+        assert!(stop_regex_bound(r"\b{end}").is_err());
+        assert_eq!(
+            stop_regex_bound(r"\bword").unwrap(),
+            4,
+            "plain \\b still works"
+        );
     }
 
     /// Deep nesting is rejected here rather than blowing Python's parser stack:
