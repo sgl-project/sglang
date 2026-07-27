@@ -239,13 +239,23 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
+            # Prefer the host mirror kept by batch prep over re-reading the
+            # device tensor: .cpu() here is a blocking D2H behind whatever is
+            # already queued on the stream, once per replay.
+            #
+            # seq_lens_cpu is the authoritative host mirror on this path -- the
+            # ascend attention backend already derives its own seq_lens_cpu_int
+            # from it for every forward mode, and likewise adds the draft width
+            # on target-verify. Reading the device tensor here made the two
+            # disagree on their source; this aligns them.
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu
+                if forward_batch.seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu()
+            )
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
-            else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens_cpu = seq_lens_cpu + self.captured_req_width
+            seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
