@@ -477,6 +477,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.spec_aux_indices = self.metadata_buffers.get_spec_only_aux_indices()
 
         setup_state_kv_args(
             kv_args,

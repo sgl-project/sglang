@@ -383,6 +383,32 @@ class MetadataBuffers:
         item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
+    def get_spec_only_aux_indices(self) -> List[int]:
+        """Return indices (within get_buf_infos() output) of aux slots that
+        hold spec-decoding-only fields (output_topk_p, output_topk_index,
+        output_hidden_states).
+
+        These fields are populated only by the last PP rank of the prefill
+        engine (see set_buf()'s ``req.hidden_states_tensor is not None``
+        gate). Transfer backends consult these indices to skip sending
+        them on non-last PP ranks; otherwise the earlier ranks' zeros
+        RDMA into the same decode aux row as the last rank's valid write
+        and can leave decode reading zeros -> garbage draft input ->
+        deterministic garbled output under PP + MTP.
+
+        The absolute positions shift with ``enable_sampling_mask``; we
+        mirror the layout in :meth:`get_buf_infos` to stay consistent.
+        """
+        # Always-present prefix: output_ids, cached_tokens, and the four
+        # logprobs tensors (2..5).
+        offset = 6
+        if self.enable_sampling_mask:
+            # Three sampling-mask tensors precede the spec-only trio.
+            offset += 3
+        # Spec-only tensors appear contiguously as topk_p, topk_index,
+        # hidden_states, in that order.
+        return [offset, offset + 1, offset + 2]
+
     def get_buf(self, idx: int):
         sampling_mask_len = None
         sampling_mask_idx = None
