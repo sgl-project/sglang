@@ -55,6 +55,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -76,6 +77,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -396,6 +398,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             dp_size=self.dp_size,
             source=self.buffers,
+        )
+
+        # --- metadata glue graph (opt-in) ------------------------------
+        # Captures the per-replay attention-metadata prep into a small CUDA
+        # graph; see metadata_glue_graph.py for the correctness contract.
+        self._metadata_glue = (
+            MetadataGlueGraph(self.device)
+            if envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+            else None
         )
 
         # --- backend ---------------------------------------------------
@@ -1053,6 +1064,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
+            if self._metadata_glue is not None:
+                # Static buffers / backend graph state are rebuilt below; any
+                # captured metadata-prep graphs are stale.
+                self._metadata_glue.reset()
             self.capture()
 
     def load_batch(
@@ -1185,7 +1200,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        # Glue-graph fast path: pointer-stable prep (static buffers + pool
+        # tensors only) is captured per key; guards keep every python-visible
+        # branch inside the backends constant for that key.
+        if (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_bs == bs
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and not self.model_runner.server_args.enable_lora
+        ):
+            self._metadata_glue.run(
+                attn_backend, fb_view, (bs, str(self.capture_forward_mode))
+            )
+        else:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token

@@ -781,6 +781,10 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
+    # into a small CUDA graph, collapsing its host dispatch cost to one launch.
+    # Experimental; auto-falls back to eager if the backend's prep is not capturable.
+    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
 
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).

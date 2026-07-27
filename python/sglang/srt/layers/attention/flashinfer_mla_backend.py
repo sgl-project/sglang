@@ -963,6 +963,11 @@ class FlashInferMLAMultiStepDraftBackend:
             )
 
         self.max_context_len = self.attn_backends[0].max_context_len
+        # Not an AttentionBackend subclass; declare the generic-introspection
+        # fields explicitly (the metadata glue graph snapshots forward_metadata
+        # across attn_backend_list leaves).
+        self.attn_backend_list = self.attn_backends
+        self.forward_metadata = None
 
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
