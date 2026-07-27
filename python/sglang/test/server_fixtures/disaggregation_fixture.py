@@ -7,6 +7,8 @@ import warnings
 from typing import ClassVar, Optional
 from urllib.parse import urlparse
 
+import requests
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -23,10 +25,34 @@ from sglang.utils import wait_for_http_ready
 logger = logging.getLogger(__name__)
 
 
+def configure_nixl_pd_backend(test_cls):
+    test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+    # NIXL backend/network selection is driven by NIXL environment variables
+    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
+    # Mooncake-specific --disaggregation-ib-device argument.
+    test_cls.rdma_devices = []
+
+
+def assert_process_healthy(test_case, name, process, url, health_path="/health"):
+    test_case.assertIsNotNone(process, f"{name} process was not started")
+    test_case.assertIsNone(
+        process.poll(),
+        f"{name} exited unexpectedly with code {process.returncode}",
+    )
+    try:
+        response = requests.get(f"{url}{health_path}", timeout=10)
+    except requests.RequestException as e:
+        test_case.fail(f"Failed to connect to {name} health endpoint: {e}")
+    test_case.assertEqual(response.status_code, 200, response.text)
+
+
 class PDDisaggregationServerBase(CustomTestCase):
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
+    prefill_tp_size: ClassVar[int] = 1
+    decode_tp_size: ClassVar[int] = 1
+    decode_base_gpu_id: ClassVar[int] = 1
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -91,7 +117,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp",
-            "1",
+            str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -116,9 +142,9 @@ class PDDisaggregationServerBase(CustomTestCase):
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp",
-            "1",
+            str(cls.decode_tp_size),
             "--base-gpu-id",
-            "1",
+            str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
