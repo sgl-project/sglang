@@ -5,7 +5,6 @@ import unittest
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
-    DeepSeekBaseDetector,
     DeepSeekR1Detector,
     DeepSeekV4Detector,
     Gemma4Detector,
@@ -243,51 +242,6 @@ class TestDeepSeekV4Detector(CustomTestCase):
 
         self.assertEqual(reasoning, "need <｜DSML｜tool_calls>")
         self.assertEqual(normal, "answer")
-
-
-class TestDeepSeekV3Detector(CustomTestCase):
-    def test_inherits_deepseek_base_detector(self):
-        detector = ReasoningParser(model_type="deepseek-v3").detector
-        self.assertIsInstance(detector, DeepSeekBaseDetector)
-        self.assertEqual(detector.reasoning_default, "explicit_thinking")
-        self.assertEqual(detector.think_excluded_tokens, None)
-
-    def test_uses_dsv32_dsml_tool_start_tokens(self):
-        detector = ReasoningParser(model_type="deepseek-v3").detector
-        self.assertEqual(
-            detector.tool_start_tokens,
-            ["<｜DSML｜function_calls>", "<｜DSML｜invoke name="],
-        )
-
-    def test_streaming_exits_reasoning_on_split_dsml_function_calls_start(self):
-        detector = ReasoningParser(model_type="deepseek-v3").detector
-        detector._in_reasoning = True
-        detector.stripped_think_start = True
-
-        reasoning = ""
-        normal = ""
-        for chunk in ["need a tool", "<", "｜DSML｜function_calls>\nX"]:
-            result = detector.parse_streaming_increment(chunk)
-            reasoning += result.reasoning_text
-            normal += result.normal_text
-
-        self.assertEqual(reasoning, "need a tool")
-        self.assertEqual(normal, "<｜DSML｜function_calls>\nX")
-
-    def test_streaming_exits_reasoning_on_split_dsml_tool_start(self):
-        detector = ReasoningParser(model_type="deepseek-v3").detector
-        detector._in_reasoning = True
-        detector.stripped_think_start = True
-
-        reasoning = ""
-        normal = ""
-        for chunk in ["need a tool", "<｜DSML｜inv", 'oke name="bash">\nX']:
-            result = detector.parse_streaming_increment(chunk)
-            reasoning += result.reasoning_text
-            normal += result.normal_text
-
-        self.assertEqual(reasoning, "need a tool")
-        self.assertEqual(normal, '<｜DSML｜invoke name="bash">\nX')
 
 
 class TestInklingDetector(CustomTestCase):
@@ -1181,7 +1135,6 @@ class TestReasoningParserAdvanced(CustomTestCase):
         """Test that all DetectorMap alias keys create the correct detector type."""
         # These are aliases that map to existing detector classes
         alias_tests = {
-            "deepseek-v3": DeepSeekBaseDetector,
             "step3": DeepSeekR1Detector,
             "step3p5": DeepSeekR1Detector,
             "interns1": Qwen3Detector,

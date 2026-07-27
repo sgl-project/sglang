@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
-from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token as dsv32_dsml_token
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -892,14 +891,18 @@ class InklingDetector(BaseReasoningFormatDetector):
         )
 
 
+class _DeepSeekV3Detector(Qwen3Detector):
+    """DeepSeek-V3 reuses Qwen3 tokens but requires explicit thinking=True to enable."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+
 class DeepSeekBaseDetector(BaseReasoningFormatDetector):
-    """DeepSeek V3.2/V4 reasoning detector with DSML tool interruptions."""
+    """DeepSeek reasoning detector with explicit thinking opt-in."""
 
     THINK_START_TOKEN = "<think>"
     THINK_END_TOKEN = "</think>"
-    DSML_TOKEN = dsv32_dsml_token
-    DEEPSEEK_TOOL_CALLS_BLOCK_NAME = "function_calls"
-    DEEPSEEK_INVOKE_BLOCK_NAME = "invoke name="
 
     def __init__(
         self,
@@ -926,10 +929,7 @@ class DeepSeekBaseDetector(BaseReasoningFormatDetector):
             force_nonempty_content=force_nonempty_content,
         )
 
-        self.tool_start_tokens: List[str] = [
-            f"<{self.DSML_TOKEN}{self.DEEPSEEK_TOOL_CALLS_BLOCK_NAME}>",
-            f"<{self.DSML_TOKEN}{self.DEEPSEEK_INVOKE_BLOCK_NAME}",
-        ]
+        self.tool_start_tokens: List[str] = []
 
     def _tool_token_max_partial_overlap(self, text: str) -> int:
         max_overlap_len = 0
@@ -1022,16 +1022,10 @@ class DeepSeekBaseDetector(BaseReasoningFormatDetector):
         return StreamingParseResult()
 
 
-class _DeepSeekV3Detector(DeepSeekBaseDetector):
-    """DeepSeek V3.2 DSML detector with explicit thinking opt-in."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-
 class DeepSeekV4Detector(DeepSeekBaseDetector):
     DSML_TOKEN = dsv4_dsml_token
     DEEPSEEK_TOOL_CALLS_BLOCK_NAME = "tool_calls"
+    DEEPSEEK_INVOKE_BLOCK_NAME = "invoke name="
 
     def __init__(
         self,
@@ -1051,6 +1045,11 @@ class DeepSeekV4Detector(DeepSeekBaseDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+        self.tool_start_tokens: List[str] = [
+            f"<{self.DSML_TOKEN}{self.DEEPSEEK_TOOL_CALLS_BLOCK_NAME}>",
+            f"<{self.DSML_TOKEN}{self.DEEPSEEK_INVOKE_BLOCK_NAME}",
+        ]
 
 
 class _MimoDetector(Qwen3Detector):
