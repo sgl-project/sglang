@@ -38,6 +38,26 @@ sglang serve \
   --port 30000
 ```
 
+### Recommended Hopper / Blackwell performance configuration
+
+For H100, H200, B200, and newer NVIDIA GPUs, explicitly select FA3 and
+capture the 16,384-token BCG tier. This is the recommended command for
+high-throughput, long embedding batches:
+
+```bash
+sglang serve \
+  --model-path google/embeddinggemma-300m \
+  --is-embedding \
+  --dtype bfloat16 \
+  --attention-backend fa3 \
+  --cuda-graph-max-bs-prefill 16384 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+EmbeddingGemma automatically enables batch tokenization for list-valued
+embedding requests, so do not add a separate tokenizer batching flag.
+
 ## Create embeddings
 
 Send one string or a batch of strings to the OpenAI-compatible endpoint:
