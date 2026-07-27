@@ -97,8 +97,6 @@ pub struct ServerArgs {
     #[serde(default)]
     pub incremental_streaming_output: bool,
     /// PD-disaggregation role: `"null"` (unified), `"prefill"`, or `"decode"`.
-    /// In PD mode health probes must carry fake bootstrap fields (see
-    /// `native_api::health_probe`) or the scheduler 400-aborts them.
     #[serde(default = "default_disaggregation_mode")]
     pub disaggregation_mode: String,
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.

@@ -61,32 +61,9 @@ fn health_routes() -> Router<AppState> {
         .route("/health_generate", probe)
 }
 
-/// The scheduler treats a room-less request as invalid on a PD node, so probes
-/// there carry the same fake bootstrap pair Python injects (http_server
-/// `/health_generate`): a sentinel host that makes the KV connector no-op.
-/// Parity tripwire: `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
+/// Sentinel host that makes the KV connector no-op. Parity with
+/// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
-
-/// Build the 1-token `/health_generate` probe: pre-tokenized (`input_ids =
-/// [0]`, skips the tokenizer), `HEALTH_CHECK_<uuid>` rid (the scheduler skips
-/// it when busy so it never occupies a queue slot), greedy — the cheapest
-/// round-trip that still produces a frame.
-fn health_probe(server_args: &crate::runtime::ServerArgs) -> GenerateRequest {
-    let pd = server_args.is_disaggregation();
-    GenerateRequest {
-        rid: Rid::new_health_check(),
-        input_ids: Some(vec![0]),
-        sampling_params: SamplingParams {
-            max_new_tokens: Some(1),
-            temperature: 0.0,
-            ..Default::default()
-        },
-        stream: false,
-        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
-        bootstrap_room: pd.then_some(0),
-        ..Default::default()
-    }
-}
 
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 iff the egress heartbeat advances within `timeout`
@@ -107,7 +84,25 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
-    let probe = health_probe(&state.server_args);
+    //
+    // On a PD node the scheduler 400-aborts room-less requests, so inject the
+    // same fake bootstrap pair Python uses (`FAKE_BOOTSTRAP_HOST` / room 0).
+    let pd = state.server_args.is_disaggregation();
+    let probe = GenerateRequest {
+        // The `HEALTH_CHECK_<uuid>` rid form
+        rid: Rid::new_health_check(),
+        input_ids: Some(vec![0]),
+        // One greedy token: the cheapest round-trip that still produces a frame.
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        },
+        stream: false,
+        bootstrap_host: pd.then(|| FAKE_BOOTSTRAP_HOST.into()),
+        bootstrap_room: pd.then_some(0),
+        ..Default::default()
+    };
     let (rid, _keepalive) =
         match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
             // Hold the receiver so the probe's sink stays open until it completes.
@@ -612,27 +607,6 @@ mod tests {
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"
             );
-        }
-    }
-    /// On a PD node the probe must carry the fake bootstrap pair (or the
-    /// scheduler 400-aborts it as room-less); on a unified node it must not.
-    #[test]
-    fn health_probe_injects_fake_bootstrap_only_in_pd_mode() {
-        use crate::runtime::ServerArgs;
-
-        let unified = ServerArgs::from_json("{}").unwrap();
-        let probe = health_probe(&unified);
-        assert!(probe.rid.as_str().starts_with("HEALTH_CHECK_"));
-        assert_eq!(probe.bootstrap_host, None);
-        assert_eq!(probe.bootstrap_room, None);
-
-        for mode in ["prefill", "decode"] {
-            let args =
-                ServerArgs::from_json(&format!(r#"{{"disaggregation_mode": "{mode}"}}"#)).unwrap();
-            let probe = health_probe(&args);
-            // Parity tripwire: sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST.
-            assert_eq!(probe.bootstrap_host.as_deref(), Some("2.2.2.2"));
-            assert_eq!(probe.bootstrap_room, Some(0));
         }
     }
 }

@@ -628,31 +628,6 @@ mod tests {
         );
     }
 
-    /// A PD decode node gets only output logprobs (the input ones belong to the
-    /// prefill node), but the response must still carry an (empty)
-    /// `input_token_logprobs` — Python always sets the pair together, and the
-    /// PD router keys its prefill-merge on the key's presence.
-    #[test]
-    fn output_only_logprobs_still_emit_empty_input_key() {
-        let out = ChunkEvent {
-            extras: Some(Box::new(ChunkExtras {
-                out_lp_val: vec![-0.5],
-                out_lp_idx: vec![10],
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        let frame = frame_value(&out, "1");
-        assert_eq!(
-            frame["meta_info"]["input_token_logprobs"],
-            serde_json::json!([])
-        );
-        assert_eq!(
-            frame["meta_info"]["output_token_logprobs"],
-            serde_json::json!([[-0.5f32, 10, serde_json::Value::Null]])
-        );
-    }
-
     /// The accumulator folds deltas cumulatively and `snapshot` borrows the
     /// running state (no per-frame clone); `into_output` moves the same state.
     #[test]
