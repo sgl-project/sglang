@@ -18,10 +18,10 @@ import time
 from pathlib import Path
 
 import grpc
+import grpc_tools
 import uvicorn
 from fastapi import FastAPI, Request
 from grpc_tools import protoc
-import grpc_tools
 
 
 def _load_generated_proto():

@@ -37,7 +37,7 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
 
 # IPC/exception types are lightweight and safe to import at module load time;
 # the gRPC-backed runtime and sampler remain lazy to preserve the optional

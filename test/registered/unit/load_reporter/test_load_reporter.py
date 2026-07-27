@@ -32,8 +32,8 @@ from sglang.srt.load_reporter.sampler import (
 )
 from sglang.srt.load_reporter.store import (
     LatestSnapshotStore,
-    SnapshotView,
     SnapshotValidationError,
+    SnapshotView,
 )
 from sglang.srt.managers.io_struct import (
     LoadReporterIpcCode,
