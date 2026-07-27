@@ -628,6 +628,7 @@ class ModelConfig:
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
             "BailingMoeV2_5ForCausalLM",
+            "BailingMoeV3ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
         if (
@@ -913,6 +914,18 @@ class ModelConfig:
                 self.scaling = compute_mla_mscale_scaling(
                     self.hf_config.rope_scaling, self.scaling
                 )
+        elif "BailingMoeV3ForCausalLM" in self.hf_config.architectures:
+            # Ling-V3: gated MLA. Unlike V2.5 the head dim is fixed and the rope
+            # half collapses when the checkpoint uses NoPE MLA.
+            self.head_dim = 128
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = (
+                0 if self.hf_config.use_mla_nope else self.hf_config.qk_rope_head_dim
+            )
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
