@@ -22,13 +22,15 @@ Usage:
     python bench_kda_flashinfer_mtp.py                 # decode+verify, correctness+bench
     python bench_kda_flashinfer_mtp.py --mode bench --task verify
     python bench_kda_flashinfer_mtp.py --num-spec 7    # 8 draft tokens / verify step
-    python bench_kda_flashinfer_mtp.py --task decode --helion
 """
 
 import argparse
 
 import torch
 
+from sglang.kernels.ops.attention.helion.kda_decode import (
+    helion_fused_recurrent_kda_packed_decode,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 
 
@@ -60,6 +62,9 @@ def make_decode_inputs(B, H, HV, K, V, pool_size, device, dtype, seed=42):
     ssm = torch.randn(pool_size, HV, V, K, device=device, dtype=dtype) * 0.01
     cache_indices = torch.arange(B, device=device, dtype=torch.int32)
     qsl = torch.arange(B + 1, device=device, dtype=torch.int32)
+    mixed_qkv = torch.cat(
+        (q.reshape(B, H * K), k.reshape(B, H * K), v.reshape(B, HV * V)), dim=-1
+    )
     return dict(
         q=q.contiguous(),
         k=k.contiguous(),
@@ -71,6 +76,7 @@ def make_decode_inputs(B, H, HV, K, V, pool_size, device, dtype, seed=42):
         ssm=ssm.contiguous(),
         cache_indices=cache_indices,
         qsl=qsl,
+        mixed_qkv=mixed_qkv.contiguous(),
         B=B,
         H=H,
         HV=HV,
@@ -140,25 +146,9 @@ def call_decode(kernel, inp, ssm):
     return out.reshape(inp["B"], inp["HV"], inp["V"]).float()
 
 
-def call_packed_triton(kernel, inp, ssm):
-    out = kernel.packed_decode(
-        inp["mixed_qkv"],
-        inp["a"],
-        inp["b"],
-        A_log=inp["A_log"],
-        dt_bias=inp["dt_bias"],
-        scale=inp["K"] ** -0.5,
-        ssm_states=ssm,
-        cache_indices=inp["cache_indices"],
-        num_v_heads=inp["HV"],
-        head_v_dim=inp["V"],
-    )
-    return out.reshape(inp["B"], inp["HV"], inp["V"]).float()
-
-
-def call_helion(helion_decode, inp, ssm):
+def call_helion(inp, ssm):
     out = inp["mixed_qkv"].new_empty(inp["B"], 1, inp["HV"], inp["V"])
-    helion_decode(
+    helion_fused_recurrent_kda_packed_decode(
         mixed_qkv=inp["mixed_qkv"],
         a=inp["a"],
         b=inp["b"],
@@ -210,99 +200,7 @@ def _time(fn, warmup=20, iters=100):
     return start.elapsed_time(end) / iters  # ms
 
 
-def run_decode_all(fi, tri, helion_decode, device, dtype, args):
-    width = 124
-    print("=" * width)
-    print(
-        "KDA decode (T=1): generic Triton vs FlashInfer vs packed Triton vs "
-        f"Helion  |  K={args.head_k} V={args.head_v} dtype={dtype}"
-    )
-    print("=" * width)
-    print(
-        f"  {'B':>6}  {'H':>3}  {'HV':>3} | {'generic(us)':>11} | "
-        f"{'flashinfer(us)':>14} | {'packed(us)':>11} | {'helion(us)':>11} | "
-        f"{'FI/H':>7} | {'packed/H':>9} | {'H max diff':>10}"
-    )
-    print("  " + "-" * 118)
-
-    for B in args.batch_sizes:
-        for H in args.num_q_heads:
-            for HV in args.num_v_heads:
-                if HV % H != 0:
-                    continue
-                K, V = args.head_k, args.head_v
-                pool = max(args.pool_size, B + 16)
-                inp = make_decode_inputs(B, H, HV, K, V, pool, device, dtype)
-                inp["mixed_qkv"] = torch.cat(
-                    (
-                        inp["q"].reshape(B, H * K),
-                        inp["k"].reshape(B, H * K),
-                        inp["v"].reshape(B, HV * V),
-                    ),
-                    dim=-1,
-                ).contiguous()
-
-                generic_ref_state = inp["ssm"].clone()
-                packed_ref_state = inp["ssm"].clone()
-                helion_ref_state = inp["ssm"].clone()
-                o_generic = call_decode(tri, inp, generic_ref_state)
-                o_packed = call_packed_triton(tri, inp, packed_ref_state)
-                o_helion = call_helion(helion_decode, inp, helion_ref_state)
-                helion_diff = max(
-                    (o_helion - o_packed).abs().max().item(),
-                    (helion_ref_state - packed_ref_state).abs().max().item(),
-                )
-                if fi is not None:
-                    fi_ref_state = inp["ssm"].clone()
-                    o_fi = call_decode(fi, inp, fi_ref_state)
-                    fi_diff = max(
-                        (o_fi - o_generic).abs().max().item(),
-                        (fi_ref_state - generic_ref_state).abs().max().item(),
-                    )
-                    if fi_diff > 2e-2:
-                        raise AssertionError(
-                            f"FlashInfer contract mismatch at B={B}: {fi_diff}"
-                        )
-                if helion_diff > 2e-2:
-                    raise AssertionError(
-                        f"Helion contract mismatch at B={B}: {helion_diff}"
-                    )
-
-                generic_state = inp["ssm"].clone()
-                packed_state = inp["ssm"].clone()
-                helion_state = inp["ssm"].clone()
-                fi_state = inp["ssm"].clone()
-                ms_generic = _time(lambda: call_decode(tri, inp, generic_state))
-                ms_fi = (
-                    _time(lambda: call_decode(fi, inp, fi_state))
-                    if fi is not None
-                    else float("nan")
-                )
-                ms_packed = _time(lambda: call_packed_triton(tri, inp, packed_state))
-                ms_helion = _time(lambda: call_helion(helion_decode, inp, helion_state))
-
-                fi_us = f"{ms_fi * 1000:>14.1f}" if fi is not None else f"{'skip':>14}"
-                h_fi = f"{ms_fi / ms_helion:>6.2f}x" if fi is not None else f"{'-':>7}"
-                print(
-                    f"  {B:>6}  {H:>3}  {HV:>3} | "
-                    f"{ms_generic * 1000:>11.1f} | {fi_us} | "
-                    f"{ms_packed * 1000:>11.1f} | "
-                    f"{ms_helion * 1000:>11.1f} | {h_fi} | "
-                    f"{ms_packed / ms_helion:>8.2f}x | {helion_diff:>10.2e}"
-                )
-
-
 def run(task, fi, tri, device, dtype, args):
-    if task == "decode" and args.helion_decode is not None:
-        run_decode_all(
-            fi,
-            tri,
-            args.helion_decode,
-            device,
-            dtype,
-            args,
-        )
-        return
     is_verify = task == "verify"
     T = 1 + args.num_spec if is_verify else 1
     title = f"target_verify (MTP, T={T})" if is_verify else "decode (T=1)"
@@ -312,11 +210,14 @@ def run(task, fi, tri, device, dtype, args):
     )
     print("=" * 92)
     hdr = "B" if not is_verify else "B(xT)"
-    print(
+    header = (
         f"  {hdr:>6}  {'H':>3}  {'HV':>3} | {'triton(us)':>11} | "
         f"{'flashinfer(us)':>14} | {'speedup':>8} | {'out_max_diff':>12}"
     )
-    print("  " + "-" * 86)
+    if not is_verify:
+        header += f" | {'helion(us)':>11} | {'FI/H':>8} | {'H max diff':>10}"
+    print(header)
+    print("  " + "-" * (124 if not is_verify else 86))
 
     for B in args.batch_sizes:
         for H in args.num_q_heads:
@@ -361,20 +262,23 @@ def run(task, fi, tri, device, dtype, args):
                 )
                 fi_us = f"{ms_fi * 1000:>14.1f}" if fi is not None else f"{'skip':>14}"
                 sp = f"{speed:>7.2f}x" if fi is not None else f"{'-':>8}"
-                print(
+                line = (
                     f"  {B:>6}  {H:>3}  {HV:>3} | {ms_tri * 1000:>11.1f} | "
                     f"{fi_us} | {sp} | {diff:>12}"
                 )
-
-
-def load_helion_decode(enabled):
-    if not enabled:
-        return None
-    from sglang.kernels.ops.attention.helion.kda_decode import (
-        helion_fused_recurrent_kda_packed_decode,
-    )
-
-    return helion_fused_recurrent_kda_packed_decode
+                if not is_verify:
+                    helion_state = inp["ssm"].clone()
+                    o_helion = call_helion(inp, helion_state)
+                    helion_diff = (o_helion - o_tri).abs().max().item()
+                    ms_helion = _time(lambda: call_helion(inp, helion_state))
+                    fi_helion = (
+                        f"{ms_fi / ms_helion:>7.2f}x" if fi is not None else f"{'-':>8}"
+                    )
+                    line += (
+                        f" | {ms_helion * 1000:>11.1f} | {fi_helion} | "
+                        f"{helion_diff:>10.2e}"
+                    )
+                print(line)
 
 
 def main():
@@ -397,13 +301,7 @@ def main():
     )
     p.add_argument("--num-q-heads", type=int, nargs="+", default=[16])
     p.add_argument("--num-v-heads", type=int, nargs="+", default=[16])
-    p.add_argument(
-        "--helion",
-        action="store_true",
-        help="Include SGLang's Helion packed KDA backend.",
-    )
     args = p.parse_args()
-    args.helion_decode = load_helion_decode(args.helion)
 
     device, dtype = "cuda", getattr(torch, args.dtype)
     cap = torch.cuda.get_device_capability()
