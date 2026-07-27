@@ -15,10 +15,10 @@
 
 Produces the ``BlockStored`` / ``BlockRemoved`` / ``AllBlocksCleared`` events
 consumed by KV-aware routers (e.g. dynamo). A cache holds one recorder and calls
-it; the recorder owns the queue and needs nothing back from its owner.
+it; the recorder owns the queue and takes only an optional placement hook.
 """
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -35,6 +35,20 @@ from sglang.srt.mem_cache.utils import (
 )
 
 
+def _no_component_types(
+    node: Any, medium: StorageMedium, page_index: int, num_pages: int
+) -> Optional[list[str]]:
+    """Default placement hook: return which KV component names are resident for
+    this page at ``medium``, or ``None`` to omit the component dimension.
+
+    Returning ``None`` (legacy whole-block behaviour) leaves the dimension unset
+    for caches with a single, undifferentiated KV component. Component-aware
+    caches (e.g. the unified radix tree) pass their own hook to report
+    FULL / SWA / MAMBA placement per tier.
+    """
+    return None
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -42,9 +56,18 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        component_types_for_page: Optional[
+            Callable[[Any, StorageMedium, int, int], Optional[list[str]]]
+        ] = None,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        self._component_types_for_page = component_types_for_page or _no_component_types
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -76,6 +99,11 @@ class KVCacheEventRecorder:
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail_metadata == event_metadata
+                    # Pages with different component placement must not merge, or
+                    # the coalesced event's component_types (the tail's) would
+                    # misrepresent the pages folded into it. None == None keeps
+                    # legacy (component dimension off) coalescing unchanged.
+                    and tail.component_types == event.component_types
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -126,6 +154,7 @@ class KVCacheEventRecorder:
 
         page_index = 0
         logical_len = len(node.key)
+        num_pages = -(-logical_len // self.page_size)
         is_bigram = node.key.is_bigram
         raw = node.key.token_ids
         for start in range(0, logical_len, self.page_size):
@@ -140,6 +169,17 @@ class KVCacheEventRecorder:
 
             block_hash = hash_str_to_int64(event_hash_values[page_index])
 
+            component_types = self._component_types_for_page(
+                node, medium, page_index, num_pages
+            )
+            # An empty (non-None) set means nothing is resident at this medium
+            # for this page -- do not claim placement. Still advance the
+            # parent-hash chain so later pages keep correct parentage.
+            if component_types is not None and len(component_types) == 0:
+                parent_block_hash = block_hash
+                page_index += 1
+                continue
+
             event_args = {
                 "block_hashes": [block_hash],
                 "parent_block_hash": parent_block_hash,
@@ -147,6 +187,7 @@ class KVCacheEventRecorder:
                 "block_size": len(page_tokens),
                 "lora_id": None,
                 "medium": medium,
+                "component_types": component_types,
             }
             if node.key.cache_salt is None:
                 event = BlockStored(**event_args)
@@ -164,6 +205,9 @@ class KVCacheEventRecorder:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
+        # A removal always means the whole block left ``medium`` (its base
+        # component is gone), so removals stay whole-block with no component
+        # dimension.
         if not self.enabled:
             return
         if medium is None:
