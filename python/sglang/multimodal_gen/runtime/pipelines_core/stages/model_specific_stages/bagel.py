@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.dits.bagel_taylorseer import (
+    BagelTaylorSeerContext,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
@@ -30,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _BAGEL_CONTEXT_KEY = "bagel_context"
+_BAGEL_TAYLORSEER_KEY = "bagel_taylorseer_context"
 _REVISED_PROMPT_KEY = "revised_prompt"
 GEN_THINK_SYSTEM_PROMPT = (
     "You should first think about the planning process in the mind and then "
@@ -363,6 +367,8 @@ class BagelBeforeDenoisingStage(PipelineStage):
             raise ValueError("BAGEL rollout mode is not supported")
         if batch.return_trajectory_latents or batch.return_trajectory_decoded:
             raise ValueError("BAGEL trajectory output is not supported")
+        if not isinstance(batch.enable_taylorseer, bool):
+            raise ValueError("BAGEL enable_taylorseer must be a boolean")
 
         if not isinstance(batch.height, int) or not isinstance(batch.width, int):
             raise ValueError("BAGEL height and width must be integers")
@@ -627,6 +633,17 @@ class BagelBeforeDenoisingStage(PipelineStage):
             raise RuntimeError("BAGEL scheduler must append exactly one terminal sigma")
 
         batch.extra[_BAGEL_CONTEXT_KEY] = context
+        if batch.enable_taylorseer:
+            # Taylor caches can retain several GiB of layer outputs. Keep them
+            # request-owned so concurrent and sequential requests never share
+            # derivatives through the resident transformer.
+            batch.extra[_BAGEL_TAYLORSEER_KEY] = BagelTaylorSeerContext.create(
+                num_layers=int(arch.num_hidden_layers),
+                num_steps=int(batch.num_inference_steps),
+                has_secondary=bool(getattr(context, "has_three_way_cfg", False)),
+            )
+        else:
+            batch.extra.pop(_BAGEL_TAYLORSEER_KEY, None)
         batch.latents = latents
         # Preserve the established 2D single-request contract while exposing a
         # real batch dimension to the shared denoising loop for merged requests.

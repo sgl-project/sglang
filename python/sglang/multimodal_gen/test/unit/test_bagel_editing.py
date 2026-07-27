@@ -88,6 +88,7 @@ class _Transformer:
     ):
         context = SimpleNamespace(
             is_editing=True,
+            has_three_way_cfg=True,
             vae_shape=tuple(vae_patches.shape),
             vae_position_ids=vae_position_ids.clone(),
             vision_shape=tuple(vision_embeddings.shape),
@@ -153,6 +154,29 @@ def test_editing_stage_builds_three_way_context_and_request_rng() -> None:
     assert stage.image_encoder.images == [(32, 32)]
     assert output.latents.shape == (4, 64)
     assert output.generator[0].initial_seed() == 11
+
+
+def test_editing_taylorseer_preserves_conditioning_rng() -> None:
+    baseline_stage = _stage()
+    accelerated_stage = _stage()
+    baseline = _batch()
+    accelerated = _batch()
+    accelerated.enable_taylorseer = True
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "bagel.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    ):
+        baseline_stage.forward(baseline, baseline_stage.server_args)
+        accelerated_stage.forward(accelerated, accelerated_stage.server_args)
+
+    assert baseline_stage.vae.seeds == accelerated_stage.vae.seeds == [11]
+    torch.testing.assert_close(accelerated.latents, baseline.latents, rtol=0, atol=0)
+    assert (
+        accelerated.extra["bagel_taylorseer_context"].secondary_unconditional
+        is not None
+    )
 
 
 def test_editing_stage_rejects_multiple_images_before_encoding() -> None:

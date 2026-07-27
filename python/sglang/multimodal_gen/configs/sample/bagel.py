@@ -20,6 +20,13 @@ class BagelSamplingParams(SamplingParams):
     guidance_scale: float = 4.0
     negative_prompt: str | None = None
     flow_shift: float | None = 3.0
+    enable_taylorseer: bool = False
+
+    def _validate(self) -> None:
+        """Validate BAGEL image-generation controls and inherited fields."""
+        super()._validate()
+        if not isinstance(self.enable_taylorseer, bool):
+            raise ValueError("enable_taylorseer must be a boolean")
 
 
 @dataclass
@@ -70,6 +77,11 @@ class BagelUnderstandingSamplingParams(BagelSamplingParams):
     def _validate(self) -> None:
         """Validate Understanding decode controls and inherited request fields."""
         super()._validate()
+        if self.enable_taylorseer:
+            raise ValueError(
+                "enable_taylorseer is unavailable for BAGEL Understanding because "
+                "it does not run image denoising"
+            )
         if (
             not isinstance(self.max_new_tokens, int)
             or isinstance(self.max_new_tokens, bool)

@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 _BAGEL_CONTEXT_KEY = "bagel_context"
+_BAGEL_TAYLORSEER_KEY = "bagel_taylorseer_context"
 
 
 def calculate_bagel_resize_dimensions(
@@ -146,6 +147,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
             "cfg_interval": self.cfg_interval,
             "cfg_renorm_min": self.cfg_renorm_min,
             "cfg_renorm_type": self.cfg_renorm_type,
+            "taylorseer_context": batch.extra.get(_BAGEL_TAYLORSEER_KEY),
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -219,8 +221,12 @@ class BagelPipelineConfig(ImagePipelineConfig):
             )
         finally:
             # The context owns large KV tensors. Drop the request's reference before
-            # VAE decode so those tensors can be reclaimed as soon as denoising ends.
+            # VAE decode so KV and Taylor tensors can be reclaimed immediately.
             batch.extra.pop(_BAGEL_CONTEXT_KEY, None)
+            taylorseer_context = batch.extra.pop(_BAGEL_TAYLORSEER_KEY, None)
+            release_taylorseer = getattr(taylorseer_context, "release", None)
+            if callable(release_taylorseer):
+                release_taylorseer()
 
 
 def _editing_vae_config() -> BagelVAEConfig:

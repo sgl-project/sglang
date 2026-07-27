@@ -9,7 +9,8 @@ description: "Serve BAGEL-7B-MoT for generation, editing, Thinking, and image Un
 multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
 native integration supports text-to-image generation, model-generated planning
 before image generation (Thinking), single-image editing, and single-image
-Understanding on NVIDIA CUDA.
+Understanding on NVIDIA CUDA. The three image-generation pipelines can also use
+BAGEL's native request-level TaylorSeer acceleration.
 
 <Warning>
 Run text-to-image generation, Thinking, editing, and Understanding as separate
@@ -19,7 +20,9 @@ process. The current integration does not support editing masks, multiple input
 images, multi-output requests, sequence/CFG parallelism, Cache-DiT, or layer-wise
 offload. Dynamic batching is supported only for compatible pure T2I requests on
 the baseline `BagelPipeline`; Thinking, Editing, and Understanding remain
-singleton-only. Transformer tensor parallelism is validated at TP=2.
+singleton-only. Native TaylorSeer is separate from Cache-DiT and is supported by
+T2I, Thinking, and Editing; Understanding rejects it because that pipeline does
+not denoise images. Transformer tensor parallelism is validated at TP=2.
 </Warning>
 
 ## Prerequisites
@@ -199,6 +202,65 @@ The default BAGEL flow shift is `3.0`. The images API accepts `flow_shift` as a
 request field; the offline CLI uses the model default. The fixed-seed example
 uses the CPU generator to match the official BAGEL noise initialization.
 
+## Accelerate denoising with native TaylorSeer
+
+[TaylorSeer](https://github.com/Shenyi-Z/TaylorSeer) forecasts intermediate
+transformer-layer outputs between periodic full evaluations. Enable it per
+request; the default remains disabled. For the offline T2I CLI, add one flag:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --enable-taylorseer \
+  --save-output
+```
+
+For the Images API, add the same control to `extra_body`:
+
+```python
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "enable_taylorseer": True,
+    },
+)
+```
+
+The same request field is accepted by `BagelThinkingPipeline` and by the
+multipart `/v1/images/edits` endpoint served by `BagelEditPipeline`. Each actual
+CFG branch owns an independent cache, and the cache is released before VAE
+decode. The fixed native settings are sixth-order forecasting, five initial
+full evaluations, and a refresh every third active branch evaluation. Under
+SGLang's exact-N contract, an always-active 50-update branch performs 20 full
+and 30 forecast evaluations. CFG branches that are inactive outside their CFG
+interval advance only when they execute. The official BAGEL `num_timesteps=50`
+path performs 49 updates; use 49 SGLang steps when comparing those trajectories.
+
+<Warning>
+TaylorSeer trades memory and exact trajectory parity for speed. Use the default
+50-step schedule when evaluating output quality; very short schedules make each
+forecast span a larger part of the denoising trajectory and can show visible
+artifacts. Schedules of five or fewer updates never reach a forecast step and
+receive no acceleration. At 1024x1024 BF16, the worst-case layer cache is
+approximately 11 GiB for two-way T2I CFG, 17 GiB for three-way Thinking/Editing,
+and 21 GiB for a two-request T2I dynamic batch. These tensors are replicated per
+TP rank. Start with `--batching-max-size 1`, monitor peak memory, and increase
+the dynamic batch cap only after validating the target GPU. Native TaylorSeer
+cannot be combined with the unsupported BAGEL Cache-DiT path.
+</Warning>
+
 ## Generate an image with Thinking
 
 Send the same Images API request to the Thinking server and optionally control
@@ -369,6 +431,9 @@ sglang generate \
   implement negative-prompt conditioning.
 - Use `num_inference_steps=50` to execute 50 denoising updates.
 - Keep `guidance_scale=4.0` and `flow_shift=3.0` for the official default path.
+- `enable_taylorseer` defaults to `false` and applies only to image-generation
+  pipelines. It is part of dynamic-batch compatibility, so enabled and disabled
+  requests never merge.
 - Thinking uses the official three-way context: system + prompt + plan, system
   only, and system + prompt. Its secondary CFG scale is fixed at `1.5`.
 - Thinking defaults to greedy planning. Add `think_do_sample=true` in HTTP or

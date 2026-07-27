@@ -803,6 +803,11 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
         )
+        add_argument(
+            "--enable-taylorseer",
+            action="store_true",
+            help="Enable BAGEL's native request-local TaylorSeer acceleration",
+        )
 
         # profiling
         add_argument(

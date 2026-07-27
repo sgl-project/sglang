@@ -42,6 +42,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedd
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.models.dits.bagel_taylorseer import (
+    BagelTaylorSeerContext,
+    TaylorSeerState,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -1788,6 +1792,7 @@ class BagelTransformer(BaseDiT):
         cfg_interval: tuple[float, float] = (0.4, 1.0),
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
+        taylorseer_context: BagelTaylorSeerContext | None = None,
         guidance: Tensor | None = None,
         **_: object,
     ) -> Tensor:
@@ -1805,6 +1810,7 @@ class BagelTransformer(BaseDiT):
             cfg_interval: Open/closed sigma interval ``(low, high]``.
             cfg_renorm_min: Lower clamp for BAGEL's CFG norm correction.
             cfg_renorm_type: ``global`` or ``channel``.
+            taylorseer_context: Optional request-owned layer forecast state.
             guidance: Unused standard embedded-guidance argument.
 
         Returns:
@@ -1839,13 +1845,18 @@ class BagelTransformer(BaseDiT):
                 sample_sigmas, sample_sigmas[:1].expand_as(sample_sigmas)
             ):
                 raise ValueError("BAGEL batched requests must use the same timestep")
-        conditional = self._generation_step(
+        if taylorseer_context is not None:
+            taylorseer_context.validate_branch_count(
+                has_secondary=bagel_context.has_three_way_cfg
+            )
+        conditional = self._generation_branch(
             hidden_states,
             timestep,
             bagel_context.conditional_kv,
             bagel_context.conditional_kv_lens,
             bagel_context.conditional_rope_offset,
             bagel_context,
+            taylorseer_context.conditional if taylorseer_context else None,
         )
 
         scale = self._as_float(guidance_scale)
@@ -1853,13 +1864,14 @@ class BagelTransformer(BaseDiT):
         sigma = float(timestep[0].item())
         cfg_enabled = cfg_interval[0] < sigma <= cfg_interval[1] and scale > 1.0
         if cfg_enabled:
-            unconditional = self._generation_step(
+            unconditional = self._generation_branch(
                 hidden_states,
                 timestep,
                 bagel_context.unconditional_kv,
                 bagel_context.unconditional_kv_lens,
                 bagel_context.unconditional_rope_offset,
                 bagel_context,
+                taylorseer_context.unconditional if taylorseer_context else None,
             )
             if bagel_context.has_three_way_cfg:
                 secondary_unconditional_kv = bagel_context.secondary_unconditional_kv
@@ -1877,13 +1889,18 @@ class BagelTransformer(BaseDiT):
                     raise ValueError("incomplete BAGEL three-way CFG context")
                 secondary_unconditional = None
                 if image_scale > 1.0:
-                    secondary_unconditional = self._generation_step(
+                    secondary_unconditional = self._generation_branch(
                         hidden_states,
                         timestep,
                         secondary_unconditional_kv,
                         secondary_unconditional_lens,
                         secondary_unconditional_offset,
                         bagel_context,
+                        (
+                            taylorseer_context.secondary_unconditional
+                            if taylorseer_context
+                            else None
+                        ),
                     )
                 conditional = self._apply_cfg_three_way(
                     conditional,
@@ -1910,6 +1927,67 @@ class BagelTransformer(BaseDiT):
             return conditional.unsqueeze(0) if had_batch_dimension else conditional
         return conditional
 
+    def _generation_branch(
+        self,
+        latents: Tensor,
+        timestep: Tensor,
+        prefix_cache: BagelKVCache,
+        prefix_lens: Tensor,
+        rope_offset: int | Tensor,
+        context: BagelContext,
+        taylorseer_state: TaylorSeerState | None,
+    ) -> Tensor:
+        """Run one CFG branch and advance only that branch's Taylor state.
+
+        Args:
+            latents: Current request or packed-request latent tokens.
+            timestep: Per-token raw flow sigma values.
+            prefix_cache: Immutable request prefix KV cache.
+            prefix_lens: Prefix length for each packed request.
+            rope_offset: RoPE offset for each packed request.
+            context: Request-owned BAGEL geometry and token IDs.
+            taylorseer_state: Optional cache for this exact CFG branch.
+
+        Returns:
+            Predicted flow tokens for this CFG branch.
+
+        Raises:
+            ValueError: If state, context, or packed geometry is inconsistent.
+            RuntimeError: If Taylor state lifecycle or model execution fails.
+        """
+        if taylorseer_state is None:
+            return self._generation_step(
+                latents,
+                timestep,
+                prefix_cache,
+                prefix_lens,
+                rope_offset,
+                context,
+                None,
+            )
+
+        # Official BAGEL advances each cache on actual branch forwards. In
+        # particular, CFG-disabled steps must not age unconditional caches.
+        taylorseer_state.begin_next_step()
+        try:
+            prediction = self._generation_step(
+                latents,
+                timestep,
+                prefix_cache,
+                prefix_lens,
+                rope_offset,
+                context,
+                taylorseer_state,
+            )
+            taylorseer_state.end_step()
+        except Exception:
+            # Per-layer updates are not transactional. Poison every CFG branch
+            # in the shared request context and release cached tensors instead
+            # of permitting a retry with partially advanced derivatives.
+            taylorseer_state.poison()
+            raise
+        return prediction
+
     def _generation_step(
         self,
         latents: Tensor,
@@ -1918,6 +1996,7 @@ class BagelTransformer(BaseDiT):
         prefix_lens: Tensor,
         rope_offset: int | Tensor,
         context: BagelContext,
+        taylorseer_state: TaylorSeerState | None,
     ) -> Tensor:
         device = latents.device
         batch_size, token_count, patch_width = latents.shape
@@ -1934,6 +2013,7 @@ class BagelTransformer(BaseDiT):
                 prefix_lens,
                 rope_offset,
                 context,
+                taylorseer_state,
             )
 
         rope_offsets = torch.as_tensor(
@@ -1982,7 +2062,12 @@ class BagelTransformer(BaseDiT):
 
         rope_positions = rope_offsets.repeat_interleave(sequence_length)
         cosine, sine = self.rotary_emb(packed, rope_positions)
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            if taylorseer_state is not None and not taylorseer_state.should_compute(
+                layer_index
+            ):
+                packed = taylorseer_state.approximate(layer_index)
+                continue
             packed, _ = layer(
                 packed,
                 cosine,
@@ -1996,6 +2081,8 @@ class BagelTransformer(BaseDiT):
                 update_cache=False,
                 causal=False,
             )
+            if taylorseer_state is not None:
+                taylorseer_state.update_cache(layer_index, packed)
 
         normalized = torch.zeros_like(packed)
         normalized[text_indexes] = self.und_final_norm(packed[text_indexes])
@@ -2012,6 +2099,7 @@ class BagelTransformer(BaseDiT):
         prefix_lens: Tensor,
         rope_offset: int | Tensor,
         context: BagelContext,
+        taylorseer_state: TaylorSeerState | None,
     ) -> Tensor:
         """Run the original singleton image-token path without batch packing."""
         device = latents.device
@@ -2043,7 +2131,12 @@ class BagelTransformer(BaseDiT):
             (sequence_length,), singleton_rope_offset, dtype=torch.long, device=device
         )
         cosine, sine = self.rotary_emb(packed, rope_positions)
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            if taylorseer_state is not None and not taylorseer_state.should_compute(
+                layer_index
+            ):
+                packed = taylorseer_state.approximate(layer_index)
+                continue
             packed, _ = layer(
                 packed,
                 cosine,
@@ -2056,6 +2149,8 @@ class BagelTransformer(BaseDiT):
                 update_cache=False,
                 causal=False,
             )
+            if taylorseer_state is not None:
+                taylorseer_state.update_cache(layer_index, packed)
 
         normalized = torch.zeros_like(packed)
         normalized[text_indexes] = self.und_final_norm(packed[text_indexes])

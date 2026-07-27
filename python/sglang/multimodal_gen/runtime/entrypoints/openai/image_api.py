@@ -20,7 +20,10 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImageResponse,
@@ -157,6 +160,34 @@ def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
         )
 
 
+def _build_image_sampling_params(
+    request_id: str,
+    *,
+    enable_taylorseer: bool | None,
+    **kwargs: Any,
+) -> SamplingParams:
+    """Build image sampling params with a client-facing TaylorSeer error."""
+    try:
+        # False is the universal default. Drop it before model-specific
+        # SamplingParams construction so non-BAGEL models do not receive an
+        # unknown field when a generic client sends the flag explicitly.
+        return build_sampling_params(
+            request_id,
+            enable_taylorseer=enable_taylorseer or None,
+            **kwargs,
+        )
+    except (TypeError, ValueError) as exc:
+        if enable_taylorseer is True and "enable_taylorseer" in str(exc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "enable_taylorseer is not supported by the active image "
+                    f"pipeline: {exc}"
+                ),
+            ) from exc
+        raise
+
+
 def _build_image_response_kwargs(
     save_file_path_list: list[str],
     resp_format: str,
@@ -251,8 +282,9 @@ async def generations(
     )
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
-        sampling = build_sampling_params(
+        sampling = _build_image_sampling_params(
             request_id,
+            enable_taylorseer=request.enable_taylorseer,
             prompt=request.prompt,
             size=request.size,
             width=request.width,
@@ -397,6 +429,7 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_taylorseer: Optional[bool] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
@@ -443,8 +476,9 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
-        sampling = build_sampling_params(
+        sampling = _build_image_sampling_params(
             request_id,
+            enable_taylorseer=enable_taylorseer,
             prompt=prompt,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),

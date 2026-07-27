@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +16,10 @@ from sglang.multimodal_gen.configs.models.dits.bagel import (
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+)
+from sglang.multimodal_gen.runtime.models.dits.bagel_taylorseer import (
+    BagelTaylorSeerContext,
+    TaylorSeerConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     BagelTransformer,
@@ -278,6 +283,280 @@ def test_batch_one_preserves_two_and_three_dimensional_forward_contract(
     assert unbatched.shape == latents.shape
     assert batched.shape == (1, *latents.shape)
     torch.testing.assert_close(batched[0], unbatched, rtol=0, atol=0)
+
+
+def test_disabled_taylorseer_preserves_pre_acceleration_singleton_math(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    latents = torch.randn(4, 4)
+    timestep = torch.tensor([0.5])
+    normalized_timestep = tiny_transformer._normalize_timestep(
+        timestep,
+        batch_size=1,
+        token_count=latents.shape[0],
+        device=latents.device,
+    )
+    conditional = tiny_transformer._generation_step_single(
+        latents,
+        normalized_timestep,
+        context.conditional_kv,
+        context.conditional_kv_lens,
+        context.conditional_rope_offset,
+        context,
+        None,
+    )
+    unconditional = tiny_transformer._generation_step_single(
+        latents,
+        normalized_timestep,
+        context.unconditional_kv,
+        context.unconditional_kv_lens,
+        context.unconditional_rope_offset,
+        context,
+        None,
+    )
+    expected = tiny_transformer._apply_cfg(
+        conditional,
+        unconditional,
+        2.0,
+        renorm_min=0.0,
+        renorm_type="global",
+    ).float()
+
+    actual = tiny_transformer(
+        latents,
+        timestep,
+        bagel_context=context,
+        guidance_scale=2.0,
+        cfg_interval=(0.0, 1.0),
+        taylorseer_context=None,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_request_owned_taylorseer_skips_layers_between_refreshes(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=1,
+        num_steps=4,
+        has_secondary=False,
+        config=TaylorSeerConfig(
+            max_order=2,
+            fresh_threshold=3,
+            first_enhance=1,
+        ),
+    )
+    layer_calls: list[int] = []
+    hook = tiny_transformer.layers[0].register_forward_hook(
+        lambda *_args: layer_calls.append(1)
+    )
+    call_counts = []
+    try:
+        for sigma in (1.0, 0.8, 0.6, 0.4):
+            output = tiny_transformer(
+                torch.randn(4, 4),
+                torch.tensor([sigma]),
+                bagel_context=context,
+                guidance_scale=2.0,
+                cfg_interval=(0.0, 1.0),
+                taylorseer_context=taylorseer,
+            )
+            assert output.shape == (4, 4)
+            assert torch.isfinite(output).all()
+            call_counts.append(len(layer_calls))
+    finally:
+        hook.remove()
+
+    # Conditional and unconditional branches each execute on refresh steps.
+    assert call_counts == [2, 2, 2, 4]
+    assert taylorseer.conditional is not taylorseer.unconditional
+    assert taylorseer.get_stats()["conditional"] == {
+        "total_steps": 4,
+        "full_steps": 2,
+        "taylor_steps": 2,
+    }
+
+
+def test_taylorseer_supports_packed_dynamic_batch(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    contexts = [
+        _build_context(tiny_transformer, [1, 2]),
+        _build_context(tiny_transformer, [2, 1, 2]),
+    ]
+    packed_context = tiny_transformer.pack_contexts(contexts)
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=1,
+        num_steps=2,
+        has_secondary=False,
+        config=TaylorSeerConfig(
+            max_order=1,
+            fresh_threshold=3,
+            first_enhance=1,
+        ),
+    )
+    latents = torch.randn(2, 4, 4)
+
+    refreshed = tiny_transformer(
+        latents,
+        torch.tensor([1.0, 1.0]),
+        bagel_context=packed_context,
+        guidance_scale=2.0,
+        cfg_interval=(0.0, 1.0),
+        taylorseer_context=taylorseer,
+    )
+    forecast = tiny_transformer(
+        latents,
+        torch.tensor([0.5, 0.5]),
+        bagel_context=packed_context,
+        guidance_scale=2.0,
+        cfg_interval=(0.0, 1.0),
+        taylorseer_context=taylorseer,
+    )
+
+    assert refreshed.shape == latents.shape
+    assert forecast.shape == latents.shape
+    assert taylorseer.conditional.completed_steps == 2
+    assert taylorseer.unconditional.completed_steps == 2
+
+    sequential_states = [
+        BagelTaylorSeerContext.create(
+            num_layers=1,
+            num_steps=2,
+            has_secondary=False,
+            config=TaylorSeerConfig(
+                max_order=1,
+                fresh_threshold=3,
+                first_enhance=1,
+            ),
+        )
+        for _ in contexts
+    ]
+    sequential_outputs = []
+    for sigma in (1.0, 0.5):
+        sequential_outputs.append(
+            torch.stack(
+                [
+                    tiny_transformer(
+                        latents[index],
+                        torch.tensor([sigma]),
+                        bagel_context=context,
+                        guidance_scale=2.0,
+                        cfg_interval=(0.0, 1.0),
+                        taylorseer_context=sequential_states[index],
+                    )
+                    for index, context in enumerate(contexts)
+                ]
+            )
+        )
+
+    torch.testing.assert_close(refreshed, sequential_outputs[0], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(forecast, sequential_outputs[1], rtol=1e-5, atol=1e-6)
+
+
+def test_taylorseer_advances_only_cfg_branches_that_execute(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=1,
+        num_steps=2,
+        has_secondary=False,
+    )
+
+    for sigma in (1.0, 0.5):
+        tiny_transformer(
+            torch.randn(4, 4),
+            torch.tensor([sigma]),
+            bagel_context=context,
+            guidance_scale=1.0,
+            taylorseer_context=taylorseer,
+        )
+
+    assert taylorseer.conditional.completed_steps == 2
+    assert taylorseer.unconditional.completed_steps == 0
+
+
+def test_taylorseer_poison_invalidates_all_cfg_branches_after_failure(
+    tiny_transformer: BagelTransformer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=1,
+        num_steps=2,
+        has_secondary=False,
+    )
+    layer = tiny_transformer.layers[0]
+    original_forward = layer.forward
+    call_count = 0
+
+    def fail_unconditional(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("injected unconditional failure")
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(layer, "forward", fail_unconditional)
+    with pytest.raises(RuntimeError, match="injected unconditional failure"):
+        tiny_transformer(
+            torch.randn(4, 4),
+            torch.tensor([1.0]),
+            bagel_context=context,
+            guidance_scale=2.0,
+            cfg_interval=(0.0, 1.0),
+            taylorseer_context=taylorseer,
+        )
+
+    assert taylorseer.is_failed
+    assert taylorseer.conditional.completed_steps == 1
+    assert taylorseer.unconditional.completed_steps == 0
+    with pytest.raises(RuntimeError, match="invalid after a failed"):
+        tiny_transformer(
+            torch.randn(4, 4),
+            torch.tensor([0.5]),
+            bagel_context=context,
+            guidance_scale=2.0,
+            cfg_interval=(0.0, 1.0),
+            taylorseer_context=taylorseer,
+        )
+
+
+def test_taylorseer_poison_clears_partial_two_layer_update(
+    tiny_transformer: BagelTransformer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arch = replace(tiny_transformer.config.arch_config, num_hidden_layers=2)
+    torch.manual_seed(0)
+    model = BagelTransformer(BagelDiTConfig(arch_config=arch)).eval()
+    context = _build_context(model, [1, 2])
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=2,
+        num_steps=1,
+        has_secondary=False,
+    )
+
+    def fail_second_layer(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("injected second-layer failure")
+
+    monkeypatch.setattr(model.layers[1], "forward", fail_second_layer)
+    with pytest.raises(RuntimeError, match="injected second-layer failure"):
+        model(
+            torch.randn(4, 4),
+            torch.tensor([1.0]),
+            bagel_context=context,
+            guidance_scale=1.0,
+            taylorseer_context=taylorseer,
+        )
+
+    assert taylorseer.is_failed
+    assert taylorseer.conditional.completed_steps == 0
+    assert taylorseer.conditional._layers == []
+    assert taylorseer.unconditional._layers == []
 
 
 def test_dynamic_batch_keeps_requests_attention_isolated(
@@ -635,6 +914,46 @@ def test_editing_context_has_three_request_owned_prefixes_with_shared_image_stor
     )
     assert prediction.shape == latents.shape
     assert torch.isfinite(prediction).all()
+
+    taylorseer = BagelTaylorSeerContext.create(
+        num_layers=1,
+        num_steps=9,
+        has_secondary=True,
+    )
+    tiny_transformer(
+        latents,
+        torch.tensor([0.5]),
+        bagel_context=context,
+        guidance_scale=4.0,
+        image_guidance_scale=1.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="text_channel",
+        taylorseer_context=taylorseer,
+    )
+    assert taylorseer.conditional.completed_steps == 1
+    assert taylorseer.unconditional.completed_steps == 1
+    assert taylorseer.secondary_unconditional is not None
+    assert taylorseer.secondary_unconditional.completed_steps == 0
+
+    for sigma in (0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1):
+        tiny_transformer(
+            latents,
+            torch.tensor([sigma]),
+            bagel_context=context,
+            guidance_scale=4.0,
+            image_guidance_scale=2.0,
+            cfg_interval=(0.0, 1.0),
+            cfg_renorm_type="text_channel",
+            taylorseer_context=taylorseer,
+        )
+    assert taylorseer.conditional.completed_steps == 9
+    assert taylorseer.unconditional.completed_steps == 9
+    assert taylorseer.secondary_unconditional.completed_steps == 8
+    assert taylorseer.secondary_unconditional.get_stats() == {
+        "total_steps": 8,
+        "full_steps": 6,
+        "taylor_steps": 2,
+    }
 
 
 def test_three_way_cfg_matches_official_text_channel_order() -> None:

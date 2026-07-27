@@ -50,6 +50,7 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    enable_taylorseer: Optional[bool] = None
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     max_think_tokens: Optional[int] = None

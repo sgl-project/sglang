@@ -3,7 +3,7 @@
 import argparse
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from PIL import Image
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.sample.bagel import (
     BagelEditSamplingParams,
     BagelSamplingParams,
     BagelThinkingSamplingParams,
+    BagelUnderstandingSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
@@ -35,6 +36,7 @@ class TestBagelSamplingParams(unittest.TestCase):
         self.assertEqual(params.flow_shift, 3.0)
         self.assertIsNone(params.negative_prompt)
         self.assertEqual(params.num_outputs_per_prompt, 1)
+        self.assertFalse(params.enable_taylorseer)
 
     def test_editing_reuses_standard_true_cfg_field(self) -> None:
         params = BagelEditSamplingParams(prompt="make the sky blue")
@@ -78,6 +80,33 @@ class TestBagelSamplingParams(unittest.TestCase):
         self.assertEqual(cli_args["max_think_tokens"], 12)
         self.assertTrue(cli_args["think_do_sample"])
         self.assertEqual(cli_args["think_temperature"], 0.8)
+
+    def test_taylorseer_is_available_to_image_generators_and_cli(self) -> None:
+        self.assertTrue(
+            BagelSamplingParams(
+                prompt="a cat", enable_taylorseer=True
+            ).enable_taylorseer
+        )
+        self.assertTrue(
+            BagelThinkingSamplingParams(
+                prompt="a cat", enable_taylorseer=True
+            ).enable_taylorseer
+        )
+        self.assertTrue(
+            BagelEditSamplingParams(
+                prompt="a cat", enable_taylorseer=True
+            ).enable_taylorseer
+        )
+        with self.assertRaisesRegex(ValueError, "does not run image denoising"):
+            BagelUnderstandingSamplingParams(prompt="describe", enable_taylorseer=True)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            BagelSamplingParams(prompt="a cat", enable_taylorseer=1)
+
+        parser = argparse.ArgumentParser()
+        SamplingParams.add_cli_args(parser)
+        args = parser.parse_args(["--enable-taylorseer"])
+        cli_args = BagelSamplingParams.get_cli_args(args)
+        self.assertTrue(cli_args["enable_taylorseer"])
 
 
 class TestBagelPipelineConfig(unittest.TestCase):
@@ -190,9 +219,13 @@ class TestBagelPipelineConfig(unittest.TestCase):
     def test_prepare_kwargs_passes_request_context_and_guidance(self) -> None:
         config = BagelPipelineConfig()
         context = object()
+        taylorseer_context = object()
         batch = SimpleNamespace(
             guidance_scale=6.5,
-            extra={"bagel_context": context},
+            extra={
+                "bagel_context": context,
+                "bagel_taylorseer_context": taylorseer_context,
+            },
         )
 
         kwargs = config.prepare_pos_cond_kwargs(
@@ -203,6 +236,7 @@ class TestBagelPipelineConfig(unittest.TestCase):
         )
 
         self.assertIs(kwargs["bagel_context"], context)
+        self.assertIs(kwargs["taylorseer_context"], taylorseer_context)
         self.assertEqual(kwargs["guidance_scale"], 6.5)
         self.assertEqual(kwargs["cfg_interval"], (0.4, 1.0))
         self.assertEqual(kwargs["cfg_renorm_type"], "global")
@@ -250,10 +284,14 @@ class TestBagelPipelineConfig(unittest.TestCase):
 
     def test_unpatchify_uses_request_shape_and_releases_context(self) -> None:
         config = BagelPipelineConfig()
+        taylorseer_context = SimpleNamespace(release=Mock())
         batch = SimpleNamespace(
             height=32,
             width=48,
-            extra={"bagel_context": object()},
+            extra={
+                "bagel_context": object(),
+                "bagel_taylorseer_context": taylorseer_context,
+            },
         )
         # 32/16 * 48/16 = 6 tokens; every token holds 2*2*16 values.
         tokens = torch.arange(6 * 64, dtype=torch.float32).reshape(6, 64)
@@ -262,6 +300,8 @@ class TestBagelPipelineConfig(unittest.TestCase):
 
         self.assertEqual(tuple(latents.shape), (1, 16, 4, 6))
         self.assertNotIn("bagel_context", batch.extra)
+        self.assertNotIn("bagel_taylorseer_context", batch.extra)
+        taylorseer_context.release.assert_called_once_with()
         # Compare against the explicit official patch permutation.
         expected = torch.einsum(
             "nhwpqc->nchpwq", tokens.reshape(1, 2, 3, 2, 2, 16)
@@ -310,16 +350,22 @@ class TestBagelPipelineConfig(unittest.TestCase):
 
     def test_unpatchify_releases_context_on_shape_error(self) -> None:
         config = BagelPipelineConfig()
+        taylorseer_context = SimpleNamespace(release=Mock())
         batch = SimpleNamespace(
             height=32,
             width=32,
-            extra={"bagel_context": object()},
+            extra={
+                "bagel_context": object(),
+                "bagel_taylorseer_context": taylorseer_context,
+            },
         )
 
         with self.assertRaisesRegex(ValueError, "latent shape"):
             config.post_denoising_loop(torch.zeros(3, 64), batch)
 
         self.assertNotIn("bagel_context", batch.extra)
+        self.assertNotIn("bagel_taylorseer_context", batch.extra)
+        taylorseer_context.release.assert_called_once_with()
 
 
 if __name__ == "__main__":

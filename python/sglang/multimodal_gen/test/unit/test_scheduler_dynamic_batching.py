@@ -5,12 +5,33 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
 
 class TestSchedulerDynamicBatching(unittest.TestCase):
+    def test_taylorseer_mismatch_prevents_request_merge(self) -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        requests = [
+            Req(
+                sampling_params=BagelSamplingParams(
+                    prompt=f"prompt-{index}",
+                    seed=index,
+                    enable_taylorseer=enable_taylorseer,
+                )
+            )
+            for index, enable_taylorseer in enumerate((False, True))
+        ]
+
+        self.assertFalse(scheduler._can_dynamic_batch(*requests))
+        self.assertEqual(
+            scheduler._get_dynamic_batch_reject_reason(*requests),
+            "sampling_params.enable_taylorseer",
+        )
+        self.assertIsNone(scheduler._try_merge_generation_reqs(requests))
+
     def test_return_frames_mismatch_prevents_request_merge(self) -> None:
         scheduler = Scheduler.__new__(Scheduler)
         requests = [

@@ -229,6 +229,29 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         self.assertIs(first.generator[0], first_generator)
         torch.testing.assert_close(first.latents, second.latents)
 
+    def test_taylorseer_state_is_request_owned(self) -> None:
+        stage = self._make_stage()
+        args = _server_args()
+        first = self._make_batch(seed=11, steps=4)
+        second = self._make_batch(seed=22, steps=4)
+        first.enable_taylorseer = True
+        second.enable_taylorseer = True
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            stage.forward(first, args)
+            stage.forward(second, args)
+
+        first_state = first.extra["bagel_taylorseer_context"]
+        second_state = second.extra["bagel_taylorseer_context"]
+        self.assertIsNot(first_state, second_state)
+        self.assertIsNot(first_state.conditional, first_state.unconditional)
+        self.assertIsNone(first_state.secondary_unconditional)
+        self.assertEqual(first_state.num_steps, 4)
+        self.assertEqual(first_state.conditional.num_layers, 28)
+
     def test_nonempty_negative_prompt_fails_fast(self) -> None:
         stage = self._make_stage()
         batch = self._make_batch()

@@ -97,7 +97,10 @@ An initial implementation of dynamic batching for T2I and T2V models can be foun
 
 For BAGEL, `✅` applies only to compatible pure T2I requests served by the
 baseline `BagelPipeline`. `BagelThinkingPipeline`, `BagelEditPipeline`, and
-`BagelUnderstandingPipeline` do not opt in to dynamic batching.
+`BagelUnderstandingPipeline` do not opt in to dynamic batching. Native
+TaylorSeer-enabled T2I requests may batch only with other enabled requests, but
+their replicated layer caches substantially increase memory use; begin with a
+model-specific cap of one and raise it only after measuring peak memory.
 
 ### Video
 

@@ -92,7 +92,7 @@ class _Transformer:
         self, _system_prefix, _user_prefix, thought_ids: torch.Tensor, **kwargs
     ) -> SimpleNamespace:
         self.thought_ids = thought_ids.clone()
-        return SimpleNamespace(is_thinking=True, **kwargs)
+        return SimpleNamespace(is_thinking=True, has_three_way_cfg=True, **kwargs)
 
 
 def _server_args() -> SimpleNamespace:
@@ -166,6 +166,28 @@ def test_thinking_stage_rewraps_clean_plan_and_preserves_noise_stream() -> None:
     assert output.extra["bagel_context"].is_thinking
     assert output.extra["revised_prompt"] == ("draw a blue fox\n<think>plan</think>")
     torch.testing.assert_close(output.latents.cpu(), expected_latents)
+
+
+def test_thinking_taylorseer_keeps_plan_and_noise_request_local() -> None:
+    baseline_stage = _stage()
+    accelerated_stage = _stage()
+    baseline = _batch()
+    accelerated = _batch()
+    accelerated.enable_taylorseer = True
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+        "bagel.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    ):
+        baseline_stage.forward(baseline, baseline_stage.server_args)
+        accelerated_stage.forward(accelerated, accelerated_stage.server_args)
+
+    assert accelerated.extra["revised_prompt"] == baseline.extra["revised_prompt"]
+    torch.testing.assert_close(accelerated.latents, baseline.latents, rtol=0, atol=0)
+    taylorseer = accelerated.extra["bagel_taylorseer_context"]
+    assert taylorseer.secondary_unconditional is not None
+    assert taylorseer.conditional is not taylorseer.unconditional
 
 
 def test_thinking_warmup_caps_only_effective_decode_length() -> None:

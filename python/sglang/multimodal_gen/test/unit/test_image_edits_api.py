@@ -43,6 +43,7 @@ def _call_edits(**sources) -> None:
             output_quality="default",
             output_compression=None,
             enable_teacache=False,
+            enable_taylorseer=sources.get("enable_taylorseer"),
             enable_upscaling=False,
             upscaling_model_path=None,
             upscaling_scale=4,
@@ -93,7 +94,10 @@ def test_edits_sources_flow_into_one_sampling_image_path(source_field: str) -> N
         build_sampling as sampling_mock,
     ):
         with pytest.raises(_CapturedSampling):
-            _call_edits(**{source_field: [source]})
+            _call_edits(
+                **{source_field: [source]},
+                enable_taylorseer=True,
+            )
 
     kwargs = sampling_mock.call_args.kwargs
     assert kwargs["image_path"] == ["/tmp/saved-source.png"]
@@ -101,7 +105,35 @@ def test_edits_sources_flow_into_one_sampling_image_path(source_field: str) -> N
     assert kwargs["seed"] == 9
     assert kwargs["guidance_scale"] == 4.0
     assert kwargs["true_cfg_scale"] == 2.0
+    assert kwargs["enable_taylorseer"] is True
     save_image.assert_awaited_once()
+
+
+def test_edits_normalizes_explicit_false_taylorseer_control() -> None:
+    source = UploadFile(filename="source.png", file=BytesIO(b"image"))
+    save_image = AsyncMock(return_value="/tmp/saved-source.png")
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "get_global_server_args",
+            return_value=SimpleNamespace(input_save_path=None, output_path=None),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "save_image_to_path",
+            save_image,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.entrypoints.openai.image_api."
+            "build_sampling_params",
+            side_effect=_CapturedSampling,
+        ) as sampling_mock,
+    ):
+        with pytest.raises(_CapturedSampling):
+            _call_edits(image=[source], enable_taylorseer=False)
+
+    assert sampling_mock.call_args.kwargs["enable_taylorseer"] is None
 
 
 def test_edits_requires_an_upload_or_url() -> None:
