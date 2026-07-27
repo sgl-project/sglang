@@ -2,10 +2,10 @@
 
 Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1,
 mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
-covering the Rust `/generate` bootstrap-field intake (scalar and per-item list
-forms injected by the router), the positional scheduler-wire PD block, the
-scheduler-hosted KV bootstrap server, the PD warmup fan-out, and the
-fake-bootstrap health probe.
+covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
+eval's single-prompt requests, per-item list form via the batch test), the
+positional scheduler-wire PD block, the scheduler-hosted KV bootstrap server,
+the PD warmup fan-out, and the fake-bootstrap health probe.
 
 The Rust server has no OpenAI endpoints, so everything (including the gsm8k
 eval) goes through ``/generate``.
@@ -59,21 +59,10 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
         self.assertGreater(metrics["score"], 0.62)
 
-    def test_generate_via_lb(self):
-        # Single request: the router injects scalar bootstrap fields.
-        response = requests.post(
-            self.lb_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        j = response.json()
-        self.assertTrue(j["text"])
-        self.assertIsNotNone(j["meta_info"]["finish_reason"])
-
     def test_generate_stream_via_lb(self):
+        # The scalar-bootstrap non-stream path is already covered 64x with an
+        # accuracy gate by test_gsm8k; what is unique here is mini_lb passing
+        # the decode node's SSE frames through under PD.
         response = requests.post(
             self.lb_url + "/generate",
             json={
@@ -94,7 +83,21 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
             chunks.append(json.loads(payload))
         self.assertTrue(chunks)
         self.assertTrue(chunks[-1]["text"])
-        self.assertIsNotNone(chunks[-1]["meta_info"]["finish_reason"])
+        # Frames are cumulative (--incremental-streaming-output defaults off),
+        # so the last frame must extend the first. (Frame *count* is not
+        # asserted: a slow reader legitimately coalesces a drained backlog.)
+        self.assertTrue(chunks[-1]["text"].startswith(chunks[0]["text"]))
+        # Exactly one terminal frame, and it is the last one. On a PD stream the
+        # prefill node produces its own finish_reason frame; leaking that into
+        # the decode stream would truncate the client mid-generation.
+        terminal = [
+            i
+            for i, chunk in enumerate(chunks)
+            if chunk["meta_info"]["finish_reason"] is not None
+        ]
+        self.assertEqual(terminal, [len(chunks) - 1], f"{terminal=} {len(chunks)=}")
+        # One request id across the whole stream — not prefill's, then decode's.
+        self.assertEqual(len({chunk["meta_info"]["id"] for chunk in chunks}), 1)
 
     def test_batch_generate_via_lb(self):
         # A batch makes the router inject per-item bootstrap lists — the list
@@ -109,8 +112,12 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 200)
         j = response.json()
         self.assertEqual(len(j), 2)
-        for item in j:
-            self.assertTrue(item["text"])
+        # Per-prompt answers, not just non-empty text: a bootstrap room paired
+        # with the wrong list index hands one item the other's transferred KV,
+        # which a truthiness check cannot see.
+        for item, expected in zip(j, ("paris", "tokyo")):
+            self.assertIn(expected, item["text"].lower(), item)
+            self.assertIsNotNone(item["meta_info"]["finish_reason"])
 
     def test_logprob_merge_via_lb(self):
         # With return_logprob the router merges the *prefill* response's
@@ -129,17 +136,42 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 200)
         meta = response.json()["meta_info"]
         self.assertEqual(len(meta["output_token_logprobs"]), meta["completion_tokens"])
-        self.assertGreater(len(meta["input_token_logprobs"]), 0)
+        # The *whole* prompt, since logprob_start_len is 0: a merge that drops
+        # prefill's list and leaves only what decode itself saw still yields a
+        # non-empty list, so pin the exact length.
+        self.assertEqual(len(meta["input_token_logprobs"]), meta["prompt_tokens"])
+
+    def test_missing_bootstrap_is_rejected(self):
+        # Negative branch of the fake-bootstrap health probe: a /generate that
+        # reaches a PD node *without* the router's bootstrap fields must surface
+        # the scheduler's 400 abort through the rust wire — not hang, not 500.
+        # Nothing else in this suite reaches the rust egress' abort_status path.
+        response = requests.post(
+            self.prefill_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
 
     def test_backend_health(self):
         # /health_generate directly on each side: on a PD node the probe only
         # passes with the fake bootstrap pair injected (room-less requests are
-        # 400-aborted by the scheduler).
-        for url in (self.prefill_url, self.decode_url):
-            self.assertEqual(
-                requests.get(url + "/health_generate", timeout=60).status_code,
-                200,
+        # 400-aborted by the scheduler). Not the fixture's assert_process_healthy:
+        # its 10s client timeout is shorter than the probe's own deadline
+        # (SGLANG_HEALTH_CHECK_TIMEOUT, 20s), which would turn a slow-but-passing
+        # side into a connection error.
+        for name, process, url in (
+            ("prefill", self.process_prefill, self.prefill_url),
+            ("decode", self.process_decode, self.decode_url),
+        ):
+            self.assertIsNone(
+                process.poll(), f"{name} exited with code {process.returncode}"
             )
+            response = requests.get(url + "/health_generate", timeout=60)
+            self.assertEqual(response.status_code, 200, response.text)
 
 
 if __name__ == "__main__":
