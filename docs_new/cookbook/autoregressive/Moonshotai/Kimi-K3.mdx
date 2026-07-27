@@ -36,7 +36,7 @@ If you do not want to use a Docker image, reproduce the dependency installation 
 
 Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
 
-**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
+**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
 
 **Strategy** — the operating point within that shape:
 
