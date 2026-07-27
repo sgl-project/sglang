@@ -723,7 +723,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -736,6 +736,20 @@ def eagle_sample(
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
+        )
+    elif _is_npu:
+        from sglang.srt.hardware_backend.npu.speculative.mtp_sampling import (
+            npu_mtp_non_greedy_sample,
+        )
+
+        predict, accept_index, num_correct_drafts = npu_mtp_non_greedy_sample(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
         )
     else:
         from sgl_kernel import (
