@@ -343,7 +343,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
     else:
-        from sglang.kernels.ops.attention.hadamard import hadamard_transform
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -2398,7 +2398,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev[0], topk_indices_next[0]
+        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
 
 
 @register_custom_op(mutates_args=["topk_result"])

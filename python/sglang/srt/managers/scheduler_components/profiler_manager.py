@@ -251,7 +251,9 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            torch.cuda.memory._record_memory_history(
+                max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+            )
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
@@ -356,7 +358,8 @@ class SchedulerProfilerManager:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                str(time.time())
+                stage_prefix
+                + str(time.time())
                 + f"-TP-{self.ps.tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
