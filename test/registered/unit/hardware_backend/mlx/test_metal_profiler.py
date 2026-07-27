@@ -204,7 +204,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         return mgr
 
     def test_start_profile_failure_does_not_crash(self):
-        import mlx.core as mx
+        import torch
 
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
@@ -214,10 +214,16 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
-            with patch.object(
-                mx.metal,
-                "start_capture",
-                side_effect=RuntimeError("Capture layer is not inserted"),
+            with (
+                patch(
+                    "sglang.srt.hardware_backend.mlx.profiler.use_mlx",
+                    return_value=False,
+                ),
+                patch.object(
+                    torch.mps.profiler,
+                    "metal_capture",
+                    side_effect=RuntimeError("Capture layer is not inserted"),
+                ),
             ):
                 result = mgr._start_profile()
 
@@ -226,9 +232,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
         self.assertIsNone(mgr.torch_profiler)
 
     def test_start_profile_success_with_mock_capture(self):
-        from unittest.mock import patch as mock_patch
-
-        import mlx.core as mx
+        import torch
 
         from sglang.srt.hardware_backend.mlx.profiler import (
             apply_metal_profiler_patches,
@@ -238,14 +242,25 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._make_manager(tmp)
-            with mock_patch.object(mx.metal, "start_capture"), mock_patch.object(
-                mx.metal, "stop_capture"
-            ), mock_patch("torch.distributed.barrier"):
+            mock_ctx = MagicMock()
+            with (
+                patch(
+                    "sglang.srt.hardware_backend.mlx.profiler.use_mlx",
+                    return_value=False,
+                ),
+                patch.object(
+                    torch.mps.profiler, "metal_capture", return_value=mock_ctx
+                ),
+                patch("torch.distributed.barrier"),
+            ):
                 result = mgr._start_profile()
                 self.assertTrue(result.success)
                 self.assertTrue(mgr.profile_in_progress)
                 mgr._stop_profile()
                 self.assertFalse(mgr.profile_in_progress)
+
+            mock_ctx.__enter__.assert_called_once_with()
+            mock_ctx.__exit__.assert_called_once_with(None, None, None)
 
 
 if __name__ == "__main__":
