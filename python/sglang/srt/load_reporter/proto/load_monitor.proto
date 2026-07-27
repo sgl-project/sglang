@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package router.loadmonitor.v1;
+
+import "google/protobuf/empty.proto";
+
+service LoadMonitorService {
+  rpc Report(stream LoadReport) returns (google.protobuf.Empty);
+}
+
+enum WorkerType {
+  WORKER_TYPE_UNSPECIFIED = 0;
+  WORKER_TYPE_REGULAR = 1;
+  WORKER_TYPE_PREFILL = 2;
+  WORKER_TYPE_DECODE = 3;
+}
+
+enum ReportStatus {
+  REPORT_STATUS_UNSPECIFIED = 0;
+  REPORT_STATUS_HEALTHY = 1;
+  REPORT_STATUS_STALE = 2;
+  REPORT_STATUS_UNREACHABLE = 3;
+}
+
+message Worker {
+  string worker_addr = 1;
+  WorkerType worker_type = 2;
+  optional string model = 3;
+  optional string zone = 4;
+}
+
+message RankLoad {
+  int32 dp_rank = 1;
+  int64 snapshot_time_unix_ms = 2;
+  int64 num_running_reqs = 3;
+  int64 num_waiting_reqs = 4;
+  int64 num_waiting_uncached_tokens = 5;
+  int64 num_used_tokens = 6;
+  int64 num_total_tokens = 7;
+  int64 max_total_num_tokens = 8;
+  int64 max_running_requests = 9;
+  double token_usage = 10;
+  double gen_throughput = 11;
+  double cache_hit_rate = 12;
+  double utilization = 13;
+}
+
+message LoadReport {
+  string source_instance_id = 1;
+  uint64 sequence_id = 2;
+  int64 report_time_unix_ms = 3;
+  Worker worker = 4;
+  ReportStatus status = 5;
+  optional string last_error = 6;
+  repeated RankLoad ranks = 7;
+}
