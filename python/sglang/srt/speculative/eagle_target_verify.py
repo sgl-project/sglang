@@ -12,6 +12,7 @@ from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -24,7 +25,7 @@ def prepare_eagle_verify_logits(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
-    vocab_mask: Optional[torch.Tensor] = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ) -> torch.Tensor:
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
@@ -57,11 +58,8 @@ def prepare_eagle_verify_logits(
             )
         )
 
-    if vocab_mask is not None:
-        assert verify_input.grammar is not None
-        verify_input.grammar.apply_vocab_mask(
-            logits=next_token_logits, vocab_mask=vocab_mask
-        )
+    if grammar_mask is not None:
+        grammar_mask.apply(next_token_logits)
 
     return next_token_logits
 
@@ -70,7 +68,7 @@ def maybe_eagle_sample_target_verify_topk1(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
-    vocab_mask: Optional[torch.Tensor] = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ) -> Optional[TargetVerifyTopk1Output]:
     """Run the CUDA topk=1 verify fast path when its semantics apply."""
     from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
@@ -105,7 +103,9 @@ def maybe_eagle_sample_target_verify_topk1(
     ):
         return None
 
-    logits = prepare_eagle_verify_logits(verify_input, batch, logits_output, vocab_mask)
+    logits = prepare_eagle_verify_logits(
+        verify_input, batch, logits_output, grammar_mask
+    )
     return target_verify_topk1_postprocess(
         logits,
         candidates,
