@@ -31,6 +31,9 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+    # Emit the per-component (full/swa/mamba) placement snapshot in KV events.
+    # Only honored by component-aware caches (the unified radix tree).
+    enable_kv_events_component_types: bool = False
     enable_session_radix_cache: bool = False
 
     enable_mamba_extra_buffer: bool = False
