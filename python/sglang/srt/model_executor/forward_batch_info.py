@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -218,8 +218,29 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+# Predicate for whether a forward's sequence is sharded across the attn-TP group
+# (vs. replicated on every rank). Injected at init; unset defaults to sharded.
+_attn_tp_sequence_sharded_predicate: Optional[Callable[[int], bool]] = None
+
+
+def register_attn_tp_sequence_sharded_predicate(
+    predicate: Callable[[int], bool],
+) -> None:
+    """Register the predicate for whether a forward is sharded across attn-TP."""
+    global _attn_tp_sequence_sharded_predicate
+    _attn_tp_sequence_sharded_predicate = predicate
+
+
 def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
-    """(tokens_per_rank, rank_offset) of this attn-TP rank's contiguous shard."""
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's slice of the sequence.
+
+    A replicated (non-sharded) forward puts the whole sequence on every rank, so
+    the slice is the full range with no offset; localizing it as a shard would
+    drop real tokens on non-zero ranks.
+    """
+    predicate = _attn_tp_sequence_sharded_predicate
+    if predicate is not None and not predicate(num_tokens_per_dp):
+        return num_tokens_per_dp, 0
     parallel = get_parallel()
     tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
     return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
