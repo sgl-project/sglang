@@ -60,6 +60,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 
 logger = logging.getLogger(__name__)
 _USE_FUSED_FP32_QK_NORM: bool | None = None
+_AttentionStateKey = tuple[torch.device, torch.dtype, int, int, int, int]
+_BAGEL_FLASH_ATTENTION_STATE: dict[_AttentionStateKey, bool] = {}
+_BAGEL_FLASHINFER_ATTENTION_STATE: dict[_AttentionStateKey, bool] = {}
 
 
 class _BagelColumnParallelLinear(ColumnParallelLinear):
@@ -530,6 +533,114 @@ def _interleave_prefix_and_query(
     return torch.cat(sequences, dim=0)
 
 
+def _can_use_bagel_cuda_attention(
+    query: Tensor, attention_backend: AttentionBackendEnum
+) -> bool:
+    """Return whether BAGEL may use CUDA dense-attention kernels."""
+    return (
+        attention_backend == AttentionBackendEnum.FA
+        and query.is_cuda
+        and query.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def _bagel_flash_attention_version(query: Tensor) -> int:
+    """Select FA4 on Blackwell-or-newer GPUs and FA3 otherwise."""
+    major, _ = torch.cuda.get_device_capability(query.device)
+    return 4 if major >= 10 else 3
+
+
+def _attention_state_key(
+    query: Tensor, key: Tensor, version: int
+) -> _AttentionStateKey:
+    """Build a process-local capability key for one attention configuration."""
+    return (
+        query.device,
+        query.dtype,
+        version,
+        int(query.shape[1]),
+        int(key.shape[1]),
+        int(query.shape[-1]),
+    )
+
+
+def _run_bagel_flash_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_lens: Tensor,
+    key_lens: Tensor,
+    *,
+    causal: bool,
+    version: int,
+) -> Tensor:
+    """Run SGLang's packed FA3/FA4 implementation."""
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+
+    cu_query = F.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+    cu_key = F.pad(torch.cumsum(key_lens, dim=0), (1, 0)).to(torch.int32)
+    return flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_query,
+        cu_key,
+        max_seqlen_q=int(query_lens.max().item()),
+        max_seqlen_k=int(key_lens.max().item()),
+        causal=causal,
+        ver=version,
+    )
+
+
+def _run_single_flashinfer_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    causal: bool,
+) -> Tensor:
+    """Run FlashInfer's NHD prefill kernel for one request."""
+    from flashinfer import single_prefill_with_kv_cache
+
+    return single_prefill_with_kv_cache(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        causal=causal,
+        kv_layout="NHD",
+        pos_encoding_mode="NONE",
+    )
+
+
+def _run_flashinfer_varlen_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    query_sizes: list[int],
+    key_sizes: list[int],
+    *,
+    causal: bool,
+) -> Tensor:
+    """Run FlashInfer per request so packed batches cannot attend across samples."""
+    query_chunks = torch.split(query, query_sizes, dim=0)
+    key_chunks = torch.split(key, key_sizes, dim=0)
+    value_chunks = torch.split(value, key_sizes, dim=0)
+    return torch.cat(
+        [
+            _run_single_flashinfer_attention(
+                query_chunk,
+                key_chunk,
+                value_chunk,
+                causal=causal,
+            )
+            for query_chunk, key_chunk, value_chunk in zip(
+                query_chunks, key_chunks, value_chunks
+            )
+        ],
+        dim=0,
+    )
+
+
 def _run_varlen_attention(
     query: Tensor,
     key: Tensor,
@@ -540,7 +651,7 @@ def _run_varlen_attention(
     causal: bool,
     attention_backend: AttentionBackendEnum,
 ) -> Tensor:
-    """Use SGLang FlashAttention on CUDA and a CPU-safe SDPA fallback."""
+    """Use FA, then FlashInfer on Blackwell, with a CPU-safe SDPA fallback."""
     query_sizes = [int(length) for length in query_lens.tolist()]
     key_sizes = [int(length) for length in key_lens.tolist()]
     if len(query_sizes) != len(key_sizes) or not query_sizes:
@@ -555,31 +666,80 @@ def _run_varlen_attention(
     if value.shape[0] != key.shape[0]:
         raise ValueError("BAGEL attention key and value lengths must match")
 
-    if (
-        attention_backend == AttentionBackendEnum.FA
-        and query.is_cuda
-        and query.dtype in (torch.float16, torch.bfloat16)
-    ):
-        try:
-            from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    if _can_use_bagel_cuda_attention(query, attention_backend):
+        version = _bagel_flash_attention_version(query)
+        state_key = _attention_state_key(query, key, version)
+        flash_attention_error: Exception | None = None
+        flash_attention_state = _BAGEL_FLASH_ATTENTION_STATE.get(state_key)
+        if flash_attention_state is not False:
+            try:
+                output = _run_bagel_flash_attention(
+                    query,
+                    key,
+                    value,
+                    query_lens,
+                    key_lens,
+                    causal=causal,
+                    version=version,
+                )
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except (ImportError, NotImplementedError, RuntimeError, TypeError) as error:
+                if flash_attention_state is True:
+                    raise
+                _BAGEL_FLASH_ATTENTION_STATE[state_key] = False
+                flash_attention_error = error
+            else:
+                _BAGEL_FLASH_ATTENTION_STATE[state_key] = True
+                return output
 
-            cu_query = F.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
-            cu_key = F.pad(torch.cumsum(key_lens, dim=0), (1, 0)).to(torch.int32)
-            major, _ = torch.cuda.get_device_capability(query.device)
-            return flash_attn_varlen_func(
-                query,
-                key,
-                value,
-                cu_query,
-                cu_key,
-                max_seqlen_q=int(query_lens.max().item()),
-                max_seqlen_k=int(key_lens.max().item()),
-                causal=causal,
-                ver=4 if major >= 10 else 3,
-            )
-        except (ImportError, NotImplementedError, RuntimeError, TypeError) as error:
+        # The old BAGEL integration used FlashInfer only as a Blackwell
+        # fallback. Keep FA as the public backend while preserving that
+        # resilience, and split packed batches to avoid cross-request attention.
+        if (
+            version == 4
+            and _BAGEL_FLASHINFER_ATTENTION_STATE.get(state_key) is not False
+        ):
+            flashinfer_state = _BAGEL_FLASHINFER_ATTENTION_STATE.get(state_key)
+            try:
+                output = _run_flashinfer_varlen_attention(
+                    query,
+                    key,
+                    value,
+                    query_sizes,
+                    key_sizes,
+                    causal=causal,
+                )
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except (ImportError, NotImplementedError, RuntimeError, TypeError) as error:
+                if flashinfer_state is True:
+                    raise
+                _BAGEL_FLASHINFER_ATTENTION_STATE[state_key] = False
+                logger.warning(
+                    "BAGEL FlashAttention and FlashInfer unavailable; using SDPA "
+                    "(FlashAttention: %s; FlashInfer: %s)",
+                    flash_attention_error or "cached unavailable",
+                    error,
+                )
+                flash_attention_error = None
+            else:
+                _BAGEL_FLASHINFER_ATTENTION_STATE[state_key] = True
+                if flash_attention_error is not None:
+                    logger.warning(
+                        "BAGEL FlashAttention unavailable; using FlashInfer: %s",
+                        flash_attention_error,
+                    )
+                elif flashinfer_state is None:
+                    logger.info(
+                        "BAGEL is using FlashInfer after a cached FlashAttention failure"
+                    )
+                return output
+
+        if flash_attention_error is not None:
             logger.warning(
-                "BAGEL FlashAttention unavailable; falling back to SDPA: %s", error
+                "BAGEL FlashAttention unavailable; falling back to SDPA: %s",
+                flash_attention_error,
             )
 
     if len(query_sizes) == 1:

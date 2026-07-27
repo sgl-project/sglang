@@ -26,8 +26,10 @@ from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     _apply_bagel_qk_norm,
     _BagelRMSNorm,
     _interleave_prefix_and_query,
+    _run_varlen_attention,
     _sdpa_attention,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _tp2_config(*, load_lm_head: bool = False) -> BagelDiTConfig:
@@ -828,6 +830,431 @@ def test_attention_backend_selection_is_explicit(
 
     with pytest.raises(ValueError, match="Unsupported BAGEL attention backend"):
         BagelTransformer(tiny_transformer.config, attention_backend="sage_attn")
+
+    with pytest.raises(ValueError, match="Unsupported BAGEL attention backend"):
+        BagelTransformer(tiny_transformer.config, attention_backend="flashinfer")
+
+
+def test_varlen_attention_prefers_flash_attention() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+    expected = torch.randn_like(query)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            return_value=expected,
+        ) as flash_attention,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention"
+        ) as flashinfer_attention,
+    ):
+        actual = _run_varlen_attention(
+            query,
+            key,
+            value,
+            lengths,
+            lengths,
+            causal=True,
+            attention_backend=AttentionBackendEnum.FA,
+        )
+
+    assert actual is expected
+    flash_attention.assert_called_once()
+    flashinfer_attention.assert_not_called()
+
+
+def test_varlen_attention_uses_per_request_flashinfer_fallback() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(5, 1, 4)
+    value = torch.randn_like(key)
+    query_lens = torch.tensor([2, 1], dtype=torch.int32)
+    key_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+    def fake_single_request(
+        query_chunk: torch.Tensor,
+        key_chunk: torch.Tensor,
+        value_chunk: torch.Tensor,
+        *,
+        causal: bool,
+    ) -> torch.Tensor:
+        assert key_chunk.shape == value_chunk.shape
+        assert causal is False
+        return query_chunk + key_chunk.shape[0]
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=RuntimeError("FA4 unavailable"),
+        ) as flash_attention,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_single_flashinfer_attention",
+            side_effect=fake_single_request,
+        ) as single_request,
+    ):
+        first = _run_varlen_attention(
+            query,
+            key,
+            value,
+            query_lens,
+            key_lens,
+            causal=False,
+            attention_backend=AttentionBackendEnum.FA,
+        )
+        second = _run_varlen_attention(
+            query,
+            key,
+            value,
+            query_lens,
+            key_lens,
+            causal=False,
+            attention_backend=AttentionBackendEnum.FA,
+        )
+
+    expected = torch.cat((query[:2] + 3, query[2:] + 2), dim=0)
+    torch.testing.assert_close(first, expected)
+    torch.testing.assert_close(second, expected)
+    assert flash_attention.call_count == 1
+    assert single_request.call_count == 4
+    assert [call.args[0].shape[0] for call in single_request.call_args_list] == [
+        2,
+        1,
+        2,
+        1,
+    ]
+
+
+def test_varlen_attention_falls_back_to_per_request_sdpa() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(5, 1, 4)
+    value = torch.randn_like(key)
+    query_lens = torch.tensor([2, 1], dtype=torch.int32)
+    key_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=RuntimeError("FA4 unavailable"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention",
+            side_effect=RuntimeError("FlashInfer unavailable"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._sdpa_attention",
+            side_effect=lambda query_chunk, _key, _value, _causal: query_chunk,
+        ) as sdpa_attention,
+    ):
+        actual = _run_varlen_attention(
+            query,
+            key,
+            value,
+            query_lens,
+            key_lens,
+            causal=False,
+            attention_backend=AttentionBackendEnum.FA,
+        )
+
+    torch.testing.assert_close(actual, query)
+    assert sdpa_attention.call_count == 2
+
+
+def test_varlen_attention_propagates_fa_failure_after_success() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=[query, RuntimeError("FA launch failed")],
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention"
+        ) as flashinfer_attention,
+    ):
+        torch.testing.assert_close(
+            _run_varlen_attention(
+                query,
+                key,
+                value,
+                lengths,
+                lengths,
+                causal=False,
+                attention_backend=AttentionBackendEnum.FA,
+            ),
+            query,
+        )
+        with pytest.raises(RuntimeError, match="FA launch failed"):
+            _run_varlen_attention(
+                query,
+                key,
+                value,
+                lengths,
+                lengths,
+                causal=False,
+                attention_backend=AttentionBackendEnum.FA,
+            )
+
+    flashinfer_attention.assert_not_called()
+
+
+def test_varlen_attention_propagates_flashinfer_failure_after_success() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=RuntimeError("FA4 unavailable"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention",
+            side_effect=[query, RuntimeError("FlashInfer launch failed")],
+        ),
+    ):
+        torch.testing.assert_close(
+            _run_varlen_attention(
+                query,
+                key,
+                value,
+                lengths,
+                lengths,
+                causal=False,
+                attention_backend=AttentionBackendEnum.FA,
+            ),
+            query,
+        )
+        with pytest.raises(RuntimeError, match="FlashInfer launch failed"):
+            _run_varlen_attention(
+                query,
+                key,
+                value,
+                lengths,
+                lengths,
+                causal=False,
+                attention_backend=AttentionBackendEnum.FA,
+            )
+
+
+def test_varlen_attention_skips_flashinfer_before_blackwell() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=3,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=RuntimeError("FA3 unavailable"),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention"
+        ) as flashinfer_attention,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._sdpa_attention",
+            return_value=query,
+        ),
+    ):
+        actual = _run_varlen_attention(
+            query,
+            key,
+            value,
+            lengths,
+            lengths,
+            causal=False,
+            attention_backend=AttentionBackendEnum.FA,
+        )
+
+    torch.testing.assert_close(actual, query)
+    flashinfer_attention.assert_not_called()
+
+
+def test_varlen_attention_explicit_sdpa_bypasses_cuda_backends() -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention"
+        ) as flash_attention,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention"
+        ) as flashinfer_attention,
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._sdpa_attention",
+            return_value=query,
+        ) as sdpa_attention,
+    ):
+        actual = _run_varlen_attention(
+            query,
+            key,
+            value,
+            lengths,
+            lengths,
+            causal=False,
+            attention_backend=AttentionBackendEnum.TORCH_SDPA,
+        )
+
+    torch.testing.assert_close(actual, query)
+    flash_attention.assert_not_called()
+    flashinfer_attention.assert_not_called()
+    sdpa_attention.assert_called_once_with(query, key, value, False)
+
+
+@pytest.mark.parametrize("failing_backend", ["flash_attention", "flashinfer"])
+def test_varlen_attention_never_hides_cuda_oom(failing_backend: str) -> None:
+    query = torch.randn(3, 2, 4)
+    key = torch.randn(3, 1, 4)
+    value = torch.randn_like(key)
+    lengths = torch.tensor([3], dtype=torch.int32)
+    flash_attention_error: Exception | None = None
+    flashinfer_error: Exception | None = None
+    if failing_backend == "flash_attention":
+        flash_attention_error = torch.cuda.OutOfMemoryError("FA OOM")
+    else:
+        flash_attention_error = RuntimeError("FA4 unavailable")
+        flashinfer_error = torch.cuda.OutOfMemoryError("FlashInfer OOM")
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASH_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._BAGEL_FLASHINFER_ATTENTION_STATE",
+            {},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._can_use_bagel_cuda_attention",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._bagel_flash_attention_version",
+            return_value=4,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_bagel_flash_attention",
+            side_effect=flash_attention_error,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._run_flashinfer_varlen_attention",
+            side_effect=flashinfer_error,
+        ),
+    ):
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            _run_varlen_attention(
+                query,
+                key,
+                value,
+                lengths,
+                lengths,
+                causal=False,
+                attention_backend=AttentionBackendEnum.FA,
+            )
 
 
 def test_bf16_rms_norm_matches_official_cast_order(
