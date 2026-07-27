@@ -11,6 +11,9 @@ from sglang.srt.model_executor.model_runner_components.remote_instance_weight_tr
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize("initial_weight_info", [None, {"model.weight": (1, 2, 3)}])
