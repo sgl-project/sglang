@@ -18,13 +18,16 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding.utils import rotate_half
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_compiler_backend, round_up
 
 logger = logging.getLogger(__name__)
@@ -410,7 +413,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         workspace_buffer: Optional[torch.Tensor] = None
         if (
-            get_mm().mm_attention_backend == "flashinfer_cudnn"
+            get_server_args().mm_attention_backend == "flashinfer_cudnn"
             and torch.cuda.is_available()
         ):
             workspace_buffer = torch.empty(
@@ -676,7 +679,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
         max_seqlen: Optional[int] = None
         sequence_lengths: Optional[torch.Tensor] = None
         encoder_cu_seq_len = cu_seq_len
-        if get_mm().mm_attention_backend == "flashinfer_cudnn":
+        if get_server_args().mm_attention_backend == "flashinfer_cudnn":
             (
                 encoder_cu_seq_len,
                 sequence_lengths,
@@ -688,7 +691,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
             device=hidden_states.device,
             packed_indptrs=(
                 encoder_cu_seq_len
-                if get_mm().mm_attention_backend == "flashinfer_cudnn"
+                if get_server_args().mm_attention_backend == "flashinfer_cudnn"
                 else None
             ),
             sequence_lengths=sequence_lengths,
@@ -720,7 +723,7 @@ class MiniMaxVLVisionModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        self.use_data_parallel = get_server_args().mm_enable_dp_encoder
         self.vision_config = config
 
         self.vision_model = MiniMaxVLVisionTransformer(
