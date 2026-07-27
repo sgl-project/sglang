@@ -2340,17 +2340,16 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            # FMHA fp8 hd256 fast-path (ROCm/aiter PR #3732).
-            # Qwen3.5 (head_dim 256) otherwise runs the slow Triton / CK
-            # batch-prefill path. When opted in on gfx950, route pure prefill
-            # (no cached prefix, no sliding window) through aiter's hand-written
-            # hd256 fp8 asm kernel. q/k/v are quantized to fp8 with per-tensor
-            # descales (amax / fp8_max) so the kernel can recover true magnitudes.
-            # All other shapes fall through to the mha_batch_prefill_func path
-            # below.
-            use_hd256_asm = (
-                get_bool_env_var("SGLANG_AITER_FMHA_FP8_HD256", "False")
-                and is_gfx95_supported()
+            # FMHA fp8 per-tensor ASM prefill fast-path (ROCm/aiter PR #3732),
+            # ahead of the slow Triton / CK mha_batch_prefill_func path. When
+            # opted in, route pure prefill (no cached prefix, no sliding window,
+            # no sink, no soft cap) through aiter's hand-written fmha_v3_varlen_fwd.
+            # q/k/v are quantized to fp8 with per-tensor descales (amax / fp8_max)
+            # so the kernel can recover true magnitudes.
+            # ASM coverage (is_fmha_v3_fp8): hd128 on gfx950/gfx942, hd256 on
+            # gfx950 only. All other shapes fall through to the path below.
+            use_fp8_asm = (
+                get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
                 and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
                 and forward_batch.extend_prefix_lens_cpu is not None
@@ -2358,11 +2357,17 @@ class AiterAttnBackend(AttentionBackend):
                 and window_size == (-1, -1)
                 and sinks is None
                 and self.logits_soft_cap == 0.0
-                and layer.qk_head_dim == 256
-                and layer.v_head_dim == 256
+                and layer.qk_head_dim == layer.v_head_dim
+                and (
+                    (layer.qk_head_dim == 256 and is_gfx95_supported())
+                    or (
+                        layer.qk_head_dim == 128
+                        and (is_gfx95_supported() or is_gfx942_supported())
+                    )
+                )
             )
 
-            if use_hd256_asm:
+            if use_fp8_asm:
                 cu_seqlens_q = self.qo_indptr[:bs0]
                 max_q_len = self.forward_metadata.max_q_len
 
