@@ -844,6 +844,18 @@ def get_device_name(device_id: int = 0) -> str:
 
 
 @lru_cache(maxsize=1)
+def is_mnnvl_fabric_device() -> bool:
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
+    the device name: the GB200/GB300 superchips. Used to auto-select
+    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
+    v2 multinode, DCP fi_a2a)."""
+    if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+        return False
+    name = (torch.cuda.get_device_name(0) or "").upper()
+    return any(tag in name for tag in ("GB200", "GB300"))
+
+
+@lru_cache(maxsize=1)
 def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
@@ -3588,6 +3600,38 @@ def require_gathered_buffer(server_args: ServerArgs):
 
 def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+
+
+def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+    """Return the request-batch alignment used by decode CUDA graphs."""
+    alignment = 1
+    if server_args.enable_two_batch_overlap:
+        alignment *= 2
+    if require_gathered_buffer(server_args):
+        alignment *= get_parallel().attn_tp_size
+    if alignment % get_parallel().attn_cp_size != 0:
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    """Pad a request capacity to the maximum decode CUDA-graph batch size."""
+    return ceil_align(
+        max_batch_size,
+        get_cuda_graph_batch_size_alignment(server_args),
+    )
+
+
+def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
+    """Pad a request capacity to the maximum eager MLP-sync batch size."""
+    if not require_mlp_sync(server_args):
+        return max_batch_size
+
+    # Local import avoids the same CP dependency cycle as ForwardBatch padding.
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:

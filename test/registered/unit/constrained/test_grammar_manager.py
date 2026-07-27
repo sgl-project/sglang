@@ -287,7 +287,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
     def test_cache_hit_applies_request_thinking_budget(self):
         mgr = self._make_mgr()
         grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_id=0, max_think_tokens=99
+            grammar=None, think_end_ids=[0], max_think_tokens=99
         )
         mgr.grammar_backend.get_cached_or_future_value.return_value = (
             grammar_obj,
@@ -306,7 +306,7 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         mgr = self._make_mgr()
         mgr._enable_strict_thinking = True
         grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_id=0, max_think_tokens=99
+            grammar=None, think_end_ids=[0], max_think_tokens=99
         )
         mgr.grammar_backend.init_strict_reasoning_grammar.return_value = grammar_obj
 
@@ -559,7 +559,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         mgr = self._make_mgr()
 
         grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_id=0, max_think_tokens=99
+            grammar=None, think_end_ids=[0], max_think_tokens=99
         )
         future = Future()
         future.set_result(grammar_obj)

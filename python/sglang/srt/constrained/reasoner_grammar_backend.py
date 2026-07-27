@@ -14,6 +14,7 @@
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
 import logging
+from collections import deque
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 from .base_grammar_backend import (
     BaseGrammarBackend,
@@ -29,6 +31,11 @@ from .base_grammar_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bounds the accept/rollback history. Rollback depth is the speculative draft
+# tree depth (single digits) or a jump-forward rewind, so this is far above
+# what any caller unwinds, while keeping the per-request cost constant.
+_MATCH_HISTORY_LIMIT = 256
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -40,10 +47,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
       GENERATION (tokens_after_end >= 0)
         -> grammar consulted for accept/fill/rollback
 
+    The end of the thinking phase is a token *sequence* (think_end_ids), which
+    may be a single token ("</think>") or several (Kimi-K3 closes its think
+    channel with "<|close|>think<|sep|>", three tokens); the phase flips only
+    after the whole sequence has been generated in order.
+
     When enable_token_filter=True (strict mode), fill_vocab_mask filters
     excluded tokens during THINKING and enforces max_think_tokens budget.
-    When the budget is exhausted, only think_end_id is allowed, forcing the
-    model to exit the thinking phase.
+    When the budget is exhausted, only the token that advances the think_end
+    sequence is allowed, forcing the model to exit the thinking phase.
     When enable_token_filter=False (non-strict mode), fill_vocab_mask is
     a no-op during THINKING.
     """
@@ -51,7 +63,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def __init__(
         self,
         grammar: Optional[BaseGrammarObject],
-        think_end_id: int,
+        think_end_ids: List[int],
         think_excluded_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
@@ -62,7 +74,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     ):
         super().__init__()
         self.grammar = grammar
-        self.think_end_id = think_end_id
+        self.think_end_ids = think_end_ids
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
@@ -70,12 +82,26 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
-        self._think_end_id_list = [think_end_id]
+        self._matcher = TokenSequenceMatcher(think_end_ids)
+
+        # How much of think_end_ids the generated tail matches so far. Markers
+        # that span several tokens (Kimi-K3 closes its think channel with
+        # "<|close|>think<|sep|>") only end the thinking phase once all of them
+        # have arrived in order.
+        self.think_end_match_len = 0
+        # Match length before each accepted token. Speculative decoding walks a
+        # draft tree over this very object, accepting a token and rolling it
+        # back to explore siblings, and relies on that pair being an exact
+        # identity; the match length cannot be recovered from the counters, so
+        # it is remembered here.
+        self._match_len_history = deque(maxlen=_MATCH_HISTORY_LIMIT)
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
 
     def maybe_init_reasoning(self, reasoning: bool):
+        self.think_end_match_len = 0
+        self._match_len_history.clear()
         if reasoning:
             self.tokens_in_think = 0
             self.tokens_after_end = -1
@@ -89,16 +115,27 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _is_generation(self):
         return self.tokens_after_end >= 0
 
+    def _next_think_end_token(self) -> int:
+        """The token that would extend the current think_end_ids match."""
+        return self._matcher.next_token(self.think_end_match_len)
+
     def transfer_state(self, token: int) -> None:
+        self._match_len_history.append(self.think_end_match_len)
         if self._is_thinking():
-            if token == self.think_end_id:
+            matched = self._matcher.advance(self.think_end_match_len, token)
+            if matched == len(self._matcher):
+                self.think_end_match_len = 0
                 self.tokens_after_end = 0
-            else:
-                self.tokens_in_think += 1
+                return
+            self.think_end_match_len = matched
+            self.tokens_in_think += 1
         elif self._is_generation():
             self.tokens_after_end += 1
 
     def rollback_state(self):
+        # Restore the match length recorded before the token being undone; the
+        # counters below cannot express a partial marker match.
+        restored = self._match_len_history.pop() if self._match_len_history else None
         if self._is_thinking():
             if self.tokens_in_think > 0:
                 self.tokens_in_think -= 1
@@ -107,6 +144,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self.tokens_after_end = -1
             elif self.tokens_after_end > 0:
                 self.tokens_after_end -= 1
+        if restored is not None:
+            self.think_end_match_len = restored
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
@@ -150,8 +189,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     vocab_mask, self.think_excluded_token_ids, idx, is_allowed=False
                 )
             else:
+                # Budget exhausted: allow only the token that advances the
+                # think_end marker, walking a multi-token marker one step per
+                # decode until the thinking phase closes.
                 self._do_token_filter(
-                    vocab_mask, self._think_end_id_list, idx, is_allowed=True
+                    vocab_mask, [self._next_think_end_token()], idx, is_allowed=True
                 )
             return
         if self._is_generation() and self.grammar is not None:
@@ -180,7 +222,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def copy(self):
         new_obj = ReasonerGrammarObject(
             self.grammar.copy() if self.grammar is not None else None,
-            self.think_end_id,
+            self.think_end_ids,
             self.think_excluded_token_ids,
             self.max_think_tokens,
             self.enable_token_filter,
@@ -191,6 +233,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
+        new_obj.think_end_match_len = self.think_end_match_len
+        new_obj._match_len_history = deque(
+            self._match_len_history, maxlen=_MATCH_HISTORY_LIMIT
+        )
         new_obj._finished = self._finished
         return new_obj
 
@@ -242,12 +288,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
                 f"could not be encoded by the tokenizer."
             )
-        if len(think_end_ids) != 1:
-            raise ValueError(
-                f"think_end_token '{reasoning_parser.detector.think_end_token}' "
-                "must encode to exactly one token for constrained reasoning."
-            )
-        self.think_end_id = think_end_ids[0]
+        self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -298,7 +339,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ) -> ReasonerGrammarObject:
         obj = ReasonerGrammarObject(
             grammar=grammar,
-            think_end_id=self.think_end_id,
+            think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,

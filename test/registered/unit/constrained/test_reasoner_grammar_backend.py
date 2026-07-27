@@ -13,6 +13,7 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -75,7 +76,7 @@ class TestReasonerGrammarObject(unittest.TestCase):
     def _make_strict_object(self):
         return ReasonerGrammarObject(
             grammar=None,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=2,
             enable_token_filter=True,
@@ -205,16 +206,84 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         )
         self.assertIsNotNone(reasoner)
 
-    def test_rejects_multi_token_think_end_marker(self):
+    def test_accepts_multi_token_think_end_marker(self):
+        """A marker spanning several tokens must not be refused at construction.
+
+        Refusing it left the reasoner backend uninstalled, so the grammar was
+        consulted from the first generated token, i.e. inside the think channel.
+        """
         backend = _DummyGrammarBackend(support_token_filter=True)
 
-        with self.assertRaisesRegex(ValueError, "must encode to exactly one token"):
-            ReasonerGrammarBackend(
-                backend,
-                self._make_parser(),
-                self._make_tokenizer(end_ids=[2, 3]),
-                enable_strict_thinking=True,
-            )
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(end_ids=[2, 3]),
+            enable_strict_thinking=True,
+        )
+
+        self.assertEqual(reasoner.think_end_ids, [2, 3])
+
+    def test_multi_token_marker_ends_thinking_only_when_complete(self):
+        """A prefix of the marker must not end the thinking phase."""
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 3])
+        obj.maybe_init_reasoning(True)
+
+        obj.accept_token(2)
+        self.assertTrue(obj._is_thinking())
+
+        obj.accept_token(3)
+        self.assertTrue(obj._is_generation())
+
+    def test_multi_token_marker_survives_accept_then_rollback(self):
+        """Speculative decoding explores a draft tree on the live grammar.
+
+        It accepts a token, inspects the node and rolls back, and requires that
+        pair to leave the object unchanged. Dropping a partial marker match on
+        rollback made the marker unmatchable afterwards: the phase never
+        switched and the grammar was never applied.
+        """
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 3])
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(2)
+        before = (obj.think_end_match_len, obj.tokens_in_think, obj.tokens_after_end)
+
+        obj.accept_token(9)
+        obj.rollback(1)
+
+        self.assertEqual(
+            (obj.think_end_match_len, obj.tokens_in_think, obj.tokens_after_end),
+            before,
+        )
+        obj.accept_token(3)
+        self.assertTrue(obj._is_generation())
+
+    def test_rollback_out_of_generation_restores_partial_match(self):
+        """Undoing the marker's final token leaves its earlier tokens matched."""
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 3])
+        obj.maybe_init_reasoning(True)
+        obj.accept_token(2)
+        obj.accept_token(3)
+        self.assertTrue(obj._is_generation())
+
+        obj.rollback(1)
+
+        self.assertTrue(obj._is_thinking())
+        self.assertEqual(obj.think_end_match_len, 1)
+
+    def test_self_overlapping_marker_is_matched(self):
+        """Restarting a failed match at position 0 misses overlapping markers.
+
+        With marker [2, 2, 3] the stream 2 2 2 3 ends on a complete marker, but
+        a restart that only reconsiders the first token drops the candidate
+        beginning at the second 2 and never reports it.
+        """
+        obj = ReasonerGrammarObject(grammar=None, think_end_ids=[2, 2, 3])
+        obj.maybe_init_reasoning(True)
+
+        for token in (2, 2, 2, 3):
+            obj.accept_token(token)
+
+        self.assertTrue(obj._is_generation())
 
     def test_rejects_unencodable_excluded_token(self):
         backend = _DummyGrammarBackend(support_token_filter=True)
@@ -255,7 +324,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         inner_grammar.is_terminated.return_value = False
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -272,11 +341,11 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
 
-        # Accept 3 thinking tokens then think_end_id
+        # Accept 3 thinking tokens then think_end_ids
         obj.accept_token(10)
         obj.accept_token(11)
         obj.accept_token(12)
-        obj.accept_token(7)  # think_end_id → tokens_after_end = 0
+        obj.accept_token(7)  # think_end_ids → tokens_after_end = 0
 
         self.assertTrue(obj._is_generation())
         self.assertEqual(obj.tokens_after_end, 0)
@@ -296,7 +365,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         # 2 thinking tokens + think_end + 3 generation tokens
         obj.accept_token(10)  # think
         obj.accept_token(11)  # think
-        obj.accept_token(7)  # think_end_id
+        obj.accept_token(7)  # think_end_ids
         obj.accept_token(20)  # gen 1
         obj.accept_token(21)  # gen 2
         obj.accept_token(22)  # gen 3
@@ -315,7 +384,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj.maybe_init_reasoning(True)
 
         obj.accept_token(10)  # think
-        obj.accept_token(7)  # think_end_id
+        obj.accept_token(7)  # think_end_ids
         obj.accept_token(20)  # gen 1
         obj.accept_token(21)  # gen 2
 
@@ -344,7 +413,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
         obj.maybe_init_reasoning(True)
 
         obj.accept_token(10)
-        obj.accept_token(7)  # think_end_id → GENERATION
+        obj.accept_token(7)  # think_end_ids → GENERATION
         obj.accept_token(20)
 
         self.assertEqual(obj.tokens_in_think, 1)
@@ -383,7 +452,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -411,7 +480,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
             enable_token_filter=True,
@@ -424,7 +493,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         )
         obj.maybe_init_reasoning(True)
         obj.accept_token(10)
-        obj.accept_token(7)  # think_end_id → GENERATION
+        obj.accept_token(7)  # think_end_ids → GENERATION
 
         mask = obj.allocate_vocab_mask(64, 1, "cpu")
         obj.fill_vocab_mask(mask, 0)
@@ -435,7 +504,7 @@ class TestReasonerGrammarObjectFillVocabMask(unittest.TestCase):
         inner_grammar = MagicMock()
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
             enable_token_filter=False,
@@ -463,7 +532,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         inner_grammar.is_terminated.return_value = False
         obj = ReasonerGrammarObject(
             grammar=inner_grammar,
-            think_end_id=7,
+            think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
             enable_token_filter=False,
@@ -480,7 +549,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
         obj.accept_token(10)  # thinking token
-        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(7)  # think_end_ids -> GENERATION
         obj.accept_token(58)  # generation token "["
         self.assertEqual(obj.current_token, 58)
 
@@ -497,7 +566,7 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
         must not be re-accepted; with current_token tracked, the guard skips."""
         obj, inner_grammar = self._make_object_with_mock_grammar()
         obj.maybe_init_reasoning(True)
-        obj.accept_token(7)  # think_end_id -> GENERATION
+        obj.accept_token(7)  # think_end_ids -> GENERATION
         obj.accept_token(58)  # "[" accepted into inner grammar
         obj.accept_token(4913)  # '{"' accepted into inner grammar
         inner_grammar.accept_token.reset_mock()
@@ -509,6 +578,56 @@ class TestReasonerGrammarObjectCurrentToken(unittest.TestCase):
 
         # Guard must have fired -> no second accept of 4913 into the inner grammar.
         inner_grammar.accept_token.assert_not_called()
+
+
+class TestKimiK3StrictThinking(unittest.TestCase):
+    """Kimi-K3 at long context skips `<|close|>think<|sep|>` and jumps straight to
+    the answer, so the whole generation is routed into reasoning_content and
+    `content` comes back empty. The token-masking half of --enable-strict-thinking
+    is what blocks that escape, and it only engages when the detector supplies
+    think_excluded_tokens."""
+
+    # Measured against the Kimi-K3 tiktoken vocabulary. Every XTML structural
+    # marker is three tokens: <|open|>/<|close|>, a bare tag name, then <|sep|>.
+    K3_TOKEN_IDS = {
+        "<|open|>think<|sep|>": [163587, 39964, 163589],
+        "<|close|>think<|sep|>": [163588, 39964, 163589],
+        "<|open|>": [163587],
+        "<|close|>": [163588],
+        "<|sep|>": [163589],
+        "think": [39964],
+        "response": [12092],
+        "message": [2778],
+        "<|end_of_msg|>": [163586],
+        "[EOS]": [163585],
+        "[EOT]": [163593],
+    }
+
+    def _make_backend(self):
+        return ReasonerGrammarBackend(
+            _DummyGrammarBackend(support_token_filter=True),
+            ReasoningParser(model_type="kimi_k3", stream_reasoning=False),
+            _DummyTokenizer(self.K3_TOKEN_IDS),
+            enable_strict_thinking=True,
+        )
+
+    def test_token_filter_engages(self):
+        backend = self._make_backend()
+
+        self.assertTrue(backend.enable_token_filter)
+        self.assertIsNotNone(backend.think_excluded_token_ids)
+
+    def test_excluded_ids_cannot_block_the_think_close_marker(self):
+        """_get_think_excluded_token_ids flattens each string to token ids and bans
+        them one by one, so an excluded string that shares a token with the
+        think-close marker bans that token outright. Excluding the full
+        `<|close|>message<|sep|>` would ban `<|close|>` and strand the model inside
+        the think channel with no way to ever close it."""
+        backend = self._make_backend()
+
+        self.assertFalse(
+            set(backend.think_excluded_token_ids) & set(backend.think_end_ids)
+        )
 
 
 if __name__ == "__main__":

@@ -77,6 +77,15 @@ class TestMmHashesContract(CustomTestCase):
         b.set_pad_value()
         self.assertNotEqual(a.pad_value, b.pad_value)
 
+    def test_set_hash_updates_an_existing_pad_value(self):
+        item = MultimodalDataItem(modality=Modality.IMAGE, hash=0xAAAA)
+        item.set_pad_value()
+
+        item.set_hash(0xBBBB)
+
+        self.assertEqual(item.hash, 0xBBBB)
+        self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+
 
 if __name__ == "__main__":
     unittest.main()

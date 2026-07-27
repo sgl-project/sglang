@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -57,6 +58,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     draft_tp_context,
+    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -86,8 +88,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
-        attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
-        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
+        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._decode_graph_allowed = (
+            not server_args.disable_cuda_graph and not self._is_pd_prefill
+        )
+        if (
+            server_args.enable_dp_attention
+            and self._draft_is_moe
+            and ps.attn_tp_size > 1
+        ):
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
@@ -167,7 +176,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             server_args.enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
@@ -195,7 +204,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._verify_epilogue = None
         if (
             self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
+            and self._decode_graph_allowed
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
@@ -245,6 +254,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._forced_budget_frac: Optional[float] = None
+        self._need_mamba_verify_commit = False
 
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
@@ -254,6 +264,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+
+        if self._is_pd_prefill and not self._draft_is_moe:
+            self.draft_model.prune_to_ctx_kv_injection()
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -296,9 +309,15 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        self._need_mamba_verify_commit = mambaish_config(
+            self.model_runner.model_config
+        ) is not None and hasattr(
+            self.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        capture_decode_cuda_graph = self._decode_graph_allowed
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -407,6 +426,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
+        # Must inject before prefill returns: the scheduler may update radix
+        # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
         draft_seq_lens = torch.tensor(
@@ -423,6 +444,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             cache_loc=batch.out_cache_loc,
             positions=positions,
         )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 
         batch_output.next_draft_input = make_next_draft_input(
@@ -583,10 +605,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
+            # The epilogue's in-graph accept is greedy (accept_greedy_triton);
+            # sampling batches must take the eager accept path even when the
+            # draft proposal itself folded.
+            and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
         )
+        prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -650,6 +677,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             else:
                 on_publish(accept.new_seq_lens)
 
+        self._commit_target_mamba_states_after_verify(
+            batch=batch,
+            seq_lens_pre_verify=prefix_lens,
+            seq_lens_post_verify=accept.new_seq_lens,
+            commit_lens=accept.commit_lens,
+        )
+
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
             self._verify_executor.commit_hidden(
@@ -703,6 +737,53 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _commit_target_mamba_states_after_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        seq_lens_post_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Commit the last accepted verify step's KDA/mamba state (chain
+        layout: step index = commit_lens - 1) into the persistent caches."""
+        if not self._need_mamba_verify_commit:
+            return
+        # Chain layout only: step index = commit_lens - 1. A tree (topk > 1)
+        # layout would need the accept-index mapping the shared spec_utils
+        # commit helper does.
+        assert self.server_args.speculative_eagle_topk in (None, 1)
+        attn_backend = self.target_worker.model_runner.attn_backend
+
+        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        mamba_steps_to_track = None
+
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
+            )
+            tracking_point = (
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                to_track_ith.to(torch.int64),
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
         )
 
     def get_confidence_budget_prepare(self):

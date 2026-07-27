@@ -254,7 +254,16 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # Deep-merge dict-valued overrides into existing sub-configs (e.g.
+        # {"text_config": {"num_hidden_layers": 5}} for multimodal models like
+        # KimiK3) instead of replacing the whole sub-config with a plain dict,
+        # which would drop every other field and break attribute access.
+        for key, value in model_override_args.items():
+            current = getattr(config, key, None)
+            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                current.update(value)
+            else:
+                setattr(config, key, value)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

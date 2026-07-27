@@ -106,6 +106,19 @@ class DummyProcessor:
         return {"input_ids": _DummyTokenTensor(text_len + image_tokens)}
 
 
+class KimiK3Processor(DummyProcessor):
+    def __init__(self, tokenizer: PreTrainedTokenizerFast):
+        super().__init__(tokenizer)
+        self.media_call_count = 0
+
+    def __call__(self, text, medias=None, **kwargs):
+        if medias is None:
+            raise ValueError("Kimi K3 requires medias with text")
+        self.media_call_count += 1
+        text_len = len(self.tokenizer.encode(text))
+        return {"input_ids": _DummyTokenTensor(text_len + 4 * len(medias))}
+
+
 class _FakeMMMUDataset:
     def __init__(self, records):
         self.records = records
@@ -446,6 +459,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
                 self.assertTrue(rows[0].image_data)
                 for marker in ("user:", "assistant:", "[IMAGE]"):
                     self.assertNotIn(marker, rows[0].prompt)
+
+    def test_image_sampler_uses_kimi_k3_media_contract(self):
+        processor = KimiK3Processor(self.tokenizer)
+        rows = sample_image_requests(
+            num_requests=1,
+            image_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang-oai-chat",
+            random_image_count=False,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(processor.media_call_count, 1)
+        self.assertTrue(rows[0].image_data)
 
     def test_image_sampler_random_resolution(self):
         state = np.random.get_state()

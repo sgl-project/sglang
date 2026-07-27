@@ -74,6 +74,12 @@ def main(args):
             data_path = download_and_cache_file(url)
         lines = list(read_jsonl(data_path))
 
+    # Kwarg spelling is family-specific (enable_thinking vs thinking) and
+    # unknown names are silently swallowed; override via --chat-template-kwargs.
+    chat_template_kwargs = {"enable_thinking": True}
+    if args.chat_template_kwargs:
+        chat_template_kwargs.update(json.loads(args.chat_template_kwargs))
+
     # Construct prompts
     num_questions = args.num_questions
     num_shots = args.num_shots
@@ -89,7 +95,7 @@ def main(args):
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                **chat_template_kwargs,
             )
         questions.append(raw_question)
         labels.append(get_answer_value(lines[i]["answer"]))
@@ -183,6 +189,13 @@ if __name__ == "__main__":
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode by wrapping prompts with chat template",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=str,
+        default=None,
+        help="JSON dict merged over the default {'enable_thinking': True} "
+        "and passed to tokenizer.apply_chat_template",
     )
     parser.add_argument(
         "--tokenizer-path",

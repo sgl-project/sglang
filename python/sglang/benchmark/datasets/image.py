@@ -148,7 +148,7 @@ def create_mm_data_row(
             prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
-    if type(processor).__name__ == "KimiK25Processor":
+    if type(processor).__name__ in ("KimiK25Processor", "KimiK3Processor"):
         medias = [{"type": "image", "image": img} for img in images]
         prompt_len = processor(
             text=prompt_str,

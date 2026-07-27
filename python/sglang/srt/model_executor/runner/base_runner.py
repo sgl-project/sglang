@@ -80,6 +80,7 @@ def _allocate_decode_buffers(
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
+    pp_proxy_residual_num_blocks: Optional[int] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -114,9 +115,14 @@ def _allocate_decode_buffers(
                 "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
             }
             if not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                residual_shape = (
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
+                    if pp_proxy_residual_num_blocks is not None
+                    else (max_bs, hidden_size)
                 )
+                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
@@ -294,6 +300,15 @@ class BaseRunner(ABC):
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
+        # One dummy forward leaves the caching allocator short of a full forward's
+        # scratch: a second one still triggers fresh cudaMalloc segments (measured
+        # 6 segments / 118 MB; a third adds none). Capturing cuda graphs on that
+        # half-warmed allocator silently corrupts them -- spec verify degenerates
+        # and the accept length pins at the draft ceiling, with no error. Run once
+        # more so capture sees a settled allocator.
+        with torch.inference_mode():
+            self._dummy_run(batch_size=batch_size, buffers=buffers)
+
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_req: int = 1):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_req).
@@ -333,6 +348,7 @@ class BaseRunner(ABC):
             ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
         )
 
     def _dummy_run(

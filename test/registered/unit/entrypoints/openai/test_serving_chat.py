@@ -197,6 +197,107 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_keeps_adjacent_image_placeholders_adjacent(self):
+        image_data = []
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
+        }
+
+        flattened = self.chat._flatten_kimi_k3_content(message, image_data, [], [])
+
+        self.assertEqual(
+            flattened["content"],
+            [
+                {"type": "image_url", "image_url": {"url": "image-1"}},
+                {"type": "image_url", "image_url": {"url": "image-2"}},
+                {"type": "text", "text": "Compare them."},
+            ],
+        )
+        self.assertEqual([item.url for item in image_data], ["image-1", "image-2"])
+
+    def test_kimi_k3_routes_structural_prompt_ids_without_decode_reencode(self):
+        self.tm.model_config.is_multimodal = True
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 8]
+        self.tm.tokenizer.decode.return_value = "decoded prompt"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {
+                            "type": "text",
+                            "text": "<|media_pad|> Describe it.",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(
+            request, self.fastapi_request
+        )
+
+        self.assertEqual(adapted.input_ids, [7, 99, 8])
+        self.assertIsNone(adapted.text)
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        content = call.args[0][0]["content"]
+        self.assertEqual(content[0]["type"], "image_url")
+        self.assertEqual(content[0]["image_url"]["url"], "image-1")
+        self.assertEqual(
+            content[1],
+            {
+                "type": "text",
+                "text": "<|media_pad|> Describe it.",
+            },
+        )
+
+    def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
+        self.chat.chat_encoding_spec = "kimi_k3"
+        ret = [
+            {
+                "text": "Answer",
+                "meta_info": {
+                    "id": "chatcmpl-kimi-k3-usage",
+                    "prompt_tokens": 2075,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "image_tokens": 2035,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, created=123)
+
+        self.assertEqual(response.usage.prompt_tokens, 2072)
+        self.assertEqual(response.usage.total_tokens, 2073)
+        self.assertEqual(response.usage.prompt_tokens_details.image_tokens, 2035)
+
+    def test_kimi_k3_rejects_internal_placeholder_in_user_text(self):
+        message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<|kimi_image_placeholder|> Describe it.",
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "reserved for Kimi-K3 image input"):
+            self.chat._flatten_kimi_k3_content(message, [], [], [])
+
     def test_kimi_tool_call_keeps_default_reasoning(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True

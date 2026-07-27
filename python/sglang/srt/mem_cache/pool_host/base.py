@@ -90,9 +90,24 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ):
         self.device_pool = device_pool
-        self.page_size = page_size
+        # Under DCP the controller/radix layer works in the widened logical
+        # index space (page_size here is page_size * dcp_size), while this
+        # rank's buffer only materializes its owned 1/dcp_size token shard.
+        # self.page_size / self.size / self.page_num are kernel-facing
+        # (physical); the alloc/free/mem_state surface below is logical.
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        assert page_size % dcp_size == 0, (
+            f"HiCache host pool page_size ({page_size}) must be a multiple of "
+            f"dcp_size ({dcp_size}); expected the widened page from the DCP "
+            "paged allocator."
+        )
+        self.logical_page_size = page_size
+        self.page_size = page_size // dcp_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -107,9 +122,12 @@ class HostKVCache(abc.ABC):
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
+        # Align up the host memory pool size to the (physical) page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        # Logical capacity exposed to the radix/controller layer: one slot per
+        # logical token, dcp_size of which collapse onto one physical row.
+        self.logical_size = self.size * self.dcp_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -264,17 +282,20 @@ class HostKVCache(abc.ABC):
     @synchronized
     def clear(self):
         # Initialize memory states and tracking structures.
+        # All slot accounting is in the logical space (== physical when
+        # dcp_size == 1): the radix tree stores one host slot per logical
+        # token; the physical buffer row is derived at transfer time.
         self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
+            (self.logical_size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.
         self.release_slots = []
         self.num_release_slots = 0
         # Per-slot flag used to detect double-free.
         # slot_used[k] is true if slot k is allocated.
-        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
+        self.slot_used = torch.zeros(self.logical_size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -291,10 +312,31 @@ class HostKVCache(abc.ABC):
         self.release_slots = []
         self.num_release_slots = 0
 
+    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Translate logical slot indices to this rank's physical buffer rows.
+
+        Identity when dcp_size == 1. Under DCP, keeps the owned interleaved
+        subset (index % dcp_size == dcp_rank) and collapses it onto physical
+        rows (// dcp_size) — the same owner rule the device-side KV write and
+        page-table kernels use. For runs made of whole widened pages every
+        rank keeps exactly 1/dcp_size of the slots, covering its full
+        physical pages.
+        """
+        if self.dcp_size == 1:
+            return indices
+        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
+        assert owned.numel() * self.dcp_size == indices.numel(), (
+            "HiCache DCP translation expects runs of whole widened pages "
+            f"(every residue class equally represented); got {indices.numel()} "
+            f"logical slots -> {owned.numel()} owned rows with dcp_size="
+            f"{self.dcp_size}."
+        )
+        return owned
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
-            need_size % self.page_size == 0
+            need_size % self.logical_page_size == 0
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
             return None

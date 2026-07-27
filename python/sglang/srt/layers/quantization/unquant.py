@@ -254,6 +254,48 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         return F.linear(x, layer.weight, bias)
 
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            get_bf16_gemm_backend().is_cutedsl()
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and (bias is None or bias.dtype == torch.bfloat16)
+            and not layer.weight.requires_grad
+            and (bias is None or not bias.requires_grad)
+            and _use_cutedsl_bf16_gemm(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                cutedsl_bf16_gemm_out,
+            )
+
+            return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+
+        if x.ndim != 2:
+            raise ValueError("caller-owned linear output currently requires a 2D input")
+        if output.shape != (x.shape[0], layer.weight.shape[0]):
+            raise ValueError(
+                f"linear output has shape {output.shape}, expected "
+                f"{(x.shape[0], layer.weight.shape[0])}"
+            )
+        torch.mm(x, layer.weight.t(), out=output)
+        if bias is not None:
+            output.add_(bias)
+        return output
+
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""

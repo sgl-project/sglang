@@ -181,6 +181,37 @@ class SiluAndMul(MultiPlatformOp):
         return self._musa_swish_glu(x)
 
 
+class SituAndMul(MultiPlatformOp):
+    """SituGLU activation used by Kimi K3.
+
+    Computes beta * tanh(gate / beta) * sigmoid(gate) * up.
+    When linear_beta is set, up is softly clipped:
+        up = linear_beta * tanh(up / linear_beta).
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+
+        return situ_and_mul(x, None, self.beta, self.linear_beta)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
 class GeluAndMul(MultiPlatformOp):
     def __init__(self, approximate="tanh"):
         super().__init__()

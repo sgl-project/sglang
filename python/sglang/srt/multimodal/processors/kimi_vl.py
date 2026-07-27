@@ -39,6 +39,12 @@ class KimiVLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
         )
+        expected_image_count = len(image_data or [])
+        if len(base_output.images) != expected_image_count:
+            raise ValueError(
+                "Kimi image placeholders must map one-to-one to image data: "
+                f"expected {expected_image_count}, loaded {len(base_output.images)}"
+            )
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens

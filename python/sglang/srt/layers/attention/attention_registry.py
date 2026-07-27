@@ -69,6 +69,18 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    if (
+        runner.server_args.dcp_size > 1
+        and runner.server_args.speculative_algorithm is not None
+    ):
+        _, decode_backend = runner.server_args.get_attention_backends()
+        if decode_backend == "trtllm_mla":
+            raise ValueError(
+                "trtllm_mla cannot serve decode context parallelism with speculative "
+                "decoding: it does not forward the cyclic DCP metadata to its decode "
+                "kernel and returns no rank-local LSE for the cross-rank merge. "
+                "Select cutedsl_mla or tokenspeed_mla."
+            )
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
@@ -89,9 +101,9 @@ def create_tokenspeed_mla_backend(runner):
 def create_cutedsl_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("cutedsl_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+    from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 
-    return TRTLLMMLABackend(runner, backend="cute-dsl")
+    return CuteDslMLABackend(runner)
 
 
 @register_attention_backend("aiter")

@@ -227,6 +227,13 @@ def load_jit(
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
+    if torch.version.hip is not None:
+        extra_cuda_cflags = [
+            flag
+            for flag in extra_cuda_cflags
+            if flag not in ("--use_fast_math", "-use_fast_math")
+        ]
+
     cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
     cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
 

@@ -37,7 +37,9 @@ These tests prove the views:
     (the shape `MambaPool.State.conv[i]` / `.temporal` expose);
   - reject a deliberately mis-aligned spec via the alignment assert.
 
-Skipped on CPU — these views back GPU kernels and we mirror the GPU path.
+The round-trip class is skipped on CPU — those views back GPU kernels and we
+mirror the GPU path. ``TestKDAFlashInferEnvelopeStateContract`` is pure stride
+arithmetic and runs everywhere.
 
     python -m pytest test/registered/unit/mem_cache/test_shared_mamba_views.py -v
 """
@@ -286,6 +288,175 @@ class TestUnifiedMambaViews(unittest.TestCase):
             want_slots=4,
         )
         self._fill_and_roundtrip(pool, spec)
+
+
+def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:
+    """Kimi K3 KDA per-rank state geometry: 69 KDA layers, K = V = 128,
+    conv width 4 (=> 3 cached tokens), conv row ``(kernel-1, q+k+v dim)``
+    in the KimiLinear layout (``KimiLinearStateShape.create`` with
+    num_k_heads == num_heads, head_k_dim == head_dim — see
+    ``models/kimi_linear.py``), temporal/SSM state ``(HV, V, K)``.
+    ``heads_per_rank`` = 96 total KDA heads / attn_tp (12 at the TP8
+    deployment shape, cf. ``kernels/ops/attention/kda_fused_decode.py``)."""
+    h = heads_per_rank
+    return dict(
+        layer_num=69,
+        conv_state_shapes=((3, 3 * h * 128),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(h, 128, 128),
+        # FlashInfer recurrent_kda requires a bf16 state pool (the server-args
+        # gate enforces --mamba-ssm-dtype bfloat16 for flashinfer decode).
+        temporal_dtype=torch.bfloat16,
+    )
+
+
+class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
+    """Derived property: the envelope-strided KDA temporal view (unified memory
+    / page-major layout) must satisfy the state contract of FlashInfer
+    ``recurrent_kda`` (pinned ``flashinfer_python==0.6.14``), because the KDA
+    flashinfer decode wrapper (``linear/kernels/kda_flashinfer.py``) passes the
+    committed per-layer pool view straight into the kernel (in-place state
+    update on the cu_seqlens path — no gather/scatter copy around the call).
+
+    The kernel compiles its state argument as a CuTe fake tensor of shape
+    ``[N, HV, V, K]`` with stride ``(sym_int64(divisibility=16), V*K, K, 1)``
+    and ``assumed_align=32`` (flashinfer ``kda_kernels/recurrent_kda.py``), so
+    a per-layer pool view is only readable by the kernel when:
+
+      * its inner strides are exactly compact ``(V*K, K, 1)``;
+      * its slot stride — the per-slot envelope pitch, NOT ``HV*V*K`` — is a
+        multiple of 16 elements (32 bytes at bf16);
+      * its base byte offset is 32-byte aligned (for every layer).
+
+    Any envelope-layout change that breaks one of these (per-slot padding that
+    is not a 32 B multiple, a conv-shape change misaligning the temporal
+    region, a transposed/padded temporal inner layout) would silently
+    mis-address every KDA state read/write on SM100 flashinfer decode; this
+    test turns such a diff red without a GPU.
+    """
+
+    # 32 B: recurrent_kda's assumed_align AND its slot-stride divisibility
+    # (16 elements * 2 B bf16). External-source literal from flashinfer
+    # kda_kernels/recurrent_kda.py (S_batch = cute.sym_int64(divisibility=16),
+    # make_fake_tensor(..., assumed_align=32)).
+    _KERNEL_ALIGN_BYTES = 32
+
+    @staticmethod
+    def _build_tp8_views():
+        """Real TP8 K3 KDA envelope views on CPU (2 slots suffice — the
+        per-slot geometry is slot-count independent)."""
+        from sglang.srt.mem_cache.layout.page_major import (
+            build_page_major_mamba_views,
+            mamba_entry_bytes,
+        )
+
+        geom = _k3_kda_mamba_geometry(12)  # 96 heads / TP8
+        entry_bytes = mamba_entry_bytes(**geom)
+        max_slots = 2
+        raw = torch.empty(max_slots * entry_bytes, dtype=torch.uint8, device="cpu")
+        _, temporal_view = build_page_major_mamba_views(
+            raw, max_slots=max_slots, **geom
+        )
+        return geom, entry_bytes, temporal_view
+
+    def test_k3_tp8_envelope_view_matches_recurrent_kda_contract(self):
+        """Check every per-layer temporal view against the kernel contract."""
+        geom, entry_bytes, temporal_view = self._build_tp8_views()
+
+        itemsize = temporal_view.element_size()
+        _, v, k = geom["temporal_state_shape"]
+        for layer in (0, geom["layer_num"] - 1):
+            view = temporal_view[layer]  # [slots, HV, V, K], what decode() gets
+            self.assertEqual(
+                view.stride()[1:],
+                (v * k, k, 1),
+                "temporal inner strides must stay compact (V*K, K, 1): "
+                "recurrent_kda compiles them as constants",
+            )
+            self.assertEqual(
+                view.stride(0),
+                entry_bytes // itemsize,
+                "slot stride must be the envelope pitch (entry_bytes)",
+            )
+            self.assertEqual(
+                view.stride(0) % (self._KERNEL_ALIGN_BYTES // itemsize),
+                0,
+                "slot stride must satisfy recurrent_kda's "
+                "sym_int64(divisibility=16) — 16 elements = 32 B at bf16",
+            )
+            self.assertEqual(
+                (view.storage_offset() * itemsize) % self._KERNEL_ALIGN_BYTES,
+                0,
+                f"layer {layer} temporal view base is not 32 B aligned "
+                "(recurrent_kda assumed_align=32)",
+            )
+
+    def test_k3_entry_and_temporal_offset_32B_multiples_across_tp(self):
+        """The two byte quantities that feed the contract above — the per-slot
+        envelope pitch and the temporal region's offset inside the envelope
+        (= all-layers conv region, temporal comes last) — must be 32 B
+        multiples for every plausible attn-TP shard of K3's 96 KDA heads."""
+        import math
+
+        from sglang.srt.mem_cache.layout.page_major import mamba_entry_bytes
+
+        for heads_per_rank in (96, 48, 24, 12):  # attn_tp 1 / 2 / 4 / 8
+            geom = _k3_kda_mamba_geometry(heads_per_rank)
+            entry_bytes = mamba_entry_bytes(**geom)
+            conv_region_bytes = (
+                geom["layer_num"]
+                * math.prod(geom["conv_state_shapes"][0])
+                * geom["conv_dtype"].itemsize
+            )
+            self.assertEqual(
+                entry_bytes % self._KERNEL_ALIGN_BYTES,
+                0,
+                f"tp shard h={heads_per_rank}: envelope pitch {entry_bytes} B "
+                "breaks recurrent_kda's slot-stride divisibility",
+            )
+            self.assertEqual(
+                conv_region_bytes % self._KERNEL_ALIGN_BYTES,
+                0,
+                f"tp shard h={heads_per_rank}: temporal region offset "
+                f"{conv_region_bytes} B breaks assumed_align=32",
+            )
+
+    def test_wrapper_state_contract_check_matches_layout(self):
+        """The KDA flashinfer decode wrapper enforces this same contract at
+        runtime (``FlashInferKDAKernel._check_state_stride_contract``, called
+        once per pool view before handing the pool to ``recurrent_kda``). A
+        regression in that check would only surface on SM100 hardware, so pin
+        its accept/reject behavior here: it must ACCEPT exactly what the
+        layouts produce — the envelope-strided per-layer view and a plain
+        contiguous pool — and REJECT views the kernel would silently
+        mis-address (wrong inner strides; a slot stride off the divisibility)."""
+        import types
+
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
+            FlashInferKDAKernel,
+        )
+
+        check = FlashInferKDAKernel._check_state_stride_contract
+
+        def run(view):
+            # Fresh stub per call: the real kernel caches approvals by id().
+            check(types.SimpleNamespace(_state_contract_ok=set()), view)
+
+        _, _, temporal_view = self._build_tp8_views()
+        envelope = temporal_view[0]  # what forward_decode hands to the kernel
+        run(envelope)  # must not raise
+
+        contiguous = torch.empty(2, 12, 128, 128, dtype=torch.bfloat16)
+        run(contiguous)  # locally-allocated pools must keep working
+
+        with self.assertRaises(ValueError):
+            run(envelope.transpose(-1, -2))  # inner strides not compact
+
+        # Slot stride 196616 elements: envelope-like but % 16 != 0.
+        flat = torch.empty(2 * 196616, dtype=torch.bfloat16)
+        misaligned = flat.as_strided((2, 12, 128, 128), (196616, 16384, 128, 1))
+        with self.assertRaises(ValueError):
+            run(misaligned)
 
 
 if __name__ == "__main__":

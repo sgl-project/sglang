@@ -33,7 +33,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.models.kimi_vl_moonvit import MLP2
+from sglang.srt.models.kimi_vl_moonvit import (
+    MLP2,
+    concat_or_single,
+    tpool_patch_merger,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
@@ -68,36 +72,6 @@ def apply_rope(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def tpool_patch_merger(
-    x: torch.Tensor,
-    grid_thws: torch.Tensor,
-    merge_kernel_size: tuple[int, int] = (2, 2),
-) -> list[torch.Tensor]:
-    d_model = x.size(-1)
-
-    outputs = []
-    pre_sum = 0
-    for t, h, w in grid_thws.tolist():
-        # Get the current sequence
-        seq = x[pre_sum : pre_sum + t * h * w]
-        # Reshape along self.merge_kernel_size and concat to the last dimension
-        kernel_height, kernel_width = merge_kernel_size
-        new_height, new_width = h // kernel_height, w // kernel_width
-        reshaped_seq = seq.view(
-            t, new_height, kernel_height, new_width, kernel_width, d_model
-        )
-        reshaped_seq = (
-            reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().mean(dim=0)
-        )  # temporal pooling
-        padded_seq = reshaped_seq.view(
-            new_height * new_width, kernel_height * kernel_width, -1
-        )
-        outputs.append(padded_seq)
-        pre_sum += t * h * w
-
-    return outputs
-
-
 class MoonViTEncoderLayer(nn.Module):
 
     def __init__(
@@ -111,11 +85,13 @@ class MoonViTEncoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        qkv_hidden_size: int | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
-        self.hidden_size_per_attention_head = self.hidden_dim // self.num_heads
+        proj_size = qkv_hidden_size if qkv_hidden_size is not None else hidden_dim
+        self.hidden_size_per_attention_head = proj_size // self.num_heads
 
         self.norm0 = nn.LayerNorm(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -130,7 +106,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.attn = VisionAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
-            projection_size=hidden_dim,
+            projection_size=proj_size,
             use_qkv_parallel=True,
             qkv_bias=attn_bias,
             proj_bias=attn_bias,
@@ -449,9 +425,8 @@ class MoonViT3dEncoder(nn.Module):
             video_attn_type == "spatial_temporal"
         ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
         self.video_attn_type = video_attn_type
-        self.rope_2d = Rope2DPosEmbRepeated(
-            block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
-        )
+        qkv_hs = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
+        self.rope_2d = Rope2DPosEmbRepeated(qkv_hs // block_cfg["num_heads"], 512, 512)
         self.blocks = nn.ModuleList(
             [
                 MoonViTEncoderLayer(
@@ -539,17 +514,21 @@ class MoonViT3dPretrainedModel(nn.Module):
             pos_emb_type=config.pos_emb_type,
         )
 
+        qkv_hidden_size = getattr(config, "qkv_hidden_size", None)
+        block_cfg = {
+            "num_heads": config.num_attention_heads,
+            "hidden_dim": config.hidden_size,
+            "mlp_dim": config.intermediate_size,
+            "activation": PytorchGELUTanh(),
+            "attn_bias": getattr(config, "attn_bias", True),
+            "use_data_parallel": use_data_parallel,
+        }
+        if qkv_hidden_size is not None:
+            block_cfg["qkv_hidden_size"] = qkv_hidden_size
         self.encoder = MoonViT3dEncoder(
             hidden_dim=config.hidden_size,
             num_layers=config.num_hidden_layers,
-            block_cfg={
-                "num_heads": config.num_attention_heads,
-                "hidden_dim": config.hidden_size,
-                "mlp_dim": config.intermediate_size,
-                "activation": PytorchGELUTanh(),
-                "attn_bias": True,
-                "use_data_parallel": use_data_parallel,
-            },
+            block_cfg=block_cfg,
             video_attn_type=config.video_attn_type,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
@@ -632,7 +611,7 @@ def mm_projection_auto(
         return vt_output
 
     num_embedding_list = [x.shape[0] for x in vt_output]
-    batched = torch.cat(vt_output, dim=0)
+    batched = concat_or_single(vt_output, dim=0)
     proj_out = mm_projector(batched) if mm_projector else batched
     proj_out = proj_out.reshape(-1, proj_out.shape[-1])
     proj_out = torch.split(proj_out, num_embedding_list)

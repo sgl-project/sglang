@@ -178,6 +178,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            # Detect MXFP4 before the scheme-based path: MXFP4 uses a
+            # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
+            # handles all MoE backends, bypassing the scheme abstraction.
+            if self._is_mxfp4_moe(layer_name=prefix):
+                from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+                logger.info_once(
+                    "Using Mxfp4MoEMethod for MXFP4 compressed-tensors MoE"
+                )
+                return Mxfp4MoEMethod(prefix=prefix)
+
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
                 use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -547,6 +558,28 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return is_mxint4 and input_quant_none and is_symmetric and is_static
+
+    def _is_mxfp4_moe(self, layer_name: str) -> bool:
+        """Detect MXFP4-quantized MoE from global format or target scheme."""
+        if "mxfp4" in (self.quant_format or ""):
+            return True
+        self._add_fused_moe_to_target_scheme_map()
+        for key in ["FusedMoE", "Linear"]:
+            scheme = self.target_scheme_map.get(key)
+            if scheme is None:
+                continue
+            wq = scheme.get("weights")
+            if wq is None:
+                continue
+            if (
+                wq.num_bits == 4
+                and wq.type == QuantizationType.FLOAT
+                and wq.strategy == QuantizationStrategy.GROUP.value
+                and wq.group_size == 32
+                and wq.symmetric
+            ):
+                return True
+        return False
 
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel

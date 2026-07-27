@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from sglang.srt.layers.attention.attention_registry import create_trtllm_mla_backend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.model_executor.model_runner_components import (
     attention_backend_setup,
@@ -66,6 +67,39 @@ def test_split_full_attention_applies_model_wrapper_once():
     assert split_backend.decode_backend.name == "decode"
     assert split_backend.prefill_backend.name == "prefill"
     assert runner.init_new_workspace is True
+
+
+def test_trtllm_mla_prefill_allows_cutedsl_mla_dcp_decode():
+    runner = SimpleNamespace(
+        use_mla_backend=True,
+        server_args=SimpleNamespace(
+            dcp_size=8,
+            speculative_algorithm="DSPARK",
+            get_attention_backends=lambda: ("trtllm_mla", "cutedsl_mla"),
+        ),
+    )
+    backend = object()
+    module = SimpleNamespace(TRTLLMMLABackend=lambda _runner: backend)
+
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.layers.attention.trtllm_mla_backend": module},
+    ):
+        assert create_trtllm_mla_backend(runner) is backend
+
+
+def test_trtllm_mla_dcp_decode_with_speculative_decoding_is_rejected():
+    runner = SimpleNamespace(
+        use_mla_backend=True,
+        server_args=SimpleNamespace(
+            dcp_size=8,
+            speculative_algorithm="DSPARK",
+            get_attention_backends=lambda: ("trtllm_mla", "trtllm_mla"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="cannot serve decode context parallelism"):
+        create_trtllm_mla_backend(runner)
 
 
 if __name__ == "__main__":
