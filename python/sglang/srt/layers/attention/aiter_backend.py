@@ -2351,7 +2351,6 @@ class AiterAttnBackend(AttentionBackend):
             use_fp8_asm = (
                 get_bool_env_var("SGLANG_AITER_FMHA_FP8_ASM", "False")
                 and forward_batch.forward_mode.is_extend()
-                and not forward_batch.forward_mode.is_draft_extend_v2()
                 and forward_batch.extend_prefix_lens_cpu is not None
                 and not any(forward_batch.extend_prefix_lens_cpu)
                 and window_size == (-1, -1)
