@@ -12,6 +12,10 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.quantization.fp4_utils import (
+    NVFP4_SF_VEC_SIZE,
+    fp4_quantize,
+)
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -34,7 +38,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_FP4_SF_VEC_SIZE = 16
 _cutedsl_logged_scalarize: set = set()
 
 
@@ -238,19 +241,17 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
     )
 
 
-def refresh_cutedsl_standard_scales(layer: torch.nn.Module) -> None:
+def refresh_cutedsl_standard_scales_for_weight_update(
+    layer: torch.nn.Module,
+) -> None:
     with torch.inference_mode(False):
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    current_scales = getattr(layer, "_cutedsl_scales", None)
-    current_input_scale = getattr(layer, "_cutedsl_input_scale", None)
-    if current_scales is None:
-        layer._cutedsl_scales = new_scales
-        layer._cutedsl_input_scale = used_input_scale
-        return
+    current_scales = layer._cutedsl_scales
+    current_input_scale = layer._cutedsl_input_scale
 
     # Decode CUDA graphs capture these tensor addresses, so reloads must update
     # their values without replacing the tensors.
@@ -293,7 +294,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     buffers are normal tensors -- inference tensors cannot be inplace-updated
     during later CUDA graph capture, which runs outside inference_mode.
     """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
+    if layer._cutedsl_wrapper is not None:
         return
 
     try:
@@ -346,7 +347,12 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
         )
-    refresh_cutedsl_standard_scales(layer)
+    with torch.inference_mode(False):
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            resolve_cutedsl_standard_scales(layer)
+        )
+    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    layer._cutedsl_input_scale = used_input_scale
 
 
 # ---------------------------------------------------------------------------
@@ -409,32 +415,25 @@ def _quantize_hidden_states_nvfp4(
     input_scale: torch.Tensor,
     use_per_token_activation: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    if use_per_token_activation:
-        from flashinfer import SfLayout, nvfp4_quantize
-
-        x_fp4_bytes, x_sf_bytes, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            input_scale,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
-        )
-        seq_len, hidden_size = hidden_states.shape
-        x_fp4 = x_fp4_bytes.reshape(seq_len, hidden_size // 2)
-        x_sf = x_sf_bytes.view(torch.float8_e4m3fn).reshape(
-            seq_len, hidden_size // _FP4_SF_VEC_SIZE
-        )
-        return x_fp4, x_sf, per_token_scale
-
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
-    x_fp4, x_sf = fp4_quantize(
+    quantized = fp4_quantize(
         hidden_states,
         input_scale,
-        sf_vec_size=_FP4_SF_VEC_SIZE,
+        sf_vec_size=NVFP4_SF_VEC_SIZE,
         is_sf_swizzled_layout=False,
+        per_token_activation=use_per_token_activation,
     )
-    return x_fp4, x_sf, None
+    if use_per_token_activation:
+        x_fp4_bytes, x_sf_bytes, per_token_scale = quantized
+    else:
+        x_fp4_bytes, x_sf_bytes = quantized
+        per_token_scale = None
+
+    seq_len, hidden_size = hidden_states.shape
+    x_fp4 = x_fp4_bytes.reshape(seq_len, hidden_size // 2)
+    x_sf = x_sf_bytes.view(torch.float8_e4m3fn).reshape(
+        seq_len, hidden_size // NVFP4_SF_VEC_SIZE
+    )
+    return x_fp4, x_sf, per_token_scale
 
 
 @register_fused_func("none", "flashinfer_cutedsl")

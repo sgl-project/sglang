@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    NVFP4_SF_VEC_SIZE,
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
@@ -2213,6 +2214,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
+        if self._is_cutedsl_v2_standard:
+            layer._cutedsl_wrapper = None
+            layer._cutedsl_scales = None
+            layer._cutedsl_input_scale = None
+            layer._cutedsl_per_token_input_scale = None
 
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
@@ -2472,32 +2478,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_cutedsl_moe
             and self.quant_config.use_per_token_activation
         ):
-            e4m3_max = (
-                256.0
-                if envs.FLASHINFER_NVFP4_4OVER6.get()
-                and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-                else 448.0
+            from flashinfer.quantization.nvfp4_quantization_utils import (
+                current_nvfp4_4over6_config,
+                make_nvfp4_global_scale,
             )
-            cutedsl_per_token_input_scale = torch.tensor(
-                1.0 / (e4m3_max * 6.0),
-                device=layer.w13_input_scale_quant.device,
-                dtype=torch.float32,
+
+            cutedsl_per_token_input_scale = make_nvfp4_global_scale(
+                layer.w13_input_scale_quant,
+                per_token_activation=True,
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
             )
-            existing_per_token_input_scale = getattr(
-                layer, "_cutedsl_per_token_input_scale", None
-            )
-            if (
-                isinstance(existing_per_token_input_scale, torch.Tensor)
-                and existing_per_token_input_scale.shape
-                == cutedsl_per_token_input_scale.shape
-                and existing_per_token_input_scale.dtype
-                == cutedsl_per_token_input_scale.dtype
-                and existing_per_token_input_scale.device
-                == cutedsl_per_token_input_scale.device
-            ):
-                existing_per_token_input_scale.copy_(cutedsl_per_token_input_scale)
-            else:
+            if layer._cutedsl_per_token_input_scale is None:
                 layer._cutedsl_per_token_input_scale = cutedsl_per_token_input_scale
+            else:
+                layer._cutedsl_per_token_input_scale.copy_(
+                    cutedsl_per_token_input_scale
+                )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             gemm1_clamp_limit = (
@@ -2674,11 +2670,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    _FP4_SF_VEC_SIZE,
-                    refresh_cutedsl_standard_scales,
+                    refresh_cutedsl_standard_scales_for_weight_update,
                 )
 
-                sf_vec_size = _FP4_SF_VEC_SIZE
                 num_local_experts = layer.w13_weight.shape[0]
                 w13_m = layer.w13_weight.shape[1]
                 w13_k = layer.w13_weight.shape[2] * 2
@@ -2694,7 +2688,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         m=w13_m,
                         k=w13_k,
                         num_groups=num_local_experts,
-                        sf_vec_size=sf_vec_size,
+                        sf_vec_size=NVFP4_SF_VEC_SIZE,
                     ),
                 )
                 copy_or_rebind_param(
@@ -2707,11 +2701,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         m=w2_m,
                         k=w2_k,
                         num_groups=num_local_experts,
-                        sf_vec_size=sf_vec_size,
+                        sf_vec_size=NVFP4_SF_VEC_SIZE,
                     ),
                 )
-                if getattr(layer, "_cutedsl_wrapper", None) is not None:
-                    refresh_cutedsl_standard_scales(layer)
+                if layer._cutedsl_wrapper is not None:
+                    refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
