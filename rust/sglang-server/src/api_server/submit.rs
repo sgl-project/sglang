@@ -33,18 +33,30 @@ pub(super) async fn submit(
     // first's sink, 500 that client mid-generation, and deliver its remaining
     // chunks to the second's connection. Reject instead, as Python's
     // `TokenizerManager` does. The entry is dropped by the caller's `AbortGuard`.
-    if matches!(kind, RequestKind::Generate(_))
-        && !state
+    let mut lease = None;
+    if matches!(kind, RequestKind::Generate(_)) {
+        if !state
             .live_rids
             .lock()
             .expect("live_rids poisoned")
             .insert(rid.clone())
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Duplicate request ID detected: {rid}"),
-        )
-            .into_response());
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Duplicate request ID detected: {rid}"),
+            )
+                .into_response());
+        }
+        // RAII from here on. Every path out of this function that is NOT a
+        // successful hand-off must release the rid, including the one that never
+        // returns: `send_async` below is an await point, and a client disconnecting
+        // there drops this future mid-flight. A leaked entry makes the rid
+        // permanently unusable — every retry 400s — which defeats client-supplied
+        // rids as idempotency keys and is drivable by saturating the inbox.
+        lease = Some(RidLease {
+            live_rids: state.live_rids.clone(),
+            rid: rid.clone(),
+        });
     }
     let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
@@ -58,12 +70,44 @@ pub(super) async fn submit(
         kind,
     };
     match state.senders.tm.send_async(TmEvent::Ingress(request)).await {
-        Ok(()) => Ok((id, rid, rx)),
+        Ok(()) => {
+            // Handed off: the caller's `AbortGuard` owns the release from here.
+            if let Some(lease) = lease.as_mut() {
+                lease.disarm();
+            }
+            Ok((id, rid, rx))
+        }
         // `SendError` has a single meaning — the channel is disconnected.
         Err(_) => {
             tracing::error!(%rid, "tm inbox closed; request rejected");
             // Return 503 so the client can retry.
             Err((StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())
+        }
+    }
+}
+
+/// Holds a `live_rids` entry until the request is safely handed to the TM, then
+/// hands ownership to the caller's [`AbortGuard`](super::guard::AbortGuard) via
+/// [`disarm`](Self::disarm). Dropped undisarmed — an early return, or the future
+/// being dropped at the `send_async` await — it releases the rid.
+struct RidLease {
+    live_rids: super::LiveRids,
+    rid: String,
+}
+
+impl RidLease {
+    fn disarm(&mut self) {
+        self.rid.clear();
+    }
+}
+
+impl Drop for RidLease {
+    fn drop(&mut self) {
+        if self.rid.is_empty() {
+            return; // disarmed: the AbortGuard owns it now
+        }
+        if let Ok(mut live) = self.live_rids.lock() {
+            live.remove(&self.rid);
         }
     }
 }
