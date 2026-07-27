@@ -73,7 +73,7 @@ from sglang.srt.layers.attention.aiter_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.utils import get_bool_env_var, get_int_env_var
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -85,16 +85,6 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
 
-# Route pure-prefill head-dim-256 attention (e.g. Qwen3.5) through aiter's
-# FMHA fp8 hd256 asm kernel (ROCm/aiter PR #3732) instead of the slower
-# CK mha_batch_prefill path. Opt-in and only active on gfx950; the fast-path
-# in forward_extend additionally restricts it to head_dim==256 with no cached
-# prefix, falling back to mha_batch_prefill_func otherwise.
-_use_fmha_fp8_hd256 = (
-    get_bool_env_var("SGLANG_AITER_FMHA_FP8_HD256", "False") and is_gfx95_supported()
-)
-_fmha_fp8_hd256_min_len = get_int_env_var("SGLANG_AITER_FMHA_FP8_HD256_MIN_LEN", 16384)
-
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
 # intra_batch_mode=False if _use_mla_ps_kernel else True
@@ -102,6 +92,20 @@ _fmha_fp8_hd256_min_len = get_int_env_var("SGLANG_AITER_FMHA_FP8_HD256_MIN_LEN",
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
+
+
+def _quant_fp8_pertensor(x, num_heads, head_dim):
+    """Dynamic per-tensor fp8 quantization for the hd256 prefill fast-path.
+
+    Scales amax to fp8's max so the full range is used, and returns the descale
+    so the kernel can recover true magnitudes (real = quantized * descale). Used
+    for a bf16 KV cache, where no calibrated k/v scales are available.
+    """
+    fp8_max = torch.finfo(fp8_dtype).max
+    x = x.contiguous().view(-1, num_heads, head_dim)
+    scale = (x.abs().amax().to(torch.float32) / fp8_max).clamp(min=1e-12)
+    x_f8 = (x / scale).to(fp8_dtype)
+    return x_f8, scale.view(1)
 
 
 class WrapperDispatch(Enum):
@@ -2340,36 +2344,61 @@ class AiterAttnBackend(AttentionBackend):
             # descales (amax / fp8_max) so the kernel can recover true magnitudes.
             # All other shapes fall through to the mha_batch_prefill_func path
             # below.
-            use_hd256_fastpath = False
-            if _use_fmha_fp8_hd256:
-                use_hd256_fastpath = (
-                    layer.qk_head_dim == 256
-                    and layer.v_head_dim == 256
-                    and window_size == (-1, -1)
-                    and not forward_batch.forward_mode.is_draft_extend_v2()
-                    and not any(forward_batch.extend_prefix_lens_cpu)
-                    and self.forward_metadata.max_q_len >= _fmha_fp8_hd256_min_len
-                )
+            use_hd256_fastpath = (
+                get_bool_env_var("SGLANG_AITER_FMHA_FP8_HD256", "False")
+                and is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+            )
 
             if use_hd256_fastpath:
                 cu_seqlens_q = self.qo_indptr[:bs0]
                 max_q_len = self.forward_metadata.max_q_len
-                fp8_max = torch.finfo(fp8_dtype).max
 
-                def _to_fp8_pertensor(x, num_heads):
-                    # Per-tensor fp8 quantization: scale amax to fp8's max so the
-                    # full range is used, and return the descale so the kernel can
-                    # recover the true magnitudes (real = quantized * descale).
-                    x = x.contiguous().view(-1, num_heads, layer.head_dim)
-                    scale = (x.abs().amax().to(torch.float32) / fp8_max).clamp(
-                        min=1e-12
+                if self.kv_cache_dtype == fp8_dtype:
+                    # fp8 KV cache: reuse the model's calibrated per-tensor scales
+                    # (k_descale/v_descale) and only pay the contiguous cast, no
+                    # amax reduction. q reuses the k scale (matches #28482).
+                    q_scale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
                     )
-                    x_f8 = (x / scale).to(fp8_dtype)
-                    return x_f8, scale.view(1)
+                    q_f8 = (
+                        q.contiguous()
+                        .view(-1, layer.tp_q_head_num, layer.head_dim)
+                        .to(fp8_dtype)
+                    )
+                    k_f8 = (
+                        k.contiguous()
+                        .view(-1, layer.tp_k_head_num, layer.head_dim)
+                        .to(fp8_dtype)
+                    )
+                    v_f8 = (
+                        v.contiguous()
+                        .view(-1, layer.tp_v_head_num, layer.head_dim)
+                        .to(fp8_dtype)
+                    )
+                    k_scale = k_descale
+                    v_scale = v_descale
+                else:
+                    # bf16 KV cache: no calibrated scales exist, so quantize
+                    # dynamically with per-tensor amax scaling.
+                    q_f8, q_scale = _quant_fp8_pertensor(
+                        q, layer.tp_q_head_num, layer.head_dim
+                    )
+                    k_f8, k_scale = _quant_fp8_pertensor(
+                        k, layer.tp_k_head_num, layer.head_dim
+                    )
+                    v_f8, v_scale = _quant_fp8_pertensor(
+                        v, layer.tp_v_head_num, layer.head_dim
+                    )
 
-                q_f8, q_scale = _to_fp8_pertensor(q, layer.tp_q_head_num)
-                k_f8, k_scale = _to_fp8_pertensor(k, layer.tp_k_head_num)
-                v_f8, v_scale = _to_fp8_pertensor(v, layer.tp_v_head_num)
                 o = flash_attn_varlen_fp8_pertensor_func(
                     q_f8,
                     k_f8,
@@ -2383,7 +2412,42 @@ class AiterAttnBackend(AttentionBackend):
                     max_q_len,
                     causal=True,
                     softmax_scale=layer.scaling,
+                )
+                if o.dtype != self.input_dtype:
+                    o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+            # bf16 ASM varlen fallback for no-prefix head_dim==256 prefill
+            # (ROCm/aiter flash_attn_varlen_func). Unlike the fp8 fast-path
+            # above, this avoids fp8 quantization (no accuracy loss, no per-token
+            # cast). It is only valid for a pure prefill with no cached prefix,
+            # because it consumes the contiguous current-step k/v rather than the
+            # paged KV pool. Runs whenever the fp8 fast-path did not.
+            # The kernel natively supports softcap and sinks, so those are passed
+            # through instead of gated out.
+            use_hd256_bf16_fallback = (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+            )
+            if use_hd256_bf16_fallback:
+                cu_seqlens_q = self.qo_indptr[:bs0]
+                max_q_len = self.forward_metadata.max_q_len
+                o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+                    cu_seqlens_q,
+                    cu_seqlens_q,
+                    max_q_len,
+                    max_q_len,
+                    softmax_scale=layer.scaling,
                     logits_soft_cap=self.logits_soft_cap,
+                    causal=True,
+                    sink_ptr=sinks,
                 )
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
