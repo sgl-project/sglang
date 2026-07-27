@@ -23,6 +23,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def get_grammar_stop_token_ids(model_config, tokenizer) -> set:
+    """Stop tokens a grammar may end on in an accepting state.
+
+    Must mirror the model-level stop matching in
+    Req._check_token_based_finish (model config/generation config EOS,
+    tokenizer EOS, and tokenizer additional stop tokens). Anything narrower
+    lets the grammar mask a stop token the runtime would honor, forcing
+    constrained requests to run until max_tokens (e.g. checkpoints whose
+    config.json EOS is <|endoftext|> while the chat turn ends with
+    <|im_end|> from the tokenizer).
+    """
+    stop_token_ids = set(model_config.hf_eos_token_id or set())
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos is not None:
+        stop_token_ids.add(tokenizer_eos)
+    stop_token_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or [])
+    return stop_token_ids
+
+
 class GrammarManager:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
@@ -33,7 +52,7 @@ class GrammarManager:
                 self.server_args,
                 scheduler.tokenizer,
                 scheduler.model_config.vocab_size,
-                scheduler.model_config.hf_eos_token_id,
+                get_grammar_stop_token_ids(scheduler.model_config, scheduler.tokenizer),
                 think_end_id=scheduler.model_config.think_end_id,
             )
         else:
