@@ -916,10 +916,7 @@ def _flash_attn_fwd(
         # wins +4-15% at bs<=8 (worst pocket -7% at bs16); kv 2k is net
         # negative at small bs, and kv<=512 stays on 256-tile single-split
         # direct mode (no reduction kernel), so only 1k flips.
-        seq_tile_env = envs.SGLANG_FORCE_FA4_DECODE_SEQUENCE_TILE.get()
-        if seq_tile_env is not None:
-            sequence_tile = seq_tile_env
-        elif (
+        if (
             512 < bias_decode_seqlen_k <= 1024
             and not bias_decode_mxfp8
             and (not bias_decode_paged or page_size <= 128)
@@ -954,8 +951,7 @@ def _flash_attn_fwd(
 
         bias_smem_extent = decode_bias.shape[-1]
         if (
-            not envs.SGLANG_OPT_FA4_DECODE_BIAS_SMEM.get()
-            or decode_bias.dtype != torch.bfloat16
+            decode_bias.dtype != torch.bfloat16
             or bias_smem_extent * grouped_head_tile * prediction_tile * 2
             > 16 * 1024
         ):
