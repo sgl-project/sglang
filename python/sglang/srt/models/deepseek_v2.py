@@ -1484,11 +1484,18 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
+            dispatch_kwargs = dict(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
+            if get_moe_a2a_backend().is_flydsl():
+                dispatch_kwargs["dynamic_recv_cluster_rows"] = getattr(
+                    state.forward_batch,
+                    "flydsl_tbo_cluster_dispatch_rows",
+                    None,
+                )
+            self.experts.dispatcher.dispatch_a(**dispatch_kwargs)
 
     def op_dispatch_b(self, state):
         if self.ep_size > 1:

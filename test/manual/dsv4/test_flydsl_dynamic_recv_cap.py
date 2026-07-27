@@ -30,9 +30,7 @@ def _run_once(op, inp, weights, indices, cur, recv_cap):
     total_recv = int(ret[4].item())
     assert ret[0].shape[0] == recv_cap
     assert total_recv <= recv_cap
-    combined, _ = op.combine(
-        ret[0], None, ret[3], cur_tok=cur, recv_cap=recv_cap
-    )
+    combined, _ = op.combine(ret[0], None, ret[3], cur_tok=cur, recv_cap=recv_cap)
     torch.cuda.synchronize()
     return total_recv, combined[:cur].clone()
 
@@ -72,12 +70,8 @@ def _worker(rank, world_size, port):
         inp, weights, indices = _make_inputs(
             rank, world_size, cur, hidden, epr, topk, device
         )
-        full_count, full_out = _run_once(
-            op, inp, weights, indices, cur, physical_cap
-        )
-        dyn_count, dyn_out = _run_once(
-            op, inp, weights, indices, cur, dynamic_cap
-        )
+        full_count, full_out = _run_once(op, inp, weights, indices, cur, physical_cap)
+        dyn_count, dyn_out = _run_once(op, inp, weights, indices, cur, dynamic_cap)
         assert dyn_count == full_count
         if cur:
             torch.testing.assert_close(dyn_out, full_out, rtol=0, atol=0)

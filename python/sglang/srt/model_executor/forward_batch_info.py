@@ -547,6 +547,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
+    # Exact all-rank padded dispatch rows for one eager TBO child. Populated
+    # once before layer execution and reused by every FlyDSL MoE dispatcher.
+    flydsl_tbo_cluster_dispatch_rows: Optional[int] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
