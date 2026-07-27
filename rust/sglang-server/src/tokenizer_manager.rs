@@ -39,6 +39,10 @@ pub enum TmEvent {
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.
+/// Client-visible rids currently in flight. Shared by the api server (which
+/// admits a rid) and ingress (which releases it once its abort has taken effect).
+pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 #[derive(Clone)]
 pub struct Senders {
     /// → TokenizerManager ingress loop.

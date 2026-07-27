@@ -88,10 +88,22 @@ impl Runnable for Egress {
                         // buckets: a frame that fails at request 0 buckets nothing,
                         // so bucket-driven cleanup would leave every request in it
                         // hanging.
-                        tracing::warn!(
-                            rids = decoded.rids.len(),
-                            "egress: bad batch frame; failing its requests"
-                        );
+                        // Distinguish "failed N requests" from "named nobody": a
+                        // frame whose header would not decode at all yields no rids,
+                        // so nothing downstream fails and every request in it waits
+                        // forever. That is the case worth paging on, and it used to
+                        // log the same line as the recoverable one.
+                        if decoded.rids.is_empty() {
+                            tracing::error!(
+                                "egress: bad batch frame named NO rids; any request in \
+                                 it will hang (header undecodable, or empty rid column)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                rids = decoded.rids.len(),
+                                "egress: bad batch frame; failing its requests"
+                            );
+                        }
                         for b in buckets.iter_mut() {
                             b.clear();
                         }

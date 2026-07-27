@@ -39,7 +39,7 @@ struct AppState {
 /// The in-flight rid set (see [`AppState::live_rids`]). A `std::sync::Mutex` is
 /// right here: it is held only across one hash-set operation, never across an
 /// await.
-type LiveRids = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+use crate::tokenizer_manager::LiveRids;
 
 pub async fn serve(
     listener: std::net::TcpListener,
@@ -47,6 +47,10 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
     egress_activity: ActivityCounter,
+    // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
+    // local one here would leave the api server admitting rids that nothing ever
+    // releases.
+    live_rids: LiveRids,
     shutdown: flume::Receiver<()>,
 ) {
     let state = AppState {
@@ -54,7 +58,7 @@ pub async fn serve(
         egress_buf,
         server_args: server_args.clone(),
         egress_activity,
-        live_rids: LiveRids::default(),
+        live_rids,
     };
     // Each endpoint module registers its own routes and merges here.
     let app = Router::new()
