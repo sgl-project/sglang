@@ -17,7 +17,7 @@ The mixin produces the ``BlockStored`` / ``BlockRemoved`` / ``AllBlocksCleared``
 events consumed by KV-aware routers (e.g. dynamo).
 """
 
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -32,6 +32,23 @@ from sglang.srt.mem_cache.utils import (
 
 
 class KVCacheEventMixin:
+    def _component_types_for_page(
+        self,
+        node: Any,
+        medium: StorageMedium,
+        page_index: int,
+        num_pages: int,
+    ) -> Optional[list[str]]:
+        """Hook: return which KV component names are resident for this page at
+        ``medium``, or ``None`` to omit the component dimension entirely.
+
+        The base implementation returns ``None`` (legacy whole-block behaviour)
+        so caches with a single, undifferentiated KV component leave the
+        component dimension unset. Component-aware caches (e.g. the unified radix
+        tree) override this to report FULL / SWA / MAMBA placement per tier.
+        """
+        return None
+
     def _record_store_event(self, node: Any, medium=None):
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
@@ -55,6 +72,9 @@ class KVCacheEventMixin:
 
             page_index = 0
             logical_len = len(node.key)
+            # Derived from the same quantity the page loop iterates over, so the
+            # "last page" hook below cannot drift from the pages actually emitted.
+            num_pages = -(-logical_len // self.page_size)
             is_bigram = node.key.is_bigram
             raw = node.key.token_ids
             for start in range(0, logical_len, self.page_size):
@@ -69,6 +89,17 @@ class KVCacheEventMixin:
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
+                component_types = self._component_types_for_page(
+                    node, medium, page_index, num_pages
+                )
+                # An empty (non-None) set means nothing is resident at this
+                # medium for this page -- do not claim placement. Still advance
+                # the parent-hash chain so later pages keep correct parentage.
+                if component_types is not None and len(component_types) == 0:
+                    parent_block_hash = block_hash
+                    page_index += 1
+                    continue
+
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -77,6 +108,7 @@ class KVCacheEventMixin:
                         block_size=len(page_tokens),
                         lora_id=None,
                         medium=medium,
+                        component_types=component_types,
                     )
                 )
 
@@ -87,6 +119,9 @@ class KVCacheEventMixin:
         # One BlockRemoved per radix node.
         # ``medium`` defaults to StorageMedium.GPU but callers may override for
         # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
+        # A BlockRemoved always means the whole block left ``medium`` (its base
+        # component is gone), so removals stay whole-block with no component
+        # dimension.
         if self.enable_kv_cache_events:
             if medium is None:
                 medium = StorageMedium.GPU
