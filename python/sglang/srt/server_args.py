@@ -3678,13 +3678,21 @@ class ServerArgs:
                 # default to a full eight-way 2K embedding batch; callers can
                 # still override this for larger aggregate prefills.
                 prefill_config = self.cuda_graph_config.prefill
-                if (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked:
+                # Unit-level capability tests may invoke this hook without
+                # running the full CUDA-graph configuration parser, which is
+                # where this internal lock set is normally initialized.
+                # Treat that minimal construction as having no user-locked
+                # graph settings.
+                cuda_graph_config_locked = getattr(
+                    self, "_cuda_graph_config_locked", set()
+                )
+                if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
                     prefill_config.max_bs = max(
                         prefill_config.max_bs or 0,
                         model_config.context_len,
                         16384,
                     )
-                    if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
                         prefill_config.bs = (
                             self._generate_prefill_cuda_graph_batch_sizes(
                                 prefill_config.max_bs
