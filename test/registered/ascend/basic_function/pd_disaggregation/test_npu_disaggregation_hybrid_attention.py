@@ -115,11 +115,14 @@ class TestDisaggregationHybridAttentionGDN(TestDisaggregationHybridAttentionBase
         4,
     ]
     gsm8k_score_threshold = 0.93
+
     def test_gsm8k(self):
         self.run_gsm8k()
 
 
-class TestDisaggregationHybridAttentionGDNDPDecode(TestDisaggregationHybridAttentionBase):
+class TestDisaggregationHybridAttentionGDNDPDecode(
+    TestDisaggregationHybridAttentionBase
+):
     """Test with prefill tp=4 and decode tp=4/dp=2 with dp-attention enabled."""
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH
@@ -138,6 +141,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(TestDisaggregationHybridAtten
         4,
     ]
     gsm8k_score_threshold = 0.9
+
     def test_gsm8k(self):
         self.run_gsm8k()
 
