@@ -81,9 +81,7 @@ def npu_mtp_non_greedy_sample(
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, num_draft_tokens, dim=0
     )
-    target_probs = F.softmax(
-        next_token_logits.float() / expanded_temperature, dim=-1
-    )
+    target_probs = F.softmax(next_token_logits.float() / expanded_temperature, dim=-1)
 
     from sglang.srt.utils.async_probe import maybe_detect_nan
 
@@ -96,9 +94,7 @@ def npu_mtp_non_greedy_sample(
         sampling_info.need_top_p_sampling,
     )
     maybe_detect_nan(target_probs, "NPU v2 verify: target_probs after renorm")
-    target_probs = target_probs.reshape(
-        batch_size, num_draft_tokens, -1
-    ).contiguous()
+    target_probs = target_probs.reshape(batch_size, num_draft_tokens, -1).contiguous()
 
     if use_rejection_sampling:
         draft_probs = verify_input.draft_probs
@@ -139,9 +135,7 @@ def npu_mtp_non_greedy_sample(
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
     tp_group = (
-        get_parallel().attn_tp_group
-        if is_dp_attention_enabled()
-        else get_tp_group()
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
     )
     if tp_group.world_size > 1:
         tp_group.broadcast(predict, src=0)
