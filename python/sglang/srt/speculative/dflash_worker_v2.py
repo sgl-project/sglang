@@ -49,6 +49,8 @@ from sglang.srt.speculative.draft_worker_common import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.runtime_context import get_parallel
 
 _is_npu = is_npu()
 
@@ -1039,6 +1041,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
             )
         num_tokens = int(target_hidden.shape[0])
+        # Prefill context-parallel (round-robin split) all-gathers hidden states to
+        # a length padded up to a multiple of cp_size; those trailing rows are
+        # padding (round-robin de-interleave keeps real tokens contiguous at
+        # [0:n_real]). cache_loc / positions carry the real token count, so drop the
+        # small CP padding tail to keep the draft-KV write aligned. Guarded to CP +
+        # a positive sub-cp_size excess so non-CP / non-DFlash paths are untouched.
+        _cache_n = int(cache_loc.numel())
+        if num_tokens > _cache_n and is_dsa_enable_prefill_cp():
+            _cp = int(get_parallel().attn_cp_size)
+            if _cp > 1 and 0 < (num_tokens - _cache_n) < _cp:
+                target_hidden = target_hidden[:_cache_n]
+                num_tokens = _cache_n
         if int(cache_loc.numel()) != num_tokens:
             raise ValueError(
                 "DFLASH cache_loc length mismatch: "
