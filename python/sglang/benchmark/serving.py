@@ -489,6 +489,7 @@ async def async_request_openai_chat_completions(
                         )
                         output.prompt_len = (response_json.get("usage") or {}).get(
                             "prompt_tokens", prompt_len
+                        )
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
