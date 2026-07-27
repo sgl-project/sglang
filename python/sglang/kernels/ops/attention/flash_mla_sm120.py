@@ -418,7 +418,12 @@ def _split_kv_pages_to_64(
         mkey = f"flash_mla_sm120_mask:{dev}"
         mbuf = buffers.get(mkey)
         if mbuf is None or mbuf.shape[0] < N:
-            mbuf = torch.empty(N, dtype=torch.int8, device=dev)
+            # The first allocation can happen under inference mode (autotune),
+            # but the buffer is zeroed again later during CUDA graph capture
+            # outside inference mode -- an inference tensor cannot be mutated
+            # there, so force a normal tensor.
+            with torch.inference_mode(False):
+                mbuf = torch.empty(N, dtype=torch.int8, device=dev)
             buffers[mkey] = mbuf
         mask = mbuf[:N]
         mask.zero_()
