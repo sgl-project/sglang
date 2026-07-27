@@ -71,6 +71,67 @@ steady-state 为 `23.96 FPS`。
 
 `/work/parity-results/0724-window18-sink9-5s-b200-attempt04`
 
+## 八个单键的扩展验证
+
+在上述单个 `l` case 通过后，又用同一个 prompt、seed、首帧、checkpoint 和
+18/9 KV 合同，独立验证了 `w/a/s/d/i/j/k/l` 八个单键。新 manifest 是
+`cases_action_controls_single_key_kv_roll_832x480.json`；每个 case 仍然生成
+128 帧，加首帧共 129 帧 / 5.375 秒，因此每个 action 都会真实越过
+18 latent-frame window。
+
+- SGLang immutable SHA：
+  `df58a83ca9c7e0003beda772e4a5151c0cefa6c4`。
+- MinWM main immutable SHA：
+  `0796bc201fae4c86f100620cb23402ae21c8f3b5`。
+- Kubernetes Job：
+  `minwm-0724-bounded-parity-8keys-20260727-02`。
+- run id：
+  `0724-window18-sink9-5s-8keys-b200-attempt02`。
+- GPU：单卡 NVIDIA B200。
+- action 使用 checkpoint 的离散 `label_81`，不是 0.8 连续幅度：
+  `w=9, a=27, s=18, d=36, i=3, j=2, k=4, l=1`。
+
+| Key | Label | SGLang TTFF | 稳态 scheduler FPS | 结果 |
+| --- | ---: | ---: | ---: | --- |
+| `w` | 9 | 13,617.5 ms（含首次 compile） | 24.572 | bitwise |
+| `a` | 27 | 997.2 ms | 24.773 | bitwise |
+| `s` | 18 | 975.4 ms | 24.795 | bitwise |
+| `d` | 36 | 981.2 ms | 24.872 | bitwise |
+| `i` | 3 | 978.7 ms | 24.795 | bitwise |
+| `j` | 2 | 974.3 ms | 24.950 | bitwise |
+| `k` | 4 | 979.0 ms | 24.806 | bitwise |
+| `l` | 1 | 989.7 ms | 24.751 | bitwise |
+
+八组结果全部满足：
+
+- baseline/SGLang lossless frame SHA256 相同；
+- baseline/SGLang MP4 SHA256 相同；
+- `bitwise_equal=true`、`max_abs=0`、`RMSE=0`、`SSIM=1.0`；
+- 八个 action 得到八个不同的 frame SHA，排除了测试清单实际重复同一 action
+  的可能。
+
+跨全部 56 个稳态 chunk，scheduler 平均为 `645.446 ms / 16 frames`，
+即 `24.789 FPS`；WebSocket payload 平均到达间隔为 `643.627 ms`，
+即 `24.859 FPS`。排除首次 compile case 后，从发送 init 到收到最后一帧的
+逐 case 端到端平均为 `23.521 FPS`。MinWM baseline 的逐 case 完整离线流程
+平均为 `8.579 s / 129 frames = 15.037 FPS`，但它包含一次性返回、VAE 解码和
+MP4 写盘，不能与 scheduler-only FPS 直接等价比较。
+
+八组视频在页面中平铺展示，每张卡片的 `Play both` 会同步播放该组
+baseline/SGLang：
+
+`results/0724-window18-sink9-5s-8keys-b200-bitwise/player/index.html`
+
+集群完整证据：
+
+`/work/parity-results/0724-window18-sink9-5s-8keys-b200-attempt02`
+
+扩展验证的第一次提交 `attempt01` 在模型启动前失败。失败时在线 Deployment
+恰好滚动更新，并把共享 EBS 卷重新标记为新 Pod 的 SELinux MCS 类别；测试 Pod
+因此无法创建 `/work` 子目录。`attempt02` 只给测试 Pod 设置
+`seLinuxOptions.type=spc_t`，没有启用 privileged，也没有修改或重启在线
+Deployment。该变化只解决共享卷并发访问，不影响模型计算或 parity 结论。
+
 ## 首次失败、根因与修复
 
 首轮 `attempt01` 的 18/9 配置实际生效，但生成视频未通过数值阈值：
