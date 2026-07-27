@@ -93,8 +93,13 @@ class TestKimiK3EvalMI35x(CustomTestCase):
             "1200",
         ]
         env = os.environ.copy()
-        # AITER supplies K3's MoE on ROCm: FlyDSL is the HIP counterpart of the
-        # CuTe-DSL path, and SITUV2_A8W4 selects the W4A8 SiTU expert kernels.
+        # AITER supplies K3's MoE on ROCm. SGLANG_AITER_K3_OPT is read in
+        # mxfp4.py and models/kimi_k3.py but is gated behind SGLANG_USE_AITER,
+        # so both must be set. AITER_SITUV2_A8W4 selects the W4A8 SiTU expert
+        # kernels; it additionally requires the MoE activation to be "situ",
+        # which K3 supplies from its own config. AITER_FLYDSL_FORCE is consumed
+        # by AITER itself rather than sglang -- it will not grep to anything
+        # in-tree.
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_AITER_K3_OPT"] = "1"
         env["AITER_FLYDSL_FORCE"] = "1"
