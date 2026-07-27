@@ -266,13 +266,13 @@ Test Environment:
 
     ```shell Command
     #One A3 card has 2 npu chips
-    sglang serve --tp-size 2 --sp-degree 1 --model-path Qwen/Qwen-Image --port 30000 --num-gpus 2
+    sglang serve --tp-size 2 --sp-degree 1 --model-path Qwen/Qwen-Image --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30000 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -314,7 +314,7 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+        --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20 --port 30000
     ```
 
     **Result**:
@@ -345,7 +345,7 @@ Test Environment:
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 30000 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
