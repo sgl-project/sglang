@@ -15,6 +15,7 @@ import msgspec.msgpack
 import numpy as np
 
 from common import (
+    action_label_sequence,
     action_weights,
     load_cases,
     materialize_first_frame,
@@ -139,8 +140,7 @@ async def run_case(args, case, contract, first_frame: Path):
         }
     else:
         action_condition = {
-            "action_labels": [int(case["action_label"])]
-            * int(contract["generated_latent_frames"])
+            "action_labels": action_label_sequence(case, contract)
         }
     payload = {
         "type": "init",

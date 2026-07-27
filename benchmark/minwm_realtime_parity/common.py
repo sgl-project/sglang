@@ -59,14 +59,12 @@ def load_cases(path: str | Path) -> dict:
         raise ValueError("parity manifest case ids must be unique")
     for case in cases:
         bits = action_bits(case["keys"])
-        label = (
-            TRANS_BITS_TO_LABEL[tuple(bits[:4])] * 9
-            + ROT_BITS_TO_LABEL[tuple(bits[4:])]
-        )
+        label = action_label(case["keys"])
         if label != case["action_label"]:
             raise ValueError(
                 f"{case['id']}: action_label={case['action_label']} does not match keys={case['keys']}"
             )
+        _validate_action_schedule(case, contract)
         if "action_weights" in case:
             weights = action_weights(case)
             active_keys = [key for key, value in zip(KEY_ORDER, weights) if value > 0]
@@ -178,6 +176,99 @@ def action_bits(keys: list[str]) -> list[int]:
     return bits
 
 
+def action_label(keys: list[str]) -> int:
+    bits = action_bits(keys)
+    return (
+        TRANS_BITS_TO_LABEL[tuple(bits[:4])] * 9
+        + ROT_BITS_TO_LABEL[tuple(bits[4:])]
+    )
+
+
+def _validate_action_schedule(case: dict, contract: dict) -> None:
+    schedule = case.get("action_schedule")
+    if schedule is None:
+        return
+    if not isinstance(schedule, list) or not schedule:
+        raise ValueError(f"{case['id']}: action_schedule must be a non-empty list")
+    generated_pixels = int(contract["generated_pixel_frames"])
+    generated_latents = int(contract["generated_latent_frames"])
+    if generated_pixels % generated_latents:
+        raise ValueError("pixel/latent frame contract is not integral")
+    pixels_per_latent = generated_pixels // generated_latents
+    cursor = 0
+    for segment in schedule:
+        start = segment.get("start_frame")
+        end = segment.get("end_frame")
+        keys = segment.get("keys")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+        ):
+            raise ValueError(
+                f"{case['id']}: action schedule boundaries must be integers"
+            )
+        if start != cursor or end <= start or end > generated_pixels:
+            raise ValueError(
+                f"{case['id']}: action schedule must be contiguous; "
+                f"expected start {cursor}, got [{start}, {end})"
+            )
+        if start % pixels_per_latent or end % pixels_per_latent:
+            raise ValueError(
+                f"{case['id']}: action boundaries must align to "
+                f"{pixels_per_latent}-pixel latent frames"
+            )
+        if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+            raise ValueError(f"{case['id']}: action schedule keys must be a list")
+        action_bits(keys)
+        cursor = end
+    if cursor != generated_pixels:
+        raise ValueError(
+            f"{case['id']}: action schedule ends at {cursor}, "
+            f"expected {generated_pixels}"
+        )
+
+
+def action_label_sequence(case: dict, contract: dict) -> list[int]:
+    schedule = case.get("action_schedule")
+    generated_latents = int(contract["generated_latent_frames"])
+    if schedule is None:
+        return [int(case["action_label"])] * generated_latents
+    pixels_per_latent = (
+        int(contract["generated_pixel_frames"]) // generated_latents
+    )
+    labels = []
+    for segment in schedule:
+        segment_latents = (
+            int(segment["end_frame"]) - int(segment["start_frame"])
+        ) // pixels_per_latent
+        labels.extend([action_label(segment["keys"])] * segment_latents)
+    if len(labels) != generated_latents:
+        raise ValueError(
+            f"{case['id']}: action schedule produced {len(labels)} latent labels, "
+            f"expected {generated_latents}"
+        )
+    return labels
+
+
+def pixel_action_bits(case: dict, contract: dict) -> list[list[int]]:
+    schedule = case.get("action_schedule")
+    generated_pixels = int(contract["generated_pixel_frames"])
+    if schedule is None:
+        return [action_bits(case["keys"]) for _ in range(generated_pixels)]
+    rows = []
+    for segment in schedule:
+        count = int(segment["end_frame"]) - int(segment["start_frame"])
+        rows.extend([action_bits(segment["keys"]) for _ in range(count)])
+    if len(rows) != generated_pixels:
+        raise ValueError(
+            f"{case['id']}: action schedule produced {len(rows)} pixel actions, "
+            f"expected {generated_pixels}"
+        )
+    return rows
+
+
 def action_weights(case: dict) -> list[float]:
     values = case.get("action_weights")
     if values is None:
@@ -244,8 +335,16 @@ def materialize_first_frame(case: dict, inputs_dir: str | Path) -> Path:
 
 def build_minwm_message(case: dict, contract: dict, first_frame: Path) -> dict:
     use_weights = contract.get("action_output_format") == "primitive_float"
-    action_row = action_weights(case) if use_weights else action_bits(case["keys"])
-    pixel_actions = [action_row for _ in range(int(contract["generated_pixel_frames"]))]
+    if use_weights and case.get("action_schedule") is not None:
+        raise ValueError("scheduled primitive_float actions are not implemented")
+    pixel_actions = (
+        [
+            action_weights(case)
+            for _ in range(int(contract["generated_pixel_frames"]))
+        ]
+        if use_weights
+        else pixel_action_bits(case, contract)
+    )
     controls = [
         {
             "type": "keyboard_direction_frame_interval",

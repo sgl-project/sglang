@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from common import (
+    action_label_sequence,
     action_weights,
     build_minwm_message,
     load_cases,
@@ -345,9 +346,7 @@ def main() -> None:
                         "match manifest"
                     )
             else:
-                expected_actions = [0] + [int(case["action_label"])] * int(
-                    contract["generated_latent_frames"]
-                )
+                expected_actions = [0] + action_label_sequence(case, contract)
                 actual_actions = batch["action"][0].tolist()
                 if actual_actions != expected_actions:
                     raise AssertionError(
