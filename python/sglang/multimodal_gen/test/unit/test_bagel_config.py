@@ -316,9 +316,7 @@ class TestBagelPipelineConfig(unittest.TestCase):
                 batch = SimpleNamespace(
                     height=32,
                     width=48,
-                    extra={
-                        "bagel_context": SimpleNamespace(batch_size=batch_size)
-                    },
+                    extra={"bagel_context": SimpleNamespace(batch_size=batch_size)},
                 )
                 tokens = torch.arange(batch_size * 6 * 64, dtype=torch.float32).reshape(
                     batch_size, 6, 64
