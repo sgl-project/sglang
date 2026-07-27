@@ -155,6 +155,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                max_output_tokens: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),

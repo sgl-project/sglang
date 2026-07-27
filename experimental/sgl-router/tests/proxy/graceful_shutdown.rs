@@ -51,6 +51,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            max_output_tokens: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

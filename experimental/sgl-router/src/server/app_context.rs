@@ -190,6 +190,7 @@ impl AppContext {
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
+                    max_output_tokens: None,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {

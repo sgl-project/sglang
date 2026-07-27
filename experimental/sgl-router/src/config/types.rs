@@ -1,4 +1,4 @@
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -340,6 +340,15 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// Per-request output-token contract for this model. A request whose
+    /// `max_completion_tokens` / `max_tokens` exceeds this is rejected with
+    /// 400 before admission; a request that sets neither gets
+    /// `max_tokens = <cap>` injected into the forwarded body, so no request
+    /// can generate unbounded output. `None` (default) leaves today's
+    /// behavior: the engine's context length is the only output bound.
+    /// `NonZeroU64` rules out a `0` cap, which would reject or zero out
+    /// every request.
+    pub max_output_tokens: Option<NonZeroU64>,
 }
 
 /// Default [`ModelConfig::tokenizer_shards`]. 8 independent instances is

@@ -130,6 +130,15 @@ struct RequestProbe {
     model: Option<String>,
     #[serde(default)]
     rid: Option<String>,
+    /// Probed as raw `Value`s, not `u64`: a mistyped value (float, string,
+    /// negative) must not fail the probe's deserialize — the engine is
+    /// authoritative for schema errors and returns the better message.
+    /// `null` deserializes to `None` (same as absent), matching the
+    /// engine's treatment of an explicit `"max_tokens": null`.
+    #[serde(default)]
+    max_tokens: Option<serde_json::Value>,
+    #[serde(default)]
+    max_completion_tokens: Option<serde_json::Value>,
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -201,8 +210,19 @@ async fn chat_completions_inner(
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
         .model
-        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?
+        .to_owned();
     let model_id = ModelId(model_str.clone());
+
+    // Enforce the per-model output-token contract (`--max-output-tokens`)
+    // before admission: an explicit ask above the cap is a client error
+    // (mirroring the engine's own validation), and rejecting here costs no
+    // queue slot and no engine round-trip. When the request set no output
+    // budget at all, remember the cap for injection into the forwarded body
+    // below — otherwise an unbounded request generates until EOS or the
+    // engine's full context window fills.
+    let inject_max_tokens = output_budget_action(ctx.config.model.max_output_tokens, &probe)?;
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
@@ -605,14 +625,15 @@ async fn chat_completions_inner(
     };
 
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `rid`, `input_ids`, and/or bootstrap fields, or forwarding the original
-    // bytes untouched when none apply.
+    // `rid`, `input_ids`, bootstrap fields, and/or default `max_tokens`, or
+    // forwarding the original bytes untouched when none apply.
     let outgoing_body = build_outgoing_body(
         &body,
         request_value,
         forward_input_ids,
         bootstrap.as_ref(),
         rid_to_inject,
+        inject_max_tokens,
     )?;
     let at_post_build = start.elapsed();
 
@@ -1327,8 +1348,9 @@ fn build_outgoing_body(
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
     rid: Option<&str>,
+    max_tokens: Option<u64>,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
+    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() && max_tokens.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -1355,6 +1377,17 @@ fn build_outgoing_body(
         obj.insert(
             "rid".to_string(),
             serde_json::Value::String(rid.to_string()),
+        );
+    }
+    if let Some(cap) = max_tokens {
+        // Caller passes `Some` only when the request set neither
+        // `max_tokens` nor `max_completion_tokens` (decided at probe time by
+        // `output_budget_action`), so this never overrides a client value —
+        // it defaults the output budget to the per-model cap so an
+        // unbounded request can't run to the full context window.
+        obj.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::Number(cap.into()),
         );
     }
     if let Some(ids) = input_ids {
@@ -1525,6 +1558,71 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
             msgs.iter()
                 .any(|m| matches!(m.get("content"), Some(serde_json::Value::Array(_))))
         })
+}
+
+/// Resolve the per-model output-token contract (`--max-output-tokens`)
+/// against what the request asked for.
+///
+/// Returns the value to inject as `max_tokens` into the forwarded body
+/// (`Some(cap)` exactly when the cap is configured and the request set no
+/// effective output budget), or a 400 when the request explicitly asked
+/// for more than the cap.
+///
+/// The effective value mirrors the engine's resolution (protocol.py:
+/// `max_completion_tokens or max_tokens` — Python `or`, where an explicit
+/// numeric `0` is falsy): `max_completion_tokens` wins when present and
+/// non-zero, otherwise `max_tokens`. Diverging here would open a bypass —
+/// e.g. a legal `max_completion_tokens: 0` shadowing an over-cap
+/// `max_tokens` that the engine would then actually use.
+///
+/// Values are read through [`lax_number`] — not `as_u64` — for the same
+/// reason: the engine's pydantic lax mode coerces integral floats
+/// (`999999.0`) and numeric strings (`"999999"`) to ints, so a stricter
+/// read here could be slipped past. Everything `lax_number` can't read
+/// (non-numeric string, bool, …) neither rejects nor injects: it forwards
+/// untouched so the engine — authoritative for the request schema —
+/// produces its own 4xx with the better message.
+fn output_budget_action(
+    cap: Option<std::num::NonZeroU64>,
+    probe: &RequestProbe,
+) -> Result<Option<u64>, ApiError> {
+    let Some(cap) = cap else {
+        return Ok(None);
+    };
+    let requested = probe
+        .max_completion_tokens
+        .as_ref()
+        .filter(|v| lax_number(v) != Some(0.0))
+        .or(probe.max_tokens.as_ref());
+    match requested {
+        None => Ok(Some(cap.get())),
+        Some(v) => {
+            if let Some(f) = lax_number(v) {
+                if f > cap.get() as f64 {
+                    return Err(ApiError::BadRequest(format!(
+                        "max_tokens is too large: {v}. This model supports at most \
+                         {cap} completion tokens."
+                    )));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Read a JSON value the way the engine's pydantic lax mode reads an int
+/// field: numbers directly, numeric strings by parsing. Returns `None` for
+/// anything pydantic would reject outright (non-numeric string, bool,
+/// array, …). Non-integral floats parse here but fail pydantic's int
+/// coercion — harmless for the cap check: an over-cap `1e9` gets our 400
+/// instead of reaching the engine, an under-cap `1.5` forwards and gets
+/// the engine's 4xx.
+fn lax_number(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
@@ -1774,7 +1872,7 @@ mod tests {
             room: 42,
         };
         let injected =
-            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
+            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1795,7 +1893,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1810,11 +1908,137 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
         );
+    }
+
+    /// A `max_tokens` default is injected as a top-level number — including
+    /// on the path where nothing else needs injection (the early-return must
+    /// not swallow it).
+    #[test]
+    fn build_outgoing_body_injects_default_max_tokens() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let out = build_outgoing_body(&body, None, None, None, None, Some(131072)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("max_tokens"), Some(&serde_json::json!(131072)));
+        assert!(parsed.get("messages").is_some());
+    }
+
+    fn probe_of(body: &str) -> RequestProbe {
+        parse_probe(&Bytes::copy_from_slice(body.as_bytes())).unwrap()
+    }
+
+    fn cap(n: u64) -> Option<std::num::NonZeroU64> {
+        Some(std::num::NonZeroU64::new(n).unwrap())
+    }
+
+    /// No cap configured → never rejects, never injects, regardless of what
+    /// the request asked for.
+    #[test]
+    fn output_budget_no_cap_is_passthrough() {
+        let p = probe_of(r#"{"model":"x","max_tokens":999999999}"#);
+        assert_eq!(output_budget_action(None, &p).unwrap(), None);
+    }
+
+    /// Neither field set → inject the cap.
+    #[test]
+    fn output_budget_injects_cap_when_unset() {
+        let p = probe_of(r#"{"model":"x"}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), Some(131072));
+        // An explicit `null` is treated the same as absent (engine parity).
+        let p = probe_of(r#"{"model":"x","max_tokens":null}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), Some(131072));
+    }
+
+    /// A legal explicit ask (≤ cap, boundary included) forwards untouched —
+    /// no rejection, no injection.
+    #[test]
+    fn output_budget_legal_explicit_value_forwards_untouched() {
+        let p = probe_of(r#"{"model":"x","max_tokens":131072}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), None);
+        let p = probe_of(r#"{"model":"x","max_completion_tokens":42}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), None);
+    }
+
+    /// An explicit ask above the cap is rejected with a 400 naming both the
+    /// asked-for value and the cap.
+    #[test]
+    fn output_budget_rejects_over_cap() {
+        let p = probe_of(r#"{"model":"x","max_tokens":131073}"#);
+        let err = output_budget_action(cap(131072), &p).unwrap_err();
+        assert!(matches!(&err, ApiError::BadRequest(m)
+            if m.contains("131073") && m.contains("131072")));
+    }
+
+    /// `max_completion_tokens` wins over the deprecated `max_tokens` when
+    /// both are present — same precedence as the engine.
+    #[test]
+    fn output_budget_max_completion_tokens_takes_precedence() {
+        // Over-cap max_tokens is ignored because max_completion_tokens is legal.
+        let p = probe_of(r#"{"model":"x","max_tokens":999999,"max_completion_tokens":100}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), None);
+        // And the reverse: over-cap max_completion_tokens rejects even when
+        // max_tokens is legal.
+        let p = probe_of(r#"{"model":"x","max_tokens":100,"max_completion_tokens":999999}"#);
+        assert!(output_budget_action(cap(131072), &p).is_err());
+    }
+
+    /// Engine parity for Python-`or` falsiness: a numeric-zero
+    /// `max_completion_tokens` (0 or 0.0) falls through to `max_tokens`, so
+    /// it must not shadow an over-cap `max_tokens` — and standing alone it
+    /// leaves the budget unset (→ inject).
+    #[test]
+    fn output_budget_zero_mct_falls_through_to_max_tokens() {
+        for body in [
+            r#"{"model":"x","max_completion_tokens":0,"max_tokens":999999}"#,
+            r#"{"model":"x","max_completion_tokens":0.0,"max_tokens":999999}"#,
+        ] {
+            let p = probe_of(body);
+            assert!(
+                output_budget_action(cap(131072), &p).is_err(),
+                "body {body} must reject via the max_tokens fallthrough"
+            );
+        }
+        let p = probe_of(r#"{"model":"x","max_completion_tokens":0}"#);
+        assert_eq!(output_budget_action(cap(131072), &p).unwrap(), Some(131072));
+    }
+
+    /// Values the engine's pydantic lax mode would coerce to an over-cap int
+    /// — integral floats and numeric strings — are rejected, not forwarded.
+    #[test]
+    fn output_budget_rejects_laxly_coercible_over_cap_values() {
+        for body in [
+            r#"{"model":"x","max_tokens":999999.0}"#,
+            r#"{"model":"x","max_tokens":"999999"}"#,
+        ] {
+            let p = probe_of(body);
+            assert!(
+                output_budget_action(cap(131072), &p).is_err(),
+                "body {body} must reject"
+            );
+        }
+    }
+
+    /// A mistyped value that can't reach an over-cap int at the engine
+    /// (non-numeric string, under-cap float, negative) neither rejects nor
+    /// injects — it forwards untouched for the engine's own validation.
+    #[test]
+    fn output_budget_mistyped_value_forwards_untouched() {
+        for body in [
+            r#"{"model":"x","max_tokens":"large"}"#,
+            r#"{"model":"x","max_tokens":1.5}"#,
+            r#"{"model":"x","max_tokens":-5}"#,
+        ] {
+            let p = probe_of(body);
+            assert_eq!(
+                output_budget_action(cap(131072), &p).unwrap(),
+                None,
+                "body {body} must forward untouched"
+            );
+        }
     }
 
     /// A router-minted `rid` is injected as a top-level string so the engine
@@ -1824,8 +2048,8 @@ mod tests {
     fn build_outgoing_body_injects_rid() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out =
-            build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-abc123"), None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("rid").and_then(|r| r.as_str()),
@@ -1851,8 +2075,8 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out =
-            build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None, None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1947,7 +2171,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),

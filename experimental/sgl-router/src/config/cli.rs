@@ -7,7 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
@@ -70,6 +70,14 @@ pub struct Cli {
     /// traffic doesn't funnel through one HF merge-cache lock.
     #[arg(long, default_value_t = 0)]
     pub tokenizer_l1_cache_mb: usize,
+    /// Per-request output-token cap for this model (e.g. `131072`). A
+    /// request whose `max_completion_tokens` / `max_tokens` exceeds this is
+    /// rejected with 400 before admission; a request that sets neither gets
+    /// `max_tokens = <cap>` injected into the forwarded body. Unset (the
+    /// default) preserves today's behavior: the engine's context length is
+    /// the only output bound.
+    #[arg(long)]
+    pub max_output_tokens: Option<NonZeroU64>,
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
@@ -394,6 +402,7 @@ impl Cli {
                 circuit_breaker,
                 cache_aware,
                 sticky,
+                max_output_tokens: self.max_output_tokens,
             },
             discovery,
             proxy: ProxyConfig {
