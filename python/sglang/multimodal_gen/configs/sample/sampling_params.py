@@ -77,6 +77,7 @@ class DataType(Enum):
     VIDEO = auto()
     MESH = auto()
     ACTION = auto()
+    TEXT = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
@@ -85,7 +86,9 @@ class DataType(Enum):
             return "mp4"
         if self == DataType.ACTION:
             return "json"
-        return "glb"
+        if self == DataType.MESH:
+            return "glb"
+        return "txt"
 
 
 @dataclass
@@ -249,7 +252,16 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        output_extensions = (
+            ".mp4",
+            ".jpg",
+            ".png",
+            ".webp",
+            ".obj",
+            ".glb",
+            ".json",
+            ".txt",
+        )
         if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -609,7 +621,13 @@ class SamplingParams:
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
             )
 
-        if pipeline_config.task_type.is_image_gen():
+        if pipeline_config.task_type.is_text_gen():
+            # Text-producing multimodal pipelines do not own a temporal VAE.
+            # Keep the inherited media fields inert instead of entering the
+            # video frame-alignment path below.
+            self.num_frames = 1
+            self.adjust_frames = False
+        elif pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
@@ -949,6 +967,26 @@ class SamplingParams:
             "--think-temperature",
             type=float,
             help="Sampling temperature for BAGEL planning text",
+        )
+        add_argument(
+            "--max-new-tokens",
+            type=int,
+            help="Maximum autoregressive text tokens, including the initial BOS token",
+        )
+        add_argument(
+            "--do-sample",
+            action="store_true",
+            help="Sample autoregressive text instead of greedy decoding",
+        )
+        add_argument(
+            "--temperature",
+            type=float,
+            help="Sampling temperature for autoregressive text",
+        )
+        add_argument(
+            "--enable-thinking",
+            action="store_true",
+            help="Enable BAGEL reasoning before the final Understanding answer",
         )
         add_argument(
             "--guidance-scale",

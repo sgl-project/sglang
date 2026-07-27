@@ -101,6 +101,7 @@ class _ExpandedOutputParts:
     noise_preds: list[torch.Tensor] = field(default_factory=list)
     output_file_paths: list[str] = field(default_factory=list)
     revised_prompts: list[str | None] = field(default_factory=list)
+    text_outputs: list[Any] = field(default_factory=list)
     metrics_list: list[Any] = field(default_factory=list)
     trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
@@ -477,6 +478,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req: Req,
         save_output_paths: Callable[[OutputBatch], None],
     ) -> None:
+        # Autoregressive text is already CPU/IPC-safe and must never enter the
+        # image/video file or frame materialization paths.
+        if output_batch.text_outputs is not None:
+            return
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
         elif req.save_output and req.return_file_paths_only:
@@ -791,6 +796,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             output_count = int(output_batch.output.shape[0])
         elif output_batch.output is not None:
             output_count = len(output_batch.output)
+        elif output_batch.text_outputs is not None:
+            output_count = len(output_batch.text_outputs)
         else:
             output_count = len(output_batch.output_file_paths or [])
         if output_batch.revised_prompts is None:
@@ -801,6 +808,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         else:
             parts.revised_prompts.extend(output_batch.revised_prompts)
+        if output_batch.text_outputs is not None:
+            if len(output_batch.text_outputs) != output_count:
+                raise ValueError(
+                    "text_outputs must align one-to-one with expanded outputs"
+                )
+            parts.text_outputs.extend(output_batch.text_outputs)
         if isinstance(output_batch.output, torch.Tensor):
             parts.tensor_outputs.append(output_batch.output)
         elif output_batch.output is not None:
@@ -839,6 +852,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             merged.output_file_paths = parts.output_file_paths
         if any(prompt is not None for prompt in parts.revised_prompts):
             merged.revised_prompts = parts.revised_prompts
+        if parts.text_outputs:
+            merged.text_outputs = parts.text_outputs
         if any(metrics is not None for metrics in parts.metrics_list):
             merged.metrics_list = parts.metrics_list
             merged.metrics = next(

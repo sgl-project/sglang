@@ -749,10 +749,12 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         total_items = sum(per_req_counts)
         output_items = self._count_first_dim(output_batch.output)
         output_path_items = self._count_first_dim(output_batch.output_file_paths)
+        text_items = self._count_first_dim(output_batch.text_outputs)
 
-        if output_items is None and output_path_items is None:
+        if output_items is None and output_path_items is None and text_items is None:
             logger.warning(
-                "Batched output has neither tensor outputs nor output_file_paths; cannot split safely."
+                "Batched output has no media, file-path, or text outputs; "
+                "cannot split safely."
             )
             return None
 
@@ -767,6 +769,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             logger.warning(
                 "Unexpected batched output_file_paths size: got %s items, expected %s",
                 output_path_items,
+                total_items,
+            )
+            return None
+        if text_items is not None and text_items != total_items:
+            logger.warning(
+                "Unexpected batched text output size: got %s items, expected %s",
+                text_items,
                 total_items,
             )
             return None
@@ -807,6 +816,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 ),
                 revised_prompts=self._slice_batched_value(
                     output_batch.revised_prompts, start, end, total_items
+                ),
+                text_outputs=self._slice_batched_value(
+                    output_batch.text_outputs, start, end, total_items
                 ),
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(

@@ -274,11 +274,30 @@ class DiffGenerator:
                     if (
                         output_batch.output is None
                         and output_batch.output_file_paths is None
+                        and output_batch.text_outputs is None
                     ):
                         logger.error("Received empty output from scheduler")
                         continue
 
-                    if requests[0].save_output and requests[0].return_file_paths_only:
+                    if output_batch.text_outputs is not None:
+                        self._validate_output_count(
+                            len(output_batch.text_outputs), len(requests)
+                        )
+                        for idx, text_output in enumerate(output_batch.text_outputs):
+                            req = requests[idx]
+                            results.append(
+                                GenerationResult(
+                                    **self._result_common(
+                                        req, output_batch, timer.duration, idx
+                                    ),
+                                    text=text_output.text,
+                                    finish_reason=text_output.finish_reason,
+                                    prompt_tokens=text_output.prompt_tokens,
+                                    completion_tokens=text_output.completion_tokens,
+                                    prompt_index=global_output_index + idx,
+                                )
+                            )
+                    elif requests[0].save_output and requests[0].return_file_paths_only:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
                             len(output_file_paths), len(requests)

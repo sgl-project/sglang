@@ -336,6 +336,8 @@ class _BagelMoTAttention(nn.Module):
         config: BagelDiTArchConfig,
         layer_index: int,
         attention_backend: AttentionBackendEnum,
+        *,
+        load_generation_expert: bool,
     ) -> None:
         super().__init__()
         hidden_size = config.hidden_size
@@ -349,6 +351,7 @@ class _BagelMoTAttention(nn.Module):
         # DenoisingStage discovers the selected backend by scanning child
         # modules for this conventional attribute.
         self.backend = attention_backend
+        self.generation_enabled = load_generation_expert
 
         self.und_q_proj = nn.Linear(hidden_size, query_size, bias=True)
         self.und_k_proj = nn.Linear(hidden_size, kv_size, bias=True)
@@ -357,12 +360,36 @@ class _BagelMoTAttention(nn.Module):
         self.und_q_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.und_k_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.gen_q_proj = nn.Linear(hidden_size, query_size, bias=True)
-        self.gen_k_proj = nn.Linear(hidden_size, kv_size, bias=True)
-        self.gen_v_proj = nn.Linear(hidden_size, kv_size, bias=True)
-        self.gen_o_proj = nn.Linear(query_size, hidden_size, bias=False)
-        self.gen_q_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.gen_k_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.gen_q_proj = (
+            nn.Linear(hidden_size, query_size, bias=True)
+            if load_generation_expert
+            else None
+        )
+        self.gen_k_proj = (
+            nn.Linear(hidden_size, kv_size, bias=True)
+            if load_generation_expert
+            else None
+        )
+        self.gen_v_proj = (
+            nn.Linear(hidden_size, kv_size, bias=True)
+            if load_generation_expert
+            else None
+        )
+        self.gen_o_proj = (
+            nn.Linear(query_size, hidden_size, bias=False)
+            if load_generation_expert
+            else None
+        )
+        self.gen_q_norm = (
+            _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            if load_generation_expert
+            else None
+        )
+        self.gen_k_norm = (
+            _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            if load_generation_expert
+            else None
+        )
 
     def _project_understanding(
         self, hidden_states: Tensor
@@ -386,6 +413,15 @@ class _BagelMoTAttention(nn.Module):
     def _project_generation(
         self, hidden_states: Tensor, text_indexes: Tensor, latent_indexes: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if not self.generation_enabled:
+            raise RuntimeError(
+                "BAGEL generation expert is not loaded for this transformer"
+            )
+        assert self.gen_q_proj is not None
+        assert self.gen_k_proj is not None
+        assert self.gen_v_proj is not None
+        assert self.gen_q_norm is not None
+        assert self.gen_k_norm is not None
         sequence_length = hidden_states.shape[0]
         # Official BAGEL keeps generation Q/K in FP32 through QK-norm and RoPE,
         # then casts to BF16 immediately before FlashAttention. Preserve that
@@ -504,6 +540,7 @@ class _BagelMoTAttention(nn.Module):
 
         if mode == "und":
             return self.und_o_proj(attended), prefix_cache
+        assert self.gen_o_proj is not None
         output = hidden_states.new_zeros(hidden_states.shape)
         if text_indexes.numel() > 0:
             output[text_indexes] = self.und_o_proj(attended[text_indexes])
@@ -512,8 +549,11 @@ class _BagelMoTAttention(nn.Module):
 
 
 class _BagelMoTMLP(nn.Module):
-    def __init__(self, config: BagelDiTArchConfig) -> None:
+    def __init__(
+        self, config: BagelDiTArchConfig, *, load_generation_expert: bool
+    ) -> None:
         super().__init__()
+        self.generation_enabled = load_generation_expert
         self.und_gate = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
@@ -523,14 +563,20 @@ class _BagelMoTMLP(nn.Module):
         self.und_down = nn.Linear(
             config.intermediate_size, config.hidden_size, bias=False
         )
-        self.gen_gate = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
+        self.gen_gate = (
+            nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            if load_generation_expert
+            else None
         )
-        self.gen_up = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
+        self.gen_up = (
+            nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            if load_generation_expert
+            else None
         )
-        self.gen_down = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
+        self.gen_down = (
+            nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+            if load_generation_expert
+            else None
         )
 
     @staticmethod
@@ -551,6 +597,13 @@ class _BagelMoTMLP(nn.Module):
             return self._expert(
                 hidden_states, self.und_gate, self.und_up, self.und_down
             )
+        if not self.generation_enabled:
+            raise RuntimeError(
+                "BAGEL generation expert is not loaded for this transformer"
+            )
+        assert self.gen_gate is not None
+        assert self.gen_up is not None
+        assert self.gen_down is not None
         output = torch.zeros_like(hidden_states)
         if text_indexes.numel() > 0:
             output[text_indexes] = self._expert(
@@ -571,14 +624,29 @@ class _BagelMoTLayer(nn.Module):
         config: BagelDiTArchConfig,
         layer_index: int,
         attention_backend: AttentionBackendEnum,
+        *,
+        load_generation_expert: bool,
     ) -> None:
         super().__init__()
         self.und_in_norm = _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.gen_in_norm = _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = _BagelMoTAttention(config, layer_index, attention_backend)
+        self.gen_in_norm = (
+            _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if load_generation_expert
+            else None
+        )
+        self.attn = _BagelMoTAttention(
+            config,
+            layer_index,
+            attention_backend,
+            load_generation_expert=load_generation_expert,
+        )
         self.und_post_norm = _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.gen_post_norm = _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = _BagelMoTMLP(config)
+        self.gen_post_norm = (
+            _BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if load_generation_expert
+            else None
+        )
+        self.mlp = _BagelMoTMLP(config, load_generation_expert=load_generation_expert)
 
     @staticmethod
     def _route_norm(
@@ -588,10 +656,14 @@ class _BagelMoTLayer(nn.Module):
         *,
         mode: str,
         und_norm: _BagelRMSNorm,
-        gen_norm: _BagelRMSNorm,
+        gen_norm: _BagelRMSNorm | None,
     ) -> Tensor:
         if mode == "und":
             return und_norm(hidden_states)
+        if gen_norm is None:
+            raise RuntimeError(
+                "BAGEL generation expert is not loaded for this transformer"
+            )
         output = torch.zeros_like(hidden_states)
         if text_indexes.numel() > 0:
             output[text_indexes] = und_norm(hidden_states[text_indexes])
@@ -691,6 +763,7 @@ class BagelTransformer(BaseDiT):
         self.latent_channel = arch.latent_channel
         self.latent_downsample = arch.latent_downsample
         self.max_latent_size = arch.max_latent_size
+        self.generation_enabled = bool(config.load_generation_expert)
 
         self.embed_tokens = nn.Embedding(arch.vocab_size, arch.hidden_size)
         self.rotary_emb = _Qwen2RotaryEmbedding(
@@ -698,12 +771,21 @@ class BagelTransformer(BaseDiT):
         )
         self.layers = nn.ModuleList(
             [
-                _BagelMoTLayer(arch, index, selected_attention_backend)
+                _BagelMoTLayer(
+                    arch,
+                    index,
+                    selected_attention_backend,
+                    load_generation_expert=self.generation_enabled,
+                )
                 for index in range(arch.num_hidden_layers)
             ]
         )
         self.und_final_norm = _BagelRMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
-        self.gen_final_norm = _BagelRMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
+        self.gen_final_norm = (
+            _BagelRMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
+            if self.generation_enabled
+            else None
+        )
         self.lm_head = (
             nn.Linear(arch.hidden_size, arch.vocab_size, bias=False)
             if config.load_lm_head
@@ -711,14 +793,24 @@ class BagelTransformer(BaseDiT):
         )
 
         patch_dim = arch.latent_patch_size**2 * arch.latent_channel
-        self.vae2llm = nn.Linear(patch_dim, arch.hidden_size)
-        self.llm2vae = nn.Linear(arch.hidden_size, patch_dim)
-        self.time_embedder = _BagelTimestepEmbedder(
-            arch.hidden_size,
-            frequency_embedding_size=arch.timestep_frequency_embedding_size,
+        self.vae2llm = (
+            nn.Linear(patch_dim, arch.hidden_size) if self.generation_enabled else None
         )
-        self.latent_pos_embed = _LoadedPositionTable(
-            arch.latent_position_embedding_rows, arch.hidden_size
+        self.llm2vae = (
+            nn.Linear(arch.hidden_size, patch_dim) if self.generation_enabled else None
+        )
+        self.time_embedder = (
+            _BagelTimestepEmbedder(
+                arch.hidden_size,
+                frequency_embedding_size=arch.timestep_frequency_embedding_size,
+            )
+            if self.generation_enabled
+            else None
+        )
+        self.latent_pos_embed = (
+            _LoadedPositionTable(arch.latent_position_embedding_rows, arch.hidden_size)
+            if self.generation_enabled
+            else None
         )
 
         self.requires_grad_(False)
@@ -891,6 +983,50 @@ class BagelTransformer(BaseDiT):
         return system_prefix, user_prefix
 
     @torch.no_grad()
+    def build_understanding_prefix(
+        self,
+        vision_embeddings: Tensor,
+        user_input_ids: Tensor,
+        *,
+        start_of_image_token_id: int,
+        end_of_image_token_id: int,
+        system_input_ids: Tensor | None = None,
+    ) -> BagelPrefixContext:
+        """Build the official system-optional, image, then user text prefix.
+
+        Args:
+            vision_embeddings: ViT semantic tokens shaped ``[tokens, hidden_size]``.
+            user_input_ids: Wrapped user message token IDs.
+            start_of_image_token_id: Tokenizer-validated vision-start ID.
+            end_of_image_token_id: Tokenizer-validated vision-end ID.
+            system_input_ids: Optional wrapped VLM reasoning system message.
+
+        Returns:
+            Request-owned prefix ready for autoregressive text decoding.
+
+        Raises:
+            RuntimeError: If the language head is not loaded.
+            ValueError: If image embeddings or token IDs are invalid.
+        """
+        self._require_lm_head()
+        device = self.device
+        prefix = BagelPrefixContext(
+            BagelKVCache.empty(self.num_layers),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            0,
+        )
+        if system_input_ids is not None:
+            prefix = self._append_text_prefix(prefix, system_input_ids)
+        prefix = self._append_image_prefix(
+            prefix,
+            vision_embeddings,
+            mode="und",
+            start_of_image_token_id=start_of_image_token_id,
+            end_of_image_token_id=end_of_image_token_id,
+        )
+        return self._append_text_prefix(prefix, user_input_ids)
+
+    @torch.no_grad()
     def generate_text(
         self,
         prefix: BagelPrefixContext,
@@ -901,7 +1037,8 @@ class BagelTransformer(BaseDiT):
         do_sample: bool = False,
         temperature: float = 0.3,
         seed: int = 0,
-    ) -> Tensor:
+        return_finish_reason: bool = False,
+    ) -> Tensor | tuple[Tensor, str]:
         """Generate one request-local BAGEL planning message.
 
         The returned sequence matches official BAGEL: its first token is BOS,
@@ -917,10 +1054,13 @@ class BagelTransformer(BaseDiT):
             do_sample: Sample from logits instead of greedy argmax.
             temperature: Positive sampling temperature when sampling is enabled.
             seed: Seed for the request-local text generator.
+            return_finish_reason: Return ``(tokens, reason)`` for text response
+                transports while preserving the tensor-only Thinking contract.
 
         Returns:
             One-dimensional generated token IDs, including BOS and excluding
-            the predicted EOS.
+            the predicted EOS. When requested, also returns ``"stop"`` after
+            EOS or ``"length"`` after exhausting ``max_length``.
 
         Raises:
             RuntimeError: If the optional language head was not loaded.
@@ -937,7 +1077,9 @@ class BagelTransformer(BaseDiT):
             prefix.rope_offset + max_length
             > self.config.arch_config.max_position_embeddings
         ):
-            raise ValueError("BAGEL Thinking would exceed max_position_embeddings")
+            raise ValueError(
+                "BAGEL text generation would exceed max_position_embeddings"
+            )
         if not isinstance(do_sample, bool):
             raise ValueError("BAGEL do_sample must be a boolean")
         if do_sample and (
@@ -960,6 +1102,7 @@ class BagelTransformer(BaseDiT):
         current = torch.tensor([int(bos_token_id)], dtype=torch.long, device=device)
         generated: list[Tensor] = []
         text_generator = None
+        hit_eos = False
         if do_sample:
             text_generator = torch.Generator(device=device)
             text_generator.manual_seed(int(seed))
@@ -971,7 +1114,7 @@ class BagelTransformer(BaseDiT):
             )
             logits = lm_head(self.und_final_norm(hidden_states[-1]))
             if do_sample:
-                probabilities = torch.softmax(logits.float() / temperature, dim=-1)
+                probabilities = torch.softmax(logits / temperature, dim=-1)
                 next_token = torch.multinomial(
                     probabilities,
                     num_samples=1,
@@ -980,9 +1123,13 @@ class BagelTransformer(BaseDiT):
             else:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
             if int(next_token.item()) == int(eos_token_id):
+                hit_eos = True
                 break
             current = next_token.to(dtype=torch.long)
-        return torch.cat(generated)
+        generated_ids = torch.cat(generated)
+        if return_finish_reason:
+            return generated_ids, "stop" if hit_eos else "length"
+        return generated_ids
 
     @torch.no_grad()
     def build_thinking_context(
@@ -1041,6 +1188,13 @@ class BagelTransformer(BaseDiT):
                 "BAGEL text generation requires a transformer with load_lm_head=True"
             )
         return self.lm_head
+
+    def _require_generation_expert(self) -> None:
+        """Reject image-generation calls on the slim UND-only transformer."""
+        if not self.generation_enabled:
+            raise RuntimeError(
+                "BAGEL image generation requires load_generation_expert=True"
+            )
 
     def _append_image_prefix(
         self,
@@ -1194,9 +1348,11 @@ class BagelTransformer(BaseDiT):
             A request-owned three-way denoising context.
 
         Raises:
+            RuntimeError: If generation-only experts were not loaded.
             ValueError: If image-token shapes, positions, or output geometry do
                 not match checkpoint constraints.
         """
+        self._require_generation_expert()
         self._validate_image_size(height, width)
         start_of_image_token_id = int(start_of_image_token_id)
         end_of_image_token_id = int(end_of_image_token_id)
@@ -1314,9 +1470,11 @@ class BagelTransformer(BaseDiT):
             Flow prediction with the same rank and shape as ``hidden_states``.
 
         Raises:
+            RuntimeError: If generation-only experts were not loaded.
             ValueError: If batched/dynamic input or context geometry is invalid.
         """
         del encoder_hidden_states, guidance
+        self._require_generation_expert()
         had_batch_dimension = hidden_states.ndim == 3
         if had_batch_dimension:
             if hidden_states.shape[0] != 1:
@@ -1643,12 +1801,8 @@ class BagelTransformer(BaseDiT):
         required = set(params)
         loaded: set[str] = set()
         unexpected: list[str] = []
-        skipped_prefixes = ["connector.", "vit_model.", "vit_pos_embed."]
-        if self.lm_head is None:
-            skipped_prefixes.append("language_model.lm_head.")
-
         for source_name, tensor in weights:
-            if source_name.startswith(tuple(skipped_prefixes)):
+            if not self.accepts_checkpoint_weight(source_name):
                 continue
             target_name = self._map_checkpoint_name(source_name)
             parameter = params.get(target_name)
@@ -1667,6 +1821,41 @@ class BagelTransformer(BaseDiT):
                 details.append(f"unclassified checkpoint weights: {sorted(unexpected)}")
             raise ValueError("; ".join(details))
         return loaded
+
+    def accepts_checkpoint_weight(self, source_name: str) -> bool:
+        """Return whether this configured transformer owns a checkpoint tensor.
+
+        Args:
+            source_name: Tensor name from BAGEL's ``ema.safetensors``.
+
+        Returns:
+            ``True`` when the tensor must be streamed into this transformer.
+        """
+        if source_name.startswith(("connector.", "vit_model.", "vit_pos_embed.")):
+            return False
+        if self.lm_head is None and source_name.startswith("language_model.lm_head."):
+            return False
+        target_name = self._map_checkpoint_name(source_name)
+        if not self.generation_enabled and self._is_generation_target(target_name):
+            return False
+        return True
+
+    @staticmethod
+    def _is_generation_target(target_name: str) -> bool:
+        """Classify parameters used only by image generation."""
+        if target_name.startswith(
+            (
+                "gen_final_norm.",
+                "vae2llm.",
+                "llm2vae.",
+                "time_embedder.",
+                "latent_pos_embed.",
+            )
+        ):
+            return True
+        return bool(
+            re.match(r"^layers\.\d+\.(?:gen_|attn\.gen_|mlp\.gen_)", target_name)
+        )
 
     def _map_checkpoint_name(self, source_name: str) -> str:
         name = source_name

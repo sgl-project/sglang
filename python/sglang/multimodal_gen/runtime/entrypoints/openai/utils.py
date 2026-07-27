@@ -350,6 +350,7 @@ async def process_generation_batch(
             result.output is None
             and result.output_file_paths is None
             and result.raw_frame_batches is None
+            and result.text_outputs is None
         ):
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
@@ -381,9 +382,10 @@ async def process_generation_batch(
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:
+        completed_outputs = len(result.text_outputs or save_file_path_list)
         log_batch_completion(
             logger,
-            len(save_file_path_list),
+            completed_outputs,
             total_time,
         )
 

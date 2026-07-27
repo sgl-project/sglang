@@ -39,6 +39,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.b
     BagelEditInputValidationStage,
     BagelInputValidationStage,
     BagelThinkingBeforeDenoisingStage,
+    BagelUnderstandingInputValidationStage,
+    BagelUnderstandingStage,
     validate_bagel_special_tokens,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -48,22 +50,20 @@ from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
-_REQUIRED_CHECKPOINT_FILES = (
+_BASE_REQUIRED_CHECKPOINT_FILES = (
     "config.json",
     "llm_config.json",
     "ema.safetensors",
-    "ae.safetensors",
 )
-_DOWNLOAD_PATTERNS = [
-    *_REQUIRED_CHECKPOINT_FILES,
+_VAE_CHECKPOINT_FILE = "ae.safetensors"
+_TOKENIZER_ASSET_PATTERNS = (
     "tokenizer*",
     "vocab*",
     "merges.txt",
     "*.model",
     "special_tokens_map.json",
     "added_tokens.json",
-]
-_TOKENIZER_ASSET_PATTERNS = tuple(_DOWNLOAD_PATTERNS[len(_REQUIRED_CHECKPOINT_FILES) :])
+)
 _LEGACY_CONFIG_PATTERN = re.compile(
     r'\{\s*"name"\s*:\s*\[\s*"BAGEL-7B-MoT"\s*\]\s*,?\s*\}\s*'
 )
@@ -94,7 +94,7 @@ class BagelPipeline(ComposedPipelineBase):
     def validate_disagg_role(self, role: RoleType) -> None:
         """Reject disaggregated execution until BAGEL context transfer is defined."""
         if role != RoleType.MONOLITHIC:
-            raise ValueError("BAGEL T2I supports monolithic serving only")
+            raise ValueError("BAGEL pipelines support monolithic serving only")
 
     @staticmethod
     def _validate_runtime_capabilities(server_args: ServerArgs) -> None:
@@ -120,7 +120,9 @@ class BagelPipeline(ComposedPipelineBase):
             unsupported.append("layerwise offload")
         if getattr(server_args, "dit_cpu_offload", False):
             unsupported.append("DiT CPU offload")
-        if getattr(server_args, "vae_cpu_offload", False):
+        pipeline_config = server_args.pipeline_config
+        is_text_pipeline = pipeline_config.task_type.is_text_gen()
+        if getattr(server_args, "vae_cpu_offload", False) and not is_text_pipeline:
             unsupported.append("VAE CPU offload")
         if getattr(server_args, "cache_dit_config", None) is not None or bool(
             envs.SGLANG_CACHE_DIT_ENABLED
@@ -132,10 +134,12 @@ class BagelPipeline(ComposedPipelineBase):
             unsupported.append("LoRA")
         if getattr(server_args, "comfyui_mode", False):
             unsupported.append("ComfyUI mode")
-        pipeline_config = server_args.pipeline_config
         if getattr(pipeline_config, "dit_precision", None) != "bf16":
             unsupported.append("non-BF16 DiT precision")
-        if getattr(pipeline_config, "vae_precision", None) != "bf16":
+        if (
+            not is_text_pipeline
+            and getattr(pipeline_config, "vae_precision", None) != "bf16"
+        ):
             unsupported.append("non-BF16 VAE precision")
         if (
             getattr(
@@ -154,11 +158,14 @@ class BagelPipeline(ComposedPipelineBase):
             )
 
     @staticmethod
-    def _validate_checkpoint(path: str) -> dict[str, Any]:
+    def _validate_checkpoint(path: str, *, require_vae: bool = True) -> dict[str, Any]:
         """Validate the strict non-Diffusers checkpoint marker set and architecture."""
+        required_files = [*_BASE_REQUIRED_CHECKPOINT_FILES]
+        if require_vae:
+            required_files.append(_VAE_CHECKPOINT_FILE)
         missing = [
             name
-            for name in _REQUIRED_CHECKPOINT_FILES
+            for name in required_files
             if not os.path.isfile(os.path.join(path, name))
         ]
         if missing:
@@ -288,6 +295,7 @@ class BagelPipeline(ComposedPipelineBase):
         self, server_args: ServerArgs
     ) -> tuple[str, dict[str, Any]]:
         model_path = str(self.model_path)
+        require_vae = "vae" in self._required_config_modules
         if os.path.isdir(model_path):
             resolved = os.path.realpath(model_path)
         elif os.path.exists(model_path):
@@ -298,9 +306,13 @@ class BagelPipeline(ComposedPipelineBase):
             resolved = snapshot_download(
                 repo_id=model_path,
                 revision=server_args.revision,
-                allow_patterns=_DOWNLOAD_PATTERNS,
+                allow_patterns=[
+                    *_BASE_REQUIRED_CHECKPOINT_FILES,
+                    *([_VAE_CHECKPOINT_FILE] if require_vae else []),
+                    *_TOKENIZER_ASSET_PATTERNS,
+                ],
             )
-        return resolved, self._validate_checkpoint(resolved)
+        return resolved, self._validate_checkpoint(resolved, require_vae=require_vae)
 
     @staticmethod
     def _stream_weights(
@@ -357,12 +369,16 @@ class BagelPipeline(ComposedPipelineBase):
         self._validate_runtime_capabilities(server_args)
         modules: dict[str, Any] = dict(loaded_modules or {})
 
-        if "scheduler" not in modules:
+        required_modules = set(self._required_config_modules)
+        if "scheduler" in required_modules and "scheduler" not in modules:
             modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=1.0)
 
-        weight_backed_components = {"transformer", "vae", "tokenizer"}
-        if "image_encoder" in self._required_config_modules:
-            weight_backed_components.add("image_encoder")
+        weight_backed_components = required_modules & {
+            "transformer",
+            "vae",
+            "image_encoder",
+            "tokenizer",
+        }
         weight_backed_missing = weight_backed_components - modules.keys()
         checkpoint_path: str | None = None
         checkpoint_config: dict[str, Any] | None = None
@@ -373,7 +389,7 @@ class BagelPipeline(ComposedPipelineBase):
                 server_args.model_paths[component_name] = checkpoint_path
 
         device = get_local_torch_device()
-        if "transformer" not in modules:
+        if "transformer" in required_modules and "transformer" not in modules:
             assert checkpoint_path is not None and checkpoint_config is not None
             from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
                 BagelTransformer,
@@ -395,20 +411,11 @@ class BagelPipeline(ComposedPipelineBase):
                     hf_config=checkpoint_config,
                     attention_backend=attention_backend,
                 )
-            transformer_skip_prefixes = [
-                "connector.",
-                "vit_model.",
-                "vit_pos_embed.",
-            ]
-            if not server_args.pipeline_config.dit_config.load_lm_head:
-                transformer_skip_prefixes.append("language_model.lm_head.")
             self._stream_weights(
                 transformer,
                 os.path.join(checkpoint_path, "ema.safetensors"),
                 "transformer",
-                key_filter=lambda name: not name.startswith(
-                    tuple(transformer_skip_prefixes)
-                ),
+                key_filter=transformer.accepts_checkpoint_weight,
             )
             modules["transformer"] = transformer.to(device=device, dtype=dtype).eval()
 
@@ -442,7 +449,7 @@ class BagelPipeline(ComposedPipelineBase):
                 device=device, dtype=dtype
             ).eval()
 
-        if "vae" not in modules:
+        if "vae" in required_modules and "vae" not in modules:
             assert checkpoint_path is not None
             from sglang.multimodal_gen.runtime.models.vaes.bagel_vae import BagelVAE
 
@@ -467,7 +474,7 @@ class BagelPipeline(ComposedPipelineBase):
             )
             modules["vae"] = vae.to(device=device, dtype=dtype).eval()
 
-        if "tokenizer" not in modules:
+        if "tokenizer" in required_modules and "tokenizer" not in modules:
             assert checkpoint_path is not None and checkpoint_config is not None
             modules["tokenizer"] = self._load_tokenizer(
                 checkpoint_path, checkpoint_config
@@ -491,9 +498,10 @@ class BagelPipeline(ComposedPipelineBase):
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         """Validate runtime gates and initialize decoder-only VAE metadata."""
         self._validate_runtime_capabilities(server_args)
-        vae_config = server_args.pipeline_config.vae_config
-        if hasattr(vae_config, "post_init"):
-            vae_config.post_init()
+        if "vae" in self._required_config_modules:
+            vae_config = server_args.pipeline_config.vae_config
+            if hasattr(vae_config, "post_init"):
+                vae_config.post_init()
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         """Build validation -> prefill -> standard denoise -> standard decode."""
@@ -577,4 +585,40 @@ class BagelThinkingPipeline(BagelPipeline):
         self.add_standard_decoding_stage()
 
 
-EntryClass = [BagelPipeline, BagelEditPipeline, BagelThinkingPipeline]
+class BagelUnderstandingPipeline(BagelPipeline):
+    """Run BAGEL image Understanding as a terminal text pipeline."""
+
+    pipeline_name = "BagelUnderstandingPipeline"
+
+    from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
+        BagelUnderstandingPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.bagel import (
+        BagelUnderstandingSamplingParams,
+    )
+
+    pipeline_config_cls = BagelUnderstandingPipelineConfig
+    sampling_params_cls = BagelUnderstandingSamplingParams
+    _required_config_modules = ["transformer", "image_encoder", "tokenizer"]
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        """Build validation -> ViT/UND prefill -> autoregressive text output."""
+        self.add_stage(
+            BagelUnderstandingInputValidationStage(), "input_validation_stage"
+        )
+        self.add_stage(
+            BagelUnderstandingStage(
+                transformer=self.get_module("transformer"),
+                image_encoder=self.get_module("image_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+            ),
+            "bagel_understanding_stage",
+        )
+
+
+EntryClass = [
+    BagelPipeline,
+    BagelEditPipeline,
+    BagelThinkingPipeline,
+    BagelUnderstandingPipeline,
+]

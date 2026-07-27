@@ -200,6 +200,11 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
+    text_results = results if isinstance(results, list) else [results]
+    for result in text_results:
+        if result is not None and result.text is not None:
+            print(result.text)
+
     prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
 

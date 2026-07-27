@@ -1,11 +1,11 @@
 # Copyright 2025 ByteDance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for BAGEL image generation and optional text planning.
+"""Configuration for BAGEL generation and multimodal understanding.
 
 The architecture values follow the official BAGEL implementation and the
-``ByteDance-Seed/BAGEL-7B-MoT`` checkpoint. This integration intentionally
-exposes BAGEL's image-generation subset, with an optional language head for
-Thinking.
+``ByteDance-Seed/BAGEL-7B-MoT`` checkpoint. Image-producing pipelines load
+both mixture-of-transformer experts, while Understanding can omit the
+generation-only expert and latent projection modules.
 
 Source: https://github.com/ByteDance-Seed/Bagel/tree/a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f
 """
@@ -101,8 +101,11 @@ class BagelDiTConfig(DiTConfig):
 
     ``load_lm_head`` is opt-in so the baseline T2I and Editing pipelines do
     not keep the checkpoint's roughly 1 GiB language head resident.
+    ``load_generation_expert`` lets the text-only Understanding pipeline avoid
+    roughly 12 GiB of generation-expert weights that it never executes.
     """
 
     arch_config: BagelDiTArchConfig = field(default_factory=BagelDiTArchConfig)
     prefix: str = "bagel"
     load_lm_head: bool = False
+    load_generation_expert: bool = True

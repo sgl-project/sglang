@@ -18,7 +18,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+    TextGenerationOutput,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -32,6 +36,12 @@ GEN_THINK_SYSTEM_PROMPT = (
     "generate the image.\n"
     "The planning process is enclosed within <think> </think> tags, i.e. "
     "<think> planning process here </think> image here"
+)
+VLM_THINK_SYSTEM_PROMPT = (
+    "You should first think about the reasoning process in the mind and then "
+    "provide the user with the answer.\n"
+    "The reasoning process is enclosed within <think> </think> tags, i.e. "
+    "<think> reasoning process here </think> answer here"
 )
 _SPECIAL_TOKENS = (
     "<|im_start|>",
@@ -104,6 +114,49 @@ class BagelEditInputValidationStage(BagelInputValidationStage):
                     f"size {image.width}x{image.height}; got "
                     f"{batch.width}x{batch.height}"
                 )
+        return batch
+
+
+class BagelUnderstandingInputValidationStage(BagelInputValidationStage):
+    """Load exactly one image and apply BAGEL's outer VAE resize transform."""
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Normalize one Understanding image before its independent ViT resize.
+
+        Args:
+            batch: Request containing one image path and one text prompt.
+            server_args: Runtime configuration with BAGEL resize policy.
+
+        Returns:
+            Request containing one resized RGB PIL image.
+
+        Raises:
+            ValueError: If the request does not decode to exactly one PIL image.
+        """
+        batch = super().forward(batch, server_args)
+        images = (
+            batch.condition_image
+            if isinstance(batch.condition_image, list)
+            else [batch.condition_image]
+        )
+        if len(images) != 1 or not isinstance(images[0], Image.Image):
+            raise ValueError(
+                "BAGEL Understanding requires exactly one decoded PIL image"
+            )
+        image = images[0]
+        config = server_args.pipeline_config
+        target_width, target_height = config.calculate_condition_image_size(
+            image, image.width, image.height
+        )
+        image, _ = config.preprocess_condition_image(
+            image,
+            target_width,
+            target_height,
+            self.vae_image_processor,
+        )
+        batch.condition_image = [image]
+        batch.width = target_width
+        batch.height = target_height
         return batch
 
 
@@ -535,6 +588,200 @@ class BagelThinkingBeforeDenoisingStage(BagelBeforeDenoisingStage):
         )
         batch.extra[_REVISED_PROMPT_KEY] = f"{batch.prompt}\n{thought}"
         return context
+
+
+class BagelUnderstandingStage(PipelineStage):
+    """Encode image semantics and return BAGEL's autoregressive text answer."""
+
+    def __init__(self, transformer, image_encoder, tokenizer) -> None:
+        """Initialize immutable Understanding components.
+
+        Args:
+            transformer: Slim BAGEL UND transformer with ``lm_head``.
+            image_encoder: BAGEL ViT, connector, and position embeddings.
+            tokenizer: Official checkpoint tokenizer.
+        """
+        super().__init__()
+        self.transformer = transformer
+        self.image_encoder = image_encoder
+        self.tokenizer = tokenizer
+        self._special_token_ids: dict[str, int] | None = None
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        """Declare image encoding followed by transformer prefill/decode."""
+        del server_args
+        component_stage = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                component_stage,
+                "image_encoder",
+                phase="encode",
+                target_dtype=torch.bfloat16,
+                memory_intensive=True,
+            ),
+            ComponentUse(
+                component_stage,
+                "transformer",
+                phase="prefill_decode",
+                target_dtype=torch.bfloat16,
+                memory_intensive=True,
+            ),
+        ]
+
+    def _ensure_special_tokens(self) -> dict[str, int]:
+        if self._special_token_ids is None:
+            self._special_token_ids = validate_bagel_special_tokens(self.tokenizer)
+        return self._special_token_ids
+
+    def _tokenize_message(
+        self, text: str, special_token_ids: dict[str, int]
+    ) -> torch.Tensor:
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        return torch.tensor(
+            [
+                special_token_ids["<|im_start|>"],
+                *token_ids,
+                special_token_ids["<|im_end|>"],
+            ],
+            dtype=torch.long,
+        )
+
+    @staticmethod
+    def _decode_response(
+        tokenizer,
+        generated_ids: torch.Tensor,
+        special_token_ids: dict[str, int],
+    ) -> str:
+        """Decode official BOS-prefixed, EOS-excluded response tokens."""
+        return BagelThinkingBeforeDenoisingStage._decode_thought(
+            tokenizer, generated_ids, special_token_ids
+        )
+
+    @staticmethod
+    def _validate_request(batch: Req) -> Image.Image:
+        if not isinstance(batch.prompt, str) or not batch.prompt.strip():
+            raise ValueError(
+                "BAGEL Understanding requires exactly one non-empty string prompt"
+            )
+        if not isinstance(batch.seed, int) or isinstance(batch.seed, bool):
+            raise ValueError("BAGEL Understanding requires one scalar seed")
+        if batch.num_outputs_per_prompt != 1:
+            raise ValueError(
+                "BAGEL Understanding supports num_outputs_per_prompt=1 only"
+            )
+        if batch.num_frames != 1:
+            raise ValueError("BAGEL Understanding supports num_frames=1 only")
+        if batch.negative_prompt not in (None, ""):
+            raise ValueError("BAGEL Understanding does not support negative_prompt")
+        if batch.true_cfg_scale is not None:
+            raise ValueError("BAGEL Understanding does not support true_cfg_scale")
+        images = (
+            batch.condition_image
+            if isinstance(batch.condition_image, list)
+            else [batch.condition_image]
+        )
+        if batch.image_path is None or len(images) != 1:
+            raise ValueError("BAGEL Understanding requires exactly one input image")
+        image = images[0]
+        if not isinstance(image, Image.Image):
+            raise ValueError("BAGEL Understanding input must decode to a PIL image")
+        if batch.extra.get("dynamic_batch_seeds") is not None:
+            raise ValueError("BAGEL Understanding dynamic batching is not supported")
+        if batch.rollout:
+            raise ValueError("BAGEL Understanding rollout mode is not supported")
+        if batch.return_trajectory_latents or batch.return_trajectory_decoded:
+            raise ValueError("BAGEL Understanding trajectory output is not supported")
+        if (
+            batch.save_output
+            or batch.return_file_paths_only
+            or batch.return_frames
+            or batch.return_raw_frames
+        ):
+            raise ValueError(
+                "BAGEL Understanding returns text directly and does not support "
+                "media or file output controls"
+            )
+        return image
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        """Run official image-to-text Understanding without diffusion stages.
+
+        Args:
+            batch: Validated request with one resized PIL image.
+            server_args: Runtime configuration.
+
+        Returns:
+            Text-only output with usage and finish metadata.
+
+        Raises:
+            ValueError: If the request violates the one-image contract.
+            RuntimeError: If required model components are unavailable.
+        """
+        del server_args
+        image = self._validate_request(batch)
+        special_token_ids = self._ensure_special_tokens()
+
+        with self.use_declared_component(
+            component_name="image_encoder",
+            module=self.image_encoder,
+            phase="encode",
+        ) as image_encoder:
+            assert image_encoder is not None
+            self.image_encoder = image_encoder
+            vision_embeddings = image_encoder.encode_image(image)
+
+        with self.use_declared_component(
+            component_name="transformer",
+            module=self.transformer,
+            phase="prefill_decode",
+        ) as transformer:
+            assert transformer is not None
+            self.transformer = transformer
+            device = transformer.device
+            user_input_ids = self._tokenize_message(batch.prompt, special_token_ids).to(
+                device
+            )
+            system_input_ids = None
+            if batch.enable_thinking:
+                system_input_ids = self._tokenize_message(
+                    VLM_THINK_SYSTEM_PROMPT, special_token_ids
+                ).to(device)
+            prefix = transformer.build_understanding_prefix(
+                vision_embeddings,
+                user_input_ids,
+                system_input_ids=system_input_ids,
+                start_of_image_token_id=special_token_ids["<|vision_start|>"],
+                end_of_image_token_id=special_token_ids["<|vision_end|>"],
+            )
+            max_length = 2 if batch.is_warmup else int(batch.max_new_tokens)
+            generated_ids, finish_reason = transformer.generate_text(
+                prefix,
+                bos_token_id=special_token_ids["<|im_start|>"],
+                eos_token_id=special_token_ids["<|im_end|>"],
+                max_length=max_length,
+                do_sample=bool(batch.do_sample),
+                temperature=float(batch.temperature),
+                seed=int(batch.seed),
+                return_finish_reason=True,
+            )
+
+        response_text = self._decode_response(
+            self.tokenizer, generated_ids, special_token_ids
+        )
+        return OutputBatch(
+            text_outputs=[
+                TextGenerationOutput(
+                    text=response_text,
+                    prompt_tokens=prefix.kv_cache.sequence_length,
+                    completion_tokens=max(0, int(generated_ids.numel()) - 1),
+                    finish_reason=finish_reason,
+                )
+            ],
+            metrics=batch.metrics,
+        )
 
 
 class BagelEditBeforeDenoisingStage(BagelBeforeDenoisingStage):

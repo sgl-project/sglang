@@ -38,7 +38,7 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><div className="sgd-id-list"><code>Qwen/Qwen-Image</code><code>Qwen/Qwen-Image-2512</code><code>Qwen/Qwen-Image-Edit</code><code>Qwen/Qwen-Image-Edit-2509</code><code>Qwen/Qwen-Image-Edit-2511</code><code>Qwen/Qwen-Image-Layered</code></div></td>
           </tr>
           <tr>
-            <td>BAGEL (T2I + Thinking + single-image editing)</td>
+            <td>BAGEL (T2I + Thinking + single-image editing + Understanding)</td>
             <td><div className="sgd-id-list"><code>ByteDance-Seed/BAGEL-7B-MoT</code></div></td>
           </tr>
           <tr>
@@ -176,11 +176,13 @@ Rows are grouped when a family shares the same runtime path or optimization supp
 
 <Note>
 BAGEL currently uses its native, non-Diffusers checkpoint layout and supports
-single-output text-to-image generation, Thinking, and single-image editing on
-NVIDIA CUDA. Thinking runs as the explicit `BagelThinkingPipeline` and returns
-the generated plan through `revised_prompt`. Understanding, masks, multiple
-editing inputs, dynamic batching, distributed parallelism, Cache-DiT, and
-layer-wise offload are not supported.
+single-output text-to-image generation, Thinking, single-image editing, and
+single-image Understanding on NVIDIA CUDA. Thinking runs as the explicit
+`BagelThinkingPipeline` and returns the generated plan through `revised_prompt`.
+Understanding runs as `BagelUnderstandingPipeline` and returns text through the
+non-streaming Chat Completions API or offline `GenerationResult.text`. Masks,
+multiple image inputs, dynamic batching, distributed parallelism, Cache-DiT,
+and layer-wise offload are not supported.
 </Note>
 
 <Note>

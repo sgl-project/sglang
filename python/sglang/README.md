@@ -2,7 +2,7 @@
 
 - `eval`: The evaluation utilities.
 - `lang`: The frontend language.
-- `multimodal_gen`: Inference framework for accelerated image/video generation.
+- `multimodal_gen`: Inference framework for accelerated image/video generation and multimodal understanding.
 - `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: The test utilities.
 - `api.py`: The public APIs.

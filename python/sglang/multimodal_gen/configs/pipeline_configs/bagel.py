@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for BAGEL generation, planning, and image editing."""
+"""Pipeline configuration for BAGEL generation, editing, and understanding."""
 
 import math
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 from PIL import Image
@@ -223,6 +224,11 @@ def _thinking_dit_config() -> BagelDiTConfig:
     return BagelDiTConfig(load_lm_head=True)
 
 
+def _understanding_dit_config() -> BagelDiTConfig:
+    """Load the UND expert and language head without generation-only weights."""
+    return BagelDiTConfig(load_lm_head=True, load_generation_expert=False)
+
+
 @dataclass
 class BagelThinkingPipelineConfig(BagelPipelineConfig):
     """Configure text planning followed by official three-way T2I CFG."""
@@ -238,6 +244,64 @@ class BagelThinkingPipelineConfig(BagelPipelineConfig):
             raise RuntimeError("BAGEL Thinking requires a three-way request context")
         kwargs["image_guidance_scale"] = self.thinking_image_guidance_scale
         return kwargs
+
+
+@dataclass
+class BagelUnderstandingPipelineConfig(BagelPipelineConfig):
+    """Configure one-image BAGEL Understanding with autoregressive text output."""
+
+    allow_explicit_native_checkpoint_directory: ClassVar[bool] = True
+
+    task_type: ModelTaskType = ModelTaskType.I2T
+    dit_config: DiTConfig = field(default_factory=_understanding_dit_config)
+    image_encoder_config: BagelImageEncoderConfig = field(
+        default_factory=BagelImageEncoderConfig
+    )
+    image_encoder_precision: str = "bf16"
+
+    @staticmethod
+    def condition_image_convert_method(image: Image.Image) -> Image.Image:
+        """Composite transparent inputs over white, matching official BAGEL."""
+        has_transparency = image.info.get("transparency") is not None
+        if image.mode == "RGBA" or has_transparency:
+            rgba = image.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            return Image.alpha_composite(background, rgba).convert("RGB")
+        return image.convert("RGB")
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        """Keep the UND transformer and image encoder resident when possible."""
+        return ModelDeploymentConfig(
+            auto_enable_cfg_parallel=False,
+            keep_resident_components=("dit", "image_encoder"),
+            implicit_auxiliary_layerwise_offload_components=(),
+        )
+
+    def calculate_condition_image_size(
+        self, image: Image.Image, width: int, height: int
+    ) -> tuple[int, int]:
+        """Apply the official outer VAE resize before ViT preprocessing."""
+        del image
+        return calculate_bagel_resize_dimensions(
+            width,
+            height,
+            max_size=1024,
+            min_size=512,
+            stride=16,
+        )
+
+    def preprocess_condition_image(
+        self,
+        image: Image.Image,
+        target_width: int,
+        target_height: int,
+        _vae_image_processor,
+    ) -> tuple[Image.Image, tuple[int, int]]:
+        """Resize once before the image encoder applies its ViT transform."""
+        image = image.convert("RGB").resize(
+            (target_width, target_height), Image.Resampling.BICUBIC
+        )
+        return image, (target_width, target_height)
 
 
 @dataclass

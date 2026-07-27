@@ -1,6 +1,6 @@
 ---
 title: "BAGEL"
-description: "Serve BAGEL-7B-MoT for text-to-image generation, Thinking, and single-image editing."
+description: "Serve BAGEL-7B-MoT for generation, editing, Thinking, and image Understanding."
 ---
 
 ## Overview
@@ -8,15 +8,16 @@ description: "Serve BAGEL-7B-MoT for text-to-image generation, Thinking, and sin
 [BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a
 multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
 native integration supports text-to-image generation, model-generated planning
-before image generation (Thinking), and single-image editing on NVIDIA CUDA.
+before image generation (Thinking), single-image editing, and single-image
+Understanding on NVIDIA CUDA.
 
 <Warning>
-Run text-to-image generation, Thinking, and editing as separate pipeline
-processes. Thinking is selected when the process starts; it is not a
-per-request toggle. The current integration does not support image
-understanding, editing masks, multiple input images, multi-output requests,
-dynamic batching, tensor or sequence parallelism, Cache-DiT, or layer-wise
-offload.
+Run text-to-image generation, Thinking, editing, and Understanding as separate
+pipeline processes. Thinking T2I is selected when the process starts;
+Understanding reasoning is a per-request option on the dedicated Understanding
+process. The current integration does not support editing masks, multiple input
+images, multi-output requests, dynamic batching, tensor or sequence parallelism,
+Cache-DiT, or layer-wise offload.
 </Warning>
 
 ## Prerequisites
@@ -42,6 +43,9 @@ sglang serve \
 You can also pass a local checkpoint directory. SGLang identifies an arbitrary
 local directory as BAGEL only when it contains all four root-level files:
 `config.json`, `llm_config.json`, `ema.safetensors`, and `ae.safetensors`.
+When `BagelUnderstandingPipeline` is selected explicitly, its slim loader only
+requires the first three files plus tokenizer assets and does not open
+`ae.safetensors`.
 
 ## Start an editing server
 
@@ -76,6 +80,25 @@ sglang serve \
 The baseline T2I and Editing processes do not load the language head. Keeping
 Thinking as a separate process therefore avoids adding its roughly 1 GiB BF16
 weight to those pipelines.
+
+## Start an Understanding server
+
+Select `BagelUnderstandingPipeline` explicitly. This process loads only the UND
+transformer expert, language head, image encoder, and tokenizer. It does not load
+the generation expert, VAE, scheduler, or `ae.safetensors`:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelUnderstandingPipeline \
+  --port 30030
+```
+
+The slim Understanding weight set is approximately 15 GiB in BF16 before KV
+cache and runtime workspaces. The pipeline applies BAGEL's official outer image
+resize before the independent ViT resize, but never runs VAE encode/decode or a
+denoising loop.
 
 ## Generate an image
 
@@ -233,6 +256,63 @@ sglang generate \
 and defaults to `2.0` when omitted. Transparent inputs are composited on a
 white background before encoding, matching the official application path.
 
+## Understand an image
+
+Send one image and one prompt through the non-streaming OpenAI-compatible Chat
+Completions API:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30030/v1")
+
+with open("input.png", "rb") as input_file:
+    image_data = base64.b64encode(input_file.read()).decode("utf-8")
+
+response = client.chat.completions.create(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ],
+    max_completion_tokens=511,
+    temperature=0,
+)
+
+print(response.choices[0].message.content)
+```
+
+The public default is greedy with a BAGEL `max_new_tokens` value of `512`.
+BAGEL counts the initial `<|im_start|>` decode iteration, so the default permits
+at most 511 content tokens. Set `reasoning_effort="high"` or pass
+`extra_body={"chat_template_kwargs": {"enable_thinking": True}}` through the
+OpenAI Python SDK to prepend the official VLM reasoning system prompt. The
+returned assistant message remains one string that contains both
+`<think>...</think>` and the answer.
+
+For offline Understanding, the CLI prints the response to stdout:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --pipeline-class-name BagelUnderstandingPipeline \
+  --image-path input.png \
+  --prompt "Describe this image." \
+  --max-new-tokens 512 \
+  --seed 42
+```
+
 ## Current request contract
 
 - Send one prompt and request one output (`n=1`).
@@ -247,6 +327,11 @@ white background before encoding, matching the official application path.
 - Editing accepts exactly one source image and no mask. Omit `size` for
   automatic official resizing; if supplied, it must equal the calculated
   preprocessed size.
+- Understanding accepts exactly one image and one non-empty prompt. It returns
+  text directly and does not execute image denoising or decoding stages.
+- Understanding defaults to greedy decode. Positive Chat Completions
+  `temperature` enables request-local seeded sampling; offline callers can use
+  `--do-sample --temperature VALUE`.
 
 See the [BAGEL repository](https://github.com/ByteDance-Seed/Bagel) for the
 upstream model implementation and the
