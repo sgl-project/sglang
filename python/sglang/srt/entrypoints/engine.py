@@ -1136,6 +1136,9 @@ class Engine(EngineScoreMixin, EngineBase):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
+        if isinstance(self.tokenizer_manager, MultiTokenizerRouter):
+            self.tokenizer_manager.close()
+
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
