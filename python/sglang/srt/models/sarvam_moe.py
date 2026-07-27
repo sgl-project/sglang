@@ -62,6 +62,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 )
 from sglang.srt.runtime_context import (
     get_forward,
+    get_model,
     get_parallel,
     get_server_args,
     get_stream,
@@ -83,7 +84,7 @@ if _is_cuda:
     try:
         from sgl_kernel import merge_state_v2
 
-        from sglang.jit_kernel.concat_mla import concat_mla_k
+        from sglang.kernels.ops.attention.concat_mla import concat_mla_k
         from sglang.kernels.ops.gemm import bmm_fp8
         from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 
@@ -450,7 +451,7 @@ class SarvamMoEMLAAttention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_server_args().kv_cache_dtype
+        self.kv_cache_dtype = get_model().kv_cache_dtype
 
         self._server_args = None
         self.current_attention_backend = None
