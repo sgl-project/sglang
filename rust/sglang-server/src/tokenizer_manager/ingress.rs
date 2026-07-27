@@ -622,6 +622,69 @@ mod tests {
         (ingress, detok_rx, consumer, tm_tx)
     }
 
+    /// `on_abort` must release the rid only AFTER the deregister has actually been
+    /// delivered — ordering the EFFECT, not the send.
+    ///
+    /// Regression for the disconnect/retry race: `AbortGuard::drop` used to release
+    /// the rid right after enqueuing the abort on the lane. This handler runs later
+    /// and can stall on either bounded send below, so a retry could pass the
+    /// duplicate check and `Register` ahead of the stale abort; the shard then saw
+    /// `[Register, Deregister]`, the retry's sink was torn down (500 "response
+    /// truncated") and a real `AbortReq` naming it went to the scheduler.
+    ///
+    /// Deterministic by construction: the detok channel is a rendezvous
+    /// (`bounded(0)`), so `on_abort` provably cannot progress past the deregister
+    /// until this thread receives it. Correct code therefore CANNOT release the rid
+    /// during the wait below; a release-first regression does so immediately.
+    #[test]
+    fn on_abort_releases_the_rid_only_after_the_deregister_lands() {
+        let live: LiveRids = Default::default();
+        live.lock().unwrap().insert("x".to_string());
+
+        // Rendezvous shard channel: the send blocks until we receive.
+        let (detok_tx, detok_rx) = flume::bounded::<DetokMsg>(0);
+        let (ingress_producer, _consumer) = ingress_ring(16);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            live.clone(),
+            Senders {
+                tm: flume::unbounded().0,
+                abort: flume::unbounded().0,
+                tok: flume::unbounded().0,
+                detok: vec![detok_tx],
+            },
+            ingress_producer,
+            test_limits(),
+            sd_rx,
+        );
+
+        let handle = std::thread::spawn(move || ingress.on_abort("x".to_string()));
+
+        // The abort handler is parked on the rendezvous send. The rid MUST still be
+        // held: releasing it here is what let a retry register ahead of the abort.
+        for _ in 0..50 {
+            assert!(
+                live.lock().unwrap().contains("x"),
+                "rid released before the deregister was delivered — a retry could \
+                 now register ahead of this abort and be torn down by it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(matches!(
+            detok_rx.recv().unwrap(),
+            DetokMsg::Deregister { .. }
+        ));
+        handle.join().unwrap();
+        assert!(
+            !live.lock().unwrap().contains("x"),
+            "the rid must be released once the abort has taken effect"
+        );
+    }
+
     /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
     fn test_limits() -> Limits {
         Limits {
