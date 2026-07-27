@@ -737,7 +737,6 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
 
         def gate(
             *,
-            cuda=True,
             sm100=True,
             xpu=False,
             fp4=False,
@@ -752,7 +751,6 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             backend.enable_deepseek_v4_fp4_indexer = fp4
             backend.hisparse_coordinator = object() if hisparse else None
             with (
-                mock.patch.object(deepseek_v4_backend, "_is_cuda", cuda),
                 mock.patch.object(deepseek_v4_backend, "_is_sm100", sm100),
                 mock.patch.object(deepseek_v4_backend, "_is_xpu", xpu),
                 mock.patch.object(
@@ -791,11 +789,14 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
                 )
 
         self.assertTrue(gate())
+        # Regression guard, not a mirror: top-k v2 is the default page-table
+        # consumer and bounds its reads by the live C4 length, so it must NOT
+        # gate the optimization off. The gate deliberately does not read
+        # SGLANG_OPT_USE_TOPK_V2; adding it to the conjunction turns this red.
         self.assertTrue(gate(topk_v2=True))
 
         for override in (
             {"cuda_graph": False},
-            {"cuda": False},
             {"sm100": False},
             {"xpu": True},
             {"fp4": True},

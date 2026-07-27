@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import argparse
 import statistics
-from dataclasses import dataclass
 from typing import Callable
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -39,16 +39,14 @@ DEFAULT_MAX_SEQ_LENS = (1 << 10, 1 << 12, 1 << 15, MAX_CONTEXT_LEN)
 DEFAULT_BATCH_SIZES = (1, 4, 8, 16, 32)
 
 
-@dataclass
-class Inputs:
+class Inputs(msgspec.Struct):
     req_to_token: torch.Tensor
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     raw_out_loc: torch.Tensor
 
 
-@dataclass
-class Captured:
+class Captured(msgspec.Struct):
     graph: torch.cuda.CUDAGraph
     output: object
 

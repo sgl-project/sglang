@@ -592,8 +592,11 @@ class DeepseekV4AttnBackend(
         once in ``__init__`` rather than re-reading four env vars per forward.
         """
         return (
-            _is_cuda
-            and _is_sm100
+            # No _is_cuda term: is_sm100_supported() short-circuits to False
+            # when is_cuda() is False, so _is_sm100 already implies it. _is_xpu
+            # is not implied -- it reports process capability, not the selected
+            # device, so a dual-stack host can satisfy both.
+            _is_sm100
             and not _is_xpu
             and self.hisparse_coordinator is None
             and not self.enable_deepseek_v4_fp4_indexer
