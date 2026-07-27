@@ -240,7 +240,7 @@ class StreamingSession(BasePrefixCache):
 
         req = params.req
 
-        # [NPU] When aligned context < page_size, release the slot's KV and 
+        # [NPU] When aligned context < page_size, release the slot's KV and
         # fall back to radix cache (full prefill). Once context >= page_size,
         # streaming session kicks in with page-aligned KV reuse.
         if self.page_size > 1:
