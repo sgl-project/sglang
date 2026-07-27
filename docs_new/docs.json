@@ -757,6 +757,7 @@
               "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",
+              "docs/advanced_features/clusterdos",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
               "docs/advanced_features/model_loading",
