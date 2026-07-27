@@ -398,6 +398,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_backend=server_args.tokenizer_backend,
                 )
 
+                # The OpenAI embeddings API in vLLM tokenizes encoder models
+                # with special tokens. EmbeddingGemma's tokenizer enables BOS
+                # by default but leaves EOS disabled, so opt into EOS here to
+                # preserve the model's intended [BOS] text [EOS] input form.
+                if self.model_config.is_embedding_gemma and hasattr(
+                    self.tokenizer, "add_eos_token"
+                ):
+                    self.tokenizer.add_eos_token = True
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
