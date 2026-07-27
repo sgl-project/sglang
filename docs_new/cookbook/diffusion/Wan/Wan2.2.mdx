@@ -304,14 +304,12 @@ Test Environment:
       --tp-size 2 \
       --sp-degree 4 \
       --num-gpus 8 \
-      --port 30000 \
       --attention-backend laser_attn
     ```
 
     **Benchmark Command**:
     ```shell Command
     python -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 1 \
@@ -417,7 +415,6 @@ Test Environment:
       --tp-size 2 \
       --sp-degree 4 \
       --num-gpus 8 \
-      --port 30000 \
       --attention-backend laser_attn
     ```
 
@@ -425,7 +422,6 @@ Test Environment:
 
     ```shell Command
     python -m sglang.multimodal_gen.benchmarks.bench_serving \
-      --port 30000 \
       --dataset vbench \
       --task text-to-video \
       --num-prompts 20 \
