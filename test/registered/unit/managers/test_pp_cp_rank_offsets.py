@@ -8,6 +8,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
+from sglang.srt.managers.io_struct import P2PKVTransferReqInput  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
@@ -64,6 +65,43 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_pp_mixin_defers_p2p_control_until_next_pp_iteration(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+        p2p_req = P2PKVTransferReqInput(
+            source_url="http://source:30000",
+            target_url="http://target:30001",
+            token_ids=[1, 2],
+            matched_tokens=2,
+        )
+        normal_req = object()
+        next_req = object()
+
+        process_now, forward_now = scheduler._pp_stage_p2p_control_reqs(
+            [normal_req, p2p_req]
+        )
+        process_next, forward_next = scheduler._pp_stage_p2p_control_reqs([next_req])
+
+        self.assertEqual(process_now, [])
+        self.assertEqual(forward_now, [normal_req, p2p_req])
+        self.assertEqual(process_next, [normal_req, p2p_req, next_req])
+        self.assertEqual(forward_next, [next_req])
+
+    def test_pp_mixin_last_stage_processes_p2p_without_deferral(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        p2p_req = P2PKVTransferReqInput(
+            source_url="http://source:30000",
+            target_url="http://target:30001",
+            token_ids=[1, 2],
+            matched_tokens=2,
+        )
+
+        process_now, forward_now = scheduler._pp_stage_p2p_control_reqs([p2p_req])
+
+        self.assertEqual(process_now, [p2p_req])
+        self.assertEqual(forward_now, [p2p_req])
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []

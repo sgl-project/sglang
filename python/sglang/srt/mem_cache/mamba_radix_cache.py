@@ -536,7 +536,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
-        return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
+        return InsertResult(
+            prefix_len=prefix_len,
+            mamba_exist=mamba_exist,
+            duplicate_kv_handled_by_cache=True,
+        )
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int

@@ -407,6 +407,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    step.result.duplicate_kv_handled_by_cache = True
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:

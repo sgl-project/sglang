@@ -119,6 +119,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    P2PKVTransferReqInput,
+    P2PKVTransferReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -576,6 +578,8 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.init_p2p_allocator_observer()
 
         self.init_kv_events_publisher()
 
@@ -1260,6 +1264,15 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            if (
+                self.transfer_backend == TransferBackend.MOONCAKE
+                and self.server_args.enable_prefill_p2p_kv_transfer
+            ):
+                from sglang.srt.disaggregation.p2p_kv_transfer import (
+                    PrefillP2PMooncakeTransferEngine,
+                )
+
+                self.p2p_kv_transfer_engine = PrefillP2PMooncakeTransferEngine(self)
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -1435,6 +1448,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (P2PKVTransferReqInput, self.handle_p2p_kv_transfer),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1558,6 +1572,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.progress_p2p_kv_transfers()
             if self._engine_paused:
                 continue
 
@@ -1601,6 +1616,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.progress_p2p_kv_transfers()
             if self._engine_paused:
                 continue
 
@@ -1851,6 +1867,22 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+        )
+
+    def init_p2p_allocator_observer(self) -> None:
+        self.p2p_allocator_observer = None
+        if not self.server_args.enable_prefill_p2p_kv_transfer:
+            return
+
+        from sglang.srt.disaggregation.p2p_allocator_observer import (
+            P2PAllocatorObserver,
+        )
+
+        self.p2p_allocator_observer = P2PAllocatorObserver(
+            pool_stats_observer=self.pool_stats_observer,
+            invariant_checker=self.invariant_checker,
+            req_to_token_pool=self.req_to_token_pool,
+            ps=self.ps,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -3654,6 +3686,8 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        if self.p2p_allocator_observer is not None:
+            self.p2p_allocator_observer.maybe_log()
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -3760,6 +3794,10 @@ class Scheduler(
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
 
+        # Allocator accounting is rate-limited internally and also runs when active.
+        if self.p2p_allocator_observer is not None:
+            self.p2p_allocator_observer.maybe_log()
+
         # kv event publishing
         self.kv_events_publisher.publish_kv_events()
 
@@ -3795,6 +3833,10 @@ class Scheduler(
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
+            p2p_engine = getattr(self, "p2p_kv_transfer_engine", None)
+            if p2p_engine is not None:
+                idle &= not p2p_engine.has_pending_transfers()
+
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
@@ -4098,6 +4140,164 @@ class Scheduler(
 
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
+
+    def handle_p2p_kv_transfer(self, recv_req: P2PKVTransferReqInput):
+        logger.info(
+            "handle_p2p_kv_transfer: source=%s target=%s matched_tokens=%s dry_run=%s request_id=%s reason=%s",
+            recv_req.source_url,
+            recv_req.target_url,
+            recv_req.matched_tokens,
+            recv_req.dry_run,
+            recv_req.request_id,
+            recv_req.reason,
+        )
+        limitations = [
+            "experimental_prefill_to_prefill_mooncake",
+            "identical_tp_pp_layout_supported",
+            "identical_distributed_layout_supported",
+            "tp_pp_mismatch_falls_back_to_recompute",
+            "same_model_same_page_size_required",
+            "failure_falls_back_to_recompute",
+        ]
+        server_args = getattr(self, "server_args", None)
+        if server_args is not None and not getattr(
+            server_args, "enable_prefill_p2p_kv_transfer", False
+        ):
+            return P2PKVTransferReqOutput(
+                success=False,
+                message=(
+                    "Prefill-to-Prefill KV transfer is disabled. Start the "
+                    "prefill server with --enable-prefill-p2p-kv-transfer."
+                ),
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=True,
+                experimental_limitations=limitations,
+            )
+        if recv_req.matched_tokens <= 0:
+            return P2PKVTransferReqOutput(
+                success=False,
+                message="remote KV transfer skipped: matched_tokens must be positive.",
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=True,
+                experimental_limitations=limitations,
+            )
+        if not recv_req.token_ids:
+            return P2PKVTransferReqOutput(
+                success=False,
+                message="remote KV transfer skipped: token_ids are required.",
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=True,
+                experimental_limitations=limitations,
+            )
+        if recv_req.matched_tokens > len(recv_req.token_ids):
+            return P2PKVTransferReqOutput(
+                success=False,
+                message=(
+                    "remote KV transfer skipped: matched_tokens exceeds token_ids length."
+                ),
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=True,
+                experimental_limitations=limitations,
+            )
+        if recv_req.source_url == recv_req.target_url:
+            return P2PKVTransferReqOutput(
+                success=True,
+                message="remote KV transfer skipped: source equals target.",
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=False,
+                experimental_limitations=limitations,
+            )
+        if recv_req.dry_run:
+            return P2PKVTransferReqOutput(
+                success=True,
+                message="remote KV transfer dry-run accepted for experimental P2P Mooncake path.",
+                source_url=recv_req.source_url,
+                target_url=recv_req.target_url,
+                matched_tokens=recv_req.matched_tokens,
+                transferred_tokens=0,
+                fallback_recompute=False,
+                experimental_limitations=limitations,
+            )
+        transfer_engine = getattr(self, "p2p_kv_transfer_engine", None)
+        if transfer_engine is not None:
+            try:
+                ret = transfer_engine.start_transfer(recv_req)
+            except Exception as e:
+                logger.warning(
+                    "remote KV transfer engine failed; falling back to local recompute: %s",
+                    e,
+                )
+                return P2PKVTransferReqOutput(
+                    success=False,
+                    message=f"remote KV transfer engine failed: {e}",
+                    source_url=recv_req.source_url,
+                    target_url=recv_req.target_url,
+                    matched_tokens=recv_req.matched_tokens,
+                    transferred_tokens=0,
+                    fallback_recompute=True,
+                    experimental_limitations=limitations,
+                )
+            if isinstance(ret, P2PKVTransferReqOutput):
+                return ret
+            if ret is None:
+                return None
+            return P2PKVTransferReqOutput(
+                success=bool(getattr(ret, "success", False)),
+                message=str(getattr(ret, "message", "")),
+                source_url=str(getattr(ret, "source_url", recv_req.source_url)),
+                target_url=str(getattr(ret, "target_url", recv_req.target_url)),
+                matched_tokens=int(
+                    getattr(ret, "matched_tokens", recv_req.matched_tokens)
+                ),
+                transferred_tokens=int(getattr(ret, "transferred_tokens", 0)),
+                fallback_recompute=bool(getattr(ret, "fallback_recompute", True)),
+                experimental_limitations=list(
+                    getattr(ret, "experimental_limitations", limitations)
+                ),
+            )
+        return P2PKVTransferReqOutput(
+            success=False,
+            message=(
+                "Prefill-to-Prefill KV transfer is unavailable on this worker; "
+                "falling back to local recompute."
+            ),
+            source_url=recv_req.source_url,
+            target_url=recv_req.target_url,
+            matched_tokens=recv_req.matched_tokens,
+            transferred_tokens=0,
+            fallback_recompute=True,
+            experimental_limitations=limitations,
+        )
+
+    def progress_p2p_kv_transfers(self) -> None:
+        """Advance pending P2P transfers without blocking the scheduler loop."""
+        transfer_engine = getattr(self, "p2p_kv_transfer_engine", None)
+        if transfer_engine is None:
+            return
+
+        try:
+            completions = transfer_engine.progress_transfers()
+        except Exception:
+            logger.exception("Failed to progress pending Prefill P2P KV transfers")
+            return
+
+        for recv_req, output in completions:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests

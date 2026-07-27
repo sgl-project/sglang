@@ -46,6 +46,24 @@ class TestMamba(unittest.TestCase):
     def tearDownClass(cls):
         pass
 
+    def test_insert_reports_cache_owned_duplicate_kv(self):
+        tree = object.__new__(MambaRadixCache)
+        tree.disable = False
+        tree.root_node = object()
+        tree._insert_helper = lambda *args, **kwargs: (2, True)
+
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+                mamba_value=torch.tensor([7], dtype=torch.int64),
+            )
+        )
+
+        self.assertEqual(result.prefix_len, 2)
+        self.assertTrue(result.mamba_exist)
+        self.assertTrue(result.duplicate_kv_handled_by_cache)
+
     def test_hybrid_linear_kv_pool(self):
         size = 16
         head_num = 2

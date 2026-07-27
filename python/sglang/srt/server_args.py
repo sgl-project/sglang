@@ -2965,6 +2965,16 @@ class ServerArgs:
         "Bootstrap server port on the prefill server. Default is 8998.",
         NS("disagg"),
     ] = 8998
+    enable_prefill_p2p_kv_transfer: A[
+        bool,
+        (
+            "Enable the experimental Mooncake Prefill-to-Prefill KV transfer "
+            "endpoint and remote-KV request metadata. This requires "
+            "--disaggregation-mode=prefill and "
+            "--disaggregation-transfer-backend=mooncake."
+        ),
+        NS("disagg"),
+    ] = False
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
@@ -3758,6 +3768,15 @@ class ServerArgs:
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
             raise ValueError(
                 f"Invalid disaggregation_mode={self.disaggregation_mode!r}"
+            )
+        if self.enable_prefill_p2p_kv_transfer and (
+            self.disaggregation_mode != "prefill"
+            or self.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError(
+                "--enable-prefill-p2p-kv-transfer requires "
+                "--disaggregation-mode=prefill and "
+                "--disaggregation-transfer-backend=mooncake."
             )
 
         if self.load_balance_method == "auto":

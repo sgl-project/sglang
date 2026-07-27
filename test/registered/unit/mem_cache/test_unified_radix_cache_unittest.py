@@ -753,6 +753,7 @@ class UnifiedRadixCacheSuite:
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         result = self._insert(cache, allocator, req_to_token_pool, seq_b)
         self.assertEqual(result.prefix_len, len(seq_a))
+        self.assertTrue(result.duplicate_kv_handled_by_cache)
 
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_b))))
         self.assertEqual(len(m.device_indices), len(seq_b))

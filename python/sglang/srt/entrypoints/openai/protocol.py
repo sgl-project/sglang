@@ -834,6 +834,16 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # Experimental Prefill->Prefill remote KV transfer hint. The router sends
+    # these in the forwarded body as a fallback for deployments where custom
+    # headers are unavailable to the OpenAI adapter.
+    remote_kv_source_url: Optional[str] = None
+    remote_kv_source_bootstrap_addr: Optional[str] = None
+    remote_kv_target_url: Optional[str] = None
+    remote_kv_matched_tokens: Optional[int] = None
+    remote_kv_reason: Optional[str] = None
+    remote_kv_token_ids: Optional[List[int]] = None
+
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache

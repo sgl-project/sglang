@@ -127,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
+    P2PKVTransferReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReq,
@@ -916,6 +917,19 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
         content = ret.message or "Flush cache failed.\n"
     return Response(
         content=content,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/experimental/p2p_kv_transfer")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def experimental_p2p_kv_transfer(
+    obj: Annotated[P2PKVTransferReqInput, Body()]
+):
+    """Experimental Prefill->Prefill prefix KV transfer control endpoint."""
+    ret = await _global_state.tokenizer_manager.p2p_kv_transfer(obj)
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
