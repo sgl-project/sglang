@@ -343,7 +343,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
     else:
-        from sglang.kernels.ops.attention.hadamard import hadamard_transform
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
