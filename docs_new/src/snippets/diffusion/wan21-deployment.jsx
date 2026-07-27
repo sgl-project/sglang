@@ -193,7 +193,7 @@ export const Wan21Deployment = () => {
   --num-gpus 1`;
       } else {
         const tpSize = modelsize === '1_3b' ? (isBestPractice ? 4 : 1) : 2;
-        const spDegree = modelsize === '14b' && isBestPractice ? 4 : 2;
+        const spDegree = modelsize === '14b' && isBestPractice ? 4 : 1;
         const numGpus = isBestPractice ? 8 : (hardware === 'a3' ? 2 : 4);
 
         command = `${comment}sglang serve \\

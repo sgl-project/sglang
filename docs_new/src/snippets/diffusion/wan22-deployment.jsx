@@ -161,7 +161,7 @@
   --num-gpus 2`;
             }
           } else {
-            const spDegree = isBestPractice ? 4 : 2;
+            const spDegree = isBestPractice ? 4 : 1;
             const numGpus = isBestPractice ? 8 : (hardware === 'a3' ? 2 : 4);
 
             command = `${comment}sglang serve \\
