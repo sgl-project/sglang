@@ -53,6 +53,9 @@ def load_cases(path: str | Path) -> dict:
         contract["chunks"] * contract["latent_frames_per_chunk"]
     ):
         raise ValueError("latent frame/chunk contract is inconsistent")
+    case_ids = {case["id"] for case in cases}
+    if len(case_ids) != len(cases):
+        raise ValueError("parity manifest case ids must be unique")
     for case in cases:
         bits = action_bits(case["keys"])
         label = (
@@ -71,7 +74,98 @@ def load_cases(path: str | Path) -> dict:
                     f"{case['id']}: positive action_weights map to {active_keys}, "
                     f"not keys={case['keys']}"
                 )
+        switch = case.get("prompt_switch")
+        if switch is not None:
+            _validate_prompt_switch(case, contract, switch)
+            control_case_id = switch.get("control_case_id")
+            if control_case_id is not None and control_case_id not in case_ids:
+                raise ValueError(
+                    f"{case['id']}: unknown prompt-switch control case "
+                    f"{control_case_id!r}"
+                )
+    cases_by_id = {case["id"]: case for case in cases}
+    for case in cases:
+        switch = case.get("prompt_switch")
+        control_case_id = switch.get("control_case_id") if switch else None
+        if control_case_id is None:
+            continue
+        control = cases_by_id[control_case_id]
+        if control.get("prompt_switch") is not None:
+            raise ValueError(
+                f"{case['id']}: prompt-switch control case must not switch prompt"
+            )
+        comparable_keys = ("prompt", "first_frame", "action_label", "keys")
+        mismatches = [
+            key for key in comparable_keys if case.get(key) != control.get(key)
+        ]
+        if mismatches:
+            raise ValueError(
+                f"{case['id']}: control case {control_case_id!r} differs in "
+                f"{mismatches}"
+            )
     return manifest
+
+
+def _validate_prompt_switch(case: dict, contract: dict, switch: dict) -> None:
+    if not isinstance(switch, dict):
+        raise ValueError(f"{case['id']}: prompt_switch must be an object")
+    prompt = switch.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"{case['id']}: prompt_switch.prompt must be non-empty")
+    if prompt == case["prompt"]:
+        raise ValueError(
+            f"{case['id']}: prompt_switch.prompt must differ from initial prompt"
+        )
+    target_chunk = switch.get("target_chunk")
+    if isinstance(target_chunk, bool) or not isinstance(target_chunk, int):
+        raise ValueError(f"{case['id']}: prompt_switch.target_chunk must be an integer")
+    # The parity client queues the event immediately after init. MinWM's
+    # adapter intentionally refuses to sample prompt events for chunk 0, so the
+    # first deterministic cutover is chunk 1. Later wall-clock scheduling would
+    # make the test depend on GPU/network timing instead of model semantics.
+    if target_chunk != 1:
+        raise ValueError(
+            f"{case['id']}: deterministic prompt-switch parity currently "
+            "requires target_chunk=1"
+        )
+    if target_chunk >= int(contract["chunks"]):
+        raise ValueError(f"{case['id']}: prompt switch is outside the video")
+    event_id = switch.get("event_id")
+    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0:
+        raise ValueError(
+            f"{case['id']}: prompt_switch.event_id must be a non-negative integer"
+        )
+
+
+def prompt_switch_boundary(case: dict, contract: dict) -> int | None:
+    """Return the output pixel-frame index where the new prompt takes effect."""
+    switch = case.get("prompt_switch")
+    if switch is None:
+        return None
+    generated_latent_frames = int(contract["generated_latent_frames"])
+    generated_pixel_frames = int(contract["generated_pixel_frames"])
+    if generated_pixel_frames % generated_latent_frames:
+        raise ValueError("pixel/latent frame contract is not integral")
+    pixels_per_latent = generated_pixel_frames // generated_latent_frames
+    generated_latents_before_switch = int(switch["target_chunk"]) * int(
+        contract["latent_frames_per_chunk"]
+    )
+    return (
+        int(contract["reference_pixel_frames"])
+        + generated_latents_before_switch * pixels_per_latent
+    )
+
+
+def prompt_switch_event(case: dict) -> dict | None:
+    switch = case.get("prompt_switch")
+    if switch is None:
+        return None
+    return {
+        "type": "event",
+        "kind": "prompt",
+        "payload": switch["prompt"],
+        "event_id": int(switch["event_id"]),
+    }
 
 
 def action_bits(keys: list[str]) -> list[int]:
@@ -135,6 +229,34 @@ def build_minwm_message(case: dict, contract: dict, first_frame: Path) -> dict:
     use_weights = contract.get("action_output_format") == "primitive_float"
     action_row = action_weights(case) if use_weights else action_bits(case["keys"])
     pixel_actions = [action_row for _ in range(int(contract["generated_pixel_frames"]))]
+    controls = [
+        {
+            "type": "keyboard_direction_frame_interval",
+            "actions": pixel_actions,
+        }
+    ]
+    switch_boundary = prompt_switch_boundary(case, contract)
+    if switch_boundary is not None:
+        total_frames = int(contract["reference_pixel_frames"]) + int(
+            contract["generated_pixel_frames"]
+        )
+        controls.append(
+            {
+                "type": "text_prompt_interval",
+                "segments": [
+                    {
+                        "start": 0,
+                        "end": switch_boundary,
+                        "text": case["prompt"],
+                    },
+                    {
+                        "start": switch_boundary,
+                        "end": total_frames,
+                        "text": case["prompt_switch"]["prompt"],
+                    },
+                ],
+            }
+        )
     return {
         "schema_version": 2,
         "sample_id": case["id"],
@@ -150,12 +272,7 @@ def build_minwm_message(case: dict, contract: dict, first_frame: Path) -> dict:
                 },
                 "uri": str(first_frame),
                 "reference_frame_count": int(contract["reference_pixel_frames"]),
-                "controls": [
-                    {
-                        "type": "keyboard_direction_frame_interval",
-                        "actions": pixel_actions,
-                    }
-                ],
+                "controls": controls,
             },
         ],
     }

@@ -23,7 +23,7 @@
     .panel { background: #141924; border: 1px solid #2a3140; border-radius: 10px; overflow: hidden; }
     .label { padding: 8px 12px; font-weight: 700; }
     video { width: 100%; display: block; background: #000; }
-    .controls { display: grid; grid-template-columns: auto auto auto 1fr auto auto; align-items: center; gap: 9px; margin: 14px 0 0; }
+    .controls { display: grid; grid-template-columns: auto auto auto auto 1fr auto auto; align-items: center; gap: 9px; margin: 14px 0 0; }
     .seek { width: 100%; }
     .time { min-width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
     details { margin-top: 10px; color: #aeb7c8; }
@@ -87,6 +87,7 @@
           <button class="play">Play both</button>
           <button class="prev">−1 frame</button>
           <button class="next">+1 frame</button>
+          <button class="jump-switch" hidden>Jump to switch</button>
           <input class="seek" aria-label="Seek both videos" type="range" min="0" max="1" step="0.001" value="0">
           <span class="time">0:00 / 0:00</span>
           <select class="rate" aria-label="Playback rate"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>
@@ -97,6 +98,7 @@
       const candidate = card.querySelector('.candidate');
       const seek = card.querySelector('.seek');
       const playButton = card.querySelector('.play');
+      const jumpSwitchButton = card.querySelector('.jump-switch');
       const resourceStatus = card.querySelector('.resource-status');
       const time = card.querySelector('.time');
       const casePath = `../cases/${encodeURIComponent(item.id)}`;
@@ -108,9 +110,13 @@
       const result = card.querySelector('.case-result');
       result.className = `case-result ${item.passed ? 'pass' : 'fail'}`;
       result.textContent = item.passed ? 'PASS' : 'FAIL';
-      card.querySelector('.case-meta').textContent = `action ${item.action_label} · case ${index + 1}/${caseCount}`;
+      const switchMeta = item.prompt_switch
+        ? ` · prompt → chunk ${item.prompt_switch.target_chunk} / frame ${item.prompt_switch.pixel_frame_boundary}`
+        : ' · static prompt control';
+      card.querySelector('.case-meta').textContent = `action ${item.action_label}${switchMeta} · case ${index + 1}/${caseCount}`;
       card.querySelector('pre').textContent = JSON.stringify({
         prompt: item.prompt,
+        prompt_switch: item.prompt_switch,
         action_label: item.action_label,
         keys: item.keys,
         baseline_video: baselinePath,
@@ -186,6 +192,14 @@
       card.querySelector('.next').onclick = () => {
         baseline.pause(); candidate.pause(); seekBoth(Number(seek.value) + 1/fps);
       };
+      if (item.prompt_switch) {
+        jumpSwitchButton.hidden = false;
+        jumpSwitchButton.onclick = () => {
+          baseline.pause();
+          candidate.pause();
+          seekBoth(item.prompt_switch.switch_time_s);
+        };
+      }
       return card;
     }
 

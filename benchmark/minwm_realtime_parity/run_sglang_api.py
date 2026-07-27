@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the ten MinWM cases through SGLang's realtime WebSocket API."""
+"""Run MinWM manifest cases through SGLang's realtime WebSocket API."""
 
 from __future__ import annotations
 
@@ -18,10 +18,12 @@ from common import (
     action_weights,
     load_cases,
     materialize_first_frame,
+    prompt_switch_event,
     save_video,
     sha256_file,
     write_json,
 )
+
 RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb"
 RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip"
 RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip"
@@ -161,9 +163,11 @@ async def run_case(args, case, contract, first_frame: Path):
         payload["realtime_causal_kv_cache_num_frames"] = args.kv_cache_num_frames
     frames = []
     stats = []
+    frame_event_ids = {}
     completed_chunks = set()
     payload_completed_ns = {}
     previous_frame = None
+    queued_prompt_event = prompt_switch_event(case)
     async with websockets.connect(
         args.ws_url,
         max_size=None,
@@ -172,6 +176,13 @@ async def run_case(args, case, contract, first_frame: Path):
     ) as websocket:
         init_send_started_ns = time.perf_counter_ns()
         await websocket.send(msgspec.msgpack.encode(payload))
+        prompt_event_sent_ns = None
+        if queued_prompt_event is not None:
+            # Queue while chunk 0 is executing. The MinWM adapter does not
+            # sample prompt events for chunk 0, so this deterministically
+            # targets chunk 1 without relying on a client-side sleep.
+            await websocket.send(msgspec.msgpack.encode(queued_prompt_event))
+            prompt_event_sent_ns = time.perf_counter_ns()
         while len(completed_chunks) < int(contract["chunks"]) or len(stats) < int(
             contract["chunks"]
         ):
@@ -199,6 +210,7 @@ async def run_case(args, case, contract, first_frame: Path):
                 chunk_index = int(header["chunk_index"])
                 completed_chunks.add(chunk_index)
                 payload_completed_ns[chunk_index] = time.perf_counter_ns()
+                frame_event_ids[chunk_index] = header.get("event_id")
     ordered_completions = [
         payload_completed_ns[index] for index in range(int(contract["chunks"]))
     ]
@@ -214,7 +226,55 @@ async def run_case(args, case, contract, first_frame: Path):
             )
         ],
     }
-    return np.stack(frames), stats, payload, timing
+    prompt_switch_observation = None
+    if queued_prompt_event is not None:
+        target_chunk = int(case["prompt_switch"]["target_chunk"])
+        event_id = int(queued_prompt_event["event_id"])
+        stats_by_chunk = {int(item["chunk_index"]): item for item in stats}
+        observed_stats_event_id = stats_by_chunk[target_chunk].get("event_id")
+        observed_frame_event_id = frame_event_ids[target_chunk]
+        first_stats_chunk = next(
+            (
+                chunk_index
+                for chunk_index in range(int(contract["chunks"]))
+                if stats_by_chunk[chunk_index].get("event_id") == event_id
+            ),
+            None,
+        )
+        first_frame_chunk = next(
+            (
+                chunk_index
+                for chunk_index in range(int(contract["chunks"]))
+                if frame_event_ids[chunk_index] == event_id
+            ),
+            None,
+        )
+        prompt_switch_observation = {
+            "event": queued_prompt_event,
+            "target_chunk": target_chunk,
+            "sent_after_init_ms": (
+                (prompt_event_sent_ns - init_send_started_ns) / 1e6
+                if prompt_event_sent_ns is not None
+                else None
+            ),
+            "stats_event_id_at_target": observed_stats_event_id,
+            "frame_event_id_at_target": observed_frame_event_id,
+            "first_stats_chunk_with_event": first_stats_chunk,
+            "first_frame_chunk_with_event": first_frame_chunk,
+        }
+        if first_stats_chunk != target_chunk or first_frame_chunk != target_chunk:
+            raise AssertionError(
+                f"{case['id']}: prompt event {event_id} first affected stats/frame "
+                f"chunks {first_stats_chunk}/{first_frame_chunk}, expected "
+                f"{target_chunk}"
+            )
+    return (
+        np.stack(frames),
+        stats,
+        payload,
+        timing,
+        prompt_switch_observation,
+    )
 
 
 async def async_main(args) -> None:
@@ -250,14 +310,19 @@ async def async_main(args) -> None:
         first_frame = materialize_first_frame(case, inputs)
         warmups = []
         for warmup_index in range(args.warmup_runs):
-            warmup_frames, warmup_stats, _, warmup_timing = await run_case(
-                args, case, contract, first_frame
-            )
+            (
+                warmup_frames,
+                warmup_stats,
+                _,
+                warmup_timing,
+                warmup_prompt_switch,
+            ) = await run_case(args, case, contract, first_frame)
             warmups.append(
                 {
                     "frames": int(warmup_frames.shape[0]),
                     "chunk_stats": warmup_stats,
                     "client_timing": warmup_timing,
+                    "prompt_switch": warmup_prompt_switch,
                 }
             )
             print(
@@ -271,7 +336,7 @@ async def async_main(args) -> None:
                 ),
                 flush=True,
             )
-        frames, stats, request, timing = await run_case(
+        frames, stats, request, timing, prompt_switch = await run_case(
             args, case, contract, first_frame
         )
         expected_frames = int(contract["reference_pixel_frames"]) + int(
@@ -298,6 +363,7 @@ async def async_main(args) -> None:
             "frames_sha256": sha256_file(case_dir / f"{args.output_prefix}.npy"),
             "chunk_stats": stats,
             "client_timing": timing,
+            "prompt_switch": prompt_switch,
             "request": {
                 key: value
                 for key, value in request.items()

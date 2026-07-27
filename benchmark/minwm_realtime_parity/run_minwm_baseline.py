@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run current minWM main/V3 as the numerical baseline for ten fixed cases."""
+"""Run current minWM main/V3 as the numerical baseline for manifest cases."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from common import (
     build_minwm_message,
     load_cases,
     materialize_first_frame,
+    prompt_switch_boundary,
     save_video,
     sha256_file,
     write_json,
@@ -132,9 +133,7 @@ def main() -> None:
         "num_frames": 1 + int(contract["generated_latent_frames"]),
         "dataloader": {
             "processor_kwargs": {
-                "action_output_format": contract.get(
-                    "action_output_format", "label_81"
-                )
+                "action_output_format": contract.get("action_output_format", "label_81")
             }
         },
     }
@@ -297,6 +296,30 @@ def main() -> None:
         for run_index in range(args.warmup_runs + 1):
             pipeline.vae.model.clear_cache()
             batch = processor.process_inference_messages(message)
+            switch_boundary = prompt_switch_boundary(case, contract)
+            if switch_boundary is not None:
+                expected_switch_latent = 1 + int(
+                    case["prompt_switch"]["target_chunk"]
+                ) * int(contract["latent_frames_per_chunk"])
+                expected_prompt_lengths = [
+                    expected_switch_latent,
+                    1
+                    + int(contract["generated_latent_frames"])
+                    - expected_switch_latent,
+                ]
+                if batch["prompts"] != [
+                    case["prompt"],
+                    case["prompt_switch"]["prompt"],
+                ]:
+                    raise AssertionError(
+                        f"{case['id']}: processor prompt segments do not match manifest"
+                    )
+                if batch["prompt_seqlens"].tolist() != expected_prompt_lengths:
+                    raise AssertionError(
+                        f"{case['id']}: processor prompt lengths "
+                        f"{batch['prompt_seqlens'].tolist()} != "
+                        f"{expected_prompt_lengths}"
+                    )
             if dump_root:
                 torch.save(batch["clean_x"], dump_dir / "clean_x.pt")
             if contract.get("action_output_format") == "primitive_float":
@@ -379,6 +402,19 @@ def main() -> None:
             "video_sha256": sha256_file(case_dir / "baseline.mp4"),
             "frames_sha256": sha256_file(case_dir / "baseline.npy"),
             "latents_sha256": sha256_file(case_dir / "baseline_latents.pt"),
+            "prompt_switch": (
+                {
+                    **case["prompt_switch"],
+                    "pixel_frame_boundary": switch_boundary,
+                    "latent_frame_boundary": (
+                        1
+                        + int(case["prompt_switch"]["target_chunk"])
+                        * int(contract["latent_frames_per_chunk"])
+                    ),
+                }
+                if switch_boundary is not None
+                else None
+            ),
         }
         write_json(case_dir / "baseline.json", record)
         run_records.append(record)

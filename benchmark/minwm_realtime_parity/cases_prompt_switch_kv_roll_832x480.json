@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "case_count": 5,
+    "seed": 42,
+    "width": 832,
+    "height": 480,
+    "fps": 24,
+    "generated_latent_frames": 32,
+    "chunks": 8,
+    "latent_frames_per_chunk": 4,
+    "generated_pixel_frames": 128,
+    "reference_pixel_frames": 1,
+    "action_type": "primitive_token_residual",
+    "action_output_format": "label_81",
+    "action_order": [
+      "w",
+      "a",
+      "s",
+      "d",
+      "i",
+      "j",
+      "k",
+      "l"
+    ]
+  },
+  "cases": [
+    {
+      "id": "00_static_prompt_control_5s",
+      "source_id": "prompt-switch-kv-roll/p87/static",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 0,
+      "keys": []
+    },
+    {
+      "id": "01_switch_to_snowy_night_chunk1",
+      "source_id": "prompt-switch-kv-roll/p87/snowy-night",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 0,
+      "keys": [],
+      "prompt_switch": {
+        "target_chunk": 1,
+        "event_id": 1101,
+        "control_case_id": "00_static_prompt_control_5s",
+        "prompt": "The same city street at midnight during a heavy snowstorm, covered in fresh white snow under cold blue moonlight, with dense snowflakes blowing through the air and warm street lamps glowing through the wintry haze."
+      }
+    },
+    {
+      "id": "02_switch_to_neon_rain_chunk1",
+      "source_id": "prompt-switch-kv-roll/p87/neon-rain",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 0,
+      "keys": [],
+      "prompt_switch": {
+        "target_chunk": 1,
+        "event_id": 1102,
+        "control_case_id": "00_static_prompt_control_5s",
+        "prompt": "The same city street on a rainy cyberpunk night, drenched in vivid magenta and cyan neon reflections, with heavy rain streaking across the view, wet pavement gleaming, and luminous signs glowing through mist."
+      }
+    },
+    {
+      "id": "03_switch_to_overgrown_noon_chunk1",
+      "source_id": "prompt-switch-kv-roll/p87/overgrown-noon",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 0,
+      "keys": [],
+      "prompt_switch": {
+        "target_chunk": 1,
+        "event_id": 1103,
+        "control_case_id": "00_static_prompt_control_5s",
+        "prompt": "The same abandoned city street at bright summer noon, reclaimed by lush green vines, tall grass, wildflowers, and dense foliage climbing over the buildings, with crisp sunlight and a vivid blue sky."
+      }
+    },
+    {
+      "id": "04_switch_to_sandstorm_chunk1",
+      "source_id": "prompt-switch-kv-roll/p87/sandstorm",
+      "prompt": "A wide empty city street stretches straight toward a glowing sun low on the horizon, its rays flooding the avenue with warm golden light. Ornate buildings with shuttered storefronts and street lamps line both sides, leafy trees on the right, the road markings receding into the hazy distance at dawn.",
+      "first_frame": "s3://leap-world-us-east-2/world-model/eval/platform/eval_sets/minWM/testset100_v2/img/p87.png",
+      "action_label": 0,
+      "keys": [],
+      "prompt_switch": {
+        "target_chunk": 1,
+        "event_id": 1104,
+        "control_case_id": "00_static_prompt_control_5s",
+        "prompt": "The same city street swallowed by a violent desert sandstorm, with orange dust racing between the buildings, dunes covering the road, debris blowing through the air, and the sun reduced to a dim red disk."
+      }
+    }
+  ]
+}

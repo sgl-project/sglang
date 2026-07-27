@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from common import load_cases, sha256_file, write_json
+from common import load_cases, prompt_switch_boundary, sha256_file, write_json
 
 
 def write_player(results: Path, report: dict) -> None:
@@ -145,12 +145,19 @@ def main() -> None:
         raise ValueError(f"unknown threshold profile: {args.profile}") from exc
 
     results = Path(args.results).resolve()
+    baseline_by_case = {
+        case["id"]: np.load(
+            results / "cases" / case["id"] / "baseline.npy",
+            allow_pickle=False,
+        )
+        for case in manifest["cases"]
+    }
     records = []
     for case in manifest["cases"]:
         case_dir = results / "cases" / case["id"]
         baseline_path = case_dir / "baseline.npy"
         sglang_path = case_dir / "sglang.npy"
-        baseline = np.load(baseline_path, allow_pickle=False)
+        baseline = baseline_by_case[case["id"]]
         sglang = np.load(sglang_path, allow_pickle=False)
         metrics = {
             "all_frames": metric_block(baseline, sglang),
@@ -160,11 +167,66 @@ def main() -> None:
             "sglang_frames_sha256": sha256_file(sglang_path),
         }
         passed, failures = evaluate(metrics, profile)
+        prompt_switch = None
+        switch_boundary = prompt_switch_boundary(case, manifest["contract"])
+        if switch_boundary is not None:
+            with (case_dir / "sglang.json").open(encoding="utf-8") as source:
+                sglang_record = json.load(source)
+            observation = sglang_record.get("prompt_switch")
+            target_chunk = int(case["prompt_switch"]["target_chunk"])
+            event_id = int(case["prompt_switch"]["event_id"])
+            event_hit_target = bool(
+                observation
+                and observation.get("first_stats_chunk_with_event") == target_chunk
+                and observation.get("first_frame_chunk_with_event") == target_chunk
+                and observation.get("stats_event_id_at_target") == event_id
+                and observation.get("frame_event_id_at_target") == event_id
+            )
+            if not event_hit_target:
+                failures.append(
+                    f"prompt event {event_id} did not first affect chunk {target_chunk}"
+                )
+
+            effect = None
+            control_case_id = case["prompt_switch"].get("control_case_id")
+            if control_case_id is not None:
+                control = baseline_by_case[control_case_id]
+                prefix_metrics = metric_block(
+                    control[:switch_boundary], baseline[:switch_boundary]
+                )
+                switched_tail_metrics = metric_block(
+                    control[switch_boundary:], baseline[switch_boundary:]
+                )
+                effect = {
+                    "control_case_id": control_case_id,
+                    "prefix_before_switch": prefix_metrics,
+                    "tail_after_switch": switched_tail_metrics,
+                    "prefix_bitwise_equal": prefix_metrics["bitwise_equal"],
+                    "tail_changed": not switched_tail_metrics["bitwise_equal"],
+                }
+                if not effect["prefix_bitwise_equal"]:
+                    failures.append(
+                        "prompt-switch case diverged from control before cutover"
+                    )
+                if not effect["tail_changed"]:
+                    failures.append(
+                        "prompt switch produced no pixel change after cutover"
+                    )
+            prompt_switch = {
+                **case["prompt_switch"],
+                "pixel_frame_boundary": switch_boundary,
+                "switch_time_s": switch_boundary / float(manifest["contract"]["fps"]),
+                "event_hit_target_chunk": event_hit_target,
+                "observation": observation,
+                "effect_vs_control": effect,
+            }
+            passed = passed and not failures
         record = {
             "id": case["id"],
             "prompt": case["prompt"],
             "action_label": case["action_label"],
             "keys": case["keys"],
+            "prompt_switch": prompt_switch,
             "passed": passed,
             "failures": failures,
             "metrics": metrics,
@@ -192,6 +254,26 @@ def main() -> None:
             record["metrics"]["generated_frames"]["rmse"] for record in records
         ),
         "observed_generated_min_ssim": min(observed_ssim) if observed_ssim else None,
+        "prompt_switch_case_count": sum(
+            record["prompt_switch"] is not None for record in records
+        ),
+        "all_prompt_events_hit_target": all(
+            record["prompt_switch"]["event_hit_target_chunk"]
+            for record in records
+            if record["prompt_switch"] is not None
+        ),
+        "all_prompt_switch_prefixes_bitwise": all(
+            record["prompt_switch"]["effect_vs_control"]["prefix_bitwise_equal"]
+            for record in records
+            if record["prompt_switch"] is not None
+            and record["prompt_switch"]["effect_vs_control"] is not None
+        ),
+        "all_prompt_switch_tails_changed": all(
+            record["prompt_switch"]["effect_vs_control"]["tail_changed"]
+            for record in records
+            if record["prompt_switch"] is not None
+            and record["prompt_switch"]["effect_vs_control"] is not None
+        ),
     }
     report = {
         "schema_version": 1,
@@ -212,14 +294,18 @@ def main() -> None:
         "",
         f"Result: **{summary['passed']}/{summary['case_count']} passed**",
         "",
-        "| case | action | bitwise | max abs | RMSE | SSIM | pass |",
-        "| --- | ---: | --- | ---: | ---: | ---: | --- |",
+        "| case | action | prompt switch | event chunk | bitwise | max abs | RMSE | SSIM | pass |",
+        "| --- | ---: | --- | ---: | --- | ---: | ---: | ---: | --- |",
     ]
     for record in records:
         metric = record["metrics"]["generated_frames"]
         ssim = "n/a" if metric["ssim"] is None else f"{metric['ssim']:.8f}"
+        prompt_switch = record["prompt_switch"]
         markdown.append(
-            f"| {record['id']} | {record['action_label']} | {metric['bitwise_equal']} | "
+            f"| {record['id']} | {record['action_label']} | "
+            f"{'yes' if prompt_switch else 'no'} | "
+            f"{prompt_switch['target_chunk'] if prompt_switch else 'n/a'} | "
+            f"{metric['bitwise_equal']} | "
             f"{metric['max_abs']} | {metric['rmse']:.6f} | {ssim} | {record['passed']} |"
         )
     (results / "report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
