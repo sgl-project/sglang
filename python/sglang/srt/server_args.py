@@ -3651,6 +3651,10 @@ class ServerArgs:
             self.is_embedding = True
             self.disable_radix_cache = True
             self.chunked_prefill_size = -1
+            # Submit a list-valued embeddings request atomically so BCG can
+            # replay its full prefill batch instead of starting item zero
+            # while the remaining texts are still being tokenized.
+            self.enable_tokenizer_batch_encode = True
             requested_prefill_backend = (
                 self.prefill_attention_backend or self.attention_backend
             )
