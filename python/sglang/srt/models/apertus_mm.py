@@ -25,6 +25,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.apertus import ApertusForCausalLM
 from sglang.srt.runtime_context import get_server_args
@@ -230,6 +231,26 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         return self._pad_output_logits(output)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        component_tensors = {}
+        if self.pp_group.is_first_rank:
+            for component_name, component in (
+                ("vision_tower", self.vision_tower),
+                ("audio_tower", self.audio_tower),
+            ):
+                if component is not None:
+                    component_tensors.update(
+                        {
+                            f"{component_name}.{name}": tensor
+                            for name, tensor in component.named_parameters()
+                        }
+                    )
+                    component_tensors.update(
+                        {
+                            f"{component_name}.{name}": tensor
+                            for name, tensor in component.named_buffers()
+                        }
+                    )
+
         def remapped_weights():
             for name, weight in weights:
                 if name.startswith("model.language_model."):
@@ -239,13 +260,32 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                 elif name.startswith("model.audio_tokenizer."):
                     name = "audio_tower." + name[len("model.audio_tokenizer.") :]
 
-                if not self.pp_group.is_first_rank and name.startswith(
-                    ("vision_tower.", "audio_tower.")
-                ):
-                    continue
                 yield name, weight
 
-        return super().load_weights(remapped_weights())
+        def load_component_weight(name: str, weight: torch.Tensor) -> bool:
+            if not name.startswith(("vision_tower.", "audio_tower.")):
+                return False
+
+            if not self.pp_group.is_first_rank:
+                return True
+
+            component_tensor = component_tensors.get(name)
+            if component_tensor is None:
+                raise ValueError(
+                    f"No vision/audio tensor matches checkpoint key: {name}"
+                )
+            weight_loader = getattr(
+                component_tensor, "weight_loader", default_weight_loader
+            )
+            weight_loader(component_tensor, weight)
+            return True
+
+        def filter_language_weights():
+            for name, weight in remapped_weights():
+                if not load_component_weight(name, weight):
+                    yield name, weight
+
+        return super().load_weights(filter_language_weights())
 
 
 EntryClass = [Apertus1p5ForConditionalGeneration]
