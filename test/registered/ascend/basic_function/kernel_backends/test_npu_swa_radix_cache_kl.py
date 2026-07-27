@@ -9,8 +9,14 @@ register_npu_ci(est_time=400, suite="full-8-npu-a3", nightly=True)
 
 
 class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
+    """
+    Enable radix caching for SWA models on the NPU.
+    Maintain consistency with the baseline regarding the probability distribution mechanism for text generation,
+    thereby ensuring no loss in performance on the server side.
+    """
+
     model = GPT_OSS_120B_BF16_WEIGHTS_PATH
-    kl_div_thres = 0.02  # it was 0.002
+    kl_div_thres = 0.02
     kl_div_decode_max_new_tokens = 2048
     other_args = [
         "--tp-size",
@@ -20,7 +26,7 @@ class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
         "--trust-remote-code",
         "--attention-backend",
         "ascend",
-        "--disable-radix-cache",
+        "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
     ]
 

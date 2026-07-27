@@ -34,8 +34,6 @@ class TestStartProfile(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",
-            "--base-gpu-id",
-            10,
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -47,6 +45,8 @@ class TestStartProfile(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
+        os.environ.pop("SGLANG_PROFILE_V2", None)
 
     def setUp(self):
         self._clear_profile_dir()

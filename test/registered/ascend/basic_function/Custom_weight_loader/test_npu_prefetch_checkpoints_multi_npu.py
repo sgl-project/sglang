@@ -15,7 +15,7 @@ PROMPTS = [
 ]
 
 
-class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
+class TestPrefetchCheckpointsMultiNPU(CustomTestCase):
     """Verify that --weight-loader-prefetch-checkpoints works with DP attention."""
 
     @classmethod
