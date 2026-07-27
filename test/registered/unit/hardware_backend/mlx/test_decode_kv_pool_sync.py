@@ -9,6 +9,11 @@ padding slot) and reused rows read a previous request's slot ids.
 A finished request must also flush its committed decode KV before its
 req_to_token row is freed and reused, so a later sync cannot read the new
 owner's slot ids out of the reused row.
+
+A request released without radix insert (decode retraction, aborts) skips
+that flush entirely: its KV is never read again, and by the time stale-rid
+cleanup disposes of it the row may already belong to a live request, so
+cleanup must never sync at all.
 """
 
 import importlib.util
@@ -200,6 +205,32 @@ class TestDecodeKvPoolSyncCommittedClamp(CustomTestCase):
         self.assertEqual(pool.k_buffer[0][8][0][0].item(), 555.0)
         self.assertEqual(pool.k_buffer[0][9][0][0].item(), 555.0)
         self.assertEqual(runner._req_synced_offset["R"], 4)
+
+    def test_remove_after_noninsert_release_does_not_overwrite_reused_slots(self):
+        # Non-insert releases (decode retraction, aborts) skip the
+        # prepare_for_kv_cache_release flush hook, so R's row can be freed
+        # and reused while R still has committed-but-unsynced decode
+        # positions. Stale-rid cleanup must dispose of R without syncing
+        # through the reused row.
+        runner = _make_runner()
+        pool = runner._attention_kv_pool
+
+        # R has two committed-but-unsynced decode positions. Its scheduler row
+        # still points at slots that have since been reused by a live request.
+        for pos, slot in [(0, 1), (1, 2), (2, 5), (3, 6)]:
+            runner._req_to_token_pool.req_to_token[0, pos] = slot
+        self._add_request(runner, "R", n_tokens=4, value=100.0, committed=4, synced=2)
+        # remove_request touches fields _make_runner leaves unset.
+        runner._req_token_ids = {"R": []}
+        runner._release_cache = lambda cache: None
+
+        live = mx.full((2, H, D), 555.0, dtype=mx.float32)
+        pool.set_kv(0, mx.array([5, 6], dtype=mx.int32), live, live)
+
+        runner.remove_request("R")
+        mx.eval(*pool.all_buffers())
+        self.assertEqual(pool.k_buffer[0][5][0][0].item(), 555.0)
+        self.assertEqual(pool.k_buffer[0][6][0][0].item(), 555.0)
 
 
 if __name__ == "__main__":

@@ -740,11 +740,10 @@ class MlxModelRunner:
         Called from the TP worker at the scheduler's radix-insert point
         (``prepare_for_kv_cache_release``), before ``release_kv_cache`` frees the
         request's ``req_to_token`` row. Once the scheduler frees the row it can
-        be reallocated to another request; a later sync (e.g. from
-        ``remove_request`` on the next forward's stale-rid cleanup) would then
-        read the new owner's slot ids out of ``req_to_token`` and overwrite its
-        live pool slots. Advancing the synced bound here closes that window
-        (issue #30093).
+        be reallocated to another request, and any sync through it would read
+        the new owner's slot ids out of ``req_to_token`` and overwrite its live
+        pool slots. This is therefore the last safe point to flush; stale-rid
+        cleanup (``remove_request``) deliberately never syncs (issue #30093).
         """
         if self.disable_radix_cache:
             return
@@ -1300,10 +1299,16 @@ class MlxModelRunner:
         return req_id in self._req_caches
 
     def remove_request(self, req_id: str):
-        """Sync remaining decode KV to pool, then release request state."""
-        if not self.disable_radix_cache:
-            self._sync_decode_kv_to_pool(req_id)
+        """Release request state; deliberately never syncs to the pool.
 
+        Stale-rid cleanup runs on a later forward, after the scheduler has
+        released the request's ``req_to_token`` row: the saved row index may
+        already map to slots owned by a live request. Committed decode KV
+        that must outlive the request is flushed at the release point itself
+        (``prepare_for_kv_cache_release``) while the row is still owned, and
+        non-insert releases (retract, abort) free KV that is never read
+        again; a sync here could only corrupt (issue #30093).
+        """
         self._req_token_ids.pop(req_id, None)
         cache = self._req_caches.pop(req_id, None)
         if cache is not None:
