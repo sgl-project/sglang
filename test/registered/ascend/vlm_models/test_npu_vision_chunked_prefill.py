@@ -2,9 +2,9 @@ from sglang.test.ascend.test_ascend_utils import (
     LLAVA_ONEVISION_QWEN2_7B_OV_WEIGHTS_PATH,
     VIDEO_JOBS_PATH,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_npu_ci
 
-register_cuda_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
+register_npu_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:

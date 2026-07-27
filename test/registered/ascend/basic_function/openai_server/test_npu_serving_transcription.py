@@ -17,7 +17,7 @@ from sglang.test.ascend.test_ascend_utils import (
     AUDIO_TRUMP_WEF_PATH,
     QWEN3_ASR_0_6B_WEIGHTS_PATH,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+register_npu_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 QWEN_ASR_MODEL = QWEN3_ASR_0_6B_WEIGHTS_PATH
 AUDIO_URL = AUDIO_TRUMP_WEF_PATH
@@ -50,7 +50,7 @@ class TestServingTranscription(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--served-model-name",
-                "Qwen-asr",
+                "qwen-asr",
                 "--attention-backend",
                 "ascend",
                 "--disable-cuda-graph",
@@ -93,7 +93,7 @@ class TestServingTranscription(CustomTestCase):
     def _transcribe_stream(self, language: Optional[str] = None) -> List[str]:
         """Send a streaming transcription request and return the delta strings."""
         audio_bytes = download_audio_bytes()
-        data = {"model": "whisper", "stream": "true"}
+        data = {"model": "qwen-asr", "stream": "true"}
         if language is not None:
             data["language"] = language
         with requests.post(
