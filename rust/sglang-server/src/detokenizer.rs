@@ -334,10 +334,13 @@ fn handle_chunk(
             }
             let _ = st.fsm.apply(Event::Disconnect);
             let rid = st.rid.clone();
-            table.remove(&id);
-            // Best-effort: stop the scheduler generating for a request no client
-            // can receive. A full/closed tm inbox just drops it (shutdown).
+            // Queue the abort BEFORE dropping the sink. `table.remove` releases the
+            // handler, which drops its `AbortGuard`, which frees the rid for reuse —
+            // all of which can happen before this thread queues the abort, so a
+            // resubmitted request would then be deregistered by our stale abort.
+            // Same cross-wiring the rid registry exists to prevent.
             let _ = tm.try_send(TmEvent::Abort(rid));
+            table.remove(&id);
         }
     }
 }

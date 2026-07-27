@@ -518,13 +518,17 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 /// each errors on the other's.
 const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u'];
 
-/// Repetition counts at or above this are refused. `regex-syntax` parses counts as
+/// Repetition counts at or above this are refused — as a PRODUCT down the nesting,
+/// not per node: `(?:(?:a*){65535}){65535}` is 22 bytes, compiles fine, and costs
+/// several GiB inside `re.search` on the decode hot path (`MemoryError`, which the
+/// seatbelt does not catch). Well below that, `(?:){1048575}x` measured 428 ms per
+/// decode step in GIL-holding C. A stop-string window needs nothing like this. `regex-syntax` parses counts as
 /// `u32` and so accepts everything up to `u32::MAX`, while CPython's `MAXREPEAT`
 /// sentinel IS `u32::MAX` (`a{4294967295}` → `OverflowError`) and a large count on a
 /// nested group exhausts memory at compile time (`(?:a*){4294967294}` → several GB,
 /// then `MemoryError`). Neither is an `re.error`, so neither is caught downstream.
 /// A stop-string window this long is meaningless anyway.
-const MAX_REPEAT_COUNT: u32 = 1 << 20;
+const MAX_REPEAT_COUNT: u64 = 4096;
 
 const SHARED_ESCAPES: &[char] = &[
     'A', 'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'a', 'f', 'n', 'r', 't', 'v',
@@ -570,10 +574,13 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
             // `R`/`U`, Python adds `a`/`L`, so only their intersection is portable.
             b'(' if flag_group_bytes(&b[i..]).is_some() => {
                 let flags = flag_group_bytes(&b[i..]).expect("just matched");
-                if i > 0 {
+                // `(?flags:…)` is scoped: legal anywhere, and its clearing form is
+                // legal too. Only the GLOBAL form is position- and sign-restricted.
+                let scoped = b[i..].get(2 + flags.len()).is_some_and(|&c| c == b':');
+                if !scoped && i > 0 {
                     return reject("inline flags after the start of the pattern".into());
                 }
-                if flags.contains(&b'-') {
+                if !scoped && flags.contains(&b'-') {
                     return reject(
                         "a clearing `(?-flags)` group (Python wants `(?-flags:…)`)".into(),
                     );
@@ -627,7 +634,9 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
 /// if `b` does not open one. A `(?i:…)` scoped group is not one of these.
 fn flag_group_bytes(b: &[u8]) -> Option<&[u8]> {
     let rest = b.strip_prefix(b"(?")?;
-    let end = rest.iter().position(|&c| c == b')')?;
+    // Stop at `)` OR `:` — the scoped form `(?i:…)` carries the same flag letters
+    // and was falling through unvalidated, so `(?R:a)` reached the scheduler.
+    let end = rest.iter().position(|&c| c == b')' || c == b':')?;
     let flags = &rest[..end];
     (!flags.is_empty() && flags.iter().all(|&c| c.is_ascii_alphabetic() || c == b'-'))
         .then_some(flags)
@@ -652,6 +661,14 @@ fn check_escape(b: &[u8], i: usize) -> Result<(), String> {
         return Err("a `\\b{…}` assertion".into());
     }
     if e.is_ascii_alphanumeric() && !SHARED_ESCAPES.contains(&(e as char)) {
+        return Err(format!("the escape `\\{}`", e as char));
+    }
+    // `\<` / `\>` are GNU word-boundary ASSERTIONS to `regex-syntax` (width 0) but
+    // escaped LITERALS to Python (`\<END\>` needs 5 characters of tail). Scoring
+    // them 0 sizes the match window too small, so the stop silently never fires and
+    // the request runs to `max_new_tokens` — the one failure mode this module exists
+    // to prevent, and `\<WORD\>` is idiomatic from grep/vim.
+    if e == b'<' || e == b'>' {
         return Err(format!("the escape `\\{}`", e as char));
     }
     Ok(())
@@ -687,6 +704,12 @@ fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
                 "stop_regex {pattern:?} is not a valid regular expression: {e}"
             ))
         })?;
+    if repetition_cost_too_large(&ast, 1, false) {
+        return Err(bad(format!(
+            "stop_regex {pattern:?} repeats too many times or nests unbounded \
+             repetitions; matching it would dominate every decode step"
+        )));
+    }
     if repeats_an_assertion(&ast) {
         return Err(bad(format!(
             "stop_regex {pattern:?} quantifies a zero-width assertion, which Python's \
@@ -696,19 +719,38 @@ fn stop_regex_bound(pattern: &str) -> Result<i64, Error> {
     Ok(hir_max_len(&hir))
 }
 
-/// Whether a repetition asks for more than [`MAX_REPEAT_COUNT`] — a count Python
-/// either refuses outright (`OverflowError` at `MAXREPEAT`) or tries to honour
-/// until it runs out of memory. Both escape the decode-loop seatbelt, which only
-/// catches `re.error` / `RecursionError`.
-fn repeat_count_too_large(kind: &regex_syntax::ast::RepetitionKind) -> bool {
-    use regex_syntax::ast::{RepetitionKind, RepetitionRange};
-    let RepetitionKind::Range(range) = kind else {
-        return false;
-    };
-    let over = |n: &u32| *n >= MAX_REPEAT_COUNT;
-    match range {
-        RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n) => over(n), // codespell:ignore atleast
-        RepetitionRange::Bounded(lo, hi) => over(lo) || over(hi),
+/// Reject repetitions whose cost compounds down the nesting.
+///
+/// `outer` is the product of the counted repeats enclosing `ast`. Two families die
+/// here: a counted product over [`MAX_REPEAT_COUNT`] (memory), and an unbounded
+/// repeat nested inside another (`(?:a+)+b` — catastrophic backtracking, measured
+/// 2.3 s on a 26-character tail, and since its bound is the full-scan sentinel the
+/// tail grows every step, so the loop is dead within ~30 tokens).
+fn repetition_cost_too_large(ast: &regex_syntax::ast::Ast, outer: u64, unbounded: bool) -> bool {
+    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
+    match ast {
+        Ast::Repetition(rep) => {
+            let (factor, is_unbounded) = match &rep.op.kind {
+                RepetitionKind::Range(RepetitionRange::Exactly(n)) => (*n as u64, false),
+                RepetitionKind::Range(RepetitionRange::Bounded(_, hi)) => (*hi as u64, false),
+                RepetitionKind::Range(RepetitionRange::AtLeast(n)) => (*n as u64, true), // codespell:ignore atleast
+                _ => (1, true), // `*`, `+`, `?`
+            };
+            let total = outer.saturating_mul(factor.max(1));
+            total >= MAX_REPEAT_COUNT
+                || (is_unbounded && unbounded)
+                || repetition_cost_too_large(&rep.ast, total, unbounded || is_unbounded)
+        }
+        Ast::Group(g) => repetition_cost_too_large(&g.ast, outer, unbounded),
+        Ast::Concat(c) => c
+            .asts
+            .iter()
+            .any(|a| repetition_cost_too_large(a, outer, unbounded)),
+        Ast::Alternation(a) => a
+            .asts
+            .iter()
+            .any(|a| repetition_cost_too_large(a, outer, unbounded)),
+        _ => false,
     }
 }
 
@@ -726,7 +768,6 @@ fn repeats_an_assertion(ast: &regex_syntax::ast::Ast) -> bool {
         // Python calls "multiple repeat"). Both parse fine in Rust.
         Ast::Repetition(rep) => {
             matches!(&*rep.ast, Ast::Assertion(_) | Ast::Repetition(_))
-                || repeat_count_too_large(&rep.op.kind)
                 || repeats_an_assertion(&rep.ast)
         }
         Ast::Group(g) => repeats_an_assertion(&g.ast),
@@ -1185,6 +1226,16 @@ mod tests {
             // exhausts memory. Neither raises `re.error`, so neither is caught
             // downstream.
             ("a{4294967295}", false),
+            // Round 5: `\<`/`\>` are GNU word boundaries to regex-syntax (bound 3)
+            // but escaped literals to Python (needs 5 chars of tail) — an
+            // UNDER-estimate, so the stop silently never fires.
+            (r"\<END\>", true),
+            // Compounding repeat cost; both compile in Python, both are fatal there.
+            ("(?:(?:a*){65535}){65535}", true),
+            ("(?:){1048575}x", true),
+            ("(?:a+)+b", true), // catastrophic backtracking
+            ("(?R:a)", false),  // scoped flag form was unvalidated
+            ("(?U:a)", false),
             // Python accepts these; Rust may reject them (a false 400 is safe).
             ("(?i)[a-z]+", true), // must NOT be rejected: leading flags are fine
             (r"(?i)\d{4}-\d{2}", true), // …even with a hyphen later in the pattern
@@ -1268,6 +1319,46 @@ mod tests {
             4,
             "plain \\b still works"
         );
+    }
+
+    /// Round 5's under-estimate: `regex-syntax` reads `\<`/`\>` as GNU word-boundary
+    /// assertions (width 0), CPython as escaped literals. Scoring `\<END\>` as 3
+    /// instead of 5 sizes the scheduler's match window too small, so the stop never
+    /// fires and the request burns GPU to `max_new_tokens`.
+    #[test]
+    fn gnu_word_boundary_escapes_are_rejected() {
+        for pattern in [r"\<END\>", r"\<word", r"end\>"] {
+            assert!(
+                stop_regex_bound(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+        // A plain `<` is a literal in both and still bounds correctly.
+        assert_eq!(stop_regex_bound("<END>").unwrap(), 5);
+    }
+
+    /// Repetition cost compounds down the nesting, so a per-node cap misses
+    /// `(?:(?:a*){65535}){65535}` — 22 bytes, compiles fine in Python, then eats
+    /// GiB inside `re.search` on the decode hot path (`MemoryError`, which the
+    /// seatbelt does not catch). Nested UNBOUNDED repeats are the backtracking
+    /// family, fatal in wall-clock rather than memory.
+    #[test]
+    fn compounding_repetition_cost_is_rejected() {
+        for pattern in [
+            "(?:(?:a*){65535}){65535}",
+            "(?:){1048575}x",
+            "(?:a{100}){100}",
+            "(?:a+)+b",
+            "(a*)*b",
+        ] {
+            assert!(
+                stop_regex_bound(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+        // Ordinary nesting still works.
+        assert_eq!(stop_regex_bound("(?:ab){3}").unwrap(), 6);
+        assert_eq!(stop_regex_bound(r"\d{6}").unwrap(), 6);
     }
 
     /// Deep nesting is rejected here rather than blowing Python's parser stack:
