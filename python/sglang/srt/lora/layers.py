@@ -616,6 +616,9 @@ class InklingQKVRLinearWithLoRA(MergedColumnParallelLinearWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         bl = self.base_layer
+        # See ColumnParallelLinearWithLoRA.slice_lora_b_weights for why the
+        # base layer's own TP rank is authoritative under DP-attention.
+        tp_rank = bl.tp_rank
         hd, nkv, nh, dr, tp = (
             bl.inkling_head_dim,
             bl.inkling_num_kv_heads,

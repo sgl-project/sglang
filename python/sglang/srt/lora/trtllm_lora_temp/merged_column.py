@@ -32,6 +32,9 @@ def merged_column_lora_forward(self, input_: torch.Tensor):
     """O9 — side-stream LoRA-A shrink ‖ base merged-column GEMM."""
     if (
         not self.set_lora
+        # Idle DP-attention forwards clear batch_info; the original forward
+        # carries the skip-LoRA guard.
+        or self.lora_backend.batch_info is None
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):

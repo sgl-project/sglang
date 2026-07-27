@@ -37,6 +37,9 @@ def qkv_proj_lora_forward(self, input_: torch.Tensor):
     """
     if (
         not self.set_lora
+        # Idle DP-attention forwards clear batch_info; the original forward
+        # carries the skip-LoRA guard.
+        or self.lora_backend.batch_info is None
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer_qkv, self.B_buffer_qkv)
     ):
@@ -105,6 +108,7 @@ def row_parallel_lora_forward(
 
     if (
         not self.set_lora
+        or self.lora_backend.batch_info is None
         or not is_two_stream_active(input_parallel)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):
@@ -177,6 +181,7 @@ def column_parallel_lora_forward(self, input_: torch.Tensor):
     """
     if (
         not self.set_lora
+        or self.lora_backend.batch_info is None
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):
@@ -232,6 +237,7 @@ def replicated_lora_forward(self, x: torch.Tensor):
     """
     if (
         not self.set_lora
+        or self.lora_backend.batch_info is None
         or not is_two_stream_active(x)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):

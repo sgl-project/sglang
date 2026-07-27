@@ -336,6 +336,7 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 # the outer `tp_size`.
 ATTENTION_LINEAR_LORA_NAMES = [
     "qkv_proj",
+    "qkvr",
     "o_proj",
     "out_proj",
     "q_b_proj",
