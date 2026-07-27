@@ -1072,6 +1072,8 @@ def apply_qk_norm_rope(
             positions=positions,
             is_neox=is_neox,
             eps=q_eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
         )
         return q, k
 
