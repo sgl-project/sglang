@@ -1,11 +1,9 @@
 """Unit tests for the MLX overlap scheduler mixin (hardware_backend/mlx/scheduler_mixin.py).
 
 Covers:
-  - _finalize_mlx_pending_job advances forward_ct once per completed step
-  - _finalize_mlx_pending_job calls the profiler batch predicate with the
-    finalized batch, so step-bounded profiling (``--profile-steps`` /
-    ``/start_profile`` num_steps) can auto-stop on the MLX overlap loop, which
-    bypasses the standard Scheduler.run_batch().
+  - Every MLX launch advances forward_ct and stamps forward_iter/launch_ts.
+  - The profiler predicate runs before the async forward is enqueued, matching
+    Scheduler.run_batch() so step-bounded profiling stops on the right step.
 
 Skips on non-Apple-Silicon platforms and when ``mlx`` is missing (importing
 scheduler_mixin requires ``mlx.core``).
@@ -29,8 +27,8 @@ _SKIP_REASON = "requires Apple Silicon and mlx"
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
-class TestFinalizeMlxPendingJob(unittest.TestCase):
-    """forward_ct accounting + profiler predicate wiring in the overlap loop."""
+class TestMlxLaunchBookkeeping(unittest.TestCase):
+    """run_batch-style bookkeeping for the MLX overlap loop."""
 
     def _make_scheduler(self):
         scheduler = MagicMock()
@@ -40,26 +38,24 @@ class TestFinalizeMlxPendingJob(unittest.TestCase):
         scheduler.tp_worker.finalize_mlx_result.return_value = result
         return scheduler
 
-    def test_finalize_advances_forward_ct_and_runs_predicate(self):
+    def test_prepare_launch_advances_forward_ct_and_runs_predicate(self):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
 
         scheduler = self._make_scheduler()
-        pending = MagicMock()
+        batch = MagicMock()
 
-        SchedulerMlxOverlapMixin._finalize_mlx_pending_job(scheduler, pending)
+        SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
 
-        # Standard run_batch() advances forward_ct and runs the profiler
-        # predicate; the MLX overlap loop must do the same here.
         self.assertEqual(scheduler.forward_ct, 1)
+        self.assertEqual(batch.forward_iter, 1)
+        self.assertIsInstance(batch.launch_ts, float)
         scheduler.profiler_manager._profile_batch_predicate.assert_called_once_with(
-            pending.schedule_batch
+            batch
         )
-        # The rest of finalization still runs.
-        scheduler.process_batch_result.assert_called_once()
 
-    def test_forward_ct_advances_once_per_step(self):
+    def test_forward_ct_advances_once_per_launch(self):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
@@ -67,14 +63,14 @@ class TestFinalizeMlxPendingJob(unittest.TestCase):
         scheduler = self._make_scheduler()
 
         for expected in (1, 2, 3):
-            SchedulerMlxOverlapMixin._finalize_mlx_pending_job(scheduler, MagicMock())
+            SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, MagicMock())
             self.assertEqual(scheduler.forward_ct, expected)
 
         self.assertEqual(
             scheduler.profiler_manager._profile_batch_predicate.call_count, 3
         )
 
-    def test_finalize_stamps_forward_iter_like_run_batch(self):
+    def test_finalize_does_not_double_count_launch(self):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
@@ -82,13 +78,12 @@ class TestFinalizeMlxPendingJob(unittest.TestCase):
         scheduler = self._make_scheduler()
         pending = MagicMock()
 
+        SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, pending.batch_copy)
         SchedulerMlxOverlapMixin._finalize_mlx_pending_job(scheduler, pending)
 
-        # run_batch assigns batch.forward_iter = forward_ct; the metrics
-        # reporter and SWA maintenance skip batches where it is None, so the
-        # MLX loop must stamp it on the batch handed to process_batch_result.
+        self.assertEqual(scheduler.forward_ct, 1)
         self.assertEqual(pending.batch_copy.forward_iter, 1)
-        self.assertEqual(pending.schedule_batch.forward_iter, 1)
+        scheduler.process_batch_result.assert_called_once()
 
 
 class _StopLoop(Exception):
@@ -111,8 +106,15 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
     def _make_scheduler(self, *, recv_side_effect):
         from collections import deque
 
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._prepare_mlx_launch.side_effect = lambda batch: (
+            SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
@@ -123,7 +125,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         scheduler.tp_worker.finalize_mlx_result.return_value = result
         return scheduler
 
-    def test_fresh_launch_stamps_launch_ts_before_copy(self):
+    def test_fresh_launch_stamps_launch_ts_before_input_resolution(self):
         from unittest.mock import patch
 
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
@@ -133,6 +135,10 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         scheduler = self._make_scheduler(recv_side_effect=[[], _StopLoop()])
 
         batch = MagicMock()
+        events = []
+        scheduler.profiler_manager._profile_batch_predicate.side_effect = (
+            lambda _batch: events.append("profile")
+        )
         launch_ts_at_copy_time = []
         batch.copy.side_effect = lambda: (
             launch_ts_at_copy_time.append(batch.launch_ts),
@@ -141,30 +147,31 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         plan = MagicMock()
         plan.batch_to_run = batch
         scheduler.get_next_batch_to_run.return_value = plan
-        scheduler.tp_worker.async_forward_batch_generation_mlx.return_value = (
-            None,
-            [],
-            [],
-            None,
-            "extend",
+        scheduler.tp_worker.async_forward_batch_generation_mlx.side_effect = (
+            lambda _batch: (
+                events.append("forward"),
+                (None, [], [], None, "extend"),
+            )[1]
         )
 
-        with patch(
-            "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
-        ):
-            with self.assertRaises(_StopLoop):
-                SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
-
-        self.assertEqual(len(launch_ts_at_copy_time), 1)
-        self.assertIsInstance(
-            launch_ts_at_copy_time[0],
-            float,
-            msg=(
-                "MLX overlap loop launched a batch without stamping "
-                "launch_ts before batch.copy(); process_batch_result -> "
-                "_record_step_counters will crash on float - None."
+        with (
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.time.monotonic",
+                side_effect=lambda: (events.append("launch_ts"), 1.0)[1],
             ),
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs",
+                side_effect=lambda *_args: events.append("resolve_inputs"),
+            ),
+            self.assertRaises(_StopLoop),
+        ):
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+
+        self.assertEqual(
+            events, ["launch_ts", "profile", "resolve_inputs", "forward"]
         )
+        self.assertEqual(len(launch_ts_at_copy_time), 1)
+        self.assertEqual(launch_ts_at_copy_time[0], 1.0)
 
     def test_chained_launch_restamps_launch_ts(self):
         from unittest.mock import patch
@@ -177,6 +184,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         # decode on top of it.  Iteration 3: stop.
         scheduler = self._make_scheduler(recv_side_effect=[[], [], _StopLoop()])
 
+        events = []
         req = MagicMock()
         req.finished.return_value = False
         batch = MagicMock()
@@ -198,31 +206,33 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
             pending_decode,
             "decode",
         )
-        scheduler.tp_worker.async_chained_decode_mlx.return_value = (
-            MagicMock(),
-            [],
-            [],
-            MagicMock(),
-            "decode",
-        )
+        scheduler.tp_worker.async_chained_decode_mlx.side_effect = lambda _decode: (
+            events.append("chained_forward"),
+            (MagicMock(), [], [], MagicMock(), "decode"),
+        )[1]
 
-        with patch(
-            "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
+        launch_times = iter((1.0, 2.0))
+
+        def record_launch_ts():
+            launch_ts = next(launch_times)
+            events.append(f"launch_ts:{launch_ts}")
+            return launch_ts
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.time.monotonic",
+                side_effect=record_launch_ts,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
+            ),
+            self.assertRaises(_StopLoop),
         ):
-            with self.assertRaises(_StopLoop):
-                SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
         scheduler.tp_worker.async_chained_decode_mlx.assert_called_once()
-        self.assertIsInstance(
-            chained_copy.launch_ts,
-            float,
-            msg=(
-                "Chained decode launches must re-stamp launch_ts on their own "
-                "batch copy; inheriting the previous step's stamp skews "
-                "_record_step_counters' decode inter-step timing, and a None "
-                "stamp crashes result processing."
-            ),
-        )
+        self.assertLess(events.index("launch_ts:2.0"), events.index("chained_forward"))
+        self.assertEqual(chained_copy.launch_ts, 2.0)
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
