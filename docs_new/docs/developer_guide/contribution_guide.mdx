@@ -72,7 +72,7 @@ For tests that require launching a server, refer to [`test/registered/README.md`
 
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
-## Write documentations
+## Write documentation
 
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
 For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
@@ -152,9 +152,9 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 - Make functions as pure as possible. Avoid in-place modification of arguments.
 - Keep files concise. If a file exceeds 2,000 lines of code, split it into multiple smaller files. (e.g., `scheduler.py`, `scheduler_output_processor_mixin.py`)
 - In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
-- Keep tests run fast.
-  - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
-  - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
+- Keep tests running fast.
+  - If a single test file runs longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
+  - If a single job in a GitHub workflow runs longer than 30 mins, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
 - Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:
