@@ -123,8 +123,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         detok_rx.push(rx);
     }
 
+    // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
+    // exactly under the overload that makes them necessary (see `Senders::abort`).
+    let (abort_tx, abort_rx) = flume::unbounded::<String>();
     let senders = Senders {
         tm: tm_tx.clone(),
+        abort: abort_tx.clone(),
         tok: tok_tx,
         detok: detok_tx,
     };
@@ -163,7 +167,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 i,
                 rxs.next().unwrap(),
                 backend.clone(),
-                tm_tx.clone(),
+                abort_tx.clone(),
             )
         });
     }
@@ -227,6 +231,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
                 tm_rx,
+                abort_rx.clone(),
                 senders.clone(),
                 ingress_tx,
                 tokenizer_manager::Limits::from_server_args(&cfg.server_args),

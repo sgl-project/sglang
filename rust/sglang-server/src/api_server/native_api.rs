@@ -281,6 +281,21 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
 ) -> Response {
+    // Reject the WHOLE batch before dispatching any of it. `submit` checks one rid
+    // at a time, so a collision at item k left items 0..k already handed to the
+    // scheduler — the client sees a 400 while that prefix keeps generating, and
+    // (until the abort lane landed) could leak their rids too. Python validates
+    // every request before it creates any.
+    {
+        let live = state.live_rids.lock().expect("live_rids poisoned");
+        if let Some(dup) = requests.iter().find(|r| live.contains(&r.rid)) {
+            return pre_submit_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Duplicate request ID detected: {}", dup.rid),
+                stream,
+            );
+        }
+    }
     let mut guard = AbortGuard::new_empty(state.senders.clone(), state.live_rids.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
@@ -425,6 +440,7 @@ mod tests {
     fn senders() -> Senders {
         Senders {
             tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
             tok: flume::unbounded().0,
             detok: vec![],
         }

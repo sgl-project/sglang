@@ -221,7 +221,8 @@ class RustServer:
 
         # Runs on the scheduler's CUDA-launch thread every decode step, so each
         # Python-level pass over the batch costs inter-token latency: `rids` are
-        # the plain rid strings (parsed to u64 on the Rust side, off the GIL),
+        # the plain rid strings (hashed to a routing key on the Rust side with a
+        # per-process seed, off the GIL — not parsed; a rid is any string),
         # `finished_reasons` already `dict | None`, and `output_ids` entries are
         # always `array("i")` (never None) so `map(len)` and a bare
         # `chain.from_iterable` stay in C.
@@ -231,7 +232,7 @@ class RustServer:
         flat_ids = array("i", chain.from_iterable(output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
-        # decode_batch_frame's read order (data_cols); the extras contribution
+        # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
         data_cols = [flat_ids.tobytes()]
@@ -239,7 +240,7 @@ class RustServer:
         if has_extra:
             # The `extras` tuple is the SINGLE source of the extras column
             # order — it must match the Rust ``BatchHeader`` fields and
-            # ``decode_batch_frame``'s read order.
+            # ``for_each_chunk``'s read order.
             #
             # TODO(perf): the per-request flatten assumes the logprob/hidden
             # columns are ragged, non-contiguous nested Python lists — which is

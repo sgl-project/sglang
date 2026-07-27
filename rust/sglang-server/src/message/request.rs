@@ -186,14 +186,20 @@ impl GenerateBody {
                 // prompts is ~200 GB of clones, and a Rust allocation failure calls
                 // `abort()`, which is uncatchable and takes the scheduler process
                 // with it. Bound the product, not just `n`.
-                // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
-                // JSON became ~1008 MiB of live heap once parsed into `Value`
-                // nodes, `String`s and map entries. Scale by that measured factor
-                // so the budget bounds memory rather than wire size.
-                let per_clone = serde_json::to_string(&*sp)
-                    .map_or(0, |s| s.len())
-                    .saturating_mul(JSON_TO_HEAP_FACTOR);
-                check_broadcast_budget(per_clone, n, "sampling_params")?;
+                // `n == 1` is not a broadcast, so skip the sizing entirely: measuring
+                // it means serializing the client's whole `custom_params` to a
+                // throwaway `String` on every single request. The callee's own
+                // `n > 1` guard cannot prevent that — the cost is in the argument.
+                if n > 1 {
+                    // Serialized bytes are NOT the clone cost: measured, 63.7 MiB of
+                    // JSON became ~1008 MiB of live heap once parsed into `Value`
+                    // nodes, `String`s and map entries. Scale by that measured factor
+                    // so the budget bounds memory rather than wire size.
+                    let per_clone = serde_json::to_string(&*sp)
+                        .map_or(0, |s| s.len())
+                        .saturating_mul(JSON_TO_HEAP_FACTOR);
+                    check_broadcast_budget(per_clone, n, "sampling_params")?;
+                }
                 vec![*sp; n]
             }
         };
@@ -307,11 +313,14 @@ pub enum RequestKind {
 #[derive(Debug, Default)]
 pub struct GenerateRequest {
     /// This item's final rid: the client's (normalized per item by `into_requests`) or a
-    /// uuid minted there when none was sent. Duplicates *within* one request are
-    /// rejected by `into_requests` (Python `_validate_rid_uniqueness`); a collision with a
-    /// *concurrent* request's rid still orphans the earlier one on the shared
-    /// `RidHash` slot — the same garbage-in behavior as the Python server's
-    /// `rid_to_state` overwrite.
+    /// uuid minted there when none was sent.
+    ///
+    /// Duplicates *within* one request are rejected by `into_requests` (Python
+    /// `_validate_rid_uniqueness`). A collision with a *concurrent* request's rid
+    /// is rejected too, by the in-flight registry `api_server::submit` consults —
+    /// as Python's `TokenizerManager` does ("Duplicate request ID detected"). It
+    /// used to overwrite the earlier request's `RidHash` slot, and this comment
+    /// used to call that parity with Python; both were wrong.
     pub rid: String,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
