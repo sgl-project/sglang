@@ -485,21 +485,26 @@ class IpcModelLoader(BaseModelLoader):
             ModelOptNvFp4FusedMoEMethod,
         )
 
-        rebound = 0
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if not isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
-                continue
-            module.dispatcher.set_quant_config(
+        # Map each quant method to a function that rebinds the quant state.
+        quant_rebinds = {
+            ModelOptNvFp4FusedMoEMethod: lambda mod: mod.dispatcher.set_quant_config(
                 {
                     "input_global_scale": (
-                        module.w13_input_scale_quant
+                        mod.w13_input_scale_quant
                         if MOE_NVFP4_DISPATCH
                         or should_use_flashinfer_cutlass_moe_fp4_allgather()
                         else None
                     )
                 }
             )
+        }
+
+        rebound = 0
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if not quant_method or quant_method not in quant_rebinds:
+                continue
+            quant_rebinds[quant_method](module)
             rebound += 1
         if rebound:
             logger.info(f"[IpcModelLoader] Rebound quant state on {rebound} module(s)")
