@@ -1499,7 +1499,6 @@ class MoriKVSender(CommonKVSender):
 
         start = time.perf_counter()
         sla_ms = self.kv_mgr._transfer_timeout_ms
-        sla_tripped = False
 
         while True:
             rc = self.kv_mgr.engine.wait_all(
@@ -1507,13 +1506,14 @@ class MoriKVSender(CommonKVSender):
             )
             if rc != StatusCode.IN_PROGRESS:
                 return rc
-            if (
-                sla_ms > 0
-                and not sla_tripped
-                and (time.perf_counter() - start) * 1000 >= sla_ms
-            ):
-                sla_tripped = True
+            if sla_ms > 0 and (time.perf_counter() - start) * 1000 >= sla_ms:
+                # The room is already concluded Failed and decode has been
+                # notified, so nothing can consume a later completion. Give the
+                # shard worker back instead of spinning on it forever: there are
+                # only SGLANG_MORI_TRANSFER_SHARDS of them, and every thread
+                # parked here is one fewer for the transfers still to come.
                 self._finalize_failure(f"KV transfer exceeded SLA {sla_ms}ms")
+                return rc
 
     def _fail_from_worker(self, reason: str) -> None:
         self._finalize_failure(reason)
