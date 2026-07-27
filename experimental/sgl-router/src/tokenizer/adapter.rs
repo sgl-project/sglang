@@ -108,6 +108,79 @@ pub fn load_tokenizer_config(source: &str) -> Result<Option<serde_json::Value>> 
     Ok(Some(value))
 }
 
+/// Load the added-token strings from the `tokenizer.json` named by `source`
+/// (the same value passed to [`load`]) — the structural markers the segment
+/// cache splits on (`<|im_start|>`, role headers, `<|vision_start|>`, ...).
+///
+/// These live in tokenizer.json's `added_tokens` array, NOT in
+/// tokenizer_config.json's `special_tokens_map` (which carries only the 7 named
+/// bos/eos/... tokens). An added token is a HuggingFace hard split boundary (the
+/// tokenizer pre-splits input at them before BPE), so splitting a prompt there
+/// is byte-exact — EXCEPT for tokens with `lstrip`/`rstrip`, which absorb
+/// adjacent whitespace across the boundary and so are NOT byte-exact split
+/// points; those are excluded here. (`normalized`/`single_word` tokens are kept
+/// — they don't move the boundary; validated empirically, e.g. DeepSeek-V4's
+/// `normalized` `<｜User｜>`/`<｜Assistant｜>`, with the self-check as backstop.)
+/// [`super::segment`] additionally probe-filters
+/// the survivors to the tokens the chat template actually emits and runs a
+/// startup self-check (which also catches Metaspace/normalizer models where
+/// per-segment encoding diverges — those self-disable, staying correct).
+///
+/// Returns an empty vec — segmentation then disables itself — on any
+/// missing/unreadable/unparsable file, never an error: an absent marker set is
+/// a graceful "don't segment", not a fatal condition.
+pub fn load_added_special_tokens(source: &str) -> Vec<String> {
+    let path = if Path::new(source).is_file() || looks_like_path(source) {
+        std::path::PathBuf::from(source)
+    } else {
+        match download_tokenizer_json(source) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(repo = %source, error = %e,
+                    "could not resolve tokenizer.json for segment markers; segment cache disabled for this model");
+                return Vec::new();
+            }
+        }
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "read tokenizer.json for segment markers failed; segment cache disabled");
+            return Vec::new();
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "parse tokenizer.json for segment markers failed; segment cache disabled");
+            return Vec::new();
+        }
+    };
+    value
+        .get("added_tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    // Exclude whitespace-absorbing tokens: `lstrip`/`rstrip`
+                    // pull adjacent spaces into the token, so splitting at them
+                    // is not byte-exact (the space crosses the boundary).
+                    let lstrip = t.get("lstrip").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let rstrip = t.get("rstrip").and_then(|b| b.as_bool()).unwrap_or(false);
+                    if lstrip || rstrip {
+                        return None;
+                    }
+                    t.get("content").and_then(|c| c.as_str())
+                })
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn encode(t: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     let enc = t.encode(text).context("encode")?;
     Ok(enc.token_ids().to_vec())
@@ -136,4 +209,36 @@ pub fn decode_complete(t: &Tokenizer, ids: &[u32], skip_special: bool) -> Result
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `load_added_special_tokens` keeps clean/normalized markers but excludes
+    /// whitespace-absorbing (`lstrip`/`rstrip`) tokens, which are not byte-exact
+    /// split points, and drops empty content.
+    #[test]
+    fn added_tokens_excludes_lstrip_rstrip() {
+        let markers = load_added_special_tokens("tests/fixtures/added_tokens_flags.json");
+        assert!(markers.contains(&"<|clean|>".to_string()));
+        assert!(
+            markers.contains(&"<|normalized|>".to_string()),
+            "normalized (non-strip) tokens are kept"
+        );
+        for excluded in ["<|lstrip_tok|>", "<|rstrip_tok|>", "<|both_strip|>", ""] {
+            assert!(
+                !markers.contains(&excluded.to_string()),
+                "{excluded:?} must be excluded (lstrip/rstrip/empty)"
+            );
+        }
+        assert_eq!(markers.len(), 2, "only <|clean|> + <|normalized|> survive");
+    }
+
+    /// A missing/unreadable file yields no markers (segmentation self-disables),
+    /// never a panic/error.
+    #[test]
+    fn added_tokens_missing_file_is_empty() {
+        assert!(load_added_special_tokens("tests/fixtures/does_not_exist.json").is_empty());
+    }
 }

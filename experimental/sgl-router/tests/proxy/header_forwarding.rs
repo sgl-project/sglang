@@ -34,6 +34,7 @@ async fn forwards_whitelisted_headers_strips_others() {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            segment_cache: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],

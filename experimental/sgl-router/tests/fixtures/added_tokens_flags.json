@@ -1,0 +1,11 @@
+{
+  "_comment": "Minimal tokenizer.json-shaped fixture for adapter::load_added_special_tokens. Exercises the lstrip/rstrip exclusion: only <|clean|> and <|normalized|> should survive as segment markers.",
+  "added_tokens": [
+    { "id": 1, "content": "<|clean|>", "lstrip": false, "rstrip": false, "normalized": false, "special": true },
+    { "id": 2, "content": "<|lstrip_tok|>", "lstrip": true, "rstrip": false, "normalized": false, "special": true },
+    { "id": 3, "content": "<|rstrip_tok|>", "lstrip": false, "rstrip": true, "normalized": false, "special": true },
+    { "id": 4, "content": "<|both_strip|>", "lstrip": true, "rstrip": true, "normalized": false, "special": true },
+    { "id": 5, "content": "<|normalized|>", "lstrip": false, "rstrip": false, "normalized": true, "special": true },
+    { "id": 6, "content": "", "lstrip": false, "rstrip": false, "special": true }
+  ]
+}
