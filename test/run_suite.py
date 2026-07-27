@@ -22,6 +22,7 @@ HW_MAPPING = {
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "mlx": HWBackend.MLX,
 }
 
 # Per-commit test suites (run on every PR).
@@ -44,6 +45,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "jit-kernel-benchmark-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -91,11 +93,13 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-4-gpu-h100",
         "extra-b-test-deepep-4-gpu-b200",
         "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
         "base-a-test-1-gpu-small",
+        "stage-a-unit-test-npu",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
@@ -104,6 +108,10 @@ PER_COMMIT_SUITES = {
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
+    ],
+    HWBackend.MLX: [
+        "stage-a-unit-test-mlx",
+        "stage-b-e2e-mlx",
     ],
 }
 
@@ -169,7 +177,11 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 
@@ -189,6 +201,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.CPU,
     HWBackend.MUSA,
     HWBackend.XPU,
+    HWBackend.MLX,
 }
 
 
@@ -325,6 +338,7 @@ def run_a_suite(args):
         if not f.endswith("/conftest.py")
         and not f.endswith("/__init__.py")
         and not f.endswith("/cpu/utils.py")
+        and not f.endswith("/run_tests.py")
     ]
 
     # Strict: all discovered files must have proper registration

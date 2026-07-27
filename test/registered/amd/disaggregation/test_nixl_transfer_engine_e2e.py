@@ -46,7 +46,7 @@ class NixlTransferEngineBase(PDDisaggregationServerBase):
                 raise unittest.SkipTest("torch.cuda is not available.")
             if torch.cuda.device_count() < cls.required_gpus:
                 raise unittest.SkipTest(
-                    f"NIXL PD smoke test requires >= {cls.required_gpus} visible GPUs."
+                    f"NIXL PD check requires >= {cls.required_gpus} visible GPUs."
                 )
         except unittest.SkipTest:
             raise

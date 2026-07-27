@@ -80,6 +80,7 @@ class BenchArgs:
     dataset_path: str = ""
     task_name: str = "unknown"
     num_prompts: int = 10
+    num_outputs_per_prompt: int = 1
     batch_size: int = 1
     random_request_config: str = None
     random_request_seed: int = 42
@@ -88,6 +89,11 @@ class BenchArgs:
     skip_warmup: bool = False
     output_file: str = ""
     disable_tqdm: bool = False
+
+    # Profiling
+    profile: bool = False
+    num_profiled_timesteps: int = 5
+    profile_all_stages: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -147,6 +153,12 @@ class BenchArgs:
             help="Total number of prompts to benchmark",
         )
         parser.add_argument(
+            "--num-outputs-per-prompt",
+            type=int,
+            default=1,
+            help="Number of generated outputs requested per prompt",
+        )
+        parser.add_argument(
             "--batch-size",
             type=int,
             default=1,
@@ -185,6 +197,28 @@ class BenchArgs:
             action="store_true",
             help="Disable progress bar",
         )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help=(
+                "Enable PyTorch profiler for diffusion generation. "
+                "Set SGLANG_DIFFUSION_TORCH_PROFILER_DIR to control trace output directory."
+            ),
+        )
+        parser.add_argument(
+            "--num-profiled-timesteps",
+            type=int,
+            default=5,
+            help=(
+                "Number of denoising timesteps to profile after warmup. "
+                "Use -1 to profile all denoising timesteps."
+            ),
+        )
+        parser.add_argument(
+            "--profile-all-stages",
+            action="store_true",
+            help="Profile all diffusion pipeline stages instead of only denoising steps.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -216,7 +250,7 @@ def generate_batch(
     output = BatchOutput()
     start_time = time.perf_counter()
 
-    torch.cuda.reset_peak_memory_stats()
+    torch.get_device_module().reset_peak_memory_stats()
 
     for prompt, params in zip(prompts, user_sampling_params):
         try:
@@ -237,7 +271,9 @@ def generate_batch(
     output.latency = time.perf_counter() - start_time
     output.latency_per_sample = output.latency / len(prompts) if prompts else 0.0
     output.success = output.num_samples > 0
-    output.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    output.peak_memory_mb = torch.get_device_module().max_memory_allocated() / (
+        1024 * 1024
+    )
 
     logger.debug(
         f"Batch generated: {output.num_samples}/{len(prompts)} samples in {output.latency:.2f}s"
@@ -309,9 +345,14 @@ def throughput_test(
             "--random-request-config can only be used with --dataset random"
         )
 
+    if bench_args.num_outputs_per_prompt != 1:
+        raise ValueError(
+            "bench_offline_throughput currently supports only --num-outputs-per-prompt 1"
+        )
+
     logger.info(f"Loading {bench_args.dataset} dataset...")
     if bench_args.dataset == "vbench":
-        bench_args.task_name = engine.server_args.pipeline_config.task_type
+        bench_args.task_name = str(engine.server_args.pipeline_config.task_type)
         dataset = VBenchDataset(bench_args)
     elif bench_args.dataset == "random":
         dataset = RandomDataset(bench_args)
@@ -324,7 +365,11 @@ def throughput_test(
         "height": bench_args.height,
         "width": bench_args.width,
         "num_frames": bench_args.num_frames,
+        "num_outputs_per_prompt": bench_args.num_outputs_per_prompt,
         "seed": bench_args.seed,
+        "profile": bench_args.profile,
+        "num_profiled_timesteps": bench_args.num_profiled_timesteps,
+        "profile_all_stages": bench_args.profile_all_stages,
     }
     if bench_args.disable_safety_checker:
         _sampling_params["safety_checker"] = None
@@ -345,7 +390,9 @@ def throughput_test(
         logger.info("Running warmup batch...")
         warmup_count = min(bench_args.batch_size, total_count)
         warmup_prompts = all_prompts[:warmup_count]
-        warmup_sampling_params = all_sampling_params[:warmup_count]
+        warmup_sampling_params = [
+            {**p, "profile": False} for p in all_sampling_params[:warmup_count]
+        ]
         generate_batch(engine, bench_args, warmup_prompts, warmup_sampling_params)
 
     logger.info(f"Running benchmark with {bench_args.num_prompts} prompts...")

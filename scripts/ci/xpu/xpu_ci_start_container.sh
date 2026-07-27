@@ -98,7 +98,11 @@ elif [[ -r "${HF_TOKEN_FILE}" ]]; then
 fi
 
 echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
+# SGLANG_SERVER_LAUNCH_TIMEOUT=36000 matches /data/pgirijal/scripts/setup_upstream_env.sh:
+# 4-GPU MoE loads (Qwen3.5-35B-A3B, gemma-4-26B-A4B, ...) on Arc Pro B60 can
+# take >1h from a cold HF cache, so give sglang server startup a 10h ceiling.
 docker run -dt \
+  --shm-size 8g \
   --group-add 992 \
   ${VIDEO_GID:+--group-add "${VIDEO_GID}"} \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \
@@ -107,6 +111,7 @@ docker run -dt \
   -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   -e HF_TOKEN="${HF_TOKEN_VALUE}" \
+  -e SGLANG_SERVER_LAUNCH_TIMEOUT=36000 \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"
 

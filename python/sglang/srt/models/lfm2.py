@@ -40,7 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -265,10 +265,11 @@ class Lfm2ShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
-        conv_state = layer_cache.conv[0]
-        req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
+        # The backend owns the per-request conv-state plumbing (slot indices,
+        # prefix mask, cu-seqlens, cuda-graph buffers); this layer just runs its
+        # depthwise conv against the returned handle.
+        meta = get_attn_backend().conv_state_metadata(self.layer_idx, forward_batch)
+        conv_state = meta.layer_cache.conv[0]
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)
@@ -283,40 +284,18 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=mamba_indices.to(torch.int32),
+                conv_state_indices=meta.cache_indices,
             )
         else:
             # Prefill: multiple tokens, use varlen kernel
-            T = hidden_states.shape[0]
             Bx_t = Bx.transpose(0, 1).contiguous()
-
-            # Build query_start_loc: [0, cumsum(seq_lens)...]
-            extend_start_loc = forward_batch.extend_start_loc
-            if extend_start_loc is not None and len(extend_start_loc) > 1:
-                query_start_loc = torch.cat(
-                    [
-                        extend_start_loc,
-                        torch.tensor(
-                            [T], dtype=torch.int32, device=hidden_states.device
-                        ),
-                    ]
-                )
-                cache_indices = mamba_indices.to(torch.int32)
-                has_initial_state = forward_batch.extend_prefix_lens > 0
-            else:
-                query_start_loc = torch.tensor(
-                    [0, T], dtype=torch.int32, device=hidden_states.device
-                )
-                cache_indices = mamba_indices[:1].to(torch.int32)
-                has_initial_state = forward_batch.extend_prefix_lens[:1] > 0
-
             conv_out = causal_conv1d_fn(
                 Bx_t,
                 self.conv_weight,
                 self.conv_bias,
-                query_start_loc=query_start_loc,
-                cache_indices=cache_indices,
-                has_initial_state=has_initial_state,
+                query_start_loc=meta.query_start_loc,
+                cache_indices=meta.cache_indices,
+                has_initial_state=meta.has_initial_state,
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
