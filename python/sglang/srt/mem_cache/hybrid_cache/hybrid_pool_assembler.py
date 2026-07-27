@@ -64,6 +64,7 @@ def build_kv_host_pool(
     server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
+    host_size: Optional[float] = None,
 ):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -74,11 +75,27 @@ def build_kv_host_pool(
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        server_args.hicache_size if host_size is None else host_size,
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
         **kwargs,
+    )
+
+
+def _split_hicache_size(
+    hicache_size: int, kv_pools: tuple[Any, ...]
+) -> tuple[float, ...]:
+    device_pool_sizes = []
+    for kv_pool in kv_pools:
+        size_bytes = kv_pool.get_kv_size_bytes()
+        device_pool_sizes.append(
+            sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
+        )
+    total_device_pool_size = sum(device_pool_sizes)
+    return tuple(
+        hicache_size * size_bytes / total_device_pool_size
+        for size_bytes in device_pool_sizes
     )
 
 
@@ -182,17 +199,24 @@ def build_hybrid_swa_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+    kv_host_size = swa_host_size = None
+    if server_args.hicache_size > 0:
+        kv_host_size, swa_host_size = _split_hicache_size(
+            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=params.page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size=kv_host_size,
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=params.page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size=swa_host_size,
     )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
