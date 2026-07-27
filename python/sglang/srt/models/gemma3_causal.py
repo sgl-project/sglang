@@ -374,12 +374,19 @@ class Gemma3DecoderLayer(nn.Module):
         position_embeddings_global: torch.Tensor,
         position_embeddings_local: torch.Tensor,
         forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # Keep the residual live across layers so the add preceding the next
+        # RMSNorm is fused by Gemma3RMSNorm. This matches the upstream Gemma3
+        # residual layout and is safe to capture in a breakable CUDA graph.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # apply global RoPE to non-sliding layer only
         if self.self_attn.is_sliding:
@@ -395,15 +402,13 @@ class Gemma3DecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states, residual = self.pre_feedforward_layernorm(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        outputs = (hidden_states, residual)
 
         return outputs
 
@@ -626,21 +631,22 @@ class Gemma3TextModel(PreTrainedModel):
             hidden_states = input_embeds
 
         aux_hidden_states = []
+        residual = None
 
         num_layers = len(self.layers)
         if _is_cpu and _is_cpu_amx_available:
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
-                layer_outputs = layer(
+                hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=None,
                     position_embeddings_local=None,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
+                    residual=residual,
                     **kwargs,
                 )
-                hidden_states = layer_outputs[0]
         else:
             if positions.dim() == 1:
                 positions = einops.rearrange(positions, "s -> 1 s")
@@ -650,15 +656,15 @@ class Gemma3TextModel(PreTrainedModel):
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states)
-                layer_outputs = layer(
+                hidden_states, residual = layer(
                     positions=positions,
                     position_embeddings_global=position_embeddings_global,
                     position_embeddings_local=position_embeddings_local,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
+                    residual=residual,
                     **kwargs,
                 )
-                hidden_states = layer_outputs[0]
 
         # Capture the output of the last layer if requested.
         # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
@@ -666,7 +672,7 @@ class Gemma3TextModel(PreTrainedModel):
         if num_layers in self.layers_to_capture:
             aux_hidden_states.append(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

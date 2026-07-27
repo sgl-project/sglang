@@ -46,8 +46,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt.compilation import torch_compile_decoration
-from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -99,7 +97,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -362,16 +360,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 params.index("input_embeds") if "input_embeds" in params else None
             )
 
-        # BCG can capture an Inductor-compiled transformer body. Compile only
-        # the largest prefill bucket: it is the throughput-critical shape and
-        # avoids compiling every static BCG bucket during server startup.
-        self.enable_torch_compile = bool(
-            get_flags().capture.enable_torch_compile
-            and isinstance(self.backend, BreakableCudaGraphBackend)
-        )
-        if self.enable_torch_compile:
-            set_torch_compile_config()
-
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
 
@@ -484,7 +472,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             yield
 
     @torch.no_grad()
-    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int, forward=None):
+    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run forward inside the prefill set_tc_piecewise_forward_context.
 
         BCG path: captures only the inner layer_model.forward (transformer
@@ -515,7 +503,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                return (forward or self.layer_model.forward)(
+                return self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
@@ -872,11 +860,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        # warmup() can disable torch.compile for models that report they are
-        # incompatible with it. Keep BCG capture aligned with that decision.
-        self.enable_torch_compile = bool(
-            self.enable_torch_compile and get_flags().capture.enable_torch_compile
-        )
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
@@ -904,15 +887,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            with torch_compile_decoration.patch_model(
-                self.layer_model,
-                self.enable_torch_compile and num_tokens == self.max_num_tokens,
-                num_tokens=num_tokens,
-                tp_group=self.model_runner.tp_group,
-            ) as forward:
-                self.capture_one_shape(num_tokens, forward)
+            self.capture_one_shape(num_tokens)
 
-    def capture_one_shape(self, size: int, forward) -> None:
+    def capture_one_shape(self, size: int) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -924,7 +901,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, num_tokens)
 
         def run_once():
-            return self._run_forward(forward_batch, num_tokens, forward)
+            return self._run_forward(forward_batch, num_tokens)
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
