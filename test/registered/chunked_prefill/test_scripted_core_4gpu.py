@@ -77,7 +77,10 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                 scheduler.chunked_req is None
                 and len(scheduler.waiting_queue) == 0
                 and all(x.is_empty() for x in scheduler.running_mbs)
-                and (scheduler.cur_batch is None or scheduler.cur_batch.is_empty())
+                and (
+                    scheduler.cur_batch_for_debug is None
+                    or scheduler.cur_batch_for_debug.is_empty()
+                )
                 and (scheduler.last_batch is None or scheduler.last_batch.is_empty())
             )
             if in_flight and queues_clear:

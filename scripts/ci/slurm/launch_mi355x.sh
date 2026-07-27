@@ -24,6 +24,12 @@
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
 #                        off (e.g. hosts with a broken RDMA driver)
+#   SGLANG_USE_CHECKOUT_RUNTIME
+#                      - default 1. Reinstall this workflow checkout's Python
+#                        sglang package inside each runtime container, and the
+#                        checkout sglang-router package inside the bench
+#                        container, before launching servers/bench. Set 0 to
+#                        use the image's baked-in packages.
 #   RUNNER_NAME        - GitHub runner name (a built-in default env var)
 #   GITHUB_RUN_ID      - GitHub Actions run id (a built-in default env var)
 #                        The allocation is named
@@ -52,6 +58,11 @@ set -x
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
 MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
+SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
+case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
+    0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
+    *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
+esac
 
 if [[ -z "$MODEL_PATH" ]]; then
     echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
@@ -59,19 +70,26 @@ if [[ -z "$MODEL_PATH" ]]; then
 fi
 
 # Resolve a HuggingFace cache dir (models--org--name) to its live snapshot dir.
-# Lets nightly-configs point at the shared cache without hardcoding a snapshot
-# hash; if MODEL_PATH is already a concrete snapshot (or plain dir), use as-is.
-if [[ -f "$MODEL_PATH/refs/main" && -d "$MODEL_PATH/snapshots" ]]; then
-    SNAP_HASH="$(cat "$MODEL_PATH/refs/main")"
-    RESOLVED="$MODEL_PATH/snapshots/$SNAP_HASH"
-    if [[ -d "$RESOLVED" ]]; then
-        echo "resolved snapshot: $MODEL_PATH -> $RESOLVED"
-        MODEL_PATH="$RESOLVED"
-    else
-        echo "ERROR: refs/main=$SNAP_HASH but $RESOLVED missing" >&2
-        exit 1
+# Lets nightly-configs / recipes point at the shared cache without hardcoding a
+# snapshot hash; a concrete snapshot dir (or plain dir) is returned unchanged.
+# Used for both MODEL_PATH and an optional speculative draft model path.
+resolve_snapshot() {
+    local p="$1"
+    if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
+        local hash resolved
+        hash="$(cat "$p/refs/main")"
+        resolved="$p/snapshots/$hash"
+        if [[ -n "$hash" && -d "$resolved" ]]; then
+            echo "resolved snapshot: $p -> $resolved" >&2
+            echo "$resolved"
+            return 0
+        fi
+        echo "ERROR: refs/main=$hash but $resolved missing" >&2
+        return 1
     fi
-fi
+    echo "$p"
+}
+MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1
 
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
@@ -89,7 +107,12 @@ rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
 res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
-emit("ATTN", rt["attention_backend"])
+# Attention backend: single (`attention_backend`) or split
+# (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
+# the flag is dropped for a model that omits it.
+emit("ATTN", rt.get("attention_backend", ""))
+emit("PATTN", rt.get("prefill_attention_backend", ""))
+emit("DATTN", rt.get("decode_attention_backend", ""))
 emit("IB", rt["ib_devices"])
 emit("PPORT", rt["prefill_port"])
 emit("DPORT", rt["decode_port"])
@@ -99,17 +122,25 @@ emit("LBPORT", rt["lb_port"])
 emit("MEMFRAC", rt["mem_fraction_static"])
 emit("PAGE", rt["page_size"])
 emit("MAXREQ", rt["max_running_requests"])
+emit("MAXTOK", rt.get("max_total_tokens", ""))
 emit("CHUNK", rt["chunked_prefill_size"])
-emit("SWA", rt["swa_full_tokens_ratio"])
+# swa is DSV4-specific; emit empty when a model omits it so the flag is dropped.
+emit("SWA", rt.get("swa_full_tokens_ratio", ""))
+# 1 when the recipe carries a `model:` block (env + server_args written to
+# model_flags.sh); 0 for the DSV4 recipes, which keep the hardcoded DSV4 path.
+emit("HAS_MODEL", 1 if r.get("model") else 0)
 emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
 emit("PEP", b["prefill"].get("expert-parallel-size", 1))
 emit("PDP", b["prefill"].get("data-parallel-size", 1))
 m = r.get("mtp", {}) or {}
 emit("MTP_ENABLED", 1 if m.get("enabled") else 0)
+emit("MTP_ALGO", m.get("algorithm", "EAGLE"))
 emit("MTP_STEPS", m.get("num_steps", 3))
 emit("MTP_TOPK", m.get("eagle_topk", 1))
 emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
+# External draft checkpoint (EAGLE3 etc.); empty for DSV4's built-in EAGLE head.
+emit("MTP_DRAFT_PATH", m.get("draft_model_path", ""))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -134,7 +165,7 @@ eval "$RECIPE_VARS"
 if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
     IMAGE="$IMAGE_OVERRIDE"
 fi
-echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
+echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -143,6 +174,23 @@ echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Stage the workflow checkout on shared NFS so Slurm compute-node containers can
+# reinstall the same code SHA the workflow checked out. The container gets a
+# read-only mount and copies it to /tmp before mutating pyproject.toml.
+CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"
+if [[ "$SGLANG_USE_CHECKOUT_RUNTIME" == "1" ]]; then
+    CHECKOUT_STAGE="$WORKDIR/checkout"
+    CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+    echo "Staging checkout runtime: sha=$CHECKOUT_SHA -> $CHECKOUT_STAGE"
+    rm -rf "$CHECKOUT_STAGE"
+    mkdir -p "$CHECKOUT_STAGE"
+    tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git/config' \
+        -C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -
+    CHECKOUT_DOCKER_ARGS="$CHECKOUT_DOCKER_ARGS -e SGLANG_CHECKOUT_SHA=$CHECKOUT_SHA -v $CHECKOUT_STAGE:/sglang-checkout:ro"
+else
+    echo "SGLANG_USE_CHECKOUT_RUNTIME=0; using sglang package baked into image."
+fi
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
@@ -182,53 +230,284 @@ DSV4_ENV=(
   -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
 DSV4_ENV_STR="${DSV4_ENV[*]}"
+# A recipe carrying a `model:` block supplies its OWN docker env (below), so the
+# DSV4 env must not leak into it; the DSV4 recipes keep the string above.
+[[ "$HAS_MODEL" == "1" ]] && DSV4_ENV_STR=""
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
+
+# Model-specific docker `-e` env + sglang server args from the recipe's optional
+# `model:` block, written as bash arrays to model_flags.sh (sourced by
+# prefill.sh/decode.sh). DSV4 recipes have no `model:` block -> empty arrays, so
+# their generated docker argv is unchanged. Each server arg + its value MUST be a
+# separate YAML list item so shlex.quote keeps "--foo" and "bar" as two tokens.
+python3 - "$CONFIG_FILE" "$WORKDIR/model_flags.sh" <<'PY'
+import shlex, sys, yaml
+r = yaml.safe_load(open(sys.argv[1]))
+model = r.get("model", {}) or {}
+env = model.get("env", {}) or {}
+server_args = model.get("server_args", []) or []
+# YAML true/false parse to Python bool; render lowercase so env values stay
+# byte-identical to shell (`=false`, not `=False`) -- SGLang parsing is
+# case-sensitive for some of these.
+def fmt(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+env_args = []
+for k, v in env.items():
+    env_args += ["-e", f"{k}={fmt(v)}"]
+def q(items):
+    return " ".join(shlex.quote(fmt(x)) for x in items)
+with open(sys.argv[2], "w") as f:
+    f.write(f"MODEL_ENV_ARGS=({q(env_args)})\n")
+    f.write(f"MODEL_SERVER_ARGS=({q(server_args)})\n")
+PY
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
 EXTRA_FLAGS=""
 (( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
 (( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+[[ -n "$MAXTOK" ]] && EXTRA_FLAGS="$EXTRA_FLAGS --max-total-tokens $MAXTOK"
 if [[ "$MTP_ENABLED" == "1" ]]; then
-    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm EAGLE \
+    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm $MTP_ALGO \
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
 --speculative-num-draft-tokens $MTP_DRAFT"
+    # EAGLE3 (and other draft-model algos) need an external draft checkpoint;
+    # built-in EAGLE (DSV4) omits draft_model_path and this stays unset.
+    if [[ -n "$MTP_DRAFT_PATH" ]]; then
+        DRAFT_RESOLVED="$(resolve_snapshot "$MTP_DRAFT_PATH")" || exit 1
+        EXTRA_FLAGS="$EXTRA_FLAGS --speculative-draft-model-path $DRAFT_RESOLVED"
+    fi
 fi
-echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED)"
+echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED algo=$MTP_ALGO)"
 
-COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+if [[ "$HAS_MODEL" == "1" ]]; then
+    # Generic path (e.g. Kimi): attention + swa from the recipe, model parsers /
+    # quirks ride MODEL_SERVER_ARGS. Single `--attention-backend` when the recipe
+    # sets `attention_backend`; split `--prefill-/--decode-attention-backend` when
+    # it sets the per-role keys. swa dropped when the recipe omits it.
+    ATTN_FLAGS=""
+    [[ -n "$ATTN" ]]  && ATTN_FLAGS="$ATTN_FLAGS --attention-backend $ATTN"
+    [[ -n "$PATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --prefill-attention-backend $PATTN"
+    [[ -n "$DATTN" ]] && ATTN_FLAGS="$ATTN_FLAGS --decode-attention-backend $DATTN"
+    SWA_FLAG=""
+    [[ -n "$SWA" ]] && SWA_FLAG=" --swa-full-tokens-ratio $SWA"
+    COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
+$ATTN_FLAGS --max-running-requests $MAXREQ --page-size $PAGE \
+--mem-fraction-static $MEMFRAC$SWA_FLAG \
+--chunked-prefill-size $CHUNK \
+--disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
+else
+    # DSV4 path: byte-identical to the pre-Kimi launcher.
+    COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
 --attention-backend $ATTN --max-running-requests $MAXREQ --page-size $PAGE \
 --mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
 --disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
+fi
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
--v /it-share:/it-share:ro -v $HOME:/host_home"
+-v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 
 # ---------------------------------------------------------------------------
 # Write per-role scripts that srun dispatches to each compute node.
 # ---------------------------------------------------------------------------
+# These are UNQUOTED `<<EOF` heredocs, so $MORI_ENV/$DSV4_ENV_STR/$COMMON_FLAGS/
+# $IMAGE/$MODEL_PATH expand now (at generation). model_flags.sh is sourced at
+# runtime for the model's env/server arrays, so the `${MODEL_ENV_ARGS[@]}` /
+# `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
+# and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
+# set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
+cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-sglang] disabled; using image-baked sglang"
+    exit 0
+    ;;
+esac
+
+CHECKOUT_SRC="${CHECKOUT_SRC:-/sglang-checkout}"
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+
+if [[ ! -f "$CHECKOUT_SRC/python/sglang/version.py" ]]; then
+  echo "[checkout-sglang] ERROR: invalid checkout mount: $CHECKOUT_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-sglang] reinstalling sglang from $CHECKOUT_SRC"
+rm -rf "$RUNTIME_CHECKOUT"
+mkdir -p "$RUNTIME_CHECKOUT"
+tar --exclude='__pycache__' --exclude='*.pyc' \
+  -C "$CHECKOUT_SRC" -cf - . | tar -C "$RUNTIME_CHECKOUT" -xf -
+
+git config --global --add safe.directory "$RUNTIME_CHECKOUT" || true
+
+# The ROCm pyproject variant is the one used by AMD CI. Mutate only the private
+# /tmp copy so prefill/decode/bench never race on the read-only checkout mount.
+rm -f "$RUNTIME_CHECKOUT/python/pyproject.toml"
+cp "$RUNTIME_CHECKOUT/python/pyproject_other.toml" "$RUNTIME_CHECKOUT/python/pyproject.toml"
+for f in README.md LICENSE; do
+  if [[ -f "$RUNTIME_CHECKOUT/$f" && ! -e "$RUNTIME_CHECKOUT/python/$f" ]]; then
+    cp "$RUNTIME_CHECKOUT/$f" "$RUNTIME_CHECKOUT/python/$f"
+  fi
+done
+
+python3 -m pip uninstall -y sglang || true
+python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+
+export RUNTIME_CHECKOUT
+export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
+python3 - <<'PY'
+import importlib.metadata
+import os
+import subprocess
+import sglang
+
+checkout = os.environ["RUNTIME_CHECKOUT"]
+expected = os.path.realpath(os.path.join(checkout, "python", "sglang")) + os.sep
+actual = os.path.realpath(os.path.dirname(sglang.__file__)) + os.sep
+try:
+    sha = subprocess.check_output(
+        ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
+    ).strip()
+except Exception:
+    sha = os.environ.get("SGLANG_CHECKOUT_SHA", "unknown")
+
+print(f"[checkout-sglang] sha={sha}")
+print(f"[checkout-sglang] sglang_file={sglang.__file__}")
+print(f"[checkout-sglang] sglang_version={importlib.metadata.version('sglang')}")
+if not actual.startswith(expected):
+    raise SystemExit(f"sglang did not import from checkout: {sglang.__file__}")
+PY
+EOF
+
+cat > "$WORKDIR/install_checkout_router.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+case "${SGLANG_USE_CHECKOUT_RUNTIME:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    echo "[checkout-router] disabled; using image-baked sglang-router"
+    python3 - <<'PY' || true
+import importlib.metadata
+import sglang_router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+try:
+    import sglang_router.sglang_router_rs as rs
+
+    print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+except Exception as exc:
+    print(f"[checkout-router] sglang_router_rs_import_error={exc}")
+PY
+    exit 0
+    ;;
+esac
+
+RUNTIME_CHECKOUT="${RUNTIME_CHECKOUT:-/tmp/sglang-checkout-runtime}"
+ROUTER_SRC="$RUNTIME_CHECKOUT/sgl-model-gateway/bindings/python"
+WHEEL_DIR="${SGLANG_ROUTER_WHEEL_DIR:-/tmp/sglang-router-wheels}"
+
+if [[ ! -f "$ROUTER_SRC/pyproject.toml" ]]; then
+  echo "[checkout-router] ERROR: invalid router checkout: $ROUTER_SRC" >&2
+  exit 1
+fi
+
+echo "[checkout-router] building sglang-router from $ROUTER_SRC"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+python3 -m maturin --version >/dev/null 2>&1 \
+  || python3 -m pip install --no-cache-dir "maturin<1.14"
+
+# Match the ROCm image build recipe when compiling from the checkout copy.
+if [[ -f "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml" ]]; then
+  sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+    "$RUNTIME_CHECKOUT/sgl-model-gateway/Cargo.toml"
+fi
+
+rm -rf "$WHEEL_DIR"
+mkdir -p "$WHEEL_DIR"
+(
+  cd "$ROUTER_SRC"
+  ulimit -n 65536 || true
+  python3 -m maturin build --release --features vendored-openssl --out "$WHEEL_DIR"
+)
+
+python3 -m pip uninstall -y sglang-router || true
+python3 -m pip install --force-reinstall --no-deps "$WHEEL_DIR"/*.whl
+
+python3 - <<'PY'
+import importlib.metadata
+import sglang_router
+import sglang_router.sglang_router_rs as rs
+from sglang_router.sglang_router_rs import Router
+
+print(f"[checkout-router] sglang_router_file={sglang_router.__file__}")
+print(
+    "[checkout-router] sglang_router_version="
+    f"{importlib.metadata.version('sglang-router')}"
+)
+print(f"[checkout-router] sglang_router_rs_file={rs.__file__}")
+print(f"[checkout-router] Router={Router}")
+PY
+EOF
+
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+EOF
+
+cat > "$WORKDIR/decode_entry.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+source "\$CIDIR/model_flags.sh"
+bash "\$CIDIR/install_checkout_sglang.sh"
+if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
+  export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+fi
+exec python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  $COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
+  --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+EOF
+
 cat > "$WORKDIR/prefill.sh" <<EOF
 #!/bin/bash
+source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_prefill 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_prefill \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
-  $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/prefill_entry.sh
 EOF
 
 cat > "$WORKDIR/decode.sh" <<EOF
 #!/bin/bash
+source "$WORKDIR/model_flags.sh"
 docker rm -f mi355x_decode 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_decode \
-  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR \
-  $IMAGE python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
-  $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
+  -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $MORI_ENV $DSV4_ENV_STR "\${MODEL_ENV_ARGS[@]}" \
+  $IMAGE bash /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/decode_entry.sh
 EOF
 
 # Probe payload + validator (separate files to avoid quoting inside the
@@ -256,7 +535,14 @@ docker rm -f mi355x_bench 2>/dev/null || true
 docker run $DOCKER_COMMON --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP \
   $IMAGE bash -lc '
-    export PYTHONPATH=/sgl-workspace/sglang/python:\$PYTHONPATH
+    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    bash \$CIDIR/install_checkout_sglang.sh
+    if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
+      export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
+    else
+      export PYTHONPATH=/sgl-workspace/sglang/python:\${PYTHONPATH:-}
+    fi
+    bash \$CIDIR/install_checkout_router.sh
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
     python3 -m sglang_router.launch_router \
@@ -266,7 +552,6 @@ docker run $DOCKER_COMMON --name mi355x_bench \
       --host 0.0.0.0 --port $LBPORT \
       --disable-circuit-breaker &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
-    CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     echo "[probe] PD end-to-end check via LB"
     curl -sf -X POST http://127.0.0.1:$LBPORT/generate \
       -H "content-type: application/json" -d @\$CIDIR/probe.json > \$CIDIR/probe_out.json \
