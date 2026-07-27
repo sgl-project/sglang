@@ -183,6 +183,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
+        # DFLASH draft + prefill-CP: keep the draft cell-size budget consistent
+        # with the draft KV pool geometry (dense draft shards KV heads by tp_size,
+        # not attn_tp_size which is 1 under CP), so draft token capacity matches
+        # the target. No-op when attn_tp_size == tp_size (non-CP).
+        if (
+            kvc.is_draft_worker
+            and kvc.spec_algorithm.is_dflash_family()
+            and get_parallel().attn_tp_size != get_parallel().tp_size
+        ):
+            tp_size = get_parallel().tp_size
 
         if kvc.use_mla_backend:
             cell_size = (
