@@ -1,7 +1,8 @@
 """Positional-ABI tripwire for the embedded Rust server's scheduler wire.
 
-`rust/sglang-server`'s `GenerateRequest::to_header_msgpack` hand-writes
-`TokenizedGenerateReqInput` as a positional tagged msgpack array (msgspec
+`rust/sglang-server`'s `TokenizedGenerateReqInput` wire struct
+(`src/message/io_struct.rs`) hand-writes the header as a positional tagged
+msgpack array (msgspec
 `array_like=True` layout: `[tag, *fields]`), ending at `disagg_prefill_dp_rank`
 so the PD bootstrap block rides the wire. msgspec resolves fields by position,
 so a reorder of / insertion into the first 30 fields of the Python struct would
@@ -29,8 +30,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-c-test-cpu")
 
-# The exact prefix `to_header_msgpack` (rust/sglang-server/src/message.rs)
-# emits, in wire order. Array index = field index + 1 (idx 0 is the tag).
+# The exact prefix the Rust `TokenizedGenerateReqInput` wire struct
+# (rust/sglang-server/src/message/io_struct.rs) emits, in wire order.
+# Array index = field index + 1 (idx 0 is the tag).
 RUST_HEADER_FIELDS = (
     "rid",
     "http_worker_ipc",
@@ -77,8 +79,9 @@ class TestRustHeaderAbi(CustomTestCase):
             TokenizedGenerateReqInput.__struct_fields__[: len(RUST_HEADER_FIELDS)],
             RUST_HEADER_FIELDS,
             "TokenizedGenerateReqInput's leading fields moved: the Rust "
-            "encoder writes these slots positionally — update "
-            "rust/sglang-server/src/message.rs::to_header_msgpack in the same "
+            "encoder writes these slots positionally — update the "
+            "TokenizedGenerateReqInput wire struct in "
+            "rust/sglang-server/src/message/io_struct.rs in the same "
             "change or every rust-ingress request is silently corrupted.",
         )
 
