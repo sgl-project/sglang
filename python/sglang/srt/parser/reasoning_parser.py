@@ -2,9 +2,9 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
-from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token as dsv32_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
+from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token as dsv32_dsml_token
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
