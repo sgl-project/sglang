@@ -5,7 +5,7 @@
 // (benchmark/H200/script/v1/launch-k3.sh, benchmark/B300/script/v1/launch-k3.sh)
 // and the B200 2×8 / GB200 4×4 / H100 4×8 / MI35x 1×8 reference launches.
 // Kimi-K3 is a hybrid MoE VLM: 93 layers = 69 KDA (linear) + 24 MLA, 896 routed
-// experts + 1 shared. Served today from the DarkSharpness/sglang-kimi fork.
+// experts + 1 shared. Served today from the public sgl-project/sglang kimi-k3 branch.
 
 export const config = {
   modelName: "Kimi-K3",
@@ -216,8 +216,8 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang:dev-rocm720-mi35x",
-    mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
+    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
