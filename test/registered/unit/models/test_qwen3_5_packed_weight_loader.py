@@ -1,5 +1,5 @@
 """
-Unit tests for Qwen3_5GatedDeltaNet._make_packed_weight_loader.
+Unit tests for Qwen3_5GatedDeltaNet packed weight loading.
 
 Validates that per-tensor FP8 scales (scalar or single-element tensors)
 are broadcast to every logical shard, while normal multi-element weights
@@ -18,8 +18,15 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_mock_module(output_sizes):
@@ -39,7 +46,7 @@ def _make_per_tensor_scale_param(num_shards):
     )
 
 
-class TestMakePackedWeightLoader(unittest.TestCase):
+class TestMakePackedWeightLoader(CustomTestCase):
     """Tests for _make_packed_weight_loader broadcast / split logic."""
 
     # ------------------------------------------------------------------ #
@@ -210,6 +217,81 @@ class TestMakePackedWeightLoader(unittest.TestCase):
             # .view(-1) should flatten to [1]
             self.assertEqual(chunk.shape, torch.Size([1]))
             self.assertAlmostEqual(chunk.item(), 0.75, places=5)
+
+    def test_bind_packed_weight_loaders_includes_weight_scale_2(self):
+        module = _make_mock_module(output_sizes=[16, 16])
+        param = _make_per_tensor_scale_param(num_shards=2)
+        module.weight_scale_2 = param
+
+        before = param.weight_loader
+        gdn = object.__new__(Qwen3_5GatedDeltaNet)
+
+        Qwen3_5GatedDeltaNet._bind_packed_weight_loaders(gdn, module)
+
+        self.assertIsNot(param.weight_loader, before)
+
+
+class TestQwen35ModelOptFp4Loading(CustomTestCase):
+    def test_modelopt_fp4_config_uses_packed_mapping_for_linear_attn(self):
+        packed_mapping = {"in_proj_qkvz": ["in_proj_qkv", "in_proj_z"]}
+        excluded_quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="auto",
+            group_size=16,
+            exclude_modules=[
+                "model.layers.0.linear_attn.in_proj_qkv",
+                "model.layers.0.linear_attn.in_proj_z",
+            ],
+            packed_modules_mapping=packed_mapping,
+        )
+        quantized_quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="auto",
+            group_size=16,
+            exclude_modules=[],
+            packed_modules_mapping=packed_mapping,
+        )
+
+        excluded_layer = MergedColumnParallelLinear(
+            input_size=16,
+            output_sizes=[16, 16],
+            bias=False,
+            quant_config=excluded_quant_config,
+            prefix="model.layers.0.linear_attn.in_proj_qkvz",
+            tp_rank=0,
+            tp_size=1,
+        )
+        quantized_layer = MergedColumnParallelLinear(
+            input_size=16,
+            output_sizes=[16, 16],
+            bias=False,
+            quant_config=quantized_quant_config,
+            prefix="model.layers.0.linear_attn.in_proj_qkvz",
+            tp_rank=0,
+            tp_size=1,
+        )
+
+        self.assertIsInstance(excluded_layer.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(quantized_layer.quant_method, ModelOptFp4LinearMethod)
+
+    def test_conv1d_loader_accepts_checkpoint_singleton_dim(self):
+        calls = []
+
+        def loader(param, loaded_weight):
+            del param
+            calls.append(loaded_weight)
+
+        wrapped_loader = Qwen3_5GatedDeltaNet._make_conv1d_weight_loader(loader)
+
+        param = SimpleNamespace(data=torch.empty(5120, 4))
+        loaded_weight = torch.empty(5120, 1, 4)
+        wrapped_loader(param, loaded_weight)
+        self.assertEqual(calls.pop().shape, torch.Size([5120, 4]))
+
+        param = SimpleNamespace(data=torch.empty(5120, 1, 4))
+        loaded_weight = torch.empty(5120, 4)
+        wrapped_loader(param, loaded_weight)
+        self.assertEqual(calls.pop().shape, torch.Size([5120, 1, 4]))
 
 
 if __name__ == "__main__":
