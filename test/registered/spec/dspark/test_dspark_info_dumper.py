@@ -3,6 +3,12 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    GetInternalStateReqOutput,
+    PickleWrapper,
+    msgpack_decode,
+    msgpack_encode,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DecodeStepObservation,
     DsparkInfoDumper,
@@ -12,6 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     resolve_components,
     resolve_enabled_components,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -392,6 +399,40 @@ class TestReqsAndGpuTiming(CustomTestCase):
         self.assertGreater(record["step_gpu_ms"], 0.0)
         self.assertGreater(record["draft_gpu_ms"], 0.0)
         self.assertGreater(record["target_verify_gpu_ms"], 0.0)
+
+
+class TestDumpCrossesMsgpackIpc(CustomTestCase):
+    """Guard the DSpark -> GetInternalStateReqOutput serialization contract.
+
+    `Scheduler.get_internal_state` stores `draft_worker.dump_info_records()` under
+    `internal_state["dspark_info_record"]`, then ships the struct over the strict
+    msgpack IPC path (issue #29465). That path has no PickleWrapper fallback: any
+    value that is not msgpack-native (a numpy scalar, a torch tensor, an
+    un-converted `msgspec.Struct`) raises at encode time. The dumper's own tests
+    assert record *values* -- and `assertEqual(np.int64(3), 3)` passes -- so a
+    scalar that silently became numpy would escape them but fail this round-trip.
+    """
+
+    def _real_dump(self):
+        dumper, clock = make_dumper({"core"})
+        dumper.observe_decode_step(make_obs(forward_ct=1))
+        clock.advance(0.01)
+        dumper.observe_decode_step(make_obs(forward_ct=2))
+        dumped = dumper.dump()
+        # DsparkObservability.dump_info_records appends this float onto the raw
+        # dumper output before the scheduler reads it; mirror the full payload.
+        dumped["simulate_acc_len"] = 4.0
+        return dumped
+
+    def test_real_dump_output_round_trips_natively(self):
+        internal_state = msgspec_to_builtins(
+            {"dspark_info_record": self._real_dump(), "max_running_requests": 256}
+        )
+        output = GetInternalStateReqOutput(internal_state=internal_state)
+
+        decoded = msgpack_decode(msgpack_encode(output))
+        self.assertNotIsInstance(decoded, PickleWrapper)
+        self.assertEqual(decoded, output)
 
 
 if __name__ == "__main__":
