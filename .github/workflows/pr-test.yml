@@ -409,6 +409,7 @@ jobs:
       runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
+      bagel: ${{ needs.check-changes.outputs.bagel }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       git_ref: ${{ inputs.git_ref || '' }}

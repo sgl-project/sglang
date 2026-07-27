@@ -6,6 +6,9 @@ on:
       multimodal_gen:
         required: true
         type: string
+      bagel:
+        required: true
+        type: string
       sgl_kernel:
         required: true
         type: string
@@ -380,6 +383,67 @@ jobs:
         if: always()
         with:
           artifact-suffix: component-accuracy
+
+  multimodal-gen-bagel-parity:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true' &&
+      inputs.bagel == 'true'
+    runs-on: 1-gpu-h100
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Checkout pinned official BAGEL source
+        uses: actions/checkout@v4
+        with:
+          repository: ByteDance-Seed/Bagel
+          ref: a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f
+          path: bagel-official
+
+      - name: Download pinned BAGEL Transformer inputs
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+        run: |
+          model_path="$(hf download ByteDance-Seed/BAGEL-7B-MoT \
+            --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+            --include ema.safetensors llm_config.json)"
+          echo "SGLANG_BAGEL_MODEL_PATH=$model_path" >> "$GITHUB_ENV"
+
+      - name: Run official BAGEL Transformer parity
+        env:
+          CUDA_VISIBLE_DEVICES: "0"
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          SGLANG_BAGEL_OFFICIAL_REPO: ${{ github.workspace }}/bagel-official
+        run: |
+          cd python
+          pytest -q -s \
+            sglang/multimodal_gen/test/single_test_file/component_accuracy/test_bagel_transformer_accuracy.py
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: bagel-parity
 
   multimodal-gen-test-1-b200:
     if: |

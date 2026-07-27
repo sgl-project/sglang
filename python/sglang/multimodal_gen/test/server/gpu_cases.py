@@ -475,8 +475,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
-# The regular 1-GPU CUDA PR shard runs on H100. Keep consistency disabled until
-# the pinned official GT is available from the remotely pinned ci-data revision.
+# The regular 1-GPU CUDA PR shard runs on H100 and compares against the pinned
+# official BAGEL output from ci-data-diffusion.
 if current_platform.is_cuda():
     ONE_GPU_CASES.append(
         DiffusionTestCase(
@@ -497,8 +497,8 @@ if current_platform.is_cuda():
                 ],
             ),
             BAGEL_T2I_CI_SAMPLING_PARAMS,
-            run_perf_check=True,
-            run_consistency_check=False,
+            run_perf_check=False,
+            run_consistency_check=True,
             run_component_accuracy_check=False,
             dynamic_batching_requests=BAGEL_DYNAMIC_BATCHING_CI_REQUESTS,
         )
