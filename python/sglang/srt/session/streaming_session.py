@@ -240,10 +240,9 @@ class StreamingSession(BasePrefixCache):
 
         req = params.req
 
-        # [NPU] When aligned prefix_len drops to 0 (context < page_size), release
-        # the slot's KV and fall back to radix cache (full prefill). Once
-        # context >= page_size, streaming session kicks in with page-aligned
-        # KV reuse.
+        # [NPU] When aligned context < page_size, release the slot's KV and 
+        # fall back to radix cache (full prefill). Once context >= page_size,
+        # streaming session kicks in with page-aligned KV reuse.
         if self.page_size > 1:
             expected_prefix_len = min(slot.kv_committed_len, len(params.key))
             aligned_prefix_len = (
