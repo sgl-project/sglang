@@ -3,6 +3,22 @@
 from pathlib import Path
 
 
+def test_realtime_webui_uses_same_origin_server_by_default():
+    repo_root = Path(__file__).resolve().parents[6]
+    app_js = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/app.js"
+    ).read_text()
+    proxy_server = (
+        repo_root / "python/sglang/multimodal_gen/apps/realtime_webui/server.py"
+    ).read_text()
+
+    assert (
+        "`${protocol}//${window.location.host}/v1/realtime_video/generate`" in app_js
+    )
+    assert 'app.router.add_get("/v1/realtime_video/generate"' in proxy_server
+    assert 'app.router.add_route("*", "/v1/{path:.*}"' in proxy_server
+
+
 def test_realtime_webui_presets_do_not_emit_camera_scripts():
     repo_root = Path(__file__).resolve().parents[6]
     app_js = (

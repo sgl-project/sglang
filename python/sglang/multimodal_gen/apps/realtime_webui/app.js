@@ -1912,6 +1912,11 @@ async function applyQueryParams() {
   const params = new URLSearchParams(window.location.search);
   const server = params.get("server");
   if (server) $("serverUrl").value = server;
+  else if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    $("serverUrl").value =
+      `${protocol}//${window.location.host}/v1/realtime_video/generate`;
+  }
   const model = params.get("model");
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
