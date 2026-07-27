@@ -17,6 +17,9 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
+    KV_COMPONENT_FULL,
+    KV_COMPONENT_MAMBA,
+    KV_COMPONENT_SWA,
     BlockRemoved,
     BlockStored,
     StorageMedium,
@@ -54,6 +57,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
+    MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
@@ -343,10 +347,15 @@ def build_fixture(
     cfg: CacheConfig,
     *,
     enable_kv_cache_events: bool = False,
+    enable_kv_events_component_types: bool = False,
     tree_page_size: Optional[int] = None,
     mamba_cache_chunk_size: Optional[int] = None,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
+
+    Both event switches default off to match production, so the rest of the
+    suite keeps covering the legacy whole-block wire; the component-placement
+    tests opt in explicitly.
 
     ``tree_page_size`` stands in for DCP, which widens the tree page past the
     ``page_size`` the rest of the config still sees. It only reaches values
@@ -472,6 +481,7 @@ def build_fixture(
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
+        enable_kv_events_component_types=enable_kv_events_component_types,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
@@ -565,29 +575,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
 
-class TestUnifiedRadixCacheKVEvents(CustomTestCase):
-    cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
-
-    def _insert(self, cache, allocator, tokens):
-        key = RadixKey(array("q", tokens))
-        value = allocator.alloc(len(tokens))
-        self.assertIsNotNone(value)
-        return cache.insert(InsertParams(key=key, value=value[: len(key)]))
-
-    def _stored_events(self, cache, medium=None):
-        events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
-        if medium is not None:
-            events = [e for e in events if e.medium == medium]
-        return events
-
-    def _removed_events(self, cache, medium=None):
-        events = [e for e in cache.take_events() if isinstance(e, BlockRemoved)]
-        if medium is not None:
-            events = [e for e in events if e.medium == medium]
-        return events
-
-    def _event_hashes(self, events):
-        return [block_hash for event in events for block_hash in event.block_hashes]
+class _KVEventHiCacheFixture:
+    """HiCache wiring shared by the KV-event test classes."""
 
     def _leaf_for(self, cache, tokens):
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -595,7 +584,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNot(leaf, cache.root_node)
         return leaf
 
-    def _init_hicache(self, cache, *, write_policy: str = "write_through"):
+    def _init_hicache(
+        self,
+        cache,
+        page_size: Optional[int] = None,
+        *,
+        write_policy: str = "write_through",
+    ):
         # Production config: kernel IO backend + page_first layout with
         # PINNED host pools (kernel GPU DMA requires them). Pools track their
         # cudaHostRegister'd pointers and unregister on destroy()/GC, so the
@@ -603,7 +598,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         # address ranges (rc=712).
         server_args = ServerArgs(
             model_path="dummy",
-            page_size=self.cfg.page_size,
+            page_size=self.cfg.page_size if page_size is None else page_size,
             hicache_io_backend="kernel",
             hicache_write_policy=write_policy,
         )
@@ -626,6 +621,31 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
+
+
+class TestUnifiedRadixCacheKVEvents(_KVEventHiCacheFixture, CustomTestCase):
+    cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+
+    def _insert(self, cache, allocator, tokens):
+        key = RadixKey(array("q", tokens))
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        return cache.insert(InsertParams(key=key, value=value[: len(key)]))
+
+    def _stored_events(self, cache, medium=None):
+        events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        if medium is not None:
+            events = [e for e in events if e.medium == medium]
+        return events
+
+    def _removed_events(self, cache, medium=None):
+        events = [e for e in cache.take_events() if isinstance(e, BlockRemoved)]
+        if medium is not None:
+            events = [e for e in events if e.medium == medium]
+        return events
+
+    def _event_hashes(self, events):
+        return [block_hash for event in events for block_hash in event.block_hashes]
 
     def test_kv_events_store_and_remove_full_blocks(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -754,6 +774,444 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
         self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
+
+
+class TestUnifiedRadixCacheComponentPlacementEvents(
+    _KVEventHiCacheFixture, CustomTestCase
+):
+    """KV events must express per-component (FULL/SWA/MAMBA) GPU/CPU placement.
+
+    Snapshot/restate logic lives on ``cache.tree_core`` after the TreeCore split.
+    Uses focused snapshot assertions plus a few fresh-insert integrations.
+    """
+
+    # Shared, immutable (frozen dataclass) configs; most cases only need one of these.
+    _FULL_ONLY_CFG = CacheConfig(page_size=1, components=(ComponentType.FULL,))
+    _SWA_CFG = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=4,
+    )
+    _MAMBA_CFG = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
+    # A window narrower than the inserted key forces the commit-time SWA leaf split.
+    _SWA_SPLIT_CFG = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=2,
+    )
+
+    def _build(self, cfg: CacheConfig, *, component_types: bool = True):
+        return build_fixture(
+            cfg,
+            enable_kv_cache_events=True,
+            enable_kv_events_component_types=component_types,
+        )
+
+    def _make_node(self, cache, tokens, *, device=(), host=()):
+        """Synthetic node with the given components present on device / host."""
+        node = UnifiedTreeNode(cache.tree_core.component_types)
+        node.parent = cache.tree_core.root_node
+        node.key = RadixKey(array("q", tokens))
+        dummy = torch.zeros(max(1, len(tokens)), dtype=torch.int64)
+        for ct in device:
+            node.component_data[ct].value = dummy
+        for ct in host:
+            node.component_data[ct].host_value = dummy
+        return node
+
+    def _make_mamba_req(self, req_to_token_pool):
+        sp = SamplingParams(temperature=0, max_new_tokens=1)
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=sp,
+        )
+        req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        return req
+
+    def _stored(self, cache, medium=None):
+        events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        if medium is not None:
+            events = [e for e in events if e.medium == medium]
+        return events
+
+    # ---- Focused snapshot logic (no allocation / HiCache) ----
+
+    def test_full_only_snapshot_returns_none(self):
+        cache, _, _ = self._build(self._FULL_ONLY_CFG)
+        node = self._make_node(cache, [1, 2], device=(ComponentType.FULL,))
+        self.assertIsNone(
+            cache.tree_core._component_types_for_page(node, StorageMedium.GPU, 0, 2)
+        )
+
+    def test_component_types_disabled_returns_none(self):
+        cache, _, _ = self._build(self._SWA_CFG, component_types=False)
+        node = self._make_node(
+            cache, [1, 2], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        self.assertIsNone(
+            cache.tree_core._component_types_for_page(node, StorageMedium.GPU, 0, 2)
+        )
+
+    def test_snapshot_reports_present_components_and_mamba_last_page(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.MAMBA,
+            ),
+            sliding_window_size=128,
+            head_num=8,
+            num_layers=32,
+            full_attention_layer_ids=(7, 15, 23, 31),
+            kv_size=1024,
+            max_context_len=1024,
+        )
+        cache, _, _ = self._build(cfg)
+        node = self._make_node(
+            cache,
+            [1, 2, 3],
+            device=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        )
+        # FULL + SWA span every page; MAMBA is a single per-leaf state anchored
+        # to the last page only.
+        self.assertEqual(
+            cache.tree_core._component_types_for_page(node, StorageMedium.GPU, 0, 3),
+            [KV_COMPONENT_FULL, KV_COMPONENT_SWA],
+        )
+        self.assertEqual(
+            cache.tree_core._component_types_for_page(node, StorageMedium.GPU, 2, 3),
+            [KV_COMPONENT_FULL, KV_COMPONENT_SWA, KV_COMPONENT_MAMBA],
+        )
+
+    def test_snapshot_swa_tombstone_not_reported(self):
+        cache, _, _ = self._build(self._SWA_CFG)
+        # SWA tombstone: value None -> must not appear in the snapshot.
+        node = self._make_node(cache, [1, 2], device=(ComponentType.FULL,))
+        self.assertEqual(
+            cache.tree_core._component_types_for_page(node, StorageMedium.GPU, 0, 2),
+            [KV_COMPONENT_FULL],
+        )
+
+    def test_record_store_event_emits_host_component_types(self):
+        cache, _, _ = self._build(self._MAMBA_CFG)
+        node = self._make_node(
+            cache, [10, 11], host=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        cache.take_events()
+        cache.tree_core.kv_events.record_store(node, medium=StorageMedium.CPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        self.assertTrue(all(e.medium == StorageMedium.CPU for e in stored))
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_FULL])
+        self.assertEqual(
+            stored[1].component_types, [KV_COMPONENT_FULL, KV_COMPONENT_MAMBA]
+        )
+
+    def test_record_store_event_skips_pages_with_nothing_resident(self):
+        # A page whose component set is empty must not claim placement, but the
+        # parent-hash chain still has to advance across it so the pages that do
+        # get announced stay correctly parented.
+        from sglang.srt.mem_cache.utils import hash_str_to_int64
+
+        cache, _, _ = self._build(self._MAMBA_CFG)
+        # Mamba alone is resident, and it only covers the last page -- so pages
+        # 0 and 1 resolve to an empty set.
+        node = self._make_node(cache, [10, 11, 12], device=(ComponentType.MAMBA,))
+        cache.take_events()
+
+        cache.tree_core.kv_events.record_store(node, medium=StorageMedium.GPU)
+
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].component_types, [KV_COMPONENT_MAMBA])
+        self.assertEqual(stored[0].token_ids, [12])
+        self.assertEqual(
+            stored[0].parent_block_hash, hash_str_to_int64(node.hash_value[1])
+        )
+
+    # ---- Fresh-insert integrations ----
+
+    def test_swa_fresh_insert_reports_swa_on_gpu(self):
+        tokens = [1, 2, 3, 4]
+        stored = self._insert_and_collect(self._SWA_CFG, tokens)
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIn(KV_COMPONENT_FULL, event.component_types)
+            self.assertIn(KV_COMPONENT_SWA, event.component_types)
+
+    def _insert_and_collect(self, cfg, tokens, *, component_types=True):
+        """Insert one fresh key; return its GPU BlockStored events in emit order."""
+        cache, allocator, _ = self._build(cfg, component_types=component_types)
+        cache.take_events()
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        return self._stored(cache, StorageMedium.GPU)
+
+    def test_swa_split_insert_flush_includes_swa(self):
+        # A fresh leaf longer than one window is capped into window-sized nodes at
+        # commit, and each piece's SWA value is only stamped by the deferred
+        # SWARebuild action. If the flush ran at COMMIT (before those actions
+        # apply) SWA would be missing; running it at TAIL captures it.
+        tokens = [1, 2, 3, 4]
+        stored = self._insert_and_collect(self._SWA_SPLIT_CFG, tokens)
+        # page_size=1, so one event per token, in token order. Nothing has aged
+        # out of the window yet, so every page carries both components.
+        self.assertEqual([e.token_ids for e in stored], [[t] for t in tokens])
+        self.assertEqual(
+            [e.component_types for e in stored],
+            [[KV_COMPONENT_FULL, KV_COMPONENT_SWA]] * len(tokens),
+        )
+
+    def test_insert_emits_parents_before_children(self):
+        # The SWA commit-time leaf split makes the tail node younger than its own
+        # parents, so the flush must re-derive root-first order. A child announced
+        # first would carry parent_block_hash=None and -- because the hash chain is
+        # computed lazily off the parent's hash -- a block hash nothing else
+        # reproduces.
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        stored = self._insert_and_collect(self._SWA_SPLIT_CFG, tokens)
+
+        self.assertEqual([e.token_ids for e in stored], [[t] for t in tokens])
+        announced = set()
+        for event in stored:
+            if event.parent_block_hash is not None:
+                self.assertIn(
+                    event.parent_block_hash,
+                    announced,
+                    f"block {event.block_hashes[0]} announced before its parent",
+                )
+            announced.add(event.block_hashes[0])
+        # Only the very first block is parentless.
+        self.assertIsNone(stored[0].parent_block_hash)
+        self.assertTrue(all(e.parent_block_hash is not None for e in stored[1:]))
+
+    def test_component_mode_block_hashes_match_legacy(self):
+        # Block hashes are position-aware and must not depend on whether the
+        # component dimension is on -- otherwise a router cannot correlate them
+        # with hashes produced by any other path.
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        with_components = self._insert_and_collect(self._SWA_SPLIT_CFG, tokens)
+        legacy = self._insert_and_collect(
+            self._SWA_SPLIT_CFG, tokens, component_types=False
+        )
+        self.assertEqual(
+            {tuple(e.token_ids): e.block_hashes[0] for e in with_components},
+            {tuple(e.token_ids): e.block_hashes[0] for e in legacy},
+        )
+
+    def test_mamba_fresh_insert_reports_mamba_on_leaf_last_page(self):
+        cache, allocator, req_to_token_pool = self._build(self._MAMBA_CFG)
+        cache.take_events()
+
+        tokens = [1, 2, 3]
+        req = self._make_mamba_req(req_to_token_pool)
+        value = allocator.alloc(len(tokens))
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value[: len(tokens)],
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        stored = self._stored(cache, StorageMedium.GPU)
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIn(KV_COMPONENT_FULL, event.component_types)
+        # Mamba is anchored to the leaf's last page only.
+        self.assertNotIn(KV_COMPONENT_MAMBA, stored[0].component_types)
+        self.assertNotIn(KV_COMPONENT_MAMBA, stored[1].component_types)
+        self.assertIn(KV_COMPONENT_MAMBA, stored[2].component_types)
+
+    def test_load_back_unions_component_nodes(self):
+        # commit_load_back must emit after every component restored, unioning each
+        # one's nodes_to_load; emitting on FULL's list alone would report the
+        # promoted block as FULL-only even though SWA came back with it.
+        cfg = replace(self._SWA_CFG, kv_size=64, max_context_len=64)
+        cache, allocator, _ = self._build(cfg)
+        self._init_hicache(cache, cfg.page_size)
+        self.assertTrue(cache.tree_core.has_swa_host_pool)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        leaf = self._leaf_for(cache, tokens)
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        cache.take_events()
+
+        self._load_back_node(cache, leaf)
+
+        stored = self._stored(cache, StorageMedium.GPU)
+        self.assertTrue(stored, "load_back must announce the promoted blocks")
+        self.assertTrue(
+            any(KV_COMPONENT_SWA in e.component_types for e in stored),
+            "SWA restored by the same load must show up in the snapshot",
+        )
+        for event in stored:
+            self.assertIn(KV_COMPONENT_FULL, event.component_types)
+
+    # ---- Partial-eviction restate stays symmetric (never BlockRemoved) ----
+
+    def test_restate_device_placement_after_swa_tombstone(self):
+        cache, _, _ = self._build(self._SWA_CFG)
+        node = self._make_node(
+            cache, [7, 8], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        cache.take_events()
+        node.component_data[ComponentType.SWA].value = None
+        cache.tree_core._restate_component_placement(node, StorageMedium.GPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        for event in stored:
+            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
+            self.assertEqual(event.medium, StorageMedium.GPU)
+
+    def test_restate_is_noop_when_base_component_gone(self):
+        cache, _, _ = self._build(self._SWA_CFG)
+        # FULL absent -> whole block left the tier; restate must emit nothing
+        # (the caller is responsible for the BlockRemoved instead).
+        node = self._make_node(cache, [7, 8], device=(ComponentType.SWA,))
+        cache.take_events()
+        cache.tree_core._restate_component_placement(node, StorageMedium.GPU)
+        self.assertEqual(cache.take_events(), [])
+
+    def test_swa_eviction_walk_restates_internal_node(self):
+        # The restate call sites live in the components' eviction walks, so cover
+        # one end to end rather than only calling the helper directly. SWA leaving
+        # an internal node while FULL stays must restate that node as FULL-only
+        # and must not emit a BlockRemoved -- the block never left the GPU tier.
+        cache, allocator, _ = self._build(self._SWA_CFG)
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        cache.take_events()
+
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+
+        events = cache.take_events()
+        self.assertFalse(
+            [e for e in events if isinstance(e, BlockRemoved)],
+            "FULL survives an SWA-only eviction; nothing left the GPU tier",
+        )
+        stored = [e for e in events if isinstance(e, BlockStored)]
+        self.assertTrue(stored, "an internal SWA tombstone must restate")
+        for event in stored:
+            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
+            self.assertEqual(event.medium, StorageMedium.GPU)
+
+    def test_restate_host_placement_after_mamba_tombstone(self):
+        cache, _, _ = self._build(self._MAMBA_CFG)
+        node = self._make_node(
+            cache, [7, 8], host=(ComponentType.FULL, ComponentType.MAMBA)
+        )
+        cache.take_events()
+        node.component_data[ComponentType.MAMBA].host_value = None
+        cache.tree_core._restate_component_placement(node, StorageMedium.CPU)
+        stored = [e for e in cache.take_events() if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored), 2)
+        for event in stored:
+            self.assertEqual(event.component_types, [KV_COMPONENT_FULL])
+            self.assertEqual(event.medium, StorageMedium.CPU)
+
+    # ---- Deferral ordering invariant (see _flush_insert_store_events) ----
+
+    def test_aux_commit_actions_are_not_deferrable(self):
+        # The TAIL flush is only correct if the insert-commit aux actions force a
+        # barrier suspend -> apply before TAIL, i.e. none is deferrable. Pin it.
+        cache, _, _ = self._build(self._FULL_ONLY_CFG)
+        deferrable = cache.tree_core._is_deferrable_action
+        one = torch.zeros(1, dtype=torch.int64)
+        self.assertFalse(deferrable(SWARebuild(node_id=1, source_value=one)))
+        self.assertFalse(
+            deferrable(
+                RecoverSWAWithLockedFull(node_id=1, kept_full=one, incoming_full=one)
+            )
+        )
+        self.assertFalse(deferrable(MambaEvictExcessPathStates(tail_node_id=1)))
+        # Positive control: the fire-and-forget actions ARE deferrable.
+        self.assertTrue(deferrable(FreeDeviceKV(indices=[])))
+        self.assertTrue(
+            deferrable(
+                ReplaceWriteThroughOnNodeSplit(
+                    ack_id=1, old_node_id=1, new_node_id=2, new_child_node_id=3
+                )
+            )
+        )
+
+    # ---- Whole-block teardown must not restate (no extra BlockStored) ----
+
+    def test_demote_emits_no_extra_store(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+        )
+        cache, allocator, _ = self._build(cfg)
+
+        tokens = [1, 2, 3, 4]
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(
+            InsertParams(key=RadixKey(array("q", tokens)), value=value[: len(tokens)])
+        )
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        leaf = cache.resolve_node_handle(match.last_device_node)
+        # Simulate a completed D->H backup so _demote's invariant holds.
+        for ct in (ComponentType.FULL, ComponentType.SWA):
+            cd = leaf.component_data[ct]
+            if cd.value is not None and cd.host_value is None:
+                cd.host_value = cd.value.clone()
+        cache.take_events()
+
+        tracker = {ct: 0 for ct in cache.tree_components}
+        device_frees = defaultdict(list)
+        cache.tree_core._demote(
+            leaf, tracker, device_frees=device_frees, host_frees=defaultdict(list)
+        )
+        cache._drain_device_frees(device_frees)
+
+        events = cache.take_events()
+        # Whole block left the GPU tier: exactly a BlockRemoved, no restated store.
+        self.assertTrue(any(isinstance(e, BlockRemoved) for e in events))
+        self.assertFalse(
+            any(isinstance(e, BlockStored) for e in events),
+            "demote is a whole-block teardown and must not restate a store",
+        )
+
+    # ---- Legacy mode: flag off must match pre-feature wire behaviour ----
+
+    def test_flag_off_restate_is_noop(self):
+        cache, _, _ = self._build(self._SWA_CFG, component_types=False)
+        node = self._make_node(
+            cache, [7, 8], device=(ComponentType.FULL, ComponentType.SWA)
+        )
+        cache.take_events()
+        node.component_data[ComponentType.SWA].value = None
+        cache.tree_core._restate_component_placement(node, StorageMedium.GPU)
+        self.assertEqual(cache.take_events(), [])
+
+    def test_flag_off_fresh_insert_omits_component_types(self):
+        tokens = [1, 2, 3, 4]
+        stored = self._insert_and_collect(self._SWA_CFG, tokens, component_types=False)
+        self.assertEqual(len(stored), len(tokens))
+        for event in stored:
+            self.assertIsNone(event.component_types)
 
 
 class UnifiedRadixCacheSuite:
