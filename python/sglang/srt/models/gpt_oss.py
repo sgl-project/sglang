@@ -720,15 +720,25 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Capture hidden-state boundaries: boundary 0 is the embedding output,
+        # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
+        if self.start_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
+                if i + 1 in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -737,10 +747,6 @@ class GptOssModel(nn.Module):
                 }
             )
         else:
-            if self.end_layer in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)

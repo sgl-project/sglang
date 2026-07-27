@@ -53,7 +53,7 @@ class TestGptOssEagle3Capture(unittest.TestCase):
         model.layers = nn.ModuleList([_IncrementLayer() for _ in range(3)])
         model.start_layer = 0
         model.end_layer = 3
-        model.layers_to_capture = [1, 3]
+        model.layers_to_capture = [0, 1, 3]
         model.norm = _ResidualNorm()
 
         hidden_states, aux_hidden_states = model(
@@ -62,10 +62,22 @@ class TestGptOssEagle3Capture(unittest.TestCase):
             forward_batch=None,
         )
 
-        self.assertEqual(len(aux_hidden_states), 2)
-        torch.testing.assert_close(aux_hidden_states[0], torch.ones((1, 2)))
-        torch.testing.assert_close(aux_hidden_states[1], torch.full((1, 2), 3.0))
+        self.assertEqual(len(aux_hidden_states), 3)
+        torch.testing.assert_close(aux_hidden_states[0], torch.zeros((1, 2)))
+        torch.testing.assert_close(aux_hidden_states[1], torch.ones((1, 2)))
+        torch.testing.assert_close(aux_hidden_states[2], torch.full((1, 2), 3.0))
         torch.testing.assert_close(hidden_states, torch.full((1, 2), 3.0))
+
+    def test_dflash_layer_ids_remain_zero_based_block_indices(self):
+        model = GptOssForCausalLM.__new__(GptOssForCausalLM)
+        nn.Module.__init__(model)
+        model.pp_group = _SingleRankPPGroup()
+        model.model = SimpleNamespace(layers_to_capture=[])
+
+        model.set_dflash_layers_to_capture([23, 29, 35])
+
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.layers_to_capture, [24, 30, 36])
 
 
 if __name__ == "__main__":

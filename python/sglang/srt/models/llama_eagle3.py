@@ -159,6 +159,9 @@ class LlamaModel(nn.Module):
         )
 
         eagle_config = getattr(config, "eagle_config", None) or {}
+        # Normalize the concatenated target-model features once before the FC
+        # projection. This differs from fc_norm, which normalizes each feature
+        # chunk independently before concatenation.
         self.norm_before_fc = bool(
             eagle_config.get("norm_before_fc", getattr(config, "norm_before_fc", False))
         )
