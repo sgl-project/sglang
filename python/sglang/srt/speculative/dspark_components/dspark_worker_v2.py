@@ -643,9 +643,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         # recurrent state in per-step buffers during target verification.  The
         # accepted state must be committed before the next draft/verify step;
         # unlike KV injection below, this is target-model state.
-        accept_index = torch.arange(
-            self.gamma + 1, device=device, dtype=torch.int64
-        ).unsqueeze(0).expand(bs, -1)
+        accept_index = (
+            torch.arange(self.gamma + 1, device=device, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(bs, -1)
+        )
         commit_mamba_states_after_verify(
             target_worker=self.target_worker,
             batch=batch,
