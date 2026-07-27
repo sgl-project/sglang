@@ -9,6 +9,7 @@ import math
 import os
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -199,29 +200,45 @@ def materialize_first_frame(case: dict, inputs_dir: str | Path) -> Path:
     inputs_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(case["first_frame"]).suffix or ".png"
     target = inputs_dir / f"{case['id']}{suffix}"
-    if target.exists():
-        return target
     uri = case["first_frame"]
-    if not uri.startswith("s3://"):
+    if not target.exists() and uri.startswith(("http://", "https://")):
+        request = urllib.request.Request(
+            uri,
+            headers={"User-Agent": "sglang-minwm-parity/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            target.write_bytes(response.read())
+    elif not target.exists() and not uri.startswith("s3://"):
         source = Path(uri)
         if not source.is_file():
             raise FileNotFoundError(source)
         target.write_bytes(source.read_bytes())
-        return target
-    bucket_and_key = uri.removeprefix("s3://").split("/", 1)
-    if len(bucket_and_key) == 2:
+    elif not target.exists():
+        bucket_and_key = uri.removeprefix("s3://").split("/", 1)
         # The AWS parity jobs expose the bucket through an S3 CSI mount. Prefer
         # that authenticated, region-local path so the harness does not depend
         # on ambient AWS CLI credentials. MINWM_S3_MOUNT can disable/override it.
         mount_root = os.environ.get("MINWM_S3_MOUNT", "/s3")
-        mounted_source = Path(mount_root) / bucket_and_key[1]
-        if mount_root and mounted_source.is_file():
+        mounted_source = (
+            Path(mount_root) / bucket_and_key[1]
+            if mount_root and len(bucket_and_key) == 2
+            else None
+        )
+        if mounted_source is not None and mounted_source.is_file():
             shutil.copyfile(mounted_source, target)
-            return target
-    subprocess.run(
-        ["aws", "s3", "cp", "--only-show-errors", uri, str(target)],
-        check=True,
-    )
+        else:
+            subprocess.run(
+                ["aws", "s3", "cp", "--only-show-errors", uri, str(target)],
+                check=True,
+            )
+    expected_sha256 = case.get("first_frame_sha256")
+    if expected_sha256 is not None:
+        actual_sha256 = sha256_file(target)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"{case['id']}: first frame SHA-256 {actual_sha256} does not "
+                f"match {expected_sha256}"
+            )
     return target
 
 

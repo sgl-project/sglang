@@ -1,0 +1,21 @@
+pipeline: UnifiedDiffusionInferencePipelineV3
+height: 480
+width: 832
+use_camera: false
+num_frames: 4
+sampling_steps: 4
+guidance_scale: 0.0
+sample_solver: unipc
+
+generator_config:
+  local_attn_size: -1
+  window_size: 20
+  sink_size: 4
+
+multi_shot_config:
+  scene_cut:
+    prefix: "The scene transitions. "
+    sink_enabled: true
+    rope_offset: 8.0
+  condition_switch:
+    policy: keep_kv

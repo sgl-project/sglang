@@ -19,7 +19,8 @@ set -euo pipefail
   || "${MINWM_BENCHMARK_MODE}" == "long720p" \
   || "${MINWM_BENCHMARK_MODE}" == "triptych720p" \
   || "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" \
-  || "${MINWM_BENCHMARK_MODE}" == "bounded5s" ]] || {
+  || "${MINWM_BENCHMARK_MODE}" == "bounded5s" \
+  || "${MINWM_BENCHMARK_MODE}" == "dragon60s" ]] || {
   echo "unsupported MINWM_BENCHMARK_MODE=${MINWM_BENCHMARK_MODE}" >&2
   exit 2
 }
@@ -62,7 +63,7 @@ fi
 LOCAL_RESULTS="${WORK_ROOT}/results"
 RESULTS="${MINWM_RESULTS_ROOT%/}/${MINWM_RUN_ID}"
 SCRIPT_DIR="/workspace/sglang/benchmark/minwm_realtime_parity"
-MINWM_CONFIG="/workspace/minWM/Wan21/configs/eval/wan22_5b_varlen_dmd.yaml"
+MINWM_CONFIG="${MINWM_CONFIG_PATH:-/workspace/minWM/Wan21/configs/eval/wan22_5b_varlen_dmd.yaml}"
 mkdir -p "${LOCAL_RESULTS}" "${RESULTS}"
 if [[ -z "${REUSE_INPUT_ROOT}" ]]; then
   mkdir -p "${WORK_ROOT}/checkpoint" "${PRETRAINED}"
@@ -199,6 +200,9 @@ else
     --source-uri "${MINWM_CHECKPOINT_SOURCE_URI}" \
     --source-version-id "${MINWM_CHECKPOINT_SOURCE_VERSION}" \
     --source-etag "${MINWM_CHECKPOINT_SOURCE_ETAG}" \
+    --local-attn-size "${MINWM_CONVERT_LOCAL_ATTN_SIZE:--1}" \
+    --sink-size "${MINWM_CONVERT_SINK_SIZE:-0}" \
+    --sliding-window-num-frames "${MINWM_CONVERT_WINDOW_SIZE:-128}" \
     | tee "${RESULTS}/conversion.log"
 fi
 cp "${MODEL_DIR}/minwm_conversion_manifest.json" "${RESULTS}/"
@@ -230,6 +234,174 @@ wait_for_server() {
   tail -300 "${log_path}" >&2
   return 1
 }
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "dragon60s" ]]; then
+  DRAGON_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_dragon_ride_60s_832x480.json}"
+  DRAGON_RESULTS="${RESULTS}/dragon-ride-60s-bitwise"
+  DRAGON_SINK_SIZE="${MINWM_SINK_SIZE:-4}"
+  ARTIFACT_HOLD_SECONDS="${MINWM_ARTIFACT_HOLD_SECONDS:-0}"
+  if ! [[ "${ARTIFACT_HOLD_SECONDS}" =~ ^[0-9]+$ ]]; then
+    echo "MINWM_ARTIFACT_HOLD_SECONDS must be a non-negative integer" >&2
+    exit 2
+  fi
+  [[ -f "${MINWM_CONFIG}" ]]
+  if [[ -n "${MINWM_CONFIG_SHA256:-}" ]]; then
+    echo "${MINWM_CONFIG_SHA256}  ${MINWM_CONFIG}" | sha256sum --check -
+  fi
+  python3 - "${MODEL_DIR}/transformer/config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text())
+assert int(config["local_attn_size"]) == -1, config
+print(json.dumps({
+    "converted_local_attn_size": config["local_attn_size"],
+    "converted_sink_size": config["sink_size"],
+    "converted_sliding_window_num_frames": config["sliding_window_num_frames"],
+}, sort_keys=True))
+PY
+  mkdir -p "${DRAGON_RESULTS}"
+  python3 "${SCRIPT_DIR}/run_minwm_baseline.py" \
+    --cases "${DRAGON_CASES}" \
+    --minwm-root /workspace/minWM \
+    --checkpoint "${CHECKPOINT}" \
+    --pretrained-dir "${PRETRAINED}" \
+    --config "${MINWM_CONFIG}" \
+    --results "${DRAGON_RESULTS}" \
+    | tee "${RESULTS}/dragon60-baseline.log"
+
+  MINWM_ATTENTION_IMPL=packed \
+  MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
+  MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+  MINWM_SEGMENT_COMPILE=true \
+  sglang serve \
+    --model-path "${MODEL_DIR}" \
+    --pipeline-class-name MinWMCausalDMDPipeline \
+    --attention-backend fa \
+    --performance-mode speed \
+    --enable-torch-compile false \
+    --warmup-mode off \
+    --port 30000 \
+    > "${RESULTS}/dragon60-sglang-server.log" 2>&1 &
+  SERVER_PID=$!
+  (
+    while kill -0 "${SERVER_PID}" 2>/dev/null; do
+      nvidia-smi --query-gpu=timestamp,memory.used \
+        --format=csv,noheader,nounits || true
+      sleep 1
+    done
+  ) > "${RESULTS}/dragon60-gpu-memory.csv" &
+  GPU_MONITOR_PID=$!
+  cleanup_dragon_server() {
+    kill "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    kill "${GPU_MONITOR_PID}" 2>/dev/null || true
+    wait "${GPU_MONITOR_PID}" 2>/dev/null || true
+  }
+  trap cleanup_dragon_server EXIT INT TERM
+  if ! wait_for_server "${SERVER_PID}" "${RESULTS}/dragon60-sglang-server.log"; then
+    exit 1
+  fi
+  python3 "${SCRIPT_DIR}/run_sglang_api.py" \
+    --cases "${DRAGON_CASES}" \
+    --results "${DRAGON_RESULTS}" \
+    --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+    --sink-size "${DRAGON_SINK_SIZE}" \
+    | tee "${RESULTS}/dragon60-sglang-client.log"
+  cleanup_dragon_server
+  trap - EXIT INT TERM
+
+  set +e
+  python3 "${SCRIPT_DIR}/compare_results.py" \
+    --cases "${DRAGON_CASES}" \
+    --results "${DRAGON_RESULTS}" \
+    --profile bitwise \
+    | tee "${RESULTS}/dragon60-bitwise-compare.log"
+  bitwise_status=${PIPESTATUS[0]}
+  set -e
+  cp "${DRAGON_RESULTS}/report.json" "${RESULTS}/dragon60-bitwise-report.json"
+  if (( bitwise_status != 0 )); then
+    set +e
+    python3 "${SCRIPT_DIR}/compare_results.py" \
+      --cases "${DRAGON_CASES}" \
+      --results "${DRAGON_RESULTS}" \
+      --profile bf16_backend_candidate \
+      | tee "${RESULTS}/dragon60-numeric-compare.log"
+    numeric_status=${PIPESTATUS[0]}
+    set -e
+    cp "${DRAGON_RESULTS}/report.json" "${RESULTS}/dragon60-numeric-report.json"
+  else
+    numeric_status=0
+  fi
+
+  python3 - "${DRAGON_RESULTS}" "${RESULTS}/dragon60-summary.json" \
+    "${bitwise_status}" "${numeric_status}" "${DRAGON_SINK_SIZE}" <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+baseline = json.loads((root / "baseline_run.json").read_text())
+sglang = json.loads((root / "sglang_run.json").read_text())
+exact = json.loads((Path(root).parent / "dragon60-bitwise-report.json").read_text())
+assert baseline["sink_size"] == int(sys.argv[5]), baseline
+case = sglang["cases"][0]
+steady = [
+    item for item in case["chunk_stats"] if int(item["chunk_index"]) > 0
+]
+scheduler_ms = [float(item["scheduler_forward_ms"]) for item in steady]
+client_ms = [
+    float(value)
+    for value in case["client_timing"]["steady_payload_interarrival_ms"]
+]
+frames = sum(int(item["num_frames"]) for item in steady)
+summary = {
+    "contract": {
+        "generated_seconds": 60.0,
+        "fps": 24,
+        "generated_pixel_frames": 1440,
+        "reference_pixel_frames": 1,
+        "chunks": 90,
+        "baseline_local_attn_size": baseline["local_attn_size"],
+        "baseline_configured_window_size": baseline["window_size"],
+        "baseline_sink_size": baseline["sink_size"],
+        "sglang_runtime_window": case["request"].get(
+            "realtime_causal_kv_cache_num_frames"
+        ),
+        "sglang_runtime_sink": case["request"].get(
+            "realtime_causal_sink_size"
+        ),
+        "effective_cache_semantics": (
+            "unbounded local_attn_size=-1; YAML window_size is not consumed "
+            "by minWM main causal inference"
+        ),
+    },
+    "baseline_git_sha": baseline["minwm_git_sha"],
+    "baseline_config_sha256": baseline["config_sha256"],
+    "bitwise_status": int(sys.argv[3]),
+    "numeric_status": int(sys.argv[4]),
+    "report_summary": exact["summary"],
+    "steady_scheduler_fps": (
+        frames / (sum(scheduler_ms) / 1000) if scheduler_ms else None
+    ),
+    "steady_client_fps": (
+        frames / (sum(client_ms) / 1000) if client_ms else None
+    ),
+    "steady_chunk_p50_ms": statistics.median(client_ms) if client_ms else None,
+}
+Path(sys.argv[2]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+  touch "${RESULTS}/dragon60-artifacts-ready"
+  echo "MINWM_DRAGON60_COMPLETE results=${RESULTS} bitwise_status=${bitwise_status}"
+  if (( ARTIFACT_HOLD_SECONDS > 0 )); then
+    echo "MINWM_ARTIFACT_HOLD seconds=${ARTIFACT_HOLD_SECONDS}"
+    sleep "${ARTIFACT_HOLD_SECONDS}"
+  fi
+  exit "${bitwise_status}"
+fi
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "bounded5s" ]]; then
   BOUNDED_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_action_control_kv_roll_832x480.json}"

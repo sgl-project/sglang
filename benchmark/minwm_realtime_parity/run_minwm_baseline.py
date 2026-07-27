@@ -148,6 +148,9 @@ def main() -> None:
     OmegaConf.resolve(config)
     effective_local_attn_size = int(config.generator_config.local_attn_size)
     effective_sink_size = int(config.generator_config.sink_size)
+    configured_window_size = config.generator_config.get("window_size")
+    if configured_window_size is not None:
+        configured_window_size = int(configured_window_size)
     if (
         effective_local_attn_size != -1
         and effective_sink_size >= effective_local_attn_size
@@ -430,12 +433,14 @@ def main() -> None:
                 text=True,
             ).strip(),
             "config": str(config_path),
+            "config_sha256": sha256_file(config_path),
             "checkpoint": str(Path(args.checkpoint).resolve()),
             "checkpoint_size": Path(args.checkpoint).stat().st_size,
             "deterministic": deterministic,
             "deterministic_attention": bool(config.deterministic_attention),
             "local_attn_size": effective_local_attn_size,
             "sink_size": effective_sink_size,
+            "window_size": configured_window_size,
             "warmup_runs": args.warmup_runs,
             "cases": run_records,
         },
