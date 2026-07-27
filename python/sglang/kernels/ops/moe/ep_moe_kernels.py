@@ -615,9 +615,7 @@ def silu_and_mul_contig_post_quant_packed_fwd(
     G = size_n // quant_group_size
     assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
     BLOCK_N = quant_group_size * 4
-    assert size_n % BLOCK_N == 0, (
-        "packed UE8M0 path requires size_n % (4*group) == 0"
-    )
+    assert size_n % BLOCK_N == 0, "packed UE8M0 path requires size_n % (4*group) == 0"
     assert tuple(output_scale_packed.shape) == (M, G // 4)
     assert output_scale_packed.dtype == torch.int32
 
@@ -1521,9 +1519,7 @@ def _bincount_atomic_kernel(
     mask_n = offs_n < N
     ids = tl.load(ids_ptr + offs_n, mask=mask_n, other=-1).to(tl.int32)
     matches = (
-        (ids[:, None] == expert_range[None, :])
-        & mask_n[:, None]
-        & mask_k[None, :]
+        (ids[:, None] == expert_range[None, :]) & mask_n[:, None] & mask_k[None, :]
     )
     local_counts = tl.sum(matches.to(tl.int32), axis=0)
     tl.atomic_add(counts_ptr + expert_range, local_counts, mask=mask_k)
@@ -1604,9 +1600,7 @@ def fused_local_bincount_pad_sum(
     total = torch.empty((), dtype=torch.int32, device=device)
 
     assert max_count_per_expert is None or max_count_per_expert >= 0
-    max_count = (
-        N if max_count_per_expert is None else min(N, max_count_per_expert)
-    )
+    max_count = N if max_count_per_expert is None else min(N, max_count_per_expert)
     # Duplicate suppression materializes a BLOCK_N x BLOCK_N comparison tile;
     # beyond 128 the exact atomic path is faster despite the tighter bound.
     if max_count <= block_e and block_n_for_n <= min(block_k, 128):
