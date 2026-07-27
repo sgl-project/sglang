@@ -187,7 +187,9 @@ async def chat_completions(
             image_path = await save_image_to_path(
                 image_url,
                 os.path.join(input_dir, f"{request_id}_input"),
-                prefer_remote_source=server_args.input_save_path is None,
+                # Chat input is untrusted: always prefetch through the bounded,
+                # redirect-aware URL policy before it reaches the model worker.
+                prefer_remote_source=False,
             )
         except Exception as exc:
             raise _bad_request(f"Failed to process image_url: {exc}") from exc

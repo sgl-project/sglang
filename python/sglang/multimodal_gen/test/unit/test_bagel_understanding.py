@@ -602,9 +602,10 @@ def test_chat_api_returns_typed_text_and_openai_usage(tmp_path) -> None:
         ]
     )
     server_args = SimpleNamespace(
-        input_save_path=str(tmp_path),
+        input_save_path=None,
         pipeline_config=BagelUnderstandingPipelineConfig(),
     )
+    save_image = AsyncMock(return_value=str(tmp_path / "input.png"))
 
     with (
         patch(
@@ -615,7 +616,7 @@ def test_chat_api_returns_typed_text_and_openai_usage(tmp_path) -> None:
         patch(
             "sglang.multimodal_gen.runtime.entrypoints.openai.chat_api."
             "save_image_to_path",
-            new=AsyncMock(return_value=str(tmp_path / "input.png")),
+            new=save_image,
         ),
         patch(
             "sglang.multimodal_gen.runtime.entrypoints.openai.chat_api."
@@ -647,6 +648,7 @@ def test_chat_api_returns_typed_text_and_openai_usage(tmp_path) -> None:
     assert response.usage.prompt_tokens == 25
     assert response.usage.completion_tokens == 8
     assert response.usage.total_tokens == 33
+    assert save_image.await_args.kwargs["prefer_remote_source"] is False
 
 
 @pytest.mark.parametrize(
