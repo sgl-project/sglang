@@ -99,6 +99,10 @@ pub struct ServerArgs {
     /// The resolved Python `ModelConfig`, attached to the blob at dump time.
     #[serde(default)]
     pub model_config: ModelConfig,
+    /// Default sampling params advertised by `/get_model_info`, verbatim from
+    /// `server_args.preferred_sampling_params` (a JSON object or null).
+    #[serde(default)]
+    pub preferred_sampling_params: Option<serde_json::Value>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).

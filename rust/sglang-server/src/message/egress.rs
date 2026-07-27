@@ -218,18 +218,22 @@ fn take_hidden(
 /// already been handed out. The caller keeps whatever it was given (it logs and
 /// still forwards; see `tokenizer_manager::egress`), so treat `false` as "this
 /// frame is untrustworthy", not "nothing was delivered".
-pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
+pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded {
+    let mut decoded = Decoded::default();
     if body.len() < 4 {
-        return false;
+        return decoded;
     }
     let hlen = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     let Some(header) = body.get(4..4 + hlen) else {
-        return false;
+        return decoded;
     };
     let data = &body[4 + hlen..];
     let Ok(h) = rmp_serde::from_slice::<BatchHeader>(header) else {
-        return false;
+        return decoded;
     };
+    // Every rid in the frame, known as soon as the header parses — so a rejection
+    // below can still name the requests that were waiting on it.
+    decoded.rids = h.rids.iter().map(|r| RidHash::from_rid(r)).collect();
 
     let n = h.rids.len();
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
@@ -269,8 +273,13 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     // `col` summed every column's span into `base`, so a truncated frame is caught
     // here — the one rejection that is genuinely whole-frame, since it precedes the
     // routing loop. Past this point a failure can only be partial.
-    if base > data.len() {
-        return false;
+    //
+    // The check is EQUALITY, not `>`: every column length is header-determined, so
+    // a data buffer longer than `base` means the header and the buffer disagree.
+    // Accepting the surplus let a producer-side val/idx mismatch through with a
+    // 200, every later column reading off by the difference.
+    if base != data.len() {
+        return decoded;
     }
 
     // Mirror of Python's `has_extra` guard: checking once per frame lets the
@@ -386,11 +395,22 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
 
     for i in 0..n {
         let Some(ev) = decode_one(i) else {
-            return false;
+            return decoded;
         };
         route(ev);
     }
-    true
+    decoded.ok = true;
+    decoded
+}
+
+/// Outcome of [`for_each_chunk`]: whether the frame was accepted, plus the rids it
+/// named. `rids` is populated as soon as the header parses, so a caller can fail
+/// every request in a rejected frame — including ones whose chunk never decoded,
+/// which would otherwise wait forever for a `Done` that no longer exists.
+#[derive(Debug, Default)]
+pub struct Decoded {
+    pub ok: bool,
+    pub rids: Vec<RidHash>,
 }
 
 /// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
@@ -562,7 +582,7 @@ mod tests {
         let framed = frame_egress_batch_cols(&header, &[&data]);
         assert_eq!(framed[0], EGRESS_TAG_BATCH);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].rid_hash, RidHash::from_rid("1").0);
         assert_eq!(events[0].token_ids, vec![10, 11]);
@@ -614,9 +634,12 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
-        let ok = for_each_chunk(&framed[1..], |_| routed += 1);
-        assert!(!ok, "malformed frame must be rejected, not decoded");
+        let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!decoded.ok, "malformed frame must be rejected, not decoded");
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
+        // The rid is still reported, so the caller can fail the request that was
+        // waiting on this frame instead of letting it hang.
+        assert_eq!(decoded.rids, vec![RidHash::from_rid("1")]);
     }
 
     /// A header whose `reqlens` claim more positions than `poslens` carries is
@@ -654,7 +677,7 @@ mod tests {
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
         assert!(
-            !for_each_chunk(&framed[1..], |_| routed += 1),
+            !for_each_chunk(&framed[1..], |_| routed += 1).ok,
             "ragged poslens drift must be rejected, not truncated"
         );
 
@@ -685,9 +708,55 @@ mod tests {
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
         assert!(
-            !for_each_chunk(&framed[1..], |_| routed += 1),
+            !for_each_chunk(&framed[1..], |_| routed += 1).ok,
             "hidden poslens drift must be rejected, not truncated"
         );
+    }
+
+    /// A frame that fails at request 0 buckets nothing, so bucket-driven cleanup
+    /// would leave every request in it hanging. The rids come from the header,
+    /// which is fully parsed before the decode loop.
+    #[test]
+    fn rejected_frame_still_reports_all_its_rids() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("r0"), Value::from("r1")]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            Value::Array(vec![Value::from(9u32), Value::from(9u32)]), // tok_lens past data
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let framed = frame_egress_batch_cols(&header, &[&[0u8; 4][..]]);
+        let mut routed = 0usize;
+        let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!decoded.ok);
+        assert_eq!(routed, 0, "fails at request 0 — nothing bucketed");
+        assert_eq!(
+            decoded.rids,
+            vec![RidHash::from_rid("r0"), RidHash::from_rid("r1")],
+            "both requests must be nameable so the caller can fail them"
+        );
+    }
+
+    /// A data buffer LONGER than the header's columns means the two disagree — a
+    /// producer-side val/idx mismatch. Accepting the surplus delivered another
+    /// column's bytes as logprobs with a 200.
+    #[test]
+    fn frame_longer_than_its_columns_is_rejected() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1")]),
+            Value::Array(vec![Value::Nil]),
+            Value::Array(vec![Value::from(0u32)]),
+            Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 4 bytes
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = vec![0u8; 8]; // 4 bytes too many
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let decoded = for_each_chunk(&framed[1..], |_| {});
+        assert!(!decoded.ok, "header and data must agree exactly");
     }
 
     /// Ingress/egress rid agreement: the routing key decoded from a uuid-rid
@@ -710,7 +779,7 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 1);
         // The equality below reuses `from_rid`, so on its own it would hold for
         // any decoder that hashed *something*. These pin the two failure modes it
@@ -769,7 +838,7 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].token_ids, vec![10]);
         let ex0 = events[0]
@@ -840,7 +909,7 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 1);
         let ex = events[0].extras.as_deref().expect("extras present");
 
