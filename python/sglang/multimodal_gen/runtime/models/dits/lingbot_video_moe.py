@@ -182,18 +182,33 @@ class LingBotVideoAttention(nn.Module):
 
         B, S, H, D = q.shape
         if B > 1:
-            q = q.reshape(1, B * S, H, D)
-            k = k.reshape(1, B * S, H, D)
-            v = v.reshape(1, B * S, H, D)
-            if attention_mask is not None:
-                attention_mask = attention_mask.reshape(1, 1, 1, B * S)
-
-        q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-        k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-
-        out = self.attn(q, k, v, attn_mask=attention_mask)
-        if B > 1:
-            out = out.reshape(B, S, H, D)
+            # cos/sin are laid out per token over the flattened batch, so RoPE
+            # runs flattened; attention runs per sample, else samples attend
+            # across batch boundaries (the reference packs with varlen).
+            q = _apply_rotary_emb(
+                q.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+            ).reshape(B, S, H, D)
+            k = _apply_rotary_emb(
+                k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+            ).reshape(B, S, H, D)
+            sample_outs = []
+            for i in range(B):
+                sample_mask = (
+                    attention_mask[i : i + 1] if attention_mask is not None else None
+                )
+                sample_outs.append(
+                    self.attn(
+                        q[i : i + 1],
+                        k[i : i + 1],
+                        v[i : i + 1],
+                        attn_mask=sample_mask,
+                    )
+                )
+            out = torch.cat(sample_outs, dim=0)
+        else:
+            q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+            k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+            out = self.attn(q, k, v, attn_mask=attention_mask)
         out = out.flatten(2)
         out, _ = self.to_out(out)
         return out
@@ -312,6 +327,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     lora_param_names_mapping = LingBotVideoMoEConfig().lora_param_names_mapping
 
     def to(self, *args, **kwargs):
+        # _parse_to is private but the only exact parser for .to() overloads.
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         if dtype is None or dtype == torch.float32:
             return super().to(*args, **kwargs)
@@ -352,9 +368,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
         head_dim = hidden_size // num_attention_heads
-        assert head_dim == sum(
-            config.axes_dims
-        ), f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
+        assert head_dim == sum(config.axes_dims), (
+            f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
+        )
         mlp_only_layers = tuple(config.mlp_only_layers)
 
         self.hidden_size = hidden_size
