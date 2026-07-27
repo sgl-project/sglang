@@ -921,6 +921,10 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Route small bf16 TP all-reduces (total bytes at or below this value)
+    # through the FlashInfer all-reduce workspace's plain kAllReduce pattern
+    # instead of NCCL. 0 disables.
+    SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES = EnvInt(0)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)
