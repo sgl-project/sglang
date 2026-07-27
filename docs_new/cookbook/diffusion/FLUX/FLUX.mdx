@@ -221,7 +221,7 @@ Test Environment:
     **Server Command**:
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 8764
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
     ```
 
     **Benchmark Command**:
@@ -261,13 +261,13 @@ Test Environment:
 
     ```shell Command
     #One A3 card has 2 npu chips
-    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --port 8764 --num-gpus 2
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --num-gpus 2
     ```
 
     **Benchmark Command**:
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
@@ -308,7 +308,7 @@ Test Environment:
     **Server Command** :
 
     ```shell Command
-    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 8764
+    sglang serve --model-path black-forest-labs/FLUX.1-dev --port 30000
     ```
 
     **Benchmark Command** :
@@ -348,13 +348,13 @@ Test Environment:
 
     ```shell Command
     #One A3 card has 2 npu chips
-    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --port 8764 --num-gpus 2
+    sglang serve --tp-size 2 --sp-degree 1 --model-path black-forest-labs/FLUX.1-dev --num-gpus 2
     ```
 
     **Benchmark Command** :
 
     ```shell Command
-    python -m sglang.multimodal_gen.benchmarks.bench_serving --port 8764 --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+    python -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
     ```
 
     **Result** :
