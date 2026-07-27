@@ -216,8 +216,8 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang:dev-rocm720-mi35x",
-    mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
+    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
