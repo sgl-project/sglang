@@ -18,6 +18,7 @@
     .case-heading { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; margin: 0 0 12px; }
     .case-title { margin: 0; font-size: 18px; }
     .case-meta, .resource-status { color: #aeb7c8; }
+    .timeline { color: #d9c783; margin: -4px 0 12px; font-variant-numeric: tabular-nums; }
     .resource-status.error { color: #ff7b86; }
     .videos { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     .panel { background: #141924; border: 1px solid #2a3140; border-radius: 10px; overflow: hidden; }
@@ -73,6 +74,7 @@
           <span class="case-meta"></span>
           <span class="resource-status">Loading videos…</span>
         </div>
+        <div class="timeline" hidden></div>
         <div class="videos">
           <div class="panel">
             <div class="label">minWM main / V3 baseline</div>
@@ -114,11 +116,20 @@
         ? ` · prompt → chunk ${item.prompt_switch.target_chunk} / frame ${item.prompt_switch.pixel_frame_boundary}`
         : ' · static prompt control';
       card.querySelector('.case-meta').textContent = `action ${item.action_label}${switchMeta} · case ${index + 1}/${caseCount}`;
+      const timeline = card.querySelector('.timeline');
+      if (item.action_schedule?.length) {
+        timeline.hidden = false;
+        timeline.textContent = `Action timeline: ${item.action_schedule.map(segment => {
+          const keys = segment.keys.length ? segment.keys.join('+').toUpperCase() : 'idle';
+          return `${segment.start_frame / fps}–${segment.end_frame / fps}s ${keys}`;
+        }).join(' → ')}`;
+      }
       card.querySelector('pre').textContent = JSON.stringify({
         prompt: item.prompt,
         prompt_switch: item.prompt_switch,
         action_label: item.action_label,
         keys: item.keys,
+        action_schedule: item.action_schedule,
         baseline_video: baselinePath,
         sglang_video: candidatePath,
         failures: item.failures,

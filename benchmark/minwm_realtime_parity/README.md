@@ -12,6 +12,9 @@ decisions, sequence-parallel status, and the required comprehension quiz, read
 The 0724 same-session prompt-switch bitwise run, boundary semantics, event-id
 evidence, and one-time cutover cost are recorded in
 [`PROMPT_SWITCH_PARITY_5S.zh-CN.md`](PROMPT_SWITCH_PARITY_5S.zh-CN.md).
+The 60-second Dragon Ride UniPC run, exact W/S/idle timeline, native-scheduler
+decision, throughput result, and comprehension quiz are recorded in
+[`DRAGON_RIDE_60S_BITWISE.zh-CN.md`](DRAGON_RIDE_60S_BITWISE.zh-CN.md).
 
 ## Inputs
 

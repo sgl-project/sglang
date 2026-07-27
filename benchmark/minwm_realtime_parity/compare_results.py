@@ -226,6 +226,7 @@ def main() -> None:
             "prompt": case["prompt"],
             "action_label": case["action_label"],
             "keys": case["keys"],
+            "action_schedule": case.get("action_schedule"),
             "prompt_switch": prompt_switch,
             "passed": passed,
             "failures": failures,
