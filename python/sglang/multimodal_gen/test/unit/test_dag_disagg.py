@@ -228,6 +228,9 @@ class TestShippedTopologies(CustomTestCase):
         configs = [
             self.topology_dir / "zimage_linear.yaml",
             self.topology_dir / "zimage_conditional_join.yaml",
+            self.topology_dir / "ltx2_dual_vae.yaml",
+            self.topology_dir / "ltx2_dual_vae_3gpu.yaml",
+            self.topology_dir / "ltx2_dual_vae_7gpu.yaml",
         ]
         for path in configs:
             with self.subTest(topology=path.name):
@@ -259,6 +262,67 @@ class TestShippedTopologies(CustomTestCase):
         )
         self.assertEqual(plan.node("denoiser").in_degree, 2)
         self.assertEqual(plan.stage_owner("TimestepPreparationStage"), "relay")
+
+    def test_ltx2_dual_vae_splits_the_two_decoders(self):
+        plan = ExecutionPlan.compile(
+            DagSpec.load(str(self.topology_dir / "ltx2_dual_vae.yaml"))
+        )
+        self.assertEqual(sorted(plan.terminals), ["vae_audio", "vae_video"])
+        self.assertEqual(plan.node("denoiser").out_degree, 2)
+        self.assertEqual(plan.stage_owner("LTX2VideoDecodingStage"), "vae_video")
+        self.assertEqual(plan.stage_owner("LTX2AudioDecodingStage"), "vae_audio")
+        self.assertNotEqual(
+            plan.node("vae_video").num_instances,
+            plan.node("vae_audio").num_instances,
+        )
+
+    def test_ltx2_dual_vae_audio_branch_is_conditional(self):
+        plan = ExecutionPlan.compile(
+            DagSpec.load(str(self.topology_dir / "ltx2_dual_vae.yaml"))
+        )
+        with_audio = {"generate_audio": True}
+        without_audio = {"generate_audio": False}
+        self.assertEqual(
+            [e.edge_id for e in plan.live_out_edges("denoiser", with_audio)],
+            ["denoiser->vae_video", "denoiser->vae_audio"],
+        )
+        self.assertEqual(
+            [e.edge_id for e in plan.live_out_edges("denoiser", without_audio)],
+            ["denoiser->vae_video"],
+        )
+
+    def test_ltx2_dual_vae_3gpu_colocated_single_replica_pools(self):
+        plan = ExecutionPlan.compile(
+            DagSpec.load(str(self.topology_dir / "ltx2_dual_vae_3gpu.yaml"))
+        )
+        self.assertEqual(sorted(plan.terminals), ["vae_audio", "vae_video"])
+        self.assertEqual(plan.node("vae_video").num_instances, 1)
+        self.assertEqual(plan.node("vae_audio").num_instances, 1)
+        stages = [
+            "InputValidationStage",
+            "TextEncodingStage",
+            "LTX2TextConnectorStage",
+            "LTX2SigmaPreparationStage",
+            "TimestepPreparationStage",
+            "LTX2AVLatentPreparationStage",
+            "LTX2ImageEncodingStage",
+            "LTX2AVDenoisingStage",
+            "LTX2VideoDecodingStage",
+            "LTX2AudioDecodingStage",
+        ]
+        self.assertEqual(plan.validate_stage_coverage(stages), [])
+
+    def test_ltx2_dual_vae_7gpu_balanced_layout(self):
+        spec = DagSpec.load(str(self.topology_dir / "ltx2_dual_vae_7gpu.yaml"))
+        denoiser_pool = next(p for p in spec.pools if p.role == "denoiser")
+        self.assertEqual(len(denoiser_pool.urls), 2)
+        self.assertEqual(denoiser_pool.parallelism.get("sp"), 2)
+        plan = ExecutionPlan.compile(spec)
+        self.assertEqual(sorted(plan.terminals), ["vae_audio", "vae_video"])
+        self.assertEqual(plan.max_inflight, 16)
+        self.assertEqual(plan.node("denoiser").num_instances, 2)
+        self.assertEqual(plan.node("vae_video").num_instances, 1)
+        self.assertEqual(plan.node("vae_audio").num_instances, 1)
 
 
 class TestDagRequestScheduler(CustomTestCase):
