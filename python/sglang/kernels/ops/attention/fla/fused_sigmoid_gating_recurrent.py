@@ -571,7 +571,11 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
     # default in-place recovery. out_idx < 0 rows are skipped on store.
     out_idx = tl.load(out_indices + i_n)
     p_out = (
-        h0_source + out_idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
+        h0_source
+        + out_idx * HV * K * V
+        + i_hv * K * V
+        + o_v[None, :] * K
+        + o_k[:, None]
     )
 
     b_A_log = tl.load(p_A_log).to(tl.float32)
