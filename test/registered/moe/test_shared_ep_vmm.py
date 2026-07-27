@@ -203,6 +203,63 @@ class TestSharedEpVmmHelpers(unittest.TestCase):
             [None, "/tmp/shared_ep_fd_test/rank_0.sock", "OSError: connect failed"],
         )
 
+    def test_posix_descriptor_mismatch_is_published_before_mapping(self):
+        group = object()
+        server = MagicMock()
+        incoming = MagicMock()
+        incoming.__enter__.return_value = incoming
+        server.accept.return_value = (incoming, None)
+        outgoing = MagicMock()
+        outgoing.__enter__.return_value = outgoing
+        published = []
+
+        def fake_all_gather(output, value, *, group):
+            published.append(value)
+            if len(published) == 1:
+                output[:] = [None, None]
+            elif len(published) == 2:
+                output[:] = [
+                    "/tmp/shared_ep_fd_test/rank_0.sock",
+                    "/tmp/shared_ep_fd_test/rank_1.sock",
+                ]
+            else:
+                output[:] = [value, None]
+
+        with (
+            patch("socket.socket", side_effect=[server, outgoing]),
+            patch("tempfile.mkdtemp", return_value="/tmp/shared_ep_fd_test"),
+            patch.object(vmm_utils, "_recv_fd", return_value=None),
+            patch.object(vmm_utils, "_send_fd"),
+            patch.object(vmm_utils.os, "unlink"),
+            patch.object(vmm_utils.os, "rmdir"),
+            patch.object(
+                vmm_utils.dist,
+                "all_gather_object",
+                side_effect=fake_all_gather,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"POSIX fd validation failed on rank 0.*missing=\[\(1, 0\)\]",
+            ),
+        ):
+            vmm_utils.exchange_posix_fds(
+                group=group,
+                rank=0,
+                world_size=2,
+                local_fds=[10],
+                peer_base_counts=[1, 1],
+            )
+
+        self.assertEqual(
+            published,
+            [
+                None,
+                "/tmp/shared_ep_fd_test/rank_0.sock",
+                None,
+                "missing=[(1, 0)], extra=[]",
+            ],
+        )
+
     def test_preflight_failure_is_synchronized_before_first_allocation(self):
         local_error = RuntimeError("cuMemGetAllocationGranularity failed")
 

@@ -1893,6 +1893,20 @@ class TestSharedEpConstraints(CustomTestCase):
     def test_release_decode_capacity_is_admitted(self):
         validate_shared_ep_server_args(self._args())
 
+    def test_release_defaults_global_request_limit_to_dp_capacity(self):
+        args = self._args(max_running_requests=None)
+
+        validate_shared_ep_server_args(args)
+
+        self.assertEqual(args.max_running_requests, 32 * 8)
+
+    def test_release_rejects_global_request_limit_above_dp_capacity(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "max-running-requests 256",
+        ):
+            validate_shared_ep_server_args(self._args(max_running_requests=257))
+
     def test_release_requires_dp8_with_dp_attention(self):
         for overrides, pattern in (
             ({"dp_size": 4}, "DP8"),

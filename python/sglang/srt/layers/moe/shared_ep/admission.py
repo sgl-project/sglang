@@ -11,6 +11,18 @@ def validate_shared_ep_server_args(server_args) -> None:
         raise ValueError(f"SharedEP release requires DP8, got DP{server_args.dp_size}.")
     if not server_args.enable_dp_attention:
         raise ValueError("SharedEP release requires --enable-dp-attention.")
+    max_running_requests = RELEASE_MAX_TOKENS_PER_RANK * server_args.dp_size
+    if server_args.max_running_requests is None:
+        server_args.override(
+            "validate_shared_ep_server_args",
+            max_running_requests=max_running_requests,
+        )
+    elif server_args.max_running_requests > max_running_requests:
+        raise ValueError(
+            "SharedEP supports --max-running-requests "
+            f"{max_running_requests} or lower, got "
+            f"{server_args.max_running_requests}."
+        )
     if server_args.enable_lora or server_args.lora_paths:
         raise ValueError("SharedEP release does not support LoRA.")
 

@@ -366,13 +366,25 @@ def exchange_posix_fds(
         }
         missing = expected.difference(received_fds)
         extra = set(received_fds).difference(expected)
-        if missing or extra:
-            for fd in received_fds.values():
-                os.close(fd)
-            raise RuntimeError(
-                "POSIX fd exchange mismatch: "
-                f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
-            )
+        validation_error = (
+            f"missing={sorted(missing)[:8]}, extra={sorted(extra)[:8]}"
+            if missing or extra
+            else None
+        )
+        validation_errors = [None] * world_size
+        dist.all_gather_object(
+            validation_errors,
+            validation_error,
+            group=group,
+        )
+        for failed_rank, error_text in enumerate(validation_errors):
+            if error_text is not None:
+                for fd in received_fds.values():
+                    os.close(fd)
+                received_fds.clear()
+                raise RuntimeError(
+                    f"POSIX fd validation failed on rank {failed_rank}: {error_text}"
+                )
         return received_fds
     finally:
         if server is not None:

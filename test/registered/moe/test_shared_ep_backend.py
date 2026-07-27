@@ -444,15 +444,70 @@ else:
         "sglang.srt.layers.moe.shared_ep.backend.get_is_extend_in_batch",
         return_value=False,
     )
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_dp_global_num_tokens",
+        return_value=[16, 33, 8, 8, 8, 8, 8, 8],
+    )
+    @patch("sglang.srt.layers.moe.shared_ep.backend.quantize_pack_input")
+    def test_decode_rejects_peer_capacity_overflow_before_publish(
+        self,
+        quantize_pack,
+        _global_num_tokens,
+        _is_extend,
+    ):
+        profile = SimpleNamespace(
+            max_tokens_per_rank=32,
+            ep_size=8,
+            block_shape=(128, 128),
+        )
+        state = SimpleNamespace(
+            local_input=object(),
+            global_input=SimpleNamespace(
+                activations=object(),
+                scales=object(),
+            ),
+            input_epoch=Mock(),
+        )
+        dispatcher = SharedEpDispatcher.__new__(SharedEpDispatcher)
+        dispatcher.profile = profile
+        dispatcher.state = state
+        dispatcher.local_expert_start = 0
+        dispatcher.fallback_dispatcher = Mock()
+        hidden_states = torch.zeros((16, 4))
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones((16, 1)),
+            topk_ids=torch.zeros((16, 1), dtype=torch.int32),
+            router_logits=None,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "rank 1 has 33 local tokens.*capacity is 32",
+        ):
+            dispatcher.dispatch(hidden_states, topk_output)
+
+        quantize_pack.assert_not_called()
+        state.input_epoch.publish.assert_not_called()
+
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_is_extend_in_batch",
+        return_value=False,
+    )
+    @patch(
+        "sglang.srt.layers.moe.shared_ep.backend.get_dp_global_num_tokens",
+        return_value=[16] * 8,
+    )
     @patch("sglang.srt.layers.moe.shared_ep.backend.quantize_pack_input")
     def test_decode_rows_use_direct_path(
         self,
         quantize_pack,
+        _global_num_tokens,
         _is_extend,
     ):
         fallback = Mock()
         profile = SimpleNamespace(
             max_tokens_per_rank=32,
+            ep_size=8,
             block_shape=(128, 128),
         )
         state = SimpleNamespace(

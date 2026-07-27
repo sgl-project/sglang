@@ -11,7 +11,10 @@ from sglang.kernels.ops.attention.dsv4 import silu_and_mul_contig_post_quant
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     invoke_fused_moe_kernel,
 )
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     PermuteMethodPool,
@@ -87,6 +90,23 @@ def decode_intermediate_capacity(profile: SharedEpProfile) -> int:
         num_local_experts=profile.num_local_experts,
         block_size=profile.block_size_m,
     )
+
+
+def _validate_decode_capacity(profile: SharedEpProfile) -> None:
+    global_num_tokens = get_dp_global_num_tokens()
+    if global_num_tokens is None or len(global_num_tokens) != profile.ep_size:
+        raise RuntimeError(
+            "SharedEP requires the complete DP-Attention token-count vector "
+            "before decode publication"
+        )
+    largest = max(global_num_tokens)
+    if largest > profile.max_tokens_per_rank:
+        failed_rank = global_num_tokens.index(largest)
+        raise ValueError(
+            "SharedEP decode capacity exceeded: "
+            f"rank {failed_rank} has {largest} local tokens, "
+            f"capacity is {profile.max_tokens_per_rank}"
+        )
 
 
 def _get_shared_state(
@@ -168,6 +188,7 @@ class SharedEpDispatcher(BaseDispatcher):
 
         state = self.state
         num_tokens = hidden_states.shape[0]
+        _validate_decode_capacity(self.profile)
         if num_tokens > self.profile.max_tokens_per_rank:
             raise ValueError(
                 "SharedEP decode capacity exceeded: "
