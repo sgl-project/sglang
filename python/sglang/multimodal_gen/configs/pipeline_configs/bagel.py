@@ -115,8 +115,8 @@ class BagelPipelineConfig(ImagePipelineConfig):
         )
 
     def supports_dynamic_batching(self) -> bool:
-        """Return false until BAGEL gains a batched request-owned KV implementation."""
-        return False
+        """Return true for baseline T2I requests with compatible latent shapes."""
+        return True
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         """Pass request-owned KV state and internal-CFG controls to the DiT.
@@ -158,29 +158,37 @@ class BagelPipelineConfig(ImagePipelineConfig):
 
         Args:
             latents: Denoised patch tokens with shape ``[S, P*P*C]`` or
-                ``[1, S, P*P*C]``.
+                ``[B, S, P*P*C]``.
             batch: Request containing the requested output dimensions.
 
         Returns:
-            Unpatchified VAE latents with shape ``[1, C, H/8, W/8]``.
+            Unpatchified VAE latents with shape ``[B, C, H/8, W/8]``.
 
         Raises:
             ValueError: If token count or patch width does not match the request.
         """
         try:
-            if latents.ndim == 3:
-                if latents.shape[0] != 1:
-                    raise ValueError(
-                        "BAGEL supports exactly one latent sample per request"
-                    )
-                latents = latents[0]
-            if latents.ndim != 2:
+            if latents.ndim == 2:
+                latents = latents.unsqueeze(0)
+            elif latents.ndim != 3:
                 raise ValueError(
                     "BAGEL latents must have shape [tokens, patch_dim] or "
-                    "[1, tokens, patch_dim]"
+                    "[batch, tokens, patch_dim]"
                 )
 
             arch = self.dit_config.arch_config
+            batch_size = int(latents.shape[0])
+            context = batch.extra.get(_BAGEL_CONTEXT_KEY)
+            context_batch_size = getattr(context, "batch_size", batch_size)
+            if int(context_batch_size) != batch_size:
+                raise ValueError(
+                    "BAGEL latent batch size does not match the request context"
+                )
+            dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
+            if dynamic_seeds is not None and len(dynamic_seeds) != batch_size:
+                raise ValueError(
+                    "BAGEL latent batch size does not match dynamic request seeds"
+                )
             patch_size = int(arch.latent_patch_size)
             channels = int(arch.latent_channel)
             latent_downsample = int(arch.latent_downsample)
@@ -188,14 +196,15 @@ class BagelPipelineConfig(ImagePipelineConfig):
             token_width = int(batch.width) // latent_downsample
             expected_tokens = token_height * token_width
             expected_width = patch_size * patch_size * channels
-            if tuple(latents.shape) != (expected_tokens, expected_width):
+            expected_shape = (batch_size, expected_tokens, expected_width)
+            if tuple(latents.shape) != expected_shape:
                 raise ValueError(
                     "BAGEL latent shape does not match the request: expected "
-                    f"({expected_tokens}, {expected_width}), got {tuple(latents.shape)}"
+                    f"{expected_shape}, got {tuple(latents.shape)}"
                 )
 
             patches = latents.reshape(
-                1,
+                batch_size,
                 token_height,
                 token_width,
                 patch_size,
@@ -203,7 +212,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
                 channels,
             )
             return torch.einsum("nhwpqc->nchpwq", patches).reshape(
-                1,
+                batch_size,
                 channels,
                 token_height * patch_size,
                 token_width * patch_size,
@@ -236,6 +245,10 @@ class BagelThinkingPipelineConfig(BagelPipelineConfig):
     dit_config: DiTConfig = field(default_factory=_thinking_dit_config)
     thinking_image_guidance_scale: float = 1.5
 
+    def supports_dynamic_batching(self) -> bool:
+        """Disable batching for autoregressive planning and three-way CFG state."""
+        return False
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         """Pass the three request-owned Thinking branches to the denoiser."""
         kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
@@ -258,6 +271,10 @@ class BagelUnderstandingPipelineConfig(BagelPipelineConfig):
         default_factory=BagelImageEncoderConfig
     )
     image_encoder_precision: str = "bf16"
+
+    def supports_dynamic_batching(self) -> bool:
+        """Disable batching for autoregressive image understanding."""
+        return False
 
     @staticmethod
     def condition_image_convert_method(image: Image.Image) -> Image.Image:
@@ -318,6 +335,10 @@ class BagelEditPipelineConfig(BagelPipelineConfig):
     editing_cfg_interval: tuple[float, float] = (0.0, 1.0)
     editing_cfg_renorm_type: str = "text_channel"
     editing_image_guidance_scale: float = 2.0
+
+    def supports_dynamic_batching(self) -> bool:
+        """Disable batching for image-conditioned three-way CFG state."""
+        return False
 
     @staticmethod
     def condition_image_convert_method(image: Image.Image) -> Image.Image:

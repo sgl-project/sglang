@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
     BagelEditPipelineConfig,
     BagelPipelineConfig,
     BagelThinkingPipelineConfig,
+    BagelUnderstandingPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.bagel import (
@@ -84,7 +85,7 @@ class TestBagelPipelineConfig(unittest.TestCase):
         config = BagelPipelineConfig()
 
         self.assertFalse(config.should_use_guidance)
-        self.assertFalse(config.supports_dynamic_batching())
+        self.assertTrue(config.supports_dynamic_batching())
         self.assertFalse(config.vae_tiling)
         self.assertFalse(config.vae_sp)
         self.assertEqual(config.generator_device, "cpu")
@@ -92,6 +93,16 @@ class TestBagelPipelineConfig(unittest.TestCase):
         self.assertFalse(deployment.auto_enable_cfg_parallel)
         self.assertEqual(deployment.keep_resident_components, ("dit", "vae"))
         self.assertEqual(deployment.implicit_auxiliary_layerwise_offload_components, ())
+
+    def test_only_baseline_t2i_supports_dynamic_batching(self) -> None:
+        self.assertTrue(BagelPipelineConfig().supports_dynamic_batching())
+        for config in (
+            BagelThinkingPipelineConfig(),
+            BagelEditPipelineConfig(),
+            BagelUnderstandingPipelineConfig(),
+        ):
+            with self.subTest(config=type(config).__name__):
+                self.assertFalse(config.supports_dynamic_batching())
 
     def test_editing_config_is_explicit_and_keeps_t2i_decoder_only(self) -> None:
         t2i = BagelPipelineConfig()
@@ -256,6 +267,46 @@ class TestBagelPipelineConfig(unittest.TestCase):
             "nhwpqc->nchpwq", tokens.reshape(1, 2, 3, 2, 2, 16)
         ).reshape(1, 16, 4, 6)
         torch.testing.assert_close(latents, expected)
+
+    def test_unpatchify_supports_batched_tokens_and_preserves_batch_one(self) -> None:
+        config = BagelPipelineConfig()
+
+        for batch_size in (1, 2):
+            with self.subTest(batch_size=batch_size):
+                batch = SimpleNamespace(
+                    height=32,
+                    width=48,
+                    extra={"bagel_context": object()},
+                )
+                tokens = torch.arange(batch_size * 6 * 64, dtype=torch.float32).reshape(
+                    batch_size, 6, 64
+                )
+
+                latents = config.post_denoising_loop(tokens, batch)
+
+                self.assertEqual(tuple(latents.shape), (batch_size, 16, 4, 6))
+                self.assertNotIn("bagel_context", batch.extra)
+                expected = torch.einsum(
+                    "nhwpqc->nchpwq",
+                    tokens.reshape(batch_size, 2, 3, 2, 2, 16),
+                ).reshape(batch_size, 16, 4, 6)
+                torch.testing.assert_close(latents, expected)
+
+    def test_unpatchify_validates_dynamic_batch_metadata(self) -> None:
+        config = BagelPipelineConfig()
+        batch = SimpleNamespace(
+            height=32,
+            width=48,
+            extra={
+                "bagel_context": SimpleNamespace(batch_size=2),
+                "dynamic_batch_seeds": [1],
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "dynamic request seeds"):
+            config.post_denoising_loop(torch.zeros(2, 6, 64), batch)
+
+        self.assertNotIn("bagel_context", batch.extra)
 
     def test_unpatchify_releases_context_on_shape_error(self) -> None:
         config = BagelPipelineConfig()

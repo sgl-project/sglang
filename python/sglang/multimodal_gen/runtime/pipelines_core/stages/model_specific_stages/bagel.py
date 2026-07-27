@@ -204,7 +204,9 @@ def validate_bagel_special_tokens(tokenizer) -> dict[str, int]:
 
 
 class BagelBeforeDenoisingStage(PipelineStage):
-    """Prepare a single BAGEL T2I request for the standard denoising stage."""
+    """Prepare compatible BAGEL T2I requests for the standard denoising stage."""
+
+    allows_dynamic_batching: bool = True
 
     def __init__(self, transformer, tokenizer, scheduler) -> None:
         """Initialize the stage with immutable component templates.
@@ -254,10 +256,40 @@ class BagelBeforeDenoisingStage(PipelineStage):
 
     requires_image: bool = False
 
+    def _request_prompts(self, batch: Req) -> list[str]:
+        """Return validated prompts in request order.
+
+        Args:
+            batch: One request or a scheduler-merged request.
+
+        Returns:
+            A non-empty list of normalized prompt strings.
+
+        Raises:
+            ValueError: If prompt shape/content is invalid or the stage variant
+                does not support scheduler-level dynamic batching.
+        """
+        if isinstance(batch.prompt, str):
+            if not batch.prompt.strip():
+                raise ValueError("BAGEL T2I requires non-empty string prompts")
+            return [batch.prompt]
+
+        if isinstance(batch.prompt, list):
+            if not self.allows_dynamic_batching:
+                raise ValueError("BAGEL dynamic batching is supported by pure T2I only")
+            if not batch.prompt or any(
+                not isinstance(prompt, str) or not prompt.strip()
+                for prompt in batch.prompt
+            ):
+                raise ValueError("BAGEL T2I requires non-empty string prompts")
+            return list(batch.prompt)
+
+        raise ValueError("BAGEL T2I requires non-empty string prompts")
+
     def _validate_request(self, batch: Req, server_args: ServerArgs) -> None:
         """Reject request features outside the current BAGEL T2I contract."""
-        if not isinstance(batch.prompt, str) or not batch.prompt.strip():
-            raise ValueError("BAGEL T2I requires exactly one non-empty string prompt")
+        prompts = self._request_prompts(batch)
+        request_count = len(prompts)
         if not isinstance(batch.seed, int) or isinstance(batch.seed, bool):
             raise ValueError("BAGEL T2I requires one scalar seed")
         if batch.num_outputs_per_prompt != 1:
@@ -306,8 +338,27 @@ class BagelBeforeDenoisingStage(PipelineStage):
                 )
             if batch.image_path is not None or batch.condition_image is not None:
                 raise ValueError("BAGEL T2I does not accept image input")
-        if batch.extra.get("dynamic_batch_seeds") is not None:
-            raise ValueError("BAGEL dynamic batching is not supported")
+        dynamic_batch_seeds = batch.extra.get("dynamic_batch_seeds")
+        if request_count > 1 and dynamic_batch_seeds is None:
+            raise ValueError(
+                "BAGEL batched prompts require dynamic_batch_seeds metadata"
+            )
+        if dynamic_batch_seeds is not None:
+            if (
+                not isinstance(dynamic_batch_seeds, list)
+                or len(dynamic_batch_seeds) != request_count
+                or any(
+                    not isinstance(seed, int) or isinstance(seed, bool)
+                    for seed in dynamic_batch_seeds
+                )
+            ):
+                raise ValueError(
+                    "BAGEL dynamic_batch_seeds must contain one integer per prompt"
+                )
+            if dynamic_batch_seeds[0] != batch.seed:
+                raise ValueError(
+                    "BAGEL first dynamic seed must match the merged request seed"
+                )
         if batch.rollout:
             raise ValueError("BAGEL rollout mode is not supported")
         if batch.return_trajectory_latents or batch.return_trajectory_decoded:
@@ -336,12 +387,46 @@ class BagelBeforeDenoisingStage(PipelineStage):
                 f"got {width}x{height}"
             )
 
-        if not isinstance(batch.generator, list) or len(batch.generator) != 1:
-            raise ValueError(
-                "BAGEL requires InputValidationStage to create exactly one generator"
+        if (
+            not isinstance(batch.seeds, list)
+            or len(batch.seeds) != request_count
+            or any(
+                not isinstance(seed, int) or isinstance(seed, bool)
+                for seed in batch.seeds
             )
+        ):
+            raise ValueError("BAGEL requires one validated seed per prompt")
+        expected_seeds = (
+            dynamic_batch_seeds if dynamic_batch_seeds is not None else [batch.seed]
+        )
+        if batch.seeds != expected_seeds:
+            raise ValueError("BAGEL validated seeds do not match request seeds")
+        if (
+            not isinstance(batch.generator, list)
+            or len(batch.generator) != request_count
+        ):
+            raise ValueError("BAGEL requires one generator per prompt")
         if not math.isfinite(float(batch.guidance_scale)) or batch.guidance_scale < 0:
             raise ValueError("BAGEL guidance_scale must be a finite non-negative value")
+
+    def _build_text_to_image_context(
+        self,
+        batch: Req,
+        transformer,
+        prompt: str,
+        special_token_ids: dict[str, int],
+        device: torch.device,
+    ):
+        """Prefill one pure T2I prompt without mutating the merged request."""
+        conditional_ids = self._tokenize_prompt(prompt, special_token_ids).to(device)
+        return transformer.build_context(
+            conditional_ids,
+            None,
+            height=int(batch.height),
+            width=int(batch.width),
+            start_of_image_token_id=special_token_ids["<|vision_start|>"],
+            end_of_image_token_id=special_token_ids["<|vision_end|>"],
+        )
 
     def _build_request_context(
         self,
@@ -354,16 +439,12 @@ class BagelBeforeDenoisingStage(PipelineStage):
     ):
         """Build the two-way T2I context for one request."""
         del server_args
-        conditional_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(
-            device
-        )
-        return transformer.build_context(
-            conditional_ids,
-            None,
-            height=int(batch.height),
-            width=int(batch.width),
-            start_of_image_token_id=special_token_ids["<|vision_start|>"],
-            end_of_image_token_id=special_token_ids["<|vision_end|>"],
+        return self._build_text_to_image_context(
+            batch,
+            transformer,
+            batch.prompt,
+            special_token_ids,
+            device,
         )
 
     def _prepare_context_inputs(
@@ -426,16 +507,24 @@ class BagelBeforeDenoisingStage(PipelineStage):
                 schedule/generator setting.
         """
         self._validate_request(batch, server_args)
+        prompts = self._request_prompts(batch)
         device = get_local_torch_device()
-        generator = batch.generator[0]
-        generator_device = torch.device(generator.device)
-        if generator_device.type not in {"cpu", torch.device(device).type}:
-            raise ValueError(
-                "BAGEL generator must use CPU or the denoising device type; got "
-                f"{generator.device}, expected cpu or {device}"
-            )
-        if generator.initial_seed() != int(batch.seed):
-            raise ValueError("BAGEL request generator seed does not match batch.seed")
+        generator_devices: list[torch.device] = []
+        for request_index, (generator, seed) in enumerate(
+            zip(batch.generator, batch.seeds, strict=True)
+        ):
+            generator_device = torch.device(generator.device)
+            if generator_device.type not in {"cpu", torch.device(device).type}:
+                raise ValueError(
+                    "BAGEL generator must use CPU or the denoising device type; got "
+                    f"{generator.device}, expected cpu or {device}"
+                )
+            if generator.initial_seed() != seed:
+                raise ValueError(
+                    "BAGEL generator seed does not match its request seed at index "
+                    f"{request_index}"
+                )
+            generator_devices.append(generator_device)
 
         special_token_ids = self._ensure_special_tokens()
         context_inputs = self._prepare_context_inputs(
@@ -451,26 +540,66 @@ class BagelBeforeDenoisingStage(PipelineStage):
         ) as transformer:
             assert transformer is not None
             self.transformer = transformer
-            context = self._build_request_context(
-                batch,
-                server_args,
-                transformer,
-                special_token_ids,
-                device,
-                **context_inputs,
-            )
+            if len(prompts) == 1 and isinstance(batch.prompt, str):
+                context = self._build_request_context(
+                    batch,
+                    server_args,
+                    transformer,
+                    special_token_ids,
+                    device,
+                    **context_inputs,
+                )
+            elif len(prompts) == 1:
+                # Offline/direct callers may provide a one-item prompt list even
+                # though scheduler merges always contain at least two requests.
+                context = self._build_text_to_image_context(
+                    batch,
+                    transformer,
+                    prompts[0],
+                    special_token_ids,
+                    device,
+                )
+            else:
+                # Prefix lengths vary with prompt tokenization. Prefill each
+                # request independently, then pack the request-major KV caches.
+                contexts = [
+                    self._build_text_to_image_context(
+                        batch,
+                        transformer,
+                        prompt,
+                        special_token_ids,
+                        device,
+                    )
+                    for prompt in prompts
+                ]
+                context = transformer.pack_contexts(contexts)
+                # Packing concatenates each request-local cache. Release the
+                # source contexts before allocating initial noise and schedules.
+                del contexts
 
         arch = server_args.pipeline_config.dit_config.arch_config
         token_height = int(batch.height) // int(arch.latent_downsample)
         token_width = int(batch.width) // int(arch.latent_downsample)
         patch_width = int(arch.latent_patch_size) ** 2 * int(arch.latent_channel)
-        latents = torch.randn(
-            token_height * token_width,
-            patch_width,
-            generator=generator,
-            device=generator_device,
-            dtype=torch.float32,
-        ).to(device)
+        # Draw each request from its own RNG stream before stacking. This keeps
+        # batched initial noise exactly equal to independent sequential requests.
+        request_latents = [
+            torch.randn(
+                token_height * token_width,
+                patch_width,
+                generator=generator,
+                device=generator_device,
+                dtype=torch.float32,
+            ).to(device)
+            for generator, generator_device in zip(
+                batch.generator, generator_devices, strict=True
+            )
+        ]
+        latents = (
+            request_latents[0]
+            if len(request_latents) == 1
+            else torch.stack(request_latents)
+        )
 
         flow_shift = (
             batch.flow_shift
@@ -499,9 +628,11 @@ class BagelBeforeDenoisingStage(PipelineStage):
 
         batch.extra[_BAGEL_CONTEXT_KEY] = context
         batch.latents = latents
-        # The model consumes a 2D token matrix, but the standard denoising
-        # skeleton reads axis 0 as logical batch size when expanding timestep.
-        batch.raw_latent_shape = (1, *latents.shape)
+        # Preserve the established 2D single-request contract while exposing a
+        # real batch dimension to the shared denoising loop for merged requests.
+        batch.raw_latent_shape = (
+            (1, *latents.shape) if latents.ndim == 2 else tuple(latents.shape)
+        )
         batch.n_tokens = token_height * token_width
         batch.scheduler = scheduler
         batch.timesteps = scheduler.timesteps
@@ -514,6 +645,8 @@ class BagelBeforeDenoisingStage(PipelineStage):
 
 class BagelThinkingBeforeDenoisingStage(BagelBeforeDenoisingStage):
     """Generate a plan, rewrap it, and build official three-way T2I context."""
+
+    allows_dynamic_batching: bool = False
 
     @staticmethod
     def _decode_thought(
@@ -787,6 +920,7 @@ class BagelUnderstandingStage(PipelineStage):
 class BagelEditBeforeDenoisingStage(BagelBeforeDenoisingStage):
     """Encode one source image and build BAGEL's three Editing CFG prefixes."""
 
+    allows_dynamic_batching: bool = False
     requires_image = True
 
     def __init__(

@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     BagelTransformer,
+    _interleave_prefix_and_query,
     _sdpa_attention,
 )
 
@@ -206,6 +207,149 @@ def test_context_and_forward_are_request_isolated(
     torch.testing.assert_close(output_a_first, output_a_second)
     assert output_a_first.shape == latents.shape
     assert torch.isfinite(output_a_first).all()
+
+
+@pytest.mark.parametrize("guidance_scale", [1.0, 2.0])
+def test_dynamic_batch_matches_sequential_with_variable_prefixes(
+    tiny_transformer: BagelTransformer,
+    guidance_scale: float,
+) -> None:
+    contexts = [
+        _build_context(tiny_transformer, [1, 2]),
+        _build_context(tiny_transformer, [2, 1, 2]),
+    ]
+    packed_context = tiny_transformer.pack_contexts(contexts)
+    torch.manual_seed(3)
+    latents = torch.randn(2, 4, 4)
+    timestep = torch.tensor([0.5, 0.5])
+
+    batched = tiny_transformer(
+        latents,
+        timestep,
+        bagel_context=packed_context,
+        guidance_scale=guidance_scale,
+        cfg_interval=(0.0, 1.0),
+    )
+    sequential = torch.stack(
+        [
+            tiny_transformer(
+                latents[index],
+                timestep[index : index + 1],
+                bagel_context=context,
+                guidance_scale=guidance_scale,
+                cfg_interval=(0.0, 1.0),
+            )
+            for index, context in enumerate(contexts)
+        ]
+    )
+
+    assert packed_context.batch_size == 2
+    assert packed_context.conditional_kv_lens.tolist() == [2, 3]
+    assert packed_context.unconditional_kv_lens.tolist() == [0, 0]
+    assert packed_context.conditional_rope_offset.tolist() == [2, 3]
+    assert packed_context.conditional_kv.sequence_length == 5
+    assert batched.shape == latents.shape
+    torch.testing.assert_close(batched, sequential, rtol=1e-5, atol=1e-6)
+
+
+def test_batch_one_preserves_two_and_three_dimensional_forward_contract(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context = _build_context(tiny_transformer, [1, 2])
+    latents = torch.randn(4, 4)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.bagel_transformer._interleave_prefix_and_query",
+        side_effect=AssertionError("B=1 must use the legacy singleton path"),
+    ):
+        unbatched = tiny_transformer(
+            latents,
+            torch.tensor([0.5]),
+            bagel_context=context,
+            guidance_scale=2.0,
+        )
+        batched = tiny_transformer(
+            latents.unsqueeze(0),
+            torch.tensor([0.5]),
+            bagel_context=context,
+            guidance_scale=2.0,
+        )
+
+    assert unbatched.shape == latents.shape
+    assert batched.shape == (1, *latents.shape)
+    torch.testing.assert_close(batched[0], unbatched, rtol=0, atol=0)
+
+
+def test_dynamic_batch_keeps_requests_attention_isolated(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    context_a = _build_context(tiny_transformer, [1, 2])
+    context_b = _build_context(tiny_transformer, [2, 1, 2])
+    latents = torch.randn(2, 4, 4)
+    first = tiny_transformer(
+        latents,
+        torch.tensor([0.5, 0.5]),
+        bagel_context=tiny_transformer.pack_contexts([context_a, context_b]),
+        guidance_scale=1.0,
+    )
+
+    changed_context_b = _build_context(tiny_transformer, [7, 8, 9, 10])
+    changed_latents = latents.clone()
+    changed_latents[1].mul_(10)
+    second = tiny_transformer(
+        changed_latents,
+        torch.tensor([0.5, 0.5]),
+        bagel_context=tiny_transformer.pack_contexts([context_a, changed_context_b]),
+        guidance_scale=1.0,
+    )
+
+    torch.testing.assert_close(first[0], second[0], rtol=0, atol=0)
+
+
+def test_dynamic_batch_rejects_mismatched_timesteps(
+    tiny_transformer: BagelTransformer,
+) -> None:
+    contexts = [
+        _build_context(tiny_transformer, [1]),
+        _build_context(tiny_transformer, [2]),
+    ]
+    with pytest.raises(ValueError, match="same timestep"):
+        tiny_transformer(
+            torch.randn(2, 4, 4),
+            torch.tensor([0.5, 0.4]),
+            bagel_context=tiny_transformer.pack_contexts(contexts),
+            guidance_scale=1.0,
+        )
+
+
+def test_normalizes_scalar_request_and_token_timesteps() -> None:
+    scalar = BagelTransformer._normalize_timestep(
+        torch.tensor(0.5), 2, 3, torch.device("cpu")
+    )
+    per_request = BagelTransformer._normalize_timestep(
+        torch.tensor([0.5, 0.25]), 2, 3, torch.device("cpu")
+    )
+    per_token = BagelTransformer._normalize_timestep(
+        torch.arange(6), 2, 3, torch.device("cpu")
+    )
+
+    assert scalar.tolist() == [0.5] * 6
+    assert per_request.tolist() == [0.5, 0.5, 0.5, 0.25, 0.25, 0.25]
+    assert per_token.tolist() == list(range(6))
+
+
+def test_interleaves_prefix_and_query_per_request() -> None:
+    prefix = torch.tensor([[10.0], [20.0], [21.0]])
+    query = torch.tensor([[100.0], [101.0], [200.0]])
+
+    packed = _interleave_prefix_and_query(
+        prefix,
+        query,
+        torch.tensor([1, 2]),
+        torch.tensor([2, 1]),
+    )
+
+    assert packed[:, 0].tolist() == [10.0, 100.0, 101.0, 20.0, 21.0, 200.0]
 
 
 def test_build_context_requires_explicit_valid_image_token_ids(
@@ -419,6 +563,33 @@ def test_internal_cfg_matches_bagel_global_renorm() -> None:
 
     # Raw CFG is [5, 0]; BAGEL's global renorm caps it to the conditional norm.
     torch.testing.assert_close(output, conditional)
+
+
+def test_batched_global_cfg_renorm_is_sample_local() -> None:
+    conditional = torch.tensor([[[2.0, 0.0]], [[0.0, 4.0]]])
+    unconditional = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+
+    batched = BagelTransformer._apply_cfg(
+        conditional,
+        unconditional,
+        4.0,
+        renorm_min=0.0,
+        renorm_type="global",
+    )
+    sequential = torch.stack(
+        [
+            BagelTransformer._apply_cfg(
+                conditional[index],
+                unconditional[index],
+                4.0,
+                renorm_min=0.0,
+                renorm_type="global",
+            )
+            for index in range(2)
+        ]
+    )
+
+    torch.testing.assert_close(batched, sequential)
 
 
 def test_editing_context_has_three_request_owned_prefixes_with_shared_image_storage(

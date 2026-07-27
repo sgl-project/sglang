@@ -133,6 +133,51 @@ class BagelKVCache:
         first_key = self.key_cache[0] if self.key_cache else None
         return 0 if first_key is None else int(first_key.shape[0])
 
+    @classmethod
+    def concatenate(cls, caches: list[BagelKVCache]) -> BagelKVCache:
+        """Pack request-local caches by concatenating them in request order.
+
+        Args:
+            caches: Per-request caches with an identical layer count.
+
+        Returns:
+            One cache whose tensors are concatenated in request order.
+
+        Raises:
+            ValueError: If no caches are provided or layer layouts differ.
+        """
+        if not caches:
+            raise ValueError("BAGEL cache packing requires at least one request")
+        num_layers = len(caches[0].key_cache)
+        if any(
+            len(cache.key_cache) != num_layers or len(cache.value_cache) != num_layers
+            for cache in caches
+        ):
+            raise ValueError("BAGEL cache layer counts must match when batching")
+
+        packed_keys: list[Tensor | None] = []
+        packed_values: list[Tensor | None] = []
+        for layer_index in range(num_layers):
+            keys = [cache.key_cache[layer_index] for cache in caches]
+            values = [cache.value_cache[layer_index] for cache in caches]
+            if any(
+                (key is None) != (value is None) for key, value in zip(keys, values)
+            ):
+                raise ValueError("BAGEL key/value cache entries must be paired")
+            present_keys = [key for key in keys if key is not None]
+            present_values = [value for value in values if value is not None]
+            if present_keys and len(present_keys) != len(caches):
+                raise ValueError(
+                    "BAGEL cache layers must be present for every batched request"
+                )
+            packed_keys.append(
+                None if not present_keys else torch.cat(present_keys, dim=0)
+            )
+            packed_values.append(
+                None if not present_values else torch.cat(present_values, dim=0)
+            )
+        return cls(packed_keys, packed_values)
+
 
 @dataclass(frozen=True)
 class BagelPrefixContext:
@@ -158,15 +203,15 @@ class BagelContext:
     unconditional_kv: BagelKVCache
     conditional_kv_lens: Tensor
     unconditional_kv_lens: Tensor
-    conditional_rope_offset: int
-    unconditional_rope_offset: int
+    conditional_rope_offset: int | Tensor
+    unconditional_rope_offset: int | Tensor
     height: int
     width: int
     start_of_image_token_id: int
     end_of_image_token_id: int
     secondary_unconditional_kv: BagelKVCache | None = None
     secondary_unconditional_kv_lens: Tensor | None = None
-    secondary_unconditional_rope_offset: int | None = None
+    secondary_unconditional_rope_offset: int | Tensor | None = None
     three_way_cfg_kind: str | None = None
 
     @property
@@ -183,6 +228,11 @@ class BagelContext:
     def is_thinking(self) -> bool:
         """Return whether this context contains the third Thinking CFG branch."""
         return self.three_way_cfg_kind == "thinking"
+
+    @property
+    def batch_size(self) -> int:
+        """Return the number of request prefixes packed into this context."""
+        return int(self.conditional_kv_lens.numel())
 
     @classmethod
     def from_prefixes(
@@ -233,6 +283,81 @@ class BagelContext:
                 else secondary_unconditional.rope_offset
             ),
             three_way_cfg_kind=three_way_cfg_kind,
+        )
+
+    @classmethod
+    def pack(cls, contexts: list[BagelContext]) -> BagelContext:
+        """Pack compatible two-way T2I contexts for one denoising forward.
+
+        Args:
+            contexts: Request-owned contexts in scheduler merge order.
+
+        Returns:
+            A context with concatenated KV tensors and per-request lengths and
+            RoPE offsets.
+
+        Raises:
+            ValueError: If contexts are empty, already batched, three-way, or
+                use different image geometry or special tokens.
+        """
+        if not contexts:
+            raise ValueError("BAGEL context packing requires at least one request")
+        reference = contexts[0]
+        signature = (
+            reference.height,
+            reference.width,
+            reference.start_of_image_token_id,
+            reference.end_of_image_token_id,
+        )
+        for context in contexts:
+            if context.batch_size != 1:
+                raise ValueError("BAGEL can only pack request-local contexts")
+            if context.has_three_way_cfg:
+                raise ValueError("BAGEL dynamic batching supports pure T2I only")
+            if (
+                context.height,
+                context.width,
+                context.start_of_image_token_id,
+                context.end_of_image_token_id,
+            ) != signature:
+                raise ValueError("BAGEL batched contexts must use identical geometry")
+
+        def pack_branch(
+            cache_name: str, lengths_name: str, offset_name: str
+        ) -> tuple[BagelKVCache, Tensor, Tensor]:
+            caches = [getattr(context, cache_name) for context in contexts]
+            lengths = [getattr(context, lengths_name) for context in contexts]
+            offsets = [getattr(context, offset_name) for context in contexts]
+            for cache, branch_lengths, offset in zip(caches, lengths, offsets):
+                if branch_lengths.numel() != 1:
+                    raise ValueError("BAGEL request context must contain one KV length")
+                if cache.sequence_length != int(branch_lengths.item()):
+                    raise ValueError("BAGEL context KV length does not match its cache")
+                if not isinstance(offset, int):
+                    raise ValueError(
+                        "BAGEL request context must contain one RoPE offset"
+                    )
+            packed_lengths = torch.cat(lengths).to(dtype=torch.int32)
+            packed_offsets = packed_lengths.new_tensor(offsets, dtype=torch.long)
+            return BagelKVCache.concatenate(caches), packed_lengths, packed_offsets
+
+        conditional_kv, conditional_lens, conditional_offsets = pack_branch(
+            "conditional_kv", "conditional_kv_lens", "conditional_rope_offset"
+        )
+        unconditional_kv, unconditional_lens, unconditional_offsets = pack_branch(
+            "unconditional_kv", "unconditional_kv_lens", "unconditional_rope_offset"
+        )
+        return cls(
+            conditional_kv=conditional_kv,
+            unconditional_kv=unconditional_kv,
+            conditional_kv_lens=conditional_lens,
+            unconditional_kv_lens=unconditional_lens,
+            conditional_rope_offset=conditional_offsets,
+            unconditional_rope_offset=unconditional_offsets,
+            height=reference.height,
+            width=reference.width,
+            start_of_image_token_id=reference.start_of_image_token_id,
+            end_of_image_token_id=reference.end_of_image_token_id,
         )
 
 
@@ -348,6 +473,49 @@ def _sdpa_attention(query: Tensor, key: Tensor, value: Tensor, causal: bool) -> 
     return output.squeeze(0).transpose(0, 1)
 
 
+def _interleave_prefix_and_query(
+    prefix: Tensor,
+    query: Tensor,
+    prefix_lens: Tensor,
+    query_lens: Tensor,
+) -> Tensor:
+    """Pack ``[prefix_i, query_i]`` sequences in request order.
+
+    Args:
+        prefix: Concatenated request prefixes.
+        query: Concatenated request query blocks.
+        prefix_lens: Prefix length for each request.
+        query_lens: Query length for each request.
+
+    Returns:
+        A varlen-attention key/value layout ordered as
+        ``[prefix_0, query_0, prefix_1, query_1, ...]``.
+
+    Raises:
+        ValueError: If the length vectors or packed tensor sizes disagree.
+    """
+    prefix_sizes = [int(length) for length in prefix_lens.tolist()]
+    query_sizes = [int(length) for length in query_lens.tolist()]
+    if len(prefix_sizes) != len(query_sizes) or not prefix_sizes:
+        raise ValueError("BAGEL prefix and query length vectors must align")
+    if any(length < 0 for length in prefix_sizes) or any(
+        length <= 0 for length in query_sizes
+    ):
+        raise ValueError(
+            "BAGEL prefix lengths must be non-negative and queries positive"
+        )
+    if sum(prefix_sizes) != prefix.shape[0] or sum(query_sizes) != query.shape[0]:
+        raise ValueError("BAGEL packed tensors do not match their length vectors")
+
+    prefix_chunks = torch.split(prefix, prefix_sizes, dim=0)
+    query_chunks = torch.split(query, query_sizes, dim=0)
+    sequences = [
+        torch.cat((prefix_chunk, query_chunk), dim=0)
+        for prefix_chunk, query_chunk in zip(prefix_chunks, query_chunks)
+    ]
+    return torch.cat(sequences, dim=0)
+
+
 def _run_varlen_attention(
     query: Tensor,
     key: Tensor,
@@ -359,8 +527,19 @@ def _run_varlen_attention(
     attention_backend: AttentionBackendEnum,
 ) -> Tensor:
     """Use SGLang FlashAttention on CUDA and a CPU-safe SDPA fallback."""
-    if query_lens.numel() != 1 or key_lens.numel() != 1:
-        raise ValueError("BAGEL T2I supports exactly one request per forward")
+    query_sizes = [int(length) for length in query_lens.tolist()]
+    key_sizes = [int(length) for length in key_lens.tolist()]
+    if len(query_sizes) != len(key_sizes) or not query_sizes:
+        raise ValueError("BAGEL query and key length vectors must align")
+    if any(length <= 0 for length in query_sizes) or any(
+        key_length < query_length
+        for query_length, key_length in zip(query_sizes, key_sizes)
+    ):
+        raise ValueError("BAGEL varlen attention received invalid sequence lengths")
+    if sum(query_sizes) != query.shape[0] or sum(key_sizes) != key.shape[0]:
+        raise ValueError("BAGEL attention tensors do not match their length vectors")
+    if value.shape[0] != key.shape[0]:
+        raise ValueError("BAGEL attention key and value lengths must match")
 
     if (
         attention_backend == AttentionBackendEnum.FA
@@ -389,7 +568,20 @@ def _run_varlen_attention(
                 "BAGEL FlashAttention unavailable; falling back to SDPA: %s", error
             )
 
-    return _sdpa_attention(query, key, value, causal)
+    if len(query_sizes) == 1:
+        return _sdpa_attention(query, key, value, causal)
+    query_chunks = torch.split(query, query_sizes, dim=0)
+    key_chunks = torch.split(key, key_sizes, dim=0)
+    value_chunks = torch.split(value, key_sizes, dim=0)
+    return torch.cat(
+        [
+            _sdpa_attention(query_chunk, key_chunk, value_chunk, causal)
+            for query_chunk, key_chunk, value_chunk in zip(
+                query_chunks, key_chunks, value_chunks
+            )
+        ],
+        dim=0,
+    )
 
 
 class _BagelRMSNorm(nn.Module):
@@ -580,6 +772,7 @@ class _BagelMoTAttention(nn.Module):
         mode: str,
         prefix_cache: BagelKVCache,
         prefix_lens: Tensor,
+        query_lens: Tensor | None = None,
         update_cache: bool,
         causal: bool,
     ) -> tuple[Tensor, BagelKVCache]:
@@ -596,21 +789,51 @@ class _BagelMoTAttention(nn.Module):
         query = query.to(value.dtype)
         key = key.to(value.dtype)
         query_length = hidden_states.shape[0]
-        query_lens = torch.tensor(
-            [query_length], dtype=torch.int32, device=hidden_states.device
-        )
-        prefix_length = int(prefix_lens[0].item())
+        is_single_request = query_lens is None
+        if is_single_request:
+            if prefix_lens.numel() != 1:
+                raise ValueError("BAGEL singleton attention requires one prefix")
+            query_lens = torch.tensor(
+                [query_length], dtype=torch.int32, device=hidden_states.device
+            )
+            prefix_length = int(prefix_lens[0].item())
+        else:
+            query_lens = query_lens.to(
+                device=hidden_states.device, dtype=torch.int32
+            ).reshape(-1)
+            prefix_lens = prefix_lens.to(
+                device=hidden_states.device, dtype=torch.int32
+            ).reshape(-1)
+            if query_lens.numel() != prefix_lens.numel():
+                raise ValueError("BAGEL prefix and query request counts must match")
+            if int(query_lens.sum().item()) != query_length:
+                raise ValueError("BAGEL query lengths do not match the packed query")
+            prefix_length = int(prefix_lens.sum().item())
         prefix_key = prefix_cache.key_cache[self.layer_index]
         prefix_value = prefix_cache.value_cache[self.layer_index]
 
         if prefix_key is None:
+            if prefix_value is not None or prefix_length != 0:
+                raise ValueError("inconsistent BAGEL empty prefix KV cache")
             merged_key = key
             merged_value = value
         else:
-            if prefix_value is None or prefix_key.shape[0] != prefix_length:
+            if (
+                prefix_value is None
+                or prefix_key.shape[0] != prefix_length
+                or prefix_value.shape[0] != prefix_length
+            ):
                 raise ValueError("inconsistent BAGEL prefix KV cache")
-            merged_key = torch.cat((prefix_key, key), dim=0)
-            merged_value = torch.cat((prefix_value, value), dim=0)
+            if is_single_request:
+                merged_key = torch.cat((prefix_key, key), dim=0)
+                merged_value = torch.cat((prefix_value, value), dim=0)
+            else:
+                merged_key = _interleave_prefix_and_query(
+                    prefix_key, key, prefix_lens, query_lens
+                )
+                merged_value = _interleave_prefix_and_query(
+                    prefix_value, value, prefix_lens, query_lens
+                )
         merged_lens = prefix_lens + query_lens
 
         if update_cache:
@@ -776,6 +999,7 @@ class _BagelMoTLayer(nn.Module):
         mode: str,
         prefix_cache: BagelKVCache,
         prefix_lens: Tensor,
+        query_lens: Tensor | None = None,
         update_cache: bool,
         causal: bool,
     ) -> tuple[Tensor, BagelKVCache]:
@@ -796,6 +1020,7 @@ class _BagelMoTLayer(nn.Module):
             mode=mode,
             prefix_cache=prefix_cache,
             prefix_lens=prefix_lens,
+            query_lens=query_lens,
             update_cache=update_cache,
             causal=causal,
         )
@@ -1372,6 +1597,21 @@ class BagelTransformer(BaseDiT):
             prefix.rope_offset + 1,
         )
 
+    @staticmethod
+    def pack_contexts(contexts: list[BagelContext]) -> BagelContext:
+        """Pack compatible T2I contexts for true dynamic batching.
+
+        Args:
+            contexts: Request-local contexts in scheduler merge order.
+
+        Returns:
+            One context containing packed KV caches and per-request metadata.
+
+        Raises:
+            ValueError: If the contexts are not compatible pure T2I requests.
+        """
+        return BagelContext.pack(contexts)
+
     @torch.no_grad()
     def build_context(
         self,
@@ -1555,8 +1795,8 @@ class BagelTransformer(BaseDiT):
 
         Args:
             hidden_states: Patchified latents shaped ``[tokens, patch_dim]`` or
-                ``[1, tokens, patch_dim]``.
-            timestep: Scalar, length-one, or per-token raw flow sigma.
+                ``[batch, tokens, patch_dim]``.
+            timestep: Scalar, per-request, or per-token raw flow sigma.
             encoder_hidden_states: Unused standard DiT compatibility argument.
             bagel_context: Explicit request-owned prefix and image state.
             guidance_scale: Text classifier-free guidance strength.
@@ -1577,22 +1817,28 @@ class BagelTransformer(BaseDiT):
         del encoder_hidden_states, guidance
         self._require_generation_expert()
         had_batch_dimension = hidden_states.ndim == 3
-        if had_batch_dimension:
-            if hidden_states.shape[0] != 1:
-                raise ValueError(
-                    "BAGEL image generation does not support dynamic batching"
-                )
-            hidden_states = hidden_states[0]
-        if hidden_states.ndim != 2:
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        elif hidden_states.ndim != 3:
             raise ValueError(
-                "BAGEL expects [tokens, patch_dim] latents, "
+                "BAGEL expects [tokens, patch_dim] or [batch, tokens, patch_dim] "
+                "latents, "
                 f"got shape {tuple(hidden_states.shape)}"
             )
         self._validate_hidden_states(hidden_states, bagel_context)
 
         timestep = self._normalize_timestep(
-            timestep, hidden_states.shape[0], hidden_states.device
+            timestep,
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            hidden_states.device,
         )
+        if hidden_states.shape[0] > 1:
+            sample_sigmas = timestep.reshape(hidden_states.shape[:2])[:, 0]
+            if not torch.allclose(
+                sample_sigmas, sample_sigmas[:1].expand_as(sample_sigmas)
+            ):
+                raise ValueError("BAGEL batched requests must use the same timestep")
         conditional = self._generation_step(
             hidden_states,
             timestep,
@@ -1660,7 +1906,9 @@ class BagelTransformer(BaseDiT):
         # evaluation runs in BF16. The standard FlowMatch scheduler preserves
         # the model-output dtype, so return FP32 velocity to retain that state.
         conditional = conditional.float()
-        return conditional.unsqueeze(0) if had_batch_dimension else conditional
+        if hidden_states.shape[0] == 1:
+            return conditional.unsqueeze(0) if had_batch_dimension else conditional
+        return conditional
 
     def _generation_step(
         self,
@@ -1668,9 +1916,104 @@ class BagelTransformer(BaseDiT):
         timestep: Tensor,
         prefix_cache: BagelKVCache,
         prefix_lens: Tensor,
-        rope_offset: int,
+        rope_offset: int | Tensor,
         context: BagelContext,
     ) -> Tensor:
+        device = latents.device
+        batch_size, token_count, patch_width = latents.shape
+        if prefix_lens.numel() != batch_size:
+            raise ValueError("BAGEL context request count does not match latent batch")
+        if batch_size == 1:
+            # Preserve the original singleton operation order exactly. Besides
+            # avoiding varlen packing overhead, this keeps fixed-seed B=1 output
+            # bit-identical to the pre-batching implementation.
+            return self._generation_step_single(
+                latents[0],
+                timestep,
+                prefix_cache,
+                prefix_lens,
+                rope_offset,
+                context,
+            )
+
+        rope_offsets = torch.as_tensor(
+            rope_offset, dtype=torch.long, device=device
+        ).reshape(-1)
+        if rope_offsets.numel() == 1:
+            rope_offsets = rope_offsets.expand(batch_size)
+        elif rope_offsets.numel() != batch_size:
+            raise ValueError("BAGEL RoPE offsets must match latent batch size")
+
+        position_ids = self._latent_position_ids(
+            context.height, context.width, device
+        ).repeat(batch_size)
+        boundary_ids = torch.tensor(
+            [context.start_of_image_token_id, context.end_of_image_token_id],
+            dtype=torch.long,
+            device=device,
+        ).repeat(batch_size)
+        boundary_embeddings = self.embed_tokens(boundary_ids)
+        flat_latents = latents.reshape(batch_size * token_count, patch_width)
+        latent_embeddings = (
+            self.vae2llm(flat_latents)
+            + self.time_embedder(timestep)
+            + self.latent_pos_embed(position_ids)
+        )
+        latent_embeddings = latent_embeddings.to(boundary_embeddings.dtype)
+
+        sequence_length = token_count + 2
+        query_lens = torch.full(
+            (batch_size,), sequence_length, dtype=torch.int32, device=device
+        )
+        sequence_offsets = torch.arange(batch_size, device=device) * sequence_length
+        text_indexes = (
+            sequence_offsets[:, None]
+            + torch.tensor([0, sequence_length - 1], device=device)
+        ).reshape(-1)
+        latent_indexes = (
+            sequence_offsets[:, None]
+            + torch.arange(1, sequence_length - 1, device=device)
+        ).reshape(-1)
+        packed = boundary_embeddings.new_zeros(
+            batch_size * sequence_length, self.hidden_size
+        )
+        packed[text_indexes] = boundary_embeddings
+        packed[latent_indexes] = latent_embeddings
+
+        rope_positions = rope_offsets.repeat_interleave(sequence_length)
+        cosine, sine = self.rotary_emb(packed, rope_positions)
+        for layer in self.layers:
+            packed, _ = layer(
+                packed,
+                cosine,
+                sine,
+                text_indexes,
+                latent_indexes,
+                mode="gen",
+                prefix_cache=prefix_cache,
+                prefix_lens=prefix_lens,
+                query_lens=query_lens,
+                update_cache=False,
+                causal=False,
+            )
+
+        normalized = torch.zeros_like(packed)
+        normalized[text_indexes] = self.und_final_norm(packed[text_indexes])
+        normalized[latent_indexes] = self.gen_final_norm(packed[latent_indexes])
+        return self.llm2vae(normalized[latent_indexes]).reshape(
+            batch_size, token_count, patch_width
+        )
+
+    def _generation_step_single(
+        self,
+        latents: Tensor,
+        timestep: Tensor,
+        prefix_cache: BagelKVCache,
+        prefix_lens: Tensor,
+        rope_offset: int | Tensor,
+        context: BagelContext,
+    ) -> Tensor:
+        """Run the original singleton image-token path without batch packing."""
         device = latents.device
         position_ids = self._latent_position_ids(context.height, context.width, device)
         boundary_ids = torch.tensor(
@@ -1695,8 +2038,9 @@ class BagelTransformer(BaseDiT):
         packed[text_indexes] = boundary_embeddings
         packed[latent_indexes] = latent_embeddings
 
+        singleton_rope_offset = int(torch.as_tensor(rope_offset).reshape(-1)[0].item())
         rope_positions = torch.full(
-            (sequence_length,), rope_offset, dtype=torch.long, device=device
+            (sequence_length,), singleton_rope_offset, dtype=torch.long, device=device
         )
         cosine, sine = self.rotary_emb(packed, rope_positions)
         for layer in self.layers:
@@ -1750,14 +2094,24 @@ class BagelTransformer(BaseDiT):
         self, hidden_states: Tensor, context: BagelContext
     ) -> None:
         self._validate_image_size(context.height, context.width)
+        if hidden_states.ndim != 3:
+            raise ValueError("BAGEL internal latents must have rank three")
+        batch_size = hidden_states.shape[0]
+        if context.batch_size != batch_size:
+            raise ValueError("BAGEL context request count does not match latent batch")
+        if context.unconditional_kv_lens.numel() != batch_size:
+            raise ValueError("BAGEL unconditional context count does not match batch")
+        if batch_size > 1 and context.has_three_way_cfg:
+            raise ValueError("BAGEL dynamic batching supports pure T2I only")
         expected_tokens = (context.height // self.latent_downsample) * (
             context.width // self.latent_downsample
         )
         expected_channels = self.latent_patch_size**2 * self.latent_channel
-        if hidden_states.shape != (expected_tokens, expected_channels):
+        expected_shape = (batch_size, expected_tokens, expected_channels)
+        if hidden_states.shape != expected_shape:
             raise ValueError(
                 "BAGEL latent shape does not match request geometry: expected "
-                f"{(expected_tokens, expected_channels)}, got "
+                f"{expected_shape}, got "
                 f"{tuple(hidden_states.shape)}"
             )
 
@@ -1772,17 +2126,22 @@ class BagelTransformer(BaseDiT):
 
     @staticmethod
     def _normalize_timestep(
-        timestep: Tensor, token_count: int, device: torch.device
+        timestep: Tensor,
+        batch_size: int,
+        token_count: int,
+        device: torch.device,
     ) -> Tensor:
         timestep = torch.as_tensor(timestep, device=device).reshape(-1)
         if timestep.numel() == 1:
-            return timestep.expand(token_count)
-        if timestep.numel() != token_count:
-            raise ValueError(
-                "BAGEL timestep must be scalar or per-token; "
-                f"got {timestep.numel()} values for {token_count} tokens"
-            )
-        return timestep
+            return timestep.expand(batch_size * token_count)
+        if timestep.numel() == batch_size:
+            return timestep.repeat_interleave(token_count)
+        if timestep.numel() == batch_size * token_count:
+            return timestep
+        raise ValueError(
+            "BAGEL timestep must be scalar, per-request, or per-token; "
+            f"got {timestep.numel()} values for {batch_size}x{token_count} tokens"
+        )
 
     @staticmethod
     def _as_float(value: float | Tensor) -> float:
@@ -1803,8 +2162,14 @@ class BagelTransformer(BaseDiT):
     ) -> Tensor:
         guided = unconditional + guidance_scale * (conditional - unconditional)
         if renorm_type == "global":
-            original_norm = torch.linalg.vector_norm(conditional)
-            guided_norm = torch.linalg.vector_norm(guided)
+            if conditional.ndim == 3:
+                original_norm = torch.linalg.vector_norm(
+                    conditional, dim=(1, 2), keepdim=True
+                )
+                guided_norm = torch.linalg.vector_norm(guided, dim=(1, 2), keepdim=True)
+            else:
+                original_norm = torch.linalg.vector_norm(conditional)
+                guided_norm = torch.linalg.vector_norm(guided)
         elif renorm_type == "channel":
             original_norm = torch.linalg.vector_norm(conditional, dim=-1, keepdim=True)
             guided_norm = torch.linalg.vector_norm(guided, dim=-1, keepdim=True)

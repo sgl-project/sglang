@@ -302,6 +302,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                         error_msg=output_batch.error,
                     )
 
+                if self.receiver is None:
+                    # Every TP rank executes the merged forward for collectives,
+                    # but only rank 0 owns decoded media and replies to clients.
+                    # Return one placeholder per queue item so non-primary event
+                    # loops preserve dispatch cardinality without trying to split
+                    # rank-local empty output payloads.
+                    return [OutputBatch() for _ in reqs]
+
                 split_outputs = self._split_batched_output(output_batch, reqs)
                 if split_outputs is None:
                     logger.error(

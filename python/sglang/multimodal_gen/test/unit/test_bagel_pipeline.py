@@ -26,7 +26,9 @@ from sglang.multimodal_gen.runtime.pipelines.bagel_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel import (
     BagelBeforeDenoisingStage,
+    BagelEditBeforeDenoisingStage,
     BagelInputValidationStage,
+    BagelThinkingBeforeDenoisingStage,
     validate_bagel_special_tokens,
 )
 
@@ -48,6 +50,10 @@ class _FakeTokenizer:
         del add_special_tokens
         if text in self.token_ids:
             return [self.token_ids[text]]
+        if text == "first":
+            return [101]
+        if text == "second prompt":
+            return [201, 202]
         return [17, 23]
 
 
@@ -55,6 +61,7 @@ class _FakeTransformer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.context_calls = []
+        self.pack_context_calls = []
 
     def build_context(
         self,
@@ -76,6 +83,18 @@ class _FakeTransformer(torch.nn.Module):
         )
         self.context_calls.append(context)
         return context
+
+    def pack_contexts(self, contexts):
+        packed = SimpleNamespace(
+            contexts=list(contexts),
+            batch_size=len(contexts),
+            height=contexts[0].height,
+            width=contexts[0].width,
+            start_of_image_token_id=contexts[0].start_of_image_token_id,
+            end_of_image_token_id=contexts[0].end_of_image_token_id,
+        )
+        self.pack_context_calls.append(packed)
+        return packed
 
 
 def _server_args(config: BagelPipelineConfig | None = None) -> SimpleNamespace:
@@ -218,11 +237,10 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "negative_prompt"):
             stage.forward(batch, _server_args())
 
-    def test_list_prompt_seed_and_multiple_outputs_fail_fast(self) -> None:
+    def test_invalid_scalar_seed_and_multiple_outputs_fail_fast(self) -> None:
         stage = self._make_stage()
         args = _server_args()
         mutations = (
-            ("prompt", ["one", "two"], "one non-empty string prompt"),
             ("seed", [1], "one scalar seed"),
             ("num_outputs_per_prompt", 2, "num_outputs_per_prompt=1"),
         )
@@ -232,6 +250,134 @@ class TestBagelBeforeDenoisingStage(unittest.TestCase):
                 setattr(batch, field, value)
                 with self.assertRaisesRegex(ValueError, message):
                     stage.forward(batch, args)
+
+    def test_dynamic_batch_prefills_and_draws_each_request_in_order(self) -> None:
+        stage = self._make_stage()
+        batch = self._make_batch(seed=11)
+        batch.prompt = ["first", "second prompt"]
+        batch.extra["dynamic_batch_seeds"] = [11, 22]
+        batch.seeds = [11, 22]
+        batch.generator = [
+            torch.Generator("cpu").manual_seed(seed) for seed in batch.seeds
+        ]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            output = stage.forward(batch, _server_args())
+
+        transformer = stage.transformer
+        self.assertEqual(len(transformer.context_calls), 2)
+        self.assertEqual(len(transformer.pack_context_calls), 1)
+        torch.testing.assert_close(
+            transformer.context_calls[0].conditional_input_ids,
+            torch.tensor([151644, 101, 151645]),
+        )
+        torch.testing.assert_close(
+            transformer.context_calls[1].conditional_input_ids,
+            torch.tensor([151644, 201, 202, 151645]),
+        )
+        self.assertIs(output.extra["bagel_context"], transformer.pack_context_calls[0])
+        self.assertEqual(tuple(output.latents.shape), (2, 6, 64))
+        self.assertEqual(output.raw_latent_shape, (2, 6, 64))
+        self.assertEqual(output.n_tokens, 6)
+
+        expected = torch.stack(
+            [
+                torch.randn(
+                    6,
+                    64,
+                    generator=torch.Generator("cpu").manual_seed(seed),
+                )
+                for seed in (11, 22)
+            ]
+        )
+        torch.testing.assert_close(output.latents, expected, rtol=0, atol=0)
+
+    def test_single_item_prompt_list_uses_the_t2i_context_path(self) -> None:
+        stage = self._make_stage()
+        batch = self._make_batch(seed=11)
+        batch.prompt = ["first"]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            output = stage.forward(batch, _server_args())
+
+        self.assertEqual(len(stage.transformer.context_calls), 1)
+        self.assertEqual(len(stage.transformer.pack_context_calls), 0)
+        torch.testing.assert_close(
+            stage.transformer.context_calls[0].conditional_input_ids,
+            torch.tensor([151644, 101, 151645]),
+        )
+        self.assertEqual(tuple(output.latents.shape), (6, 64))
+        self.assertEqual(output.raw_latent_shape, (1, 6, 64))
+
+    def test_dynamic_batch_metadata_must_align_with_prompts(self) -> None:
+        stage = self._make_stage()
+        args = _server_args()
+
+        cases = (
+            (
+                lambda batch: setattr(batch, "prompt", ["first", "second prompt"]),
+                "dynamic_batch_seeds metadata",
+            ),
+            (
+                lambda batch: (
+                    setattr(batch, "prompt", ["first", "second prompt"]),
+                    batch.extra.update({"dynamic_batch_seeds": [42]}),
+                ),
+                "one integer per prompt",
+            ),
+            (
+                lambda batch: (
+                    setattr(batch, "prompt", ["first", "second prompt"]),
+                    batch.extra.update({"dynamic_batch_seeds": [42, 7]}),
+                ),
+                "one validated seed per prompt",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                batch = self._make_batch()
+                mutate(batch)
+                with self.assertRaisesRegex(ValueError, message):
+                    stage.forward(batch, args)
+
+    def test_dynamic_batch_generator_seed_must_match_each_request(self) -> None:
+        stage = self._make_stage()
+        batch = self._make_batch(seed=11)
+        batch.prompt = ["first", "second prompt"]
+        batch.extra["dynamic_batch_seeds"] = [11, 22]
+        batch.seeds = [11, 22]
+        batch.generator = [
+            torch.Generator("cpu").manual_seed(11),
+            torch.Generator("cpu").manual_seed(99),
+        ]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.bagel.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            with self.assertRaisesRegex(ValueError, "at index 1"):
+                stage.forward(batch, _server_args())
+
+    def test_non_t2i_variants_reject_direct_batched_prompts(self) -> None:
+        batch = self._make_batch()
+        batch.prompt = ["first", "second prompt"]
+
+        self.assertTrue(BagelBeforeDenoisingStage.allows_dynamic_batching)
+        for stage_type in (
+            BagelThinkingBeforeDenoisingStage,
+            BagelEditBeforeDenoisingStage,
+        ):
+            with self.subTest(stage=stage_type.__name__):
+                self.assertFalse(stage_type.allows_dynamic_batching)
+                stage = stage_type.__new__(stage_type)
+                with self.assertRaisesRegex(ValueError, "pure T2I only"):
+                    stage._request_prompts(batch)
 
 
 class TestBagelLoaderContract(unittest.TestCase):

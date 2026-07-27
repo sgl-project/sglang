@@ -16,9 +16,10 @@ Run text-to-image generation, Thinking, editing, and Understanding as separate
 pipeline processes. Thinking T2I is selected when the process starts;
 Understanding reasoning is a per-request option on the dedicated Understanding
 process. The current integration does not support editing masks, multiple input
-images, multi-output requests, dynamic batching, sequence/CFG parallelism,
-Cache-DiT, or layer-wise offload. Transformer tensor parallelism is validated at
-TP=2.
+images, multi-output requests, sequence/CFG parallelism, Cache-DiT, or layer-wise
+offload. Dynamic batching is supported only for compatible pure T2I requests on
+the baseline `BagelPipeline`; Thinking, Editing, and Understanding remain
+singleton-only. Transformer tensor parallelism is validated at TP=2.
 </Warning>
 
 ## Prerequisites
@@ -116,6 +117,37 @@ sglang serve \
   --tp-size 2 \
   --port 30000
 ```
+
+## Batch compatible pure T2I requests
+
+Dynamic batching is opt-in and is supported only by the baseline
+`BagelPipeline` used in the first server example. Enable it with the standard
+SGLang-Diffusion batching flags:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --batching-mode dynamic \
+  --batching-max-size 2 \
+  --batching-delay-ms 5 \
+  --enable-batching-metrics \
+  --port 30000
+```
+
+`--batching-max-size 1` is the default and keeps singleton dispatch. Increase it
+only as GPU memory allows. Requests merge only when their image geometry,
+generation-affecting sampling parameters, and output handling are compatible;
+prompts and seeds may differ. BAGEL still requires `n=1`: batching merges
+separate concurrent requests and does not enable multiple outputs from one
+request.
+
+`BagelThinkingPipeline`, `BagelEditPipeline`, and
+`BagelUnderstandingPipeline` remain singleton-only even when these server flags
+are present. Batch execution can introduce small numerical differences from
+singleton execution, and there is no automatic OOM retry. See
+[Inference Batching](/docs/sglang-diffusion/dynamic_batching) for admission
+rules, optional `--batching-config` caps, and metrics.
 
 ## Generate an image
 

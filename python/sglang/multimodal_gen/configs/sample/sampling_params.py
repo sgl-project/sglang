@@ -204,7 +204,8 @@ class SamplingParams:
 
     # Misc
     save_output: bool = True
-    return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
+    # A merged dynamic batch uses one output transport, so requests must agree.
+    return_frames: bool = False
     rollout: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
