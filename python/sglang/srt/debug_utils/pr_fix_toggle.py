@@ -93,7 +93,7 @@ patches:
               and server_args.page_size > 1
               and (server_args.speculative_eagle_topk or 1) > 1
           ):
-              extra = max(extra, get_alloc_reserve_per_decode(server_args))
+              extra = max(extra, get_alloc_len_per_decode(server_args))
         replacement: ""
 """
 
