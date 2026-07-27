@@ -117,6 +117,35 @@ class TestHelionKDADispatcher(unittest.TestCase):
         kernel._packed_decode.assert_not_called()
         kernel._triton.packed_decode.assert_called_once()
 
+    def test_packed_decode_forwards_lower_bound(self):
+        kernel = HelionKDAKernel.__new__(HelionKDAKernel)
+        kernel._packed_decode = MagicMock()
+        kernel._triton = MagicMock()
+        mixed_qkv = torch.empty(2, 16)
+        a = torch.empty(2, 8)
+        b = torch.empty(2, 1)
+        a_log = torch.empty(1)
+        dt_bias = torch.empty(8)
+        state = torch.empty(2, 1, 4, 8)
+        indices = torch.arange(2, dtype=torch.int32)
+
+        kernel.packed_decode(
+            mixed_qkv,
+            a,
+            b,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=0.5,
+            ssm_states=state,
+            cache_indices=indices,
+            num_v_heads=1,
+            head_v_dim=4,
+            lower_bound=-5.0,
+        )
+
+        kernel._packed_decode.assert_called_once()
+        self.assertEqual(kernel._packed_decode.call_args.kwargs["lower_bound"], -5.0)
+
     def test_replayssm_accepts_helion_and_rejects_other_backends(self):
         with (
             patch("sglang.srt.server_args.is_sm100_supported", return_value=False),

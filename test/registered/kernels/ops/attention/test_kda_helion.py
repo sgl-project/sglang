@@ -26,10 +26,13 @@ def test_public_signatures_match_triton() -> None:
     helion_decode_signature = inspect.signature(
         helion_fused_recurrent_kda_packed_decode
     )
-    assert list(helion_decode_signature.parameters) == list(decode_signature.parameters)
-    assert [
-        parameter.default for parameter in helion_decode_signature.parameters.values()
-    ] == [parameter.default for parameter in decode_signature.parameters.values()]
+    for name, parameter in decode_signature.parameters.items():
+        assert helion_decode_signature.parameters[name].default == parameter.default
+    extra_decode_parameters = set(helion_decode_signature.parameters) - set(
+        decode_signature.parameters
+    )
+    assert extra_decode_parameters <= {"lower_bound"}
+    assert helion_decode_signature.parameters["lower_bound"].default is None
 
     prefill_signature = inspect.signature(triton_chunk_kda)
     helion_prefill_signature = inspect.signature(helion_chunk_kda)
@@ -108,6 +111,90 @@ def test_packed_decode_contract(state_dtype: torch.dtype) -> None:
     assert torch.count_nonzero(helion_out[1]).item() == 0
     untouched = torch.tensor([0, 1, 3, 4, 6], device="cuda")
     assert torch.equal(helion_state[untouched], state[untouched])
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_decode_lower_bound_contract(state_dtype: torch.dtype) -> None:
+    torch.manual_seed(321)
+    batch, q_heads, v_heads, key_dim, value_dim = 3, 2, 4, 128, 128
+    pool_size = 7
+    mixed_qkv = torch.randn(
+        batch,
+        2 * q_heads * key_dim + v_heads * value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gate = torch.randn(batch, v_heads * key_dim, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(batch, v_heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(v_heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(v_heads * key_dim, device="cuda", dtype=torch.float32)
+    state = (
+        torch.randn(
+            pool_size,
+            v_heads,
+            value_dim,
+            key_dim,
+            device="cuda",
+            dtype=state_dtype,
+        )
+        * 0.01
+    )
+    indices = torch.tensor([5, -1, 2], device="cuda", dtype=torch.int32)
+    reference_state = state.clone()
+    helion_state = state.clone()
+    reference_out = mixed_qkv.new_zeros(batch, 1, v_heads, value_dim)
+    helion_out = torch.empty_like(reference_out)
+    scale = key_dim**-0.5
+    lower_bound = -5.0
+
+    heads_per_q = v_heads // q_heads
+    q, k, v = mixed_qkv.split(
+        [q_heads * key_dim, q_heads * key_dim, v_heads * value_dim], dim=-1
+    )
+    q = q.float().view(batch, q_heads, key_dim)
+    k = k.float().view(batch, q_heads, key_dim)
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    q = q.repeat_interleave(heads_per_q, dim=1)
+    k = k.repeat_interleave(heads_per_q, dim=1)
+    v = v.float().view(batch, v_heads, value_dim)
+    raw_gate = gate.float().view(batch, v_heads, key_dim)
+    raw_gate = raw_gate + dt_bias.view(1, v_heads, key_dim)
+    A = torch.exp(a_log.float()).view(1, v_heads, 1)
+    decay = torch.exp(lower_bound * torch.sigmoid(A * raw_gate))
+    beta_value = torch.sigmoid(beta.float())
+    for batch_idx, state_idx in enumerate(indices.tolist()):
+        if state_idx < 0:
+            continue
+        current_state = reference_state[state_idx].float()
+        current_state = current_state * decay[batch_idx, :, None, :]
+        residual = v[batch_idx] - (current_state * k[batch_idx, :, None, :]).sum(-1)
+        residual = residual * beta_value[batch_idx, :, None]
+        current_state = current_state + residual[..., None] * k[batch_idx, :, None, :]
+        reference_out[batch_idx, 0] = (
+            current_state * (q[batch_idx] * scale)[:, None, :]
+        ).sum(-1)
+        reference_state[state_idx] = current_state
+
+    result, result_state = helion_fused_recurrent_kda_packed_decode(
+        mixed_qkv,
+        gate,
+        beta,
+        a_log,
+        dt_bias,
+        scale,
+        helion_state,
+        helion_out,
+        indices,
+        True,
+        lower_bound,
+    )
+
+    assert result.data_ptr() == helion_out.data_ptr()
+    assert result_state.data_ptr() == helion_state.data_ptr()
+    torch.testing.assert_close(helion_out, reference_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(helion_state, reference_state, atol=2e-2, rtol=1e-2)
+    assert torch.count_nonzero(helion_out[1]).item() == 0
 
 
 def _compare_prefill(

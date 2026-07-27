@@ -56,11 +56,13 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     scale: float,
+    lower_bound: float,
     initial_state: torch.Tensor,
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     use_fast_rsqrt: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    use_lower_bound: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused packed KDA decode body; mutates ``initial_state`` and ``out``."""
     B = mixed_qkv.size(0)
@@ -109,18 +111,21 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             k_input_offsets = H * K + i_h * K + k_offsets
             v_offsets = 2 * H * K + i_hv * V + tile_v.index
 
-            gate_input = a[i_b, i_hv * K + k_offsets].float()
-            gate_input = gate_input + dt_bias[i_hv * K + k_offsets].float()
-            gate_exp = torch.exp2(gate_input * _LOG2_E)
-            softplus = torch.where(
-                gate_input <= 20.0,
-                torch.log(1.0 + gate_exp),
-                gate_input,
-            )
+            raw_gate = a[i_b, i_hv * K + k_offsets].float()
+            raw_gate = raw_gate + dt_bias[i_hv * K + k_offsets].float()
             A_log_value = A_log[i_hv].float()
             A = torch.exp2(A_log_value * _LOG2_E)
+            if use_lower_bound:
+                log_decay = lower_bound * torch.sigmoid(A * raw_gate)
+            else:
+                gate_exp = torch.exp2(raw_gate * _LOG2_E)
+                softplus = torch.where(
+                    raw_gate <= 20.0,
+                    torch.log(1.0 + gate_exp),
+                    raw_gate,
+                )
+                log_decay = -A * softplus
             beta = torch.sigmoid(b[i_b, i_hv].float())
-            log_decay = -A * softplus
 
             state = initial_state[state_index, i_hv, tile_v.index, k_offsets].float()
             decay = torch.exp2(log_decay * _LOG2_E)
@@ -290,6 +295,7 @@ def helion_fused_recurrent_kda_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    lower_bound: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Helion implementation of SGLang's packed KDA decode contract.
 
@@ -298,6 +304,7 @@ def helion_fused_recurrent_kda_packed_decode(
 
     * ``mixed_qkv`` is ``[B, 2*H*K + HV*V]`` after the short convolution.
     * ``a`` and ``b`` are raw forget-gate and beta logits.
+    * ``lower_bound`` selects the bounded sigmoid decay used by safe-gate KDA.
     * ``initial_state`` is ``[num_slots, HV, V, K]`` and is updated in place.
     * ``ssm_state_indices == -1`` writes a zero output and leaves state untouched.
     * ``out`` is ``[B, 1, HV, V]`` and is written in place.
@@ -320,6 +327,8 @@ def helion_fused_recurrent_kda_packed_decode(
         if is_bf16_state
         else _helion_fused_recurrent_kda_packed_decode
     )
+    use_lower_bound = lower_bound is not None
+    lower_bound_value = 0.0 if lower_bound is None else lower_bound
     result = kernel(
         mixed_qkv,
         a,
@@ -327,10 +336,12 @@ def helion_fused_recurrent_kda_packed_decode(
         A_log,
         dt_bias,
         scale,
+        lower_bound_value,
         initial_state,
         out,
         ssm_state_indices,
         use_qk_l2norm_in_kernel,
         is_bf16_state,
+        use_lower_bound,
     )
     return result, initial_state
