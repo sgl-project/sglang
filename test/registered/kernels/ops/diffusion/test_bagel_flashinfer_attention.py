@@ -1,5 +1,7 @@
 """GPU parity tests for BAGEL's FlashInfer attention fallback."""
 
+import sys
+
 import pytest
 import torch
 
@@ -115,3 +117,7 @@ def test_bagel_flashinfer_keeps_dynamic_requests_isolated(causal: bool) -> None:
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
