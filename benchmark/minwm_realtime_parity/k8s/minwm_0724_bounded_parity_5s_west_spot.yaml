@@ -1,15 +1,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-0724-bounded-parity-5s-20260727-01
+  name: minwm-0724-bounded-parity-5s-20260727-04
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-0724-bounded-parity-5s-20260727-01
+    app.kubernetes.io/name: minwm-0724-bounded-parity-5s-20260727-04
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: 0724-window18-sink9-5s-b200-attempt01
+    seedleap.ai/run-id: 0724-window18-sink9-5s-b200-attempt04
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: b47d00c714b6fe1d24dcd6b399986ce026c8207b
+    seedleap.ai/sglang-git-ref: 85fbea66e153ac2639a33cc6ef1abc3b14387351
     seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/capacity-type: spot
@@ -23,12 +23,12 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-0724-bounded-parity-5s-20260727-01
+        app.kubernetes.io/name: minwm-0724-bounded-parity-5s-20260727-04
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: 0724-window18-sink9-5s-b200-attempt01
+        seedleap.ai/run-id: 0724-window18-sink9-5s-b200-attempt04
         seedleap.ai/owner: chenshengdong
       annotations:
-        seedleap.ai/sglang-git-ref: b47d00c714b6fe1d24dcd6b399986ce026c8207b
+        seedleap.ai/sglang-git-ref: 85fbea66e153ac2639a33cc6ef1abc3b14387351
         seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
     spec:
       restartPolicy: Never
@@ -52,13 +52,17 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: b47d00c714b6fe1d24dcd6b399986ce026c8207b
+              value: 85fbea66e153ac2639a33cc6ef1abc3b14387351
             - name: MINWM_GIT_REF
               value: 0796bc201fae4c86f100620cb23402ae21c8f3b5
             - name: MINWM_BENCHMARK_MODE
               value: bounded5s
             - name: MINWM_RUN_ID
+              value: 0724-window18-sink9-5s-b200-attempt04
+            - name: MINWM_REUSE_INPUT_RUN_ID
               value: 0724-window18-sink9-5s-b200-attempt01
+            - name: MINWM_REUSE_MODEL_RUN_ID
+              value: 0724-window18-sink9-5s-b200-attempt03
             - name: MINWM_CASES_PATH
               value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_action_control_kv_roll_832x480.json
             - name: MINWM_LOCAL_ATTN_SIZE
