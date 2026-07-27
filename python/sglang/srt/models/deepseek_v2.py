@@ -2688,6 +2688,21 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            # DFLASH/EAGLE3 aux hidden states are captured at intermediate target
+            # layers in the CP-split token layout; gather them to full length too
+            # so downstream pruning (LogitsProcessor uses full-seq last_index) and
+            # the DFlash draft-KV materialization index them consistently with the
+            # main hidden states. Without this the aux tensors keep 1/cp_size the
+            # tokens and full-length indices read out of bounds (HIP memory fault).
+            aux_hidden_states = [
+                cp_all_gather_rerange_output(
+                    aux,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+                for aux in aux_hidden_states
+            ]
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
