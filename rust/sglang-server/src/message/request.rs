@@ -21,10 +21,10 @@ const MAX_BATCH_SIZE: usize = 4096;
 /// the `One` arms of the fan-out).
 const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
 
-/// Live heap per byte of serialized JSON, measured on `custom_params`-shaped
-/// input (63.7 MiB of JSON → ~1008 MiB resident). `serde_json::Value` pays for
-/// enum tags, `String` headers and map nodes that the wire form does not.
-const JSON_TO_HEAP_FACTOR: usize = 16;
+/// Live heap per byte of serialized JSON. Measured across shapes at 1.0–7.0×
+/// (`serde_json::Value` pays for enum tags, `String` headers and map nodes that
+/// the wire form does not); 8 is the ceiling of that range, not a worst case.
+const JSON_TO_HEAP_FACTOR: usize = 8;
 
 /// The `/generate` wire body before batch splitting: `text`/`input_ids`/`sampling_params`
 /// each scalar-or-list, fanned into per-request [`GenerateRequest`]s by
@@ -399,7 +399,10 @@ impl HeapBytes for TokenIds {
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
 fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
-    if per_clone.saturating_mul(n) > MAX_BROADCAST_CLONE_BYTES {
+    // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
+    // is duplicated. Charging it here rejected ordinary single requests with a
+    // message about a batch they never sent.
+    if n > 1 && per_clone.saturating_mul(n) > MAX_BROADCAST_CLONE_BYTES {
         return Err(Error::Validation(format!(
             "{name} ({per_clone} bytes) broadcast to {n} prompts would allocate more \
              than the {MAX_BROADCAST_CLONE_BYTES}-byte limit; send a shorter {name} \

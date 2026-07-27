@@ -354,6 +354,12 @@ impl SamplingParams {
         // scheduler's `re.search` (see `stop_regex_bound`). A rejected pattern is a
         // 400 for this request; an accepted one carries a bound the scheduler uses
         // to size its match window.
+        if self.stop_strs.len() > MAX_STOP_COUNT {
+            return Err(bad(format!(
+                "at most {MAX_STOP_COUNT} stop strings are allowed, got {}",
+                self.stop_strs.len()
+            )));
+        }
         if self.stop_regex_strs.len() > MAX_STOP_REGEX_COUNT {
             return Err(bad(format!(
                 "at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, got {}",
@@ -528,7 +534,7 @@ fn take_one_or_many(v: Option<OneOrMany<String>>) -> Vec<String> {
 /// "reject", so a new escape is a 400 until someone checks both dialects.
 /// Inline flags both dialects understand. Rust also has `R`/`U`, Python `a`/`L`;
 /// each errors on the other's.
-const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u'];
+const PORTABLE_FLAGS: &[char] = &['i', 'm', 's', 'x', 'u', '-'];
 
 /// Repetition counts at or above this are refused — as a PRODUCT down the nesting,
 /// not per node: `(?:(?:a*){65535}){65535}` is 22 bytes, compiles fine, and costs
@@ -546,12 +552,21 @@ const MAX_REPEAT_COUNT: u64 = 256;
 /// compile, and that cost lands on the scheduler.
 const MAX_STOP_REGEX_LEN: usize = 4096;
 
+/// Most stop STRINGS accepted per request. The scheduler scans the decoded text
+/// once per stop per decode step, so this is a per-step multiplier: 50k stops
+/// measured 20.4 ms/step from a 586 KB body.
+const MAX_STOP_COUNT: usize = 256;
+
 /// Most `stop_regex` patterns accepted per request. Python's `re` cache holds 512
 /// (`re._MAXCACHE`), so past that every pattern recompiles on every decode step.
 const MAX_STOP_REGEX_COUNT: usize = 64;
 
 const SHARED_ESCAPES: &[char] = &[
     'A', 'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'a', 'f', 'n', 'r', 't', 'v',
+    // `\xHH` (exactly two hex digits) is shared; only the braced `\x{…}` form is
+    // Rust-only, and `check_escape` rejects that separately. Omitting `x` here
+    // contradicted this list's own doc comment and 400ed `\x41`.
+    'x',
 ];
 
 /// Reject the constructs `regex-syntax` accepts but Python's `re` cannot compile.
@@ -571,12 +586,15 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
     // is >= 0x80 and matches no arm.
     let b = pattern.as_bytes();
     let mut i = 0;
+    // Still inside the run of leading `(?flags)` groups.
+    let mut leading = true;
     while i < b.len() {
         match b[i] {
             b'\\' => {
                 if let Err(what) = check_escape(b, i) {
                     return reject(what);
                 }
+                leading = false;
                 i += 2; // skip the escaped character, so `\(` is not a group open
             }
             // `(?<name>…)` is a named group to Rust; Python spells it `(?P<name>…)`
@@ -597,7 +615,9 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
                 // `(?flags:…)` is scoped: legal anywhere, and its clearing form is
                 // legal too. Only the GLOBAL form is position- and sign-restricted.
                 let scoped = b[i..].get(2 + flags.len()).is_some_and(|&c| c == b':');
-                if !scoped && i > 0 {
+                // Python allows global flags only at the start, but allows SEVERAL
+                // (`(?i)(?m)a`); `leading` stays true while we are still in that run.
+                if !scoped && !leading {
                     return reject("inline flags after the start of the pattern".into());
                 }
                 if !scoped && flags.contains(&b'-') {
@@ -611,7 +631,16 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
                 {
                     return reject(format!("the inline flag `{}`", f as char));
                 }
-                i += 1;
+                // Advance past the WHOLE group, not one byte: scanning its inner
+                // `?`/letters/`)` through the default arm would clear `leading` and
+                // make the next `(?m)` look like a mid-pattern flag change.
+                if scoped {
+                    leading = false;
+                    i += 1;
+                } else {
+                    i += 2 + flags.len() + 1; // `(?` + flags + `)`
+                }
+                continue; // still in the leading flag run
             }
             // A `[` inside a character class. Rust reads it as a literal (or a POSIX
             // class); Python's parser terminates the class differently and can end up
@@ -644,7 +673,10 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
                 }
                 i = j.max(i + 1);
             }
-            _ => i += 1,
+            _ => {
+                leading = false;
+                i += 1;
+            }
         }
     }
     Ok(())
@@ -1325,6 +1357,44 @@ mod tests {
                 "{pattern} must be rejected"
             );
         }
+    }
+
+    /// Patterns Python compiles fine that this validator used to 400. A false
+    /// rejection is safe but it is still a bug: `(?i-s:a)` alone was 267 hits in
+    /// the review corpus, and `\x41` was rejected by the very list whose doc
+    /// comment calls `\xHH` shared.
+    #[test]
+    fn ordinary_python_patterns_are_not_spuriously_rejected() {
+        for pattern in [
+            "(?-i:abc)", // scoped clearing group: legal anywhere
+            "(?i-s:a)",  // mixed set/clear inside a scoped group
+            r"\x41",     // two-hex escape — shared with Python
+            r"a\x41b",
+            "(?i)(?m)a", // several LEADING global flag groups
+            "(?i)abc",
+        ] {
+            assert!(
+                stop_regex_bound(pattern).is_ok(),
+                "{pattern} is valid Python and must not be rejected"
+            );
+        }
+        // The genuinely Rust-only forms still reject.
+        for pattern in [r"\x{41}", "a(?i)b", "(?R)a"] {
+            assert!(
+                stop_regex_bound(pattern).is_err(),
+                "{pattern} must be rejected"
+            );
+        }
+    }
+
+    /// The commoner field had no limit at all: the scheduler scans the decoded text
+    /// once per stop per decode step.
+    #[test]
+    fn stop_string_count_is_capped() {
+        let stops: Vec<String> = (0..MAX_STOP_COUNT + 1).map(|i| i.to_string()).collect();
+        let json = serde_json::json!({ "stop": stops }).to_string();
+        let err = norm_err(&json).to_string();
+        assert!(err.contains("at most"), "{err}");
     }
 
     /// A repetition count Python cannot honour: `u32::MAX` is its `MAXREPEAT`
