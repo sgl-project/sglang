@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
