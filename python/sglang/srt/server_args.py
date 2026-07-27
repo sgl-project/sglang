@@ -2713,6 +2713,7 @@ class ServerArgs:
             "Used when --enable-mm-global-cache is set.",
             choices=["mooncake"],
         ),
+        NS("mm"),
     ] = "mooncake"
     disable_fast_image_processor: A[
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
