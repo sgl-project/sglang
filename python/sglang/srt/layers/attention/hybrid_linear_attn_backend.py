@@ -779,7 +779,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             output=output,
             layer_cache=layer_cache,
             metadata=self.forward_metadata,
-            forward_batch=forward_batch,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
         )
