@@ -5,7 +5,7 @@ description: Dense and sparse embedding models with FlashInfer acceleration and 
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 <Warning>
-Most decoder-style embedding models require `--is-embedding`, and some require `--trust-remote-code`. Encoder-only and sequence-classification architectures are recognized automatically. `google/embeddinggemma-300m` is also detected automatically.
+Native encoder embedding architectures and `google/embeddinggemma-300m` are detected automatically. Decoder-style embedding models require `--is-embedding`; add `--trust-remote-code` when the model requires it.
 </Warning>
 
 ## Quick Start

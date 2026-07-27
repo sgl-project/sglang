@@ -26,7 +26,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertTrue(spec.safe_disable_kv_cache)
         self.assertEqual(spec.bcg_prefill_policy, BCGPrefillPolicy.FULL_ENCODER)
 
-    def test_encoder_embedding_models_still_require_explicit_intent(self):
+    def test_encoder_embedding_models_enable_embedding_mode_automatically(self):
         spec = resolve_embedding_model_spec(
             ["BertModel"],
             is_embedding_requested=False,
@@ -36,8 +36,8 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertEqual(spec.family, "bert")
         self.assertEqual(spec.task, EmbeddingTask.EMBED)
         self.assertEqual(spec.pooling, PoolingStrategy.CLS)
-        self.assertTrue(spec.requires_embedding_flag)
-        self.assertFalse(spec.auto_enable_embedding)
+        self.assertFalse(spec.requires_embedding_flag)
+        self.assertTrue(spec.auto_enable_embedding)
 
     def test_decoder_embedding_intent_does_not_assume_encoder_fast_path(self):
         spec = resolve_embedding_model_spec(

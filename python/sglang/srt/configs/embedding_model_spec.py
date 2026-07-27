@@ -35,8 +35,9 @@ class EmbeddingModelSpec:
     """Resolved capabilities for an embedding or pooling model.
 
     ``auto_enable_embedding`` is intentionally narrow: it is true only when a
-    checkpoint unambiguously declares an embedding-only architecture. Decoder
-    checkpoints trained for embeddings still require explicit user intent.
+    checkpoint unambiguously declares a pooling/embedding-only architecture.
+    Decoder checkpoints trained for embeddings still require explicit user
+    intent.
     """
 
     family: str
@@ -120,8 +121,8 @@ def resolve_embedding_model_spec(
                 task=EmbeddingTask.EMBED,
                 pooling=pooling,
                 normalize=True,
-                requires_embedding_flag=True,
-                auto_enable_embedding=False,
+                requires_embedding_flag=False,
+                auto_enable_embedding=True,
                 bidirectional_attention=False,
                 bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
             )

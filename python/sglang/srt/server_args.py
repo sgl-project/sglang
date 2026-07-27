@@ -3631,6 +3631,11 @@ class ServerArgs:
         # whose values depend on later prompt tokens, so both are invalid.
         # Breakable CUDA Graph captures one complete prefill and is the graph
         # mode validated for this encoder-style attention.
+        # Native encoder architectures declare a pooling-only task and do not
+        # need the legacy --is-embedding intent flag. Decoder checkpoints still
+        # require that explicit opt-in because their architecture alone does
+        # not distinguish embedding from generation serving.
+        #
         # ``_handle_model_capability_adjustments`` is also exercised directly
         # by a few focused tests that use a small ModelConfig stand-in. Keep
         # the old predicate as a compatibility fallback while production
