@@ -292,6 +292,59 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
 
+    def test_ascend_mha_transfer_uses_contiguous_hicache_backing(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.layout = "page_first_direct"
+        host.page_size = 2
+        host.kv_buffer = torch.empty(2, 2, 2, 2, 1, 1)
+
+        device_k = torch.empty(2, 3, 2, 1, 1)
+        device_v = torch.empty_like(device_k)
+        device_pool = SimpleNamespace(
+            # FIA exposes lists here; these must not be sent to the operator.
+            k_buffer=[device_k[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            v_buffer=[device_v[layer].reshape(-1, 1, 1, 1) for layer in range(2)],
+            get_hicache_transfer_buffers=mock.Mock(
+                return_value=(device_k, device_v)
+            ),
+        )
+        host_indices = _indices(0, 2)
+        device_indices = _indices(2, 4)
+        directions = SimpleNamespace(H2D="H2D", D2H="D2H")
+
+        with (
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
+                directions,
+                create=True,
+            ),
+            mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
+                create=True,
+            ) as transfer,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                io_backend="kernel_ascend",
+            )
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id=0,
+                io_backend="kernel_ascend",
+            )
+
+        self.assertEqual(device_pool.get_hicache_transfer_buffers.call_count, 2)
+        self.assertEqual(transfer.call_count, 2)
+        for call in transfer.call_args_list:
+            self.assertIs(call.kwargs["device_k"], device_k)
+            self.assertIs(call.kwargs["device_v"], device_v)
+        self.assertEqual(transfer.call_args_list[0].kwargs["direction"], "D2H")
+        self.assertEqual(transfer.call_args_list[1].kwargs["direction"], "H2D")
+
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
         kv_cache_dim = 5
