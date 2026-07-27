@@ -131,7 +131,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
         return None
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
-    return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+    padding = target_size - curr_size
+    if padding == 0:
+        return x
+    return F.pad(x, pad=(0, padding), mode="constant", value=-1)
 
 
 def _create_flashmla_metadata():
@@ -439,6 +442,7 @@ class DSV4RawVerifyMetadata:
     extend_start_loc: Optional[torch.Tensor] = None
     verify_lens: Optional[torch.Tensor] = None
     total_verify_tokens: int = 0
+    live_prefix_only: bool = False
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -454,6 +458,7 @@ class DSV4RawVerifyMetadata:
         self.extend_start_loc = other.extend_start_loc
         self.verify_lens = other.verify_lens
         self.total_verify_tokens = other.total_verify_tokens
+        self.live_prefix_only = other.live_prefix_only
 
 
 @dataclass
@@ -571,15 +576,21 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self.cuda_graph_custom_mask = None
 
-    def _can_use_live_prefix_target_verify_metadata(self) -> bool:
-        """Whether the default SM100 verify pipeline bounds reads by live length.
+    def _can_use_live_prefix_target_verify_metadata(
+        self, *, use_prefill_cuda_graph: bool
+    ) -> bool:
+        """Whether graph-captured SM100 verify consumers bound metadata reads.
 
-        All current alternative indexer/top-k consumers are excluded below.
-        Keep any new consumer disabled until its stale-tail behavior is
-        explicitly verified.
+        The default DeepGEMM indexer and JIT top-k v1/v2 paths bound page-table
+        reads by the live C4 length. Native FlashMLA bounds C128 address
+        generation by ``extra_topk_length``. The nonpaged indexer only serves
+        ordinary EXTEND batches, while alternative target-verify consumers are
+        excluded below until their undefined-tail behavior is verified.
+        ``SGLANG_PREP_IN_CUDA_GRAPH=0`` bypasses this graph-only optimization.
         """
         return (
-            _is_cuda
+            use_prefill_cuda_graph
+            and _is_cuda
             and _is_sm100
             and not _is_xpu
             and self.hisparse_coordinator is None
@@ -864,6 +875,9 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=extend_start_loc,
                 verify_lens=verify_lens,
                 total_verify_tokens=total_verify_tokens,
+                live_prefix_only=self._can_use_live_prefix_target_verify_metadata(
+                    use_prefill_cuda_graph=use_prefill_cuda_graph
+                ),
             )
         else:
             seq_lens_cpu_list = (
@@ -1007,7 +1021,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
-            live_prefix_only=self._can_use_live_prefix_target_verify_metadata(),
+            live_prefix_only=raw_metadata.live_prefix_only,
         )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
@@ -1439,6 +1453,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )

@@ -228,9 +228,10 @@ def init_compression_metadata(
     """Build compressed-attention metadata.
 
     ``live_prefix_only`` is an internal CUDA-graph optimization. When enabled,
-    only each row's live C128 prefix is refreshed; the remaining capacity may
-    retain values from an earlier replay. The default initializes the full
-    output exactly as before.
+    only each row's advertised C128 prefix is refreshed; the remaining
+    capacity is undefined. Native FlashMLA predicates KV address generation by
+    the matching C128 length, so it may vector-load but cannot consume this
+    suffix. The default initializes the full output exactly as before.
     """
     return _init_compressed_attn_metadata_triton(
         seq_lens,

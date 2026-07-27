@@ -306,9 +306,9 @@ def build_page_table_positions(
     ]
     page_table = (page_table // page_size).to(torch.int32)
     if live_prefix_only:
-        # The CUDA path leaves non-live columns untouched across graph replays.
-        # Give the reference path deterministic values there while preserving
-        # the same contract: only columns below live_pages are consumable.
+        # The CUDA path leaves non-live columns undefined. Give the reference
+        # path deterministic values there while preserving the same contract:
+        # only columns below live_pages are consumable.
         live_pages = torch.clamp(
             torch.div(
                 torch.clamp(seq_lens_casual, min=0) + page_size - 1,
@@ -394,9 +394,9 @@ def build_page_table_positions_triton(
     """Build per-query page tables and position metadata on CUDA.
 
     ``live_prefix_only`` refreshes only ``ceil(max(seq_len, 0) / page_size)``
-    columns per row. CUDA-graph consumers must bound reads by the corresponding
-    sequence length because the remaining capacity may be stale. The default
-    continues to initialize every page-table column.
+    columns per row. Consumers must bound reads by the corresponding sequence
+    length because the remaining capacity is undefined. The default continues
+    to initialize every page-table column.
     """
     num_q = seq_lens_casual.shape[0]
     num_pages = (max_seq_len + page_size - 1) // page_size
