@@ -153,3 +153,19 @@ docker run -dt \
 # Mark the workspace mount as a safe directory so git operations as root
 # inside the container don't trip the cross-user repo guard.
 docker exec "${CONTAINER_NAME}" git config --global --add safe.directory /sglang-checkout || true
+
+# Pre-warm the HF cache for models used by tests that time out on cold download.
+# popen_launch_server's inner timeout counts network time, so a slow HF Hub can
+# eat the whole window before shard loading begins. Best-effort: on failure the
+# test still tries a live download.
+if [[ -n "${HF_TOKEN_VALUE}" ]]; then
+  docker exec "${CONTAINER_NAME}" /bin/bash -c \
+    "/opt/venv/bin/hf auth login --token '${HF_TOKEN_VALUE}' >/dev/null 2>&1 || true"
+fi
+for model in \
+    "meta-llama/Llama-3.2-1B-Instruct" \
+    "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct"; do
+  echo "Pre-downloading HF model: ${model}"
+  docker exec "${CONTAINER_NAME}" /opt/venv/bin/hf download "${model}" \
+    >/dev/null 2>&1 || echo "Warning: pre-download of ${model} failed; test will retry online" >&2
+done
