@@ -12,10 +12,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.layers.quantization.fp4_utils import (
-    NVFP4_SF_VEC_SIZE,
-    fp4_quantize,
-)
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
@@ -35,6 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FP4_SF_VEC_SIZE = 16
 _cutedsl_logged_scalarize: set = set()
 
 
@@ -260,8 +257,11 @@ def refresh_cutedsl_standard_scales_for_weight_update(
             "CuTe DSL scale metadata changed during weight reload; "
             "CUDA graph recapture is required."
         )
-    scale_pairs = tuple(zip(current_scales, new_scales))
-    for current, new in (*scale_pairs, (current_input_scale, used_input_scale)):
+    scale_pairs = (
+        *zip(current_scales, new_scales),
+        (current_input_scale, used_input_scale),
+    )
+    for current, new in scale_pairs:
         if (
             not isinstance(current, torch.Tensor)
             or current.shape != new.shape
@@ -276,16 +276,19 @@ def refresh_cutedsl_standard_scales_for_weight_update(
     with torch.no_grad():
         for current, new in scale_pairs:
             current.copy_(new)
-        current_input_scale.copy_(used_input_scale)
 
 
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
-    it depends on final weight shapes and EP configuration. The wrapper's
-    CUDA-graph buffers and resolved scales are later updated in place, so they
-    must be normal tensors even when initialization runs under inference_mode().
+    it depends on final weight shapes and EP configuration.  The wrapper's
+    CUDA-graph buffers are allocated inside CuteDslMoEWrapper.__init__, which
+    typically runs during the autotune dummy forward under inference_mode().
+    We wrap the creation in inference_mode(False) so that those pre-allocated
+    buffers are normal tensors -- inference tensors cannot be inplace-updated
+    during later CUDA graph capture, which runs outside inference_mode. The
+    resolved scale tensors share this scope because reload updates them in place.
     """
     if layer._cutedsl_wrapper is not None:
         return
@@ -415,6 +418,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation in (
         "silu",
@@ -432,18 +436,20 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         topk_ids = topk_ids.to(torch.int32)
 
     if quant_info.use_per_token_activation:
-        x_fp4, x_sf, per_token_scale = fp4_quantize(
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        x_fp4, x_sf, per_token_scale = nvfp4_quantize(
             hidden_states,
             quant_info.a1_scale,
-            sf_vec_size=NVFP4_SF_VEC_SIZE,
-            is_sf_swizzled_layout=False,
+            sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
+            backend="cute-dsl",
         )
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
             quant_info.a1_scale,
-            sf_vec_size=NVFP4_SF_VEC_SIZE,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
             is_sf_swizzled_layout=False,
         )
         per_token_scale = None
@@ -451,7 +457,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     seq_len, hidden_size = hidden_states.shape
     x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
     x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-        seq_len, hidden_size // NVFP4_SF_VEC_SIZE
+        seq_len, hidden_size // _FP4_SF_VEC_SIZE
     )
 
     output = quant_info.wrapper.run(
@@ -488,6 +494,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         FlashinferCombineInput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation in (
         "silu",
@@ -516,18 +523,20 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         per_token_scale = None
     else:
         if quant_info.use_per_token_activation:
-            x_fp4, x_sf, per_token_scale = fp4_quantize(
+            from flashinfer import SfLayout, nvfp4_quantize
+
+            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
                 hidden_states,
                 quant_info.a1_scale,
-                sf_vec_size=NVFP4_SF_VEC_SIZE,
-                is_sf_swizzled_layout=False,
+                sfLayout=SfLayout.layout_linear,
                 per_token_activation=True,
+                backend="cute-dsl",
             )
         else:
             x_fp4, x_sf = fp4_quantize(
                 hidden_states,
                 quant_info.a1_scale,
-                sf_vec_size=NVFP4_SF_VEC_SIZE,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
                 is_sf_swizzled_layout=False,
             )
             per_token_scale = None
@@ -535,7 +544,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         seq_len, hidden_size = hidden_states.shape
         x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-            seq_len, hidden_size // NVFP4_SF_VEC_SIZE
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
         )
 
     output = quant_info.wrapper.run(
@@ -581,11 +590,6 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     assert (
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
-    if quant_info.use_per_token_activation:
-        raise ValueError(
-            "flashinfer_cutedsl per-token activation is supported only on the "
-            "CuteDSL v2 path (moe_a2a_backend='none' or 'flashinfer')."
-        )
 
     hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
 
