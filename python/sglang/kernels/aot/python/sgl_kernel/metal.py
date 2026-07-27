@@ -170,9 +170,9 @@ def block_paged_attention_decode(
         raise ValueError("seq_lens must have one entry per batch item")
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
-    if head_dim > 128:
+    if head_dim > 256:
         raise ValueError(
-            "block_paged_attention_decode currently supports head_dim <= 128"
+            "block_paged_attention_decode currently supports head_dim <= 256"
         )
     if q.dtype != k_blocks.dtype or q.dtype != v_blocks.dtype:
         raise ValueError("q/k_blocks/v_blocks dtypes must match")

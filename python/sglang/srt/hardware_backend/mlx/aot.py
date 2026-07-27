@@ -208,7 +208,7 @@ def _build_rope_kernel(inputs: MlxAOTKernelBuildInputs) -> MlxAOTRoPEKernel:
 def _build_block_paged_attention_kernel(
     inputs: MlxAOTKernelBuildInputs,
 ) -> MlxAOTBlockPagedAttentionKernel:
-    if inputs.head_dim > 128:
+    if inputs.head_dim > 256:
         return MlxAOTBlockPagedAttentionKernel()
     try:
         block_paged_attention_decode = _load_metal_block_paged_attention_decode()

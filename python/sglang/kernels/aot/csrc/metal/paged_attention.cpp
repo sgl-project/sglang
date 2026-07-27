@@ -1,9 +1,8 @@
-#include "metal_common.h"
-
 #include <cmath>
 #include <stdexcept>
 #include <string>
 
+#include "metal_common.h"
 #include "mlx/allocator.h"
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
@@ -63,10 +62,9 @@ class BlockPagedAttentionDecode : public Primitive {
     };
 
     const std::string kname = std::string("block_paged_attention_decode_") + dtype_suffix(q.dtype());
-    const std::string hash = kname + "_hd" + std::to_string(head_dim_) + "_q" +
-                             std::to_string(num_qo_heads_) + "_k" + std::to_string(num_kv_heads_) +
-                             "_bs" + std::to_string(block_size_) + "_mb" + std::to_string(mb) + "_s" +
-                             std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
+    const std::string hash = kname + "_hd" + std::to_string(head_dim_) + "_q" + std::to_string(num_qo_heads_) + "_k" +
+                             std::to_string(num_kv_heads_) + "_bs" + std::to_string(block_size_) + "_mb" +
+                             std::to_string(mb) + "_s" + std::to_string(static_cast<int>(sm_scale_ * 1000000.0f));
     auto* pipe = d.get_kernel(kname, g_library, hash, consts);
     if (!pipe) {
       throw std::runtime_error("block_paged_attention_decode: failed to resolve kernel");
@@ -81,7 +79,7 @@ class BlockPagedAttentionDecode : public Primitive {
     enc.set_output_array(out, 5);
 
     const uint32_t batch = static_cast<uint32_t>(q.shape(0));
-    enc.dispatch_threads(MTL::Size::Make(batch, nq, 32), MTL::Size::Make(1, 1, 32));
+    enc.dispatch_threads(MTL::Size::Make(batch, nq, 256), MTL::Size::Make(1, 1, 256));
   }
 
   const char* name() const override {
@@ -144,14 +142,13 @@ nb::object block_paged_attention_decode_py(
     throw std::runtime_error("block_paged_attention_decode: metadata batch dimension must match q");
   if (num_qo_heads % num_kv_heads != 0)
     throw std::runtime_error("block_paged_attention_decode: num_qo_heads must be divisible by num_kv_heads");
-  if (head_dim > 128)
-    throw std::runtime_error("block_paged_attention_decode: head_dim > 128 is not supported by this kernel");
-  if (block_size <= 0)
-    throw std::runtime_error("block_paged_attention_decode: block_size must be positive");
+  if (head_dim > 256)
+    throw std::runtime_error("block_paged_attention_decode: head_dim > 256 is not supported by this kernel");
+  if (block_size <= 0) throw std::runtime_error("block_paged_attention_decode: block_size must be positive");
 
   auto stream = default_stream(Device::gpu);
-  auto primitive = std::make_shared<BlockPagedAttentionDecode>(
-      stream, head_dim, num_qo_heads, num_kv_heads, block_size, sm_scale);
+  auto primitive =
+      std::make_shared<BlockPagedAttentionDecode>(stream, head_dim, num_qo_heads, num_kv_heads, block_size, sm_scale);
   auto outs = array::make_arrays({q.shape()}, {q.dtype()}, primitive, {q, k_blocks, v_blocks, block_tables, seq_lens});
   return wrap_array(std::move(outs[0]));
 }

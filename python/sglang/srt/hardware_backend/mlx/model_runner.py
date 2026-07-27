@@ -37,8 +37,8 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousAttentionKVCache,
     MlxAttentionKVPool,
-    MlxBlockAttentionKVPool,
     MLXAttentionWrapper,
+    MlxBlockAttentionKVPool,
     MlxModelCacheLayout,
     PoolBackedAttentionKVCache,
     clear_context,
@@ -667,7 +667,9 @@ class MlxModelRunner:
         logical_blocks = positions // self._block_size
         block_offsets = positions - logical_blocks * self._block_size
         block_ids = mx.array(table, dtype=mx.int32)[logical_blocks]
-        for pool_idx, layer_idx in enumerate(self._cache_layout.attention_layer_indices):
+        for pool_idx, layer_idx in enumerate(
+            self._cache_layout.attention_layer_indices
+        ):
             k = cache[layer_idx].keys[0, :, start:end, :].transpose(1, 0, 2)
             v = cache[layer_idx].values[0, :, start:end, :].transpose(1, 0, 2)
             self._block_attention_kv_pool.set_kv(
@@ -990,7 +992,9 @@ class MlxModelRunner:
         prev_tokens.append(next_token)
 
         self._req_synced_offset[pending.req_id] = pending.new_synced_offset
-        self._sync_full_kv_to_block_pool(pending.req_id, self._req_caches[pending.req_id])
+        self._sync_full_kv_to_block_pool(
+            pending.req_id, self._req_caches[pending.req_id]
+        )
         self._store_auxiliary_state(
             self._req_pool_idx[pending.req_id],
             self._req_caches[pending.req_id],
@@ -1354,7 +1358,9 @@ class MlxModelRunner:
             if pending.pool_synced_offsets is not None:
                 self._req_synced_offset[rid] = pending.pool_synced_offsets[rid]
                 if self._block_attention_kv_pool is not None:
-                    self._req_block_synced_offset[rid] = pending.pool_synced_offsets[rid]
+                    self._req_block_synced_offset[rid] = pending.pool_synced_offsets[
+                        rid
+                    ]
 
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:

@@ -87,8 +87,7 @@ class MlxAttentionKVPool:
 
 
 class MlxBlockAttentionKVPool:
-    """Pre-allocated block-table attention KV pool.
-    """
+    """Pre-allocated block-table attention KV pool."""
 
     def __init__(
         self,
