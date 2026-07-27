@@ -1933,12 +1933,24 @@ class MMEncoder:
                         else [serialized_data]
                     )
                     tracker = await sock.send_multipart(frames, copy=False, track=True)
-                    await asyncio.to_thread(tracker.wait, self.send_timeout)
                 except Exception:
                     if self.scheduler_send_sockets.get(endpoint) is sock:
                         self.scheduler_send_sockets.pop(endpoint, None)
                     sock.close(linger=0)
                     raise
+
+            # MessageTracker.wait() protects the zero-copy source buffer; it
+            # is not a receiver acknowledgement. Waiting under the per-peer
+            # lock serialized every large embedding on that TCP connection.
+            # Queue sends in order under the lock, then wait for buffer
+            # ownership independently so libzmq can pipeline the connection.
+            try:
+                await asyncio.to_thread(tracker.wait, self.send_timeout)
+            except Exception:
+                if self.scheduler_send_sockets.get(endpoint) is sock:
+                    self.scheduler_send_sockets.pop(endpoint, None)
+                    sock.close(linger=0)
+                raise
 
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(

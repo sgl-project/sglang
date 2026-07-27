@@ -1,6 +1,7 @@
 import asyncio
 import pickle
 import sys
+import threading
 import time
 from array import array
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +12,7 @@ import pytest
 import torch
 import zmq
 import zmq.asyncio
+from fastapi import HTTPException
 from PIL import Image
 
 from sglang.srt.disaggregation.encode_receiver import (
@@ -21,10 +23,64 @@ from sglang.srt.disaggregation.encode_receiver import (
 )
 from sglang.srt.disaggregation.encode_server import MMEncoder, _get_mm_grid_dim
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.tokenizer_manager import (
+    _reject_missing_dispatched_encoder_embedding,
+)
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_kimi_k3_encoder_transfer_backend_auto_avoids_tp_fanout():
+    assert (
+        resolve_encoder_transfer_backend("auto", "KimiK3ForConditionalGeneration", 8)
+        == "zmq_to_tokenizer"
+    )
+    assert (
+        resolve_encoder_transfer_backend("auto", "KimiK3ForConditionalGeneration", 1)
+        == "zmq_to_scheduler"
+    )
+    assert (
+        resolve_encoder_transfer_backend("auto", "Qwen3VLForConditionalGeneration", 8)
+        == "zmq_to_scheduler"
+    )
+    assert (
+        resolve_encoder_transfer_backend(
+            "zmq_to_scheduler", "KimiK3ForConditionalGeneration", 8
+        )
+        == "zmq_to_scheduler"
+    )
+    assert (
+        resolve_encoder_transfer_backend(
+            "mooncake", "KimiK3ForConditionalGeneration", 8
+        )
+        == "mooncake"
+    )
+
+
+def test_epd_language_only_rejects_missing_dispatched_embedding():
+    server_args = SimpleNamespace(
+        language_only=True,
+        encoder_transfer_backend="zmq_to_tokenizer",
+    )
+    request = SimpleNamespace(need_wait_for_mm_inputs=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _reject_missing_dispatched_encoder_embedding(server_args, request, None)
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+def test_epd_allows_local_processing_when_request_was_not_dispatched():
+    server_args = SimpleNamespace(
+        language_only=True,
+        encoder_transfer_backend="zmq_to_tokenizer",
+    )
+    request = SimpleNamespace(need_wait_for_mm_inputs=False)
+
+    _reject_missing_dispatched_encoder_embedding(server_args, request, None)
 
 
 def _encoder(model_type="kimi_k3"):
@@ -261,6 +317,81 @@ def test_epd_encoder_reuses_scheduler_zmq_peer():
             context.term()
 
     asyncio.run(send_twice())
+
+
+def test_epd_encoder_pipelines_zero_copy_sends_per_peer():
+    class FakeTracker:
+        def __init__(self, release):
+            self.release = release
+
+        def wait(self, timeout):
+            assert self.release.wait(timeout)
+
+    class FakeSocket:
+        def __init__(self, release, second_queued):
+            self.release = release
+            self.second_queued = second_queued
+            self.send_count = 0
+
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, _endpoint):
+            pass
+
+        def close(self, **_kwargs):
+            pass
+
+        async def send_multipart(self, _frames, **_kwargs):
+            self.send_count += 1
+            if self.send_count == 2:
+                self.second_queued.set()
+            return FakeTracker(self.release)
+
+    class FakeContext:
+        def __init__(self, socket):
+            self.socket_instance = socket
+
+        def socket(self, _socket_type):
+            return self.socket_instance
+
+    async def run_test():
+        release = threading.Event()
+        second_queued = asyncio.Event()
+        socket = FakeSocket(release, second_queued)
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.server_args = SimpleNamespace(
+            encoder_transfer_backend="zmq_to_scheduler"
+        )
+        encoder.send_timeout = 1
+        encoder.context = FakeContext(socket)
+        encoder.scheduler_send_sockets = {}
+        encoder.scheduler_send_locks = {}
+        mm_data = EmbeddingData(
+            req_id="test-rid_local_part_0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            error_msg="probe",
+            error_code=599,
+        )
+
+        first = asyncio.create_task(encoder._send(None, mm_data, url="127.0.0.1:12345"))
+        while socket.send_count < 1:
+            await asyncio.sleep(0)
+        second = asyncio.create_task(
+            encoder._send(None, mm_data, url="127.0.0.1:12345")
+        )
+        try:
+            await asyncio.wait_for(second_queued.wait(), timeout=0.5)
+        finally:
+            release.set()
+        await asyncio.gather(first, second)
+
+        assert socket.send_count == 2
+
+    asyncio.run(run_test())
 
 
 if __name__ == "__main__":

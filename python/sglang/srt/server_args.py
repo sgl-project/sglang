@@ -323,7 +323,23 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
-ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+ENCODER_TRANSFER_BACKEND_CHOICES = [
+    "auto",
+    "zmq_to_scheduler",
+    "zmq_to_tokenizer",
+    "mooncake",
+]
+
+
+def resolve_encoder_transfer_backend(
+    backend: str, model_arch: str, tp_size: int
+) -> str:
+    if backend != "auto":
+        return backend
+    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+        return "zmq_to_tokenizer"
+    return "zmq_to_scheduler"
+
 
 DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
@@ -3031,7 +3047,7 @@ class ServerArgs:
     encoder_transfer_backend: A[
         str,
         Arg(
-            help="The backend for encoder disaggregation transfer. Default is zmq_to_scheduler.",
+            help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
             choices=ENCODER_TRANSFER_BACKEND_CHOICES,
         ),
         NS("disagg"),
@@ -7249,6 +7265,17 @@ class ServerArgs:
         # Validate model type for encoder disaggregation
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        if self.encoder_transfer_backend == "auto":
+            self.encoder_transfer_backend = resolve_encoder_transfer_backend(
+                self.encoder_transfer_backend, model_arch, self.tp_size
+            )
+            if self.encoder_only or self.language_only:
+                logger.info(
+                    "Encoder transfer backend auto-resolved to %s for %s at TP%d.",
+                    self.encoder_transfer_backend,
+                    model_arch,
+                    self.tp_size,
+                )
         if (self.encoder_only or self.language_only) and model_arch not in [
             "Qwen2VLForConditionalGeneration",
             "Qwen3VLForConditionalGeneration",

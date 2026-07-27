@@ -147,6 +147,23 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
+    """Do not silently turn a failed EPD request into local vision work."""
+    if (
+        mm_inputs is None
+        and server_args.language_only
+        and server_args.encoder_transfer_backend == "zmq_to_tokenizer"
+        and request_obj.need_wait_for_mm_inputs
+    ):
+        raise fastapi.HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "The encoder did not return multimodal embeddings. "
+                "The request was not run locally in language-only mode."
+            ),
+        )
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -908,6 +925,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         mm_processor=self.mm_processor,
                         prompt=mm_processor_input,
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                    )
+                    _reject_missing_dispatched_encoder_embedding(
+                        self.server_args, obj, mm_inputs
                     )
                 if mm_inputs is None:
                     if self.server_args.language_only:
