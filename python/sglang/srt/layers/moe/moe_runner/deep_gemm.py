@@ -143,6 +143,10 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
 
 
 _DEEP_GEMM_GROUPED_BLOCK_N = 128
+_STANDARD_CONTIGUOUS_M_ALIGNMENT = 128
+# Full-tail GEMM2 amortizes its padded rows once the average routed expert
+# spans more than two aligned M tiles (B > 8192 for MiniMax-M3).
+_GEMM2_ZERO_PADDING_MIN_M_TILES = 2
 
 
 @cache
@@ -169,6 +173,26 @@ def _has_full_psum_wave(
     return max_active_experts * blocks_per_expert >= _get_num_sms(device)
 
 
+def _has_dense_routed_experts(
+    num_tokens: int,
+    runner_config: MoeRunnerConfig,
+) -> bool:
+    num_shared_experts = runner_config.num_fused_shared_experts or 0
+    routed_topk = runner_config.top_k - num_shared_experts
+    num_routed_experts = runner_config.num_local_experts - num_shared_experts
+    if num_routed_experts == 0:
+        expected_routed_m = num_tokens
+    else:
+        expected_routed_m = ceil_div(
+            num_tokens * routed_topk,
+            num_routed_experts,
+        )
+    return (
+        expected_routed_m
+        > _GEMM2_ZERO_PADDING_MIN_M_TILES * _STANDARD_CONTIGUOUS_M_ALIGNMENT
+    )
+
+
 def _select_contiguous_gemm_options(
     runner_input: DeepGemmRunnerInput,
     running_state: dict,
@@ -187,7 +211,9 @@ def _select_contiguous_gemm_options(
     )
     assert grouped_layout is not None
     gemm1_ensure_zero_padding = not use_psum_layout
-    gemm2_ensure_zero_padding = not use_psum_layout
+    gemm2_ensure_zero_padding = not use_psum_layout or _has_dense_routed_experts(
+        num_tokens, runner_config
+    )
     return (
         grouped_layout,
         use_psum_layout,

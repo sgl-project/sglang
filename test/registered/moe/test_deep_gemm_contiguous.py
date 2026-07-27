@@ -279,6 +279,8 @@ def _run_standard_deep_gemm(
         pytest.param(6, True, False, id="after-psum"),
         pytest.param(25, True, False, id="presence-bincount"),
         pytest.param(26, True, False, id="atomic-bincount"),
+        pytest.param(8192, True, False, id="before-gemm2-full-tail"),
+        pytest.param(8193, True, True, id="after-gemm2-full-tail"),
     ],
 )
 @torch.inference_mode()
