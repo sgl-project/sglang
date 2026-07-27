@@ -10,6 +10,7 @@ import json
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import zmq
 
@@ -44,11 +45,29 @@ def str_to_dtype(s: str) -> torch.dtype:
     return d
 
 
+def _coerce_tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    raise TypeError(f"Expected Tensor or ndarray, got {type(value)}")
+
+
+def _normalize_tensor_field(
+    value: torch.Tensor | np.ndarray | list | tuple | None,
+) -> torch.Tensor | list[torch.Tensor] | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_coerce_tensor(v) for v in value if v is not None]
+    return _coerce_tensor(value)
+
+
 class TensorWrapper:
     """Expose a CPU-contiguous tensor's data buffer for zero-copy ZMQ send."""
 
     def __init__(self, tensor: torch.Tensor):
-        if tensor.is_cuda or tensor.is_npu:
+        if tensor.device.type != "cpu":
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -93,6 +112,10 @@ def pack_tensors(
     buffers = []
 
     for field_name, value in tensor_fields.items():
+        if value is None:
+            continue
+
+        value = _normalize_tensor_field(value)
         if value is None:
             continue
 

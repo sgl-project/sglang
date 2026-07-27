@@ -3,8 +3,11 @@
 
 import logging
 from abc import ABC, abstractmethod
+from typing import Literal
 
 logger = logging.getLogger(__name__)
+
+TransferBackend = Literal["auto", "mooncake"]
 
 _MOONCAKE_AVAILABLE = None
 
@@ -114,13 +117,16 @@ def create_transfer_engine(
     hostname: str = "127.0.0.1",
     gpu_id: int = 0,
     ib_device: str | None = None,
+    backend: TransferBackend = "auto",
 ) -> BaseTransferEngine:
-    """Factory: returns MooncakeDiffusionEngine if mooncake is available."""
+    """Factory for disaggregated diffusion transfer engines."""
+    del backend
     if not _check_mooncake():
         raise RuntimeError(
             "Mooncake transfer engine is required for disaggregated diffusion "
             "but is not installed. Please install mooncake first."
         )
+
     return MooncakeDiffusionEngine(
         hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
     )

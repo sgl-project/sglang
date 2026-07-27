@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import dataclasses
+import json
 import multiprocessing as mp
 import os
 import signal
@@ -481,7 +482,7 @@ def launch_pool_disagg_server(
     # Start DiffusionServer
     frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
 
-    diffusion_server = DiffusionServer(
+    diffusion_server = DiffusionServer.from_classic_args(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
         denoiser_work_endpoints=denoiser_work_endpoints,
@@ -567,6 +568,49 @@ def parse_url_string(url_str: str) -> list[str]:
     return [u.strip() for u in url_str.split(";") if u.strip()]
 
 
+def launch_dag_server(server_args: ServerArgs):
+    """Launch the orchestrator for a custom DAG topology (``--disagg-dag``).
+
+    Node work endpoints come from the topology's pool URLs; result endpoints
+    follow the same ``base_port + index + 1`` convention the three fixed roles
+    use, so a DAG deployment needs no extra port bookkeeping.
+    """
+    configure_logger(server_args)
+
+    plan = server_args.resolve_execution_plan()
+    host = server_args.host or "127.0.0.1"
+    base_port = server_args.scheduler_port
+    frontend_endpoint = f"tcp://{host}:{base_port}"
+
+    logger.info("Starting DiffusionServer with a %d-node DAG", len(plan.node_names))
+    logger.info("  Frontend: %s", frontend_endpoint)
+    for name in plan.node_names:
+        node = plan.node(name)
+        logger.info(
+            "  %s: %d instance(s), capacity=%d, work=%s, result=%s",
+            name,
+            node.num_instances,
+            node.capacity,
+            node.pool.urls,
+            node.pool.result_endpoint,
+        )
+
+    diffusion_server = DiffusionServer(
+        frontend_endpoint=frontend_endpoint,
+        plan=plan,
+        timeout_s=float(server_args.disagg_timeout),
+    )
+    diffusion_server.start()
+
+    if not diffusion_server.wait_ready(timeout=30.0):
+        raise RuntimeError("DiffusionServer failed to bind sockets within 30 seconds")
+
+    try:
+        launch_http_server_only(server_args)
+    finally:
+        diffusion_server.stop()
+
+
 def launch_disagg_server(server_args: ServerArgs):
     """Launch DiffusionServer head node + HTTP server (--disagg-role server).
 
@@ -578,6 +622,10 @@ def launch_disagg_server(server_args: ServerArgs):
         denoiser result: scheduler_port + 2
         decoder result: scheduler_port + 3
     """
+    if server_args.disagg_dag:
+        launch_dag_server(server_args)
+        return
+
     configure_logger(server_args)
 
     for name, val in [
@@ -618,7 +666,7 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_ep,
     )
 
-    diffusion_server = DiffusionServer(
+    diffusion_server = DiffusionServer.from_classic_args(
         frontend_endpoint=frontend_endpoint,
         encoder_work_endpoints=encoder_work_endpoints,
         denoiser_work_endpoints=denoiser_work_endpoints,
@@ -661,13 +709,24 @@ def launch_disagg_role(server_args: ServerArgs):
             "--disagg-server-addr is required for --disagg-role " f"{role_type.value}"
         )
 
+    plan = server_args.resolve_execution_plan()
+    node_name = server_args.dag_node
+
     # Derive endpoints
     work_endpoint = server_args.derive_pool_work_endpoint()
-    result_endpoint = server_args.derive_pool_result_endpoint()
+    if plan is not None:
+        if not node_name or not plan.has_node(node_name):
+            raise ValueError(
+                f"--dag-node must name a node in --disagg-dag; got {node_name!r}, "
+                f"known nodes: {plan.node_names}"
+            )
+        result_endpoint = plan.node(node_name).pool.result_endpoint
+    else:
+        result_endpoint = server_args.derive_pool_result_endpoint()
 
     logger.info(
-        "Starting disagg role: %s, num_gpus=%d",
-        role_type.value,
+        "Starting disagg node: %s, num_gpus=%d",
+        node_name or role_type.value,
         server_args.num_gpus,
     )
     logger.info("  Work endpoint (bind): %s", work_endpoint)
@@ -686,13 +745,27 @@ def launch_disagg_role(server_args: ServerArgs):
         start=server_args.scheduler_port + 100, avoid={server_args.scheduler_port}
     )
 
-    role_par = server_args.get_role_parallelism(role_type)
+    if plan is not None:
+        # Each pool carries its own parallelism, so two nodes with the same
+        # role_affinity can be sharded differently.
+        node_par = plan.node(node_name).pool.parallelism
+        role_par = {
+            "tp_size": node_par.get("tp"),
+            "sp_degree": node_par.get("sp"),
+            "ulysses_degree": node_par.get("ulysses"),
+            "ring_degree": node_par.get("ring"),
+        }
+        is_source = plan.is_source(node_name)
+    else:
+        role_par = server_args.get_role_parallelism(role_type)
+        is_source = role_type == RoleType.ENCODER
+
     role_overrides = {
         "disagg_role": role_type,
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
         "pool_result_endpoint": result_endpoint,
-        "warmup": role_type == RoleType.ENCODER,
+        "warmup": is_source,
         "server_warmup": False,
         "scheduler_port": internal_scheduler_port,
         # Per-role parallelism (None = auto-derive from num_gpus)
@@ -766,8 +839,41 @@ def launch_disagg_role(server_args: ServerArgs):
         shutdown_scheduler_processes(role_args, processes, request_shutdown=False)
 
 
+def validate_dag_topology(server_args: ServerArgs) -> None:
+    """Compile the DAG and check it against the pipeline, then exit.
+
+    Builds the stage graph in a single process so a topology typo -- an
+    unclaimed stage, a stage name that no longer exists -- surfaces here
+    rather than after a multi-GPU cluster has come up. Only the modules this
+    node claims are loaded, so validating the lightest node is the cheapest
+    way to check the whole topology.
+    """
+    configure_logger(server_args)
+
+    plan = server_args.resolve_execution_plan()
+    if plan is None:
+        raise ValueError("--dag-validate requires --disagg-dag")
+
+    print(json.dumps(plan.to_dict(), indent=2))
+
+    from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline
+
+    # Stage constructors read the process-global args, which normally get set
+    # while a worker boots.
+    set_global_server_args(server_args)
+
+    # Constructing the pipeline runs validate_dag_stage_coverage, which raises
+    # if the plan and the registered stages disagree.
+    build_pipeline(server_args)
+    print("\nDAG topology is valid.")
+
+
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
+    if server_args.dag_validate:
+        validate_dag_topology(server_args)
+        return
+
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
         launch_server(server_args)

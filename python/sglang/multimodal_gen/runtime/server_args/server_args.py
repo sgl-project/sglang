@@ -380,6 +380,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
+    # Custom DAG topology; when set it supersedes the three-role arguments.
+    disagg_dag: str | None = None
+    dag_node: str | None = None
+    dag_validate: bool = False
     disagg_timeout: int = 3600
     disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
