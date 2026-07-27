@@ -7,8 +7,8 @@ import pytest
 import torch
 from PIL import Image
 
-from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.srt.multimodal.processors.kimi_k3 import _fill_transparent_bg
+from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
