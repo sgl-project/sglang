@@ -18,6 +18,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
@@ -170,6 +171,15 @@ class SchedulerProfilerManager:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+
+        if current_platform.is_out_of_tree():
+            if hasattr(
+                torch.profiler.ProfilerActivity,
+                current_platform.get_torch_profiler_activity_str(),
+            ):
+                activity_map[current_platform.get_torch_profiler_activity_str()] = (
+                    current_platform.get_torch_profiler_activity()
+                )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
         torchprof_activities = [
@@ -241,7 +251,9 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            torch.cuda.memory._record_memory_history(
+                max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+            )
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
@@ -346,7 +358,8 @@ class SchedulerProfilerManager:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                str(time.time())
+                stage_prefix
+                + str(time.time())
                 + f"-TP-{self.ps.tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",

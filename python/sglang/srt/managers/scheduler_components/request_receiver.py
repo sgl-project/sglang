@@ -167,7 +167,10 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            _local_ctrl = (
+                self.server_args.enable_dp_attention_local_control_broadcast
+                or self.server_args.is_ep_scale_joiner
+            )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
                     control_reqs = broadcast_pyobj(
@@ -223,11 +226,12 @@ class SchedulerRequestReceiver:
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                if error_code is None:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                elif isinstance(error_code, HTTPStatus):
+                    status_code = error_code
+                else:
+                    status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
