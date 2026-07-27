@@ -28,9 +28,9 @@
 
 | 指标 | 结果 |
 | --- | ---: |
-| SGLang scheduler forward | 38.045 FPS |
-| 服务端完整 chunk | 37.683 FPS |
-| 客户端通过 NLB 实收 | 38.017 FPS |
+| SGLang scheduler forward | 37.906 FPS |
+| 服务端完整 chunk | 37.541 FPS |
+| 客户端通过 NLB 实收 | 37.874 FPS |
 | 目标实时帧率 | 24 FPS |
 | 余量（客户端实收 / 目标） | 1.58× |
 
@@ -223,20 +223,25 @@ DMD student 没有 CFG 的 uncond lane，因此 guidance 被规范化为 0，CFG
 | 编码 FPS | 24 |
 | 总帧数 | 65（1 reference + 64 generated） |
 | 时长 | 2.708333 秒 |
-| MP4 大小 | 467,313 bytes |
-| MP4 SHA-256 | `e4c4fcae990ef6f9010afe99a9ca4ea3e552124fb30310056a8ae798fe1d1a38` |
+| MP4 大小 | 467,587 bytes |
+| MP4 SHA-256 | `15c106e90b0cb3b7dfc32799b53e51d5ca1097488594d3f9ca273df1ad9699e6` |
 
 产物：
 
 ```text
 benchmark/minwm_realtime_parity/results/latest-checkpoint-0724-spot-b200/
 ├── cases/00_forward_pottery/
-│   ├── sglang_spot_b200.mp4
-│   └── sglang_spot_b200.json
+│   ├── sglang_spot_b200_final.mp4
+│   └── sglang_spot_b200_final.json
 ├── inputs/00_forward_pottery.png
-├── sglang_spot_b200_run.json
-└── throughput.json
+├── sglang_spot_b200_final_run.json
+└── throughput_final.json
 ```
+
+最终 Pod 的视频 SHA 与前一个 Pod 的视频 SHA 不同。当前部署选择
+`performance_mode=speed`、whole-DiT `torch.compile` 和非确定性 FA 路径，
+目标是吞吐而不是 bitwise 重现；同 prompt、seed 和首帧不保证跨进程 bitwise
+一致。若要做 parity 回归，必须改用仓库中的 bitwise profile。
 
 ### 6.3 吞吐
 
@@ -245,20 +250,21 @@ chunks，共计量 320 个生成帧。
 
 | 指标 | 均值/结果 | P95 | P99 |
 | --- | ---: | ---: | ---: |
-| scheduler forward | 420.55 ms/chunk | 459 ms | 467 ms |
-| 完整 chunk | 424.60 ms/chunk | 462 ms | 470 ms |
-| NLB 客户端 chunk 间隔 | 420.86 ms/chunk | 459.34 ms | 466.61 ms |
-| scheduler FPS | 38.045 | — | — |
-| 完整服务端 FPS | 37.683 | — | — |
-| NLB 客户端 FPS | 38.017 | — | — |
+| scheduler forward | 422.10 ms/chunk | 466 ms | 475 ms |
+| 完整 chunk | 426.20 ms/chunk | 472 ms | 478 ms |
+| NLB 客户端 chunk 间隔 | 422.45 ms/chunk | 467.94 ms | 472.95 ms |
+| scheduler FPS | 37.906 | — | — |
+| 完整服务端 FPS | 37.541 | — | — |
+| NLB 客户端 FPS | 37.874 | — | — |
 
 这里的 38 FPS 是“不做输出 pacing 时模型能生产多少帧”。Web UI 默认启用
 24 FPS pacing，所以 UI 路径会主动等待并按约 24 FPS 推送，不能把 pacing 后的
 24 FPS误判成模型吞吐下降。
 
-首次 cold compile 的第一个 chunk 用时 126.64 秒；后续同次视频的最后两个
-chunk 分别是 391 ms 和 402 ms。编译缓存持久化到 GP3 后，稳态测试的首 payload
-时间为 3.512 秒，之后进入上述约 38 FPS 的稳定窗口。
+首次部署的第一个 cold compile chunk 用时 126.64 秒。最终声明式 Pod 重启后的
+首个验证 case 仍有 44.71 秒 compile/cache 恢复开销，最后两个 chunk 分别是
+396 ms 和 402 ms。完成 10 个 warmup chunks 后，最终吞吐测试的首 payload
+时间为 2.959 秒，之后进入上述约 38 FPS 的稳定窗口。
 
 ### 6.4 Web UI
 
