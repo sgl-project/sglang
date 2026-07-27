@@ -1302,11 +1302,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             assert isinstance(output, PPProxyTensors)
             # Slice in token rows, not request rows: under speculative verify
-            # each request carries num_tokens_per_req tokens (identical for
-            # plain decode, where num_tokens_per_req == 1).
+            # each request carries captured_req_width tokens (identical for
+            # plain decode, where captured_req_width == 1).
             return PPProxyTensors(
                 {
-                    k: v[: self.bs * self.num_tokens_per_req]
+                    k: v[: self.bs * self.captured_req_width]
                     for k, v in output.tensors.items()
                 }
             )
