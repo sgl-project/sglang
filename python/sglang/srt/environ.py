@@ -900,6 +900,10 @@ class Envs:
     # path through the Blackwell CuTe-DSL TGV kernel. Default-off and inert
     # unless SGLANG_BS1_BF16_DENSE is also enabled.
     SGLANG_BS1_BF16_TGV = EnvBool(False)
+    # Launch the CuTe-DSL TGV bf16 GEMM with programmatic dependent launch.
+    # Round 5/6 GB300 evidence: PDL TGV crashes or regresses under real TP8
+    # serving concurrency; set 0 to run the same tactics without PDL.
+    SGLANG_CUTEDSL_BF16_GEMM_PDL = EnvBool(True)
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
     # Consults the tuned per-(N, K, M) Triton tile config table in
     # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /

@@ -1404,12 +1404,14 @@ def _tgv_bf16_gemm_run(
         # Match cuBLAS/F.linear semantics for empty batches; a 0-CTA launch
         # would fail with CUDA_ERROR_INVALID_VALUE.
         return out
+    from sglang.srt.environ import envs
+
     return _run_tgv(
         x,
         weight.t(),
         bias,
         out,
-        pdl=True,
+        pdl=envs.SGLANG_CUTEDSL_BF16_GEMM_PDL.get(),
         tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
     )
 
