@@ -346,6 +346,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
         )
+
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
