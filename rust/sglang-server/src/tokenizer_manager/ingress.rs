@@ -28,7 +28,7 @@ use crate::message::{
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::{LiveRids, Senders, TmEvent};
+use crate::tokenizer_manager::{AbortSource, LiveRids, Senders, TmEvent};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -37,7 +37,7 @@ pub struct Ingress {
     rx: flume::Receiver<TmEvent>,
     /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
     /// abort is handled promptly even while the bounded inbox is saturated.
-    abort_rx: flume::Receiver<String>,
+    abort_rx: flume::Receiver<AbortSource>,
     /// In-flight rid registry. Released HERE, not by the guard that queued the
     /// abort — see [`Ingress::on_abort`].
     live_rids: LiveRids,
@@ -85,7 +85,7 @@ impl Limits {
 impl Ingress {
     pub fn new(
         rx: flume::Receiver<TmEvent>,
-        abort_rx: flume::Receiver<String>,
+        abort_rx: flume::Receiver<AbortSource>,
         live_rids: LiveRids,
         senders: Senders,
         ingress: IngressProducer,
@@ -106,7 +106,7 @@ impl Ingress {
 
 /// Which lane produced the next item.
 enum Lane {
-    Abort(String),
+    Abort(AbortSource),
     Event(TmEvent),
 }
 
@@ -131,8 +131,8 @@ impl Runnable for Ingress {
                     // on the abort lane first: those requests are in flight on the
                     // scheduler, and the selector may report the closed inbox before
                     // it ever looks at a pending abort.
-                    while let Ok(rid) = self.abort_rx.try_recv() {
-                        self.on_abort(rid);
+                    while let Ok(source) = self.abort_rx.try_recv() {
+                        self.on_abort(source);
                     }
                     return;
                 }
@@ -355,7 +355,8 @@ impl Ingress {
     /// Client disconnected: deregister, then push an `AbortReq(rid)` so the
     /// scheduler stops generating. Fire-and-forget (a full ring drops the abort;
     /// the request then finishes at EOS).
-    fn on_abort(&self, rid: String) {
+    fn on_abort(&self, source: AbortSource) {
+        let rid = source.rid().to_string();
         let id = RidHash::from_rid(&rid);
         let _ = self
             .senders
@@ -382,7 +383,13 @@ impl Ingress {
         // then saw [Register, Deregister] and the retry got a 500, while a real
         // `AbortReq` naming it went to the scheduler. An epoch on the detok
         // messages cannot fix that — `AbortReq` matches by rid STRING.
-        if let Ok(mut live) = self.live_rids.lock() {
+        //
+        // …and only for a GUARD abort. A detok-originated one (failed request,
+        // decoder error, full sink) leaves the handler's guard armed and still
+        // owning the entry, so releasing here would hand the same rid out twice.
+        if matches!(source, AbortSource::Guard(_))
+            && let Ok(mut live) = self.live_rids.lock()
+        {
             live.remove(&rid);
         }
     }
@@ -564,7 +571,7 @@ mod tests {
     }
 
     fn make_ingress_with_abort(
-        abort_rx: flume::Receiver<String>,
+        abort_rx: flume::Receiver<AbortSource>,
     ) -> (
         Ingress,
         flume::Receiver<DetokMsg>,
@@ -582,14 +589,14 @@ mod tests {
         IngressConsumer,
         flume::Sender<TmEvent>,
     ) {
-        let (abort_tx, abort_rx) = flume::unbounded::<String>();
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
         make_ingress_inner(limits, abort_rx)
     }
 
     fn make_ingress_inner(
         limits: Limits,
-        abort_rx: flume::Receiver<String>,
+        abort_rx: flume::Receiver<AbortSource>,
     ) -> (
         Ingress,
         flume::Receiver<DetokMsg>,
@@ -643,7 +650,7 @@ mod tests {
 
         // Rendezvous shard channel: the send blocks until we receive.
         let (detok_tx, detok_rx) = flume::bounded::<DetokMsg>(0);
-        let (ingress_producer, _consumer) = ingress_ring(16);
+        let (ingress_producer, consumer) = ingress_ring(16);
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
         let ingress = Ingress::new(
@@ -661,7 +668,8 @@ mod tests {
             sd_rx,
         );
 
-        let handle = std::thread::spawn(move || ingress.on_abort("x".to_string()));
+        let handle =
+            std::thread::spawn(move || ingress.on_abort(AbortSource::Guard("x".to_string())));
 
         // The abort handler is parked on the rendezvous send. The rid MUST still be
         // held: releasing it here is what let a retry register ahead of the abort.
@@ -679,10 +687,72 @@ mod tests {
             DetokMsg::Deregister { .. }
         ));
         handle.join().unwrap();
+        // The doc claims the release trails the deregister AND the ring push, so
+        // pin both halves: without this, moving the push after the release passes.
+        assert_eq!(
+            consumer.drain(8).headers.len(),
+            1,
+            "the AbortReq must reach the ring before the rid is released"
+        );
         assert!(
             !live.lock().unwrap().contains("x"),
             "the rid must be released once the abort has taken effect"
         );
+    }
+
+    /// A detokenizer-originated abort deregisters and tells the scheduler to stop,
+    /// but must NOT release the rid: the handler's `AbortGuard` is still armed and
+    /// still owns that registry entry.
+    ///
+    /// Regression for two distinct cross-client failures that both start here. The
+    /// detok shard aborts from three terminal paths (`handle_fail`, the decoder
+    /// error, and a full sink), none of which the guard knows about. Releasing on
+    /// those admitted a retry of the same rid while the original guard was live,
+    /// and then either (a) the guard's own later abort deregistered the RETRY —
+    /// 500 mid-generation plus a real `AbortReq` naming it — or (b) on the paths
+    /// where the handler disarms, the guard's later release freed the retry's entry
+    /// and a THIRD request was admitted whose `Register` overwrote the retry's sink.
+    #[test]
+    fn detok_originated_abort_does_not_release_the_rid() {
+        let live: LiveRids = Default::default();
+        live.lock().unwrap().insert("x".to_string());
+        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
+        let (ingress_producer, consumer) = ingress_ring(16);
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            live.clone(),
+            Senders {
+                tm: flume::unbounded().0,
+                abort: flume::unbounded().0,
+                tok: flume::unbounded().0,
+                detok: vec![detok_tx],
+            },
+            ingress_producer,
+            test_limits(),
+            sd_rx,
+        );
+
+        ingress.on_abort(AbortSource::Detok("x".to_string()));
+
+        // The scheduler-facing half still happens — this abort is real work.
+        assert!(matches!(
+            detok_rx.try_recv().unwrap(),
+            DetokMsg::Deregister { .. }
+        ));
+        assert_eq!(consumer.drain(8).headers.len(), 1);
+        // …but the registry entry stays with the guard that owns it.
+        assert!(
+            live.lock().unwrap().contains("x"),
+            "a detok abort must not release a rid whose AbortGuard is still armed — \
+             doing so admits a retry that the guard then tears down"
+        );
+
+        // The guard's own abort is what releases it.
+        ingress.on_abort(AbortSource::Guard("x".to_string()));
+        assert!(!live.lock().unwrap().contains("x"));
     }
 
     /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
@@ -1083,9 +1153,11 @@ mod tests {
     #[test]
     fn abort_deregisters_from_shard() {
         // Aborts arrive on their own unbounded lane now, not the request inbox.
-        let (abort_tx, abort_rx) = flume::unbounded::<String>();
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         let (ingress, detok_rx, _consumer, tm_tx) = make_ingress_with_abort(abort_rx);
-        abort_tx.send("rid-13".to_string()).unwrap();
+        abort_tx
+            .send(AbortSource::Guard("rid-13".to_string()))
+            .unwrap();
         drop(abort_tx);
         drop(tm_tx);
         ingress.run();
