@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -51,10 +53,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    # PDL: overlap this kernel's prologue with the producer (the KDA/GDN
+    # conv1d_update). All global loads below happen after the wait, so
+    # numerics are unchanged. The immediate trigger releases the LAUNCH of
+    # the next PDL kernel so its prologue overlaps this whole body;
+    # consumers' own gdc_wait still fences on full completion.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -319,6 +331,11 @@ def fused_sigmoid_gating_delta_rule_update(
         else 0
     )
 
+    # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
+    # already launches dependents. Bit-exact (scheduling only) — benefits both
+    # KDA and GDN recurrent paths.
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -363,6 +380,7 @@ def fused_sigmoid_gating_delta_rule_update(
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     o = o.squeeze(0)
     return o

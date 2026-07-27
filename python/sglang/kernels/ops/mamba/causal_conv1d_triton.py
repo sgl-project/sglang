@@ -634,8 +634,13 @@ def _causal_conv1d_update_kernel(
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
+    # PDL: the immediate trigger releases the LAUNCH of the PDL'd recurrent
+    # update so its prologue overlaps this kernel's body; every consumer's
+    # gdc_wait still fences on full completion. Fired before the batch
+    # early-return so all CTAs trigger explicitly.
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -983,9 +988,6 @@ def _causal_conv1d_update_kernel(
                 parent_idx_tokens,
                 mask=mask_retrieve,
             )
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_update(
