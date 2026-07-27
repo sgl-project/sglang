@@ -1158,14 +1158,16 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     temb=temb,
                     freqs_cis=freqs_cis,
                     joint_attention_kwargs=joint_attention_kwargs,
+                    num_replicated_prefix=num_replicated_prefix,
                 )
             for block in self.single_transformer_blocks:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     temb=temb,
-                    freqs_cis=freqs_cis,
+                    freqs_cis=singles_freqs_cis,
                     joint_attention_kwargs=joint_attention_kwargs,
+                    num_replicated_prefix=num_replicated_prefix,
                 )
             self.spectrum_record_features(hidden_states)
         else:
