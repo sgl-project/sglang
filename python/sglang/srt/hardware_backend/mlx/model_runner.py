@@ -102,6 +102,7 @@ class MlxPendingDecode:
     lazy_tokens: mx.array
     req_ids: list[str]
     caches: list[list[Any]]
+    auxiliary_state_snapshots: dict[str, Any] | None = None
 
 
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
@@ -176,6 +177,10 @@ class MlxModelRunner:
         self._req_to_token_pool: ReqToTokenPool | None = None
         self._req_pool_idx: dict[str, int] = {}
         self._req_synced_offset: dict[str, int] = {}
+        # Boundary snapshots captured before an already-launched lookahead
+        # mutates the same native auxiliary caches. They become authoritative
+        # only after the corresponding decode step is finalized.
+        self._finalized_auxiliary_state_snapshots: dict[str, Any] = {}
 
         self._pool_size = self._compute_pool_size(pool_size)
         self._aot_kernels = self._build_aot_kernels()
@@ -264,7 +269,46 @@ class MlxModelRunner:
         cache = self._req_caches.get(req_id)
         if req_pool_idx is None or cache is None:
             return
+        finalized_snapshots = getattr(self, "_finalized_auxiliary_state_snapshots", {})
+        snapshot = finalized_snapshots.pop(req_id, None)
+        if snapshot is not None:
+            pool_index = self._get_auxiliary_state_pool_index(req_pool_idx)
+            pool = self._get_auxiliary_state_pool()
+            if pool_index is not None and callable(
+                getattr(pool, "store_snapshot", None)
+            ):
+                pool.store_snapshot(pool_index, snapshot)
+                return
         self._store_auxiliary_state(req_pool_idx, cache)
+
+    def _capture_pending_auxiliary_state(self, pending: MlxPendingDecode) -> None:
+        """Preserve this decode boundary before lookahead mutates live caches."""
+        if not self._cache_layout.has_auxiliary_state:
+            return
+        pool = self._get_auxiliary_state_pool()
+        capture_cache = getattr(pool, "capture_cache", None)
+        if not callable(capture_cache):
+            return
+        pending.auxiliary_state_snapshots = {
+            req_id: capture_cache(
+                cache,
+                self._cache_layout.auxiliary_layer_indices,
+            )
+            for req_id, cache in zip(pending.req_ids, pending.caches)
+        }
+
+    def _record_finalized_auxiliary_state(self, pending: MlxPendingDecode) -> None:
+        """Make the finalized step's pre-lookahead snapshots available to release."""
+        finalized = getattr(self, "_finalized_auxiliary_state_snapshots", None)
+        if finalized is None:
+            finalized = self._finalized_auxiliary_state_snapshots = {}
+        snapshots = pending.auxiliary_state_snapshots or {}
+        for req_id in pending.req_ids:
+            snapshot = snapshots.get(req_id)
+            if snapshot is None:
+                finalized.pop(req_id, None)
+            else:
+                finalized[req_id] = snapshot
 
     def _select_auxiliary_state_track_len(
         self,
@@ -1204,6 +1248,11 @@ class MlxModelRunner:
           returned pending: state bookkeeping for step N has to happen
           before step N+1's bookkeeping.
         """
+        # The scheduler does not know whether prev produced EOS until after the
+        # lookahead graph is launched. Preserve prev's auxiliary-state boundary
+        # before graph construction advances the shared native cache to N+1.
+        # capture_cache only clones lazy arrays; it does not wait on the GPU.
+        self._capture_pending_auxiliary_state(prev)
         caches = prev.caches
 
         # After prev's graph ran, each attention KV cache offset was
@@ -1248,6 +1297,8 @@ class MlxModelRunner:
         for i, rid in enumerate(pending.req_ids):
             self._req_token_ids[rid].append(next_tokens[i])
 
+        self._record_finalized_auxiliary_state(pending)
+
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:
             mx.clear_cache()
@@ -1269,6 +1320,7 @@ class MlxModelRunner:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
+        getattr(self, "_finalized_auxiliary_state_snapshots", {}).pop(req_id, None)
 
     def clear(self):
         """Clear all request states."""
@@ -1278,5 +1330,6 @@ class MlxModelRunner:
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
+        getattr(self, "_finalized_auxiliary_state_snapshots", {}).clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()
