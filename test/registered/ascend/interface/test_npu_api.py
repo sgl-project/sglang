@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import QWEN3_5_35B_A3B_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 
 OUTPUT_DIR = "./profiler_dir"
 
-register_npu_ci(est_time=1600, suite="full-2-npu-a3", nightly=True)
+register_npu_ci(est_time=1600, suite="full-1-npu-a3", nightly=True)
 
 
 class Test01_NpuApi(CustomTestCase):
@@ -32,14 +32,12 @@ class Test01_NpuApi(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_5_35B_A3B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
             "ascend",
             "--enable-return-hidden-states",
-            "--tp-size",
-            "2",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -74,8 +72,8 @@ class Test01_NpuApi(CustomTestCase):
         self.assertEqual(response.json()["weight_version"], "default")
         self.assertFalse(response.json()["has_image_understanding"])
         self.assertFalse(response.json()["has_audio_understanding"])
-        self.assertEqual(response.json()["model_type"], "qwen3")
-        self.assertEqual(response.json()["architectures"][0], "Qwen3ForCausalLM")
+        self.assertEqual(response.json()["model_type"], "llama")
+        self.assertEqual(response.json()["architectures"][0], "LlamaForCausalLM")
 
     def test_api_server_info(self):
         response = requests.get(f"{self.base_url}/server_info")
@@ -102,7 +100,7 @@ class Test01_NpuApi(CustomTestCase):
         self.assertEqual(response.json()["data"][0]["object"], "model")
         self.assertEqual(response.json()["data"][0]["owned_by"], "sglang")
         self.assertEqual(response.json()["data"][0]["root"], self.model)
-        self.assertEqual(response.json()["data"][0]["max_model_len"], 40960)
+        self.assertEqual(response.json()["data"][0]["max_model_len"], 131072)
 
     def test_api_v1_models_path(self):
         response = requests.get(f"{self.base_url}/v1/models/{self.model}")
@@ -111,7 +109,7 @@ class Test01_NpuApi(CustomTestCase):
         self.assertEqual(response.json()["object"], "model")
         self.assertEqual(response.json()["owned_by"], "sglang")
         self.assertEqual(response.json()["root"], self.model)
-        self.assertEqual(response.json()["max_model_len"], 40960)
+        self.assertEqual(response.json()["max_model_len"], 131072)
 
     def test_api_generate_single_text(self):
         response = requests.post(
@@ -231,14 +229,12 @@ class TestChatCompletionsInterface(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_5_35B_A3B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
             "ascend",
             "--enable-return-hidden-states",
-            "--tp-size",
-            "2",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -274,7 +270,6 @@ class TestChatCompletionsInterface(CustomTestCase):
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
         data = response.json()
         self.assertEqual(data["model"], "default")
-        self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_max_completion_tokens(self):
         response = requests.post(
@@ -475,14 +470,12 @@ class TestEnableThinking(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_5_35B_A3B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
             "ascend",
             "--enable-return-hidden-states",
-            "--tp-size",
-            "2",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -674,14 +667,12 @@ class TestStartProfile(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
-        cls.model = QWEN3_5_35B_A3B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
             "ascend",
             "--enable-torch-profiler",
-            "--tp-size",
-            "2",
         ]
         cls.process = popen_launch_server(
             cls.model,

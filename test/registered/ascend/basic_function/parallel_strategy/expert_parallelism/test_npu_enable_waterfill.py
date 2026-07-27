@@ -19,11 +19,11 @@ register_npu_ci(est_time=200, suite="full-4-npu-a3", nightly=True)
 
 
 class TestEnableDeepepWaterFill(CustomTestCase):
-    """Testcase: Verify set --enable-deepep-waterfill the inference accuracy of the model on the
+    """Testcase: Verify set --enable-waterfill the inference accuracy of the model on the
     GSM8K dataset is no less than 0.72, relevant information is contained in the logs.
 
     [Test Category] Parameters
-    [Test Target] --enable-deepep-waterfill
+    [Test Target] --enable-waterfill
     """
 
     @classmethod
@@ -53,7 +53,7 @@ class TestEnableDeepepWaterFill(CustomTestCase):
                 "--attention-backend",
                 "ascend",
                 "--disable-cuda-graph",
-                "--enable-deepep-waterfill",
+                "--enable-waterfill",
             ],
             return_stdout_stderr=(cls.out_log_file, cls.err_log_file),
             env={
@@ -84,7 +84,7 @@ class TestEnableDeepepWaterFill(CustomTestCase):
         self.assertGreater(metrics["score"], 0.72)
         self.err_log_file.seek(0)
         content = self.err_log_file.read()
-        error_message = "DeepEP Waterfill is enabled"
+        error_message = "Waterfill is enabled"
         self.assertIn(error_message, content)
 
 

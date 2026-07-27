@@ -35,11 +35,6 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
-      coverage_run_id:
-        required: false
-        type: string
-        default: ""
-        description: "Unique identifier for coverage data grouping. Pass caller's run_id-run_attempt."
 
 concurrency:
   group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -59,11 +54,6 @@ jobs:
         run: |
           npu-smi info
 
-      - name: Install coverage
-        run: |
-          python -c "import coverage" 2>/dev/null || pip install coverage
-          echo "import coverage; coverage.process_startup()" > $(python -c "import site; print(site.getsitepackages()[0])")/coverage.pth
-
       - name: Run test
         timeout-minutes: 300
         env:
@@ -73,10 +63,6 @@ jobs:
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
           SGLANG_TEST_METRICS_OUTPUT: /root/.cache/tests/output/metrics/metrics
-          PYTHONUNBUFFERED: "1"
-          COVERAGE_FILE: ${{ inputs.coverage_run_id && format('/root/.cache/coverage_data/{0}/.coverage', inputs.coverage_run_id) || '' }}
-          COVERAGE_RCFILE: ${{ inputs.coverage_run_id && '/root/.cache/coverage_data/.coveragerc' || '' }}
-          COVERAGE_PROCESS_START: ${{ inputs.coverage_run_id && '/root/.cache/coverage_data/.coveragerc' || '' }}
         shell: bash
         run: |
           sglang_source_path=$(pwd)
@@ -163,11 +149,7 @@ jobs:
 
           echo "Running test case ${test_case}"
           test_exit_code=0
-          if [ -n "${{ inputs.coverage_run_id }}" ]; then
-            coverage run ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
-          else
-            ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
-          fi
+          ${PYTHON_FOR_SGLANG} -u ${test_case} 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
           echo "Finished test case ${test_case}"
 
           if [ "${test_exit_code}" = "0" ]; then

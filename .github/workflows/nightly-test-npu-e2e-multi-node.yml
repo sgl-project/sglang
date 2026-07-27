@@ -59,11 +59,6 @@ on:
         type: string
         default: ""
         description: "The transformers version number for running sglang. Use default version in image if keep empty."
-      coverage_run_id:
-        required: false
-        type: string
-        default: ""
-        description: "Unique identifier for coverage data grouping. Pass caller's run_id-run_attempt."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -203,11 +198,6 @@ jobs:
             CMD="${CMD} --transformers-version ${transformers_version}"
           else
             echo "Use default transformers version in image."
-          fi
-
-          coverage_run_id="${{ inputs.coverage_run_id }}"
-          if [ "$coverage_run_id" != "" ];then
-            CMD="${CMD} --coverage-run-id ${coverage_run_id}"
           fi
 
           echo "Run command: ${CMD}"

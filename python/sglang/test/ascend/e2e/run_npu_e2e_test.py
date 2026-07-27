@@ -554,7 +554,6 @@ def run_npu_e2e_test_case(
     env="debug",
     trouble_shotting=False,
     transformers_version="",
-    coverage_run_id="",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -575,12 +574,6 @@ def run_npu_e2e_test_case(
 
     kube_config_map = f"sglang-configmap-{random_str}"
     final_kube_job_name = f"{kube_job_name_prefix}-{random_str}"
-
-    coverage_file = (
-        f"/root/.cache/coverage_data/{coverage_run_id}/.coverage"
-        if coverage_run_id
-        else ""
-    )
 
     kube_yaml_file_dict = {
         KUBE_JOB_SINGLE: f"k8s_single_{random_str}.yaml",
@@ -610,7 +603,6 @@ def run_npu_e2e_test_case(
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
-                "coverage_file": coverage_file,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -633,7 +625,6 @@ def run_npu_e2e_test_case(
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
-                "coverage_file": coverage_file,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -661,7 +652,6 @@ def run_npu_e2e_test_case(
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
-                "coverage_file": coverage_file,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -852,14 +842,6 @@ if __name__ == "__main__":
         help="The transformers version number for running sglang. Use default version in image if keep empty.",
     )
 
-    parser.add_argument(
-        "--coverage-run-id",
-        type=str,
-        required=False,
-        default="",
-        help="Unique identifier for coverage data grouping. Pass caller's run_id-run_attempt.",
-    )
-
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -876,7 +858,6 @@ if __name__ == "__main__":
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
-    coverage_run_id = args.coverage_run_id
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -906,5 +887,4 @@ if __name__ == "__main__":
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
-        coverage_run_id=coverage_run_id,
     )

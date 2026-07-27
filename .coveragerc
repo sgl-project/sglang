@@ -1,17 +1,8 @@
 [run]
-source = sglang.srt.hardware_backend.npu
-parallel = true
-relative_files = true
-concurrency = multiprocessing
+source = python/sglang/srt
 omit =
     */test/*
     */__pycache__/*
-
-[paths]
-source =
-    python/sglang/srt/hardware_backend/npu
-    */python/sglang/srt/hardware_backend/npu
-    sglang/srt/hardware_backend/npu
 
 [report]
 show_missing = true
@@ -20,3 +11,6 @@ exclude_lines =
     if __name__ == .__main__.:
     raise NotImplementedError
     if TYPE_CHECKING
+
+[html]
+directory = htmlcov

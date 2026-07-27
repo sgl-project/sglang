@@ -62,8 +62,6 @@ spec:
             value: "{{ sglang_is_in_ci }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
-          - name: COVERAGE_FILE
-            value: "{{ coverage_file }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -176,8 +174,6 @@ spec:
             value: "{{ sglang_is_in_ci }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
-          - name: COVERAGE_FILE
-            value: "{{ coverage_file }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -290,8 +286,6 @@ spec:
             value: "{{ sglang_is_in_ci }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
-          - name: COVERAGE_FILE
-            value: "{{ coverage_file }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
