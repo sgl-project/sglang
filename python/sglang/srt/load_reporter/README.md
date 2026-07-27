@@ -1,64 +1,79 @@
-# SGLang 嵌入式负载上报器
+# SGLang Embedded Load Reporter
 
-## 概述
+## Overview
 
-在 SGLang Python HTTP/TokenizerManager 进程内实现的 per-worker 负载上报器，通过 gRPC client-streaming 向多个 Router 实时推送调度器负载快照。
+The per-worker load reporter runs inside the SGLang Python HTTP/TokenizerManager
+process and continuously streams scheduler load snapshots to multiple Routers by
+using gRPC client streaming.
 
-**运行约束：**
-- 单 tokenizer 模式从 `TokenizerManager.get_loads(include=["core"])` 采集
-- 多 tokenizer 模式由唯一的 `MultiTokenizerRouter` 持有 runtime，HTTP worker 通过 IPC 注册并合并刷新通知
-- 使用 `grpc.aio.insecure_channel`（h2c，无 TLS/认证）
-- `POST /v1/start_reporting` 必须使用 `--admin-api-key` 对应的 Bearer token
+**Runtime constraints:**
 
-### 运行时依赖
+- In single-tokenizer mode, snapshots come from
+  `TokenizerManager.get_loads(include=["core"])`.
+- In multi-tokenizer mode, the single `MultiTokenizerRouter` owns the runtime;
+  HTTP workers register through IPC and coalesce refresh notifications.
+- The reporter uses `grpc.aio.insecure_channel` (h2c, without TLS or gRPC
+  authentication).
+- `POST /v1/start_reporting` requires a Bearer token matching
+  `--admin-api-key`.
 
-负载上报依赖通过各平台 pyproject 中统一的 `load-reporter` optional extra 提供，
-不会增加普通 SGLang wheel 的默认依赖。使用该功能的环境应安装：
+### Runtime dependencies
+
+Load-reporting dependencies are provided by the shared `load-reporter` optional
+extra in each platform pyproject. They do not increase the default dependency
+set of a regular SGLang wheel. Install the extra in environments that use this
+feature:
 
 ```bash
 pip install "sglang[load-reporter]"
 ```
 
-该 extra 约束 `grpcio>=1.78.0` 与 `protobuf>=6.31.1,<7`；`test`/`dev` extra
-也会安装它，以保证社区 CI 执行负载上报测试。缺少依赖或版本不兼容时普通服务
-仍可启动，注册接口返回 HTTP 501。
+The extra requires `grpcio>=1.78.0` and `protobuf>=6.31.1,<7`. The `test` and
+`dev` extras also install these dependencies so that community CI can run the
+load-reporter tests. A normal server can still start when the dependencies are
+missing or incompatible, but the registration endpoint returns HTTP 501.
 
-## 架构
+## Architecture
 
-```
+```text
 FastAPI lifespan
- ├─ 单 tokenizer: LoadReporterRuntime (composition root)
- └─ 多 tokenizer: HTTP worker proxy/notifier ─IPC→ MultiTokenizerRouter
-                                           └─ LoadReporterRuntime (唯一 owner)
-     ├─ LatestSnapshotStore (atomic latest-wins)
+ ├─ Single tokenizer: LoadReporterRuntime (composition root)
+ └─ Multiple tokenizers: HTTP worker proxy/notifier ─IPC→ MultiTokenizerRouter
+                                                └─ LoadReporterRuntime (sole owner)
+     ├─ LatestSnapshotStore (atomic latest-wins view)
      ├─ ReportBuilder (SnapshotView → protobuf)
-     ├─ LoadSampler (single-flight get_loads 循环)
+     ├─ LoadSampler (single-flight get_loads loop)
      └─ MonitorManager (MonitorKey → MonitorTask map)
-         └─ MonitorTask × N (每个 Router target 一个独立 gRPC stream)
+         └─ MonitorTask × N (one independent gRPC stream per Router target)
 ```
 
-**时序边界：**
-- Request-end 只刷新 store（同步、非阻塞）
-- gRPC 发送只在 stream 初次连接和该 Monitor 自己的 `report_interval_ms` deadline 触发
-- Timer 与 request-end 共用一个 sampler 状态机，任一时刻最多一个 `get_loads()` 在飞
+**Timing boundaries:**
 
-## 模块组成
+- A request-end notification only refreshes the store; it is synchronous and
+  non-blocking.
+- A gRPC write occurs only when a stream first connects or when that Monitor's
+  `report_interval_ms` deadline expires.
+- Timer and request-end refreshes share one sampler state machine, so at most
+  one `get_loads()` call is in flight at any time.
 
-| 文件 | 职责 |
-|-----|-----|
-| `config.py` | `LoadReporterConfig` / `WorkerMetadata` 从 `ServerArgs` 固化；内部 transport 常量 |
-| `store.py` | `LatestSnapshotStore`：校验 `LoadSnapshot`、timestamp fallback、latest-wins、不可变 `SnapshotView` |
-| `report_builder.py` | `ReportBuilder`：纯函数转换 `SnapshotView` → `pb.LoadReport`，附加 status 和全局 sequence |
-| `sampler.py` | `LoadSampler`：唯一调用 `get_loads()` 的 single-flight 后台 task，coalescing refresh 通知 |
-| `registration.py` | 严格 Pydantic schema、`MonitorKey`/`MonitorRegistration` value objects、origin 规范化、`POST /v1/start_reporting` 路由 |
-| `monitor.py` | `MonitorManager` (map ownership + identity-safe upsert)、`MonitorTask` (每目标一条 gRPC stream + fixed-rate + lease/reconnect 状态机) |
-| `runtime.py` | `LoadReporterRuntime`：顶层对象装配、`start_reporting` 控制面、`notify_request_finished` 同步钩子、有界 `close()` |
-| `ipc.py` | 多 tokenizer 的控制请求/响应关联、刷新事件合并及稳定错误映射 |
-| `proto/load_monitor.proto` | Canonical `model_gateway.loadmonitor.v1` IDL（字段/enum 值逐字等于 Router 协议，不增减） |
+## Module layout
 
-### 重新生成 Python 协议代码
+| File | Responsibility |
+|------|----------------|
+| `config.py` | Freezes `LoadReporterConfig` and `WorkerMetadata` from `ServerArgs`; defines internal transport constants. |
+| `store.py` | `LatestSnapshotStore`: validates `LoadSnapshot`, applies timestamp fallback and latest-wins merging, and publishes immutable `SnapshotView` values. |
+| `report_builder.py` | `ReportBuilder`: converts `SnapshotView` to `pb.LoadReport` and adds status and a process-global sequence number. |
+| `sampler.py` | `LoadSampler`: the only task that calls `get_loads()`; coalesces refresh notifications in a single-flight background loop. |
+| `registration.py` | Strict Pydantic schemas, `MonitorKey` and `MonitorRegistration` value objects, origin normalization, and the `POST /v1/start_reporting` route. |
+| `monitor.py` | `MonitorManager` owns the target map and performs identity-safe upserts; each `MonitorTask` owns one gRPC stream and its fixed-rate lease/reconnect state machine. |
+| `runtime.py` | `LoadReporterRuntime`: top-level composition, the `start_reporting` control plane, the synchronous `notify_request_finished` hook, and bounded shutdown. |
+| `ipc.py` | Correlates multi-tokenizer control requests and responses, coalesces refresh events, and maps stable errors. |
+| `proto/load_monitor.proto` | Embedded `model_gateway.loadmonitor.v1` IDL. Fields 1 through 13 match the Router contract; Engine field 14 is an additive load-report extension. |
 
-从仓库根目录使用固定工具链生成，确保生成代码兼容项目支持的最低运行时版本：
+### Regenerating the Python protobuf code
+
+Run the pinned toolchain from the repository root so the generated files remain
+compatible with the project's minimum supported runtime versions:
 
 ```bash
 codegen_dir=$(mktemp -d /tmp/sglang-load-reporter-codegen.XXXXXX)
@@ -70,93 +85,158 @@ cd python/sglang/srt/load_reporter/proto
   -I. --python_out=. --grpc_python_out=. load_monitor.proto
 ```
 
-`grpc_tools.protoc` 会为同目录模块生成绝对导入；提交前须将
-`import load_monitor_pb2 as load__monitor__pb2` 改为包内相对导入
-`from . import load_monitor_pb2 as load__monitor__pb2`。不要删除或修改生成器写入的
-protobuf/gRPC 运行时版本校验。
+`grpc_tools.protoc` generates an absolute import for the sibling module. Before
+committing, replace `import load_monitor_pb2 as load__monitor__pb2` with the
+package-relative import
+`from . import load_monitor_pb2 as load__monitor__pb2`. Do not remove or modify
+the protobuf or gRPC runtime-version checks emitted by the generator.
 
-## 控制流
+## Control flow
 
-### 启动
+### Startup
+
 1. **Lifespan setup**
-   - 单 tokenizer：构造 `LoadReporterRuntime(snapshot_source, server_args)` 并安装 request-finished hook
-   - 多 tokenizer：每个 HTTP worker 构造 control proxy / refresh notifier；Router 在首次注册时惰性构造唯一 runtime
-   - 写入 `app.state.load_reporter_runtime` / `load_reporter_unsupported_reason`
+   - Single tokenizer: construct
+     `LoadReporterRuntime(snapshot_source, server_args)` and install the
+     request-finished hook.
+   - Multiple tokenizers: each HTTP worker constructs a control proxy and
+     refresh notifier; the Router lazily constructs the single runtime on the
+     first registration.
+   - Store the runtime or unsupported reason in
+     `app.state.load_reporter_runtime` and
+     `app.state.load_reporter_unsupported_reason`.
 
-### 注册与上报
-2. **Router 注册**
-   - `POST /v1/start_reporting` → `runtime.start_reporting(payload, worker_addr)` → `MonitorManager.upsert`
-   - 首次注册：创建 `MonitorTask`，启动 `run()` task；调用 `sampler.activate()`
-   - 重复注册（相同 origin）：更新 `MonitorRegistration` (revision++)、lease、interval；唤醒 task 重算 deadline
-   - 冲突（不同 origin）：返回 HTTP 409
+### Registration and reporting
 
-3. **采集循环** (`LoadSampler`)
-   - Activation 后立即刷新；随后 wait(wake_event, timeout=min_interval_ms)
-   - Request-end hook 调用 `notify_refresh()` 设置 wake 事件
-   - `MonitorManager` interval 改变时调用 `notify_schedule_changed()`
-   - 每次 `get_loads()` 完成后，`LatestSnapshotStore.apply_full_snapshot` 原子发布新 view（失败时 `record_error`）
-   - Coalescing 规则：采集进行中到达的通知只触发至多一次额外刷新
+2. **Router registration**
+   - `POST /v1/start_reporting` calls
+     `runtime.start_reporting(payload, worker_addr)`, then
+     `MonitorManager.upsert`.
+   - The first registration creates a `MonitorTask`, starts its `run()` task,
+     and calls `sampler.activate()`.
+   - Re-registering from the same origin updates `MonitorRegistration`
+     (`revision++`), the lease, and the interval, then wakes the task so it can
+     recompute its deadline.
+   - Re-registering from a different origin returns HTTP 409.
 
-4. **流发送** (`MonitorTask`)
-   - 每 target 一个 `grpc.aio` channel + client stream (`LoadMonitorServiceStub.Report`)
-   - (Re)connect 后立即发送当前 snapshot；随后按 `report_interval_ms` 固定速率发送
-   - 并发等待：stop event / registration update / lease expiry / call completion / report deadline
-   - Update 到达时用 `updated_at + interval` 重新锚定 deadline
-   - Write/backpressure 恢复后跳过已错过周期（不补发历史）
+3. **Sampling loop (`LoadSampler`)**
+   - Refresh immediately after activation, then wait for either the wake event
+     or a `min_interval_ms` timeout.
+   - The request-end hook calls `notify_refresh()` to set the wake event.
+   - `MonitorManager` calls `notify_schedule_changed()` when an interval
+     changes.
+   - After each `get_loads()` call, `LatestSnapshotStore.apply_full_snapshot`
+     atomically publishes a new view; failures call `record_error` instead.
+   - Notifications received while sampling cause at most one additional
+     refresh.
 
-5. **重连与错误分类**
-   - **Retryable** (`UNAVAILABLE` / `DEADLINE_EXCEEDED` / `RESOURCE_EXHAUSTED`)：exponential backoff (0.25s–5s, ±20% jitter)
-   - **Wait-for-renewal** (`INVALID_ARGUMENT` / `UNAUTHENTICATED` / `PERMISSION_DENIED` / `UNIMPLEMENTED`)：记录错误，阻塞等待下一次 registration update (revision 增加)
-   - 成功 epoch (至少发送一条) 后重置 backoff 为初始值
-   - Lease 到期：task 自行退出，调用 `on_stopped` 从 manager map 移除
+4. **Stream writes (`MonitorTask`)**
+   - Each target owns a `grpc.aio` channel and client stream
+     (`LoadMonitorServiceStub.Report`).
+   - Send the current snapshot immediately after each connection, then use a
+     fixed `report_interval_ms` cadence.
+   - Concurrent waits cover the stop event, registration updates, lease
+     expiry, call completion, and the report deadline.
+   - An update re-anchors the deadline at `updated_at + interval`.
+   - After write backpressure clears, skip missed periods instead of replaying
+     historical reports.
 
-### 关闭
+5. **Reconnect and error classification**
+   - **Retryable** (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, or
+     `RESOURCE_EXHAUSTED`): exponential backoff from 0.25 to 5 seconds with
+     20 percent jitter.
+   - **Wait for renewal** (`INVALID_ARGUMENT`, `UNAUTHENTICATED`,
+     `PERMISSION_DENIED`, or `UNIMPLEMENTED`): record the error and wait for a
+     registration update with a larger revision.
+   - A successful epoch, defined as sending at least one report, resets the
+     backoff to its initial value.
+   - On lease expiry the task exits and `on_stopped` removes it from the
+     manager map.
+
+### Shutdown
+
 6. **Shutdown**
-   - HTTP worker lifespan：先 detach hook / IPC 组件，再关闭 proxy 与 notifier
-   - 父进程 finally：在 Router event loop 上关闭唯一 runtime，再清理 Router socket
-   - `close()` 顺序：sampler.close() → manager.close() (stop 所有 task 并 await 收敛)
-   - Timeout 后调用 `cancel_remaining()` 强制取消未收敛的 task
+   - During the HTTP worker lifespan, detach hooks and IPC components before
+     closing the proxy and notifier.
+   - In the parent-process `finally` block, close the sole runtime on the
+     Router event loop before removing the Router socket.
+   - `close()` orders shutdown as `sampler.close()`, then `manager.close()` to
+     stop every task and await convergence.
+   - After the timeout, `cancel_remaining()` force-cancels tasks that have not
+     converged.
 
-## 配置参数
+## Configuration
 
-| `ServerArgs` 字段 | 默认值 | 说明 |
-|------------------|-------|-----|
-| `load_reporter_snapshot_stale_after_ms` | 3000 | 超过此阈值报告 `REPORT_STATUS_STALE` |
-| `load_reporter_zone` | `None` | 可选 zone 元数据（空字符串规范化为 `None`） |
+| `ServerArgs` field | Default | Description |
+|--------------------|---------|-------------|
+| `load_reporter_snapshot_stale_after_ms` | `3000` | Reports `REPORT_STATUS_STALE` after this threshold. |
+| `load_reporter_zone` | `None` | Optional zone metadata; an empty string is normalized to `None`. |
 
-**内部常量** (`config.py`，不生成 CLI 参数)：
+**Internal constants** (`config.py`; they do not create CLI arguments):
+
 - `GRPC_CONNECT_TIMEOUT_SECONDS = 3.0`
 - `RECONNECT_INITIAL_SECONDS = 0.25`
 - `RECONNECT_MAX_SECONDS = 5.0`
 - `SHUTDOWN_TIMEOUT_SECONDS = 5.0`
 
-## 协议约束
+## Protocol constraints
 
-- **Wire contract**：`proto/load_monitor.proto` 的字段号/类型/enum 值逐字等于 Router 提供的 canonical IDL，不增加 normalized load / SDK metadata / `worker_id`
-- **`Worker.worker_addr`**：从注册 HTTP request origin 规范化（`scheme://host:port`），不读 `Forwarded` / `X-Forwarded-*`
-- **`RankLoad.snapshot_time_unix_ms`**：优先使用 `LoadSnapshot.timestamp * 1000`；无效时 fallback 到 `collected_at_unix_ms`
-- **Latest-wins 合并**：同一 DP rank 的多次 snapshot 按 timestamp 保留较新值；timestamp 相同时使用本次完整 sample 的 raw metrics
-- **Status 逻辑**：
-  - `HEALTHY`：所有 rank 的 `(report_time - snapshot_time)` ≤ `snapshot_stale_after_ms`
-  - `STALE`：有 rank 超过阈值（report 仍包含 ranks）
-  - `UNREACHABLE`：无权威 rank snapshot（store 从未成功 `apply_full_snapshot`）
+- **Wire contract:** fields 1 through 13 and all enum values in
+  `proto/load_monitor.proto` match the canonical Router IDL. Engine-side
+  `RankLoad.prefill_throughput` is the additive field 14. Routers generated
+  from the older schema safely preserve protocol compatibility by treating it
+  as an unknown field; a Router must regenerate its bindings before it can
+  consume the value.
+- **Prefill throughput:** `prefill_throughput` is the most recent completed
+  Prefill compute-token count divided by the elapsed Prefill statistics
+  interval. Cache-hit tokens are excluded. It is nonzero only while a PD
+  Prefill scheduler is active; an idle PD Prefill Engine, an Aggregated Engine,
+  or a Decode Engine reports `0`. The field is carried internally and exposed
+  only through gRPC LoadReport. It is intentionally absent from `/v1/loads`
+  JSON and Prometheus-text projections.
+- **`Worker.worker_addr`:** normalize the registration HTTP request origin to
+  `scheme://host:port`; never read `Forwarded` or `X-Forwarded-*`.
+- **`RankLoad.snapshot_time_unix_ms`:** prefer
+  `LoadSnapshot.timestamp * 1000`; fall back to `collected_at_unix_ms` when the
+  source timestamp is invalid.
+- **Latest-wins merging:** for repeated snapshots of the same DP rank, keep the
+  newer timestamp. When timestamps are equal, use the complete raw metrics
+  from the current sample.
+- **Status logic:**
+  - `HEALTHY`: every rank satisfies
+    `report_time - snapshot_time <= snapshot_stale_after_ms`.
+  - `STALE`: at least one rank exceeds the threshold; the report still includes
+    its ranks.
+  - `UNREACHABLE`: there is no authoritative rank snapshot because the store
+    has never completed `apply_full_snapshot` successfully.
 
-## 线程与异步模型
+## Threading and asynchronous model
 
-- **单 event loop**：Reporter 所有组件与 FastAPI / TokenizerManager 在同一 asyncio loop
-- **Single-flight sampler**：任一时刻最多一个 `get_loads()` 在飞；通知只设置 wake event，不创建 task
-- **Per-target task**：每 Monitor 一个独立 `asyncio.Task`；manager 不引入 coordinator / reconcile loop / session generation
-- **Request-end hook**：同步调用 `sampler.notify_refresh()`（设置 event），不 await / 不创建 task / 不调用 `get_loads()`
-- **Error isolation**：Reporter 的采集 / 校验 / 连接 / 写入 / 后台 task / 关闭错误不传播到推理请求或 FastAPI 主生命周期
+- **Single event loop:** every reporter component shares the FastAPI and
+  TokenizerManager asyncio event loop.
+- **Single-flight sampler:** at most one `get_loads()` call is in flight;
+  notifications set a wake event instead of creating tasks.
+- **Per-target task:** every Monitor owns one independent `asyncio.Task`; the
+  manager has no coordinator, reconcile loop, or session generation.
+- **Request-end hook:** synchronously call `sampler.notify_refresh()`; do not
+  await, create a task, or call `get_loads()` there.
+- **Error isolation:** sampling, validation, connection, write, background-task,
+  and shutdown failures never propagate into inference requests or the main
+  FastAPI lifespan.
 
-## 测试与验证
+## Tests and validation
 
-单元测试覆盖 store/builder/sampler/monitor deadline、鉴权、可选依赖边界、IPC 关联与合并、
-多 worker 唯一 owner、退出清理和 msgpack round-trip。GPU E2E 验证两个 tokenizer/HTTP
-worker 启动后仅建立一条 Router gRPC stream。
+Unit tests cover the store, builder, sampler, monitor deadlines,
+authentication, optional-dependency boundary, IPC correlation and coalescing,
+single ownership across multiple workers, shutdown cleanup, and msgpack
+round-trips. GPU end-to-end validation checks that two tokenizer/HTTP workers
+establish only one Router gRPC stream.
 
-## 已知限制
+## Known limitations
 
-- 无 TLS / mTLS / 认证 / ACK / 重放 / exactly-once / 持久化
-- 不自定义 gRPC keepalive / message size（使用 grpcio 默认值）
-- Router 协议不支持 SDK metadata / normalized load / `worker_id` 等扩展字段
+- No TLS, mTLS, gRPC authentication, acknowledgements, replay, exactly-once
+  delivery, or persistence.
+- No custom gRPC keepalive or message-size configuration; grpcio defaults are
+  used.
+- Except for the additive `prefill_throughput` field, the Router protocol has
+  no SDK metadata, normalized load, `worker_id`, or similar extensions.

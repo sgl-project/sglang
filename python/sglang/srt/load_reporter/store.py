@@ -39,6 +39,7 @@ _NON_NEGATIVE_INT64_FIELDS = (
 _FINITE_FLOAT_FIELDS = (
     "token_usage",
     "gen_throughput",
+    "prefill_throughput",
     "cache_hit_rate",
     "utilization",
 )
@@ -62,6 +63,7 @@ class RankSnapshot:
     max_running_requests: int
     token_usage: float
     gen_throughput: float
+    prefill_throughput: float
     cache_hit_rate: float
     utilization: float
 
@@ -160,7 +162,7 @@ def _snapshot_time_unix_ms(load: LoadSnapshot, collected_at_unix_ms: int) -> int
 def _rank_snapshot_from_load(
     load: LoadSnapshot, *, collected_at_unix_ms: int
 ) -> RankSnapshot:
-    """Validate one scheduler snapshot and freeze its core metrics.
+    """Validate one scheduler snapshot and freeze its reportable metrics.
 
     Args:
         load: Raw scheduler load snapshot.
@@ -195,6 +197,8 @@ def _rank_snapshot_from_load(
         field: _require_finite_float(field, getattr(load, field))
         for field in _FINITE_FLOAT_FIELDS
     }
+    if floats["prefill_throughput"] < 0:
+        raise SnapshotValidationError("prefill_throughput must be non-negative")
     return RankSnapshot(
         dp_rank=dp_rank,
         snapshot_time_unix_ms=_snapshot_time_unix_ms(load, collected_at_unix_ms),

@@ -43,6 +43,8 @@ class SchedulerLoadInquirer:
     get_running_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
+    get_prefill_throughput: Callable
+    is_fully_idle: Callable
     get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
@@ -88,9 +90,22 @@ class SchedulerLoadInquirer:
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:
-        """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
+        """Build the current per-DP-rank load snapshot.
+
+        Returns:
+            A snapshot for DP balancing, ``/v1/loads``, and internal load
+            reporting. Reporter-only fields remain excluded from HTTP
+            serialization by ``LoadSnapshot.to_dict``.
+        """
         stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
+
+        prefill_throughput = 0.0
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and not self.is_fully_idle()
+        ):
+            prefill_throughput = round(float(self.get_prefill_throughput()), 2)
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
@@ -210,6 +225,7 @@ class SchedulerLoadInquirer:
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
+            prefill_throughput=prefill_throughput,
             cache_hit_rate=round(stats.cache_hit_rate, 4),
             utilization=round(stats.utilization, 4),
             memory=memory,

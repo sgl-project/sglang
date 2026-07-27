@@ -1869,6 +1869,11 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        """Create the scheduler-backed load snapshot reader.
+
+        Returns:
+            None.
+        """
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
@@ -1886,6 +1891,8 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
+            get_prefill_throughput=lambda: self.metrics_reporter.last_input_throughput,
+            is_fully_idle=lambda: self.is_fully_idle(),
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
@@ -3626,8 +3633,16 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
-    ):
-        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+    ) -> None:
+        """Apply one model result and publish the resulting scheduler load.
+
+        Args:
+            batch: Scheduled batch whose forward pass produced ``result``.
+            result: Generation or embedding result returned by the model worker.
+
+        Returns:
+            None.
+        """
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -3644,7 +3659,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         self._record_step_counters(batch, result)
-
+        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)

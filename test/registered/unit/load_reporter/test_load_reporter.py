@@ -19,16 +19,24 @@ from sglang.srt.load_reporter.ipc import (
     LoadReporterControlProxy,
     LoadReporterRefreshNotifier,
 )
+from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.registration import (
     StartReportingRequest,
+    WorkerIdentity,
     authorize_start_reporting,
     start_reporting,
 )
+from sglang.srt.load_reporter.report_builder import ReportBuilder, SequenceAllocator
 from sglang.srt.load_reporter.runtime import LoadReporterRuntime
 from sglang.srt.load_reporter.sampler import (
     LoadSampler,
     RouterLoadSnapshotSource,
     TokenizerManagerLoadSnapshotSource,
+)
+from sglang.srt.load_reporter.store import (
+    LatestSnapshotStore,
+    SnapshotView,
+    SnapshotValidationError,
 )
 from sglang.srt.managers.io_struct import (
     LoadReporterIpcCode,
@@ -400,6 +408,115 @@ class TestLoadReporterControl(AsyncCustomTestCase):
             self.assertEqual(sent, [])
         finally:
             await notifier.close()
+
+
+class TestPrefillThroughputReport(CustomTestCase):
+    """Cover Prefill throughput validation and protobuf construction."""
+
+    @staticmethod
+    def _apply_snapshot(prefill_throughput: float) -> SnapshotView:
+        """Validate and publish one deterministic rank snapshot.
+
+        Args:
+            prefill_throughput: Candidate Prefill throughput in tokens per second.
+
+        Returns:
+            The immutable view published by the reporter store.
+
+        Raises:
+            SnapshotValidationError: If the candidate value is invalid.
+        """
+        return LatestSnapshotStore().apply_full_snapshot(
+            [
+                LoadSnapshot(
+                    dp_rank=0,
+                    timestamp=1.0,
+                    max_total_num_tokens=4096,
+                    max_running_requests=128,
+                    prefill_throughput=prefill_throughput,
+                )
+            ],
+            expected_dp_ranks={0},
+            collected_at_unix_ms=1000,
+            collected_at_monotonic=1.0,
+        )
+
+    def test_store_and_proto_preserve_prefill_throughput(self) -> None:
+        """Preserve the internal value through the store and gRPC payload.
+
+        Returns:
+            None.
+        """
+        view = self._apply_snapshot(123.45)
+        self.assertEqual(view.ranks[0].prefill_throughput, 123.45)
+
+        report = ReportBuilder(
+            source_instance_id="test-source",
+            stale_after_ms=3000,
+            sequence=SequenceAllocator(),
+        ).build(
+            view,
+            WorkerIdentity(
+                worker_addr="http://127.0.0.1:30000",
+                worker_type=pb.WORKER_TYPE_PREFILL,
+                model="test-model",
+                zone=None,
+            ),
+            report_time_unix_ms=1000,
+        )
+
+        self.assertEqual(report.ranks[0].prefill_throughput, 123.45)
+
+    def test_default_prefill_throughput_is_zero(self) -> None:
+        """Use the protobuf-compatible zero default when no value is supplied.
+
+        Returns:
+            None.
+        """
+        snapshot = LoadSnapshot(
+            dp_rank=0,
+            max_total_num_tokens=4096,
+            max_running_requests=128,
+        )
+        self.assertEqual(snapshot.prefill_throughput, 0.0)
+
+    def test_invalid_prefill_throughput_is_rejected(self) -> None:
+        """Reject negative and non-finite Prefill throughput values.
+
+        Returns:
+            None.
+        """
+        for value in (-0.01, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(SnapshotValidationError):
+                    self._apply_snapshot(value)
+
+    def test_rank_load_field_numbers_remain_compatible(self) -> None:
+        """Keep existing RankLoad tags stable and assign tag 14 additively.
+
+        Returns:
+            None.
+        """
+        fields = {field.name: field.number for field in pb.RankLoad.DESCRIPTOR.fields}
+        self.assertEqual(
+            fields,
+            {
+                "dp_rank": 1,
+                "snapshot_time_unix_ms": 2,
+                "num_running_reqs": 3,
+                "num_waiting_reqs": 4,
+                "num_waiting_uncached_tokens": 5,
+                "num_used_tokens": 6,
+                "num_total_tokens": 7,
+                "max_total_num_tokens": 8,
+                "max_running_requests": 9,
+                "token_usage": 10,
+                "gen_throughput": 11,
+                "cache_hit_rate": 12,
+                "utilization": 13,
+                "prefill_throughput": 14,
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -71,7 +71,12 @@ class _FakeHttpTokenizerManager:
 
 
 class TestLoadsResponse(CustomTestCase):
-    def test_response_omits_server_side_aggregate_and_redundant_fields(self):
+    def test_response_omits_server_side_aggregate_and_redundant_fields(self) -> None:
+        """Verify HTTP projections omit server-only and reporter-only fields.
+
+        Returns:
+            None.
+        """
         manager = _FakeHttpTokenizerManager(
             [
                 LoadSnapshot(
@@ -79,6 +84,7 @@ class TestLoadsResponse(CustomTestCase):
                     num_running_reqs=3,
                     num_waiting_reqs=2,
                     num_total_tokens=256,
+                    prefill_throughput=123.45,
                 )
             ]
         )
@@ -89,8 +95,14 @@ class TestLoadsResponse(CustomTestCase):
         self.assertNotIn("aggregate", response)
         self.assertEqual(len(response["loads"]), 1)
         self.assertNotIn("num_total_reqs", response["loads"][0])
+        self.assertNotIn("prefill_throughput", response["loads"][0])
         self.assertEqual(response["loads"][0]["num_running_reqs"], 3)
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
+
+        prometheus_response = asyncio.run(
+            get_loads(tokenizer_manager=manager, format="prometheus")
+        )
+        self.assertNotIn(b"prefill_throughput", prometheus_response.body)
 
 
 class TestLoadsAcceleratorField(CustomTestCase):
@@ -107,7 +119,12 @@ class TestLoadsAcceleratorField(CustomTestCase):
 
 
 class TestGetLoads(CustomTestCase):
-    def test_load_snapshot_wire_format_is_msgpack_slots(self):
+    def test_load_snapshot_wire_format_is_msgpack_slots(self) -> None:
+        """Verify the internal msgpack slot retains reporter-only metrics.
+
+        Returns:
+            None.
+        """
         path = _temp_path()
         writer = ShmLoadSnapshotWriter(path, dp_size=2, dp_rank=1)
         try:
@@ -117,6 +134,7 @@ class TestGetLoads(CustomTestCase):
                     num_running_reqs=3,
                     num_waiting_reqs=2,
                     token_usage=0.25,
+                    prefill_throughput=123.45,
                 )
             )
 
@@ -127,6 +145,7 @@ class TestGetLoads(CustomTestCase):
             magic, version, dp_size, slot_size = HEADER_STRUCT.unpack_from(data, 0)
             self.assertEqual(magic, MAGIC)
             self.assertEqual(version, VERSION)
+            self.assertEqual(VERSION, 2)
             self.assertEqual(dp_size, 2)
             self.assertEqual(slot_size, SLOT_SIZE)
 
@@ -140,12 +159,18 @@ class TestGetLoads(CustomTestCase):
             self.assertEqual(decoded["num_running_reqs"], 3)
             self.assertEqual(decoded["num_waiting_reqs"], 2)
             self.assertEqual(decoded["token_usage"], 0.25)
+            self.assertEqual(decoded["prefill_throughput"], 123.45)
         finally:
             writer.close()
             if os.path.exists(path):
                 os.unlink(path)
 
-    def test_reads_snapshot_and_filters_sections(self):
+    def test_reads_snapshot_and_filters_sections(self) -> None:
+        """Verify SHM preserves private fields while projections omit them.
+
+        Returns:
+            None.
+        """
         path = _temp_path()
         writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
         reader = ShmLoadSnapshotReader(path, dp_size=1)
@@ -165,6 +190,7 @@ class TestGetLoads(CustomTestCase):
                     max_total_num_tokens=4096,
                     token_usage=0.125,
                     gen_throughput=99.5,
+                    prefill_throughput=123.45,
                     cache_hit_rate=0.75,
                     utilization=0.5,
                     max_running_requests=128,
@@ -180,13 +206,16 @@ class TestGetLoads(CustomTestCase):
 
             self.assertEqual(len(loads), 1)
             self.assertEqual(loads[0].num_total_tokens, 256)
+            self.assertEqual(loads[0].prefill_throughput, 123.45)
 
             d = loads[0].to_dict({"core"})
+            self.assertNotIn("prefill_throughput", d)
             self.assertNotIn("disaggregation", d)
             self.assertNotIn("queues", d)
 
             loads_all = asyncio.run(manager.get_loads(include=["all"], dp_rank=0))
             d_all = loads_all[0].to_dict()
+            self.assertNotIn("prefill_throughput", d_all)
             self.assertIn("disaggregation", d_all)
             self.assertIn("queues", d_all)
         finally:

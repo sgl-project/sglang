@@ -129,7 +129,12 @@ class TestShmRoundTrip(CustomTestCase):
 
 
 class TestZmqRoundTrip(CustomTestCase):
-    def test_single_rank_zmq_to_shm(self):
+    def test_single_rank_zmq_to_shm(self) -> None:
+        """Verify ZMQ-to-SHM transport preserves reporter-only metrics.
+
+        Returns:
+            None.
+        """
         shm_path = _temp_path()
         addr = _ipc_addr()
         reader = ZmqShmLoadSnapshotReader(addr, shm_path, dp_size=2)
@@ -137,13 +142,21 @@ class TestZmqRoundTrip(CustomTestCase):
         try:
             _warmup_zmq([writer], reader)
 
-            writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=7, timestamp=2.0))
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    num_running_reqs=7,
+                    timestamp=2.0,
+                    prefill_throughput=321.25,
+                )
+            )
             time.sleep(0.05)
 
             load = reader.read(0)
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 7)
             self.assertEqual(load.timestamp, 2.0)
+            self.assertEqual(load.prefill_throughput, 321.25)
         finally:
             writer.close()
             reader.close()

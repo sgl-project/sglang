@@ -181,7 +181,12 @@ _SECTION_FIELDS = frozenset(
 
 
 class LoadSnapshot(msgspec.Struct, omit_defaults=True):
-    """Per-DP-rank load metrics: the SHM/zmq wire format and the /v1/loads source."""
+    """Per-DP-rank metrics shared by internal load consumers.
+
+    Core fields listed in ``_CORE_KEYS`` are exposed through ``/v1/loads``.
+    Other top-level fields, such as ``prefill_throughput``, remain available to
+    internal consumers without expanding the HTTP response.
+    """
 
     timestamp: float = 0.0
     dp_rank: int = 0
@@ -197,6 +202,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     max_running_requests: int = 0
     token_usage: float = 0.0
     gen_throughput: float = 0.0
+    prefill_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     utilization: float = 0.0
     # cumulative counters

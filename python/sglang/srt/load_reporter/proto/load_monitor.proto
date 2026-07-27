@@ -45,6 +45,8 @@ message RankLoad {
   double gen_throughput = 11;
   double cache_hit_rate = 12;
   double utilization = 13;
+  // Completed uncached Prefill compute throughput in tokens per second.
+  double prefill_throughput = 14;
 }
 
 message LoadReport {
