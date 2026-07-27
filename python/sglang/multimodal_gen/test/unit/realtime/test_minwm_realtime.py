@@ -46,7 +46,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MinWMChunkLatentPreparationStage,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
-from sglang.multimodal_gen.tools.convert_minwm_checkpoint import DEFAULT_SOURCE_URI
+from sglang.multimodal_gen.tools.convert_minwm_checkpoint import (
+    DEFAULT_SOURCE_URI,
+    TRANSFORMER_CONFIG,
+    build_transformer_config,
+)
 
 
 @pytest.mark.parametrize(
@@ -54,6 +58,12 @@ from sglang.multimodal_gen.tools.convert_minwm_checkpoint import DEFAULT_SOURCE_
     [
         ([], 0),
         (["w"], 9),
+        (["s"], 18),
+        (["a"], 27),
+        (["d"], 36),
+        (["i"], 3),
+        (["j"], 2),
+        (["k"], 4),
         (["l"], 1),
         (["w", "l"], 10),
         (["w", "a"], 45),
@@ -78,6 +88,26 @@ def test_minwm_action_label_bits_match_wasd_ijkl_order():
             [0, 0, 0, 0, 1, 1, 0, 0],
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_label"),
+    [
+        ("w", 9),
+        ("s", 18),
+        ("a", 27),
+        ("d", 36),
+        ("i", 3),
+        ("j", 2),
+        ("k", 4),
+        ("l", 1),
+    ],
+)
+def test_minwm_realtime_state_preserves_single_key_direction(key, expected_label):
+    state = MinWMRealtimeState()
+    state.receive_camera_state([key], event_id=17)
+    assert state.sample_action_labels(4) == [expected_label] * 4
+    assert state.latest_sampled_event_id == 17
 
 
 def test_minwm_action_validation_is_exact_integer_labels():
@@ -189,6 +219,15 @@ def test_minwm_bounded_session_presamples_reference_and_full_horizon(monkeypatch
 
 def test_minwm_default_kv_horizon_retains_complete_bounded_session():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                sink_size=0,
+                sliding_window_num_frames=128,
+            )
+        )
+    )
+    stage.sink_size = 0
     stage.sliding_window_num_frames = 128
     stage.num_frames_per_block = 4
     batch = SimpleNamespace(
@@ -204,14 +243,54 @@ def test_minwm_default_kv_horizon_retains_complete_bounded_session():
         batch, SimpleNamespace(pipeline_config=pipeline_config)
     )
     assert stage.sliding_window_num_frames == 33
-    assert stage._causal_kv_cache_kwargs(None) == {"allow_growth": True}
+    assert stage._minwm_unbounded_cache is True
 
     batch.realtime_causal_kv_cache_num_frames = 45
     stage._apply_causal_cache_overrides(
         batch, SimpleNamespace(pipeline_config=pipeline_config)
     )
     assert stage.sliding_window_num_frames == 45
-    assert stage._causal_kv_cache_kwargs(None) == {"allow_growth": False}
+    assert stage._minwm_unbounded_cache is False
+
+
+def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                sink_size=0,
+                sliding_window_num_frames=128,
+            )
+        )
+    )
+    stage.sink_size = 0
+    stage.sliding_window_num_frames = 128
+    stage.num_frames_per_block = 4
+    pipeline_config = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+    )
+    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+
+    bounded_request = SimpleNamespace(
+        realtime_causal_sink_size=9,
+        realtime_causal_kv_cache_num_frames=18,
+        condition_inputs={MINWM_TOTAL_CHUNKS_CONDITION: 8},
+    )
+    stage._apply_causal_cache_overrides(bounded_request, server_args)
+    assert stage.sink_size == 9
+    assert stage.sliding_window_num_frames == 18
+    assert stage._minwm_unbounded_cache is False
+
+    default_request = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+        condition_inputs={MINWM_TOTAL_CHUNKS_CONDITION: 8},
+    )
+    stage._apply_causal_cache_overrides(default_request, server_args)
+    assert stage.sink_size == 0
+    assert stage.sliding_window_num_frames == 33
+    assert stage._minwm_unbounded_cache is True
 
 
 def test_minwm_unbounded_kv_policy_reaches_cache_allocation():
@@ -335,6 +414,24 @@ def test_minwm_converter_defaults_to_requested_0721_checkpoint():
         "wan22-5B-stage3-dmd-8-0721-6a531f0e067/global_step_003200"
         in DEFAULT_SOURCE_URI
     )
+
+
+def test_minwm_converter_records_explicit_cache_policy():
+    config = build_transformer_config(
+        local_attn_size=18,
+        sink_size=9,
+        sliding_window_num_frames=18,
+    )
+    assert config["local_attn_size"] == 18
+    assert config["sink_size"] == 9
+    assert config["sliding_window_num_frames"] == 18
+    assert TRANSFORMER_CONFIG["local_attn_size"] == -1
+    with pytest.raises(ValueError, match="smaller"):
+        build_transformer_config(
+            local_attn_size=18,
+            sink_size=18,
+            sliding_window_num_frames=18,
+        )
 
 
 @pytest.mark.parametrize("degree", [2, 4, 8])

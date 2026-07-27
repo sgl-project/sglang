@@ -124,6 +124,10 @@ s3://leap-world-us-east-2/world-model/evals/minwm/checkpoint-staging/wan22-5B-va
 - `sink_size=0`
 - `sliding_window_num_frames=128`
 
+这三个值由 SGLang checkpoint converter 写入服务目录，并不储存在 `model.pt`
+权重张量中。converter 现在将其作为显式参数写入 conversion manifest，避免再把
+serving 默认值误记成 checkpoint 训练合同。
+
 转换结果、checkpoint 和 donor 文件保存在 200 GiB GP3 PVC 上。Pod 重启不会重复
 复制或转换 checkpoint。
 
@@ -310,26 +314,41 @@ p6-b200 Spot。
 20 GB checkpoint 使用 S3 服务端跨区复制，并校验长度、CRC64NVME、ETag 和
 SHA-256。这样避免本机带宽成为瓶颈，也留下可重复验证的 staging object。
 
-### 7.3 Web UI 的 LingBot 默认 KV 参数不能直接用于 MinWM
+### 7.3 MinWM 和 LingBot 都支持 sink/window，默认 profile 不同
 
-配套 UI 原默认 `sink=9/window=18`，它来自 LingBot。这个 MinWM checkpoint 是：
+此前把 UI 的 `sink=9/window=18` 解释成“LingBot 专属，不能用于 MinWM”，这个结论
+不正确。2026-07-27 核对的 seedleap/minWM 最新 `main`
+`0796bc201fae4c86f100620cb23402ae21c8f3b5` 中，5B DMD 仍通过
+`UnifiedDiffusionInferencePipelineV3` 调用模型自持的 `CausalKVCache`；该 cache
+原生同时实现有限 `local_attn_size` window 和 `sink_size`。
 
-```text
-local_attn_size=-1
-sink_size=0
-sliding_window_num_frames=128
-```
+需要区分两套 profile：
 
-浏览器第一次生成时，LingBot override 触发了一条不同的动态 compile 图，
-TorchInductor 生成代码报：
+- MinWM exact：不下发 override，复现 base config 的
+  `local_attn_size=-1/sink_size=0` 完整历史；
+- bounded serving：下发 `sink=9/window=18`，限制长 session 的 KV 容量。它是
+  MinWM 和 LingBot 都支持的性能/内存策略，但历史开始淘汰后不会与完整历史
+  baseline bitwise 一致。
+
+第一次用 9/18 失败的真正原因是 whole-DiT `torch.compile` 编译了有状态 cache
+滚动代码，Inductor 生成的动态 slice kernel 引用了未绑定 symbol：
 
 ```text
 NameError: name 's22' is not defined
 ```
 
-部署版 UI 现在不下发 sink/window override，让 SGLang 使用 MinWM 对齐语义：
-sink 取模型的 0，因 `local_attn_size=-1` 保留完整因果历史。修正后 Web UI
-生成成功。
+这不是 KV 参数不兼容。修复只在 MinWM self-attention 调用 cache update 的边界
+graph break，把 cursor、滚动 copy 和动态 slice 留在 eager；通用 cache 和 DiT
+其余计算路径仍可编译。同时修复 MinWM stage 的请求间 override 泄漏。部署 manifest
+保留 UI 的 9/18 bounded preset，exact benchmark 仍显式留空。UI 也不再把 LingBot
+的 `0.05/frame`、`4/6 deg/frame` 写成 MinWM 的物理动作幅度，而显示为
+`checkpoint-relative`。
+
+B200 实际验证使用 832×480、24 FPS metadata、8 chunks，输出 129 帧并跨过
+window=18 的滚动边界。修复后 8/8 chunks 完成；排除冷编译及第二个过渡 chunk，
+chunks 2–7 的 scheduler 均值 379.3 ms/chunk，对应约 42.2 generated FPS。
+此前同机短测的完整历史与 bounded profile 分别约 40.0/39.9 FPS，未观察到 cache
+边界 graph break 的稳态吞吐惩罚；这仍是单 case 冒烟数据，不应当作正式容量结论。
 
 ### 7.4 NLB 必须启用 Pod 所在 AZ
 
@@ -431,8 +450,8 @@ us-east-1d 的重复测试部署后来才获得一台 p6-b200 Spot，但 Pod 已
    24 FPS？这两者分别测量什么？
 2. 为什么 internal NLB 仅放在 `2a/2b` 时，即使打开 cross-zone，`2d` 的 IP
    target 仍是 `unused`？
-3. `local_attn_size=-1`、`sink_size=0` 和 `window=18` override 同时出现时，
-   哪一项背离了这个 checkpoint 的 MinWM main 语义？
+3. 为什么 MinWM exact profile 使用 `-1/0`，但线上 bounded profile 仍可以使用
+   `sink=9/window=18`？两者从第几个 latent frame 起可能分叉？
 4. 为什么本部署关闭 CFG parallel，并强制 `guidance_scale=0`？
 5. checkpoint 转换为什么需要 donor Diffusers 目录，但运行时不依赖
    `~/workspace/minWM`？

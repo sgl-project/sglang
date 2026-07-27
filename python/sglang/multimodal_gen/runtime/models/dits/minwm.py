@@ -77,6 +77,25 @@ _MINWM_SEGMENT_COMPILE = _env_flag("MINWM_SEGMENT_COMPILE", True)
 _MINWM_ANNOUNCED_ATTENTION_BACKENDS: set[tuple[str, str]] = set()
 
 
+@torch.compiler.disable
+def _minwm_update_and_get_attention_kv(
+    kv_cache,
+    *,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    current_chunk_start: int,
+    cache_head_start: int | None,
+):
+    """Keep MinWM's stateful bounded-cache update outside whole-DiT compile."""
+    return kv_cache.update_and_get_attention_kv(
+        key=key,
+        value=value,
+        current_chunk_start=current_chunk_start,
+        cache_head_start=cache_head_start,
+        debug_name="MinWM causal KV cache",
+    )
+
+
 class _MinWMTimestepEmbedder(TimestepEmbedder):
     """Use minWM's float64 sinusoid construction before the checkpoint MLP."""
 
@@ -498,12 +517,12 @@ class MinWMCausalSelfAttention(CausalWanSelfAttention):
         ):
             attention_key, attention_value = roped_key, value
         else:
-            cache_view = kv_cache.update_and_get_attention_kv(
+            cache_view = _minwm_update_and_get_attention_kv(
+                kv_cache,
                 key=roped_key,
                 value=value,
                 current_chunk_start=current_start,
                 cache_head_start=0 if sequence_shard_enabled else self.head_start,
-                debug_name="MinWM causal KV cache",
             )
             attention_key, attention_value = cache_view.k, cache_view.v
         if _MINWM_ATTENTION_IMPL == "dense":

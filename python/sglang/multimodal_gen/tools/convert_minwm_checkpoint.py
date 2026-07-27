@@ -210,6 +210,33 @@ def link_or_copy(source: Path, target: Path, *, link: bool) -> None:
         shutil.copy2(source, target)
 
 
+def build_transformer_config(
+    *,
+    local_attn_size: int,
+    sink_size: int,
+    sliding_window_num_frames: int,
+) -> dict:
+    if local_attn_size != -1 and local_attn_size <= 0:
+        raise ValueError("local_attn_size must be -1 or positive")
+    if sink_size < 0:
+        raise ValueError("sink_size must be non-negative")
+    if local_attn_size != -1 and sink_size >= local_attn_size:
+        raise ValueError("sink_size must be smaller than finite local_attn_size")
+    if sliding_window_num_frames <= 0:
+        raise ValueError("sliding_window_num_frames must be positive")
+    if local_attn_size == -1 and sink_size >= sliding_window_num_frames:
+        raise ValueError("sink_size must be smaller than sliding_window_num_frames")
+    config = dict(TRANSFORMER_CONFIG)
+    config.update(
+        {
+            "local_attn_size": local_attn_size,
+            "sink_size": sink_size,
+            "sliding_window_num_frames": sliding_window_num_frames,
+        }
+    )
+    return config
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--minwm-checkpoint", required=True)
@@ -220,6 +247,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-version-id")
     parser.add_argument("--source-etag")
     parser.add_argument("--max-shard-gib", type=float, default=4.0)
+    parser.add_argument("--local-attn-size", type=int, default=-1)
+    parser.add_argument("--sink-size", type=int, default=0)
+    parser.add_argument("--sliding-window-num-frames", type=int, default=128)
     return parser.parse_args()
 
 
@@ -239,8 +269,13 @@ def main() -> None:
         transformer_dir,
         max_shard_bytes=int(args.max_shard_gib * 1024**3),
     )
+    transformer_config = build_transformer_config(
+        local_attn_size=args.local_attn_size,
+        sink_size=args.sink_size,
+        sliding_window_num_frames=args.sliding_window_num_frames,
+    )
     with (transformer_dir / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(TRANSFORMER_CONFIG, handle, indent=2, sort_keys=True)
+        json.dump(transformer_config, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
     donor = Path(args.donor_diffusers_dir)
@@ -266,6 +301,14 @@ def main() -> None:
         "generator": summary,
         "safetensors": shard_summary,
         "native_geometry": {"width": 832, "height": 480},
+        "causal_cache_defaults": {
+            "local_attn_size": transformer_config["local_attn_size"],
+            "sink_size": transformer_config["sink_size"],
+            "sliding_window_num_frames": transformer_config[
+                "sliding_window_num_frames"
+            ],
+            "provenance": "converter arguments, not checkpoint tensors",
+        },
     }
     with (output_dir / "minwm_conversion_manifest.json").open(
         "w", encoding="utf-8"

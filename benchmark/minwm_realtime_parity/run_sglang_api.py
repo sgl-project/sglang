@@ -8,6 +8,7 @@ import asyncio
 import json
 import re
 import time
+import zlib
 from pathlib import Path
 
 import msgspec.msgpack
@@ -21,12 +22,43 @@ from common import (
     sha256_file,
     write_json,
 )
-from sglang.multimodal_gen.runtime.utils.realtime_video import (
-    RAW_RGB_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
-    RAW_RGBA_DELTA_GZIP_CONTENT_TYPE,
-    restore_delta_gzip_raw_rgb_payload,
-)
+RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb"
+RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip"
+RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip"
+
+
+def restore_delta_gzip_raw_rgb_payload(
+    payload: bytes,
+    *,
+    bytes_per_frame: int,
+    num_frames: int,
+    reference_frame: bytes | None = None,
+) -> bytes:
+    """Decode the wire format without importing the GPU-serving package."""
+    if reference_frame is not None and len(reference_frame) != bytes_per_frame:
+        raise ValueError("delta gzip reference frame size mismatch")
+    restored = bytearray(zlib.decompress(payload, wbits=31))
+    expected = bytes_per_frame * num_frames
+    if len(restored) != expected:
+        raise ValueError(
+            f"delta gzip payload size mismatch: expected {expected}, got {len(restored)}"
+        )
+    previous = (
+        np.frombuffer(reference_frame, dtype=np.uint8)
+        if reference_frame is not None
+        else None
+    )
+    for frame_idx in range(num_frames):
+        current = np.frombuffer(
+            restored,
+            dtype=np.uint8,
+            count=bytes_per_frame,
+            offset=frame_idx * bytes_per_frame,
+        )
+        if previous is not None:
+            current ^= previous
+        previous = current
+    return bytes(restored)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +87,8 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Discard this many complete runs of each case before measuring it.",
     )
+    parser.add_argument("--sink-size", type=int)
+    parser.add_argument("--kv-cache-num-frames", type=int)
     return parser.parse_args()
 
 
@@ -121,6 +155,10 @@ async def run_case(args, case, contract, first_frame: Path):
         "realtime_output_format": "raw",
         "condition_inputs": action_condition,
     }
+    if args.sink_size is not None:
+        payload["realtime_causal_sink_size"] = args.sink_size
+    if args.kv_cache_num_frames is not None:
+        payload["realtime_causal_kv_cache_num_frames"] = args.kv_cache_num_frames
     frames = []
     stats = []
     completed_chunks = set()
@@ -184,6 +222,16 @@ async def async_main(args) -> None:
         raise ValueError("--output-prefix must be a safe filename stem")
     if args.warmup_runs < 0:
         raise ValueError("--warmup-runs must be non-negative")
+    if args.sink_size is not None and args.sink_size < 0:
+        raise ValueError("--sink-size must be non-negative")
+    if args.kv_cache_num_frames is not None and args.kv_cache_num_frames <= 0:
+        raise ValueError("--kv-cache-num-frames must be positive")
+    if (
+        args.sink_size is not None
+        and args.kv_cache_num_frames is not None
+        and args.sink_size >= args.kv_cache_num_frames
+    ):
+        raise ValueError("--sink-size must be smaller than --kv-cache-num-frames")
     manifest = load_cases(args.cases)
     contract = manifest["contract"]
     selected = set(args.selected_cases or [])

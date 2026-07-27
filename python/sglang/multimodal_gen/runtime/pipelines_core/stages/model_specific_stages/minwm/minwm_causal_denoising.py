@@ -186,6 +186,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> None:
+        self._reset_causal_cache_config_defaults()
         explicit_window = getattr(batch, "realtime_causal_kv_cache_num_frames", None)
         if explicit_window is None:
             explicit_window = getattr(
@@ -205,6 +206,18 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self.sliding_window_num_frames = 1 + int(total_chunks) * int(
                 self.num_frames_per_block
             )
+
+    def _reset_causal_cache_config_defaults(self) -> None:
+        """Prevent request-local sink/window overrides from leaking to the next session."""
+        arch_config = getattr(
+            getattr(self.transformer, "config", None), "arch_config", None
+        )
+        if arch_config is None:
+            return
+        if hasattr(arch_config, "sink_size"):
+            self.sink_size = int(arch_config.sink_size)
+        if hasattr(arch_config, "sliding_window_num_frames"):
+            self.sliding_window_num_frames = int(arch_config.sliding_window_num_frames)
 
     def _causal_kv_cache_kwargs(self, policy: CausalDMDCachePolicy) -> dict:
         return {

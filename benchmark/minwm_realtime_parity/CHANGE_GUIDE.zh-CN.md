@@ -4,6 +4,8 @@
 哪些地方为了数值一致性没有采用 SGLang 的常规快速路径，以及应该按什么顺序阅读代码。
 更完整的运行命令、逐项决策日志和实验记录见
 [`MinWM-Realtime.zh-CN.mdx`](../../docs_new/cookbook/diffusion/MinWM/MinWM-Realtime.zh-CN.mdx)。
+0724 checkpoint 的 WASD/视角键验证过程单独记录在
+[`ACTION_CONTROL_INVESTIGATION.zh-CN.md`](./ACTION_CONTROL_INVESTIGATION.zh-CN.md)。
 
 ## 1. 一句话结论
 
@@ -124,6 +126,54 @@ TTFF（Time To First Frame）是请求开始到收到第一批可显示帧的时
 MinWM `main` 的 KV 合同是 `local_attn_size=-1, sink_size=0`，也就是完整历史。
 bounded 请求按完整 horizon 预分配；unbounded 请求允许 cache 增长。历史测试中的
 45/128-frame window 只能作为显式性能实验，不能静默替换默认模型语义。
+
+### 7.1 KV 参数勘误与本次修复
+
+2026-07-27 重新核对 seedleap/minWM 的远端 `main`
+`0796bc201fae4c86f100620cb23402ae21c8f3b5`。最新 5B DMD 推理入口仍是
+`wan_inference.py → wan22_5b_varlen_dmd.yaml →
+UnifiedDiffusionInferencePipelineV3 → UnifiedWanModel → CausalKVCache`。
+`CausalKVCache` 明确同时支持 `local_attn_size` 和 `sink_size`：
+`local_attn_size=N` 就是保留 N 个 latent frame 的有限 attention window，
+`sink_size=S` 在滚动时保留最前 S 帧。最新 5B base 的默认值是 `-1/0`，表示默认
+完整历史；这不等于 MinWM 不支持 sink/window。
+
+SGLang 把同一机制拆成模型默认和请求级 cache 容量两层：
+
+- `local_attn_size/sink_size` 来自转换后 transformer config；
+- `realtime_causal_sink_size/realtime_causal_kv_cache_num_frames` 可由服务或单次
+  WebSocket 请求覆盖；
+- UI 的 `sink=9/window=18` 是合法的有限窗口 serving preset；它不是只适用于
+  LingBot 的参数，也不是 checkpoint 张量中编码的事实；
+- exact profile 不传 override，目的是复现 MinWM `main` 的 `-1/0` 完整历史；
+  有限 9/18 profile 在第 18 个 latent frame 以后会因淘汰历史而不再与完整历史
+  baseline bitwise 一致。
+
+原文把转换器写入的 `sliding_window_num_frames=128` 误写成了“checkpoint 参数”。
+`model.pt` 只有权重，不能证明训练时 cache policy；转换器现在接受显式
+`--local-attn-size/--sink-size/--sliding-window-num-frames`，并在 conversion
+manifest 中标注这些值来自转换参数。
+
+代码审计还发现两个真实缺陷：
+
+1. MinWM stage 会原地修改 `sink/window`，但不像 LingBot stage 那样在新请求前恢复
+   transformer 默认值。于是先跑 9/18、再跑无 override，请求二会继承请求一的
+   `sink=9`。现在每个请求先 reset，再应用 server/request override，并有跨请求
+   回归测试。
+2. `sink=9/window=18` 在 whole-DiT `torch.compile` 下触发的
+   `NameError: s22 is not defined` 来自 Inductor 为动态 cache slice 生成了未绑定
+   symbol，不是参数语义不兼容。现在只在 MinWM self-attention 调用 cache update
+   的边界 graph break，使 cursor、滚动 copy 和动态 slice 保持 eager；通用 cache
+   和 DiT 其余计算路径没有被全局禁用编译。
+
+真实 B200、832×480、8 chunks（129 帧）回归已跨过 window=18 的滚动点：
+
+- 修复前：首个显式 9/18 请求在动态 slice compile 阶段报 `s22`，无视频；
+- 修复后：8/8 chunks 完成，无 `s22`；丢弃冷编译和第二个过渡 chunk后，
+  chunks 2–7 的 scheduler 均值为 379.3 ms/chunk，即 42.2 generated FPS；
+- 同机较早一轮完整历史和 bounded 冒烟分别约 40.0 与 39.9 FPS。样本只有一个
+  5 秒 case，所以只能说明 eager cache 边界没有可见稳态吞吐损失，不能替代正式
+  多轮 benchmark。
 
 ## 8. 性能结果应该怎样读
 

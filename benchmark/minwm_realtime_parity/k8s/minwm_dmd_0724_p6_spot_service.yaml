@@ -255,19 +255,22 @@ spec:
 
               WEBUI_DIR=/workspace/sglang/python/sglang/multimodal_gen/apps/realtime_webui
               sed -i '/const server = params.get("server");/{n;s|if (server) $("serverUrl").value = server;|if (server) $("serverUrl").value = server; else $("serverUrl").value = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:30000/v1/realtime_video/generate`;|;}' "${WEBUI_DIR}/app.js"
-              # The bundled UI defaults target LingBot (sink=9/window=18).
-              # MinWM main and this checkpoint use sink=0 with unbounded causal
-              # history (local_attn_size=-1), so omit both request overrides.
-              # Also make the visible playback target match the 24 FPS test.
+              # sink=9/window=18 is a bounded serving preset supported by both
+              # LingBot and MinWM. Exact MinWM full-history parity tests omit
+              # these request overrides in the benchmark harness.
+              # Also make the visible playback target match the 24 FPS test and
+              # avoid presenting LingBot's geometric step sizes as MinWM units.
               sed -i \
                 -e 's/const DEFAULT_TARGET_FPS = 25;/const DEFAULT_TARGET_FPS = 24;/' \
                 -e 's/fps: 25/fps: 24/g' \
+                -e 's/"0.05\/frame"/"checkpoint-relative"/g' \
+                -e 's/"4deg\/frame"/"checkpoint-relative"/g' \
+                -e 's/"6deg\/frame"/"checkpoint-relative"/g' \
                 "${WEBUI_DIR}/app.js"
               sed -i \
                 -e 's/id="fps" type="number" value="25"/id="fps" type="number" value="24"/' \
-                -e 's/id="sinkSize" type="number" value="9"/id="sinkSize" type="number" value=""/' \
-                -e 's/id="windowFrames" type="number" value="18"/id="windowFrames" type="number" value=""/' \
                 -e 's/<b>25 fps<\/b> target/<b>24 fps<\/b> target/' \
+                -e 's/<div class="section-title">LingBot<\/div>/<div class="section-title">MinWM<\/div>/' \
                 "${WEBUI_DIR}/index.html"
               python3 -m http.server 18080 --bind 0.0.0.0 \
                 --directory "${WEBUI_DIR}" >/tmp/minwm-webui.log 2>&1 &
