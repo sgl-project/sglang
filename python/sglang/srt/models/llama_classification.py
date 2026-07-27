@@ -59,9 +59,9 @@ class LlamaForClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        assert get_embedding, (
+            "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return score_and_pool(
@@ -73,6 +73,13 @@ class LlamaForClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
@@ -84,6 +91,26 @@ class LlamaForClassification(nn.Module):
                 continue
             else:
                 LlamaForCausalLM._legacy_load_weights(self, [(name, loaded_weight)])
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            WeightsMapper,
+        )
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        mapper = WeightsMapper(
+            orig_to_new_suffix={
+                ".activation_scale": ".input_scale",
+                ".weight_scale_inv": ".weight_scale",
+            }
+        )
+        return loader.load_weights(weights, mapper=mapper)
 
 
 EntryClass = LlamaForClassification

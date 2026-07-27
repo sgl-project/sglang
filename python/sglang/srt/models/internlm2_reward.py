@@ -63,7 +63,11 @@ class InternLM2ForRewardModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        return InternLM2ForCausalLM.load_weights(self, weights)
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return InternLM2ForCausalLM._load_weights_v2(self, weights)
+        return InternLM2ForCausalLM._legacy_load_weights(self, weights)
 
 
 EntryClass = InternLM2ForRewardModel

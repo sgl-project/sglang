@@ -53,9 +53,9 @@ class Gemma2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Gemma2ForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "Gemma2ForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
@@ -69,7 +69,11 @@ class Gemma2ForSequenceClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        Gemma2ForCausalLM.load_weights(self, weights)
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return Gemma2ForCausalLM._load_weights_v2(self, weights)
+        Gemma2ForCausalLM._legacy_load_weights(self, weights)
 
 
 EntryClass = [Gemma2ForSequenceClassification]

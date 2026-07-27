@@ -80,6 +80,14 @@ class Exaone4GatedMLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_GATE_UP_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_GATE_UP_MAPPING)
+
 
 class Exaone4Attention(nn.Module):
     def __init__(
@@ -210,6 +218,14 @@ class Exaone4Attention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            STANDARD_QKV_MAPPING,
+            load_with_stacked_dispatch,
+        )
+
+        return load_with_stacked_dispatch(self, weights, STANDARD_QKV_MAPPING)
 
 
 class Exaone4DecoderLayer(nn.Module):
@@ -540,6 +556,13 @@ class Exaone4ForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -606,6 +629,38 @@ class Exaone4ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+        )
+
+        params_dict = dict(self.named_parameters())
+
+        def _prepare(
+            src: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, loaded_weight in src:
+                if "scale" in name:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                yield name, loaded_weight
+
+        weights = filter_pp_weights(
+            _prepare(weights), self.model.start_layer, self.model.end_layer
+        )
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

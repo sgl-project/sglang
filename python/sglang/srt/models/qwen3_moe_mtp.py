@@ -125,7 +125,26 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        return super().load_weights(weights, is_mtp=True)
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return Qwen3MoeForCausalLM._legacy_load_weights(self, weights, is_mtp=True)
+
+        def prepare_mtp_weights():
+            for name, loaded_weight in weights:
+                if "mtp" not in name:
+                    continue
+                if name in {
+                    "mtp.fc.weight",
+                    "mtp.pre_fc_norm_embedding.weight",
+                    "mtp.pre_fc_norm_hidden.weight",
+                }:
+                    name = name.removeprefix("mtp.")
+                else:
+                    name = name.replace("mtp", "model")
+                yield name, loaded_weight
+
+        return Qwen3MoeForCausalLM._load_weights_v2(self, prepare_mtp_weights())
 
 
 EntryClass = [Qwen3MoeForCausalLMMTP]

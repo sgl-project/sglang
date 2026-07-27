@@ -141,6 +141,13 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         mtp_layer_found = False
         mtp_weight_patterns = [
             f"mtp_block.{self.mtp_layer_id}",
@@ -184,6 +191,53 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
             raise KeyError(
                 f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights."
             )
+
+    def _load_weights_v2(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            StackedParamsDispatch,
+        )
+
+        mtp_weight_patterns = (
+            f"mtp_block.{self.mtp_layer_id}",
+            f"mtp_emb_norm.{self.mtp_layer_id}",
+            f"mtp_hidden_norm.{self.mtp_layer_id}",
+            f"mtp_linear_proj.{self.mtp_layer_id}",
+        )
+        stacked_dispatch = StackedParamsDispatch(
+            mappings=tuple(Ernie4_5_ForCausalLM.stacked_params_mapping)
+        )
+        params_dict = dict(self.named_parameters())
+        dispatched: set[str] = set()
+        mtp_layer_found = False
+
+        def remaining_weights():
+            nonlocal mtp_layer_found
+            for name, loaded_weight in weights:
+                if not any(pattern in name for pattern in mtp_weight_patterns):
+                    continue
+                mtp_layer_found = True
+                name = name.replace(f".{self.mtp_layer_id}.", ".")
+                target = stacked_dispatch.try_load(
+                    name, loaded_weight, params_dict
+                )
+                if target is not None:
+                    if target not in params_dict:
+                        raise KeyError(
+                            f"Parameter '{target}' not found in MTP model."
+                        )
+                    dispatched.add(target)
+                    continue
+                yield name, loaded_weight
+
+        loaded = AutoWeightsLoader(self).load_weights(remaining_weights())
+        if not mtp_layer_found:
+            raise KeyError(
+                f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights."
+            )
+        return loaded | dispatched
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

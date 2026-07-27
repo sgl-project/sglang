@@ -11,7 +11,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.qwen3 import Qwen3Model as Qwen3TransformerModel
+from sglang.srt.models.qwen3 import (
+    Qwen3Model as Qwen3TransformerModel,
+    _prepare_qwen3_checkpoint_weights,
+)
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,13 @@ class Qwen3Model(nn.Module):
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -119,6 +129,19 @@ class Qwen3Model(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+
+        params_dict = dict(self.named_parameters())
+        weights = _prepare_qwen3_checkpoint_weights(weights, params_dict)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = Qwen3Model
