@@ -101,10 +101,10 @@ class _FakeRoutedMoeLayer(_FakeFusedMoEWithLoRA, _IdentityMoeSlices):
 
 
 class _FakeDenseLayer:
-    def slice_lora_a_weights(self, weights, _rank):
+    def slice_lora_a_weights(self, weights):
         return weights
 
-    def slice_lora_b_weights(self, weights, _rank):
+    def slice_lora_b_weights(self, weights):
         return weights
 
 
