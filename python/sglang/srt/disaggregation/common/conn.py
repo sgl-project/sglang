@@ -1625,10 +1625,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
 
-        if (
-            self.p2p_layout_fingerprint is None
-            and p2p_layout_fingerprint is not None
-        ):
+        if self.p2p_layout_fingerprint is None and p2p_layout_fingerprint is not None:
             self.p2p_layout_fingerprint = str(p2p_layout_fingerprint)
         elif (
             p2p_layout_fingerprint is not None

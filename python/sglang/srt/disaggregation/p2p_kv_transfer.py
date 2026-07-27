@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 import requests
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.utils import (
     KVClassType,
@@ -396,14 +397,11 @@ class PrefillP2PMooncakeTransferEngine:
                     pending.role == "target"
                     and pending.source_future is not None
                     and (
-                        not pending.source_future.done()
-                        or not pending.source_terminal
+                        not pending.source_future.done() or not pending.source_terminal
                     )
                 ):
                     pending.quarantine_allocation = True
-                output = self._fail(
-                    pending.req, f"P2P progress failed safely: {exc}"
-                )
+                output = self._fail(pending.req, f"P2P progress failed safely: {exc}")
             if output is None:
                 continue
             try:
@@ -493,9 +491,7 @@ class PrefillP2PMooncakeTransferEngine:
             if layout_error:
                 raise RuntimeError(layout_error)
 
-            receiver_cls = get_kv_class(
-                TransferBackend.MOONCAKE, KVClassType.RECEIVER
-            )
+            receiver_cls = get_kv_class(TransferBackend.MOONCAKE, KVClassType.RECEIVER)
             room = int(req.p2p_bootstrap_room or random.getrandbits(63))
             receiver = receiver_cls(kv_manager, source_bootstrap_addr, room)
             receiver.init(prefill_dp_rank=0)
@@ -606,8 +602,7 @@ class PrefillP2PMooncakeTransferEngine:
                 pending.state = P2PTransferState.FAILED
                 return self._fail(
                     req,
-                    pending.source_error
-                    or "target receiver metadata consensus failed",
+                    pending.source_error or "target receiver metadata consensus failed",
                 )
 
         if (
@@ -625,8 +620,7 @@ class PrefillP2PMooncakeTransferEngine:
                 pending.state = P2PTransferState.FAILED
                 return self._fail(
                     req,
-                    pending.source_error
-                    or "target receiver metadata consensus failed",
+                    pending.source_error or "target receiver metadata consensus failed",
                 )
 
         if (
@@ -669,10 +663,7 @@ class PrefillP2PMooncakeTransferEngine:
 
         if pending.state == P2PTransferState.WAIT_SOURCE:
             if pending.trigger_source:
-                if (
-                    pending.source_future is None
-                    or not pending.source_future.done()
-                ):
+                if pending.source_future is None or not pending.source_future.done():
                     source_state = 1
                 elif pending.source_error is None:
                     source_state = 2
@@ -747,9 +738,7 @@ class PrefillP2PMooncakeTransferEngine:
             result.transferred_tokens,
             self.scheduler.token_to_kv_pool_allocator,
         )
-        self._register_target_prefix(
-            req, pending.allocation, result.transferred_tokens
-        )
+        self._register_target_prefix(req, pending.allocation, result.transferred_tokens)
         pending.state = P2PTransferState.COMMIT
         logger.info(
             "p2p_target_receiver_done: request_id=%s transferred_tokens=%s "

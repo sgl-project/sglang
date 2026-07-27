@@ -13,9 +13,10 @@ class TestP2PKVTransferEndpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
+            from starlette.testclient import TestClient
+
             from sglang.srt.entrypoints.http_server import app, set_global_state
             from sglang.srt.managers.io_struct import P2PKVTransferReqOutput
-            from starlette.testclient import TestClient
         except (ImportError, OSError):
             raise unittest.SkipTest(
                 "http_server import requires runtime libraries not available on CPU"

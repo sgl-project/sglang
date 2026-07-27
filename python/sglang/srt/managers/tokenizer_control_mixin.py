@@ -143,6 +143,7 @@ def _p2p_bootstrap_addr_matches_source(source_url: str, bootstrap_addr: str) -> 
         return False
     return source_host.rstrip(".").casefold() == addr_host.rstrip(".").casefold()
 
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -356,9 +357,7 @@ class TokenizerControlMixin:
                 matched_tokens=obj.matched_tokens,
                 transferred_tokens=0,
                 fallback_recompute=True,
-                experimental_limitations=[
-                    "experimental_prefill_to_prefill_mooncake"
-                ],
+                experimental_limitations=["experimental_prefill_to_prefill_mooncake"],
             )
         if obj.p2p_bootstrap_room is None:
             obj.p2p_bootstrap_room = uuid.uuid4().int & ((1 << 63) - 1)

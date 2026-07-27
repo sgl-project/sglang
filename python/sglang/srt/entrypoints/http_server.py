@@ -923,9 +923,7 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
 
 @app.post("/experimental/p2p_kv_transfer")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def experimental_p2p_kv_transfer(
-    obj: Annotated[P2PKVTransferReqInput, Body()]
-):
+async def experimental_p2p_kv_transfer(obj: Annotated[P2PKVTransferReqInput, Body()]):
     """Experimental Prefill->Prefill prefix KV transfer control endpoint."""
     ret = await _global_state.tokenizer_manager.p2p_kv_transfer(obj)
     return ORJSONResponse(

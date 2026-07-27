@@ -25,6 +25,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -59,7 +60,6 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -97,9 +97,7 @@ def _request_base_url(raw_request: Optional[Request]) -> Optional[str]:
 
 def _extract_remote_kv_headers(
     raw_request: Optional[Request],
-) -> tuple[
-    Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]
-]:
+) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str], Optional[str]]:
     """Extract explicit experimental Prefill->Prefill remote-KV hints.
 
     The feature is opt-in by header. Missing or malformed headers leave all
@@ -143,8 +141,7 @@ def _select_remote_kv_metadata(raw_request: Optional[Request], request: Any):
     the best-effort P2P path instead of mixing metadata field by field.
     """
     header_present = bool(
-        raw_request
-        and raw_request.headers.get(REMOTE_KV_SOURCE_HEADER)
+        raw_request and raw_request.headers.get(REMOTE_KV_SOURCE_HEADER)
     )
     header_bundle = _extract_remote_kv_headers(raw_request)
     body_bundle = (

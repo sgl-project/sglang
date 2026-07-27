@@ -26,8 +26,8 @@ class _FakeRequest:
 
 class TestRemoteKVHeaders(CustomTestCase):
     def test_missing_headers_leave_remote_kv_disabled(self):
-        source, matched_tokens, reason, target, bootstrap_addr = _extract_remote_kv_headers(
-            _FakeRequest({"host": "127.0.0.1:30001"})
+        source, matched_tokens, reason, target, bootstrap_addr = (
+            _extract_remote_kv_headers(_FakeRequest({"host": "127.0.0.1:30001"}))
         )
 
         self.assertIsNone(source)
@@ -37,15 +37,17 @@ class TestRemoteKVHeaders(CustomTestCase):
         self.assertIsNone(bootstrap_addr)
 
     def test_remote_kv_headers_extract_source_tokens_reason_and_target(self):
-        source, matched_tokens, reason, target, bootstrap_addr = _extract_remote_kv_headers(
-            _FakeRequest(
-                {
-                    "host": "127.0.0.1:30001",
-                    "x-sgl-remote-kv-source": "http://127.0.0.1:30000",
-                    "x-sgl-remote-kv-matched-tokens": "128",
-                    "x-sgl-remote-kv-reason": "load_imbalance",
-                    "x-sgl-remote-kv-source-bootstrap-addr": "127.0.0.1:32400",
-                }
+        source, matched_tokens, reason, target, bootstrap_addr = (
+            _extract_remote_kv_headers(
+                _FakeRequest(
+                    {
+                        "host": "127.0.0.1:30001",
+                        "x-sgl-remote-kv-source": "http://127.0.0.1:30000",
+                        "x-sgl-remote-kv-matched-tokens": "128",
+                        "x-sgl-remote-kv-reason": "load_imbalance",
+                        "x-sgl-remote-kv-source-bootstrap-addr": "127.0.0.1:32400",
+                    }
+                )
             )
         )
 
@@ -56,15 +58,17 @@ class TestRemoteKVHeaders(CustomTestCase):
         self.assertEqual(bootstrap_addr, "127.0.0.1:32400")
 
     def test_explicit_target_header_overrides_host_inference(self):
-        source, matched_tokens, reason, target, bootstrap_addr = _extract_remote_kv_headers(
-            _FakeRequest(
-                {
-                    "host": "router.internal:30100",
-                    "x-sgl-remote-kv-source": "http://127.0.0.1:31201",
-                    "x-sgl-remote-kv-target": "http://127.0.0.1:31200",
-                    "x-sgl-remote-kv-matched-tokens": "128",
-                    "x-sgl-remote-kv-reason": "load_imbalance",
-                }
+        source, matched_tokens, reason, target, bootstrap_addr = (
+            _extract_remote_kv_headers(
+                _FakeRequest(
+                    {
+                        "host": "router.internal:30100",
+                        "x-sgl-remote-kv-source": "http://127.0.0.1:31201",
+                        "x-sgl-remote-kv-target": "http://127.0.0.1:31200",
+                        "x-sgl-remote-kv-matched-tokens": "128",
+                        "x-sgl-remote-kv-reason": "load_imbalance",
+                    }
+                )
             )
         )
 
@@ -75,13 +79,15 @@ class TestRemoteKVHeaders(CustomTestCase):
         self.assertIsNone(bootstrap_addr)
 
     def test_malformed_matched_tokens_disables_remote_kv(self):
-        source, matched_tokens, reason, target, bootstrap_addr = _extract_remote_kv_headers(
-            _FakeRequest(
-                {
-                    "host": "127.0.0.1:30001",
-                    "x-sgl-remote-kv-source": "http://127.0.0.1:30000",
-                    "x-sgl-remote-kv-matched-tokens": "not-an-int",
-                }
+        source, matched_tokens, reason, target, bootstrap_addr = (
+            _extract_remote_kv_headers(
+                _FakeRequest(
+                    {
+                        "host": "127.0.0.1:30001",
+                        "x-sgl-remote-kv-source": "http://127.0.0.1:30000",
+                        "x-sgl-remote-kv-matched-tokens": "not-an-int",
+                    }
+                )
             )
         )
 
@@ -164,9 +170,7 @@ class TestRemoteKVHeaders(CustomTestCase):
             )
         )
         self.assertIsNone(
-            _validated_source_bootstrap_addr(
-                "http://127.0.0.1:30000", "127.0.0.1:0"
-            )
+            _validated_source_bootstrap_addr("http://127.0.0.1:30000", "127.0.0.1:0")
         )
 
     def test_remote_kv_request_id_preserves_existing_id(self):
@@ -189,9 +193,7 @@ class TestRemoteKVSchedulerControl(CustomTestCase):
 
     def test_disabled_feature_falls_back(self):
         scheduler = self._scheduler_with_tp(1)
-        scheduler.server_args = SimpleNamespace(
-            enable_prefill_p2p_kv_transfer=False
-        )
+        scheduler.server_args = SimpleNamespace(enable_prefill_p2p_kv_transfer=False)
         ret = scheduler.handle_p2p_kv_transfer(
             P2PKVTransferReqInput(
                 source_url="http://127.0.0.1:30000",
