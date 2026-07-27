@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_xpu,
     use_intel_xpu_backend,
 )
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
@@ -128,6 +129,7 @@ def inplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    fuse_swiglu_interleaved: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -160,6 +162,7 @@ def inplace_fused_experts(
         filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 
@@ -194,6 +197,7 @@ def outplace_fused_experts(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    fuse_swiglu_interleaved: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -226,6 +230,7 @@ def outplace_fused_experts(
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 
@@ -249,6 +254,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    fuse_swiglu_interleaved: bool = False,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -286,6 +292,7 @@ def fused_experts(
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
         return hidden_states
     else:
@@ -319,6 +326,7 @@ def fused_experts(
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
 
 
@@ -461,6 +469,7 @@ def _fused_moe_kernel_sequence(
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    fuse_swiglu_interleaved: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -513,17 +522,46 @@ def _fused_moe_kernel_sequence(
         and (not use_int4_w4a16)
     )
 
-    intermediate_cache1 = torch.empty(
-        (total_tokens, N),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if fuse_swiglu_interleaved:
+        # W13 rows are physically interleaved (permuted once at load), so the
+        # activation MUST come from the fused up-GEMM epilogue -- any
+        # standalone activation kernel would read halves layout and be
+        # silently wrong. Fail loudly on an incompatible call instead.
+        assert (
+            activation == "silu"
+            and is_gated
+            and gemm1_alpha is None
+            and gemm1_limit is None
+            and swiglu_limit is None
+            and b1 is None
+            and not (
+                use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
+            )
+            and not apply_router_weight_on_input
+            and hooks is None
+            and hidden_states.dtype == torch.bfloat16
+        ), "fuse_swiglu_interleaved set on an incompatible fused_moe call"
+        # The up-GEMM epilogue applies silu(gate) * up in-register and writes
+        # the half-width activation directly; intermediate_cache1 and the
+        # standalone activation kernel are skipped entirely.
+        intermediate_cache1 = None
+        gemm1_out = intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    else:
+        gemm1_out = intermediate_cache1 = torch.empty(
+            (total_tokens, N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
     invoke_fused_moe_kernel(
         hidden_states,
         w1,
         b1,
-        intermediate_cache1,
+        gemm1_out,
         a1_scale,
         w1_scale,
         w1_zp,
@@ -544,6 +582,7 @@ def _fused_moe_kernel_sequence(
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
+        fuse_swiglu=fuse_swiglu_interleaved,
     )
 
     if hooks and hooks.after_gate_up:
@@ -558,14 +597,18 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
-    intermediate_cache2 = torch.empty(
-        (total_tokens, N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if not fuse_swiglu_interleaved:
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
     # Activation function with multiplication
-    if activation == "silu" and is_gated:
+    if fuse_swiglu_interleaved:
+        # silu(gate) * up was already applied in the up-GEMM epilogue.
+        pass
+    elif activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
@@ -776,11 +819,25 @@ def _fused_moe_kernel_sequence(
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if _use_moe_sum_reduce_torch_compile(num_tokens):
-                moe_sum_reduce_torch_compile(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
+                if is_arch_support_pdl():
+                    # PDL-chained triton reduce: its prologue overlaps the
+                    # down-GEMM tail (that kernel already triggers dependents
+                    # after its store); the inductor kernel cannot carry PDL
+                    # launch attributes. Numerics: one fp32 rounding
+                    # (sum * scale, then cast) vs the compile path's two
+                    # (sum -> cast, then scale in output dtype) -- slightly
+                    # more precise, not bit-equal.
+                    moe_sum_reduce_triton(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
+                else:
+                    moe_sum_reduce_torch_compile(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        out_hidden_states,
+                        routed_scaling_factor,
+                    )
             else:
                 moe_sum_reduce(
                     intermediate_cache3.view(*intermediate_cache3.shape),
@@ -866,6 +923,7 @@ def fused_experts_impl(
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
+    fuse_swiglu_interleaved: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -942,6 +1000,7 @@ def fused_experts_impl(
         hooks=None,
         swiglu_limit=swiglu_limit,
         gate_up_interleaved=gate_up_interleaved,
+        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
     )
 
 

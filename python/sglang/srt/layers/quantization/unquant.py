@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_cuda,
     is_hip,
     is_npu,
     set_weight_attrs,
@@ -54,6 +55,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 )
 
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -271,6 +273,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        # Set by process_weights_after_loading when w13 rows are permuted to
+        # interleave gate/up for the fused swiglu up-GEMM epilogue.
+        self.w13_swiglu_interleaved = False
 
     def create_weights(
         self,
@@ -442,6 +447,36 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+        # Interleave gate/up rows of W13 so the triton up-GEMM epilogue can
+        # apply silu(gate) * up in-register and skip intermediate_cache1 and
+        # the standalone activation kernel (bf16 decode fast path). Each GEMM
+        # output column is an independent dot product, so per-column results
+        # are unchanged by the row reordering. Every consumer of this layout
+        # receives it via TritonMoeQuantInfo.fuse_swiglu_interleaved.
+        if (
+            _is_cuda
+            and not _should_use_aiter_moe
+            and self._aiter_runner is None
+            and self.runner.runner_backend.is_triton()
+            and get_moe_a2a_backend().is_none()
+            and not self.with_bias
+            and layer.w13_weight.dtype == torch.bfloat16
+            and layer.moe_runner_config.activation == "silu"
+            and layer.moe_runner_config.is_gated
+            and layer.moe_runner_config.gemm1_alpha is None
+            and layer.moe_runner_config.gemm1_clamp_limit is None
+            and layer.moe_runner_config.swiglu_limit is None
+        ):
+            w13 = layer.w13_weight.data
+            inter = w13.shape[1] // 2
+            idx = torch.empty(w13.shape[1], dtype=torch.long, device=w13.device)
+            idx[0::2] = torch.arange(0, inter, device=w13.device)
+            idx[1::2] = torch.arange(inter, 2 * inter, device=w13.device)
+            # Per-expert to cap the gather temp at one expert's slice.
+            for e in range(w13.shape[0]):
+                w13[e] = w13[e][idx]
+            self.w13_swiglu_interleaved = True
 
         return
 
@@ -642,6 +677,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                fuse_swiglu_interleaved=self.w13_swiglu_interleaved,
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -705,6 +741,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             w2_weight=layer.w2_weight,
             b13=getattr(layer, "w13_weight_bias", None),
             b2=getattr(layer, "w2_weight_bias", None),
+            fuse_swiglu_interleaved=self.w13_swiglu_interleaved,
         )
 
     def forward_xpu(
