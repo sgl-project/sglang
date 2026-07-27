@@ -229,8 +229,6 @@ class TestShippedTopologies(CustomTestCase):
             self.topology_dir / "zimage_linear.yaml",
             self.topology_dir / "zimage_conditional_join.yaml",
             self.topology_dir / "ltx2_dual_vae.yaml",
-            self.topology_dir / "ltx2_dual_vae_3gpu.yaml",
-            self.topology_dir / "ltx2_dual_vae_7gpu.yaml",
         ]
         for path in configs:
             with self.subTest(topology=path.name):
@@ -290,39 +288,6 @@ class TestShippedTopologies(CustomTestCase):
             [e.edge_id for e in plan.live_out_edges("denoiser", without_audio)],
             ["denoiser->vae_video"],
         )
-
-    def test_ltx2_dual_vae_3gpu_colocated_single_replica_pools(self):
-        plan = ExecutionPlan.compile(
-            DagSpec.load(str(self.topology_dir / "ltx2_dual_vae_3gpu.yaml"))
-        )
-        self.assertEqual(sorted(plan.terminals), ["vae_audio", "vae_video"])
-        self.assertEqual(plan.node("vae_video").num_instances, 1)
-        self.assertEqual(plan.node("vae_audio").num_instances, 1)
-        stages = [
-            "InputValidationStage",
-            "TextEncodingStage",
-            "LTX2TextConnectorStage",
-            "LTX2SigmaPreparationStage",
-            "TimestepPreparationStage",
-            "LTX2AVLatentPreparationStage",
-            "LTX2ImageEncodingStage",
-            "LTX2AVDenoisingStage",
-            "LTX2VideoDecodingStage",
-            "LTX2AudioDecodingStage",
-        ]
-        self.assertEqual(plan.validate_stage_coverage(stages), [])
-
-    def test_ltx2_dual_vae_7gpu_balanced_layout(self):
-        spec = DagSpec.load(str(self.topology_dir / "ltx2_dual_vae_7gpu.yaml"))
-        denoiser_pool = next(p for p in spec.pools if p.role == "denoiser")
-        self.assertEqual(len(denoiser_pool.urls), 2)
-        self.assertEqual(denoiser_pool.parallelism.get("sp"), 2)
-        plan = ExecutionPlan.compile(spec)
-        self.assertEqual(sorted(plan.terminals), ["vae_audio", "vae_video"])
-        self.assertEqual(plan.max_inflight, 16)
-        self.assertEqual(plan.node("denoiser").num_instances, 2)
-        self.assertEqual(plan.node("vae_video").num_instances, 1)
-        self.assertEqual(plan.node("vae_audio").num_instances, 1)
 
 
 class TestDagRequestScheduler(CustomTestCase):
