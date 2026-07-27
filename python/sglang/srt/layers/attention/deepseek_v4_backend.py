@@ -60,6 +60,8 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -90,19 +92,6 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
-def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
-    # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
-    # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
-    if forward_batch.forward_mode.is_idle():
-        return forward_batch.forward_mode
-    if forward_batch.forward_mode == ForwardMode.EXTEND:
-        return forward_batch.forward_mode
-    return (
-        getattr(forward_batch, "_original_forward_mode", None)
-        or forward_batch.forward_mode
-    )
-
-
 def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
     actual_forward_mode = getattr(
         forward_batch, "actual_forward_mode", forward_batch.forward_mode
@@ -110,9 +99,11 @@ def _get_target_verify_bs(forward_batch: ForwardBatch) -> int:
     if actual_forward_mode.is_idle():
         return 0
 
-    spec_info = getattr(forward_batch, "spec_info", None)
-    draft_token_num = getattr(spec_info, "draft_token_num", 0)
-    draft_token = getattr(spec_info, "draft_token", None)
+    spec_info = forward_batch.spec_info
+    if not isinstance(spec_info, (EagleVerifyInput, DFlashVerifyInput)):
+        return forward_batch.batch_size
+    draft_token_num = spec_info.draft_token_num
+    draft_token = spec_info.draft_token
     if draft_token is None:
         return forward_batch.batch_size
     if draft_token_num <= 0:
@@ -1350,8 +1341,7 @@ class DeepseekV4AttnBackend(
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if self.mtp_enabled and logical_forward_mode.is_idle():
+        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             self.online_c128_mtp.clear()
             return
 
@@ -1365,7 +1355,7 @@ class DeepseekV4AttnBackend(
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
     ):
-        logical_forward_mode = _get_logical_forward_mode(forward_batch)
+        forward_mode = forward_batch.forward_mode
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         # Regular prefill batches already carry scheduler-maintained CPU lengths.
@@ -1385,13 +1375,13 @@ class DeepseekV4AttnBackend(
             max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
-            logical_forward_mode,
+            forward_mode,
             req_pool_indices,
             seq_lens,
             verify_bs=verify_bs,
         )
 
-        if logical_forward_mode.is_decode_or_idle():
+        if forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,
             # so slice the shared multi-step out_cache_loc now, not at forward time.
             out_cache_loc = forward_batch.out_cache_loc
@@ -1408,7 +1398,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc,
             )
-        elif self.is_dspark_draft and logical_forward_mode.is_target_verify():
+        elif self.is_dspark_draft and forward_mode.is_target_verify():
             block_size = int(forward_batch.spec_info.draft_token_num)
             metadata = self.init_forward_metadata_dspark_draft_block(
                 max_seq_len=max_seq_len,
@@ -1418,7 +1408,7 @@ class DeepseekV4AttnBackend(
                 out_cache_loc=forward_batch.out_cache_loc,
                 block_size=block_size,
             )
-        elif logical_forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify():
             ragged_layout = self._resolve_verify_layout(forward_batch, bs=len(seq_lens))
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
@@ -1429,7 +1419,7 @@ class DeepseekV4AttnBackend(
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )
-        elif logical_forward_mode.is_draft_extend_v2():
+        elif forward_mode.is_draft_extend_v2():
             num_tokens_per_req = self.speculative_num_draft_tokens
             assert num_tokens_per_req > 0
             metadata = self.init_forward_metadata_draft_extend(
@@ -1438,7 +1428,7 @@ class DeepseekV4AttnBackend(
                 num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=forward_batch.out_cache_loc,
             )
-        elif logical_forward_mode.is_prefill():
+        elif forward_mode.is_prefill():
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             extend_seq_lens = forward_batch.extend_seq_lens
             assert (

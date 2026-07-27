@@ -8,6 +8,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -583,13 +584,17 @@ def run_eagle_verify(
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
-    clear_unaccepted_c128 = getattr(
-        token_to_kv_pool_allocator.get_kvcache(),
-        "clear_unaccepted_c128_draft_states",
-        None,
-    )
-    if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
-        clear_unaccepted_c128(
+    if (
+        is_deepseek_v4(target_worker.model_config.hf_config)
+        and not batch.forward_mode.is_idle()
+    ):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        target_kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        assert isinstance(target_kv_cache, DeepSeekV4TokenToKVPool)
+        target_kv_cache.clear_unaccepted_c128_draft_states(
             batch.req_pool_indices,
             batch.seq_lens,
             accept_lens,
