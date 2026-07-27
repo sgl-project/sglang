@@ -855,7 +855,7 @@ class TestTokenizeDetokenize(CustomTestCase):
 # Embedded Rust server (SGLANG_RUST_SERVER=1): rerun the whole endpoint suite
 # against the rust api-server/tokenizer/detokenizer stack — the logprob tests
 # exercise the columnar egress wire (`push_generation` extras -> Rust
-# `BatchHeader`/`decode_batch_frame` -> detok reshape) end to end. Suite
+# `BatchHeader`/`for_each_chunk` -> detok reshape) end to end. Suite
 # surface the rust server does not implement yet is skipped explicitly below.
 # ---------------------------------------------------------------------------
 @unittest.skipUnless(

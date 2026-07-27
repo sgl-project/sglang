@@ -4,7 +4,7 @@
 //! `is_disconnected` abort).
 
 use crate::ids::RidHash;
-use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::tokenizer_manager::Senders;
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
@@ -69,19 +69,13 @@ impl Drop for AbortGuard {
         // overwrite that entry, which is the cross-client delivery the registry
         // exists to prevent. Holding it costs the client a 400 on retry; releasing
         // it costs another client's tokens.
-        let mut undelivered = Vec::new();
+        // Unbounded lane: this send only fails at shutdown, when the loop is gone
+        // and nothing is generating anyway. So the release below is unconditional
+        // again — no rid is held back, and none is released while its abort is
+        // still undelivered.
         for (_, rid) in self.rids.drain(..) {
-            if self
-                .senders
-                .tm
-                .try_send(TmEvent::Abort(rid.clone()))
-                .is_err()
-            {
-                tracing::warn!(%rid, "abort could not be queued; holding the rid");
-                undelivered.push(rid);
-            }
+            let _ = self.senders.abort.send(rid);
         }
-        self.owned.retain(|rid| !undelivered.contains(rid));
         // Release the in-flight rids so the client can reuse them. Every rid the
         // guard covered, disarmed or not — a disarmed one finished, which is
         // exactly when it stops being in flight.
@@ -97,9 +91,10 @@ impl Drop for AbortGuard {
 mod tests {
     use super::*;
 
-    fn senders_with_tm(tm: flume::Sender<TmEvent>) -> Senders {
+    fn senders_with_abort(abort: flume::Sender<String>) -> Senders {
         Senders {
-            tm,
+            tm: flume::unbounded().0,
+            abort,
             tok: flume::unbounded().0,
             detok: vec![],
         }
@@ -119,7 +114,7 @@ mod tests {
         live.lock().unwrap().insert("r2".to_string());
         let (tm_tx, _tm_rx) = flume::unbounded();
         let id1 = RidHash::from_rid("r1");
-        let mut guard = AbortGuard::new(senders_with_tm(tm_tx), live.clone(), id1, "r1".into());
+        let mut guard = AbortGuard::new(senders_with_abort(tm_tx), live.clone(), id1, "r1".into());
         guard.arm(RidHash::from_rid("r2"), "r2".to_string());
         guard.disarm(id1); // finished naturally — still must be released
         drop(guard);
@@ -133,13 +128,13 @@ mod tests {
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();
         drop(AbortGuard::new(
-            senders_with_tm(tm_tx),
+            senders_with_abort(tm_tx),
             Default::default(),
             RidHash::from_rid("r7"),
             "r7".to_string(),
         ));
         assert!(
-            matches!(tm_rx.try_recv(), Ok(TmEvent::Abort(rid)) if rid == "r7"),
+            matches!(tm_rx.try_recv(), Ok(rid) if rid == "r7"),
             "armed guard must abort its rid on drop",
         );
         assert!(tm_rx.try_recv().is_err(), "exactly one abort");
@@ -151,7 +146,7 @@ mod tests {
         let (tm_tx, tm_rx) = flume::unbounded();
         let id = RidHash::from_rid("r9");
         let mut guard = AbortGuard::new(
-            senders_with_tm(tm_tx),
+            senders_with_abort(tm_tx),
             Default::default(),
             id,
             "r9".to_string(),

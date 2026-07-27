@@ -14,6 +14,7 @@ use axum::{
 };
 
 use super::AppState;
+use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
 use crate::runtime::ServerArgs;
@@ -37,8 +38,18 @@ async fn await_control_result(
     state: &AppState,
     control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
-    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
-    match rx.recv().await {
+    let (id, rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
+    // Control requests register a detok entry like any other, and only
+    // `handle_result` removes it — so a request that never produces one (a stalled
+    // scheduler, a client that hangs up mid-await) leaves the entry behind. A
+    // monitor polling `/server_info` then leaks one `DetokState` per poll, forever.
+    // The guard deregisters on drop; it is disarmed below when the result lands.
+    let mut guard = AbortGuard::new(state.senders.clone(), state.live_rids.clone(), id, rid);
+    let received = rx.recv().await;
+    if received.is_some() {
+        guard.disarm(id); // completed normally — nothing to abort
+    }
+    match received {
         Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
             let code =

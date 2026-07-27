@@ -28,13 +28,16 @@ use crate::message::{
 };
 use crate::ring::IngressProducer;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::{Senders, TmEvent, recv};
+use crate::tokenizer_manager::{Senders, TmEvent};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
 /// with positional arguments.
 pub struct Ingress {
     rx: flume::Receiver<TmEvent>,
+    /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
+    /// abort is handled promptly even while the bounded inbox is saturated.
+    abort_rx: flume::Receiver<String>,
     senders: Senders,
     ingress: IngressProducer,
     limits: Limits,
@@ -79,6 +82,7 @@ impl Limits {
 impl Ingress {
     pub fn new(
         rx: flume::Receiver<TmEvent>,
+        abort_rx: flume::Receiver<String>,
         senders: Senders,
         ingress: IngressProducer,
         limits: Limits,
@@ -86,6 +90,7 @@ impl Ingress {
     ) -> Self {
         Self {
             rx,
+            abort_rx,
             senders,
             ingress,
             limits,
@@ -94,13 +99,38 @@ impl Ingress {
     }
 }
 
+/// Which lane produced the next item.
+enum Lane {
+    Abort(String),
+    Event(TmEvent),
+}
+
 impl Runnable for Ingress {
     fn run(self) {
-        while let Some(ev) = recv(&self.rx, &self.shutdown) {
-            match ev {
+        loop {
+            // Select, not a drain-then-block: an abort arriving while the inbox is
+            // idle must still be handled at once.
+            let next = flume::Selector::new()
+                .recv(&self.abort_rx, |r| r.ok().map(Lane::Abort))
+                .recv(&self.rx, |r| r.ok().map(Lane::Event))
+                .recv(&self.shutdown, |_| None)
+                .wait();
+            match next {
+                Some(Lane::Abort(rid)) => self.on_abort(rid),
                 // A fresh request and one returning from the tokenizer pool.
-                TmEvent::Ingress(req) | TmEvent::Tokenized(req) => self.drive(req),
-                TmEvent::Abort(rid) => self.on_abort(rid),
+                Some(Lane::Event(TmEvent::Ingress(req) | TmEvent::Tokenized(req))) => {
+                    self.drive(req)
+                }
+                None => {
+                    // Shutdown, or the inbox closed. Drain whatever is still queued
+                    // on the abort lane first: those requests are in flight on the
+                    // scheduler, and the selector may report the closed inbox before
+                    // it ever looks at a pending abort.
+                    while let Ok(rid) = self.abort_rx.try_recv() {
+                        self.on_abort(rid);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -516,8 +546,33 @@ mod tests {
         make_ingress_with(test_limits())
     }
 
+    fn make_ingress_with_abort(
+        abort_rx: flume::Receiver<String>,
+    ) -> (
+        Ingress,
+        flume::Receiver<DetokMsg>,
+        IngressConsumer,
+        flume::Sender<TmEvent>,
+    ) {
+        make_ingress_inner(test_limits(), abort_rx)
+    }
+
     fn make_ingress_with(
         limits: Limits,
+    ) -> (
+        Ingress,
+        flume::Receiver<DetokMsg>,
+        IngressConsumer,
+        flume::Sender<TmEvent>,
+    ) {
+        let (abort_tx, abort_rx) = flume::unbounded::<String>();
+        std::mem::forget(abort_tx); // keep the lane open; tests end by dropping tm_tx
+        make_ingress_inner(limits, abort_rx)
+    }
+
+    fn make_ingress_inner(
+        limits: Limits,
+        abort_rx: flume::Receiver<String>,
     ) -> (
         Ingress,
         flume::Receiver<DetokMsg>,
@@ -528,6 +583,7 @@ mod tests {
         let (detok_tx, detok_rx) = flume::unbounded();
         let senders = Senders {
             tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
             tok: tok_tx,
             detok: vec![detok_tx],
         };
@@ -537,7 +593,7 @@ mod tests {
         // end `run` by dropping `tm_tx`, not by shutdown.
         let (sd_tx, sd_rx) = flume::unbounded::<()>();
         std::mem::forget(sd_tx);
-        let ingress = Ingress::new(tm_rx, senders, ingress_producer, limits, sd_rx);
+        let ingress = Ingress::new(tm_rx, abort_rx, senders, ingress_producer, limits, sd_rx);
         (ingress, detok_rx, consumer, tm_tx)
     }
 
@@ -938,8 +994,11 @@ mod tests {
     /// aborted before any terminal chunk can't leak.
     #[test]
     fn abort_deregisters_from_shard() {
-        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress();
-        tm_tx.send(TmEvent::Abort("rid-13".to_string())).unwrap();
+        // Aborts arrive on their own unbounded lane now, not the request inbox.
+        let (abort_tx, abort_rx) = flume::unbounded::<String>();
+        let (ingress, detok_rx, _consumer, tm_tx) = make_ingress_with_abort(abort_rx);
+        abort_tx.send("rid-13".to_string()).unwrap();
+        drop(abort_tx);
         drop(tm_tx);
         ingress.run();
 
