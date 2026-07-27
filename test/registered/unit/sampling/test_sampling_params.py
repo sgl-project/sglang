@@ -8,6 +8,7 @@ register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
 import unittest
+from itertools import combinations
 from unittest.mock import MagicMock
 
 import msgspec
@@ -77,6 +78,15 @@ class TestSamplingParamsInit(CustomTestCase):
 class TestSamplingParamsVerify(CustomTestCase):
 
     VOCAB_SIZE = 32000
+    GRAMMAR_CONFLICT_ERROR = (
+        "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+    )
+    GRAMMAR_VALUES = {
+        "json_schema": '{"type":"object"}',
+        "regex": "abc",
+        "ebnf": 'root ::= "abc"',
+        "structural_tag": '{"structures":[],"triggers":[]}',
+    }
 
     def _make(self, **kwargs):
         """Helper: create SamplingParams with safe defaults, override with kwargs."""
@@ -273,19 +283,28 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
-        """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
-        sp = self._make(json_schema='{"type":"object"}', regex="abc")
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
+        """Test that every pair of grammar constraints is mutually exclusive."""
+        for first, second in combinations(self.GRAMMAR_VALUES, 2):
+            with self.subTest(first=first, second=second):
+                sp = self._make(
+                    **{
+                        first: self.GRAMMAR_VALUES[first],
+                        second: self.GRAMMAR_VALUES[second],
+                    }
+                )
+                with self.assertRaises(ValueError) as error:
+                    sp.verify(self.VOCAB_SIZE)
+                self.assertEqual(str(error.exception), self.GRAMMAR_CONFLICT_ERROR)
 
     def test_single_grammar_valid(self):
-        """Test that setting only one grammar type is accepted."""
-        sp = self._make(json_schema='{"type":"object"}')
-        sp.verify(self.VOCAB_SIZE)
+        """Test that each grammar constraint is valid on its own."""
+        for grammar, value in self.GRAMMAR_VALUES.items():
+            with self.subTest(grammar=grammar):
+                self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
-    def test_all_three_grammars_set_raises(self):
-        """Test that verify() rejects setting json_schema, regex, and ebnf together."""
-        sp = self._make(json_schema="{}", regex="a", ebnf="rule")
+    def test_all_grammars_set_raises(self):
+        """Test that verify() rejects setting every grammar constraint together."""
+        sp = self._make(**self.GRAMMAR_VALUES)
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
