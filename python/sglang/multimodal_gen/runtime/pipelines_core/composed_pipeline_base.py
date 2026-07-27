@@ -17,6 +17,7 @@ from tqdm import tqdm
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
+    get_module_role,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -79,6 +80,10 @@ class ComposedPipelineBase(ABC):
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
+    # Set from --disagg-dag / --dag-node; None means the classic role-affinity
+    # filtering applies.
+    _dag_plan: Any = None
+    _dag_node: str | None = None
 
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
@@ -103,6 +108,8 @@ class ComposedPipelineBase(ABC):
         """
         self.server_args = server_args
         self._disagg_role = server_args.disagg_role
+        self._dag_plan = server_args.resolve_execution_plan()
+        self._dag_node = server_args.dag_node if self._dag_plan is not None else None
         self.validate_disagg_role(self._disagg_role)
 
         self.model_path: str = model_path
@@ -123,7 +130,29 @@ class ComposedPipelineBase(ABC):
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if self._dag_node is not None:
+            original_modules = list(self._required_config_modules)
+            declared = self._dag_plan.node(self._dag_node).modules
+            if declared is not None:
+                # A node's module list only has to name the heavy, role-specific
+                # weights it wants. Modules that belong to no role in
+                # particular -- the diffusion scheduler above all -- are cheap
+                # and used everywhere, so requiring every topology to repeat
+                # them would be noise that silently breaks stages when omitted.
+                allowed = set(declared)
+                self._required_config_modules = [
+                    m
+                    for m in self._required_config_modules
+                    if m in allowed or get_module_role(m) is None
+                ]
+            skipped = set(original_modules) - set(self._required_config_modules)
+            if skipped:
+                logger.info(
+                    "DAG node=%s: skipping modules %s",
+                    self._dag_node,
+                    sorted(skipped),
+                )
+        elif self._disagg_role != RoleType.MONOLITHIC:
             original_modules = list(self._required_config_modules)
             task_name = self.server_args.pipeline_config.task_type.name.lower()
             self._required_config_modules = filter_modules_for_role(
@@ -164,6 +193,7 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        self.validate_dag_stage_coverage(list(self.declared_stage_names))
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -575,6 +605,29 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
+        """Decide whether this process runs a stage.
+
+        Under a custom DAG the plan is authoritative: a stage belongs to
+        whichever node claims it by name, which is what lets two nodes share a
+        ``role_affinity`` (two denoiser pools, two VAE pools) and still get
+        different stages.          Classic deployments keep using ``role_affinity``.
+        """
+        # Record before filtering: coverage validation needs the stages this
+        # pipeline *would* run, not the ones this node kept.
+        self.declared_stage_names[stage_name] = None
+
+        if self._dag_node is not None:
+            owner = self._dag_plan.stage_owner(stage_name)
+            if owner == self._dag_node:
+                return True
+            logger.info(
+                "DAG node=%s: skipping stage %s (owner=%s)",
+                self._dag_node,
+                stage_name,
+                owner or "<unclaimed>",
+            )
+            return False
+
         if self._disagg_role == RoleType.MONOLITHIC:
             return True
         if role_affinity == self._disagg_role:
@@ -587,6 +640,47 @@ class ComposedPipelineBase(ABC):
             role_affinity.value,
         )
         return False
+
+    @property
+    def declared_stage_names(self) -> dict[str, None]:
+        """Insertion-ordered set of every stage name offered to ``add_stage``.
+
+        Includes stages this node filtered out, which is what makes coverage
+        validation meaningful. Initialized lazily so subclasses that build a
+        pipeline without running ``__init__`` still work.
+        """
+        names = self.__dict__.get("_declared_stage_names")
+        if names is None:
+            names = {}
+            self._declared_stage_names = names
+        return names
+
+    def dag_claims(self, stage_name: str) -> bool:
+        """Whether the active DAG topology assigns *stage_name* to some node.
+
+        Lets a pipeline offer a finer stage breakdown only when the topology
+        asks for it, instead of splitting unconditionally and paying for a
+        transfer that a single-process deployment does not need.
+        """
+        if self._dag_plan is None:
+            return False
+        return self._dag_plan.stage_owner(stage_name) is not None
+
+    def validate_dag_stage_coverage(self, all_stage_names: list[str]) -> None:
+        """Fail startup if the plan and the pipeline disagree about stages.
+
+        Called with the *unfiltered* stage list, so it catches both a stage no
+        node claims (it would silently never run) and a stage the plan names
+        but the pipeline does not define (a typo in config).
+        """
+        if self._dag_plan is None:
+            return
+        errors = self._dag_plan.validate_stage_coverage(all_stage_names)
+        if errors:
+            raise ValueError(
+                "DAG topology does not match pipeline stages:\n"
+                + "\n".join(f"  - {e}" for e in errors)
+            )
 
     def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
         class_name = stage.__class__.__name__
