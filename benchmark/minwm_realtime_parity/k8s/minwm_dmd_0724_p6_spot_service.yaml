@@ -379,6 +379,9 @@ spec:
   loadBalancerSourceRanges:
     - 10.0.0.0/8
     - 172.16.0.0/12
+    # Company egress ranges, aligned with lingbot2-h200-public.
+    - 5.34.217.44/32
+    - 45.8.204.4/32
   selector:
     app: minwm-dmd-0724-p6
   ports:

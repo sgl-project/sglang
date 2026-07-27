@@ -21,8 +21,12 @@
 - 模型列表：
   `http://k8s-default-minwmdmd-68fa5a3b8e-1e3897a685e566f1.elb.us-west-2.amazonaws.com:30000/v1/models`
 
-这是 internal NLB，只允许 `10.0.0.0/8` 和 `172.16.0.0/12`，不能从普通公网访问。
-当前没有配置 TLS，因此内网入口使用 HTTP/WS，而不是 HTTPS/WSS。
+这是 internal NLB。NLB 安全组允许 VPC/私网网段 `10.0.0.0/8`、
+`172.16.0.0/12`，并参考现有 `lingbot2-h200-public` 服务加入公司出口
+`5.34.217.44/32`、`45.8.204.4/32`；没有开放 `0.0.0.0/0`。
+但安全组放行不等于网络路径可达：当前 VPC 没有到公司网络的
+TGW/VPN/peering，internal NLB 也没有公网入口，因此普通办公网络仍不能直接访问。
+当前没有配置 TLS，入口使用 HTTP/WS，而不是 HTTPS/WSS。
 
 稳态吞吐结果：
 
@@ -282,6 +286,15 @@ chunks，共计量 320 个生成帧。
 由于执行验收的桌面不在该 VPC 路由内，浏览器视觉检查通过临时
 `kubectl port-forward` 连接同一个 Service。NLB HTTP、模型列表、健康检查、
 WebSocket 视频和吞吐则全部从集群内通过真正的 internal NLB 地址完成。
+
+桌面上的代理/TUN DNS 还会把 NLB hostname 映射到 `198.18.0.0/15` 的 fake-IP；
+即使 NLB 安全组已放行公司出口 `/32`，该 fake-IP 和缺失的 VPC 公司网路由仍会
+使桌面请求失败。要获得可直接打开的公司入口，需要二选一：
+
+- 将 Service 改为 internet-facing NLB，并继续仅允许公司出口 `/32`；这会重建
+  NLB，hostname 会变化。
+- 保持 internal NLB，为 VPC 建立到公司网络的 TGW/VPN/peering，并确保公司 DNS
+  返回 NLB 的真实 `10.82.x.x` 地址。
 
 ## 7. 重大决策和与预期不同之处
 
