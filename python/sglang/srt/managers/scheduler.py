@@ -3470,7 +3470,12 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none() and self.pp_group.is_last_rank:
-                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.ps.pp_size > 1
+                    and batch.spec_algorithm == SpeculativeAlgorithm.EAGLE
+                    else {}
+                )
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
