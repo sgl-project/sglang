@@ -1034,6 +1034,14 @@ class Envs:
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
 
+    # Route small bf16 TP all-reduces (total bytes at or below this value)
+    # through the FlashInfer all-reduce workspace's plain kAllReduce pattern
+    # instead of NCCL. 0 disables. Targets the per-draft-forward NCCL
+    # all-reduces in speculative decoding, which NCCL RING_LL serves at
+    # ~26 us/call on cross-node MNNVL while the FlashInfer one-shot kernel
+    # serves equivalent shapes at ~8 us in the same graphs.
+    SGLANG_FLASHINFER_SMALL_AR_MAX_BYTES = EnvInt(0)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
