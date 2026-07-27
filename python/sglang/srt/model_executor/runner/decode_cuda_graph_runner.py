@@ -403,10 +403,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- metadata glue graph (opt-in) ------------------------------
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
+        # Force-off for DFlash-family spec: verify installs host-fed fast
+        # plans (sync-free begin_forward that recomputes plan inputs on the
+        # host every replay), and capturing one freezes the capture-time
+        # plan — drafts go stale and accept length collapses to ~1.
+        enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+            logger.warning(
+                "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
+                "DFlash-family speculative decoding (host-fed fast verify "
+                "plans must re-run on the host every replay); disabling the "
+                "metadata glue graph."
+            )
+            enable_metadata_glue = False
         self._metadata_glue = (
-            MetadataGlueGraph(self.device)
-            if envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-            else None
+            MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
 
         # --- backend ---------------------------------------------------

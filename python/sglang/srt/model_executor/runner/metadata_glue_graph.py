@@ -21,6 +21,14 @@ Correctness contract:
   happen outside capture.
 - Any capture failure (e.g. a backend syncing or reading host values inside
   its prep) permanently disables the glue graph and falls back to eager.
+- Backends whose prep computes values on the HOST each replay (e.g. the
+  DFlash-family host-fed fast verify plans) must never be glued: capture
+  records only device ops, so the host-written plan inputs would replay
+  frozen at their capture-time values. Note the failure is SILENT — capture
+  succeeds, outputs stay correct, only accept length collapses. Callers must
+  gate such configurations off before routing here
+  (``decode_cuda_graph_runner`` force-disables the glue for DFlash-family
+  spec).
 """
 
 from __future__ import annotations
