@@ -4,6 +4,12 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_end_token as dsv4_thinking_end_token,
+)
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_start_token as dsv4_thinking_start_token,
+)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -896,6 +902,7 @@ class _DeepSeekV3Detector(Qwen3Detector):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.reasoning_default = "explicit_thinking"
 
 
 class DeepSeekBaseDetector(BaseReasoningFormatDetector):
@@ -1023,6 +1030,8 @@ class DeepSeekBaseDetector(BaseReasoningFormatDetector):
 
 
 class DeepSeekV4Detector(DeepSeekBaseDetector):
+    THINK_START_TOKEN = dsv4_thinking_start_token
+    THINK_END_TOKEN = dsv4_thinking_end_token
     DSML_TOKEN = dsv4_dsml_token
     DEEPSEEK_TOOL_CALLS_BLOCK_NAME = "tool_calls"
     DEEPSEEK_INVOKE_BLOCK_NAME = "invoke name="
