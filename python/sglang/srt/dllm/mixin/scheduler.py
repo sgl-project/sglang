@@ -74,9 +74,9 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert (
-            not fdfo_mode or result.accept_length_per_req_cpu is not None
-        ), "FDFO dLLM result is missing accept lengths."
+        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
+            "FDFO dLLM result is missing accept lengths."
+        )
 
         # Sync mode emits tokens only once a block fully resolves; FDFO always
         # commits (resolved blocks decode, unresolved blocks stash + free KV).
@@ -107,13 +107,12 @@ class SchedulerDllmMixin:
                     ] = array("q", next_token_ids)
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
-                    req.output_ids.extend(next_token_ids)
+                    self._append_dllm_output_ids(req, next_token_ids)
                     self._append_dllm_step_maps(
                         req,
                         step_maps[idx] if step_maps is not None else None,
                         new_tokens,
                     )
-                    req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
@@ -174,9 +173,8 @@ class SchedulerDllmMixin:
                         next_step_maps = next_step_maps[output_start:]
 
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
-                req.output_ids.extend(next_token_ids)
+                self._append_dllm_output_ids(req, next_token_ids)
                 self._append_dllm_step_maps(req, next_step_maps, len(next_token_ids))
-                req.update_finish_state(new_accepted_len=len(next_token_ids))
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache)
@@ -191,6 +189,20 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    @staticmethod
+    def _append_dllm_output_ids(req: Req, token_ids: List[int]) -> None:
+        """Commit a resolved dLLM block while preserving its first stop."""
+
+        for token_id in token_ids:
+            req.output_ids.append(int(token_id))
+            if not req.finished():
+                # Check one accepted token at a time so an EOS/stop before the
+                # length cap wins even though the complete resolved block is
+                # retained for replay.
+                req.update_finish_state()
+                if req.finished() and req.finished_len is None:
+                    req.finished_len = len(req.output_ids)
 
     @staticmethod
     def _append_dllm_step_maps(
@@ -385,9 +397,8 @@ class SchedulerDllmMixin:
 
             # Try preemption if batch is full
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 

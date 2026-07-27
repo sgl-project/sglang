@@ -1282,6 +1282,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
+    # Complete terminal dLLM block replay payload. Normal output_ids and
+    # customized_info["step_maps"] remain truncated at the stop condition.
+    dllm_replay_token_ids: Optional[List[Optional[List[int]]]] = None
+    dllm_replay_step_maps: Optional[List[Optional[List[int]]]] = None
+    dllm_stop_lengths: Optional[List[Optional[int]]] = None
+    dllm_replay_contract_versions: Optional[List[Optional[int]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
@@ -1364,6 +1370,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
+    # Complete terminal dLLM block replay payload. Normal output_ids and
+    # customized_info["step_maps"] remain truncated at the stop condition.
+    dllm_replay_token_ids: Optional[List[Optional[List[int]]]] = None
+    dllm_replay_step_maps: Optional[List[Optional[List[int]]]] = None
+    dllm_stop_lengths: Optional[List[Optional[int]]] = None
+    dllm_replay_contract_versions: Optional[List[Optional[int]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request

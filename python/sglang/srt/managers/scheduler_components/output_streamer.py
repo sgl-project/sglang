@@ -292,6 +292,10 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
+    dllm_replay_token_ids: list = field(default_factory=list)
+    dllm_replay_step_maps: list = field(default_factory=list)
+    dllm_stop_lengths: list = field(default_factory=list)
+    dllm_replay_contract_versions: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -534,6 +538,36 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
+        if req.return_step_maps and req.finished():
+            if req.dllm_step_maps is None:
+                raise RuntimeError(
+                    f"dLLM replay step-map storage is missing for request {req.rid}"
+                )
+            if len(req.dllm_step_maps) != len(req.output_ids):
+                raise RuntimeError(
+                    f"dLLM replay token/step mismatch for request {req.rid}: got "
+                    f"{len(req.output_ids)} tokens and "
+                    f"{len(req.dllm_step_maps)} steps"
+                )
+            stop_length = (
+                req.finished_len if req.finished_len is not None else len(output_ids_)
+            )
+            if stop_length != len(output_ids_):
+                raise RuntimeError(
+                    f"dLLM replay stop-length mismatch for request {req.rid}: got "
+                    f"stop_length={stop_length} and "
+                    f"{len(output_ids_)} normal output tokens"
+                )
+            self.dllm_replay_token_ids.append(list(req.output_ids))
+            self.dllm_replay_step_maps.append(list(req.dllm_step_maps))
+            self.dllm_stop_lengths.append(stop_length)
+            self.dllm_replay_contract_versions.append(1)
+        else:
+            self.dllm_replay_token_ids.append(None)
+            self.dllm_replay_step_maps.append(None)
+            self.dllm_stop_lengths.append(None)
+            self.dllm_replay_contract_versions.append(None)
+
         current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
             for key, req_values in req.customized_info.items():
@@ -605,6 +639,10 @@ class _GenerationStreamAccumulator:
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),
+            dllm_replay_token_ids=self.dllm_replay_token_ids,
+            dllm_replay_step_maps=self.dllm_replay_step_maps,
+            dllm_stop_lengths=self.dllm_stop_lengths,
+            dllm_replay_contract_versions=self.dllm_replay_contract_versions,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,

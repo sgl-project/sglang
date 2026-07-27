@@ -141,6 +141,32 @@ class TestDllmStepMaps(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "positive one-based"):
             SchedulerDllmMixin._append_dllm_step_maps(req, [0], 1)
 
+    def test_scheduler_preserves_terminal_block_and_first_stop(self):
+        class _Req:
+            def __init__(self):
+                self.output_ids = []
+                self.finished_reason = None
+                self.finished_len = None
+
+            def finished(self):
+                return self.finished_reason is not None
+
+            def update_finish_state(self):
+                # Match the production precedence that previously hid an EOS
+                # when a whole accepted block reached max_new_tokens at once.
+                if len(self.output_ids) >= 4:
+                    self.finished_reason = "length"
+                    self.finished_len = 4
+                elif self.output_ids[-1] == 99:
+                    self.finished_reason = "eos"
+                    self.finished_len = len(self.output_ids)
+
+        req = _Req()
+        SchedulerDllmMixin._append_dllm_output_ids(req, [10, 99, 11, 12])
+        self.assertEqual(req.output_ids, [10, 99, 11, 12])
+        self.assertEqual(req.finished_reason, "eos")
+        self.assertEqual(req.finished_len, 2)
+
 
 class TestDllmSampling(unittest.TestCase):
     def test_greedy_preserves_argmax(self):

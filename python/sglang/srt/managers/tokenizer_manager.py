@@ -1541,9 +1541,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1571,9 +1571,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 yield out
             else:
                 if (
@@ -1772,9 +1772,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -1910,6 +1912,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:
             customized_info = None
+        replay_batches = {
+            "dllm_replay_token_ids": getattr(recv_obj, "dllm_replay_token_ids", None),
+            "dllm_replay_step_maps": getattr(recv_obj, "dllm_replay_step_maps", None),
+            "dllm_stop_lengths": getattr(recv_obj, "dllm_stop_lengths", None),
+            "dllm_replay_contract_versions": getattr(
+                recv_obj, "dllm_replay_contract_versions", None
+            ),
+        }
+        for field_name, field_values in replay_batches.items():
+            if field_values is not None and len(field_values) != len(recv_obj.rids):
+                raise RuntimeError(
+                    f"{field_name} batch mismatch in TokenizerManager: got "
+                    f"{len(field_values)} values for {len(recv_obj.rids)} requests"
+                )
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -2168,6 +2184,98 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         pooled_hidden_states = pooled_hidden_states[0]
                     if pooled_hidden_states[i] is not None:
                         out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
+
+            replay_values = {
+                field_name: (field_values[i] if field_values is not None else None)
+                for field_name, field_values in replay_batches.items()
+            }
+            replay_present = {
+                field_name: field_value is not None
+                for field_name, field_value in replay_values.items()
+            }
+            if any(replay_present.values()) and not all(replay_present.values()):
+                missing = sorted(
+                    field_name
+                    for field_name, is_present in replay_present.items()
+                    if not is_present
+                )
+                raise RuntimeError(
+                    f"Incomplete dLLM replay payload for request {rid}; "
+                    f"missing {missing}"
+                )
+            if all(replay_present.values()):
+                if not getattr(state.obj, "return_step_maps", False):
+                    raise RuntimeError(
+                        f"Unexpected dLLM replay payload for request {rid}"
+                    )
+                if not state.finished:
+                    raise RuntimeError(
+                        f"dLLM replay payload arrived before request {rid} finished"
+                    )
+                replay_token_ids = replay_values["dllm_replay_token_ids"]
+                replay_step_maps = replay_values["dllm_replay_step_maps"]
+                stop_length = replay_values["dllm_stop_lengths"]
+                contract_version = replay_values["dllm_replay_contract_versions"]
+                if isinstance(contract_version, bool) or contract_version != 1:
+                    raise RuntimeError(
+                        f"Unsupported dLLM replay contract version for request "
+                        f"{rid}: {contract_version!r}"
+                    )
+                if isinstance(stop_length, bool) or not isinstance(stop_length, int):
+                    raise RuntimeError(
+                        f"dLLM stop length must be an integer for request {rid}, "
+                        f"got {stop_length!r}"
+                    )
+                if not 0 < stop_length <= len(replay_token_ids):
+                    raise RuntimeError(
+                        f"Invalid dLLM stop length for request {rid}: "
+                        f"{stop_length} for {len(replay_token_ids)} replay tokens"
+                    )
+                if len(replay_step_maps) != len(replay_token_ids):
+                    raise RuntimeError(
+                        f"dLLM replay token/step mismatch for request {rid}: "
+                        f"got {len(replay_token_ids)} tokens and "
+                        f"{len(replay_step_maps)} steps"
+                    )
+                if any(
+                    isinstance(step, bool) or not isinstance(step, int) or step <= 0
+                    for step in replay_step_maps
+                ):
+                    raise RuntimeError(
+                        f"dLLM replay step maps must contain positive one-based "
+                        f"integers for request {rid}"
+                    )
+                if stop_length != len(state.output_ids):
+                    raise RuntimeError(
+                        f"dLLM stop-prefix mismatch for request {rid}: got "
+                        f"stop_length={stop_length} and "
+                        f"{len(state.output_ids)} normal output tokens"
+                    )
+                if list(replay_token_ids[:stop_length]) != state.output_ids:
+                    raise RuntimeError(
+                        f"dLLM replay tokens do not preserve the normal output "
+                        f"prefix for request {rid}"
+                    )
+                prefix_step_maps = state.customized_info_accumulated.get(
+                    "step_maps", []
+                )
+                if list(replay_step_maps[:stop_length]) != prefix_step_maps:
+                    raise RuntimeError(
+                        f"dLLM replay step maps do not preserve the normal output "
+                        f"prefix for request {rid}"
+                    )
+                meta_info.update(
+                    {
+                        "dllm_replay_token_ids": list(replay_token_ids),
+                        "dllm_replay_step_maps": list(replay_step_maps),
+                        "dllm_stop_length": stop_length,
+                        "dllm_replay_contract_version": contract_version,
+                    }
+                )
+            elif state.finished and getattr(state.obj, "return_step_maps", False):
+                raise RuntimeError(
+                    f"dLLM replay payload is missing for finished request {rid}"
+                )
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -2704,7 +2812,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -2911,9 +3019,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+        responses: List[
+            ScaleElasticEPReqOutput
+        ] = await self.scale_elastic_ep_communicator(obj)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase
