@@ -50,11 +50,24 @@ ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 
 # --- 1. Kimi-K3 SGLang code (replaces the base's stock sglang, editable) ---
 COPY . /sgl-workspace/sglang
-RUN cd /sgl-workspace/sglang && pip install -e python --no-deps
+# Keep the installed extension modules, but discard Rust and pip build
+# artifacts that are not used at runtime.
+RUN cd /sgl-workspace/sglang && \
+    rm -rf .git && \
+    test ! -e .git && \
+    pip install -e python --no-deps && \
+    rm -rf \
+      rust/target \
+      rust/sglang-grpc/target \
+      rust/sglang-mm/target \
+      rust/sglang-server/target \
+      /usr/local/cargo/registry \
+      /root/.cache/pip
 
 # --- 2. DeepEP: patch (topk16 / hidden3584 / SourceMeta / cccl) + multi-arch rebuild ---
 RUN TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
-    bash /sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh
+    bash /sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh && \
+    rm -rf /sgl-workspace/DeepEP/build /sgl-workspace/DeepEP/dist
 
 # --- 3. DeepGEMM mega-MoE: SiTU JIT-header patch (runtime-JIT, no rebuild) ---
 RUN python3 /sgl-workspace/sglang/docker/kimi_k3/apply_deepgemm_situ_patch.py
@@ -64,15 +77,21 @@ RUN python3 /sgl-workspace/sglang/docker/kimi_k3/apply_deepgemm_situ_patch.py
 
 # Reinstall the matching FlashInfer package trio before patching its Python
 # sources. A mixed Python/cubin/JIT-cache installation fails at import time.
-RUN python3 -m pip install --no-deps --force-reinstall \
+RUN python3 -m pip uninstall -y \
+      flashinfer-python flashinfer-cubin flashinfer-jit-cache && \
+    rm -rf /root/.cache/flashinfer /root/.cache/pip && \
+    python3 -m pip install --no-deps \
       "flashinfer-python==0.6.15.post1" && \
-    python3 -m pip install --no-deps --force-reinstall \
+    python3 -m pip install --no-deps \
       "flashinfer-cubin==0.6.15.post1" \
       --index-url https://flashinfer.ai/whl && \
-    python3 -m pip install --no-deps --force-reinstall \
+    python3 -m pip install --no-deps \
       "flashinfer-jit-cache==0.6.15.post1" \
       --index-url https://flashinfer.ai/whl/cu130 && \
-    python3 -c 'from importlib.metadata import version; expected = "0.6.15.post1"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual'
+    python3 -c 'from importlib.metadata import version; expected = "0.6.15.post1"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual' && \
+    rm -rf /root/.cache/pip
+
+ENV FLASHINFER_VERSION="0.6.15.post1"
 
 # --- 4. FlashInfer: CuTeDSL MLA decode-context-parallel runtime patch ---
 RUN FLASHINFER_DCP_PATCH=/sgl-workspace/sglang/docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt && \
@@ -80,6 +99,7 @@ RUN FLASHINFER_DCP_PATCH=/sgl-workspace/sglang/docker/kimi_k3/flashinfer-perkz-d
     sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
       patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
     sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}"
+      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
+    rm -rf /root/.cache/flashinfer /root/.cache/pip
 
 WORKDIR /sgl-workspace/sglang
