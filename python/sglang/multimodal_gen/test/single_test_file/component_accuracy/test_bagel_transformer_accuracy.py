@@ -674,7 +674,10 @@ def _run_sglang(
             renorm_min=0.0,
             renorm_type="global",
         )
-    torch.testing.assert_close(guided, expected_guided.float(), rtol=0.0, atol=0.0)
+    assert conditional.dtype == torch.bfloat16
+    assert unconditional.dtype == torch.bfloat16
+    assert guided.dtype == torch.bfloat16
+    torch.testing.assert_close(guided, expected_guided, rtol=0.0, atol=0.0)
     prefix_after = _cache_snapshot(context.conditional_kv)
     assert _tensor_hash(prefix_before) == _tensor_hash(prefix_after)
     return (
