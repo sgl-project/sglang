@@ -175,13 +175,7 @@ impl GenerateBody {
                 // `abort()`, which is uncatchable and takes the scheduler process
                 // with it. Bound the product, not just `n`.
                 let per_clone = serde_json::to_string(&*sp).map_or(0, |s| s.len());
-                if per_clone.saturating_mul(n) > MAX_BROADCAST_CLONE_BYTES {
-                    return Err(Error::Validation(format!(
-                        "sampling_params ({per_clone} bytes) broadcast to {n} prompts \
-                         would allocate more than the {MAX_BROADCAST_CLONE_BYTES}-byte \
-                         limit; send a shorter `sampling_params` or a smaller batch"
-                    )));
-                }
+                check_broadcast_budget(per_clone, n, "sampling_params")?;
                 vec![*sp; n]
             }
         };
@@ -192,7 +186,10 @@ impl GenerateBody {
         let rids: Vec<String> = match rid {
             None => (0..n).map(|_| crate::ids::new_rid()).collect(),
             Some(OneOrMany::One(r)) if !is_batch => vec![r],
-            Some(OneOrMany::One(r)) => (0..n).map(|i| format!("{r}_{i}")).collect(),
+            Some(OneOrMany::One(r)) => {
+                check_broadcast_budget(r.len(), n, "rid")?;
+                (0..n).map(|i| format!("{r}_{i}")).collect()
+            }
             Some(OneOrMany::Many(v)) => {
                 if !is_batch || v.len() != n {
                     return Err(Error::Validation(format!(
@@ -355,14 +352,59 @@ impl GenerateRequest {
 
 /// Fan one scalar-or-list option out to `n` per-item values: absent → `None`
 /// each, a scalar broadcasts, a list must match the batch size.
-fn fan_out<T: OneOrManyItem + Clone>(
+/// Bytes a broadcast value costs per clone. Only the heap matters — the inline
+/// part is bounded by the type.
+trait HeapBytes {
+    fn heap_bytes(&self) -> usize;
+}
+impl HeapBytes for bool {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+impl HeapBytes for i64 {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+impl HeapBytes for String {
+    fn heap_bytes(&self) -> usize {
+        self.len()
+    }
+}
+impl HeapBytes for TokenIds {
+    fn heap_bytes(&self) -> usize {
+        self.len() * std::mem::size_of::<i32>()
+    }
+}
+
+/// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
+fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
+    if per_clone.saturating_mul(n) > MAX_BROADCAST_CLONE_BYTES {
+        return Err(Error::Validation(format!(
+            "{name} ({per_clone} bytes) broadcast to {n} prompts would allocate more \
+             than the {MAX_BROADCAST_CLONE_BYTES}-byte limit; send a shorter {name} \
+             or a smaller batch"
+        )));
+    }
+    Ok(())
+}
+
+fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
     value: Option<OneOrMany<T>>,
     n: usize,
     name: &str,
 ) -> Result<Vec<Option<T>>, Error> {
     match value {
         None => Ok(vec![None; n]),
-        Some(OneOrMany::One(v)) => Ok(vec![Some(v); n]),
+        Some(OneOrMany::One(v)) => {
+            // Same budget as the `sampling_params` broadcast: `vec![Some(v); n]`
+            // deep-clones client data once per prompt, so a 16 MiB
+            // `token_ids_logprob` fanned to 4096 prompts is ~64 GiB — an
+            // allocation failure, which `abort()`s the scheduler process.
+            check_broadcast_budget(v.heap_bytes(), n, name)?;
+            Ok(vec![Some(v); n])
+        }
         Some(OneOrMany::Many(v)) => {
             if v.len() != n {
                 return Err(Error::Validation(format!(

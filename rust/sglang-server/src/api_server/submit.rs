@@ -28,6 +28,24 @@ pub(super) async fn submit(
         RequestKind::Generate(g) => g.rid.clone(),
         RequestKind::Control(c) => c.rid().to_string(),
     };
+    // Generate rids can be client-supplied, so two in-flight requests may share
+    // one. Detok `Register` is an insert-overwrite: the second would evict the
+    // first's sink, 500 that client mid-generation, and deliver its remaining
+    // chunks to the second's connection. Reject instead, as Python's
+    // `TokenizerManager` does. The entry is dropped by the caller's `AbortGuard`.
+    if matches!(kind, RequestKind::Generate(_))
+        && !state
+            .live_rids
+            .lock()
+            .expect("live_rids poisoned")
+            .insert(rid.clone())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Duplicate request ID detected: {rid}"),
+        )
+            .into_response());
+    }
     let id = RidHash::from_rid(&rid);
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).

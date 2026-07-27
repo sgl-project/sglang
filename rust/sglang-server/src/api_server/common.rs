@@ -63,7 +63,7 @@ async fn model_info(State(state): State<AppState>) -> Response {
         "model_path": sa.model_path,
         "tokenizer_path": sa.tokenizer_path,
         "is_generation": true,
-        "preferred_sampling_params": serde_json::Value::Null,
+        "preferred_sampling_params": sa.preferred_sampling_params,
         "weight_version": serde_json::Value::Null,
     });
     (
