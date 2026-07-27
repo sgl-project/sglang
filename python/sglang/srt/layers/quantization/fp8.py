@@ -707,8 +707,9 @@ class Fp8LinearMethod(LinearMethodBase):
             n, k = layer.weight.shape
             # gfx950 keeps a per-shape Triton-tuned exception list (weights for
             # those shapes stay unshuffled); gfx942 always uses CK bpreshuffle.
-            if _use_aiter_bpreshuffle_gfx942 or not use_aiter_triton_gemm_w8a8_tuned_gfx950(
-                n, k
+            if (
+                _use_aiter_bpreshuffle_gfx942
+                or not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
             ):
                 # TODO(1am9trash), to deal with case that this branch chance
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
