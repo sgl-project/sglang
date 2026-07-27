@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib.util
 import platform
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
@@ -126,8 +126,6 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         return scheduler
 
     def test_fresh_launch_stamps_launch_ts_before_input_resolution(self):
-        from unittest.mock import patch
-
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
@@ -167,15 +165,11 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         ):
             SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
-        self.assertEqual(
-            events, ["launch_ts", "profile", "resolve_inputs", "forward"]
-        )
+        self.assertEqual(events, ["launch_ts", "profile", "resolve_inputs", "forward"])
         self.assertEqual(len(launch_ts_at_copy_time), 1)
         self.assertEqual(launch_ts_at_copy_time[0], 1.0)
 
     def test_chained_launch_restamps_launch_ts(self):
-        from unittest.mock import patch
-
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
@@ -233,6 +227,10 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         scheduler.tp_worker.async_chained_decode_mlx.assert_called_once()
         self.assertLess(events.index("launch_ts:2.0"), events.index("chained_forward"))
         self.assertEqual(chained_copy.launch_ts, 2.0)
+        # The live batch only needs the iteration for SWA maintenance before
+        # the next fresh launch; per-step timing consumes the batch copy.
+        self.assertEqual(batch.forward_iter, 2)
+        self.assertEqual(batch.launch_ts, 1.0)
 
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
@@ -280,9 +278,13 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         # again; the sentinel raising instead means the loop never exits.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
 
-        SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+        with patch(
+            "sglang.srt.hardware_backend.mlx.scheduler_mixin.mx.synchronize"
+        ) as synchronize:
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
         self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
+        synchronize.assert_called_once_with()
 
     def test_loop_exits_when_shutdown_arrives_while_paused(self):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
@@ -297,10 +299,14 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
         scheduler._engine_paused = True
 
-        SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
+        with patch(
+            "sglang.srt.hardware_backend.mlx.scheduler_mixin.mx.synchronize"
+        ) as synchronize:
+            SchedulerMlxOverlapMixin.event_loop_overlap_mlx(scheduler)
 
         self.assertEqual(scheduler.request_receiver.recv_requests.call_count, 1)
         scheduler.get_next_batch_to_run.assert_not_called()
+        synchronize.assert_called_once_with()
 
 
 if __name__ == "__main__":

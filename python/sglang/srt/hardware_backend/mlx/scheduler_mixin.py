@@ -189,10 +189,10 @@ class SchedulerMlxOverlapMixin:
             # updates the same req objects with the new token.
             batch_copy = prev.batch_copy.copy()
             self._prepare_mlx_launch(batch_copy)
-            # Keep the live scheduler batch aligned with the newest queued
-            # step; result processing uses the per-step batch_copy above.
+            # Keep the live scheduler batch's iteration aligned: when the
+            # chain breaks, prepare_for_decode() may run SWA maintenance
+            # before the next fresh launch gets a chance to re-stamp it.
             prev.schedule_batch.forward_iter = batch_copy.forward_iter
-            prev.schedule_batch.launch_ts = batch_copy.launch_ts
             lazy_tokens, prefills, extends, decode, mode = (
                 self.tp_worker.async_chained_decode_mlx(prev.decode)
             )
@@ -209,6 +209,10 @@ class SchedulerMlxOverlapMixin:
 
         while True:
             if self.gracefully_exit:
+                # A lookahead job may already be queued by mx.async_eval but
+                # not finalized. Drain Metal work before the scheduler starts
+                # releasing host resources during graceful teardown.
+                mx.synchronize()
                 break
 
             recv_reqs = self.request_receiver.recv_requests()
