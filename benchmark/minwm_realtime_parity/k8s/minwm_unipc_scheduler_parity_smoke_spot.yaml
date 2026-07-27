@@ -1,0 +1,170 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-unipc-scheduler-parity-20260727-02
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-unipc-scheduler-parity-20260727-02
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: 868d5b5e2c359bff9841a73eb3b694a6af70bcd8
+    seedleap.ai/minwm-git-ref: ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
+    seedleap.ai/capacity-type: spot
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-unipc-scheduler-parity-20260727-02
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/owner: chenshengdong
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-test-usw2d-karpenter
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-usw2d-karpenter
+          effect: NoSchedule
+      containers:
+        - name: test
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --quiet --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --quiet --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM ae2fd81ead16e05f79a57a2f47a4f3b8ea2391bc
+              clone_at sglang /workspace/sglang 868d5b5e2c359bff9841a73eb3b694a6af70bcd8
+              PYTHONPATH=/workspace/sglang/python:/workspace/minWM/Wan21 \
+                /opt/minwm/venv/bin/python3 - <<'PY'
+              import importlib.util
+              import json
+              import sys
+              import types
+              from pathlib import Path
+
+              import torch
+
+              from wan_utils.scheduler import (
+                  FlowUniPCMultistepScheduler as NativeFlowUniPCMultistepScheduler,
+              )
+
+              base_name = (
+                  "sglang.multimodal_gen.runtime.models.schedulers.base"
+              )
+              base_module = types.ModuleType(base_name)
+
+              class BaseScheduler:
+                  def __init__(self, *args, **kwargs):
+                      pass
+
+              base_module.BaseScheduler = BaseScheduler
+              sys.modules[base_name] = base_module
+              scheduler_name = (
+                  "sglang.multimodal_gen.runtime.models.schedulers."
+                  "scheduling_flow_unipc_multistep"
+              )
+              scheduler_path = Path(
+                  "/workspace/sglang/python/sglang/multimodal_gen/runtime/"
+                  "models/schedulers/scheduling_flow_unipc_multistep.py"
+              )
+              spec = importlib.util.spec_from_file_location(
+                  scheduler_name, scheduler_path
+              )
+              scheduler_module = importlib.util.module_from_spec(spec)
+              sys.modules[scheduler_name] = scheduler_module
+              spec.loader.exec_module(scheduler_module)
+              MinWMFlowUniPCParityScheduler = (
+                  scheduler_module.MinWMFlowUniPCParityScheduler
+              )
+
+              torch.manual_seed(42)
+              torch.cuda.manual_seed_all(42)
+              device = torch.device("cuda")
+              results = []
+              for dtype in (torch.float32, torch.bfloat16):
+                  native = NativeFlowUniPCMultistepScheduler(
+                      num_train_timesteps=1000,
+                      shift=1.0,
+                      use_dynamic_shifting=False,
+                  )
+                  parity = MinWMFlowUniPCParityScheduler(
+                      num_train_timesteps=1000,
+                      shift=1.0,
+                      use_dynamic_shifting=False,
+                  )
+                  native.set_timesteps(4, device=device, shift=5.0)
+                  parity.set_timesteps(4, device=device, shift=5.0)
+                  assert torch.equal(native.timesteps, parity.timesteps)
+                  assert torch.equal(native.sigmas, parity.sigmas)
+                  assert native.sigmas.device.type == parity.sigmas.device.type == "cpu"
+
+                  initial = torch.randn(
+                      (1, 4, 16, 6, 8), device=device, dtype=dtype
+                  )
+                  model_outputs = [
+                      torch.randn_like(initial) for _ in native.timesteps
+                  ]
+                  native_sample = initial.clone()
+                  parity_sample = initial.clone()
+                  steps = []
+                  for index, (native_t, parity_t, model_output) in enumerate(
+                      zip(native.timesteps, parity.timesteps, model_outputs, strict=True)
+                  ):
+                      native_sample = native.step(
+                          model_output,
+                          native_t,
+                          native_sample,
+                          return_dict=False,
+                      )[0]
+                      parity_sample = parity.step(
+                          model_output,
+                          parity_t,
+                          parity_sample,
+                          return_dict=False,
+                      )[0]
+                      delta = (
+                          native_sample.float() - parity_sample.float()
+                      ).abs()
+                      step = {
+                          "index": index,
+                          "bitwise": bool(torch.equal(native_sample, parity_sample)),
+                          "max_abs": float(delta.max().item()),
+                      }
+                      steps.append(step)
+                      assert step["bitwise"], step
+                  results.append({"dtype": str(dtype), "steps": steps})
+              print(json.dumps({"all_bitwise": True, "results": results}, sort_keys=True))
+              PY
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"

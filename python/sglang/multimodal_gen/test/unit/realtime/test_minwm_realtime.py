@@ -373,8 +373,10 @@ def test_minwm_unipc_scheduler_matches_native_shift_contract():
     )
     scheduler = pipeline.modules["scheduler"]
 
+    assert scheduler.__class__.__name__ == "MinWMFlowUniPCParityScheduler"
     assert scheduler.config.shift == 1.0
     scheduler.set_timesteps(4, device="cpu", shift=5.0)
+    assert scheduler.sigmas.device.type == "cpu"
     assert scheduler.timesteps.tolist() == [999, 936, 832, 624]
 
 
