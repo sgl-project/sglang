@@ -18,8 +18,9 @@ Hierarchy example (OOT plugin)::
 
 Method status annotations:
 
-- ``[Active]``  — SGLang core calls this method through ``current_platform``.
-  OOT implementations take effect immediately.
+- ``[Active]``  — SGLang core has at least one path routed through
+  ``current_platform`` for this method. OOT implementations take effect on
+  those routed paths.
 - ``[Planned]`` — Reserved interface. SGLang core still uses hardcoded calls
   (e.g. ``torch.cuda.empty_cache()``). OOT implementations will NOT take
   effect until the core is migrated in a future PR.
@@ -145,8 +146,8 @@ class DeviceMixin:
         return self._enum == PlatformEnum.OOT
 
     # ------------------------------------------------------------------
-    # Active methods — core calls these through current_platform.
-    # OOT implementations take effect immediately.
+    # Active methods — core has at least one current_platform call path.
+    # OOT implementations take effect on the routed paths.
     # ------------------------------------------------------------------
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
@@ -157,6 +158,10 @@ class DeviceMixin:
         self, device: Optional["torch.device"] = None
     ) -> float:
         """[Active] Get current peak memory usage in bytes."""
+        raise NotImplementedError
+
+    def get_device_name(self, device_id: int = 0) -> str:
+        """[Active] Get human-readable device name on routed paths."""
         raise NotImplementedError
 
     def is_pin_memory_available(self, device=None) -> bool:
@@ -177,10 +182,6 @@ class DeviceMixin:
 
     def set_device(self, device: "torch.device") -> None:
         """[Planned] Set the current device."""
-        raise NotImplementedError
-
-    def get_device_name(self, device_id: int = 0) -> str:
-        """[Planned] Get human-readable device name."""
         raise NotImplementedError
 
     def get_device_uuid(self, device_id: int = 0) -> str:
