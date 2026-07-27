@@ -463,24 +463,33 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return _strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
         return _strip_response_wrappers(text)
 
-    def _find_think_close(self, text: str, start: int = 0) -> Tuple[int, int]:
-        """Earliest canonical or sep-elided think close as ``(idx, end)``; the elided ``end`` keeps ``<|open|>`` in the remainder."""
-        idx = text.find(self.think_end_token, start)
-        elided_idx = text.find(THINK_CLOSE_ELIDED, start)
-        if elided_idx != -1 and (idx == -1 or elided_idx < idx):
-            return elided_idx, elided_idx + len(THINK_CLOSE_NOSEP)
-        if idx != -1:
-            return idx, idx + len(self.think_end_token)
-        return -1, -1
+    # a think close is <|close|>think followed by <|sep|> (consumed), another marker,
+    # an end token, or — non-streaming only — the end of the text
+    _think_close_re = re.compile(
+        r"<\|close\|>think(?:<\|sep\|>|(?=<\|open\|>|<\|close\|>|<\|end_of_msg\|>|\[EOS\]|\[EOT\]))"
+    )
+    _think_close_eof_re = re.compile(
+        r"<\|close\|>think(?:<\|sep\|>|(?=<\|open\|>|<\|close\|>|<\|end_of_msg\|>|\[EOS\]|\[EOT\]|$))"
+    )
+
+    def _find_think_close(
+        self, text: str, start: int = 0, at_eof: bool = False
+    ) -> Tuple[int, int]:
+        """Earliest think close as ``(idx, end)``; ``(-1, -1)`` if absent."""
+        pattern = self._think_close_eof_re if at_eof else self._think_close_re
+        m = pattern.search(text, start)
+        if m is None:
+            return -1, -1
+        return m.start(), m.end()
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
-        if not in_reasoning and self._find_think_close(text)[0] == -1:
+        if not in_reasoning and self._find_think_close(text, at_eof=True)[0] == -1:
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
-        close_idx, close_end = self._find_think_close(text, start)
+        close_idx, close_end = self._find_think_close(text, start, at_eof=True)
         if close_idx == -1:
             tools_idx = text.find(self.tool_start_token, start)
             if tools_idx != -1:
@@ -544,7 +553,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, THINK_CLOSE_ELIDED, self.tool_start_token]
+            markers = [
+                self.think_end_token,
+                THINK_CLOSE_ELIDED,
+                THINK_CLOSE_NOSEP + "<|close|>",
+                THINK_CLOSE_NOSEP + "<|end_of_msg|>",
+                THINK_CLOSE_NOSEP + "[EOS]",
+                THINK_CLOSE_NOSEP + "[EOT]",
+                self.tool_start_token,
+            ]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = _partial_suffix_len(buf, markers)

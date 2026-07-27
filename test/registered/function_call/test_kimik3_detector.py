@@ -325,6 +325,43 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertEqual(reasoning, "I am thinking")
         self.assertEqual(content, "Answer here")
 
+    def test_non_stream_close_at_end_of_text(self):
+        # generation can stop right at the close; the marker must not leak
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse("Simple, no tools needed.<|close|>think")
+        self.assertEqual(result.reasoning_text, "Simple, no tools needed.")
+        self.assertFalse(result.normal_text)
+
+    def test_non_stream_close_then_end_of_msg(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse("done thinking<|close|>think<|end_of_msg|>")
+        self.assertEqual(result.reasoning_text, "done thinking")
+        self.assertNotIn("<|close|>", result.normal_text or "")
+
+    def test_non_stream_close_then_message_close(self):
+        # no response section at all: reasoning must stay clean, answer empty
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            "hmm<|close|>think<|close|>message<|sep|>"
+        )
+        self.assertEqual(result.reasoning_text, "hmm")
+        self.assertFalse(result.normal_text)
+
+    def test_streaming_close_then_end_of_msg_single_chunk(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        reasoning, content = self._stream(
+            detector, ["short thought<|close|>think<|end_of_msg|>"]
+        )
+        self.assertEqual(reasoning, "short thought")
+        self.assertNotIn("<|close|>", content)
+
+    def test_streaming_close_at_stream_end_is_held(self):
+        # stream dies right after the close: the marker stays buffered, not emitted
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        reasoning, content = self._stream(detector, ["thinking...", "<|close|>think"])
+        self.assertEqual(reasoning, "thinking...")
+        self.assertNotIn("<|close|>", reasoning + content)
+
     def test_streaming_elided_think_close_char_by_char(self):
         detector = KimiK3ReasoningDetector(force_reasoning=True)
         full = (
