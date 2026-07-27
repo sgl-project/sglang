@@ -20,6 +20,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
+from sglang.multimodal_gen.configs.pipeline_configs.bagel import BagelPipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
@@ -49,6 +50,25 @@ from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 
+_BAGEL_PIPELINE_CLASS_NAMES = frozenset(
+    {
+        "BagelPipeline",
+        "BagelThinkingPipeline",
+        "BagelUnderstandingPipeline",
+        "BagelEditPipeline",
+    }
+)
+_LEGACY_BAGEL_MODE_FIELDS = (
+    "enable_editing",
+    "enable_think",
+    "enable_understanding",
+)
+_LEGACY_BAGEL_VALUE_FIELDS = (
+    "cfg_img_scale",
+    "max_understanding_tokens",
+)
+_LEGACY_BAGEL_PATH_FIELDS = ("image_path",)
+
 
 def _get_extra_field(request, field_name):
     """Get a field from model_extra, with fallback to nested extra_body dict."""
@@ -72,6 +92,74 @@ def _get_request_field_or_extra(request, field_name):
     if value is not None:
         return value
     return _get_extra_field(request, field_name)
+
+
+def _get_extra_field_values(
+    request: ImageGenerationsRequest, field_name: str
+) -> list[Any]:
+    """Return every direct or nested value supplied for an extension field."""
+    extra = request.model_extra or {}
+    values = [extra[field_name]] if field_name in extra else []
+    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
+        nested = _parse_extra_container(extra.get(container_name))
+        if field_name in nested:
+            values.append(nested[field_name])
+    return values
+
+
+def _reject_legacy_bagel_generation_fields(
+    request: ImageGenerationsRequest, server_args: Any
+) -> None:
+    """Reject active request-level mode switches from the BAGEL prototype.
+
+    Args:
+        request: Parsed OpenAI-compatible image generation request.
+        server_args: Active server configuration used to identify BAGEL.
+
+    Raises:
+        HTTPException: If a BAGEL request activates a removed legacy field.
+    """
+    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    if pipeline_class_name not in _BAGEL_PIPELINE_CLASS_NAMES and not isinstance(
+        pipeline_config, BagelPipelineConfig
+    ):
+        return
+
+    active_fields = [
+        field_name
+        for field_name in _LEGACY_BAGEL_MODE_FIELDS
+        if any(_get_extra_field_values(request, field_name))
+    ]
+    active_fields.extend(
+        field_name
+        for field_name in _LEGACY_BAGEL_VALUE_FIELDS
+        if any(
+            value is not None for value in _get_extra_field_values(request, field_name)
+        )
+    )
+    active_fields.extend(
+        field_name
+        for field_name in _LEGACY_BAGEL_PATH_FIELDS
+        if any(_get_extra_field_values(request, field_name))
+    )
+    if not active_fields:
+        return
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "BAGEL no longer supports legacy per-request mode fields on "
+            f"/v1/images/generations: {', '.join(sorted(active_fields))}. "
+            "Start BagelThinkingPipeline instead of enable_think; use "
+            "BagelEditPipeline with /v1/images/edits and true_cfg_scale instead "
+            "of enable_editing and cfg_img_scale; use BagelUnderstandingPipeline "
+            "with /v1/chat/completions and max_completion_tokens instead of "
+            "enable_understanding and max_understanding_tokens. For HTTP input, "
+            "replace image_path with image or url on the edits endpoint, or with "
+            "image_url on the chat endpoint."
+        ),
+    )
 
 
 def _parse_extra_container(value: Any) -> dict[str, Any]:
@@ -274,6 +362,7 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    _reject_legacy_bagel_generation_fields(request, server_args)
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
     ext = (
         "png"

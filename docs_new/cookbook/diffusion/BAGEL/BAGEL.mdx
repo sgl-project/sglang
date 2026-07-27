@@ -25,6 +25,21 @@ T2I, Thinking, and Editing; Understanding rejects it because that pipeline does
 not denoise images. Transformer tensor parallelism is validated at TP=2.
 </Warning>
 
+<Note>
+Older BAGEL prototypes selected capabilities with request fields on
+`/v1/images/generations`. Active values now return HTTP 400 on a BAGEL server:
+use `BagelThinkingPipeline` instead of `enable_think`; use `BagelEditPipeline`
+and `/v1/images/edits` instead of `enable_editing`, with `true_cfg_scale`
+replacing `cfg_img_scale`; use `BagelUnderstandingPipeline` and
+`/v1/chat/completions` instead of `enable_understanding`, with
+`max_completion_tokens` replacing `max_understanding_tokens`. Inactive
+boolean selectors set to `False`/`None`, nullable value fields set to `None`,
+and an empty path remain accepted for generic clients. The old HTTP `image_path`
+field is otherwise rejected: send `image` or `url` to the edits endpoint, or
+`image_url` to Chat Completions. Offline `sglang generate --image-path` remains
+supported.
+</Note>
+
 ## Prerequisites
 
 - Install SGLang Diffusion by following the
