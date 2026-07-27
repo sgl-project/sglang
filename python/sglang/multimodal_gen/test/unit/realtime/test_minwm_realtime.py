@@ -794,6 +794,35 @@ def test_minwm_adaln_uses_bf16_modulation_sum_and_fp32_layer_norm():
         _minwm_layer_norm(hidden, eps=1e-6), expected_norm, rtol=0, atol=0
     )
 
+    generator = torch.Generator().manual_seed(23)
+    affine_hidden = torch.randn(2, 11, 32, generator=generator).to(torch.bfloat16)
+    affine_weight = torch.randn(32, generator=generator)
+    affine_bias = torch.randn(32, generator=generator)
+    expected_affine_norm = torch.nn.functional.layer_norm(
+        affine_hidden.float(),
+        (affine_hidden.shape[-1],),
+        affine_weight.to(affine_hidden.dtype).float(),
+        affine_bias.to(affine_hidden.dtype).float(),
+        1e-6,
+    ).to(affine_hidden.dtype)
+    actual_affine_norm = _minwm_layer_norm(
+        affine_hidden,
+        eps=1e-6,
+        weight=affine_weight,
+        bias=affine_bias,
+    )
+    torch.testing.assert_close(
+        actual_affine_norm, expected_affine_norm, rtol=0, atol=0
+    )
+    fp32_parameter_norm = torch.nn.functional.layer_norm(
+        affine_hidden.float(),
+        (affine_hidden.shape[-1],),
+        affine_weight,
+        affine_bias,
+        1e-6,
+    ).to(affine_hidden.dtype)
+    assert not torch.equal(actual_affine_norm, fp32_parameter_norm)
+
     expected_adaln = (
         torch.nn.functional.layer_norm(hidden.float(), (hidden.shape[-1],), eps=1e-6)
         * (1 + actual_modulation.float())

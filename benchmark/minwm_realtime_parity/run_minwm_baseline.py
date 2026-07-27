@@ -216,10 +216,10 @@ def main() -> None:
                         value.detach().cpu(),
                         dump_dir / f"{name}_{index:03d}.pt",
                     )
-                    if name == "self_q":
+                    if name in {"self_q", "cross_q"}:
                         torch.save(
                             hook_args[0].detach().cpu(),
-                            dump_dir / f"self_q_input_{index:03d}.pt",
+                            dump_dir / f"{name}_input_{index:03d}.pt",
                         )
                 detail_counters[name] = index + 1
 

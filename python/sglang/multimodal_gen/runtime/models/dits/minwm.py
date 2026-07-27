@@ -221,11 +221,19 @@ def _minwm_layer_norm_op(
     bias: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
+    # minWM's inference loader casts the entire generator to BF16 before moving
+    # it to CUDA. SGLang keeps the generic affine LayerNorm parameters in FP32,
+    # so reproduce that model-wide cast at the operation boundary before doing
+    # the actual normalization in FP32.
+    weight_float = (
+        weight.to(hidden_states.dtype).float() if weight is not None else None
+    )
+    bias_float = bias.to(hidden_states.dtype).float() if bias is not None else None
     return F.layer_norm(
         hidden_states.float(),
         (hidden_states.shape[-1],),
-        weight.float() if weight is not None else None,
-        bias.float() if bias is not None else None,
+        weight_float,
+        bias_float,
         eps,
     ).type_as(hidden_states)
 
@@ -1037,10 +1045,10 @@ class MinWMCausalTransformer3DModel(CausalWanTransformer3DModel):
 
             def hook(_module, hook_args, output, detail_name=name):
                 index = counters[detail_name]
-                if index < 2 and detail_name == "self_q":
+                if index < 2 and detail_name in {"self_q", "cross_q"}:
                     torch.save(
                         hook_args[0].detach().cpu(),
-                        dump_dir / f"self_q_input_{index:03d}.pt",
+                        dump_dir / f"{detail_name}_input_{index:03d}.pt",
                     )
                 dump(detail_name, output)
 
