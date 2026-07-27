@@ -241,7 +241,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -295,6 +295,29 @@ logger = logging.getLogger(__name__)
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+
+DECODE_STEP_MAX_US = 2_000_000
+
+
+def _accumulate_decode_moment(
+    totals: list[float],
+    batch_size: int,
+    step_us: int,
+    generated: int,
+) -> None:
+    if batch_size <= 0 or step_us <= 0:
+        return
+    b = float(batch_size)
+    t = float(step_us)
+    g = float(generated)
+    totals[0] += 1.0
+    totals[1] += b
+    totals[2] += t
+    totals[3] += b * b
+    totals[4] += b * t
+    totals[5] += g
+
 
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -786,6 +809,11 @@ class Scheduler(
         )
 
         if self.server_args.speculative_draft_load_format is not None:
+            # Write the draft load_format onto server_args (not just the bag):
+            # the draft worker is built from a copy of self.server_args and
+            # build_load_config reads server_args.load_format, so a bag-only
+            # override would be ignored and the draft would load in the target's
+            # format.
             self.server_args.override(
                 "scheduler.draft_load_format",
                 load_format=self.server_args.speculative_draft_load_format,
@@ -857,6 +885,12 @@ class Scheduler(
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
 
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.ep_join_mode == "recover"
+        ):
+            model_runner.post_capture_elastic_ep_recover()
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
@@ -890,8 +924,8 @@ class Scheduler(
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
             )
-        if not get_server_args().pp_max_micro_batch_size:
-            get_server_args().override(
+        if not get_parallel().pp_max_micro_batch_size:
+            get_context().override(
                 "scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
                     self.max_running_requests // self.ps.pp_size, 1
@@ -1460,11 +1494,9 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
-        # A plain HiRadixCache (no hisparse) also holds a large pinned host KV
-        # pool; unregister it here too, else the kernel unpins it during reclaim.
-        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None)
-        if host_pool is not None:
-            host_pool.destroy()
+        self.tree_cache.release_host_resources()
+        if self.decode_offload_manager is not None:
+            self.decode_offload_manager.release_host_resources()
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
@@ -1646,14 +1678,12 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Spec algorithms that don't advance the grammar FSM inside verify() (see
-        # supports_grammar_overlap) still need overlap forced off for grammar decode
-        # batches, so the FSM is advanced before the next batch's bitmask.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
@@ -1839,6 +1869,10 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
+        self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -1859,6 +1893,9 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
     def init_output_streamer(self) -> None:
@@ -2381,25 +2418,25 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
+            tree_cache = self.tree_cache
+            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
+                req.last_host_node
+            ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    tree_cache.get_prefix_hash_values(req.last_host_node)
+                    if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                tree_cache.prefetch_from_storage(
                     req.rid,
-                    last_host_node,
+                    req.last_host_node,
                     new_input_tokens,
-                    last_hash,
+                    tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
 
@@ -2837,7 +2874,7 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_server_args().pp_max_micro_batch_size - running_bs
+        res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3310,6 +3347,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3491,18 +3529,24 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
-                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                    pooler_output, can_run_cuda_graph = (
+                        self.tp_worker.forward_batch_embedding(batch)
+                    )
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
+                        can_run_cuda_graph=can_run_cuda_graph,
                     )
                     ret.copy_to_cpu()
             else:
                 resolve_forward_inputs(batch, self.future_map)
-                pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                pooler_output, can_run_cuda_graph = (
+                    self.tp_worker.forward_batch_embedding(batch)
+                )
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
+                    can_run_cuda_graph=can_run_cuda_graph,
                 )
 
         self._maybe_report_active_ranks()
@@ -3599,6 +3643,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._record_step_counters(batch, result)
+
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3608,6 +3654,33 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _record_step_counters(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        mode = batch.forward_mode
+        is_prefill = mode.is_extend_without_speculative()
+        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+            return
+        if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill:
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
+        else:
+            batch_size = len(batch.reqs)
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -3893,7 +3966,9 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
+        # Resolved config (pristine server_args + post-publish overrides) so a
+        # readback reflects values changed via /set_internal_state, not startup.
+        ret = get_context().resolved_server_args_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -4013,8 +4088,8 @@ class Scheduler(
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
-                get_server_args().override(source="update_server_args", **remaining)
-            logger.info(f"Global server args updated! {get_server_args()=}")
+                get_context().override(source="update_server_args", **remaining)
+            logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
 
