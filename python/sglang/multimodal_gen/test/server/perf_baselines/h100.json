@@ -2,8 +2,8 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI H100 80GB pool",
-        "description": "Reference numbers captured from CI diffusion runs (latest source: PR 28127 run 27487958425, tightened only from prior baselines).",
-        "last_updated": "2026-06-14"
+        "description": "Reference numbers captured from CI diffusion runs (BAGEL refreshed on H100 80GB; other entries latest source: PR 28127 run 27487958425).",
+        "last_updated": "2026-07-08"
     },
     "tolerances": {
         "long_term": {
@@ -35,6 +35,70 @@
         ]
     },
     "scenarios": {
+        "bagel_t2i": {
+            "stages_ms": {
+                "BagelInputValidationStage": 0.03,
+                "BagelBeforeDenoisingStage": 35.41,
+                "DenoisingStage": 12765.42,
+                "DecodingStage": 6.65
+            },
+            "denoise_step_ms": {
+                "0": 270.58,
+                "1": 275.7,
+                "2": 274.23,
+                "3": 289.04,
+                "4": 278.15,
+                "5": 279.38,
+                "6": 282.35,
+                "7": 283.4,
+                "8": 279.64,
+                "9": 278.49,
+                "10": 283.71,
+                "11": 279.53,
+                "12": 279.33,
+                "13": 280.9,
+                "14": 283.82,
+                "15": 280.77,
+                "16": 280.23,
+                "17": 281.46,
+                "18": 283.62,
+                "19": 278.92,
+                "20": 280.52,
+                "21": 280.38,
+                "22": 280.25,
+                "23": 278.98,
+                "24": 280.6,
+                "25": 280.56,
+                "26": 280.0,
+                "27": 278.9,
+                "28": 280.91,
+                "29": 279.69,
+                "30": 278.98,
+                "31": 280.31,
+                "32": 280.99,
+                "33": 279.24,
+                "34": 279.92,
+                "35": 279.48,
+                "36": 280.19,
+                "37": 280.51,
+                "38": 279.99,
+                "39": 280.34,
+                "40": 281.55,
+                "41": 143.45,
+                "42": 142.09,
+                "43": 141.07,
+                "44": 141.04,
+                "45": 142.15,
+                "46": 141.51,
+                "47": 141.6,
+                "48": 141.83,
+                "49": 141.19
+            },
+            "expected_e2e_ms": 12810.42,
+            "expected_avg_denoise_ms": 255.23,
+            "expected_median_denoise_ms": 279.81,
+            "estimated_full_test_time_s": 83.5
+        },
         "qwen_image_t2i": {
             "stages_ms": {
                 "TextEncodingStage": 232.03,

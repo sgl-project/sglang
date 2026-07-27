@@ -456,6 +456,7 @@ T2I_sampling_params = DiffusionSamplingParams(
 BAGEL_T2I_CI_SAMPLING_PARAMS = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="1024x1024",
+    output_format="png",
     extras={
         "seed": 42,
         "num_inference_steps": 50,
