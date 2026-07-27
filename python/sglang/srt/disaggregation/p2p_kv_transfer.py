@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +41,9 @@ logger = logging.getLogger(__name__)
 def _p2p_req_to_builtins(req: P2PKVTransferReqInput):
     if dataclasses.is_dataclass(req):
         return dataclasses.asdict(req)
-    return msgspec_to_builtins(req)
+    import msgspec
+
+    return msgspec.to_builtins(req)
 
 
 def _radix_key(token_ids, extra_key=None):
