@@ -32,8 +32,12 @@ from sglang.srt.managers.tokenizer_control_mixin import (
     TokenizerControlMixin,
 )
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.test.ci.ci_register import register_cpu_ci
+
+try:
+    from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+except ImportError:
+    msgspec_to_builtins = msgspec.to_builtins
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
