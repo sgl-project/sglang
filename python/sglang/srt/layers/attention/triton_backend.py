@@ -29,7 +29,12 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_utils import (
@@ -223,7 +228,14 @@ class TritonAttnBackend(AttentionBackend):
             self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
-            cuda_graph_fully_disabled()
+            # BCG captures one complete prefill forward. It is therefore safe
+            # for encoder-style attention, unlike the other CUDA graph modes
+            # that can split or pad requests. Eager prefill remains supported
+            # as before.
+            (
+                cuda_graph_fully_disabled()
+                or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            )
             and model_runner.server_args.chunked_prefill_size == -1
         )
 
@@ -282,6 +294,8 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+        # Tree-mask scratch is fetched from the target backend only.
+        self.is_draft_runner = model_runner.is_draft_worker
 
     def get_num_kv_splits(
         self,
@@ -973,7 +987,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if not self.skip_prefill:
+        if not self.skip_prefill and not self.is_draft_runner:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -1211,6 +1225,8 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        score_mod=None,
+        aux_tensors=None,
     ):
         # TODO: reuse the buffer across layers
         attn_out = getattr(forward_batch, "_attn_output", None)
@@ -1277,6 +1293,10 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         if self.dcp_size > 1:
+            if score_mod is not None:
+                raise NotImplementedError(
+                    "DCP Triton extend does not support score_mod"
+                )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
@@ -1284,7 +1304,15 @@ class TritonAttnBackend(AttentionBackend):
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
             return self._forward_extend_unified(
-                q, o, layer, forward_batch, causal, logits_soft_cap, sinks
+                q,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
             )
 
         # Normal mode: use original 2-stage kernel
@@ -1317,6 +1345,7 @@ class TritonAttnBackend(AttentionBackend):
         # extend_attention_fwd below. Correctness is never at risk.
         if (
             self.use_verify_splitkv
+            and score_mod is None
             and forward_batch.forward_mode.is_target_verify()
             and self.verify_splitkv_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1368,6 +1397,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
         return o
 
@@ -1513,6 +1544,8 @@ class TritonAttnBackend(AttentionBackend):
         causal: bool,
         logits_soft_cap: float,
         sinks: Optional[torch.Tensor],
+        score_mod=None,
+        aux_tensors=None,
     ):
         """
         Unified 1-stage extend attention for deterministic inference.
@@ -1638,6 +1671,8 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
 
         return o
@@ -1651,6 +1686,8 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        score_mod=None,
+        aux_tensors=None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -1716,6 +1753,10 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = self.forward_metadata.swa_attn_logits
 
         if self.dcp_size > 1:
+            if score_mod is not None:
+                raise NotImplementedError(
+                    "DCP Triton decode does not support score_mod"
+                )
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
@@ -1775,6 +1816,8 @@ class TritonAttnBackend(AttentionBackend):
             has_mla=self.use_mla,
             use_pdl=self.use_pdl,
             page_size=self.page_size,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
         )
         return o
 

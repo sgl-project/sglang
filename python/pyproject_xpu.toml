@@ -30,7 +30,7 @@ dependencies = [
   "gguf",
   "interegular",
   "IPython",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
   "msgspec",
@@ -67,6 +67,7 @@ dependencies = [
   "tqdm",
   "transformers==5.12.1",
   "uvicorn",
+  "xxhash",
   "uvloop",
   # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
 ]
@@ -130,7 +131,7 @@ sglang = "sglang.cli.main:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
-  "jit_kernel/**/*"
+  "kernels/**/*"
 ]
 
 [tool.setuptools.packages.find]
