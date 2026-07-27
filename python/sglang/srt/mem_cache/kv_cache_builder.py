@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_memory,
+    get_observability,
     get_parallel,
     get_schedule,
 )
@@ -324,6 +325,7 @@ def build_kv_cache(
         eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        enable_kv_events_component_types=get_observability().enable_kv_events_component_types,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),

@@ -1623,6 +1623,16 @@ class KVEventsSubscriber:
         if isinstance(event, BlockStored):
             hashes = [str(h) for h in event.block_hashes]
             tier = self._medium_to_tier(event.medium)
+            # The external-KV API is keyed by (hashes, tier) only, so
+            # component_types is logged for observability but not forwarded.
+            if event.component_types is not None:
+                logger.debug(
+                    "BlockStored: %d hashes tier=%s components=%s (component "
+                    "granularity not forwarded to UMBP master)",
+                    len(hashes),
+                    tier,
+                    event.component_types,
+                )
             ok = self._umbp_client.report_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(
@@ -1634,6 +1644,8 @@ class KVEventsSubscriber:
         elif isinstance(event, BlockRemoved):
             hashes = [str(h) for h in event.block_hashes]
             tier = self._medium_to_tier(event.medium)
+            # BlockRemoved is always whole-block, so a tier-level revoke is
+            # correct without component granularity.
             ok = self._umbp_client.revoke_external_kv_blocks(hashes, tier)
             if not ok:
                 logger.warning(
