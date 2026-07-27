@@ -1,0 +1,103 @@
+---
+title: "BAGEL"
+description: "Serve the BAGEL-7B-MoT text-to-image checkpoint with SGLang Diffusion."
+---
+
+## Overview
+
+[BAGEL-7B-MoT](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) is a
+multimodal mixture-of-transformer-experts model from ByteDance Seed. SGLang's
+initial BAGEL integration supports its text-to-image path on NVIDIA CUDA.
+
+<Warning>
+This integration is text-to-image only. It does not support image editing,
+image understanding, multi-output requests, dynamic batching, tensor or
+sequence parallelism, Cache-DiT, or layer-wise offload.
+</Warning>
+
+## Prerequisites
+
+- Install SGLang Diffusion by following the
+  [installation guide](/docs/sglang-diffusion/installation).
+- Use one NVIDIA CUDA GPU with enough memory for the BF16 checkpoint and the
+  requested image resolution.
+- Use the official `ByteDance-Seed/BAGEL-7B-MoT` checkpoint. The examples pin a
+  checkpoint revision for reproducibility.
+
+## Start the server
+
+Start the OpenAI-compatible image server:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --port 30000
+```
+
+You can also pass a local checkpoint directory. SGLang identifies an arbitrary
+local directory as BAGEL only when it contains all four root-level files:
+`config.json`, `llm_config.json`, `ema.safetensors`, and `ae.safetensors`.
+
+## Generate an image
+
+Send a single-output request through the OpenAI-compatible images API:
+
+```python
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    prompt="Doraemon is eating dorayaki",
+    n=1,
+    response_format="b64_json",
+    size="1024x1024",
+    extra_body={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "flow_shift": 3.0,
+        "generator_device": "cpu",
+    },
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("bagel.png", "wb") as output_file:
+    output_file.write(image_bytes)
+```
+
+For an offline one-shot generation, use the CLI:
+
+```bash
+sglang generate \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --prompt "Doraemon is eating dorayaki" \
+  --height 1024 \
+  --width 1024 \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --guidance-scale 4.0 \
+  --save-output
+```
+
+The default BAGEL flow shift is `3.0`. The images API accepts `flow_shift` as a
+request field; the offline CLI uses the model default. The fixed-seed example
+uses the CPU generator to match the official BAGEL noise initialization.
+
+## Current request contract
+
+- Send one prompt and request one output (`n=1`).
+- Use an empty or omitted negative prompt. BAGEL's initial T2I path does not
+  implement negative-prompt conditioning.
+- Use `num_inference_steps=50` to execute 50 denoising updates.
+- Keep `guidance_scale=4.0` and `flow_shift=3.0` for the official default path.
+
+See the [BAGEL repository](https://github.com/ByteDance-Seed/Bagel) for the
+upstream model implementation and the
+[SGLang Diffusion API guide](/docs/sglang-diffusion/api/openai_api) for endpoint
+details.

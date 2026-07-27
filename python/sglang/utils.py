@@ -46,6 +46,67 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "comfy-org--ideogram-4": "Ideogram4Nvfp4Pipeline",
 }
 
+BAGEL_MODEL_ID = "ByteDance-Seed/BAGEL-7B-MoT"
+BAGEL_PIPELINE_NAME = "BagelPipeline"
+BAGEL_LOCAL_CHECKPOINT_MARKERS: frozenset[str] = frozenset(
+    {
+        "config.json",
+        "llm_config.json",
+        "ema.safetensors",
+        "ae.safetensors",
+    }
+)
+
+
+def _matches_hf_model_id_or_cache_path(model_path: str, model_id: str) -> bool:
+    """Match one canonical Hugging Face ID or its local cache directory.
+
+    Args:
+        model_path: Hugging Face model ID or local filesystem path.
+        model_id: Canonical Hugging Face model ID.
+
+    Returns:
+        Whether ``model_path`` is the canonical ID or contains its exact
+        ``models--org--repo`` Hugging Face cache segment.
+    """
+    normalized_path = os.path.normpath(model_path).replace("\\", "/").lower()
+    normalized_model_id = model_id.rstrip("/").lower()
+    if normalized_path.rstrip("/") == normalized_model_id:
+        return True
+
+    cache_segment = f"models--{normalized_model_id.replace('/', '--')}"
+    return cache_segment in normalized_path.split("/")
+
+
+def resolve_non_diffusers_diffusion_pipeline(model_path: str) -> str | None:
+    """Resolve a non-Diffusers checkpoint without network access.
+
+    BAGEL local directories are recognized only when every required root-level
+    marker is a file. This strict check prevents an unrelated or incomplete
+    directory whose name contains ``bagel`` from being routed to the BAGEL
+    pipeline.
+
+    Args:
+        model_path: Hugging Face model ID, cache path, or local checkpoint path.
+
+    Returns:
+        Registered pipeline name, or ``None`` when the path is not recognized.
+    """
+    if _matches_hf_model_id_or_cache_path(model_path, BAGEL_MODEL_ID):
+        return BAGEL_PIPELINE_NAME
+
+    if os.path.isdir(model_path) and all(
+        os.path.isfile(os.path.join(model_path, marker))
+        for marker in BAGEL_LOCAL_CHECKPOINT_MARKERS
+    ):
+        return BAGEL_PIPELINE_NAME
+
+    model_path_lower = model_path.lower()
+    for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
+        if pattern in model_path_lower:
+            return pipeline_name
+    return None
+
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
@@ -85,11 +146,8 @@ def has_diffusion_overlay_registry_match(
 
 
 def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
+    """Return whether ``model_path`` resolves to a native non-Diffusers pipeline."""
+    return resolve_non_diffusers_diffusion_pipeline(model_path) is not None
 
 
 def execute_once(func):

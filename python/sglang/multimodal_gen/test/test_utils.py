@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
+from sglang.utils import BAGEL_MODEL_ID
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
@@ -159,6 +160,10 @@ def _load_clip_processor_with_roberta_processing_compat(
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_AR_MODEL_NAME_FOR_TEST = "zai-org/GLM-Image"
+
+# BAGEL text-to-image model
+DEFAULT_BAGEL_MODEL_NAME_FOR_TEST = BAGEL_MODEL_ID
+DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST = "5019f57d168e5816e8f3f701b17cc816bb7cf24b"
 
 # Cosmos3 generation models
 DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"

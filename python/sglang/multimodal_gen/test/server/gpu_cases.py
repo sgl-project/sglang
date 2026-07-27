@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    BAGEL_T2I_CI_SAMPLING_PARAMS,
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
@@ -40,6 +41,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     _with_default_num_gpus,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
     DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
@@ -467,6 +470,28 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
 ]
+
+# The regular 1-GPU CUDA PR shard runs on H100.
+# TODO: Enable consistency and performance checks after publishing the pinned
+# official GT and a measured H100 baseline; never infer these values locally.
+if current_platform.is_cuda():
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_t2i",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="image",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                ],
+            ),
+            BAGEL_T2I_CI_SAMPLING_PARAMS,
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        )
+    )
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():

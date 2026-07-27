@@ -453,6 +453,18 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+BAGEL_T2I_CI_SAMPLING_PARAMS = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="1024x1024",
+    extras={
+        "seed": 42,
+        "num_inference_steps": 50,
+        "guidance_scale": 4.0,
+        "flow_shift": 3.0,
+        "generator_device": "cpu",
+    },
+)
+
 IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
 
 IDEOGRAM4_CI_PROMPT = json.dumps(
