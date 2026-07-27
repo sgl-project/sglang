@@ -286,6 +286,17 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         return decoded;
     }
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
+    // Each ragged family's per-request counts must consume its position column
+    // EXACTLY. Only the deficit was caught (`take_poslens` runs off the end); a
+    // surplus left positions unread and delivered a truncated row with a 200.
+    if sum(&h.out_top_reqlens) != h.out_top_poslens.len()
+        || sum(&h.in_top_reqlens) != h.in_top_poslens.len()
+        || sum(&h.out_tid_reqlens) != h.out_tid_poslens.len()
+        || sum(&h.in_tid_reqlens) != h.in_tid_poslens.len()
+        || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
+    {
+        return decoded;
+    }
 
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
     // are concatenated in exactly this order, every element 4 bytes.
@@ -425,7 +436,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 in_tid_lens,
                 hidden_val,
                 hidden_lens,
-                ..Default::default()
+                // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
+                // below: a new column must fail to compile here until it is decoded.
+                out_lp_txt: Vec::new(),
+                in_lp_txt: Vec::new(),
+                out_top_txt: Vec::new(),
+                in_top_txt: Vec::new(),
+                out_tid_txt: Vec::new(),
+                in_tid_txt: Vec::new(),
             };
             (!ex.is_empty()).then(|| Box::new(ex))
         };
