@@ -1215,9 +1215,7 @@ def _load_official_consistency_gt_outputs() -> dict[str, frozenset[str]]:
 
 def _official_consistency_gt_outputs_for_case(case_id: str) -> frozenset[str]:
     canonical_case_id = get_consistency_gt_case_id(case_id)
-    return _load_official_consistency_gt_outputs().get(
-        canonical_case_id, frozenset()
-    )
+    return _load_official_consistency_gt_outputs().get(canonical_case_id, frozenset())
 
 
 def _is_official_consistency_gt_base_url(base_url: str) -> bool:
