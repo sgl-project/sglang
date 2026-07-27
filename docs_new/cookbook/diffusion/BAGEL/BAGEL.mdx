@@ -461,6 +461,117 @@ sglang generate \
   --seed 42
 ```
 
+## Use `DiffGenerator` from Python
+
+For a local Python workflow without an HTTP server, select the capability when
+constructing the generator. Change `MODE` before starting the process; do not
+reuse one live generator for another BAGEL pipeline. The context manager shuts
+down the local scheduler and workers after the request:
+
+```python
+from pathlib import Path
+
+from sglang.multimodal_gen import DiffGenerator
+
+MODEL_PATH = "ByteDance-Seed/BAGEL-7B-MoT"
+REVISION = "5019f57d168e5816e8f3f701b17cc816bb7cf24b"
+MODE = "t2i"  # t2i | thinking | editing | understanding
+INPUT_PATH = Path("input.png").resolve()
+OUTPUT_PATH = str(Path("bagel-python-output").resolve())
+
+PIPELINES = {
+    "t2i": "BagelPipeline",
+    "thinking": "BagelThinkingPipeline",
+    "editing": "BagelEditPipeline",
+    "understanding": "BagelUnderstandingPipeline",
+}
+
+IMAGE_DEFAULTS = {
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "negative_prompt": "",
+    "seed": 42,
+    "generator_device": "cpu",
+    "output_path": OUTPUT_PATH,
+    "save_output": True,
+    "return_file_paths_only": True,
+}
+REQUESTS = {
+    "t2i": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Doraemon is eating dorayaki",
+        "height": 1024,
+        "width": 1024,
+        "output_file_name": "t2i.png",
+    },
+    "thinking": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Doraemon is eating dorayaki",
+        "height": 1024,
+        "width": 1024,
+        "max_think_tokens": 1000,
+        "think_do_sample": False,
+        "think_temperature": 0.3,
+        "output_file_name": "thinking.png",
+    },
+    "editing": {
+        **IMAGE_DEFAULTS,
+        "prompt": "Turn the background into a blue sky",
+        "image_path": str(INPUT_PATH),
+        "true_cfg_scale": 2.0,
+        "output_file_name": "editing.png",
+    },
+    "understanding": {
+        "prompt": "Describe this image.",
+        "image_path": str(INPUT_PATH),
+        "max_new_tokens": 512,
+        "do_sample": False,
+        "enable_thinking": False,
+        "seed": 42,
+        "save_output": False,
+        "return_file_paths_only": False,
+    },
+}
+
+
+def main() -> None:
+    if MODE in {"editing", "understanding"} and not INPUT_PATH.is_file():
+        raise FileNotFoundError(f"BAGEL input image is missing: {INPUT_PATH}")
+
+    with DiffGenerator.from_pretrained(
+        model_path=MODEL_PATH,
+        revision=REVISION,
+        pipeline_class_name=PIPELINES[MODE],
+        num_gpus=1,
+        tp_size=1,
+    ) as generator:
+        result = generator.generate(sampling_params_kwargs=REQUESTS[MODE])
+
+    if result is None or isinstance(result, list):
+        raise RuntimeError("Expected one BAGEL result")
+    if result.text is not None:
+        print(result.text)
+        print(
+            f"finish={result.finish_reason}, prompt_tokens={result.prompt_tokens}, "
+            f"completion_tokens={result.completion_tokens}"
+        )
+    else:
+        print(f"Saved to {result.output_file_path}")
+        if result.revised_prompt is not None:
+            print(f"Conditioning prompt: {result.revised_prompt}")
+
+
+if __name__ == "__main__":
+    # DiffGenerator uses multiprocessing spawn, so script entry must be guarded.
+    main()
+```
+
+`input.png` is required only for Editing and Understanding. To use TP=2, set
+both `num_gpus=2` and `tp_size=2`. Set
+`REQUESTS[MODE]["enable_taylorseer"] = True` for a selected T2I, Thinking, or
+Editing request when native TaylorSeer acceleration is wanted.
+
 ## Benchmark all BAGEL pipelines
 
 Run the dedicated offline benchmark to exercise all six BAGEL cases: standard
