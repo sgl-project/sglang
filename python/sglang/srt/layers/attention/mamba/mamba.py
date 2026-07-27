@@ -564,14 +564,15 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            # Runs once per mamba LAYER: read the pre-resolved selection off the
+            # metadata. Deriving it here (`mask.any()` + `mask.nonzero()`) costs
+            # two stream syncs per layer, i.e. dozens per prefill forward.
             if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
+                metadata.has_mamba_track_mask
                 and metadata.track_conv_indices is not None
             ):
                 x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
+                conv_state[metadata.conv_states_mask_indices] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
