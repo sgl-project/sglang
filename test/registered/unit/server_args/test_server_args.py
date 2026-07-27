@@ -5,7 +5,7 @@ import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
@@ -39,6 +39,52 @@ register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
+
+
+class TestObjectStorageModelSources(CustomTestCase):
+    @patch("sglang.srt.server_args.ObjectStorageModel.download_and_get_path")
+    def test_prepare_unique_model_source_metadata(self, mock_download):
+        model_uri = "s3://bucket/target/"
+        draft_uri = "s3://bucket/draft/"
+        server_args = ServerArgs(
+            model_path="dummy",
+            tokenizer_path=model_uri,
+            speculative_draft_model_path=draft_uri,
+        )
+        server_args.model_path = model_uri
+
+        server_args._handle_model_source_paths()
+
+        self.assertEqual(
+            mock_download.call_args_list,
+            [call(model_uri), call(draft_uri)],
+        )
+
+    def test_remote_draft_uses_runai_streamer(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_draft_model_path="s3://bucket/draft/",
+        )
+        server_args.model_path = "/models/target"
+        server_args.load_format = "safetensors"
+
+        server_args._handle_load_format()
+
+        self.assertEqual(server_args.load_format, "safetensors")
+        self.assertEqual(server_args.speculative_draft_load_format, "runai_streamer")
+
+    def test_explicit_draft_load_format_is_preserved(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_draft_model_path="s3://bucket/draft/",
+            speculative_draft_load_format="dummy",
+        )
+        server_args.model_path = "/models/target"
+        server_args.load_format = "safetensors"
+
+        server_args._handle_load_format()
+
+        self.assertEqual(server_args.speculative_draft_load_format, "dummy")
 
 
 class TestPrepareServerArgs(CustomTestCase):
