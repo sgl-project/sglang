@@ -104,9 +104,6 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
                     "--trust-remote-code",
                     "--mem-fraction-static",
                     "0.7",
-                    "--attention-backend",
-                    "ascend",
-                    "--disable-cuda-graph",
                 ],
                 env={"SGLANG_MM_AVOID_RETOKENIZE": flag},
             )

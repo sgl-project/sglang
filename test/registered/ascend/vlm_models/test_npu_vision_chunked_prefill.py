@@ -163,9 +163,6 @@ class TestVisionChunkedPrefill(CustomTestCase):
             other_args=[
                 "--chunked-prefill-size",
                 f"{chunked_prefill_size}",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
             ],
         )
         return process.pid

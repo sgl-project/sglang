@@ -31,7 +31,7 @@ QWEN_ASR_MODEL = QWEN3_ASR_0_6B_WEIGHTS_PATH
 AUDIO_URL = AUDIO_TRUMP_WEF_PATH
 
 
-def download_audio_bytes(url=AUDIO_TRUMP_WEF_PATH):
+def read_audio_bytes(url=AUDIO_TRUMP_WEF_PATH):
     """Read audio file from local path and return raw bytes."""
     with open(url, "rb") as f:
         return f.read()
@@ -51,9 +51,6 @@ class TestServingTranscription(CustomTestCase):
             other_args=[
                 "--served-model-name",
                 "qwen-asr",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
             ],
         )
 
@@ -73,7 +70,7 @@ class TestServingTranscription(CustomTestCase):
         Passing ``language=None`` omits the field entirely, which exercises
         the fused auto-detect path.
         """
-        audio_bytes = download_audio_bytes()
+        audio_bytes = read_audio_bytes()
         data = {"model": "qwen-asr"}
         if language is not None:
             data["language"] = language
@@ -92,7 +89,7 @@ class TestServingTranscription(CustomTestCase):
 
     def _transcribe_stream(self, language: Optional[str] = None) -> List[str]:
         """Send a streaming transcription request and return the delta strings."""
-        audio_bytes = download_audio_bytes()
+        audio_bytes = read_audio_bytes()
         data = {"model": "qwen-asr", "stream": "true"}
         if language is not None:
             data["language"] = language
