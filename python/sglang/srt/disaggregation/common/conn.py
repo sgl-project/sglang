@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -469,11 +469,11 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != self.server_args.kv_cache_dtype
+            and info.kv_cache_dtype != get_model().kv_cache_dtype
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={self.server_args.kv_cache_dtype}. "
+                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
@@ -626,7 +626,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": self.server_args.kv_cache_dtype,
+            "kv_cache_dtype": get_model().kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
             "enable_dsa_cache_layer_split": getattr(
                 self.server_args, "enable_dsa_cache_layer_split", False
@@ -1260,10 +1260,13 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+                # Register kv_args only once to prefill KVManager according to the info fetched
+                # from the bootstrap server. Do this before caching in connection_pool so a failed
+                # registration does not leave a stale entry that later requests would reuse.
+                if not self._register_kv_args():
+                    return
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -1322,6 +1325,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1348,8 +1356,8 @@ class CommonKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
-    def _register_kv_args(self):
-        pass
+    def _register_kv_args(self) -> bool:
+        return True
 
     def send_metadata(
         self,
