@@ -41,14 +41,7 @@ The HuggingFace repo ships both the mistral native layout (`params.json` + `cons
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
-**Docker Images by Hardware:**
-
-| Hardware | Docker Image |
-| --- | --- |
-| H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mistral-medium-3.5` |
-| B200 / B300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mistral-medium-3.5` |
-
-> Day-0 support for Mistral Medium 3.5 is not yet in `lmsysorg/sglang:latest` — pull one of the tags above (matching your GPU's CUDA driver) until the changes propagate to the next stable release.
+**Docker Image:** `lmsysorg/sglang:latest` covers all the GPUs in this cookbook (H100 / H200 / B200 / B300).
 
 ---
 

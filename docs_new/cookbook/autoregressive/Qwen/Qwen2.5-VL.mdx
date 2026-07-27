@@ -29,13 +29,15 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
-This section provides deployment configurations optimized for AMD MI300X, MI325X and MI355X hardware platforms and different use cases.
+This section provides deployment configurations optimized for AMD MI300X, MI325X and MI355X as well as Intel Xeon CPU hardware platforms and different use cases.
 
 ### 3.1 Basic Configuration
 
-The Qwen2.5-VL series offers models in various sizes. The following configurations have been verified on AMD MI300X, MI325X and MI355X GPUs.
+The Qwen2.5-VL series offers models in various sizes. The following configurations have been verified on AMD MI300X, MI325X and MI355X GPUs as well as Intel Xeon CPUs.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model size.
 
@@ -45,6 +47,7 @@ The Qwen2.5-VL series offers models in various sizes. The following configuratio
 
 * **Memory Management**: For the 72B model on MI300X/MI325X/MI355X, we have verified successful deployment with `--context-length 128000`. Smaller context lengths can be used to reduce memory usage if needed.
 * **Multi-GPU Deployment**: Use Tensor Parallelism (`--tp`) to scale across multiple GPUs. For example, use `--tp 8` for the 72B model and `--tp 2` for the 32B model on MI300X/MI325X/MI355X.
+* **Xeon CPU service configuration**: Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

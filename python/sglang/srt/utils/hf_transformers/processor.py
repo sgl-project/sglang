@@ -153,6 +153,8 @@ def get_processor(
 
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+    if model_name is not None:
+        model_name = resolve_runai_obj_uri(model_name)
 
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(

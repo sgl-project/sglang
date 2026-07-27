@@ -144,7 +144,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 - AI Core: the core that actually performs matrix/vector computation
 - Vector Unit: responsible for SIMD computation (similar to CUDA Core)
 - Scalar Unit: responsible for control/loop
-- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
+- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64KB, L1 is 256KB, and L2 is shared.
 
 #### 2. Ascend memory hierarchy (from fastest to slowest)
 
@@ -168,6 +168,6 @@ Must be vectorized.
 1. Ascend 910 series usually has only 40 or 48 vector cores. If the number of grids exceeds 40 or 48 vector cores, the grids will be delivered in a queue, resulting in a long waiting time. Therefore, the number of cores for high-performance implementation does not exceed the number of vector cores.
 2. Try to use up all the UB as much as possible. Move a large block size at a time to ensure that the bound is in the MTE. No Redundant Copy.
 3. If the offset is a negative number, the current triton-ascend considers it as a discrete memory access scenario. As a result, the performance severely deteriorates, and the data is read from the entire DMA block instead of being read in scalar mode.
-4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32 bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
+4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
 5. Use Double Buffer, parallelizes computation and data transfer. While computing one block of data, another block of data is being transferred to L1.
 6. If hostbound behavior is severe, core binding can be used to address it.
