@@ -27,7 +27,7 @@
 
 #include "dsa_indexer.cuh"  // vendored kernels + NUM_HEADS/BLOCK_* config
 
-namespace {
+namespace sglang {
 
 using tvm::ffi::TensorView;
 
@@ -373,4 +373,4 @@ void dsa_litetopk_select(
       /*seed_base=*/static_cast<const int32_t*>(nullptr));
 }
 
-}  // namespace
+}  // namespace sglang
