@@ -45,7 +45,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
                         return_hidden_states,
                     )
 
-    def test_comptetion_stream(self):
+    def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
         for return_hidden_states in self.return_hidden_states:
             for use_list_input in self.use_list_input:

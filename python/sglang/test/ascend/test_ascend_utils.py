@@ -46,6 +46,7 @@ MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
 IMAGES_DIR = "/root/.cache/modelscope/hub/datasets/images/"
 VIDEO_DIR = "/root/.cache/modelscope/hub/datasets/video/"
+WAV_PATH = "/root/.cache/modelscope/hub/datasets/wav/asr_en.wav"
 
 # LLM model weights path
 AFM_4_5B_BASE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/AFM-4.5B-Base")
@@ -85,6 +86,7 @@ EXAONE_3_5_7_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 GEMMA_3_4B_IT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-3-4b-it")
 GLM_4_9B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/glm-4-9b-chat")
 GLM_5_1_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5.1-w4a8")
+GPT_J_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "EleutherAI/gpt-j-6b")
 GPT_OSS_120B_BF16_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "eigen-ai-labs/gpt-oss-120b-bf16"
 )
@@ -147,6 +149,9 @@ OLMO_2_1124_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 OLMOE_1B_7B_0924_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "allenai/OLMoE-1B-7B-0924"
 )
+ORION_14B_BASE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "OrionStarAI/Orion-14B-Base"
+)
 PERSIMMON_8B_CHAT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Howeee/persimmon-8b-chat"
 )
@@ -160,6 +165,7 @@ QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2.5-7B-Instruct"
 )
 QWEN3_0_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-0.6B")
+QWEN3_0_6B_ASR_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-ASR-0.6B")
 QWEN3_5_27B_MODEL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-27B")
 QWEN3_6_27B_MODEL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.6-27B")
 QWEN3_6_27B_CYBERSECURITY_LORA_MODEL_WEIGHTS_PATH = os.path.join(
@@ -186,6 +192,9 @@ QWEN3_30B_A3B_INSTRUCT_2507_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
 QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-Instruct-2507"
 )
+QWEN3_30B_A3B_INSTRUCT_2507_THEO_STYLE_LORA_PATH = os.path.join(
+    HF_MODEL_WEIGHTS_DIR, "Qwen3-30B-A3B-Instruct-2507-theo-style-lora"
+)
 QWEN3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-4B")
 QWEN3_4B_LORA_V2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-4B-lora-v2")
 QWEN3_4B_LORA_ZH_WEBNOVELTY_V0_0_WEIGHTS_PATH = os.path.join(
@@ -200,6 +209,9 @@ QWEN3_8B_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
 QWEN3_8B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B")
 QWEN3_8B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B_eagle3")
 QWEN3_8B_DECRYPTED_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B")
+QWEN3_8B_DFLASH_B16_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "z-lab/Qwen3-8B-DFlash-b16"
+)
 QWEN3_8B_EAGLE3_DECRYPTED_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B_eagle3"
 )
@@ -228,6 +240,7 @@ STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
 )
 STARCODER2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "bigcode/starcoder2-7b")
+TELE_FLM_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "FLM/Tele-FLM")
 TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
 XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
 MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
@@ -289,6 +302,7 @@ QWEN3_VL_235B_A22B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 QWEN2_0_5B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2-0.5B-Instruct"
 )
+STEP3_VL_10B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "stepfun-ai/Step3-VL-10B")
 
 QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B")
 QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
@@ -315,6 +329,26 @@ QWEN3_5_397B_W4A8_MODEL_PATH = os.path.join(
 )
 QWEN3_5_397B_W8A8_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
+)
+QWEN3_5_35B_W8A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp"
+)
+QWEN3_5_9B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-9B")
+QWEN3_5_35B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-35B-A3B")
+QWEN3_5_35B_A3B_W8A8_MTP_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp"
+)
+QWEN3_VL_8B_EAGLE3_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-VL-8B-Instruct-Eagle3"
+)
+
+# DLM model weights path
+LLADA2_0_FLASH_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "inclusionAI/LLaDA2.0-flash"
+)
+SDAR_8B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "JetLM/SDAR-8B-Chat")
+SDAR_30B_A3B_CHAT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "JetLM/SDAR-30B-A3B-Chat"
 )
 
 # Embedding model weights path
@@ -385,6 +419,9 @@ INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
 # Other
 DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
 FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
+HOT_MAP_PT = "/root/.cache/sglang/hot_map/expert_distribution_recorder.pt"
+HOT_MAP_JSON = "/root/.cache/sglang/hot_map/expert_distribution_recorder.json"
+HOT_MAP_STRING = "/root/.cache/sglang/hot_map/qwen3_30b_a3b_random_no_redundant.json"
 CONFIG_YAML_PATH = (
     "/__w/sglang/sglang/test/registered/ascend/basic_function/config/config.yaml"
 )

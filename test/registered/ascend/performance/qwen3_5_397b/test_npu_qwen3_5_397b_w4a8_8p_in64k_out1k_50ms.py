@@ -111,8 +111,8 @@ class TestNPUQwen3_5_397B_64K(TestAscendPerformanceTestCaseBase):
     envs = QWEN3_5_397B_64K_ENVS
     warmup_requests = 8
     dataset_name = "random"
-    max_concurrency = 28
-    num_prompts = 28
+    max_concurrency = 24
+    num_prompts = 24
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

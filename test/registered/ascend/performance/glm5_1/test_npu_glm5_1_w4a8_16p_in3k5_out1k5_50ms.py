@@ -24,7 +24,7 @@ GLM_5_1_TWO_NODE_ENVS = {
     "GLOO_SOCKET_IFNAME": NIC_NAME,
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
-    "HCCL_BUFFSIZE": "2500",
+    "DEEPEP_HCCL_BUFFSIZE": "2500",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
 }
@@ -50,7 +50,7 @@ GLM_5_1_TWO_NODE_OTHER_ARGS = [
     0.65,
     "--served-model-name",
     "glm-5",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     16,
     "--max-running-requests",
     256,

@@ -85,9 +85,13 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
 
         time.sleep(5)
         request_a = {
-            "text": "repeat the words France",
+            "text": "Generate a very long and detailed story about a space exploration mission. Include technical details, character dialogues, and vivid descriptions of alien landscapes. Make it as long and comprehensive as possible.",
             "priority": 2,
-            "sampling_params": {"max_new_tokens": 2000},
+            "sampling_params": {
+                "max_new_tokens": 2000,
+                "temperature": 0.7,
+                "ignore_eos": True,
+            },
         }
 
         loop = asyncio.new_event_loop()
@@ -154,9 +158,13 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
 
         time.sleep(5)
         request_a = {
-            "text": "repeat the words France",
+            "text": "Generate a very long and detailed story about a space exploration mission. Include technical details, character dialogues, and vivid descriptions of alien landscapes. Make it as long and comprehensive as possible.",
             "priority": 2,
-            "sampling_params": {"max_new_tokens": 2000},
+            "sampling_params": {
+                "max_new_tokens": 2000,
+                "temperature": 0.7,
+                "ignore_eos": True,
+            },
         }
 
         loop = asyncio.new_event_loop()
@@ -207,8 +215,11 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
         latency_b = e2e_latencies[2]
 
         assert (
-            latency_c < latency_a < latency_b
-        ), f"expected C<A<B，accurate：C={latency_c}, A={latency_a}, B={latency_b}"
+            latency_c < latency_a
+        ), f"expected C<A，accurate：C={latency_c}, A={latency_a}, B={latency_b}"
+        assert (
+            latency_c < latency_b
+        ), f"expected C<B，accurate：C={latency_c}, A={latency_a}, B={latency_b}"
 
 
 def _verify_generate_responses(

@@ -31,6 +31,7 @@ class TestVLMModels(CustomTestCase):
         4,
     ]
     timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    max_tokens = 30
 
     @classmethod
     def setUpClass(cls):
@@ -74,7 +75,7 @@ class TestVLMModels(CustomTestCase):
             eval_name="mmmu",
             num_examples=100,
             num_threads=64,
-            max_tokens=30,
+            max_tokens=self.max_tokens,
             return_latency=True,
         )
 

@@ -88,7 +88,7 @@ class TestConfigPriority(CustomTestCase):
 
     def test_config_priority(self):
         # will use false model path (/nonexistent/Qwen/Qwen3-32B) service start fail
-        error_message = "Invalid repo_id: model, must be of format namespace/name"
+        error_message = "404 page not found"
         with tempfile.NamedTemporaryFile(
             mode="w+", delete=True, suffix="out.log"
         ) as out_log_file, tempfile.NamedTemporaryFile(

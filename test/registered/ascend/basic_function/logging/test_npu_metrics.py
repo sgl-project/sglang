@@ -166,6 +166,63 @@ class TestNPUMetrics2NPU(_BaseTestNPUMetrics):
     verify_metrics_extra = True
 
 
+class TestNPUMetricsExtraLabels(_BaseTestNPUMetrics):
+    """Testcase: Verify that --extra-metric-labels injects constant labels into all metrics.
+
+    [Test Category] Parameter
+    [Test Target] --extra-metric-labels
+    """
+
+    metrics_args = [
+        "--enable-metrics",
+        "--extra-metric-labels",
+        '{"env":"prod","team":"npu-inference","region":"us-east-1"}',
+    ]
+
+    def test_metrics_extra_metric_labels(self):
+        metrics_response = requests.get(f"{self.base_url}/metrics")
+        self.assertEqual(metrics_response.status_code, 200)
+        metrics_text = metrics_response.text
+
+        expected_labels = {
+            "env": "prod",
+            "team": "npu-inference",
+            "region": "us-east-1",
+        }
+
+        # 1. Raw text sanity check
+        for k, v in expected_labels.items():
+            self.assertIn(f'{k}="{v}"', metrics_text)
+
+        # 2. Parsed metrics structural check
+        metrics = _parse_prometheus_metrics(metrics_text)
+        print(f"extra_metric_labels_text=\n{metrics_text}")
+
+        # Pick a representative set of metrics to verify
+        metrics_to_check = [
+            "sglang:num_running_reqs",
+            "sglang:prompt_tokens_total",
+            "sglang:generation_tokens_total",
+            "sglang:time_to_first_token_seconds_sum",
+            "sglang:forward_execution_seconds_total",
+        ]
+
+        for metric_name in metrics_to_check:
+            self.assertIn(metric_name, metrics, f"Missing metric: {metric_name}")
+
+            samples = metrics[metric_name]
+            self.assertGreater(len(samples), 0, f"{metric_name} has no samples")
+
+            for sample in samples:
+                for k, v in expected_labels.items():
+                    self.assertEqual(
+                        sample.labels.get(k),
+                        v,
+                        f"{metric_name}: label {k} mismatch: "
+                        f"got {sample.labels.get(k)}, want {v}",
+                    )
+
+
 def _generate_metrics(base_url: str, repeat_requests_num: int = 2) -> None:
     """Send requests to generate metrics data.
 
@@ -683,6 +740,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestNPUMetricsMFUDisabled))
     suite.addTests(loader.loadTestsFromTestCase(TestNPUMetricsMFUEnabled))
     suite.addTests(loader.loadTestsFromTestCase(TestNPUMetrics2NPU))
+    suite.addTests(loader.loadTestsFromTestCase(TestNPUMetricsExtraLabels))
     suite.addTests(loader.loadTestsFromTestCase(TestNPUStatLoggersDI))
     suite.addTests(loader.loadTestsFromTestCase(TestNPUStatLoggersDIRecording))
     runner = unittest.TextTestRunner()

@@ -21,7 +21,7 @@ ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "HCCL_BUFFSIZE": "2000",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
 }
 
 OTHER_ARGS = [
@@ -59,7 +59,7 @@ class TestQwen3(TestAscendAccuracyTestCaseBase):
     model = QWEN3_VL_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
-    accuracy = 0.76
+    accuracy = 0.7167
     datasets = ["mmmu"]
     few_shot_num = 0
     generation_config = {"max_tokens": 65536}

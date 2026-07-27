@@ -164,6 +164,9 @@ MINIMAX_M2_5_EAGLE3_MODEL_PATH = (
 QWEN3_5_397B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
 )
+DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp"
+)
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
 )
@@ -793,50 +796,56 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    if self.tpot and metrics.get("mean_tpot"):
+
+    # Always dump measured values when available, regardless of threshold
+    if metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
             labels={"test_case": tc_name, "type": "perf"},
         )
-        dump_metric(
-            "tpot_baseline",
-            float(self.tpot),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
-    if self.output_token_throughput and metrics.get("total_tps"):
+        if self.tpot:
+            dump_metric(
+                "tpot_baseline",
+                float(self.tpot),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+    if metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
             labels={"test_case": tc_name, "type": "perf"},
         )
-        dump_metric(
-            "throughput_baseline",
-            float(self.output_token_throughput),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
-    if self.ttft and metrics.get("mean_ttft"):
+        if self.output_token_throughput:
+            dump_metric(
+                "throughput_baseline",
+                float(self.output_token_throughput),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+    if metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
             labels={"test_case": tc_name, "type": "perf"},
         )
-        dump_metric(
-            "ttft_baseline",
-            float(self.ttft),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
-    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
+        if self.ttft:
+            dump_metric(
+                "ttft_baseline",
+                float(self.ttft),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+    if metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
             labels={"test_case": tc_name, "type": "perf"},
         )
-        dump_metric(
-            "e2e_latency_baseline",
-            float(self.mean_e2e_latency),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
+        if self.mean_e2e_latency:
+            dump_metric(
+                "e2e_latency_baseline",
+                float(self.mean_e2e_latency),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
 
     if self.tpot:
         if self.tpot < TPOT_THRESHOLD:

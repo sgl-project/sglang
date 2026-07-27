@@ -18,7 +18,7 @@ register_npu_ci(
 QWEN3_6_35B_A3B_128K_1K_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "HCCL_BUFFSIZE": "1600",
+    "DEEPEP_HCCL_BUFFSIZE": "1600",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
@@ -89,6 +89,7 @@ class TestNPUQwen3_6_35BA3B_1P_In128k_Out1k_50ms(TestAscendPerformanceTestCaseBa
     envs = QWEN3_6_35B_A3B_128K_1K_ENVS
     dataset_name = "random"
     max_concurrency = 3
+    warmup_requests = max_concurrency
     num_prompts = 3
     input_len = 128000
     output_len = 1000

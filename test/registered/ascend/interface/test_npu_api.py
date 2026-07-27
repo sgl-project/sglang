@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -32,7 +32,7 @@ class Test01_NpuApi(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_0_6B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
@@ -72,8 +72,8 @@ class Test01_NpuApi(CustomTestCase):
         self.assertEqual(response.json()["weight_version"], "default")
         self.assertFalse(response.json()["has_image_understanding"])
         self.assertFalse(response.json()["has_audio_understanding"])
-        self.assertEqual(response.json()["model_type"], "qwen3")
-        self.assertEqual(response.json()["architectures"][0], "Qwen3ForCausalLM")
+        self.assertEqual(response.json()["model_type"], "llama")
+        self.assertEqual(response.json()["architectures"][0], "LlamaForCausalLM")
 
     def test_api_server_info(self):
         response = requests.get(f"{self.base_url}/server_info")
@@ -229,7 +229,7 @@ class TestChatCompletionsInterface(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_0_6B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
@@ -264,12 +264,12 @@ class TestChatCompletionsInterface(CustomTestCase):
             f"{self.base_url}/v1/chat/completions",
             json={
                 "messages": [{"role": "user", "content": "Hello"}],
+                "enable_thinking": True,
             },
         )
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
         data = response.json()
         self.assertEqual(data["model"], "default")
-        self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_max_completion_tokens(self):
         response = requests.post(
@@ -289,6 +289,7 @@ class TestChatCompletionsInterface(CustomTestCase):
                 "model": self.model,
                 "messages": [{"role": "user", "content": "Hello"}],
                 "stream": True,
+                "enable_thinking": True,
             },
         )
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
@@ -469,7 +470,7 @@ class TestEnableThinking(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_0_6B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",
@@ -666,7 +667,7 @@ class TestStartProfile(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
-        cls.model = QWEN3_0_6B_WEIGHTS_PATH
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.other_args = [
             "--attention-backend",

@@ -29,15 +29,12 @@ EXPECTED_SPANS_LEVEL_3 = EXPECTED_SPANS_LEVEL_2 + [
 
 
 class TestNPUTracing(TestNPULoggingBase):
-    """Test tracing functionality on single NPU.
-
-    [Description]
-        Validates that --enable-trace exports spans to the configured
-        OTLP endpoint and that different trace levels control span
-        granularity correctly.
+    """Testcase：Verify --enable-trace exports spans correctly on single NPU. Validate that different trace levels
+    control span granularity as expected, with --trace-modules=request explicitly configured to clarify the traced
+    module scope. Inference requests are successfully processed during testing.
 
     [Test Category] Functionality
-    [Test Target] --enable-trace; --otlp-traces-endpoint
+    [Test Target] --enable-trace; --trace-modules; --otlp-traces-endpoint
     """
 
     @classmethod
@@ -54,6 +51,8 @@ class TestNPUTracing(TestNPULoggingBase):
                 "--enable-trace",
                 "--otlp-traces-endpoint",
                 "127.0.0.1:4317",
+                "--trace-modules",
+                "request",
             ]
         )
         # Speed up OTLP export for faster test execution
@@ -278,7 +277,12 @@ class TestNPUTracing(TestNPULoggingBase):
 
 
 class TestTraceEngine(CustomTestCase):
-    """Integration tests for tracing with Engine API - each test creates its own engine."""
+    """Testcase：Verify tracing functionality with Engine API on NPU. Ensure request-scoped spans are exported correctly
+    via OTLP when enable_trace is set, while the inference and embedding requests are successfully processed.
+
+    [Test Category] Parameter
+    [Test Target] enable_trace; trace_modules; otlp_traces_endpoint
+    """
 
     def setUp(self):
         self.collector = None
@@ -295,7 +299,7 @@ class TestTraceEngine(CustomTestCase):
         time.sleep(0.2)
 
     def test_trace_engine_enable(self):
-        """Test tracing with Engine API."""
+        """Test that Engine.generate() exports request module spans with tracing enabled."""
         self._start_collector()
 
         prompt = "Today is a sunny day and I like"
@@ -307,6 +311,7 @@ class TestTraceEngine(CustomTestCase):
             random_seed=42,
             enable_trace=True,
             otlp_traces_endpoint="localhost:4317",
+            trace_modules="request",
         )
 
         try:
@@ -326,7 +331,7 @@ class TestTraceEngine(CustomTestCase):
             engine.shutdown()
 
     def test_trace_engine_encode(self):
-        """Test tracing with Engine encode API."""
+        """Test that Engine.encode() exports request module spans with tracing enabled."""
         self._start_collector()
 
         prompt = "Today is a sunny day and I like"
@@ -337,6 +342,7 @@ class TestTraceEngine(CustomTestCase):
             random_seed=42,
             enable_trace=True,
             otlp_traces_endpoint="localhost:4317",
+            trace_modules="request",
             is_embedding=True,
         )
 

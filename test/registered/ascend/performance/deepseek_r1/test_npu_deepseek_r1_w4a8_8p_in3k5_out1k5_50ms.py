@@ -22,8 +22,8 @@ MODEL_ENVS = {
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "56",
-    "HCCL_BUFFSIZE": "2000",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "72",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -58,7 +58,7 @@ MODEL_OTHER_ARGS = [
     8188,
     "--disable-radix-cache",
     "--chunked-prefill-size",
-    -1,
+    65536,
     "--max-prefill-tokens",
     3000,
     "--moe-a2a-backend",
@@ -84,7 +84,7 @@ MODEL_OTHER_ARGS = [
     "--tool-call-parser",
     "deepseekv3",
     "--max-total-tokens",
-    112500,
+    100000,
 ]
 
 

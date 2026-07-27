@@ -19,14 +19,13 @@ register_npu_ci(est_time=120, suite="full-2-npu-a3", nightly=True)
 
 
 class TestNPUTracingDisaggregation(TestDisaggregationBase):
-    """Test tracing in PD disaggregation mode on NPU.
-
-    [Description]
-        Validates that --enable-trace exports spans correctly in PD
-        disaggregation mode, including disaggregation-specific transfer spans.
+    """Testcase：Verify --enable-trace exports spans correctly in PD disaggregation mode on NPU.
+        Validate that disaggregation-specific transfer spans are exported as expected,
+        with --trace-modules=request explicitly configured to clarify the traced module scope.
+        Inference requests are successfully processed during testing.
 
     [Test Category] Functionality
-    [Test Target] --enable-trace; --otlp-traces-endpoint
+    [Test Target] --enable-trace; --trace-modules; --otlp-traces-endpoint
     """
 
     @classmethod
@@ -72,6 +71,8 @@ class TestNPUTracingDisaggregation(TestDisaggregationBase):
             "--enable-trace",
             "--otlp-traces-endpoint",
             "localhost:4317",
+            "--trace-modules",
+            "request",
         ]
 
         cls.process_prefill = popen_launch_pd_server(
@@ -100,6 +101,8 @@ class TestNPUTracingDisaggregation(TestDisaggregationBase):
             "localhost:4317",
             "--dist-init-addr",
             "127.0.0.1:10000",
+            "--trace-modules",
+            "request",
         ]
 
         cls.process_decode = popen_launch_pd_server(
@@ -149,7 +152,8 @@ class TestNPUTracingDisaggregation(TestDisaggregationBase):
             )
 
     def test_disaggregation_transfer_spans(self):
-        """Test that disaggregation produces transfer-related spans."""
+        """Test that PD disaggregation exports request module spans (e.g., prefill_forward,
+        decode_forward) and disaggregation-specific transfer spans."""
         # Set trace level on both prefill and decode servers
         response = requests.get(f"{self.prefill_url}/set_trace_level?level=1")
         self.assertEqual(response.status_code, 200)
@@ -183,6 +187,15 @@ class TestNPUTracingDisaggregation(TestDisaggregationBase):
 
         # Verify disaggregation-specific spans exist
         span_names = self.collector.get_span_names()
+        self.assertTrue(
+            self.collector.has_any_span(
+                [
+                    RequestStage.PREFILL_FORWARD.stage_name,
+                    RequestStage.DECODE_FORWARD.stage_name,
+                ]
+            ),
+            f"Expected request module spans in PD disaggregation, got {sorted(span_names)}",
+        )
 
         # Check for transfer-related spans
         self.assertTrue(

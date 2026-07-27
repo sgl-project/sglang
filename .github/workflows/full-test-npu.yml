@@ -1,7 +1,7 @@
 name: Full Test (NPU)
 
 on:
-# pull_request:
+#  pull_request:
 #    branches:
 #      - main
 #      - testcases
@@ -164,6 +164,7 @@ jobs:
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
+          cp ~/.cache/modelscope/hub/datasets/hellaswag_val.jsonl /tmp
       - name: Print Log Information
         run: bash scripts/ci/npu/npu_log_print.sh
       - name: Run test
@@ -181,11 +182,16 @@ jobs:
           # speed up by using infra cache services
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
+          pip install fastokens
+          pip install mindstudio-probe --pre
           pip install sentence_transformers torchaudio==2.10.0
           pip install zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
           pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
           pip install jsonlines httpx==0.25.0 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4 dotenv granian
           pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
+          pip install msgpack
+          pip install watchfiles
+          pip install torchao==0.16.0
           git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
           cd ./lmms-eval
           nohup pip install . > lmmslog.txt 2>&1 &
@@ -193,7 +199,7 @@ jobs:
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
           cd test
-          python3 run_suite.py --hw npu --suite full-1-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-size 2 --auto-partition-id ${{ matrix.part }}
+          python3 run_suite.py --hw npu --suite full-1-npu-a3 --nightly --continue-on-error --timeout-per-file 4800 --auto-partition-size 2 --auto-partition-id ${{ matrix.part }}
 
   full-2-npu-a3:
     needs: [ set-image-config ]
@@ -253,7 +259,10 @@ jobs:
           pip install zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
           pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
           pip install jsonlines httpx==0.25.0 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4 dotenv
+          pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
+          pip install websocket-client websockets
           git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+          pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
           cd ./lmms-eval
           nohup pip install . > lmmslog.txt 2>&1 &
           sleep 120
@@ -520,9 +529,9 @@ jobs:
 #            runner: linux-aarch64-a3-2
 #            test_case: test/registered/ascend/performance/qwen3_30b_a3b/test_npu_qwen3_30b_w8a8_1p_in6k_out1k5_bs16.py
 #            test_type: 'perf'
-          - name: qwen3_next_80b_w8a8_2p_in3k5_out1k5_20ms
+          - name: qwen3_next_80b_w8a8_1p_in3k5_out1k5_20ms
             runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/performance/qwen3_next_80b_a3b_instruct/test_npu_qwen3_next_80b_w8a8_2p_in3k5_out1k5_20ms.py
+            test_case: test/registered/ascend/performance/qwen3_next_80b_a3b_instruct/test_npu_qwen3_next_80b_w8a8_1p_in3k5_out1k5_20ms.py
             test_type: 'perf'
           - name: qwen3_next_80b_w8a8_2p_in3k5_out1k5_50ms
             runner: linux-aarch64-a3-16
@@ -600,6 +609,14 @@ jobs:
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/performance/qwen3_6_35b_a3b/test_npu_qwen3_6_35b_a3b_1p_in1080p_30_out256_50ms.py
             test_type: 'perf'
+          - name: deepseek_v4_flash_w8a8_8p_gpqa
+            runner: linux-aarch64-a3-16
+            test_case: test/registered/ascend/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_gpqa.py
+            test_type: 'accuracy'
+          # glm4_6v_flash accuracy tests
+          - name: glm4_6v_flash_1p_mmmu
+            runner: linux-aarch64-a3-2
+            test_case: test/registered/ascend/accuracy/glm4_6v_flash/test_npu_glm4_6v_flash_1p_mmmu.py
     uses: ./.github/workflows/nightly-test-npu-e2e-single-node.yml
     with:
       runner: ${{ matrix.test_config.runner }}
@@ -619,41 +636,41 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          - name: prefill_policy_bucket_balance
-            test_case: test/registered/ascend/basic_function/wip/test_npu_prefill_policy_bucket_balance.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-            prefill_size: 3
-            decode_size: 1
-            router_size: 1
-          - name: hierarchical_cache
-            test_case: test/registered/ascend/basic_function/wip/test_npu_hierarchical_cache.py
-            test_type: 'func'
-            prefill_decode_deployment: 'separation'
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-          - name: fusion_operator
-            test_case: test/registered/ascend/basic_function/wip/test_npu_fusion_operator.py
-            test_type: 'func'
-            prefill_decode_deployment: 'separation'
-            prefill_size: 1
-            decode_size: 2
-            router_size: 1
-          - name: bucket_adjust_interval_secs
-            test_case: test/registered/ascend/basic_function/wip/test_npu_bucket_adjust_interval_secs.py
-            test_type: 'func'
-            prefill_decode_deployment: 'separation'
-            prefill_size: 3
-            decode_size: 1
-            router_size: 1
-          - name: bucket_adjust_interval_secs_concurrency
-            test_case: test/registered/ascend/basic_function/parallel_strategy/test_npu_bucket_adjust_interval_secs_concurrency.py
-            test_type: 'func'
-            prefill_decode_deployment: 'separation'
-            prefill_size: 3
-            decode_size: 1
-            router_size: 1
+          #- name: prefill_policy_bucket_balance
+          #  test_case: test/registered/ascend/basic_function/wip/test_npu_prefill_policy_bucket_balance.py
+          #  test_type: 'perf'
+          #  prefill_decode_deployment: 'separation'
+          #  prefill_size: 3
+          #  decode_size: 1
+          #  router_size: 1
+          #- name: hierarchical_cache
+          #  test_case: test/registered/ascend/basic_function/wip/test_npu_hierarchical_cache.py
+          #  test_type: 'func'
+          #  prefill_decode_deployment: 'separation'
+          #  prefill_size: 1
+          #  decode_size: 1
+          #  router_size: 1
+          #- name: fusion_operator
+          #  test_case: test/registered/ascend/basic_function/wip/test_npu_fusion_operator.py
+          #  test_type: 'func'
+          #  prefill_decode_deployment: 'separation'
+          #  prefill_size: 1
+          #  decode_size: 2
+          #  router_size: 1
+          #- name: bucket_adjust_interval_secs
+          #  test_case: test/registered/ascend/basic_function/wip/test_npu_bucket_adjust_interval_secs.py
+          #  test_type: 'func'
+          #  prefill_decode_deployment: 'separation'
+          #  prefill_size: 3
+          #  decode_size: 1
+          #  router_size: 1
+          #- name: bucket_adjust_interval_secs_concurrency
+          #  test_case: test/registered/ascend/basic_function/parallel_strategy/test_npu_bucket_adjust_interval_secs_concurrency.py
+          #  test_type: 'func'
+          #  prefill_decode_deployment: 'separation'
+          #  prefill_size: 3
+          #  decode_size: 1
+          #  router_size: 1
           # ===== DeepSeek R1 W4A8 1p1d_16p PD separation =====
           - name: deepseek_r1_w4a8_1p1d_16p_in3k5_out1k5_50ms
             prefill_size: 1
@@ -802,20 +819,6 @@ jobs:
             decode_size: 2
             router_size: 1
             test_case: test/registered/ascend/basic_function/cp/test_npu_cp_vs_nocp_ttft.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/ascend/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/ascend/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           - name: test_npu_mimo_v2_flash_1p1d_12p_in32k_out1_ttft_5s

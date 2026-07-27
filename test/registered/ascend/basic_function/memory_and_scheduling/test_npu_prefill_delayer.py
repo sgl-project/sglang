@@ -3,13 +3,16 @@ import os
 import re
 import time
 import unittest
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import openai
 import requests
+import torch
 
 from sglang.bench_serving import run_benchmark
+from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
     DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH,
@@ -23,6 +26,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     get_benchmark_args,
     popen_launch_server,
+    run_distributed_test,
 )
 
 register_npu_ci(
@@ -32,6 +36,327 @@ register_npu_ci(
 )
 
 WORLD_SIZE = os.environ.get("SGLANG_TEST_WORLD_SIZE", "8")
+
+
+# ============================ Unit Tests ============================
+
+
+@dataclass
+class NegotiateCall:
+    prefillable: List[bool]
+    token_usage: List[float]
+    running_batch: Optional[List[int]] = None
+    max_prefill_bs: Optional[List[int]] = None
+    waiting_queue_len: Optional[List[int]] = None
+    max_running_requests: Optional[int] = None
+    sleep_before_s: float = 0.0
+
+
+@dataclass
+class NegotiateTestCase:
+    name: str
+    max_delay_passes: int
+    token_usage_low_watermark: Optional[float]
+    calls: List[NegotiateCall]
+    expected_allow: bool
+    expected_reason: str
+    queue_min_ratio: Optional[float] = None
+    max_delay_ms: Optional[float] = None
+    expected_wait_forward_passes: Optional[int] = None
+
+
+def _run_negotiate_test(rank, test_cases):
+    world_size = torch.distributed.get_world_size()
+    cpu_group = torch.distributed.new_group(backend="gloo")
+
+    for case in test_cases:
+        delayer = PrefillDelayer(
+            dp_size=world_size,
+            attn_tp_size=1,
+            cpu_group=cpu_group,
+            server_args=SimpleNamespace(
+                enable_dp_attention=True,
+                disaggregation_mode="null",
+                disable_overlap_schedule=False,
+                prefill_delayer_queue_min_ratio=case.queue_min_ratio,
+                prefill_delayer_max_delay_ms=case.max_delay_ms,
+            ),
+            max_delay_passes=case.max_delay_passes,
+            token_usage_low_watermark=case.token_usage_low_watermark,
+        )
+
+        for call in case.calls:
+            if call.sleep_before_s > 0:
+                time.sleep(call.sleep_before_s)
+
+            extra_kwargs = {}
+            if call.running_batch is not None:
+                extra_kwargs["running_batch"] = call.running_batch[rank]
+            if call.max_prefill_bs is not None:
+                extra_kwargs["max_prefill_bs"] = call.max_prefill_bs[rank]
+            if call.waiting_queue_len is not None:
+                extra_kwargs["waiting_queue_len"] = call.waiting_queue_len[rank]
+            if call.max_running_requests is not None:
+                extra_kwargs["max_running_requests"] = call.max_running_requests
+
+            result = delayer._negotiate_should_allow_prefill(
+                local_prefillable=call.prefillable[rank],
+                token_usage=call.token_usage[rank],
+                **extra_kwargs,
+            )
+
+        assert (result.output_allow, result.output_reason) == (
+            case.expected_allow,
+            case.expected_reason,
+        ), f"Case {case.name} rank {rank}"
+
+        if case.expected_wait_forward_passes is not None:
+            assert result.wait_forward_passes == case.expected_wait_forward_passes, (
+                f"Case {case.name} rank {rank}: wait_forward_passes "
+                f"{result.wait_forward_passes} != {case.expected_wait_forward_passes}"
+            )
+            if case.expected_wait_forward_passes > 0:
+                assert (
+                    result.wait_seconds > 0.0
+                ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+
+
+_NEGOTIATE_TEST_CASES = [
+    NegotiateTestCase(
+        name="all_prefillable",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+        expected_wait_forward_passes=0,
+    ),
+    NegotiateTestCase(
+        name="all_prefillable_with_previous_wait",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+        expected_wait_forward_passes=1,
+    ),
+    NegotiateTestCase(
+        name="none_prefillable",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[False, False, False, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="",
+    ),
+    NegotiateTestCase(
+        name="mixed_delay",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="mixed_watermark_force_allow",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=True,
+        expected_reason="token_watermark",
+    ),
+    NegotiateTestCase(
+        name="mixed_watermark_disabled",
+        max_delay_passes=100,
+        token_usage_low_watermark=None,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="mixed_watermark_not_prefillable",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[False, False, True, False],
+                token_usage=[0.5, 0.9, 0.9, 0.9],
+            )
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="mixed_timeout",
+        max_delay_passes=3,
+        token_usage_low_watermark=0.8,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+            NegotiateCall(
+                prefillable=[True, False, True, False],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_timeout",
+        expected_wait_forward_passes=2,
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_delay",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=0.5,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+        ],
+        expected_allow=False,
+        expected_reason="delay",
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_above_threshold",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=0.5,
+        max_delay_ms=5000,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[64, 64, 64, 64],
+                max_running_requests=1024,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_disabled_when_ratio_unset",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=None,
+        max_delay_ms=None,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[1, 1, 1, 1],
+                max_running_requests=1024,
+            )
+        ],
+        expected_allow=True,
+        expected_reason="no_wait",
+    ),
+    NegotiateTestCase(
+        name="queue_trigger_wall_clock_timeout",
+        max_delay_passes=100,
+        token_usage_low_watermark=0.8,
+        queue_min_ratio=0.5,
+        max_delay_ms=50,
+        calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+                sleep_before_s=0.2,
+            ),
+        ],
+        expected_allow=True,
+        expected_reason="wait_success",
+        expected_wait_forward_passes=1,
+    ),
+]
+
+
+class TestPrefillDelayerNegotiate(unittest.TestCase):
+    def test_negotiate(self):
+        run_distributed_test(
+            _run_negotiate_test,
+            world_size=4,
+            backend="gloo",
+            test_cases=_NEGOTIATE_TEST_CASES,
+        )
+
+
+# ============================ E2E Tests ============================
 
 
 class TestPrefillDelayerThroughputOnlineServing(CustomTestCase):

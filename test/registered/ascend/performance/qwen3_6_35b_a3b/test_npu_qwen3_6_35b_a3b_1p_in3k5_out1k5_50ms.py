@@ -94,6 +94,7 @@ class TestNPUQwen3_6_35BA3B_1P_In3k5_Out1k5_50ms(TestAscendPerformanceTestCaseBa
     envs = QWEN3_6_35B_A3B_3K5_1K5_ENVS
     dataset_name = "random"
     max_concurrency = 122
+    warmup_requests = max_concurrency
     num_prompts = 122
     input_len = 3500
     output_len = 1500
