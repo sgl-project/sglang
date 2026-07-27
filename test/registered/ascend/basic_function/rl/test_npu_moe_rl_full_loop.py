@@ -11,6 +11,10 @@ Covered cross paths:
 
 Model: Qwen/Qwen3-30B-A3B (BF16, Unquantized MoE)
 Hardware: NPU
+
+Note:
+  - the NPU-customized torch_memory_saver is required.
+    pip install torch_memory_saver-xxx.whl
 """
 
 import logging
@@ -35,7 +39,7 @@ from sglang.test.test_utils import (
 register_npu_ci(
     est_time=300,
     suite="full-1-npu-a3",
-    disabled="Depends on the NPU-customized version of torch_memory_saver.",
+    nightly=True,
 )
 
 logging.basicConfig(
