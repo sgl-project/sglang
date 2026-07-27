@@ -21,8 +21,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
@@ -50,9 +50,9 @@ fn config() -> Config {
         model: ModelConfig {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: PolicyKind::CacheAwareZmq,
+            policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
-            cache_aware: Some(CacheAwareConfig::default()),
+            cache_aware: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -60,6 +60,7 @@ fn config() -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     }
 }
 
@@ -78,8 +79,8 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
     });
-    // Use the real loaded tokenizers (not the empty-registry test default) so
-    // the cache-aware policy can tokenize at ingress.
+    // Use the real loaded tokenizers so the request path can produce
+    // engine-equivalent input IDs independently of routing policy.
     let policies = Arc::new(
         build_registry(
             &cfg,

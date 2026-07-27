@@ -87,6 +87,8 @@ pub struct Worker {
     mode: AtomicU8,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
+    /// Router-local in-flight request count retained for lifecycle guards and
+    /// observability only. Scheduling uses load-monitor snapshots.
     pub active_requests: Arc<AtomicUsize>,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
@@ -155,12 +157,13 @@ impl Worker {
         self.mode.store(m.as_u8(), Ordering::Relaxed);
     }
 
+    /// Returns the Router-local in-flight count for diagnostics and tests.
     pub fn active_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
 
-    /// Returns a RAII guard that increments `active_requests` now and
-    /// decrements when the guard is dropped.
+    /// Returns a lifecycle guard that increments `active_requests` now and
+    /// decrements when the request or response stream ends.
     pub fn load_guard(&self) -> LoadGuard {
         LoadGuard::new(self.active_requests.clone())
     }

@@ -15,7 +15,7 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use sgl_router::policies::random::RandomPolicy;
 use sgl_router::policies::round_robin::RoundRobinPolicy;
-use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::policies::{Policy, PolicyCandidate, SelectionContext};
 use sgl_router::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -39,6 +39,17 @@ fn bench_policy(c: &mut Criterion, name: &str, policy: Arc<dyn Policy>) {
     let mut group = c.benchmark_group(format!("policy_select::{name}"));
     for &n in &[4usize, 16, 64, 256] {
         let workers = workers(n, "tiny");
+        let candidates = workers
+            .iter()
+            .map(|worker| PolicyCandidate {
+                worker: Arc::clone(worker),
+                load: Some(sgl_router::load_monitor::AggregateLoad {
+                    max_total_num_tokens: 1,
+                    max_running_requests: 1,
+                    ..Default::default()
+                }),
+            })
+            .collect::<Vec<_>>();
         let model = ModelId("tiny".into());
         // Same body across iterations — measures the policy's per-call
         // cost rather than body-parsing overhead.
@@ -51,7 +62,7 @@ fn bench_policy(c: &mut Criterion, name: &str, policy: Arc<dyn Policy>) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let ctx = SelectionContext::new(&model, Some(&body));
-                let chosen = policy.select(black_box(&workers), &ctx);
+                let chosen = policy.select(black_box(&candidates), &ctx);
                 black_box(chosen);
             });
         });

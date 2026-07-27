@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::load_monitor::AggregateLoad;
 use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::policies::{Policy, PolicyCandidate, SelectionContext};
 use sgl_router::workers::Worker;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -18,6 +19,24 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
+/// Converts worker-local fixture counters into engine-load candidates.
+fn candidates(workers: &[Arc<Worker>]) -> Vec<PolicyCandidate> {
+    workers
+        .iter()
+        .map(|worker| {
+            let load = worker.active_load() as u64;
+            PolicyCandidate {
+                worker: Arc::clone(worker),
+                load: Some(AggregateLoad {
+                    total_requests: load,
+                    num_total_tokens: load,
+                    ..AggregateLoad::default()
+                }),
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn selects_lower_load() {
     let a = worker("a");
@@ -28,7 +47,7 @@ fn selects_lower_load() {
     let ws = vec![a.clone(), b.clone()];
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
-    let chosen = p.select(&ws, &ctx).unwrap();
+    let chosen = p.select(&candidates(&ws), &ctx).unwrap();
     assert_eq!(chosen.id.0, "b");
 }
 
@@ -44,7 +63,7 @@ fn distribution_skews_to_lower_load() {
     let ctx = SelectionContext::new(&model_id, None);
     let mut counts = std::collections::HashMap::new();
     for _ in 0..1000 {
-        let w = p.select(&workers, &ctx).unwrap();
+        let w = p.select(&candidates(&workers), &ctx).unwrap();
         *counts.entry(w.id.0.clone()).or_insert(0) += 1;
     }
     let c_picks = *counts.get("c").unwrap_or(&0);
@@ -60,7 +79,7 @@ fn empty_returns_none() {
     let ws: Vec<Arc<Worker>> = vec![];
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
-    assert!(p.select(&ws, &ctx).is_none());
+    assert!(p.select(&candidates(&ws), &ctx).is_none());
 }
 
 #[test]
@@ -69,7 +88,7 @@ fn single_worker_returns_it() {
     let ws = vec![worker("only")];
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
-    assert_eq!(p.select(&ws, &ctx).unwrap().id.0, "only");
+    assert_eq!(p.select(&candidates(&ws), &ctx).unwrap().id.0, "only");
 }
 
 #[test]
@@ -88,7 +107,7 @@ fn all_workers_reachable() {
     let ctx = SelectionContext::new(&model_id, None);
     let mut seen = std::collections::HashSet::new();
     for _ in 0..1000 {
-        let w = p.select(&workers, &ctx).unwrap();
+        let w = p.select(&candidates(&workers), &ctx).unwrap();
         seen.insert(w.id.0.clone());
     }
     assert_eq!(
@@ -96,4 +115,35 @@ fn all_workers_reachable() {
         workers.len(),
         "every worker should be reachable, saw {seen:?}"
     );
+}
+
+/// Prefill power-of-two scoring uses total tokens rather than request count.
+#[test]
+fn prefill_compares_total_tokens() {
+    let left = worker("left");
+    let right = worker("right");
+    left.set_mode(WorkerMode::Prefill);
+    right.set_mode(WorkerMode::Prefill);
+    let candidates = vec![
+        PolicyCandidate {
+            worker: left,
+            load: Some(AggregateLoad {
+                total_requests: 1,
+                num_total_tokens: 100,
+                ..AggregateLoad::default()
+            }),
+        },
+        PolicyCandidate {
+            worker: Arc::clone(&right),
+            load: Some(AggregateLoad {
+                total_requests: 10,
+                num_total_tokens: 5,
+                ..AggregateLoad::default()
+            }),
+        },
+    ];
+    let policy = PowerOfTwoChoicesPolicy::new();
+    let model = ModelId("m".into());
+    let context = SelectionContext::new(&model, None);
+    assert_eq!(policy.select(&candidates, &context).unwrap().id, right.id);
 }

@@ -80,6 +80,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         ),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        load_monitor: Default::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
 
@@ -152,7 +153,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let w_a = build_worker(url_a, "tiny");
     let w_b = build_worker(url_b, "tiny");
     let _b_load: Vec<_> = (0..3).map(|_| w_b.load_guard()).collect();
-    let workers = vec![Arc::clone(&w_a), Arc::clone(&w_b)];
+    let workers = [Arc::clone(&w_a), Arc::clone(&w_b)];
 
     // 8. Drive select until the event has been applied. The pipeline is
     //    asynchronous (publish → SUB recv → mpsc → pump → tree); a
@@ -163,7 +164,21 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let start = std::time::Instant::now();
     let mut chose_a = false;
     while start.elapsed() < Duration::from_secs(3) {
-        if let Some(w) = policy.select(&workers, &ctx) {
+        let candidates = workers
+            .iter()
+            .map(|worker| {
+                let load = worker.active_load() as u64;
+                sgl_router::policies::PolicyCandidate {
+                    worker: Arc::clone(worker),
+                    load: Some(sgl_router::load_monitor::AggregateLoad {
+                        total_requests: load,
+                        num_total_tokens: load,
+                        ..Default::default()
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(w) = policy.select(&candidates, &ctx) {
             if w.url == url_a {
                 chose_a = true;
                 break;

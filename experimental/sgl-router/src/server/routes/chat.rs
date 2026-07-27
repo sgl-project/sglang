@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::registry::{select_decode_with_affinity, PdPoolResolver, PdResolveError};
+use crate::policies::{policy_candidates, request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -29,14 +29,9 @@ use std::sync::Arc;
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 
-/// Coarse char-count → token-count divisor used to estimate prefill load
-/// from the request body when no real tokenizer count is available. Four
-/// bytes per token is the standard SGLang upstream estimate; it
-/// overcounts ASCII and undercounts CJK but stays within an order of
-/// magnitude of the real token count, which is plenty for load
-/// scoring. The active-load counters' role is relative ordering across
-/// workers — not absolute accuracy — so the estimate is fit for
-/// purpose.
+/// Coarse char-count → token-count divisor used for Router-local request
+/// lifecycle metrics when a tokenizer count is unavailable. It is not used by
+/// policy scoring; scheduling load comes exclusively from engine snapshots.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Per-route body-size cap on `/v1/chat/completions`. 5 MiB accommodates a
@@ -105,6 +100,9 @@ pub async fn chat_completions(
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
+    // Capture exactly once so Prefill and Decode routing consume one immutable
+    // load-monitor version even while gRPC reports arrive concurrently.
+    let load_snapshot = ctx.load_monitor.snapshot();
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
@@ -125,6 +123,21 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             },
         })?;
+    let is_prefill_pool = workers
+        .iter()
+        .any(|worker| worker.mode() == WorkerMode::Prefill);
+    let candidates = policy_candidates(workers, &load_snapshot);
+    if candidates.is_empty() && load_snapshot.enabled {
+        return Err(if is_prefill_pool {
+            ApiError::NoFreshPrefillLoad {
+                model: model_str.clone(),
+            }
+        } else {
+            ApiError::NoFreshWorkerLoad {
+                model: model_str.clone(),
+            }
+        });
+    }
 
     let policy = ctx
         .policies
@@ -182,12 +195,11 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    let worker = policy.select(&candidates, &selection_ctx).ok_or_else(|| {
+        ApiError::PolicySelectionFailed {
+            model: model_str.clone(),
+        }
+    })?;
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -202,24 +214,29 @@ pub async fn chat_completions(
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
+        let decode_workers = resolver.decode_candidates(&model_id).map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
+        let decode_candidates = policy_candidates(decode_workers, &load_snapshot);
+        if decode_candidates.is_empty() && load_snapshot.enabled {
+            return Err(ApiError::NoFreshDecodeLoad {
+                model: model_str.clone(),
+            });
+        }
         Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
+            select_decode_with_affinity(&worker.url, &decode_candidates).ok_or_else(|| {
+                ApiError::NoDecodeWorkersAvailable {
+                    model: model_str.clone(),
+                }
+            })?,
         )
     } else {
         None
@@ -249,22 +266,19 @@ pub async fn chat_completions(
     let headers = request_headers;
 
     // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
-    // sits beside this one: both track in-flight load, but the
-    // ActiveLoadGuard entry is per-request (with timeout-based janitor)
-    // while the worker-scoped counter is what the cache-aware policy
-    // reads. Both must drop at the same time — when the response stream
-    // ends, the client disconnects, or the handler returns an error. In
+    // sits beside this one for timeout cancellation and observability only;
+    // neither counter participates in scheduling. Both must drop together
+    // when the response stream ends, the client disconnects, or the handler
+    // returns an error. In
     // PD mode the pair moves into the spawned prefill task so prefill
     // load is tracked for the full duration of the KV transfer; in plain
     // mode the pair stays in this handler. Decode-load contribution is
     // 0 here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler — current decode selection is
-    // host-affinity only.
+    // decode-side lifecycle metrics.
     let guard = worker.load_guard();
     // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
+    // fall back to the byte-count heuristic for policies that don't tokenize.
+    // This value is diagnostic and does not affect policy scoring.
     let prefill_load = request_tokens
         .as_ref()
         .map(|t| t.ids.len().max(1))
@@ -438,8 +452,7 @@ pub async fn chat_completions(
 
         // Synchronously await the decode worker. Its response is what
         // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // Router-local in-flight metrics cover both PD phases.
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
@@ -620,17 +633,13 @@ pub async fn chat_completions(
     }
 }
 
-/// Estimate prefill-token count from the raw request body for use as
-/// the active-load `prefill_load` counter. Returns 1 at minimum so
-/// a registered request always shows up as "load > 0" — under-counting
-/// to zero would hide the request from the cache-aware policy's
-/// load-imbalance fast-path.
+/// Estimate prefill-token count from the raw request body for the local
+/// `prefill_load` diagnostic counter. Returns 1 at minimum so every registered
+/// request remains visible in metrics.
 ///
 /// This is a coarse approximation: we count the body length in bytes
 /// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
-/// to thread the tokenizer's actual token count through (the
-/// cache-aware-zmq policy already tokenizes the prompt for tree
-/// matching — that count could be reused here).
+/// to use an exact tokenizer count on every request path.
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
@@ -679,8 +688,8 @@ struct BootstrapFields {
 ///
 /// `value` is the already-parsed request body when one is on hand (the
 /// cache-aware path parses once at ingress); it is consumed so the mutation
-/// reuses that parse. It is `None` only for a load-only policy in PD mode — a
-/// path that never parses at ingress — so the bootstrap injection re-parses
+/// reuses that parse. It is `None` for policies that do not need ingress
+/// tokenization, so the bootstrap injection re-parses
 /// the bytes here (matching the pre-refactor behavior). The body shape was
 /// validated by `parse_probe`; the non-object arm defends against a TOCTOU
 /// regression rather than panicking.

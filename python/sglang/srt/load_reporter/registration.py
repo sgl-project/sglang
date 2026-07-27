@@ -24,12 +24,6 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, IPvAnyAddress
 
-from sglang.srt.utils.auth import (
-    AuthLevel,
-    auth_level,
-    decide_request_auth,
-)
-
 router = APIRouter()
 
 
@@ -166,58 +160,20 @@ def normalize_worker_origin(request: Request) -> str:
     return f"{scheme}://{bracketed}:{port}"
 
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
-
-
-def authorize_start_reporting(request: Request) -> None:
-    """Require the configured admin API key for reporter control requests.
-
-    Args:
-        request: Incoming FastAPI request containing the Authorization header.
-
-    Returns:
-        None when the request carries the configured admin bearer token.
-
-    Raises:
-        HTTPException: With 401 for a missing or invalid token, or 403 when the
-            server has no admin API key configured.
-    """
-    decision = decide_request_auth(
-        method=request.method,
-        path=request.url.path,
-        authorization_header=request.headers.get("Authorization"),
-        api_key=None,
-        admin_api_key=getattr(
-            request.app.state,
-            "load_reporter_admin_api_key",
-            None,
-        ),
-        auth_level=AuthLevel.ADMIN_FORCE,
-    )
-    if not decision.allowed:
-        detail = "Unauthorized" if decision.error_status_code == 401 else "Forbidden"
-        raise HTTPException(status_code=decision.error_status_code, detail=detail)
-
-
 @router.post("/v1/start_reporting", response_model=StartReportingResponse)
-@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_reporting(payload: StartReportingRequest, request: Request):
-    """Register or renew one authenticated Router load-reporting target.
+    """Register or renew one internal Router load-reporting target.
 
     Args:
         payload: Strict Router endpoint and lease configuration.
-        request: Incoming FastAPI request used for authentication and worker identity.
+        request: Incoming FastAPI request used to derive the worker identity.
 
     Returns:
         The accepted lease and renewal timing.
 
     Raises:
-        HTTPException: For authentication, unsupported runtime, identity conflict,
-            or shutdown failures.
+        HTTPException: For unsupported runtime, identity conflict, or shutdown failures.
     """
-    authorize_start_reporting(request)
     runtime = getattr(request.app.state, "load_reporter_runtime", None)
     unsupported = getattr(request.app.state, "load_reporter_unsupported_reason", None)
     if runtime is None:

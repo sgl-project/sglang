@@ -67,6 +67,18 @@ pub enum ApiError {
     #[error("no decode workers available for model {model}")]
     NoDecodeWorkersAvailable { model: String },
 
+    /// Monitoring is enabled but a plain worker pool has no fresh report.
+    #[error("no fresh worker load for model {model}")]
+    NoFreshWorkerLoad { model: String },
+
+    /// Monitoring is enabled but the prefill pool has no fresh report.
+    #[error("no fresh prefill load for model {model}")]
+    NoFreshPrefillLoad { model: String },
+
+    /// Monitoring is enabled but the decode pool has no fresh report.
+    #[error("no fresh decode load for model {model}")]
+    NoFreshDecodeLoad { model: String },
+
     /// A request whose lifetime exceeded `stale_request_timeout` — the
     /// active-load janitor force-expired the in-flight bookkeeping
     /// AND fired the per-request cancellation token, which the chat
@@ -111,6 +123,7 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Maps one typed Router error to its HTTP status and stable wire code.
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
@@ -131,6 +144,15 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_decode_workers_available",
             ),
+            ApiError::NoFreshWorkerLoad { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "no_fresh_worker_load")
+            }
+            ApiError::NoFreshPrefillLoad { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "no_fresh_prefill_load")
+            }
+            ApiError::NoFreshDecodeLoad { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "no_fresh_decode_load")
+            }
             ApiError::StaleRequestExpired { .. } => {
                 (StatusCode::GATEWAY_TIMEOUT, "stale_request_expired")
             }
@@ -220,6 +242,16 @@ impl IntoResponse for ApiError {
                     "service unavailable",
                 );
                 "no decode workers available for the requested model".to_string()
+            }
+            ApiError::NoFreshWorkerLoad { model }
+            | ApiError::NoFreshPrefillLoad { model }
+            | ApiError::NoFreshDecodeLoad { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = code,
+                    "load monitor has no fresh scheduling candidate",
+                );
+                "no fresh worker load for the requested model".to_string()
             }
             ApiError::StaleRequestExpired { model } => {
                 tracing::warn!(
@@ -407,6 +439,31 @@ mod tests {
         );
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "bad_request");
+    }
+
+    /// Freshness failures expose the three pool-specific 503 error codes.
+    #[test]
+    fn no_fresh_load_errors_have_distinct_codes() {
+        let errors = [
+            (
+                ApiError::NoFreshWorkerLoad { model: "m".into() },
+                "no_fresh_worker_load",
+            ),
+            (
+                ApiError::NoFreshPrefillLoad { model: "m".into() },
+                "no_fresh_prefill_load",
+            ),
+            (
+                ApiError::NoFreshDecodeLoad { model: "m".into() },
+                "no_fresh_decode_load",
+            ),
+        ];
+        for (error, expected_code) in errors {
+            let (status, code, envelope) = parse_envelope(error.into_response());
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(code.as_deref(), Some(expected_code));
+            assert_eq!(envelope.error.code, expected_code);
+        }
     }
 
     #[test]

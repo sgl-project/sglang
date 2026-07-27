@@ -15,6 +15,46 @@ impl Config {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
         }
+        let load_policy_requires_monitor = matches!(
+            self.model.policy,
+            PolicyKind::LoadBased | PolicyKind::PowerOfTwo | PolicyKind::CacheAwareZmq
+        ) || self.model.sticky.as_ref().is_some_and(|sticky| {
+            matches!(
+                sticky.fallback_policy,
+                PolicyKind::LoadBased | PolicyKind::PowerOfTwo
+            )
+        });
+        if load_policy_requires_monitor && !self.load_monitor.enabled {
+            return Err(anyhow!(
+                "policy {:?} requires --load-monitor because scheduling load must come from engine reports",
+                self.model.policy
+            ));
+        }
+        if !self.load_monitor.enabled
+            && (self.load_monitor.bind_host != "0.0.0.0"
+                || self.load_monitor.bind_port != 0
+                || self.load_monitor.report_ip.is_some())
+        {
+            return Err(anyhow!(
+                "load-monitor address configuration requires load monitoring to be enabled"
+            ));
+        }
+        if self.load_monitor.enabled
+            && self
+                .load_monitor
+                .report_ip
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Err(anyhow!(
+                "load_monitor.report_ip must be non-empty when load monitor is enabled"
+            ));
+        }
+        if let Some(report_ip) = self.load_monitor.report_ip.as_deref() {
+            report_ip.parse::<std::net::IpAddr>().map_err(|error| {
+                anyhow!("load_monitor.report_ip {report_ip:?} must be an IP address: {error}")
+            })?;
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -94,6 +134,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            load_monitor: LoadMonitorConfig::default(),
         }
     }
 

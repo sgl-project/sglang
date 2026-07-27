@@ -13,8 +13,6 @@ from ipaddress import IPv4Address
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from fastapi import HTTPException
-
 from sglang.srt.load_reporter.ipc import (
     LoadReporterControlProxy,
     LoadReporterRefreshNotifier,
@@ -23,7 +21,6 @@ from sglang.srt.load_reporter.proto import load_monitor_pb2 as pb
 from sglang.srt.load_reporter.registration import (
     StartReportingRequest,
     WorkerIdentity,
-    authorize_start_reporting,
     start_reporting,
 )
 from sglang.srt.load_reporter.report_builder import ReportBuilder, SequenceAllocator
@@ -45,7 +42,6 @@ from sglang.srt.managers.io_struct import (
     LoadReporterStateBroadcastReq,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.utils.auth import AuthLevel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -236,29 +232,6 @@ def _ok(request_id: str) -> LoadReporterStartIpcReqOutput:
     )
 
 
-def _request(admin_api_key: str | None, authorization: str | None):
-    """Build the minimal request shape consumed by authorization.
-
-    Args:
-        admin_api_key: Configured administrator key.
-        authorization: Incoming Authorization header value.
-
-    Returns:
-        A request-like namespace for the authorization helper.
-    """
-    headers = {}
-    if authorization is not None:
-        headers["Authorization"] = authorization
-    return SimpleNamespace(
-        method="POST",
-        url=SimpleNamespace(path="/v1/start_reporting"),
-        headers=headers,
-        app=SimpleNamespace(
-            state=SimpleNamespace(load_reporter_admin_api_key=admin_api_key)
-        ),
-    )
-
-
 class TestLoadSampler(AsyncCustomTestCase):
     """Cover source adaptation, request coalescing, and activation lifecycle."""
 
@@ -339,22 +312,15 @@ class TestLoadSampler(AsyncCustomTestCase):
 
 
 class TestLoadReporterControl(AsyncCustomTestCase):
-    """Cover administrator control and multi-worker IPC semantics."""
+    """Cover the internal control endpoint and multi-worker IPC semantics."""
 
-    def test_start_reporting_requires_admin_authority(self) -> None:
-        """The route marker and bearer-token checks enforce administrator access."""
-        self.assertIs(start_reporting._auth_level, AuthLevel.ADMIN_FORCE)
+    def test_start_reporting_has_no_dedicated_authentication(self) -> None:
+        """Verify the internal Router control endpoint has no dedicated auth policy.
 
-        for admin_key, authorization, expected_status in (
-            (None, None, 403),
-            ("correct", "Bearer wrong", 401),
-        ):
-            with self.subTest(expected_status=expected_status):
-                with self.assertRaises(HTTPException) as raised:
-                    authorize_start_reporting(_request(admin_key, authorization))
-                self.assertEqual(raised.exception.status_code, expected_status)
-
-        authorize_start_reporting(_request("correct", "Bearer correct"))
+        Returns:
+            None.
+        """
+        self.assertFalse(hasattr(start_reporting, "_auth_level"))
 
     async def test_out_of_order_ipc_responses_match_request_ids(self) -> None:
         """Reversed owner responses still resolve the corresponding callers."""

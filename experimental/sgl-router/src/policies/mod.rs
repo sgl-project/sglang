@@ -13,11 +13,72 @@ pub mod round_robin;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::load_monitor::{AggregateLoad, LoadMonitorSnapshot};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
 use std::sync::Arc;
+
+/// One policy input containing the immutable worker handle and the optional
+/// fresh engine-reported load captured for the current request.
+#[derive(Debug, Clone)]
+pub struct PolicyCandidate {
+    pub worker: Arc<Worker>,
+    pub load: Option<AggregateLoad>,
+}
+
+impl PolicyCandidate {
+    /// Creates a candidate from one worker and its load in `snapshot`.
+    pub fn new(worker: Arc<Worker>, snapshot: &LoadMonitorSnapshot) -> Self {
+        let load = snapshot.fresh_load(&worker.id);
+        Self { worker, load }
+    }
+}
+
+/// Builds the candidate set for one request after circuit-breaker filtering.
+///
+/// When monitoring is enabled, only workers with fresh load survive. When it
+/// is disabled, every supplied worker remains available with `load = None`.
+pub fn policy_candidates(
+    workers: Vec<Arc<Worker>>,
+    snapshot: &LoadMonitorSnapshot,
+) -> Vec<PolicyCandidate> {
+    workers
+        .into_iter()
+        .filter_map(|worker| {
+            let candidate = PolicyCandidate::new(worker, snapshot);
+            if snapshot.enabled && candidate.load.is_none() {
+                None
+            } else {
+                Some(candidate)
+            }
+        })
+        .collect()
+}
+
+/// Converts worker-local counters into synthetic candidates for legacy policy
+/// unit tests. Production request routing never calls this helper.
+#[cfg(test)]
+pub(crate) fn test_policy_candidates(workers: &[Arc<Worker>]) -> Vec<PolicyCandidate> {
+    workers
+        .iter()
+        .map(|worker| {
+            let load = worker.active_load() as u64;
+            PolicyCandidate {
+                worker: Arc::clone(worker),
+                load: Some(AggregateLoad {
+                    num_running_reqs: load,
+                    total_requests: load,
+                    num_total_tokens: load,
+                    max_total_num_tokens: u64::MAX,
+                    max_running_requests: u64::MAX,
+                    ..AggregateLoad::default()
+                }),
+            }
+        })
+        .collect()
+}
 
 /// Tokens produced once at ingress for a request. Consumed by the
 /// cache-aware selection decision and, when `engine_equivalent`, forwarded
@@ -234,7 +295,12 @@ impl<'a> SelectionContext<'a> {
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
+    /// Selects one worker from a request-owned candidate snapshot.
+    fn select(
+        &self,
+        candidates: &[PolicyCandidate],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>>;
 
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
@@ -278,5 +344,96 @@ impl PolicyRegistry {
         for entry in self.by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::load_monitor::{Freshness, WorkerSnapshot};
+
+    /// Builds one plain worker for freshness-filter tests.
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.to_string()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".to_string())],
+            bootstrap_port: None,
+        }))
+    }
+
+    /// Builds a minimal snapshot entry with aggregate load only when fresh.
+    fn snapshot_worker(id: &str, freshness: Freshness) -> WorkerSnapshot {
+        WorkerSnapshot {
+            worker_id: id.to_string(),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec!["model".to_string()],
+            freshness,
+            source_instance_id: None,
+            sequence_id: None,
+            report_time_unix_ms: None,
+            last_error: None,
+            received_at: None,
+            expires_at: None,
+            aggregate: (freshness == Freshness::Fresh).then(AggregateLoad::default),
+            ranks: Vec::new(),
+        }
+    }
+
+    /// Monitoring disabled preserves candidates without engine load.
+    #[test]
+    fn disabled_monitor_preserves_round_robin_candidates() {
+        let snapshot = LoadMonitorSnapshot {
+            enabled: false,
+            version: 0,
+            captured_at: None,
+            workers: Vec::new(),
+        };
+        let candidates = policy_candidates(vec![worker("worker")], &snapshot);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].load.is_none());
+    }
+
+    /// Monitoring enabled filters a worker whose snapshot entry is missing.
+    #[test]
+    fn enabled_monitor_filters_missing_load_for_every_policy() {
+        let snapshot = LoadMonitorSnapshot {
+            enabled: true,
+            version: 1,
+            captured_at: Some("capture".to_string()),
+            workers: Vec::new(),
+        };
+        assert!(policy_candidates(vec![worker("worker")], &snapshot).is_empty());
+    }
+
+    /// Enabled monitoring admits only fresh entries and uniformly excludes
+    /// missing, stale, and unreachable reports.
+    #[test]
+    fn enabled_monitor_filters_every_non_fresh_state() {
+        let snapshot = LoadMonitorSnapshot {
+            enabled: true,
+            version: 4,
+            captured_at: Some("capture".to_string()),
+            workers: vec![
+                snapshot_worker("fresh", Freshness::Fresh),
+                snapshot_worker("missing", Freshness::Missing),
+                snapshot_worker("stale", Freshness::Stale),
+                snapshot_worker("unreachable", Freshness::Unreachable),
+            ],
+        };
+        let candidates = policy_candidates(
+            vec![
+                worker("fresh"),
+                worker("missing"),
+                worker("stale"),
+                worker("unreachable"),
+            ],
+            &snapshot,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].worker.id, WorkerId("fresh".to_string()));
     }
 }

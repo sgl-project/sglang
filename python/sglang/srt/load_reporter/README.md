@@ -14,8 +14,8 @@ using gRPC client streaming.
   HTTP workers register through IPC and coalesce refresh notifications.
 - The reporter uses `grpc.aio.insecure_channel` (h2c, without TLS or gRPC
   authentication).
-- `POST /v1/start_reporting` requires a Bearer token matching
-  `--admin-api-key`.
+- `POST /v1/start_reporting` is a strictly internal Router-to-Engine control
+  endpoint and does not require `--admin-api-key`.
 
 ### Runtime dependencies
 
@@ -68,7 +68,7 @@ FastAPI lifespan
 | `monitor.py` | `MonitorManager` owns the target map and performs identity-safe upserts; each `MonitorTask` owns one gRPC stream and its fixed-rate lease/reconnect state machine. |
 | `runtime.py` | `LoadReporterRuntime`: top-level composition, the `start_reporting` control plane, the synchronous `notify_request_finished` hook, and bounded shutdown. |
 | `ipc.py` | Correlates multi-tokenizer control requests and responses, coalesces refresh events, and maps stable errors. |
-| `proto/load_monitor.proto` | Embedded `model_gateway.loadmonitor.v1` IDL. Fields 1 through 13 match the Router contract; Engine field 14 is an additive load-report extension. |
+| `proto/load_monitor.proto` | Embedded `router.loadmonitor.v1` IDL. Fields 1 through 13 match the Router contract; Engine field 14 is an additive load-report extension. |
 
 ### Regenerating the Python protobuf code
 
@@ -226,8 +226,8 @@ the protobuf or gRPC runtime-version checks emitted by the generator.
 
 ## Tests and validation
 
-Unit tests cover the store, builder, sampler, monitor deadlines,
-authentication, optional-dependency boundary, IPC correlation and coalescing,
+Unit tests cover the store, builder, sampler, monitor deadlines, internal
+control behavior, optional-dependency boundary, IPC correlation and coalescing,
 single ownership across multiple workers, shutdown cleanup, and msgpack
 round-trips. GPU end-to-end validation checks that two tokenizer/HTTP workers
 establish only one Router gRPC stream.

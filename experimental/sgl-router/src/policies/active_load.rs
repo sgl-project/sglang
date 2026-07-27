@@ -4,11 +4,9 @@
 //! Per-worker active-load tracking with RAII guards and a stale-request
 //! janitor.
 //!
-//! The cache-aware-zmq policy ([`super::cache_aware_zmq`]) needs to combine
-//! the hash tree's overlap score with a per-worker load signal. The
-//! per-worker `Worker::active_requests` counter tracks one axis — number of
-//! in-flight HTTP requests — and is already drop-safe through
-//! [`crate::workers::LoadGuard`].
+//! Engine-reported scheduling load lives in [`crate::load_monitor`]. The
+//! counters in this module are deliberately Router-local: they drive request
+//! timeout cancellation and observability, never policy scoring.
 //!
 //! This module adds two things on top of that:
 //!
@@ -17,9 +15,10 @@
 //!    `stale_request_timeout` and decrement the counters they were holding.
 //!    Without this, a request whose `LoadGuard` is leaked (proxy task
 //!    panics before the future drops, server hits a panic-catching
-//!    middleware, etc.) would inflate a worker's load forever.
-//! 2. **Two-axis tracking** so PD-disaggregation can score prefill (token
-//!    count) separately from decode (block count). The two counters share
+//!    middleware, etc.) would leave lifecycle state and its diagnostic gauge
+//!    inflated forever.
+//! 2. **Two-axis diagnostics** so PD-disaggregation metrics can distinguish
+//!    prefill token estimates from decode activity. The two counters share
 //!    the same registry shape; we expose them as a single
 //!    [`ActiveLoadGuard`] holding both so the proxy's hot path mints one
 //!    guard per request rather than two.
@@ -72,10 +71,8 @@ impl std::fmt::Display for RequestId {
     }
 }
 
-/// Per-worker counters: one for prefill (token) load, one for decode (block)
-/// load. The two axes are tracked separately so cache-aware-zmq can score
-/// prefill candidates by token load and decode candidates by block load
-/// without each axis spamming through the other's counter.
+/// Per-worker diagnostic counters: one for prefill token estimates and one for
+/// decode activity. Policies do not consume either axis.
 ///
 /// Production tracks **active requests** as the unit (count of in-flight
 /// requests pinning the worker), not raw token / block counts — until the
@@ -170,13 +167,11 @@ impl Clock for MockClock {
     }
 }
 
-/// Registry of in-flight requests + per-worker active-load counters.
+/// Registry of in-flight requests and per-worker diagnostic counters.
 ///
-/// Constructed once per `AppContext`; the cache-aware-zmq policy reads
-/// per-worker `prefill_load` / `decode_load` from here when scoring
-/// candidates, and the proxy holds an [`ActiveLoadGuard`] per request so
-/// counters decrement on drop. A background task periodically calls
-/// [`Self::sweep_stale`] to evict requests that outlived
+/// Constructed once per `AppContext`; the proxy holds an [`ActiveLoadGuard`]
+/// per request so counters decrement on drop. A background task periodically
+/// calls [`Self::sweep_stale`] to evict requests that outlived
 /// `stale_request_timeout`.
 #[derive(Debug)]
 pub struct ActiveLoadRegistry {
@@ -196,7 +191,7 @@ pub struct ActiveLoadRegistry {
 impl ActiveLoadRegistry {
     /// Construct an [`ActiveLoadRegistry`] wrapped in an [`Arc`].
     ///
-    /// The registry is always shared (proxy + janitor + selector all hold
+    /// The registry is always shared (proxy, metrics, and janitor all hold
     /// the same instance), so the public constructor mints the `Arc`
     /// directly to remove an easy footgun where callers forget to wrap
     /// it. Tests that need the inner type for direct field access also

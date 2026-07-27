@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir fastapi uvicorn
-COPY fake_worker.py .
+RUN pip install --no-cache-dir fastapi uvicorn grpcio grpcio-tools protobuf
+COPY experimental/sgl-router/tests/e2e/k8s_integration/fake_worker.py .
+COPY experimental/sgl-router/proto/load_monitor.proto .
 EXPOSE 30000
 CMD ["python", "fake_worker.py"]

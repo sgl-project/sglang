@@ -1,1 +1,1 @@
-"""Generated model_gateway.loadmonitor.v1 bindings."""
+"""Generated router.loadmonitor.v1 bindings."""

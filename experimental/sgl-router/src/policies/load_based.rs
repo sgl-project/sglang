@@ -1,33 +1,49 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{Policy, PolicyCandidate, SelectionContext};
 use crate::workers::Worker;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
 
-/// Deterministic load-based policy.
+/// Engine-reported least-load policy.
 ///
-/// Chooses the candidate with the lowest current `Worker::active_load`.
-/// Ties follow the candidate slice order, which is registry-dependent.
+/// Chooses the candidate with the lowest reported `running + waiting` count.
+/// Ties are randomized to avoid stable registry-order concentration.
 #[derive(Debug, Default)]
 pub struct LoadBasedPolicy;
 
 impl LoadBasedPolicy {
+    /// Constructs a stateless load-based policy.
     pub fn new() -> Self {
         Self
     }
 
-    pub fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
-        workers
+    /// Selects a minimum-request candidate with random tie-breaking.
+    pub fn pick_min_load(candidates: &[PolicyCandidate]) -> Option<Arc<Worker>> {
+        let minimum = candidates
             .iter()
-            .min_by_key(|w| w.active_load())
-            .map(Arc::clone)
+            .filter_map(|candidate| candidate.load.as_ref().map(|load| load.total_requests))
+            .min()?;
+        candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.load.as_ref().map(|load| load.total_requests) == Some(minimum)
+            })
+            .collect::<Vec<_>>()
+            .choose(&mut rand::thread_rng())
+            .map(|candidate| Arc::clone(&candidate.worker))
     }
 }
 
 impl Policy for LoadBasedPolicy {
-    fn select(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        Self::pick_min_load(workers)
+    /// Selects the least-loaded worker using engine-reported request counts.
+    fn select(
+        &self,
+        candidates: &[PolicyCandidate],
+        _ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>> {
+        Self::pick_min_load(candidates)
     }
 }
 
@@ -51,7 +67,9 @@ mod tests {
         let policy = LoadBasedPolicy::new();
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None);
-        assert!(policy.select(&[], &ctx).is_none());
+        assert!(policy
+            .select(&crate::policies::test_policy_candidates(&[]), &ctx)
+            .is_none());
     }
 
     #[test]
@@ -62,9 +80,7 @@ mod tests {
         let w0 = worker("w0");
         let w1 = worker("w1");
         let _g0 = w0.load_guard();
-        assert_eq!(
-            policy.select(&[w0, Arc::clone(&w1)], &ctx).unwrap().id,
-            w1.id
-        );
+        let candidates = crate::policies::test_policy_candidates(&[w0, Arc::clone(&w1)]);
+        assert_eq!(policy.select(&candidates, &ctx).unwrap().id, w1.id);
     }
 }

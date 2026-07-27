@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{Policy, PolicyCandidate, SelectionContext};
 use crate::server::metrics::{MetricsRegistry, StickyOutcome};
 use crate::workers::Worker;
 
@@ -165,17 +165,26 @@ impl StickyPolicy {
 }
 
 impl Policy for StickyPolicy {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+    /// Preserves or assigns a sticky worker within the fresh candidate set.
+    fn select(
+        &self,
+        candidates: &[PolicyCandidate],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>> {
         let Some(key) = ctx.routing_key().filter(|k| !k.is_empty()) else {
             self.state.record(StickyOutcome::NoRoutingKey);
-            return self.fallback.select(workers, ctx);
+            return self.fallback.select(candidates, ctx);
         };
 
         // Fast path: an existing pin whose worker is still in the healthy set.
         let mut existing = false;
         if let Some(mut entry) = self.state.assignments.get_mut(key) {
             existing = true;
-            if let Some(worker) = workers.iter().find(|w| w.url == entry.worker_url).cloned() {
+            if let Some(worker) = candidates
+                .iter()
+                .find(|candidate| candidate.worker.url == entry.worker_url)
+                .map(|candidate| Arc::clone(&candidate.worker))
+            {
                 entry.last_seen = self.state.clock.now();
                 drop(entry); // release the shard lock before recording
                 self.state.record(StickyOutcome::Hit);
@@ -193,7 +202,7 @@ impl Policy for StickyPolicy {
         // therefore both assign (last-writer-wins in the map; both may record
         // `Assigned`). The scatter is transient and self-heals: the next
         // request for that key hits the surviving pin.
-        let chosen = self.fallback.select(workers, ctx)?;
+        let chosen = self.fallback.select(candidates, ctx)?;
         self.state.assignments.insert(
             key.to_string(),
             Assignment {
@@ -244,6 +253,11 @@ mod tests {
         Arc::new(RoundRobinPolicy::new())
     }
 
+    /// Converts worker fixtures into policy candidates with synthetic load.
+    fn candidates(workers: &[Arc<Worker>]) -> Vec<PolicyCandidate> {
+        crate::policies::test_policy_candidates(workers)
+    }
+
     fn policy(idle_secs: u64) -> StickyPolicy {
         let clock = Arc::new(crate::policies::active_load::MockClock::new(Instant::now()));
         StickyPolicy::with_clock(Duration::from_secs(idle_secs), fallback(), clock)
@@ -254,7 +268,7 @@ mod tests {
         let model = ModelId("tiny".into());
         let p = policy(600);
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
-        assert!(p.select(&[], &ctx).is_none());
+        assert!(p.select(&candidates(&[]), &ctx).is_none());
     }
 
     #[test]
@@ -264,7 +278,7 @@ mod tests {
         let workers = vec![worker("w0"), worker("w1")];
         // No routing key on the context.
         let ctx = SelectionContext::new(&model, None);
-        assert!(p.select(&workers, &ctx).is_some());
+        assert!(p.select(&candidates(&workers), &ctx).is_some());
         assert_eq!(p.assignment_count(), 0, "keyless request must not pin");
     }
 
@@ -275,11 +289,11 @@ mod tests {
         let workers = vec![worker("w0"), worker("w1")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
 
-        let first = p.select(&workers, &ctx).unwrap();
+        let first = p.select(&candidates(&workers), &ctx).unwrap();
         // Many repeats must all return the same worker (the hit path never
         // consults the fallback, so this is independent of round-robin).
         for _ in 0..10 {
-            let again = p.select(&workers, &ctx).unwrap();
+            let again = p.select(&candidates(&workers), &ctx).unwrap();
             assert_eq!(again.id, first.id);
         }
         assert_eq!(p.assignment_count(), 1);
@@ -293,16 +307,16 @@ mod tests {
 
         let ctx_a = SelectionContext::with_routing_key(&model, None, Some("a"));
         let ctx_b = SelectionContext::with_routing_key(&model, None, Some("b"));
-        let a = p.select(&workers, &ctx_a).unwrap();
-        let b = p.select(&workers, &ctx_b).unwrap();
+        let a = p.select(&candidates(&workers), &ctx_a).unwrap();
+        let b = p.select(&candidates(&workers), &ctx_b).unwrap();
         // Two keys are tracked independently (two map entries), and the
         // round-robin fallback hands the two fresh keys distinct workers.
         assert_ne!(a.id, b.id);
         assert_eq!(p.assignment_count(), 2);
         // The core property: each key independently stays on its own pin.
         for _ in 0..5 {
-            assert_eq!(p.select(&workers, &ctx_a).unwrap().id, a.id);
-            assert_eq!(p.select(&workers, &ctx_b).unwrap().id, b.id);
+            assert_eq!(p.select(&candidates(&workers), &ctx_a).unwrap().id, a.id);
+            assert_eq!(p.select(&candidates(&workers), &ctx_b).unwrap().id, b.id);
         }
     }
 
@@ -314,11 +328,13 @@ mod tests {
         let w1 = worker("w1");
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
 
-        let pinned = p.select(&[Arc::clone(&w0), Arc::clone(&w1)], &ctx).unwrap();
+        let pinned = p
+            .select(&candidates(&[Arc::clone(&w0), Arc::clone(&w1)]), &ctx)
+            .unwrap();
         // Scale up: a third worker joins. The existing key must stay pinned.
         let w2 = worker("w2");
         let after = p
-            .select(&[Arc::clone(&w0), Arc::clone(&w1), w2], &ctx)
+            .select(&candidates(&[Arc::clone(&w0), Arc::clone(&w1), w2]), &ctx)
             .unwrap();
         assert_eq!(after.id, pinned.id, "true-sticky: no redistribution on add");
     }
@@ -331,17 +347,23 @@ mod tests {
         let w1 = worker("w1");
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
 
-        let pinned = p.select(&[Arc::clone(&w0), Arc::clone(&w1)], &ctx).unwrap();
+        let pinned = p
+            .select(&candidates(&[Arc::clone(&w0), Arc::clone(&w1)]), &ctx)
+            .unwrap();
         // Drop the pinned worker from the healthy set; only the other remains.
         let survivor = if pinned.id == w0.id {
             Arc::clone(&w1)
         } else {
             Arc::clone(&w0)
         };
-        let remapped = p.select(&[Arc::clone(&survivor)], &ctx).unwrap();
+        let remapped = p
+            .select(&candidates(&[Arc::clone(&survivor)]), &ctx)
+            .unwrap();
         assert_eq!(remapped.id, survivor.id);
         // The new pin sticks across subsequent calls.
-        let again = p.select(&[Arc::clone(&survivor)], &ctx).unwrap();
+        let again = p
+            .select(&candidates(&[Arc::clone(&survivor)]), &ctx)
+            .unwrap();
         assert_eq!(again.id, survivor.id);
     }
 
@@ -354,12 +376,12 @@ mod tests {
 
         // Pin key "old" at t0.
         let ctx_old = SelectionContext::with_routing_key(&model, None, Some("old"));
-        p.select(&workers, &ctx_old).unwrap();
+        p.select(&candidates(&workers), &ctx_old).unwrap();
 
         // Advance 6s, pin key "new" at t6.
         clock.advance(Duration::from_secs(6));
         let ctx_new = SelectionContext::with_routing_key(&model, None, Some("new"));
-        p.select(&workers, &ctx_new).unwrap();
+        p.select(&candidates(&workers), &ctx_new).unwrap();
         assert_eq!(p.assignment_count(), 2);
 
         // Advance to t11: "old" has been idle 11s (> 10), "new" idle 5s.
@@ -368,7 +390,7 @@ mod tests {
         assert_eq!(p.assignment_count(), 1);
 
         // "new" survived and is still pinned.
-        assert!(p.select(&workers, &ctx_new).is_some());
+        assert!(p.select(&candidates(&workers), &ctx_new).is_some());
         assert_eq!(p.assignment_count(), 1);
     }
 
@@ -380,11 +402,11 @@ mod tests {
         let workers = vec![worker("w0")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
 
-        p.select(&workers, &ctx).unwrap();
+        p.select(&candidates(&workers), &ctx).unwrap();
         // Keep referencing the key just under the idle window each step.
         for _ in 0..5 {
             clock.advance(Duration::from_secs(8));
-            p.select(&workers, &ctx).unwrap(); // hit → refreshes last_seen
+            p.select(&candidates(&workers), &ctx).unwrap(); // hit → refreshes last_seen
             assert_eq!(
                 p.sweep_expired(),
                 0,
@@ -409,7 +431,7 @@ mod tests {
         );
         let workers = vec![worker("w0")];
         let ctx = SelectionContext::with_routing_key(&model, None, Some("u1"));
-        p.select(&workers, &ctx).unwrap();
+        p.select(&candidates(&workers), &ctx).unwrap();
         assert_eq!(p.assignment_count(), 1);
 
         // Idle window is 20ms; wait well past it plus several sweep ticks.
@@ -441,7 +463,8 @@ mod tests {
             let model = model.clone();
             handles.push(tokio::spawn(async move {
                 let ctx = SelectionContext::with_routing_key(&model, None, Some("race"));
-                p.select(&workers[..], &ctx).map(|w| w.id.clone())
+                p.select(&candidates(&workers[..]), &ctx)
+                    .map(|w| w.id.clone())
             }));
         }
         for h in handles {
@@ -454,9 +477,16 @@ mod tests {
             "concurrent first-touch must converge to a single pin"
         );
         let ctx = SelectionContext::with_routing_key(&model, None, Some("race"));
-        let pinned = p.select(&workers[..], &ctx).unwrap().id.clone();
+        let pinned = p
+            .select(&candidates(&workers[..]), &ctx)
+            .unwrap()
+            .id
+            .clone();
         for _ in 0..10 {
-            assert_eq!(p.select(&workers[..], &ctx).unwrap().id, pinned);
+            assert_eq!(
+                p.select(&candidates(&workers[..]), &ctx).unwrap().id,
+                pinned
+            );
         }
     }
 }

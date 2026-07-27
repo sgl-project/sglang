@@ -35,6 +35,13 @@ spec:
             - "/etc/tokenizer/tiny.json"
             - "--policy"
             - "round_robin"
+            - "--load-monitor"
+            - "--load-monitor-bind-host"
+            - "0.0.0.0"
+            - "--load-monitor-bind-port"
+            - "0"
+            - "--load-monitor-report-ip"
+            - "$(POD_IP)"
             - "--cb-threshold"
             - "1"
             - "--cb-cool-down-secs"
@@ -47,6 +54,11 @@ spec:
           ports:
             - containerPort: 8090
               name: http
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           readinessProbe:
             httpGet:
               path: /readyz

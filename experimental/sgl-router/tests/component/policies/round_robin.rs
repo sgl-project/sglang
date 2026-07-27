@@ -3,7 +3,7 @@
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::round_robin::RoundRobinPolicy;
-use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::policies::{Policy, PolicyCandidate, SelectionContext};
 use sgl_router::workers::Worker;
 use std::sync::Arc;
 
@@ -17,6 +17,17 @@ fn worker(id: &str) -> Arc<Worker> {
     }))
 }
 
+/// Converts workers into load-agnostic round-robin candidates.
+fn candidates(workers: &[Arc<Worker>]) -> Vec<PolicyCandidate> {
+    workers
+        .iter()
+        .map(|worker| PolicyCandidate {
+            worker: Arc::clone(worker),
+            load: None,
+        })
+        .collect()
+}
+
 #[test]
 fn cycles_through_workers() {
     let p = RoundRobinPolicy::new();
@@ -24,7 +35,7 @@ fn cycles_through_workers() {
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
     let picks: Vec<_> = (0..6)
-        .filter_map(|_| p.select(&ws, &ctx))
+        .filter_map(|_| p.select(&candidates(&ws), &ctx))
         .map(|w| w.id.0.clone())
         .collect();
     assert_eq!(picks, vec!["a", "b", "c", "a", "b", "c"]);
@@ -36,7 +47,7 @@ fn empty_pool_returns_none() {
     let ws: Vec<Arc<Worker>> = vec![];
     let model_id = ModelId("m".into());
     let ctx = SelectionContext::new(&model_id, None);
-    assert!(p.select(&ws, &ctx).is_none());
+    assert!(p.select(&candidates(&ws), &ctx).is_none());
 }
 
 #[test]
@@ -47,7 +58,7 @@ fn distribution_across_100_calls() {
     let ctx = SelectionContext::new(&model_id, None);
     let mut counts = std::collections::HashMap::new();
     for _ in 0..99 {
-        let w = p.select(&ws, &ctx).unwrap();
+        let w = p.select(&candidates(&ws), &ctx).unwrap();
         *counts.entry(w.id.0.clone()).or_insert(0) += 1;
     }
     assert_eq!(counts["a"], 33);

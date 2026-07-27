@@ -3,7 +3,7 @@
 
 //! Cache-aware-ZMQ selection policy.
 //!
-//! Combines the KV-event-fed [`HashTree`] with active-load scoring and
+//! Combines the KV-event-fed [`HashTree`] with snapshot load scoring and
 //! tokenizer-driven block-hash lookup to pick the worker most likely to
 //! already hold the request's prefix in its KV cache.
 //!
@@ -28,8 +28,8 @@
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
 //!    pick the lowest-load worker whose `url` appears in the match result.
 //!    Otherwise, fall through.
-//! 4. **Min-load fallback.** Pick the lowest-load worker by
-//!    `Worker::active_load()`.
+//! 4. **Min-load fallback.** Pick the lowest engine-reported total-request
+//!    candidate from the request snapshot.
 //!
 //! The implementation never returns `None` for a non-empty `workers` slice;
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
@@ -40,7 +40,7 @@ use crate::config::CacheAwareConfig;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
-use crate::policies::{request_tokens_for, Policy, SelectionContext};
+use crate::policies::{request_tokens_for, Policy, PolicyCandidate, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
@@ -107,41 +107,52 @@ impl CacheAwareZmqPolicy {
         self
     }
 
-    /// Lowest-load worker — ties broken by stable iteration order (which
-    /// is the order the registry returned, i.e. dashmap-undefined). For
-    /// production traffic the ties are rare; tests pin the load skew.
-    fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
-        workers
+    /// Selects the worker with the minimum reported total request count.
+    fn pick_min_load(candidates: &[PolicyCandidate]) -> Option<Arc<Worker>> {
+        candidates
             .iter()
-            .min_by_key(|w| w.active_load())
-            .map(Arc::clone)
+            .filter_map(|candidate| {
+                candidate
+                    .load
+                    .as_ref()
+                    .map(|load| (load.total_requests, &candidate.worker))
+            })
+            .min_by_key(|(load, _)| *load)
+            .map(|(_, worker)| Arc::clone(worker))
     }
 
     /// Detect load imbalance. Returns `true` when the spread between max
     /// and min load is large enough that cache-aware routing would dump
     /// even more on the hot worker.
-    fn is_imbalanced(&self, workers: &[Arc<Worker>]) -> bool {
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
-            let l = w.active_load();
-            (mn.min(l), mx.max(l))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+    fn is_imbalanced(&self, candidates: &[PolicyCandidate]) -> bool {
+        let (min_load, max_load) = candidates
+            .iter()
+            .filter_map(|candidate| candidate.load.as_ref().map(|load| load.total_requests))
+            .fold((u64::MAX, 0u64), |(minimum, maximum), load| {
+                (minimum.min(load), maximum.max(load))
+            });
+        let min_load = if min_load == u64::MAX { 0 } else { min_load };
         let abs_diff = max_load.saturating_sub(min_load);
-        let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
-        abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold
+        let rel_threshold = min_load as f64 * self.config.balance_rel_threshold as f64;
+        abs_diff > self.config.balance_abs_threshold as u64 && max_load as f64 > rel_threshold
     }
 }
 
 impl Policy for CacheAwareZmqPolicy {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        if workers.is_empty() {
+    /// Selects by cache overlap with snapshot total-request load safeguards.
+    fn select(
+        &self,
+        candidates: &[PolicyCandidate],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>> {
+        if candidates.is_empty() {
             return None;
         }
 
         // 1. Load-imbalance fast-path: even the best cache hit gets
         //    dropped in favour of evening out load.
-        if self.is_imbalanced(workers) {
-            return Self::pick_min_load(workers);
+        if self.is_imbalanced(candidates) {
+            return Self::pick_min_load(candidates);
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -154,13 +165,13 @@ impl Policy for CacheAwareZmqPolicy {
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
-                    _ => return Self::pick_min_load(workers),
+                    _ => return Self::pick_min_load(candidates),
                 };
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(candidates);
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(candidates);
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -177,7 +188,7 @@ impl Policy for CacheAwareZmqPolicy {
                 model = %ctx.model(),
                 "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(candidates);
         };
         // EAGLE-family workers hash KV blocks over token bigrams; the query
         // hashes must match the worker's stored hashes or the tree lookup
@@ -190,7 +201,7 @@ impl Policy for CacheAwareZmqPolicy {
             compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(candidates);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
@@ -218,17 +229,23 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(candidates);
         }
         // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
             matched.workers.iter().map(|kw| kw.url.as_str()).collect();
-        let best_matched: Option<Arc<Worker>> = workers
+        let best_matched: Option<Arc<Worker>> = candidates
             .iter()
-            .filter(|w| matched_urls.contains(w.url.as_str()))
-            .min_by_key(|w| w.active_load())
-            .map(Arc::clone);
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
+            .filter(|candidate| matched_urls.contains(candidate.worker.url.as_str()))
+            .filter_map(|candidate| {
+                candidate
+                    .load
+                    .as_ref()
+                    .map(|load| (load.total_requests, &candidate.worker))
+            })
+            .min_by_key(|(load, _)| *load)
+            .map(|(_, worker)| Arc::clone(worker));
+        let chosen = best_matched.or_else(|| Self::pick_min_load(candidates));
         if let Some(w) = &chosen {
             tracing::debug!(
                 model = %ctx.model(),
@@ -286,6 +303,11 @@ mod tests {
         }))
     }
 
+    /// Converts worker fixtures into policy candidates with synthetic load.
+    fn candidates(workers: &[Arc<Worker>]) -> Vec<PolicyCandidate> {
+        crate::policies::test_policy_candidates(workers)
+    }
+
     fn tokenizer_registry_with_tiny() -> Arc<TokenizerRegistry> {
         let cfg = crate::config::Config {
             server: crate::config::ServerConfig {
@@ -308,6 +330,7 @@ mod tests {
             ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
+            load_monitor: Default::default(),
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
     }
@@ -324,7 +347,7 @@ mod tests {
         );
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, Some(b"{\"prompt\":\"hi\"}"));
-        assert!(policy.select(&[], &ctx).is_none());
+        assert!(policy.select(&candidates(&[]), &ctx).is_none());
     }
 
     /// Empty tree: no overlap signal anywhere, fall through to min-load.
@@ -346,7 +369,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = br#"{"prompt":"hello world"}"#;
         let ctx = SelectionContext::new(&model, Some(body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -388,7 +413,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
     }
 
@@ -428,7 +455,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let _ = policy.select(&workers, &ctx).expect("must pick");
+        let _ = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
 
         let rendered = metrics.render();
         assert!(
@@ -479,7 +508,9 @@ mod tests {
         ];
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let _ = chosen_policy.select(&workers, &ctx).expect("must pick");
+        let _ = chosen_policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
 
         let rendered = metrics.render();
         assert!(
@@ -529,7 +560,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
 
         assert_eq!(
             chosen.url, "http://w1:30000",
@@ -604,7 +637,9 @@ mod tests {
                 worker("http://w1:30000", "tiny"),
             ];
             let ctx = SelectionContext::new(&model, Some(&body));
-            let chosen = policy.select(&workers, &ctx).expect("must pick");
+            let chosen = policy
+                .select(&candidates(&workers), &ctx)
+                .expect("must pick");
             assert_eq!(
                 chosen.url, "http://w0:30000",
                 "bigram-aware router must match w0's bigram-hashed prefix"
@@ -643,7 +678,9 @@ mod tests {
                 worker("http://w1:30000", "tiny"),
             ];
             let ctx = SelectionContext::new(&model, Some(&body));
-            let _ = policy.select(&workers, &ctx).expect("must pick");
+            let _ = policy
+                .select(&candidates(&workers), &ctx)
+                .expect("must pick");
             assert_eq!(
                 overlap_sum(&metrics.render()),
                 0.0,
@@ -705,7 +742,9 @@ mod tests {
         }))
         .unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(
             chosen.url, "http://w0:30000",
             "chat request must route by chat-templated tokens to the worker holding that prefix"
@@ -773,7 +812,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({ "messages": messages })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(
             chosen.url, "http://w0:30000",
             "dsv4 chat request must route by the V4-encoded prefix"
@@ -834,7 +875,9 @@ mod tests {
         }))
         .unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(
             chosen.url, "http://w0:30000",
             "a failed template render must degrade to raw-content routing"
@@ -856,7 +899,9 @@ mod tests {
         }))
         .unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
     }
 
@@ -879,7 +924,9 @@ mod tests {
         // `prompt` body (no `messages`) -> raw path, so it matches the raw tree.
         let body = serde_json::to_vec(&serde_json::json!({ "prompt": content })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
     }
 
@@ -916,7 +963,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -954,7 +1003,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000", "imbalance must dominate");
     }
 
@@ -974,7 +1025,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = br#"{"prompt":"hello"}"#;
         let ctx = SelectionContext::new(&model, Some(body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -995,7 +1048,9 @@ mod tests {
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None);
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -1017,7 +1072,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = br#"{"frobnicate":42}"#;
         let ctx = SelectionContext::new(&model, Some(body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -1041,7 +1098,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = br#"{"prompt":""}"#;
         let ctx = SelectionContext::new(&model, Some(body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -1076,7 +1135,9 @@ mod tests {
         let model = ModelId("tiny".into());
         let body = br#"{"prompt":"hello world hello world hello world"}"#;
         let ctx = SelectionContext::new(&model, Some(body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
@@ -1159,7 +1220,9 @@ mod tests {
 
         // Before clear: w0 wins.
         let ctx = SelectionContext::new(&model, Some(&body));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
 
         // After clear: tree no longer attributes the prefix to w0.
@@ -1167,7 +1230,9 @@ mod tests {
         // Bump w0's load so min-load fallback distinguishes from w1.
         let _g = w0.load_guard();
         let _g2 = w0.load_guard();
-        let chosen2 = policy.select(&workers, &ctx).expect("must pick");
+        let chosen2 = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(chosen2.url, "http://w1:30000");
     }
 
@@ -1259,7 +1324,9 @@ mod tests {
         // Body tokenizes to an unrelated prefix the tree does NOT hold.
         let body = serde_json::to_vec(&serde_json::json!({"prompt":"zzz unrelated"})).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body)).with_request_tokens(Some(&tree_ids));
-        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let chosen = policy
+            .select(&candidates(&workers), &ctx)
+            .expect("must pick");
         assert_eq!(
             chosen.url, "http://w0:30000",
             "select must use ctx tokens (w0's prefix), not re-tokenize the body"
