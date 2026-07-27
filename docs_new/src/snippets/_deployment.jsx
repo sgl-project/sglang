@@ -23,7 +23,8 @@
 //                      `flags` / `env` / `hints` (each a literal array or a function
 //                      of the whole selection), and a row-level `default` / `showWhen`.
 //                      `hints` render as `# ...` lines above the command.
-//   cells              {match, verified?, nnodes?, warn?, redirect?, env, flags}[] — one per
+//   cells              {match, verified?, verificationStatus?, nnodes?, warn?, redirect?,
+//                      env, flags}[] — one per
 //                      (hw × match dims); env/flags are flat literals, only
 //                      {{PLACEHOLDER}} subst applied. `nnodes` supplies the node
 //                      count for configs with no `nodes` dim (default 1). `warn`
@@ -31,6 +32,10 @@
 //                      embed [label](#anchor) links. `redirect: true` renders the
 //                      banner ALONE — no command, header, or copy buttons — for
 //                      cells that only point somewhere else.
+//                      `verified` is the boolean badge baseline.
+//                      `verificationStatus` overrides it with a third state —
+//                      "verified" | "in-progress" | "unverified" — for a recipe
+//                      whose verification round is open rather than absent.
 //   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders)
@@ -166,18 +171,30 @@ export const Deployment = ({ config, benchmarks }) => {
       color: isDark ? "#fde68a" : "#92400e",
       border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
-    badge: (verified) => ({
+    // Takes either a boolean (legacy `cell.verified`) or a status id — see
+    // VERIFY_LABEL / verifyStatusOf in section 3.
+    badge: (status) => ({
       display: "inline-flex", alignItems: "center", gap: "6px",
       padding: "2px 8px", borderRadius: "10px",
-      background: verified ? (isDark ? "#064e3b" : "#d1fae5")
-                           : (isDark ? "#78350f" : "#fef3c7"),
-      color:      verified ? (isDark ? "#a7f3d0" : "#065f46")
-                           : (isDark ? "#fde68a" : "#92400e"),
-      fontSize: "11px", fontWeight: 600,
+      background: {
+        verified:      isDark ? "#064e3b" : "#d1fae5",
+        "in-progress": isDark ? "#1e3a8a" : "#dbeafe",
+        unverified:    isDark ? "#78350f" : "#fef3c7",
+      }[verifyStatusOf(status)],
+      color: {
+        verified:      isDark ? "#a7f3d0" : "#065f46",
+        "in-progress": isDark ? "#bfdbfe" : "#1e40af",
+        unverified:    isDark ? "#fde68a" : "#92400e",
+      }[verifyStatusOf(status)],
+      // The in-progress label is long; keep the pill on one line and let the
+      // header row wrap around it instead of breaking the text mid-badge.
+      fontSize: "11px", fontWeight: 600, whiteSpace: "nowrap",
     }),
-    badgeDot: (verified) => ({
+    badgeDot: (status) => ({
       width: "8px", height: "8px", borderRadius: "50%",
-      background: verified ? "#10b981" : "#f59e0b",
+      background: { verified: "#10b981", "in-progress": "#3b82f6", unverified: "#f59e0b" }[
+        verifyStatusOf(status)
+      ],
     }),
     iconButton: {
       padding: "4px 10px",
@@ -388,6 +405,25 @@ export const Deployment = ({ config, benchmarks }) => {
   });
 
   // ==== 3. Pure helpers (no React state) ====
+  // Verification badge state. A cell's boolean `verified` is the baseline;
+  // `cell.verificationStatus` overrides it, which is how a recipe whose
+  // verification round is open reports that instead of collapsing into the flat
+  // Verified / Not Verified pair.
+  const VERIFY_LABEL = {
+    verified: "Verified",
+    "in-progress": "Final Verification In Progress",
+    unverified: "Not Verified",
+  };
+  // Booleans keep their historical meaning; an unrecognized status id falls
+  // back to "unverified" rather than to truthiness (a typo must never read as
+  // a green Verified badge).
+  const verifyStatusOf = (v) =>
+    typeof v === "string"
+      ? (VERIFY_LABEL[v] ? v : "unverified")
+      : (v ? "verified" : "unverified");
+  const cellVerifyStatus = (c) =>
+    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
+
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
   //   overlay dims  never touch cell lookup; the picked option contributes flags
@@ -1122,6 +1158,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
+  const verifyStatus = cellVerifyStatus(cell);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
@@ -1337,9 +1374,9 @@ export const Deployment = ({ config, benchmarks }) => {
           ) : (<>
             <div style={s.commandHeader}>
               <div style={s.headerLeft}>
-                <div style={s.badge(Boolean(cell && cell.verified))}>
-                  <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-                  {cell && cell.verified ? "Verified" : "Not Verified"}
+                <div style={s.badge(verifyStatus)}>
+                  <span style={s.badgeDot(verifyStatus)} />
+                  {VERIFY_LABEL[verifyStatus]}
                 </div>
                 <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                   {runModes.map((mode, index) => (
