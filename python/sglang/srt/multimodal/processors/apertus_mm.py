@@ -387,7 +387,9 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
                     base_output, self.mm_tokens
                 )
             else:
-                # Raw media: preserve Apertus's expanded token layout.
+                # Raw media: preserve Apertus's expanded token layout. Do not use
+                # process_and_combine_mm_data here: one source image can occupy
+                # non-contiguous placeholder fragments inside its delimiters.
                 outputs = self.process_mm_data(
                     input_text=base_output.input_text,
                     images=base_output.images,
