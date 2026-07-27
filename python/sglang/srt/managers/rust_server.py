@@ -172,19 +172,18 @@ class RustServer:
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
-        Fan the batch out into per-request chunks and push each into the Rust
-        egress ring (-> detokenizer shard -> client stream). Each chunk is a
-        ``(header, data)`` pair, mirroring the ingress ``input_ids`` split so the
+        Push the WHOLE batch into the Rust egress ring as one frame (-> detokenizer
+        shards -> client streams), mirroring the ingress ``input_ids`` split so the
         bulk numeric columns never go through msgpack:
 
-          - ``header``: msgpack ``ChunkHeader`` positional array — scalars
-            (``rid, seq, token_ids, finish_reason, prompt_tokens``) plus the shape
-            metadata (``out_lp_n, in_lp_n`` element counts for the flat logprob
-            columns, and the per-position ``lens`` vectors for the ragged / hidden
-            columns).
+          - ``header``: msgpack ``BatchHeader`` positional array — the per-request
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+            the shape metadata for the optional families (``*_lens`` element counts
+            for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
+            and hidden ones).
           - ``data``: the raw little-endian numeric buffer — every column is a
             4-byte element (``f32`` values, ``i32`` indices), concatenated in the
-            order the Rust ``decode_chunk_frame`` reads them.
+            order the Rust ``for_each_chunk`` reads them.
 
         Logprobs are columnar: output families are per-step deltas, input
         (prefill) families ride once on the first chunk. Ragged families (top-k,

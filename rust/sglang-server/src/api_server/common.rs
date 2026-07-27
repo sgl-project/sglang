@@ -37,7 +37,7 @@ async fn await_control_result(
     state: &AppState,
     control: ControlRequest,
 ) -> Result<bytes::Bytes, Response> {
-    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(Box::new(control))).await?;
+    let (_id, _rid, mut rx) = submit(state, RequestKind::Control(Box::new(control)), false).await?;
     match rx.recv().await {
         Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
@@ -63,6 +63,9 @@ async fn model_info(State(state): State<AppState>) -> Response {
         "model_path": sa.model_path,
         "tokenizer_path": sa.tokenizer_path,
         "is_generation": true,
+        // Echoed, not applied — same as Python, whose only uses are `ServerArgs`
+        // validation and this endpoint. Clients read it and send those params
+        // themselves; neither server injects them into a request.
         "preferred_sampling_params": sa.preferred_sampling_params,
         "weight_version": serde_json::Value::Null,
     });
