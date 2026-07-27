@@ -398,19 +398,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_backend=server_args.tokenizer_backend,
                 )
 
-                # The OpenAI embeddings API in vLLM tokenizes encoder models
-                # with special tokens. EmbeddingGemma's tokenizer enables BOS
-                # by default but leaves EOS disabled, so opt into EOS here to
-                # preserve the model's intended [BOS] text [EOS] input form.
-                if self.model_config.is_embedding_gemma and hasattr(
-                    self.tokenizer, "update_post_processor"
-                ):
-                    # The public attribute is read-only on the HF fast
-                    # tokenizer; change its backing flag and rebuild the post
-                    # processor exactly as the v5 compatibility restore does.
-                    self.tokenizer._add_eos_token = True
-                    self.tokenizer.update_post_processor()
-
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -838,6 +825,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
                 )
+
+        # vLLM's OpenAI embeddings endpoint includes special tokens for
+        # encoder models. EmbeddingGemma's restored Gemma tokenizer adds BOS
+        # but, by its checkpoint default, omits EOS. Add EOS explicitly here
+        # rather than mutating tokenizer-global post-processing state.
+        if (
+            self.model_config.is_embedding_gemma
+            and self.tokenizer.eos_token_id is not None
+        ):
+            input_ids = [
+                (
+                    ids
+                    if ids and ids[-1] == self.tokenizer.eos_token_id
+                    else [*ids, self.tokenizer.eos_token_id]
+                )
+                for ids in input_ids
+            ]
 
         # Step 4: Extract results based on input format
         return self._extract_tokenizer_results(
