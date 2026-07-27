@@ -18,7 +18,8 @@ set -euo pipefail
   || "${MINWM_BENCHMARK_MODE}" == "profiles" \
   || "${MINWM_BENCHMARK_MODE}" == "long720p" \
   || "${MINWM_BENCHMARK_MODE}" == "triptych720p" \
-  || "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]] || {
+  || "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" \
+  || "${MINWM_BENCHMARK_MODE}" == "bounded5s" ]] || {
   echo "unsupported MINWM_BENCHMARK_MODE=${MINWM_BENCHMARK_MODE}" >&2
   exit 2
 }
@@ -177,6 +178,82 @@ wait_for_server() {
   tail -300 "${log_path}" >&2
   return 1
 }
+
+if [[ "${MINWM_BENCHMARK_MODE}" == "bounded5s" ]]; then
+  BOUNDED_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_action_control_kv_roll_832x480.json}"
+  BOUNDED_LOCAL_ATTN_SIZE="${MINWM_LOCAL_ATTN_SIZE:-18}"
+  BOUNDED_SINK_SIZE="${MINWM_SINK_SIZE:-9}"
+  BOUNDED_RESULTS="${LOCAL_RESULTS}/bounded-window-parity-5s"
+  mkdir -p "${BOUNDED_RESULTS}"
+  export MINWM_CASES_PATH="${BOUNDED_CASES}"
+  export MINWM_LOCAL_ATTN_SIZE="${BOUNDED_LOCAL_ATTN_SIZE}"
+  export MINWM_SINK_SIZE="${BOUNDED_SINK_SIZE}"
+  export MINWM_PARITY_PROFILE=bitwise
+  export MINWM_ENABLE_TORCH_COMPILE=false
+  export MINWM_ATTENTION_IMPL=packed
+  export MINWM_PACKED_ATTENTION_DETERMINISTIC=true
+  export MINWM_NATIVE_COMPONENTS=text_encoder,vae
+  export MINWM_PARITY_DUMP_DIR="${BOUNDED_RESULTS}/parity-dumps"
+
+  set +e
+  bash "${SCRIPT_DIR}/run_all.sh" "${BOUNDED_RESULTS}" \
+    | tee "${RESULTS}/bounded-window-run.log"
+  bitwise_status=${PIPESTATUS[0]}
+  set -e
+  cp "${BOUNDED_RESULTS}/report.json" "${RESULTS}/bounded-bitwise-report.json"
+
+  numeric_status=0
+  if (( bitwise_status != 0 )); then
+    set +e
+    python3 "${SCRIPT_DIR}/compare_results.py" \
+      --cases "${BOUNDED_CASES}" \
+      --results "${BOUNDED_RESULTS}" \
+      --profile bf16_backend_candidate \
+      | tee "${RESULTS}/bounded-numeric-compare.log"
+    numeric_status=${PIPESTATUS[0]}
+    set -e
+    cp "${BOUNDED_RESULTS}/report.json" "${RESULTS}/bounded-numeric-report.json"
+  fi
+
+  python3 - "${BOUNDED_RESULTS}" "${RESULTS}/bounded-summary.json" \
+    "${bitwise_status}" "${numeric_status}" \
+    "${BOUNDED_LOCAL_ATTN_SIZE}" "${BOUNDED_SINK_SIZE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+baseline = json.loads((root / "baseline_run.json").read_text())
+sglang = json.loads((root / "sglang_run.json").read_text())
+report = json.loads((root / "report.json").read_text())
+request = sglang["cases"][0]["request"]
+summary = {
+    "contract": {
+        "local_attn_size": int(sys.argv[5]),
+        "sink_size": int(sys.argv[6]),
+        "window_includes_sink_and_current_chunk": True,
+        "baseline_local_attn_size": baseline["local_attn_size"],
+        "baseline_sink_size": baseline["sink_size"],
+        "sglang_runtime_window": request["realtime_causal_kv_cache_num_frames"],
+        "sglang_runtime_sink": request["realtime_causal_sink_size"],
+    },
+    "bitwise_status": int(sys.argv[3]),
+    "numeric_status": int(sys.argv[4]),
+    "report_summary": report["summary"],
+    "baseline_git_sha": baseline["minwm_git_sha"],
+    "checkpoint_size": baseline["checkpoint_size"],
+}
+Path(sys.argv[2]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+  cp -r "${BOUNDED_RESULTS}" "${RESULTS}/"
+  touch "${RESULTS}/bounded-window-artifacts-ready"
+  echo "MINWM_BOUNDED5S_COMPLETE results=${RESULTS} bitwise_status=${bitwise_status} numeric_status=${numeric_status}"
+  if (( bitwise_status != 0 && numeric_status != 0 )); then
+    exit "${numeric_status}"
+  fi
+  exit 0
+fi
 
 if [[ "${MINWM_BENCHMARK_MODE}" == "spmatrix720p" ]]; then
   SP_CASES="${MINWM_CASES_PATH:-${SCRIPT_DIR}/cases_720p_compile_smoke.json}"

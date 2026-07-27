@@ -11,6 +11,7 @@ PORT="${MINWM_PORT:-30000}"
 PROFILE="${MINWM_PARITY_PROFILE:-bitwise}"
 ATTENTION_BACKEND="${MINWM_ATTENTION_BACKEND:-fa}"
 ENABLE_TORCH_COMPILE="${MINWM_ENABLE_TORCH_COMPILE:-false}"
+CASES_PATH="${MINWM_CASES_PATH:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MINWM_PARITY_DETERMINISTIC="${MINWM_PARITY_DETERMINISTIC:-1}"
 export MINWM_DETERMINISTIC_ATTENTION="${MINWM_DETERMINISTIC_ATTENTION:-true}"
@@ -24,13 +25,31 @@ BASELINE_CONFIG_ARGS=()
 if [[ -n "${MINWM_CONFIG:-}" ]]; then
   BASELINE_CONFIG_ARGS=(--config "${MINWM_CONFIG}")
 fi
+CASE_ARGS=()
+if [[ -n "${CASES_PATH}" ]]; then
+  CASE_ARGS=(--cases "${CASES_PATH}")
+fi
+BASELINE_KV_ARGS=()
+SGLANG_KV_ARGS=()
+if [[ -n "${MINWM_LOCAL_ATTN_SIZE:-}" ]]; then
+  BASELINE_KV_ARGS+=(--local-attn-size "${MINWM_LOCAL_ATTN_SIZE}")
+  if [[ "${MINWM_LOCAL_ATTN_SIZE}" != "-1" ]]; then
+    SGLANG_KV_ARGS+=(--kv-cache-num-frames "${MINWM_LOCAL_ATTN_SIZE}")
+  fi
+fi
+if [[ -n "${MINWM_SINK_SIZE:-}" ]]; then
+  BASELINE_KV_ARGS+=(--sink-size "${MINWM_SINK_SIZE}")
+  SGLANG_KV_ARGS+=(--sink-size "${MINWM_SINK_SIZE}")
+fi
 
 python3 "${SCRIPT_DIR}/run_minwm_baseline.py" \
+  "${CASE_ARGS[@]}" \
   --minwm-root "${MINWM_ROOT}" \
   --checkpoint "${MINWM_CHECKPOINT}" \
   --pretrained-dir "${MINWM_PRETRAINED_DIR}" \
   --results "${RESULT_DIR}" \
-  "${BASELINE_CONFIG_ARGS[@]}"
+  "${BASELINE_CONFIG_ARGS[@]}" \
+  "${BASELINE_KV_ARGS[@]}"
 
 sglang serve \
   --model-path "${MINWM_MODEL_DIR}" \
@@ -67,12 +86,15 @@ if [[ "${ready}" != 1 ]]; then
 fi
 
 python3 "${SCRIPT_DIR}/run_sglang_api.py" \
+  "${CASE_ARGS[@]}" \
   --results "${RESULT_DIR}" \
-  --ws-url "ws://127.0.0.1:${PORT}/v1/realtime_video/generate"
+  --ws-url "ws://127.0.0.1:${PORT}/v1/realtime_video/generate" \
+  "${SGLANG_KV_ARGS[@]}"
 
 cleanup
 trap - EXIT INT TERM
 python3 "${SCRIPT_DIR}/compare_results.py" \
+  "${CASE_ARGS[@]}" \
   --results "${RESULT_DIR}" \
   --profile "${PROFILE}"
 

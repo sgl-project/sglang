@@ -42,6 +42,16 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Discard this many complete runs of each case before measuring it.",
     )
+    parser.add_argument(
+        "--local-attn-size",
+        type=int,
+        help="Override MinWM V3 generator_config.local_attn_size.",
+    )
+    parser.add_argument(
+        "--sink-size",
+        type=int,
+        help="Override MinWM V3 generator_config.sink_size.",
+    )
     return parser.parse_args()
 
 
@@ -49,6 +59,19 @@ def main() -> None:
     args = parse_args()
     if args.warmup_runs < 0:
         raise ValueError("--warmup-runs must be non-negative")
+    if args.local_attn_size is not None and (
+        args.local_attn_size == 0 or args.local_attn_size < -1
+    ):
+        raise ValueError("--local-attn-size must be -1 or positive")
+    if args.sink_size is not None and args.sink_size < 0:
+        raise ValueError("--sink-size must be non-negative")
+    if (
+        args.local_attn_size is not None
+        and args.local_attn_size != -1
+        and args.sink_size is not None
+        and args.sink_size >= args.local_attn_size
+    ):
+        raise ValueError("--sink-size must be smaller than finite --local-attn-size")
     deterministic = os.environ.get("MINWM_PARITY_DETERMINISTIC", "1").strip().lower()
     deterministic = deterministic not in {"0", "false", "no", "off"}
     os.environ["MINWM_DETERMINISTIC_ATTENTION"] = "true" if deterministic else "false"
@@ -102,25 +125,37 @@ def main() -> None:
     results = Path(args.results).resolve()
     inputs = results / "inputs"
     config = PretrainedConfig.from_pretrained(str(config_path))
-    config = OmegaConf.merge(
-        config,
-        OmegaConf.create(
-            {
-                "height": int(contract["height"]),
-                "width": int(contract["width"]),
-                "guidance_scale": 0.0,
-                "num_frames": 1 + int(contract["generated_latent_frames"]),
-                "dataloader": {
-                    "processor_kwargs": {
-                        "action_output_format": contract.get(
-                            "action_output_format", "label_81"
-                        )
-                    }
-                },
+    runtime_overrides = {
+        "height": int(contract["height"]),
+        "width": int(contract["width"]),
+        "guidance_scale": 0.0,
+        "num_frames": 1 + int(contract["generated_latent_frames"]),
+        "dataloader": {
+            "processor_kwargs": {
+                "action_output_format": contract.get(
+                    "action_output_format", "label_81"
+                )
             }
-        ),
-    )
+        },
+    }
+    generator_overrides = {}
+    if args.local_attn_size is not None:
+        generator_overrides["local_attn_size"] = args.local_attn_size
+    if args.sink_size is not None:
+        generator_overrides["sink_size"] = args.sink_size
+    if generator_overrides:
+        runtime_overrides["generator_config"] = generator_overrides
+    config = OmegaConf.merge(config, OmegaConf.create(runtime_overrides))
     OmegaConf.resolve(config)
+    effective_local_attn_size = int(config.generator_config.local_attn_size)
+    effective_sink_size = int(config.generator_config.sink_size)
+    if (
+        effective_local_attn_size != -1
+        and effective_sink_size >= effective_local_attn_size
+    ):
+        raise ValueError(
+            "effective sink_size must be smaller than finite local_attn_size"
+        )
 
     pipeline = PipelineBase.from_pretrained(
         config,
@@ -362,6 +397,8 @@ def main() -> None:
             "checkpoint_size": Path(args.checkpoint).stat().st_size,
             "deterministic": deterministic,
             "deterministic_attention": bool(config.deterministic_attention),
+            "local_attn_size": effective_local_attn_size,
+            "sink_size": effective_sink_size,
             "warmup_runs": args.warmup_runs,
             "cases": run_records,
         },
