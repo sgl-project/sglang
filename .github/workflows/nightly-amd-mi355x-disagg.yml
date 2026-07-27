@@ -49,7 +49,7 @@ jobs:
         # the tag to the self-hosted runner. Scope is deliberately tight: only
         # the clean main MI35x ROCm 7.2 line
         # `lmsysorg/sglang-rocm:v*-rocm720-mi35x-YYYYMMDD` (excludes -test-,
-        # miles-, mori-, vllm-, rocm7_14 variants). On any failure we emit an
+        # miles-, mori-, vllm-, rocm7_15 variants). On any failure we emit an
         # empty string and the launcher falls back to the recipe's pinned
         # `runtime.image`.
         run: |
