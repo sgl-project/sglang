@@ -21,16 +21,16 @@ use http_body::Frame;
 use rand::Rng;
 use serde_json::json;
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
+    core::{AdmissionError, AdmissionLease, AdmissionSnapshot},
     observability::{
         inflight_tracker::InFlightRequestTracker,
-        metrics::{method_to_static_str, metrics_labels, Metrics},
+        metrics::{method_to_static_str, metrics_labels, AdmissionDecision, Metrics},
     },
     routers::error::extract_error_code_from_response,
     server::AppState,
@@ -46,42 +46,148 @@ use crate::{
     },
 };
 
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
-    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
-    token_bucket: Option<Arc<TokenBucket>>,
-    /// Number of tokens to return.
-    tokens: f64,
+/// A stable rejection reason for Router admission control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionRejection {
+    QueueFull,
+    QueueTimeout { waited: Duration },
+    RateLimited,
+    GlobalRateLimited,
+    ShuttingDown,
+    BackgroundAdmissionUnsupported,
 }
 
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+impl From<AdmissionError> for AdmissionRejection {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::QueueFull => Self::QueueFull,
+            AdmissionError::QueueTimeout { waited } => Self::QueueTimeout { waited },
+            AdmissionError::ShuttingDown => Self::ShuttingDown,
+        }
+    }
+}
+
+impl AdmissionRejection {
+    pub const fn decision(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::QueueTimeout { .. } => "queue_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::GlobalRateLimited => "global_rate_limited",
+            Self::ShuttingDown => "shutting_down",
+            Self::BackgroundAdmissionUnsupported => "background_admission_unsupported",
+        }
+    }
+
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::QueueFull | Self::RateLimited | Self::GlobalRateLimited => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::QueueTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
+            Self::ShuttingDown | Self::BackgroundAdmissionUnsupported => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::QueueFull => "Router admission queue is full",
+            Self::QueueTimeout { .. } => "Request exceeded router queue deadline",
+            Self::RateLimited => "Router local rate limit exceeded",
+            Self::GlobalRateLimited => "Router global rate limit exceeded",
+            Self::ShuttingDown => "Router is shutting down",
+            Self::BackgroundAdmissionUnsupported => "Background admission is unsupported",
+        }
+    }
+
+    fn waited_ms(self) -> u64 {
+        match self {
+            Self::QueueTimeout { waited } => u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            _ => 0,
+        }
+    }
+}
+
+/// Runtime values attached to a structured admission rejection log.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionErrorContext<'a> {
+    pub request_id: &'a str,
+    pub max_concurrent_requests: usize,
+    pub queue_size: usize,
+    pub queue_timeout_secs: u64,
+    pub snapshot: AdmissionSnapshot,
+}
+
+/// Builds the stable JSON response and structured log for an admission rejection.
+pub fn admission_error_response(
+    rejection: AdmissionRejection,
+    context: AdmissionErrorContext<'_>,
+) -> Response {
+    let decision = rejection.decision();
+    let waited_ms = rejection.waited_ms();
+    warn!(
+        request_id = context.request_id,
+        decision,
+        max_concurrent_requests = context.max_concurrent_requests,
+        queue_size = context.queue_size,
+        queue_timeout_secs = context.queue_timeout_secs,
+        inflight = context.snapshot.inflight,
+        queued = context.snapshot.queued,
+        waited_ms,
+        "request rejected by Router admission control"
+    );
+
+    let error = match rejection {
+        AdmissionRejection::QueueFull => json!({
+            "error": {
+                "code": decision,
+                "message": rejection.message(),
+                "max_concurrent_requests": context.max_concurrent_requests,
+                "queue_size": context.queue_size,
+            }
+        }),
+        AdmissionRejection::QueueTimeout { .. } => json!({
+            "error": {
+                "code": decision,
+                "message": rejection.message(),
+                "waited_ms": waited_ms,
+            }
+        }),
+        AdmissionRejection::RateLimited
+        | AdmissionRejection::GlobalRateLimited
+        | AdmissionRejection::ShuttingDown
+        | AdmissionRejection::BackgroundAdmissionUnsupported => json!({
+            "error": {
+                "code": decision,
+                "message": rejection.message(),
+            }
+        }),
+    };
+
+    (rejection.status(), Json(error)).into_response()
+}
+
+/// A body wrapper that holds an admission lease until the body is dropped.
+///
+/// Keeping the lease in the response body ensures streaming requests remain admitted for the
+/// entire lifetime of the response, including when the client disconnects before completion.
+pub struct PermitGuardBody {
+    inner: Body,
+    _lease: AdmissionLease,
+}
+
+impl PermitGuardBody {
+    pub fn new(inner: Body, lease: AdmissionLease) -> Self {
         Self {
             inner,
-            token_bucket: Some(token_bucket),
-            tokens,
+            _lease: lease,
         }
     }
 }
 
-impl Drop for TokenGuardBody {
-    fn drop(&mut self) {
-        if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
-            // Use lock-free sync return - no runtime needed, guaranteed token return
-            bucket.return_tokens_sync(self.tokens);
-        }
-    }
-}
-
-impl http_body::Body for TokenGuardBody {
+impl http_body::Body for PermitGuardBody {
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -89,8 +195,6 @@ impl http_body::Body for TokenGuardBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // SAFETY: We never move the inner body, and Body is Unpin
-        // (it's a type alias for UnsyncBoxBody which is Unpin)
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_frame(cx)
     }
@@ -378,125 +482,47 @@ pub fn create_logging_layer() -> TraceLayer<
         .on_response(ResponseLogger::default())
 }
 
-/// Request queue entry
-pub struct QueuedRequest {
-    /// Time when the request was queued
-    queued_at: Instant,
-    /// Channel to send the permit back when acquired
-    permit_tx: oneshot::Sender<Result<(), StatusCode>>,
-}
-
-/// Queue metrics for monitoring
-#[derive(Debug, Default)]
-pub struct QueueMetrics {
-    pub total_queued: AtomicU64,
-    pub current_queued: AtomicU64,
-    pub total_timeout: AtomicU64,
-    pub total_rejected: AtomicU64,
-}
-
-/// Queue processor that handles queued requests
-pub struct QueueProcessor {
-    token_bucket: Arc<TokenBucket>,
-    queue_rx: mpsc::Receiver<QueuedRequest>,
-    queue_timeout: Duration,
-}
-
-impl QueueProcessor {
-    pub fn new(
-        token_bucket: Arc<TokenBucket>,
-        queue_rx: mpsc::Receiver<QueuedRequest>,
-        queue_timeout: Duration,
-    ) -> Self {
-        Self {
-            token_bucket,
-            queue_rx,
-            queue_timeout,
-        }
-    }
-
-    pub async fn run(mut self) {
-        debug!("Starting concurrency queue processor");
-
-        // Process requests in a single task to reduce overhead
-        while let Some(queued) = self.queue_rx.recv().await {
-            // Check timeout immediately
-            let elapsed = queued.queued_at.elapsed();
-            if elapsed >= self.queue_timeout {
-                warn!("Request already timed out in queue");
-                let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
-                continue;
-            }
-
-            let remaining_timeout = self.queue_timeout - elapsed;
-
-            // Try to acquire token for this request
-            if self.token_bucket.try_acquire(1.0).await.is_ok() {
-                // Got token immediately
-                debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
-            } else {
-                // Need to wait for token
-                let token_bucket = self.token_bucket.clone();
-
-                // Spawn task only when we actually need to wait
-                tokio::spawn(async move {
-                    if token_bucket
-                        .acquire_timeout(1.0, remaining_timeout)
-                        .await
-                        .is_ok()
-                    {
-                        debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
-                    } else {
-                        warn!("Queue: request timed out waiting for token");
-                        let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
-                    }
-                });
-            }
-        }
-
-        warn!("Concurrency queue processor shutting down");
-    }
-}
-
-/// State for the concurrency limiter
-pub struct ConcurrencyLimiter {
-    pub queue_tx: Option<mpsc::Sender<QueuedRequest>>,
-}
-
-impl ConcurrencyLimiter {
-    /// Create new concurrency limiter with optional queue
-    pub fn new(
-        token_bucket: Option<Arc<TokenBucket>>,
-        queue_size: usize,
-        queue_timeout: Duration,
-    ) -> (Self, Option<QueueProcessor>) {
-        match (token_bucket, queue_size) {
-            (None, _) => (Self { queue_tx: None }, None),
-            (Some(bucket), size) if size > 0 => {
-                let (queue_tx, queue_rx) = mpsc::channel(size);
-                let processor = QueueProcessor::new(bucket, queue_rx, queue_timeout);
-                (
-                    Self {
-                        queue_tx: Some(queue_tx),
-                    },
-                    Some(processor),
-                )
-            }
-            (Some(_), _) => (Self { queue_tx: None }, None),
-        }
-    }
-}
-
-/// Middleware function for concurrency limiting with optional queuing
-pub async fn concurrency_limit_middleware(
+/// Applies the inference-only traffic gates in their required order:
+/// mesh/global QPS, local QPS, then lifecycle-owned admission.
+///
+/// Authentication and WASM middleware are composed outside this guard by
+/// `server::build_app`, so either can short-circuit without consuming limiter
+/// state.
+pub async fn inference_guard_middleware(
     State(app_state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Check mesh global rate limit first if mesh is enabled
-    // If mesh is not enabled, this check is skipped and local rate limiting is used
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|request_id| request_id.0.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let error_context = |snapshot: AdmissionSnapshot| AdmissionErrorContext {
+        request_id: &request_id,
+        max_concurrent_requests: app_state
+            .context
+            .router_config
+            .max_concurrent_requests
+            .max(0) as usize,
+        queue_size: app_state.context.router_config.queue_size,
+        queue_timeout_secs: app_state.context.router_config.queue_timeout_secs,
+        snapshot,
+    };
+    let admission_snapshot = || {
+        app_state
+            .context
+            .admission_limiter
+            .as_ref()
+            .map(|limiter| limiter.snapshot())
+            .unwrap_or(AdmissionSnapshot {
+                inflight: 0,
+                queued: 0,
+            })
+    };
+
     if let Some(sync_manager) = &app_state.mesh_sync_manager {
         let (is_exceeded, current_count, limit) = sync_manager.check_global_rate_limit();
         if is_exceeded {
@@ -504,113 +530,48 @@ pub async fn concurrency_limit_middleware(
                 "Global rate limit exceeded: {}/{} req/s",
                 current_count, limit
             );
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "Rate limit exceeded",
-                    "current_count": current_count,
-                    "limit": limit
-                })),
-            )
-                .into_response();
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_admission_decision(AdmissionDecision::GlobalRateLimited);
+            return admission_error_response(
+                AdmissionRejection::GlobalRateLimited,
+                error_context(admission_snapshot()),
+            );
         }
     }
 
-    let token_bucket = match &app_state.context.rate_limiter {
-        Some(bucket) => bucket.clone(),
-        None => {
-            // Rate limiting disabled, pass through immediately
-            return next.run(request).await;
+    if let Some(rate_limiter) = &app_state.context.rate_limiter {
+        if rate_limiter.try_acquire(1.0).await.is_err() {
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            Metrics::record_admission_decision(AdmissionDecision::RateLimited);
+            return admission_error_response(
+                AdmissionRejection::RateLimited,
+                error_context(admission_snapshot()),
+            );
         }
+        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+    }
+
+    let lease = if let Some(admission_limiter) = &app_state.context.admission_limiter {
+        match admission_limiter.acquire().await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                return admission_error_response(
+                    AdmissionRejection::from(error),
+                    error_context(admission_limiter.snapshot()),
+                );
+            }
+        }
+    } else {
+        None
     };
 
-    // Static counter for embeddings queue size
-    static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
-
-    // Identify if this is an embeddings request based on path
-    let is_embeddings = request.uri().path().contains("/v1/embeddings");
-
-    // Try to acquire token immediately
-    if token_bucket.try_acquire(1.0).await.is_ok() {
-        debug!("Acquired token immediately");
-        Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-        let response = next.run(request).await;
-
-        // Wrap the response body with TokenGuardBody to return token when stream ends
-        // This ensures that for streaming responses, the token is only returned
-        // after the entire stream has been sent to the client.
-        let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
-        Response::from_parts(parts, Body::new(guarded_body))
-    } else {
-        // No tokens available, try to queue if enabled
-        if let Some(queue_tx) = &app_state.concurrency_queue_tx {
-            debug!("No tokens available, attempting to queue request");
-
-            // Create a channel for the token response
-            let (permit_tx, permit_rx) = oneshot::channel();
-
-            let queued = QueuedRequest {
-                queued_at: Instant::now(),
-                permit_tx,
-            };
-
-            // Try to send to queue
-            match queue_tx.try_send(queued) {
-                Ok(_) => {
-                    // On successful enqueue, update embeddings queue counter if applicable
-                    if is_embeddings {
-                        EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    // Wait for token from queue processor
-                    match permit_rx.await {
-                        Ok(Ok(())) => {
-                            debug!("Acquired token from queue");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
-                            // Dequeue for embeddings
-                            if is_embeddings {
-                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
-                            }
-
-                            let response = next.run(request).await;
-
-                            // Wrap the response body with TokenGuardBody to return token when stream ends
-                            let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
-                            Response::from_parts(parts, Body::new(guarded_body))
-                        }
-                        Ok(Err(status)) => {
-                            warn!("Queue returned error status: {}", status);
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                            // Dequeue for embeddings on error
-                            if is_embeddings {
-                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            status.into_response()
-                        }
-                        Err(_) => {
-                            error!("Queue response channel closed");
-                            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                            // Dequeue for embeddings on channel error
-                            if is_embeddings {
-                                EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
-                            }
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                        }
-                    }
-                }
-                Err(_) => {
-                    warn!("Request queue is full, returning 429");
-                    Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
-                }
-            }
-        } else {
-            warn!("No tokens available and queuing is disabled, returning 429");
-            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+    let response = next.run(request).await;
+    match lease {
+        Some(lease) => {
+            let (parts, body) = response.into_parts();
+            Response::from_parts(parts, Body::new(PermitGuardBody::new(body, lease)))
         }
+        None => response,
     }
 }
 
