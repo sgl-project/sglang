@@ -101,6 +101,14 @@ class FakeGenerator:
         }.get((self.pipeline_class_name, enable_taylorseer), 5.0)
         frame_value = len(self.factory.generate_calls) % 255
         frame = np.full((4, 4, 3), frame_value, dtype=np.uint8)
+        perf_dump_path = params.get("perf_dump_path")
+        if perf_dump_path is not None:
+            perf_path = Path(str(perf_dump_path))
+            perf_path.parent.mkdir(parents=True, exist_ok=True)
+            perf_path.write_text(
+                json.dumps({"request_id": len(self.factory.generate_calls)}),
+                encoding="utf-8",
+            )
         output_file_path = None
         if params.get("save_output"):
             artifact_path = Path(str(params["output_path"])) / str(
@@ -243,6 +251,7 @@ def test_all_modes_use_sequential_pipeline_lifecycles_and_current_params(
         params = call["params"]
         assert isinstance(params, dict)
         assert LEGACY_MODE_FIELDS.isdisjoint(params)
+        assert "perf_dump_path" not in params
 
     t2i_calls = _calls_for(factory, "BagelPipeline")
     assert len(t2i_calls) == 2
@@ -395,6 +404,10 @@ def test_unattempted_editing_workloads_are_never_reported_as_passed(
 
 def test_parallelism_is_limited_to_valid_bagel_tp_layouts(tmp_path: Path) -> None:
     base_config = _config(tmp_path, image_path=None)
+    invalid_perf_dir = tmp_path / "perf.json"
+    invalid_perf_dir.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ValueError, match="perf_dump_dir is not a directory"):
+        replace(base_config, perf_dump_dir=invalid_perf_dir)
     with pytest.raises(ValueError, match="image_path is not a file"):
         replace(base_config, image_path=tmp_path / "missing.png")
     with pytest.raises(ValueError, match="num_gpus must be 1 or 2"):
@@ -487,6 +500,58 @@ def test_each_case_warms_up_before_its_timed_requests(tmp_path: Path) -> None:
     editing_calls = _calls_for(factory, "BagelEditPipeline")
     assert all(params["save_output"] is False for params in editing_calls[:3])
     assert all(params["save_output"] is True for params in editing_calls[3:])
+
+
+def test_perf_dump_dir_profiles_only_timed_requests_with_unique_paths(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "input.png"
+    _write_input_image(image_path)
+    factory = FakeGeneratorFactory()
+    perf_dump_dir = tmp_path / "worker-perf"
+    config = replace(
+        _config(tmp_path, image_path=image_path),
+        perf_dump_dir=perf_dump_dir,
+        warmup=1,
+        editing_warmup=1,
+    )
+
+    report = run_benchmark(config, generator_factory=factory)
+
+    profiled_calls = [
+        call["params"]
+        for call in factory.generate_calls
+        if "perf_dump_path" in call["params"]
+    ]
+    assert len(profiled_calls) == 8
+    perf_paths = [Path(str(params["perf_dump_path"])) for params in profiled_calls]
+    assert len(set(perf_paths)) == 8
+    assert all(path.is_absolute() and path.is_file() for path in perf_paths)
+    assert all(perf_dump_dir.resolve() in path.parents for path in perf_paths)
+    for pipeline_class_name in PIPELINE_ORDER[:-1]:
+        calls = _calls_for(factory, pipeline_class_name)
+        assert ["perf_dump_path" in params for params in calls] == [
+            False,
+            True,
+        ] * (len(calls) // 2)
+    editing_calls = _calls_for(factory, "BagelEditPipeline")
+    assert ["perf_dump_path" in params for params in editing_calls] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+
+    reported_paths: list[Path] = []
+    for case in report["cases"]:
+        for workload in case["workloads"]:
+            for sample in workload["samples"]:
+                worker_path = sample["worker_perf_dump_path"]
+                assert worker_path is not None
+                reported_paths.append(Path(worker_path))
+    assert set(reported_paths) == set(perf_paths)
 
 
 def test_write_report_atomic_round_trips_json_and_removes_temporary_file(

@@ -440,22 +440,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ):
                 torch.cuda.empty_cache()
 
-            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
-
-            # dump per-request perf report to the server-mode file path.
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
-                )
+            self._report_request_performance(req, output_batch)
         except Exception as e:
             logger.error(
                 f"Error executing {error_context}: {e}",
@@ -471,6 +456,27 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
+
+    def _report_request_performance(self, req: Req, output_batch: OutputBatch) -> None:
+        """Log and dump completed request metrics from the main worker only.
+
+        Tensor-parallel workers receive the same output path. Restricting writes to
+        rank 0 prevents concurrent JSON truncation and preserves the rank-0 memory
+        snapshots in the final report.
+        """
+        if self.rank != 0 or req.is_warmup:
+            return
+
+        if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
+            PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+
+        if req.perf_dump_path is not None and output_batch.metrics is not None:
+            PerformanceLogger.dump_benchmark_report(
+                file_path=req.perf_dump_path,
+                metrics=output_batch.metrics,
+                meta={"model": self.server_args.model_path},
+                tag="server_perf_dump",
+            )
 
     def _materialize_output_transport(
         self,

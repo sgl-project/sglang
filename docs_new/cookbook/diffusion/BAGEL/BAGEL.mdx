@@ -474,6 +474,23 @@ artifacts are written under `--output-dir`; the Understanding text is stored in
 the JSON report. If `--image-path` is omitted, the four prompt-only generation
 cases still run, while Understanding and Editing are reported as skipped.
 
+Add `--perf-dump-dir` to collect a separate worker timing report for every
+timed request. The reports contain pipeline stage and denoising-step metrics;
+warmup requests remain unprofiled. For synchronized CUDA step timings, enable
+the existing profiling synchronization gate:
+
+```bash
+SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 \
+python -m sglang.multimodal_gen.benchmarks.bench_bagel_all_modes \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --image-path input.png \
+  --perf-dump-dir bagel-benchmark/worker-perf
+```
+
+Synchronization adds profiling overhead, so compare synchronized runs only
+with other synchronized runs. The main benchmark JSON records the absolute
+worker report path for each sample.
+
 Speedup uses the worker's inference duration, excluding PNG encoding and
 filesystem I/O, and is reported only between comparable requests: T2I with
 TaylorSeer against standard T2I, and Thinking with TaylorSeer against Thinking.

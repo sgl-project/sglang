@@ -52,6 +52,7 @@ class BenchmarkConfig:
     model_path: str
     output_dir: Path
     output_json: Path | None = None
+    perf_dump_dir: Path | None = None
     revision: str = DEFAULT_MODEL_REVISION
     image_path: Path | None = None
     prompt: str = DEFAULT_PROMPT
@@ -84,6 +85,12 @@ class BenchmarkConfig:
             raise ValueError("revision must not be empty")
         if self.image_path is not None and not Path(self.image_path).is_file():
             raise ValueError(f"image_path is not a file: {self.image_path}")
+        if (
+            self.perf_dump_dir is not None
+            and self.perf_dump_dir.exists()
+            and not self.perf_dump_dir.is_dir()
+        ):
+            raise ValueError(f"perf_dump_dir is not a directory: {self.perf_dump_dir}")
         if not self.prompt.strip() or not self.understanding_prompt.strip():
             raise ValueError("benchmark prompts must not be empty")
         for field_name in ("height", "width", "num_inference_steps", "runs"):
@@ -301,20 +308,26 @@ def _request_params(
     params = {**spec.parameters, "prompt": workload.prompt}
     if spec.result_kind == "text":
         params.update(save_output=False, return_file_paths_only=False)
-        return params
-
-    if warmup:
+    elif warmup:
         # Avoid benchmark artifacts while still materializing output for validation.
         params.update(save_output=False, return_file_paths_only=False)
-        return params
+    else:
+        output_file_name = f"{spec.id}_{workload.id}_run_{run_index + 1:02d}.png"
+        params.update(
+            save_output=True,
+            return_file_paths_only=True,
+            output_path=str(config.output_dir),
+            output_file_name=output_file_name,
+        )
 
-    output_file_name = f"{spec.id}_{workload.id}_run_{run_index + 1:02d}.png"
-    params.update(
-        save_output=True,
-        return_file_paths_only=True,
-        output_path=str(config.output_dir),
-        output_file_name=output_file_name,
-    )
+    if not warmup and config.perf_dump_dir is not None:
+        perf_dump_path = (
+            config.perf_dump_dir
+            / spec.id
+            / workload.id
+            / f"run_{run_index + 1:02d}.json"
+        ).resolve()
+        params["perf_dump_path"] = str(perf_dump_path)
     return params
 
 
@@ -358,7 +371,12 @@ def _validate_result(result: Any, result_kind: str, *, warmup: bool) -> None:
             )
 
 
-def _sample_record(result: Any, run_index: int, wall_time_ms: float) -> dict[str, Any]:
+def _sample_record(
+    result: Any,
+    run_index: int,
+    wall_time_ms: float,
+    worker_perf_dump_path: str | None,
+) -> dict[str, Any]:
     metrics = _json_safe(getattr(result, "metrics", {}) or {})
     assert isinstance(metrics, dict)
     generation_time = float(getattr(result, "generation_time", 0.0) or 0.0)
@@ -370,6 +388,7 @@ def _sample_record(result: Any, run_index: int, wall_time_ms: float) -> dict[str
         "peak_memory_mb": float(getattr(result, "peak_memory_mb", 0.0) or 0.0),
         "metrics": metrics,
         "artifact_path": getattr(result, "output_file_path", None),
+        "worker_perf_dump_path": worker_perf_dump_path,
     }
     revised_prompt = getattr(result, "revised_prompt", None)
     if revised_prompt:
@@ -463,13 +482,31 @@ def _run_case(
                     run_index=run_index,
                     warmup=False,
                 )
+                worker_perf_dump_path = params.get("perf_dump_path")
+                if worker_perf_dump_path is not None:
+                    # Remove an older run at the deterministic destination so
+                    # existence checks cannot accept a stale profiler report.
+                    Path(worker_perf_dump_path).unlink(missing_ok=True)
                 start = time.perf_counter()
                 result = _single_result(
                     generator.generate(sampling_params_kwargs=params)
                 )
                 wall_time_ms = (time.perf_counter() - start) * 1000.0
                 _validate_result(result, spec.result_kind, warmup=False)
-                sample = _sample_record(result, run_index, wall_time_ms)
+                if (
+                    worker_perf_dump_path is not None
+                    and not Path(worker_perf_dump_path).is_file()
+                ):
+                    raise RuntimeError(
+                        "BAGEL worker perf dump does not exist: "
+                        f"{worker_perf_dump_path}"
+                    )
+                sample = _sample_record(
+                    result,
+                    run_index,
+                    wall_time_ms,
+                    worker_perf_dump_path,
+                )
                 workload_record["samples"].append(sample)
                 all_samples.append(sample)
             workload_record["status"] = "passed"
@@ -531,6 +568,8 @@ def run_benchmark(
         OSError: If the output directory cannot be created.
     """
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    if config.perf_dump_dir is not None:
+        config.perf_dump_dir.mkdir(parents=True, exist_ok=True)
     config_dict = asdict(config)
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -710,6 +749,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_outputs"))
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--perf-dump-dir",
+        type=Path,
+        help="Write one worker stage/step timing JSON file per timed request",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--understanding-prompt", default=DEFAULT_UNDERSTANDING_PROMPT)
     parser.add_argument("--height", type=int, default=1024)
@@ -747,6 +791,7 @@ def _config_from_args(
             image_path=args.image_path,
             output_dir=args.output_dir,
             output_json=output_json,
+            perf_dump_dir=args.perf_dump_dir,
             prompt=args.prompt,
             understanding_prompt=args.understanding_prompt,
             height=args.height,
