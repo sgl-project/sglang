@@ -289,7 +289,7 @@ class TestBagelPipelineConfig(unittest.TestCase):
             height=32,
             width=48,
             extra={
-                "bagel_context": object(),
+                "bagel_context": SimpleNamespace(batch_size=1),
                 "bagel_taylorseer_context": taylorseer_context,
             },
         )
@@ -316,7 +316,9 @@ class TestBagelPipelineConfig(unittest.TestCase):
                 batch = SimpleNamespace(
                     height=32,
                     width=48,
-                    extra={"bagel_context": object()},
+                    extra={
+                        "bagel_context": SimpleNamespace(batch_size=batch_size)
+                    },
                 )
                 tokens = torch.arange(batch_size * 6 * 64, dtype=torch.float32).reshape(
                     batch_size, 6, 64
@@ -348,6 +350,13 @@ class TestBagelPipelineConfig(unittest.TestCase):
 
         self.assertNotIn("bagel_context", batch.extra)
 
+    def test_unpatchify_requires_request_context(self) -> None:
+        config = BagelPipelineConfig()
+        batch = SimpleNamespace(height=32, width=48, extra={})
+
+        with self.assertRaisesRegex(RuntimeError, "request context is missing"):
+            config.post_denoising_loop(torch.zeros(6, 64), batch)
+
     def test_unpatchify_releases_context_on_shape_error(self) -> None:
         config = BagelPipelineConfig()
         taylorseer_context = SimpleNamespace(release=Mock())
@@ -355,7 +364,7 @@ class TestBagelPipelineConfig(unittest.TestCase):
             height=32,
             width=32,
             extra={
-                "bagel_context": object(),
+                "bagel_context": SimpleNamespace(batch_size=1),
                 "bagel_taylorseer_context": taylorseer_context,
             },
         )

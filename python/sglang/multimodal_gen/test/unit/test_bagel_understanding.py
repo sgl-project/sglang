@@ -483,6 +483,7 @@ def test_understanding_loader_uses_only_injected_text_components() -> None:
     args = _runtime_args(config)
     pipeline = BagelUnderstandingPipeline.__new__(BagelUnderstandingPipeline)
     pipeline.model_path = "must-not-be-resolved"
+    pipeline.memory_usages = {}
     modules = {
         "transformer": torch.nn.Identity(),
         "image_encoder": torch.nn.Identity(),

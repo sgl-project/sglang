@@ -167,6 +167,7 @@ class BagelPipelineConfig(ImagePipelineConfig):
             Unpatchified VAE latents with shape ``[B, C, H/8, W/8]``.
 
         Raises:
+            RuntimeError: If the request-local BAGEL context is missing.
             ValueError: If token count or patch width does not match the request.
         """
         try:
@@ -181,8 +182,11 @@ class BagelPipelineConfig(ImagePipelineConfig):
             arch = self.dit_config.arch_config
             batch_size = int(latents.shape[0])
             context = batch.extra.get(_BAGEL_CONTEXT_KEY)
-            context_batch_size = getattr(context, "batch_size", batch_size)
-            if int(context_batch_size) != batch_size:
+            if context is None:
+                raise RuntimeError(
+                    "BAGEL request context is missing; the prefill stage must run before denoising"
+                )
+            if int(context.batch_size) != batch_size:
                 raise ValueError(
                     "BAGEL latent batch size does not match the request context"
                 )
@@ -224,23 +228,19 @@ class BagelPipelineConfig(ImagePipelineConfig):
             # VAE decode so KV and Taylor tensors can be reclaimed immediately.
             batch.extra.pop(_BAGEL_CONTEXT_KEY, None)
             taylorseer_context = batch.extra.pop(_BAGEL_TAYLORSEER_KEY, None)
-            release_taylorseer = getattr(taylorseer_context, "release", None)
-            if callable(release_taylorseer):
-                release_taylorseer()
+            if taylorseer_context is not None:
+                taylorseer_context.release()
 
 
 def _editing_vae_config() -> BagelVAEConfig:
-    """Create the full VAE required by image editing without changing T2I."""
     return BagelVAEConfig(load_encoder=True, load_decoder=True)
 
 
 def _thinking_dit_config() -> BagelDiTConfig:
-    """Create the transformer variant that strictly loads the language head."""
     return BagelDiTConfig(load_lm_head=True)
 
 
 def _understanding_dit_config() -> BagelDiTConfig:
-    """Load the UND expert and language head without generation-only weights."""
     return BagelDiTConfig(load_lm_head=True, load_generation_expert=False)
 
 

@@ -121,6 +121,17 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 SDPA_BACKEND_CLS_STR,
             )
 
+    def test_sm100_propagates_fa4_import_initialization_errors(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        FakeCudaPlatform.device_capability = DeviceCapability(10, 0)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.cuda.import_module",
+            side_effect=RuntimeError("FA4 initialization failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "FA4 initialization failed"):
+                self.resolve(AttentionBackendEnum.FA, head_size=72)
+
     def test_sm100_preparation_enables_fa4(self):
         from sglang.multimodal_gen.runtime.layers.attention.backends import (
             flash_attn as fa_backend,

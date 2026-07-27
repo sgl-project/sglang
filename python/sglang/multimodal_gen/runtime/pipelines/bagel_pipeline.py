@@ -103,55 +103,48 @@ class BagelPipeline(ComposedPipelineBase):
     def _validate_runtime_capabilities(server_args: ServerArgs) -> None:
         """Fail before model resolution when an unsupported runtime mode is set."""
         unsupported: list[str] = []
-        if getattr(server_args, "enable_cfg_parallel", False):
+        if server_args.enable_cfg_parallel:
             unsupported.append("CFG parallel")
-        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        tp_size = int(server_args.tp_size or 1)
         if tp_size not in (1, 2):
             unsupported.append(f"TP size {tp_size} (validated sizes: 1, 2)")
-        if int(getattr(server_args, "sp_degree", 1) or 1) != 1:
+        if int(server_args.sp_degree or 1) != 1:
             unsupported.append("SP")
-        if int(getattr(server_args, "ulysses_degree", 1) or 1) != 1:
+        if int(server_args.ulysses_degree or 1) != 1:
             unsupported.append("Ulysses SP")
-        if int(getattr(server_args, "ring_degree", 1) or 1) != 1:
+        if int(server_args.ring_degree or 1) != 1:
             unsupported.append("Ring SP")
-        if getattr(server_args, "use_fsdp_inference", False):
+        if server_args.use_fsdp_inference:
             unsupported.append("FSDP inference")
-        if getattr(server_args, "enable_torch_compile", False):
+        if server_args.enable_torch_compile:
             unsupported.append("torch.compile")
-        if getattr(server_args, "dit_layerwise_offload", False) or getattr(
-            server_args, "layerwise_offload_components", None
+        if (
+            server_args.dit_layerwise_offload
+            or server_args.layerwise_offload_components
         ):
             unsupported.append("layerwise offload")
-        if getattr(server_args, "dit_cpu_offload", False):
+        if server_args.dit_cpu_offload:
             unsupported.append("DiT CPU offload")
         pipeline_config = server_args.pipeline_config
         is_text_pipeline = pipeline_config.task_type.is_text_gen()
-        if getattr(server_args, "vae_cpu_offload", False) and not is_text_pipeline:
+        if server_args.vae_cpu_offload and not is_text_pipeline:
             unsupported.append("VAE CPU offload")
-        if getattr(server_args, "cache_dit_config", None) is not None or bool(
+        if server_args.cache_dit_config is not None or bool(
             envs.SGLANG_CACHE_DIT_ENABLED
         ):
             unsupported.append("Cache-DiT")
-        if getattr(server_args, "quantization", None) is not None:
+        if server_args.quantization is not None:
             unsupported.append("quantization")
-        if getattr(server_args, "lora_path", None) is not None:
+        if server_args.lora_path is not None:
             unsupported.append("LoRA")
-        if getattr(server_args, "comfyui_mode", False):
+        if server_args.comfyui_mode:
             unsupported.append("ComfyUI mode")
-        if getattr(pipeline_config, "dit_precision", None) != "bf16":
+        if pipeline_config.dit_precision != "bf16":
             unsupported.append("non-BF16 DiT precision")
-        if (
-            not is_text_pipeline
-            and getattr(pipeline_config, "vae_precision", None) != "bf16"
-        ):
+        if not is_text_pipeline and pipeline_config.vae_precision != "bf16":
             unsupported.append("non-BF16 VAE precision")
         if (
-            getattr(
-                getattr(pipeline_config, "image_encoder_config", None),
-                "prefix",
-                None,
-            )
-            == "vit_model"
+            pipeline_config.image_encoder_config.prefix == "vit_model"
             and pipeline_config.image_encoder_precision != "bf16"
         ):
             unsupported.append("non-BF16 image encoder precision")
@@ -407,13 +400,12 @@ class BagelPipeline(ComposedPipelineBase):
             dtype = resolve_precision(
                 server_args, "dit", precision_attr="dit_precision"
             )
-            attention_backend = getattr(server_args, "attention_backend", None)
-            if hasattr(server_args, "resolve_component_attention_backend"):
-                component_backend, _ = server_args.resolve_component_attention_backend(
-                    "transformer", "dit"
-                )
-                if component_backend is not None:
-                    attention_backend = component_backend
+            attention_backend = server_args.attention_backend
+            component_backend, _ = server_args.resolve_component_attention_backend(
+                "transformer", "dit"
+            )
+            if component_backend is not None:
+                attention_backend = component_backend
             with set_default_torch_dtype(dtype), torch.device("meta"):
                 transformer = BagelTransformer(
                     server_args.pipeline_config.dit_config,
@@ -442,12 +434,9 @@ class BagelPipeline(ComposedPipelineBase):
                 "image_encoder",
                 precision_attr="image_encoder_precision",
             )
-            component_backend = None
-            matched_backend_key = None
-            if hasattr(server_args, "resolve_component_attention_backend"):
-                component_backend, matched_backend_key = (
-                    server_args.resolve_component_attention_backend("image_encoder")
-                )
+            component_backend, matched_backend_key = (
+                server_args.resolve_component_attention_backend("image_encoder")
+            )
             with component_attn_backend_context_manager(
                 component_backend,
                 component_name=matched_backend_key or "image_encoder",
@@ -506,8 +495,6 @@ class BagelPipeline(ComposedPipelineBase):
             )
 
         self._validate_special_tokens(modules)
-        if not hasattr(self, "memory_usages"):
-            self.memory_usages = {}
         for component_name in self._required_config_modules:
             memory_usage = get_memory_usage_of_component(modules[component_name])
             self.memory_usages[component_name] = memory_usage or 0.0
@@ -519,11 +506,9 @@ class BagelPipeline(ComposedPipelineBase):
         self._validate_runtime_capabilities(server_args)
         if "vae" in self._required_config_modules:
             vae_config = server_args.pipeline_config.vae_config
-            if hasattr(vae_config, "post_init"):
-                vae_config.post_init()
+            vae_config.post_init()
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        """Build validation -> prefill -> standard denoise -> standard decode."""
         self.add_stage(BagelInputValidationStage(), "input_validation_stage")
         self.add_stage(
             BagelBeforeDenoisingStage(
@@ -558,7 +543,6 @@ class BagelEditPipeline(BagelPipeline):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        """Build validation -> image prefill -> standard denoise/decode."""
         self.add_stage(BagelEditInputValidationStage(), "input_validation_stage")
         self.add_stage(
             BagelEditBeforeDenoisingStage(
@@ -590,7 +574,6 @@ class BagelThinkingPipeline(BagelPipeline):
     sampling_params_cls = BagelThinkingSamplingParams
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        """Build validation -> planning/prefill -> denoise -> decode."""
         self.add_stage(BagelInputValidationStage(), "input_validation_stage")
         self.add_stage(
             BagelThinkingBeforeDenoisingStage(
@@ -621,7 +604,6 @@ class BagelUnderstandingPipeline(BagelPipeline):
     _required_config_modules = ["transformer", "image_encoder", "tokenizer"]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        """Build validation -> ViT/UND prefill -> autoregressive text output."""
         self.add_stage(
             BagelUnderstandingInputValidationStage(), "input_validation_stage"
         )

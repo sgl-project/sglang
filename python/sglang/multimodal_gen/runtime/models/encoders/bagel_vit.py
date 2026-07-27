@@ -284,12 +284,10 @@ class BagelImageEncoder(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        """Return the component parameter dtype."""
         return next(self.parameters()).dtype
 
     @property
     def device(self) -> torch.device:
-        """Return the component parameter device."""
         return next(self.parameters()).device
 
     def forward(self, patches: Tensor, position_ids: Tensor) -> Tensor:

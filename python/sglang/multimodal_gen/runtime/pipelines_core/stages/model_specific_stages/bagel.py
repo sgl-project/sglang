@@ -444,7 +444,6 @@ class BagelBeforeDenoisingStage(PipelineStage):
         device: torch.device,
         **_context_inputs,
     ):
-        """Build the two-way T2I context for one request."""
         del server_args
         return self._build_text_to_image_context(
             batch,
@@ -461,7 +460,6 @@ class BagelBeforeDenoisingStage(PipelineStage):
         special_token_ids: dict[str, int],
         device: torch.device,
     ) -> dict[str, object]:
-        """Return no extra inputs for the text-only T2I context."""
         del batch, server_args, special_token_ids, device
         return {}
 
@@ -641,7 +639,7 @@ class BagelBeforeDenoisingStage(PipelineStage):
             batch.extra[_BAGEL_TAYLORSEER_KEY] = BagelTaylorSeerContext.create(
                 num_layers=int(arch.num_hidden_layers),
                 num_steps=int(batch.num_inference_steps),
-                has_secondary=bool(getattr(context, "has_three_way_cfg", False)),
+                has_secondary=context.has_three_way_cfg,
             )
         else:
             batch.extra.pop(_BAGEL_TAYLORSEER_KEY, None)

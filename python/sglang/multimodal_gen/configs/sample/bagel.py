@@ -23,7 +23,6 @@ class BagelSamplingParams(SamplingParams):
     enable_taylorseer: bool = False
 
     def _validate(self) -> None:
-        """Validate BAGEL image-generation controls and inherited fields."""
         super()._validate()
         if not isinstance(self.enable_taylorseer, bool):
             raise ValueError("enable_taylorseer must be a boolean")
@@ -38,7 +37,6 @@ class BagelThinkingSamplingParams(BagelSamplingParams):
     think_temperature: float = 0.3
 
     def _validate(self) -> None:
-        """Validate Thinking controls in addition to common sampling fields."""
         super()._validate()
         if (
             not isinstance(self.max_think_tokens, int)
@@ -75,7 +73,6 @@ class BagelUnderstandingSamplingParams(BagelSamplingParams):
     enable_thinking: bool = False
 
     def _validate(self) -> None:
-        """Validate Understanding decode controls and inherited request fields."""
         super()._validate()
         if self.enable_taylorseer:
             raise ValueError(

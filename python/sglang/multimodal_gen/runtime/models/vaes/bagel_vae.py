@@ -223,12 +223,10 @@ class BagelVAE(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        """Return the decoder parameter dtype."""
         return next(self.parameters()).dtype
 
     @property
     def device(self) -> torch.device:
-        """Return the decoder parameter device."""
         return next(self.parameters()).device
 
     def decode(self, latents: Tensor) -> Tensor:

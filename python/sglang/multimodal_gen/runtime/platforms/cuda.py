@@ -447,7 +447,7 @@ class CudaPlatformBase(Platform):
 
         try:
             fa4_module = import_module("flash_attn.cute")
-        except Exception as e:
+        except (ImportError, OSError) as e:
             logger.info(
                 "Cannot use FlashAttention 4 because flash_attn.cute is "
                 "unavailable: %s. Falling back to Torch SDPA.",

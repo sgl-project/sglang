@@ -99,17 +99,14 @@ class TaylorSeerState:
 
     @property
     def completed_steps(self) -> int:
-        """Return the number of actual branch evaluations completed."""
         return self._completed_steps
 
     @property
     def is_failed(self) -> bool:
-        """Return whether any CFG branch in this request failed mid-evaluation."""
         return self._run_health.failed
 
     @property
     def is_refresh_step(self) -> bool:
-        """Return whether the active evaluation must execute every layer."""
         return self._refresh_step
 
     def begin_step(self, step: int) -> str:
@@ -253,7 +250,6 @@ class TaylorSeerState:
         return output
 
     def get_stats(self) -> dict[str, int]:
-        """Return completed full and forecast evaluation counts."""
         return {
             "total_steps": self._completed_steps,
             "full_steps": self._full_steps,
@@ -408,7 +404,6 @@ class BagelTaylorSeerContext:
             raise ValueError("BAGEL TaylorSeer state does not match CFG branch count")
 
     def get_stats(self) -> dict[str, dict[str, int]]:
-        """Return completed evaluation counts for every CFG branch."""
         stats = {
             "conditional": self.conditional.get_stats(),
             "unconditional": self.unconditional.get_stats(),
@@ -419,9 +414,7 @@ class BagelTaylorSeerContext:
 
     @property
     def is_failed(self) -> bool:
-        """Return whether any CFG branch failed during model evaluation."""
         return self.conditional.is_failed
 
     def release(self) -> None:
-        """Release every CFG branch cache and invalidate this request state."""
         self.conditional.release()

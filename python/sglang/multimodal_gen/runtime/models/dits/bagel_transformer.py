@@ -66,15 +66,11 @@ _BAGEL_FLASHINFER_ATTENTION_STATE: dict[_AttentionStateKey, bool] = {}
 
 
 class _BagelColumnParallelLinear(ColumnParallelLinear):
-    """Return only the tensor from SGLang's tensor-parallel linear API."""
-
     def forward(self, hidden_states: Tensor) -> Tensor:
         return super().forward(hidden_states)[0]
 
 
 class _BagelRowParallelLinear(RowParallelLinear):
-    """Return the all-reduced tensor from SGLang's row-parallel linear API."""
-
     def forward(self, hidden_states: Tensor) -> Tensor:
         return super().forward(hidden_states)[0]
 
@@ -146,7 +142,6 @@ class BagelKVCache:
 
     @property
     def sequence_length(self) -> int:
-        """Return the prefix length represented by this cache."""
         first_key = self.key_cache[0] if self.key_cache else None
         return 0 if first_key is None else int(first_key.shape[0])
 
@@ -233,22 +228,18 @@ class BagelContext:
 
     @property
     def has_three_way_cfg(self) -> bool:
-        """Return whether this context contains a complete third CFG branch."""
         return self.secondary_unconditional_kv is not None
 
     @property
     def is_editing(self) -> bool:
-        """Return whether this context contains the third Editing CFG branch."""
         return self.three_way_cfg_kind == "editing"
 
     @property
     def is_thinking(self) -> bool:
-        """Return whether this context contains the third Thinking CFG branch."""
         return self.three_way_cfg_kind == "thinking"
 
     @property
     def batch_size(self) -> int:
-        """Return the number of request prefixes packed into this context."""
         return int(self.conditional_kv_lens.numel())
 
     @classmethod

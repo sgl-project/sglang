@@ -447,6 +447,7 @@ class TestBagelLoaderContract(unittest.TestCase):
     def test_default_scheduler_preserves_official_fp32_euler_state(self) -> None:
         pipeline = BagelPipeline.__new__(BagelPipeline)
         pipeline.model_path = "must-not-be-resolved"
+        pipeline.memory_usages = {}
         modules = {
             "transformer": _FakeTransformer(),
             "vae": torch.nn.Identity(),
@@ -465,6 +466,7 @@ class TestBagelLoaderContract(unittest.TestCase):
     def test_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
         pipeline = BagelPipeline.__new__(BagelPipeline)
         pipeline.model_path = "must-not-be-resolved"
+        pipeline.memory_usages = {}
         transformer = _FakeTransformer()
         tokenizer = _FakeTokenizer()
         modules = {
@@ -492,6 +494,7 @@ class TestBagelLoaderContract(unittest.TestCase):
     def test_editing_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
         pipeline = BagelEditPipeline.__new__(BagelEditPipeline)
         pipeline.model_path = "must-not-be-resolved"
+        pipeline.memory_usages = {}
         modules = {
             "transformer": _FakeTransformer(),
             "vae": torch.nn.Identity(),
@@ -517,6 +520,7 @@ class TestBagelLoaderContract(unittest.TestCase):
     def test_thinking_fully_injected_modules_do_not_resolve_snapshot(self) -> None:
         pipeline = BagelThinkingPipeline.__new__(BagelThinkingPipeline)
         pipeline.model_path = "must-not-be-resolved"
+        pipeline.memory_usages = {}
         modules = {
             "transformer": _FakeTransformer(),
             "vae": torch.nn.Identity(),
