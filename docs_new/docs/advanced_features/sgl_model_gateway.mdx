@@ -1310,10 +1310,10 @@ Two-level caching for optimal performance:
 </table>
 
 ```bash Command
---enable-l0-cache \
---l0-max-entries 10000 \
---enable-l1-cache \
---l1-max-memory 52428800  # 50MB
+--tokenizer-cache-enable-l0 \
+--tokenizer-cache-l0-max-entries 10000 \
+--tokenizer-cache-enable-l1 \
+--tokenizer-cache-l1-max-memory 52428800  # 50MB
 ```
 
 ***
@@ -1932,7 +1932,7 @@ python -m sglang_router.launch_router \
   --worker-urls https://worker1:8443 https://worker2:8443 \
   --client-cert-path /path/to/client.crt \
   --client-key-path /path/to/client.key \
-  --ca-cert-path /path/to/ca.crt
+  --ca-cert-paths /path/to/ca.crt
 ```
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1956,7 +1956,7 @@ python -m sglang_router.launch_router \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to client private key for mTLS (PEM format)</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-path`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-paths`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to CA certificate for verifying worker TLS (PEM format, repeatable)</td>
     </tr>
   </tbody>
@@ -1964,7 +1964,7 @@ python -m sglang_router.launch_router \
 
 **Key Points:**
 - Client certificate and key must be provided together
-- Multiple CA certificates can be added with multiple `--ca-cert-path` flags
+- Multiple CA certificates can be added with multiple `--ca-cert-paths` flags
 - Uses rustls backend when TLS is configured
 - Single HTTP client is created for all workers (assumes single security domain)
 - TCP keepalive (30 seconds) is enabled for long-lived connections
@@ -1980,7 +1980,7 @@ python -m sglang_router.launch_router \
   --tls-key-path /etc/certs/server.key \
   --client-cert-path /etc/certs/client.crt \
   --client-key-path /etc/certs/client.key \
-  --ca-cert-path /etc/certs/ca.crt \
+  --ca-cert-paths /etc/certs/ca.crt \
   --api-key "secure-api-key" \
   --policy cache_aware
 ```
@@ -2154,7 +2154,7 @@ python -m sglang_router.launch_router \
   --tls-key-path /etc/certs/server.key \
   --client-cert-path /etc/certs/client.crt \
   --client-key-path /etc/certs/client.key \
-  --ca-cert-path /etc/certs/ca.crt \
+  --ca-cert-paths /etc/certs/ca.crt \
   --api-key "${ROUTER_API_KEY}"
 ```
 
@@ -2765,7 +2765,7 @@ groups:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Client private key for worker mTLS (PEM)</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-path`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-paths`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>CA certificate for verifying workers (PEM, repeatable)</td>
     </tr>
