@@ -125,7 +125,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
-    let (abort_tx, abort_rx) = flume::unbounded::<String>();
+    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
     // Shared with the api server: it admits a rid, ingress releases it once the
     // abort has actually been issued (see `Ingress::on_abort`).
     let live_rids = tokenizer_manager::LiveRids::default();

@@ -4,7 +4,7 @@
 //! `is_disconnected` abort).
 
 use crate::ids::RidHash;
-use crate::tokenizer_manager::Senders;
+use crate::tokenizer_manager::{AbortSource, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
@@ -79,7 +79,7 @@ impl Drop for AbortGuard {
         // stale abort.
         let aborted: Vec<String> = self.rids.drain(..).map(|(_, rid)| rid).collect();
         for rid in &aborted {
-            let _ = self.senders.abort.send(rid.clone());
+            let _ = self.senders.abort.send(AbortSource::Guard(rid.clone()));
         }
         // Disarmed rids finished naturally: no abort was sent for them, so nothing
         // downstream will ever release them.
@@ -99,7 +99,7 @@ impl Drop for AbortGuard {
 mod tests {
     use super::*;
 
-    fn senders_with_abort(abort: flume::Sender<String>) -> Senders {
+    fn senders_with_abort(abort: flume::Sender<AbortSource>) -> Senders {
         Senders {
             tm: flume::unbounded().0,
             abort,
@@ -144,7 +144,7 @@ mod tests {
             held.contains("aborted"),
             "an aborted rid stays held until on_abort has issued the deregister"
         );
-        assert_eq!(abort_rx.try_recv().unwrap(), "aborted");
+        assert!(matches!(abort_rx.try_recv().unwrap(), AbortSource::Guard(r) if r == "aborted"));
     }
 
     #[test]
@@ -157,7 +157,7 @@ mod tests {
             "r7".to_string(),
         ));
         assert!(
-            matches!(tm_rx.try_recv(), Ok(rid) if rid == "r7"),
+            matches!(tm_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == "r7"),
             "armed guard must abort its rid on drop",
         );
         assert!(tm_rx.try_recv().is_err(), "exactly one abort");
