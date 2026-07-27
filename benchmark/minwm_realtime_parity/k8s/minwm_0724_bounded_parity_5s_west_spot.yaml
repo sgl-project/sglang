@@ -1,15 +1,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: minwm-0724-bounded-parity-8keys-20260727-02
+  name: minwm-0724-prompt-switch-20260727-01
   namespace: default
   labels:
-    app.kubernetes.io/name: minwm-0724-bounded-parity-8keys-20260727-02
+    app.kubernetes.io/name: minwm-0724-prompt-switch-20260727-01
     seedleap.ai/task: minwm-realtime-parity
-    seedleap.ai/run-id: 0724-window18-sink9-5s-8keys-b200-attempt02
+    seedleap.ai/run-id: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
     seedleap.ai/owner: chenshengdong
   annotations:
-    seedleap.ai/sglang-git-ref: df58a83ca9c7e0003beda772e4a5151c0cefa6c4
+    seedleap.ai/sglang-git-ref: 294c224b487049d4c57951f2f62b03951b26043f
     seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
     seedleap.ai/checkpoint-version-id: Byk70ZwuVy96DMkNuwe_dAHTtvICQCcC
     seedleap.ai/capacity-type: spot
@@ -23,12 +23,12 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minwm-0724-bounded-parity-8keys-20260727-02
+        app.kubernetes.io/name: minwm-0724-prompt-switch-20260727-01
         seedleap.ai/task: minwm-realtime-parity
-        seedleap.ai/run-id: 0724-window18-sink9-5s-8keys-b200-attempt02
+        seedleap.ai/run-id: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
         seedleap.ai/owner: chenshengdong
       annotations:
-        seedleap.ai/sglang-git-ref: df58a83ca9c7e0003beda772e4a5151c0cefa6c4
+        seedleap.ai/sglang-git-ref: 294c224b487049d4c57951f2f62b03951b26043f
         seedleap.ai/minwm-git-ref: 0796bc201fae4c86f100620cb23402ae21c8f3b5
     spec:
       restartPolicy: Never
@@ -55,19 +55,19 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: df58a83ca9c7e0003beda772e4a5151c0cefa6c4
+              value: 294c224b487049d4c57951f2f62b03951b26043f
             - name: MINWM_GIT_REF
               value: 0796bc201fae4c86f100620cb23402ae21c8f3b5
             - name: MINWM_BENCHMARK_MODE
               value: bounded5s
             - name: MINWM_RUN_ID
-              value: 0724-window18-sink9-5s-8keys-b200-attempt02
+              value: 0724-window18-sink9-5s-prompt-switch-b200-attempt01
             - name: MINWM_REUSE_INPUT_RUN_ID
               value: 0724-window18-sink9-5s-b200-attempt01
             - name: MINWM_REUSE_MODEL_RUN_ID
               value: 0724-window18-sink9-5s-b200-attempt03
             - name: MINWM_CASES_PATH
-              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_action_controls_single_key_kv_roll_832x480.json
+              value: /workspace/sglang/benchmark/minwm_realtime_parity/cases_prompt_switch_kv_roll_832x480.json
             - name: MINWM_LOCAL_ATTN_SIZE
               value: "18"
             - name: MINWM_SINK_SIZE
