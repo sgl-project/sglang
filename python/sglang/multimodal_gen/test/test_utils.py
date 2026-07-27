@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "59f6c61d85393c9f60ff10b428ec314f04782eba"
+SGL_TEST_FILES_CI_DATA_REVISION = "6d689f4833e8c106ff0d853865f50496d1f2b453"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
@@ -105,6 +105,7 @@ _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
 _official_consistency_gt_outputs_cache: dict[str, frozenset[str]] | None = None
 CONSISTENCY_GT_CASE_ALIASES = {
+    "bagel_t2i": "zimage_image_t2i",
     "fsdp-inference": "zimage_image_t2i_2_gpus",
 }
 OFFICIAL_CONSISTENCY_GT_SKIP_CASES = frozenset(
@@ -1213,7 +1214,10 @@ def _load_official_consistency_gt_outputs() -> dict[str, frozenset[str]]:
 
 
 def _official_consistency_gt_outputs_for_case(case_id: str) -> frozenset[str]:
-    return _load_official_consistency_gt_outputs().get(case_id, frozenset())
+    canonical_case_id = get_consistency_gt_case_id(case_id)
+    return _load_official_consistency_gt_outputs().get(
+        canonical_case_id, frozenset()
+    )
 
 
 def _is_official_consistency_gt_base_url(base_url: str) -> bool:

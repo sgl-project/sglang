@@ -476,7 +476,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
 ]
 
 # The regular 1-GPU CUDA PR shard runs on H100 and compares against the pinned
-# official BAGEL output from ci-data-diffusion.
+# official Z-Image T2I output for the same CI prompt as a coarse semantic gate.
 if current_platform.is_cuda():
     ONE_GPU_CASES.append(
         DiffusionTestCase(
