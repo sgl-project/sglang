@@ -1069,9 +1069,18 @@ class EmbeddingGemmaModel(Gemma3ForCausalLM):
                     model_path, f"{spec['path']}/model.safetensors"
                 )
                 weights = load_file(weights_path, device="cpu")
-                layer.weight.data.copy_(weights["weight"].to(layer.weight.device))
+                weight_key = next(
+                    key
+                    for key in ("weight", "linear.weight", "dense.weight")
+                    if key in weights
+                )
+                layer.weight.data.copy_(weights[weight_key].to(layer.weight.device))
                 if layer.bias is not None:
-                    layer.bias.data.copy_(weights["bias"].to(layer.bias.device))
+                    layer.bias.data.copy_(
+                        weights[weight_key.replace("weight", "bias")].to(
+                            layer.bias.device
+                        )
+                    )
         return loaded_params
 
 
