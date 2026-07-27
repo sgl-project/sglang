@@ -1051,19 +1051,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
         return (k_buffer, v_buffer)
 
-    def _init_write_back_staging_buffers(self):
-        # Asymmetric K/V (head_dim != v_head_dim) has no JIT staged write-back
-        # path: jit_transfer_hicache_all_layer_staged_lf_pf assumes a single
-        # combined buffer with one shared stride, but K and V here live in two
-        # buffers with different strides. Disable the JIT flag so the controller
-        # moves host_indices to GPU (via move_hybrid_indices) and the non-JIT
-        # transfer_kv_all_layer_mla_lf_pf kernel receives CUDA dst_indices.
-        self.staging_page_capacity = 0
-        self.staging_token_capacity = 0
-        self.staging_k_buffer = None
-        self.staging_v_buffer = None
-        self.can_use_write_back_jit = False
-
     def _k_token_stride_size(self) -> int:
         return self.head_num * self.head_dim * self.dtype.itemsize
 
