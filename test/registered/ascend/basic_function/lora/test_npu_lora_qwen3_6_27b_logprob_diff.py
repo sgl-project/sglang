@@ -18,7 +18,7 @@ NPU regression test for Qwen3.6-27B LoRA logprob accuracy.
 
 Compares SGLang LoRA logprobs against reference training logprobs from a
 pre-computed dataset. The LoRA adapter and reference data are downloaded from:
-https://huggingface.co/datasets/opherlie/lora-test-case-Qwen3.5-4B
+https://huggingface.co/datasets/hitdogs/qwen3.6-27b-cybersecurity-lora
 
 Usage:
     python -m unittest test_npu_lora_qwen3_6_27b_logprob_diff
@@ -80,8 +80,6 @@ class TestLoRAQwen3_6_27BLogprobDiff(CustomTestCase):
             LORA_HF_REPO,
             repo_type="dataset",
         )
-
-        os.environ["SGLANG_SKIP_REMOTE_CODE_REGISTRATION"] = "true"
 
         engine = sgl.Engine(
             model_path=BASE_MODEL,
