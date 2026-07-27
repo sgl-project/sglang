@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -111,14 +113,39 @@ def write_player(results: Path, report: dict) -> None:
     template = (
         Path(__file__).with_name("sp_matrix_player.html").read_text(encoding="utf-8")
     )
-    placeholder = "__MINWM_SP_MATRIX_REPORT__"
-    if template.count(placeholder) != 1:
-        raise ValueError("SP player template must contain exactly one placeholder")
-    embedded = json.dumps(report, ensure_ascii=False).replace("</", "<\\/")
+    report_placeholder = "__MINWM_SP_MATRIX_REPORT__"
+    media_placeholder = "__MINWM_SP_MATRIX_MEDIA__"
+    if template.count(report_placeholder) != 1:
+        raise ValueError("SP player template must contain one report placeholder")
+    if template.count(media_placeholder) != 1:
+        raise ValueError("SP player template must contain one media placeholder")
+
+    media = {
+        "schema_version": 1,
+        "mime_type": "video/mp4",
+        "blobs": {},
+        "cases": {},
+    }
+    for case in report["cases"]:
+        case_sources = {}
+        case_dir = results / "cases" / case["id"]
+        for lane in report["lanes"]:
+            prefix = lane["prefix"]
+            data = (case_dir / f"{prefix}.mp4").read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            media["blobs"].setdefault(digest, base64.b64encode(data).decode("ascii"))
+            case_sources[prefix] = digest
+        media["cases"][case["id"]] = case_sources
+
+    embedded_report = json.dumps(report, ensure_ascii=False).replace("</", "<\\/")
+    embedded_media = json.dumps(media, separators=(",", ":"))
     player_dir = results / "player"
     player_dir.mkdir(exist_ok=True)
     (player_dir / "index.html").write_text(
-        template.replace(placeholder, embedded), encoding="utf-8"
+        template.replace(report_placeholder, embedded_report).replace(
+            media_placeholder, embedded_media
+        ),
+        encoding="utf-8",
     )
 
 

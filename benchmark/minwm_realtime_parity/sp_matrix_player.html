@@ -43,6 +43,9 @@
     .controls { margin-top: 14px; }
     .seek { flex: 1 1 300px; }
     .time { min-width: 110px; color: #aeb8ca; font-variant-numeric: tabular-nums; }
+    .media-status { min-height: 22px; margin: 10px 0 0; color: #aeb8ca; }
+    .media-status.ok { color: #87edc5; }
+    .media-status.error { color: #ff9eaa; }
     details { margin-top: 18px; color: #aeb8ca; }
     pre { overflow-x: auto; padding: 14px; border-radius: 10px; background: #080b10; }
     @media (max-width: 900px) {
@@ -90,12 +93,15 @@
         <input id="seek" class="seek" aria-label="同步进度" type="range" min="0" max="1" step="0.001" value="0">
         <span id="time" class="time">0:00 / 0:00</span>
       </div>
+      <p id="media-status" class="media-status" role="status" aria-live="polite">正在加载内嵌视频…</p>
       <details><summary>实测报告与输入</summary><pre id="details"></pre></details>
     </section>
   </main>
   <script id="report" type="application/json">__MINWM_SP_MATRIX_REPORT__</script>
+  <script id="media" type="application/json">__MINWM_SP_MATRIX_MEDIA__</script>
   <script>
     const report = JSON.parse(document.querySelector('#report').textContent);
+    const media = JSON.parse(document.querySelector('#media').textContent);
     const status = document.querySelector('#status');
     const metrics = document.querySelector('#metrics');
     const matrix = document.querySelector('#matrix');
@@ -106,9 +112,11 @@
     const seek = document.querySelector('#seek');
     const timeLabel = document.querySelector('#time');
     const playButton = document.querySelector('#play');
+    const mediaStatus = document.querySelector('#media-status');
     const caseItem = report.cases[0];
     const laneMap = new Map(report.lanes.map(lane => [lane.degree, lane]));
     const fps = report.contract.fps;
+    const blobUrls = new Map();
     const location = report.contract.location ? ` · ${report.contract.location}` : '';
     document.querySelector('#hardware').textContent = `${report.contract.hardware}${location}，同一 checkpoint、输入、seed 与 deterministic packed attention。默认一键同步播放 SP1 与 SP2。`;
 
@@ -126,7 +134,7 @@
       ? ''
       : sp2Delta > 0
         ? `当前 workload 的 SP2 client throughput 提升 ${fmt(sp2Delta, 2)}%。`
-        : `当前 workload 的 SP2 client throughput 没有提升，实测变化 ${fmt(sp2Delta, 2)}%；all-to-all 开销高于 attention 分片收益。`;
+        : `当前 workload 的 SP2 client throughput 没有提升，实测变化 ${fmt(sp2Delta, 2)}%；同步 all-to-all 与 layout copy 开销高于 sequence 分片省下的计算。`;
     [
       ['SP2 Client FPS', fmt(sp2?.performance.client_fps, 3)],
       ['SP2 加速比', `${fmt(sp2?.performance.client_speedup_vs_sp1, 3)}×`],
@@ -152,17 +160,78 @@
       }
     });
 
-    const casePath = `../cases/${encodeURIComponent(caseItem.id)}`;
-    referenceVideo.src = `${casePath}/sp1.mp4`;
+    const setMediaStatus = (message, kind='') => {
+      mediaStatus.textContent = message;
+      mediaStatus.className = `media-status ${kind}`.trim();
+    };
+    const videoSource = prefix => {
+      const digest = media.cases?.[caseItem.id]?.[prefix];
+      const encoded = digest && media.blobs?.[digest];
+      if (!encoded) {
+        throw new Error(`内嵌视频不存在：${caseItem.id}/${prefix}`);
+      }
+      if (!blobUrls.has(digest)) {
+        const binary = atob(encoded);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        blobUrls.set(
+          digest,
+          URL.createObjectURL(new Blob([bytes], {type: media.mime_type || 'video/mp4'})),
+        );
+      }
+      return blobUrls.get(digest);
+    };
+    const videoError = (label, video) => {
+      const code = video.error?.code;
+      const detail = video.error?.message || (code ? `MediaError code ${code}` : '未知媒体错误');
+      setMediaStatus(`${label} 加载失败：${detail}`, 'error');
+      playButton.disabled = true;
+    };
+    const updateMediaReadiness = () => {
+      if (
+        referenceVideo.readyState >= HTMLMediaElement.HAVE_METADATA
+        && candidateVideo.readyState >= HTMLMediaElement.HAVE_METADATA
+      ) {
+        setMediaStatus(
+          `视频已就绪：${formatTime(referenceVideo.duration)}，可一键同步播放。`,
+          'ok',
+        );
+        playButton.disabled = false;
+        sync(true);
+      }
+    };
+    referenceVideo.addEventListener('error', () => videoError('SP1', referenceVideo));
+    candidateVideo.addEventListener(
+      'error',
+      () => videoError(`SP${candidateSelect.value || 2}`, candidateVideo),
+    );
+    referenceVideo.addEventListener('loadedmetadata', updateMediaReadiness);
+    candidateVideo.addEventListener('loadedmetadata', updateMediaReadiness);
+
+    try {
+      referenceVideo.src = videoSource('sp1');
+      referenceVideo.load();
+    } catch (error) {
+      setMediaStatus(`SP1 加载失败：${error.message}`, 'error');
+      playButton.disabled = true;
+    }
     document.querySelector('#case-title').textContent = `${caseItem.id} · ${caseItem.keys.join('+')}`;
     document.querySelector('#details').textContent = JSON.stringify({contract: report.contract, case: caseItem, lanes: report.lanes}, null, 2);
 
     function loadCandidate() {
       const degree = Number(candidateSelect.value || 2);
       candidateLabel.textContent = `SP${degree} · Ulysses`;
-      candidateVideo.src = `${casePath}/sp${degree}.mp4`;
-      candidateVideo.load();
-      referenceVideo.currentTime = candidateVideo.currentTime = 0;
+      setMediaStatus(`正在加载 SP1 与 SP${degree} 内嵌视频…`);
+      playButton.disabled = true;
+      try {
+        candidateVideo.src = videoSource(`sp${degree}`);
+        candidateVideo.load();
+        referenceVideo.currentTime = candidateVideo.currentTime = 0;
+      } catch (error) {
+        setMediaStatus(`SP${degree} 加载失败：${error.message}`, 'error');
+      }
     }
     candidateSelect.value = '2';
     loadCandidate();
@@ -185,9 +254,17 @@
     }
     playButton.onclick = async () => {
       if (referenceVideo.paused) {
-        sync(true);
-        await Promise.all([referenceVideo.play(), candidateVideo.play()]);
-        playButton.textContent = '暂停两路视频';
+        try {
+          sync(true);
+          await Promise.all([referenceVideo.play(), candidateVideo.play()]);
+          playButton.textContent = '暂停两路视频';
+          setMediaStatus('SP1 与对比视频正在同步播放。', 'ok');
+        } catch (error) {
+          referenceVideo.pause();
+          candidateVideo.pause();
+          playButton.textContent = '一键播放两路视频';
+          setMediaStatus(`播放失败：${error.message || String(error)}`, 'error');
+        }
       } else {
         referenceVideo.pause();
         candidateVideo.pause();
@@ -201,6 +278,9 @@
     seek.oninput = () => seekBoth(Number(seek.value));
     document.querySelector('#prev').onclick = () => seekBoth(Number(seek.value) - 1 / fps);
     document.querySelector('#next').onclick = () => seekBoth(Number(seek.value) + 1 / fps);
+    window.addEventListener('unload', () => {
+      blobUrls.forEach(url => URL.revokeObjectURL(url));
+    });
   </script>
 </body>
 </html>

@@ -181,11 +181,26 @@ All SP2/SP4/SP8 generated uint8 frames are bitwise identical to SP1:
 `max_abs=0`, `RMSE=0`, `SSIM=1`, and `changed_value_fraction=0`. SP therefore
 passes the requested numerical-parity matrix, but it does **not** improve
 single-stream throughput for this workload. SP2 is 4.30% slower than SP1, while
-SP4 and SP8 are 4.40% and 4.92% slower. Ulysses only shards sequence attention
-and causal KV here; model weights, FFN, VAE, and output handling remain replicated
-or serial, so the all-to-all cost exceeds the attention saving. Per-GPU peak
-memory falls only 1.99% at SP2 and about 5.3% at SP4/SP8, while node-total memory
-increases with the number of replicas.
+SP4 and SP8 are 4.40% and 4.92% slower. The measured steady-stage medians explain
+the regression:
+
+| SP | DMD/DiT per chunk | VAE decode | Remaining scheduler time |
+| ---: | ---: | ---: | ---: |
+| 1 | 441.6 ms | 268.5 ms | 292.9 ms |
+| 2 | 505.6 ms | 268.5 ms | 280.8 ms |
+| 4 | 507.8 ms | 268.6 ms | 272.9 ms |
+| 8 | 512.6 ms | 268.5 ms | 270.8 ms |
+
+Sequence sharding is active across each transformer block, including local-token
+QKV, cross-attention, and FFN work. The current Ulysses path nevertheless runs a
+synchronous packed-QKV input all-to-all and reverse output all-to-all for every
+block and DMD forward. One chunk therefore executes `30 blocks × 4 forwards × 2`
+= 240 synchronous collectives, each surrounded by large layout/contiguous copies.
+That overhead is larger than the local-token compute saving on this B300 shape.
+VAE decode and RGB/output work also remain serial, but the measured regression
+itself is inside DMD/DiT rather than VAE. Per-GPU peak memory falls only 1.99% at
+SP2 and about 5.3% at SP4/SP8 because the model weights remain replicated, while
+node-total memory increases with the number of replicas.
 
 The copied local artifact is under
 `results/latest-checkpoint-sp-matrix-720p-b300-spot/sp-matrix-720p/`.
