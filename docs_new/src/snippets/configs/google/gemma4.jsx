@@ -104,7 +104,8 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --flush-cache`,
     accuracy: {
       gsm8k_pct:
 `# Chat-template harness (robust answer extraction for the reasoning-oriented variants)
@@ -113,7 +114,7 @@ python3 -m sglang.test.run_eval \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}}`,
     },
-    numPromptsByConc: { 1: 10, 100: 1000 },
+    numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
   // Per-hw image for the `docker run` framing. The legacy page pinned dedicated
@@ -123,7 +124,7 @@ python3 -m sglang.test.run_eval \\
   dockerImages: {
     h200:   "lmsysorg/sglang:dev-gemma-4-12B",
     b200:   "lmsysorg/sglang:dev-gemma-4-12B",
-    mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi300x: "lmsysorg/sglang:v0.5.16-rocm700-mi30x",
   },
 
   // Prefills the issue template's free-form `model` field on "Submit verified cell".
