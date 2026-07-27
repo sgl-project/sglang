@@ -34,8 +34,7 @@ sglang serve \\
   --model-path Tongyi-MAI/Z-Image-Turbo \\
   --tp-size 2 \\
   --sp-degree 1 \\
-  --num-gpus 2 \\
-  --port 30069`;
+  --num-gpus 2`;
       }
 
       return `sglang serve \\
