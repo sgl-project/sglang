@@ -262,14 +262,57 @@ print(json.dumps({
 }, sort_keys=True))
 PY
   mkdir -p "${DRAGON_RESULTS}"
-  python3 "${SCRIPT_DIR}/run_minwm_baseline.py" \
-    --cases "${DRAGON_CASES}" \
-    --minwm-root /workspace/minWM \
-    --checkpoint "${CHECKPOINT}" \
-    --pretrained-dir "${PRETRAINED}" \
-    --config "${MINWM_CONFIG}" \
-    --results "${DRAGON_RESULTS}" \
-    | tee "${RESULTS}/dragon60-baseline.log"
+  if python3 - "${DRAGON_CASES}" "${DRAGON_RESULTS}" \
+    "${MINWM_GIT_REF:-}" "${MINWM_CONFIG_SHA256:-}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+root = Path(sys.argv[2])
+run_path = root / "baseline_run.json"
+if not run_path.is_file():
+    raise SystemExit(1)
+run = json.loads(run_path.read_text())
+if sys.argv[3] and run["minwm_git_sha"] != sys.argv[3]:
+    raise SystemExit(1)
+if sys.argv[4] and run["config_sha256"] != sys.argv[4]:
+    raise SystemExit(1)
+expected_shape = (
+    int(manifest["contract"]["reference_pixel_frames"])
+    + int(manifest["contract"]["generated_pixel_frames"]),
+    int(manifest["contract"]["height"]),
+    int(manifest["contract"]["width"]),
+    3,
+)
+for case in manifest["cases"]:
+    case_dir = root / "cases" / case["id"]
+    required = [
+        case_dir / "baseline.npy",
+        case_dir / "baseline.mp4",
+        case_dir / "baseline.json",
+        case_dir / "baseline_latents.pt",
+    ]
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        raise SystemExit(1)
+    if np.load(required[0], mmap_mode="r", allow_pickle=False).shape != expected_shape:
+        raise SystemExit(1)
+print("MINWM_DRAGON60_RESUME baseline=valid")
+PY
+  then
+    echo "Skipping completed baseline after retry"
+  else
+    python3 "${SCRIPT_DIR}/run_minwm_baseline.py" \
+      --cases "${DRAGON_CASES}" \
+      --minwm-root /workspace/minWM \
+      --checkpoint "${CHECKPOINT}" \
+      --pretrained-dir "${PRETRAINED}" \
+      --config "${MINWM_CONFIG}" \
+      --results "${DRAGON_RESULTS}" \
+      | tee "${RESULTS}/dragon60-baseline.log"
+  fi
 
   MINWM_ATTENTION_IMPL=packed \
   MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
