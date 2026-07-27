@@ -477,16 +477,24 @@ class CommonKVManager(BaseKVManager):
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
         if bootstrap_addr in self.prefill_info_table:
-            if p2p_identical_layout:
-                self._resolve_rank_mapping(
-                    self.prefill_info_table[bootstrap_addr],
-                    p2p_identical_layout=True,
-                )
-            return True
+            cached_info = self.prefill_info_table[bootstrap_addr]
+            if p2p_identical_layout and cached_info.p2p_layout_fingerprint is None:
+                # Legacy Prefill->Decode discovery intentionally omits P2P-only
+                # metadata. Refresh it before reusing this entry for P2P.
+                del self.prefill_info_table[bootstrap_addr]
+            else:
+                if p2p_identical_layout:
+                    self._resolve_rank_mapping(
+                        cached_info,
+                        p2p_identical_layout=True,
+                    )
+                return True
 
         info: PrefillServerInfo = None
         try:
             url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+            if p2p_identical_layout:
+                url += "&include_p2p_metadata=1"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -1676,6 +1684,28 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         return web.Response(text="OK", status=200)
 
+    def _parallel_info_payload(self, *, include_p2p_metadata: bool) -> Dict:
+        info = PrefillServerInfo(
+            attn_tp_size=self.attn_tp_size,
+            attn_cp_size=self.attn_cp_size,
+            dp_size=self.dp_size,
+            pp_size=self.pp_size,
+            page_size=self.page_size,
+            kv_cache_dtype=self.kv_cache_dtype,
+            p2p_layout_fingerprint=self.p2p_layout_fingerprint,
+            follow_bootstrap_room=(
+                self.follow_bootstrap_room
+                if self.follow_bootstrap_room is not None
+                else True
+            ),
+            enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+            prefill_http_port=self.prefill_http_port,
+        )
+        payload = dataclasses.asdict(info)
+        if not include_p2p_metadata:
+            payload.pop("p2p_layout_fingerprint", None)
+        return payload
+
     async def _handle_route_get(self, request: web.Request):
         prefill_dp_rank = request.query.get("prefill_dp_rank")
         prefill_cp_rank = request.query.get("prefill_cp_rank")
@@ -1701,23 +1731,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     f" ({self._registered_count} workers registered).",
                     status=503,
                 )
-            info = PrefillServerInfo(
-                attn_tp_size=self.attn_tp_size,
-                attn_cp_size=self.attn_cp_size,
-                dp_size=self.dp_size,
-                pp_size=self.pp_size,
-                page_size=self.page_size,
-                kv_cache_dtype=self.kv_cache_dtype,
-                p2p_layout_fingerprint=self.p2p_layout_fingerprint,
-                follow_bootstrap_room=(
-                    self.follow_bootstrap_room
-                    if self.follow_bootstrap_room is not None
-                    else True
+            return web.json_response(
+                self._parallel_info_payload(
+                    include_p2p_metadata=(
+                        request.query.get("include_p2p_metadata") == "1"
+                    )
                 ),
-                enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
-                prefill_http_port=self.prefill_http_port,
+                status=200,
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
 
         if not self._is_ready():
             return web.Response(

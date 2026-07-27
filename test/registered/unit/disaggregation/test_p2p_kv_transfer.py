@@ -7,11 +7,18 @@ from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVSender,
+)
 from sglang.srt.disaggregation.p2p_kv_transfer import (
+    P2PTransferState,
+    PendingP2PTransfer,
     PrefillP2PMooncakeTransferEngine,
     _p2p_req_to_builtins,
     _P2PCacheIntegrityError,
@@ -265,6 +272,10 @@ class TestP2PKVTransferEngine(unittest.TestCase):
         self.assertIs(completed_req, req)
         self.assertTrue(output.success)
         self.assertEqual(output.transferred_tokens, 8)
+        sent_indices = _FakeSender.instances[0].sent[0][0]
+        self.assertIsInstance(sent_indices, np.ndarray)
+        self.assertEqual(sent_indices.dtype, np.int32)
+        self.assertTrue(sent_indices.flags.c_contiguous)
 
     def test_source_hicache_load_back_progresses_without_blocking_scheduler(self):
         class FinishEvent:
@@ -579,6 +590,28 @@ class TestP2PKVTransferEngine(unittest.TestCase):
             output, req
         )
 
+    def test_async_progress_preserves_cache_integrity_fail_stop(self):
+        scheduler = self._scheduler(_FakeKVManager(state_types=[]))
+        engine = PrefillP2PMooncakeTransferEngine(scheduler)
+        req = self._req()
+        engine._pending_transfers[req.request_id] = PendingP2PTransfer(
+            req=req,
+            role="target",
+            state=P2PTransferState.COMMIT,
+            deadline=10.0,
+            kv_manager=SimpleNamespace(),
+        )
+
+        with (
+            patch.object(
+                engine,
+                "_progress_target_transfer",
+                side_effect=_P2PCacheIntegrityError("insert exploded"),
+            ),
+            self.assertRaisesRegex(_P2PCacheIntegrityError, "insert exploded"),
+        ):
+            engine.progress_transfers()
+
     def test_receiver_poll_uses_tp_cp_consensus(self):
         scheduler = self._scheduler(_FakeKVManager(state_types=[]))
         scheduler.attn_tp_cpu_group = "tp-group"
@@ -667,6 +700,107 @@ class TestP2PKVTransferEngine(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "identical model and KV layouts"):
             manager._resolve_rank_mapping(info, p2p_identical_layout=True)
+
+    def test_bootstrap_parallel_info_hides_p2p_metadata_from_legacy_decode(self):
+        server = object.__new__(CommonKVBootstrapServer)
+        server.attn_tp_size = 2
+        server.attn_cp_size = 1
+        server.dp_size = 1
+        server.pp_size = 2
+        server.page_size = 64
+        server.kv_cache_dtype = "fp8_e4m3"
+        server.p2p_layout_fingerprint = "layout-v1"
+        server.follow_bootstrap_room = True
+        server.enable_dsa_cache_layer_split = False
+        server.prefill_http_port = 30000
+
+        legacy_payload = server._parallel_info_payload(include_p2p_metadata=False)
+        p2p_payload = server._parallel_info_payload(include_p2p_metadata=True)
+
+        self.assertNotIn("p2p_layout_fingerprint", legacy_payload)
+        self.assertEqual(p2p_payload["p2p_layout_fingerprint"], "layout-v1")
+
+    def test_p2p_parallel_info_query_explicitly_requests_layout_metadata(self):
+        manager = object.__new__(CommonKVManager)
+        manager.prefill_info_table = {}
+        manager.kv_args = SimpleNamespace(page_size=64)
+        manager._resolve_rank_mapping = MagicMock()
+        response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "attn_tp_size": 1,
+                "attn_cp_size": 1,
+                "dp_size": 1,
+                "pp_size": 1,
+                "page_size": 64,
+                "kv_cache_dtype": "fp8_e4m3",
+                "follow_bootstrap_room": True,
+                "p2p_layout_fingerprint": "layout-v1",
+            },
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.requests.get",
+                return_value=response,
+            ) as get,
+            patch(
+                "sglang.srt.disaggregation.common.conn.get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="fp8_e4m3"),
+            ),
+        ):
+            self.assertTrue(
+                manager.try_ensure_parallel_info(
+                    "127.0.0.1:8998", p2p_identical_layout=True
+                )
+            )
+
+        self.assertIn("include_p2p_metadata=1", get.call_args.args[0])
+
+    def test_p2p_parallel_info_refetches_legacy_cached_entry(self):
+        manager = object.__new__(CommonKVManager)
+        manager.prefill_info_table = {
+            "127.0.0.1:8998": SimpleNamespace(p2p_layout_fingerprint=None)
+        }
+        manager.kv_args = SimpleNamespace(page_size=64)
+        manager._resolve_rank_mapping = MagicMock()
+        response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "attn_tp_size": 1,
+                "attn_cp_size": 1,
+                "dp_size": 1,
+                "pp_size": 1,
+                "page_size": 64,
+                "kv_cache_dtype": "fp8_e4m3",
+                "follow_bootstrap_room": True,
+                "p2p_layout_fingerprint": "layout-v1",
+            },
+        )
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.requests.get",
+                return_value=response,
+            ) as get,
+            patch(
+                "sglang.srt.disaggregation.common.conn.get_model",
+                return_value=SimpleNamespace(kv_cache_dtype="fp8_e4m3"),
+            ),
+        ):
+            self.assertTrue(
+                manager.try_ensure_parallel_info(
+                    "127.0.0.1:8998", p2p_identical_layout=True
+                )
+            )
+
+        get.assert_called_once()
+        self.assertEqual(
+            manager.prefill_info_table["127.0.0.1:8998"].p2p_layout_fingerprint,
+            "layout-v1",
+        )
 
     def test_p2p_sender_forces_nonzero_cp_rank_without_changing_pd_default(self):
         class Manager:
@@ -1677,6 +1811,19 @@ class TestP2PKVTransferEngine(unittest.TestCase):
         )
 
         self.assertEqual(state_indices, [[8, 9]])
+
+    def test_backend_page_indices_are_contiguous_numpy_int32(self):
+        engine = PrefillP2PMooncakeTransferEngine(
+            self._scheduler(_FakeKVManager(state_types=[]))
+        )
+        source = torch.tensor([8, 12, 16, 20], dtype=torch.int64)[::2]
+
+        indices = engine._backend_page_indices(source)
+
+        self.assertIsInstance(indices, np.ndarray)
+        self.assertEqual(indices.dtype, np.int32)
+        self.assertTrue(indices.flags.c_contiguous)
+        self.assertEqual(indices.tolist(), [8, 16])
 
 
 if __name__ == "__main__":

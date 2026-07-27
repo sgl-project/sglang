@@ -66,13 +66,14 @@ class PPBatchMetadata:
 
 class SchedulerPPMixin:
     def _pp_stage_p2p_control_reqs(self, recv_reqs):
-        """Stage blocking P2P controls without reordering PP message streams.
+        """Stage ordered P2P controls without reordering PP message streams.
 
         A non-last stage forwards the complete receive batch through the normal
         request stream, but delays local handling until its next PP iteration.
         The last stage handles the batch immediately.  This lets downstream PP
-        stages reach P2P collectives without injecting an out-of-order send into
-        the tagless PD bootstrap/release streams.
+        stages enter the same asynchronous P2P state transitions without
+        injecting an out-of-order send into the tagless PD bootstrap/release
+        streams.
         """
         pending_reqs = getattr(self, "_pending_p2p_control_reqs", [])
         if self.pp_group.is_last_rank:

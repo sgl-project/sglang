@@ -4152,11 +4152,9 @@ class Scheduler(
             recv_req.reason,
         )
         limitations = [
-            "experimental_prefill_to_prefill_mooncake",
-            "identical_tp_pp_layout_supported",
-            "identical_distributed_layout_supported",
-            "tp_pp_mismatch_falls_back_to_recompute",
-            "same_model_same_page_size_required",
+            "identical_model_and_kv_layout_required",
+            "identical_tp_cp_pp_layout_required",
+            "same_page_size_required",
             "failure_falls_back_to_recompute",
         ]
         server_args = getattr(self, "server_args", None)
@@ -4225,7 +4223,7 @@ class Scheduler(
         if recv_req.dry_run:
             return P2PKVTransferReqOutput(
                 success=True,
-                message="remote KV transfer dry-run accepted for experimental P2P Mooncake path.",
+                message="remote KV transfer dry-run accepted.",
                 source_url=recv_req.source_url,
                 target_url=recv_req.target_url,
                 matched_tokens=recv_req.matched_tokens,

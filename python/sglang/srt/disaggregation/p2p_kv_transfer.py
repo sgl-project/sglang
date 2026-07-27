@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+import numpy as np
 import requests
 import torch
 
@@ -153,7 +154,7 @@ class _TargetRegistrationResult:
 
 
 class PrefillP2PMooncakeTransferEngine:
-    """Narrow experimental Prefill->Prefill Mooncake transfer path.
+    """Prefill-to-Prefill Mooncake transfer path.
 
     This intentionally supports only identical-layout Prefill pairs. The target
     Prefill allocates destination KV slots and optional model state, then asks the source
@@ -390,6 +391,17 @@ class PrefillP2PMooncakeTransferEngine:
                     if pending.role == "source"
                     else self._progress_target_transfer(pending)
                 )
+            except _P2PCacheIntegrityError:
+                # Cache insertion transfers allocator ownership. Once that
+                # settlement becomes uncertain, recompute is not a safe
+                # recovery path: terminate the scheduler group so every rank
+                # restarts from a consistent allocator/cache state.
+                logger.exception(
+                    "p2p_target_cache_integrity_error: request_id=%s role=%s",
+                    pending.req.request_id,
+                    pending.role,
+                )
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "p2p_transfer_progress_failed: request_id=%s role=%s",
@@ -589,7 +601,9 @@ class PrefillP2PMooncakeTransferEngine:
                     pending.kv_manager, page_indices, mamba_index
                 )
                 pending.receiver.send_metadata(
-                    page_indices, aux_index=0, state_indices=state_indices
+                    self._backend_page_indices(page_indices),
+                    aux_index=0,
+                    state_indices=state_indices,
                 )
                 metadata_ok = pending.receiver.poll() != KVPoll.Failed
             except Exception as exc:  # noqa: BLE001
@@ -1007,7 +1021,10 @@ class PrefillP2PMooncakeTransferEngine:
             state_indices = self._state_indices_for_pages(
                 pending.kv_manager, src_pages, mamba_index
             )
-            pending.sender.send(src_pages, state_indices=state_indices)
+            pending.sender.send(
+                self._backend_page_indices(src_pages),
+                state_indices=state_indices,
+            )
             pending.state = P2PTransferState.TRANSFERRING
             return None
 
@@ -1065,11 +1082,9 @@ class PrefillP2PMooncakeTransferEngine:
 
     def _limitations(self):
         return [
-            "experimental_prefill_to_prefill_mooncake",
-            "identical_tp_pp_layout_supported",
-            "identical_distributed_layout_supported",
-            "tp_pp_mismatch_falls_back_to_recompute",
-            "same_model_same_page_size_required",
+            "identical_model_and_kv_layout_required",
+            "identical_tp_cp_pp_layout_required",
+            "same_page_size_required",
             "failure_falls_back_to_recompute",
         ]
 
@@ -1368,6 +1383,13 @@ class PrefillP2PMooncakeTransferEngine:
             indices = indices.tolist()
         return [int(x) for x in indices]
 
+    @staticmethod
+    def _backend_page_indices(indices) -> np.ndarray:
+        """Normalize page indices to the disaggregation backend contract."""
+        if torch.is_tensor(indices):
+            indices = indices.detach().cpu().numpy()
+        return np.ascontiguousarray(indices, dtype=np.int32)
+
     def _state_indices_for_pages(
         self, kv_manager, page_indices, mamba_index: int | None
     ):
@@ -1538,7 +1560,9 @@ class PrefillP2PMooncakeTransferEngine:
         metadata_error = None
         try:
             receiver.send_metadata(
-                page_indices, aux_index=0, state_indices=state_indices
+                self._backend_page_indices(page_indices),
+                aux_index=0,
+                state_indices=state_indices,
             )
         # Backend implementations can raise different exception types; convert
         # all of them into the same rank-consensus failure result.
@@ -1935,7 +1959,10 @@ class PrefillP2PMooncakeTransferEngine:
                 self._state_type_names(kv_manager),
                 state_indices,
             )
-            sender.send(src_pages, state_indices=state_indices)
+            sender.send(
+                self._backend_page_indices(src_pages),
+                state_indices=state_indices,
+            )
             deadline = time.monotonic() + self._TRANSFER_TIMEOUT_S
             while time.monotonic() < deadline:
                 poll = sender.poll()
