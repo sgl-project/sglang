@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -15,9 +13,9 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 class HelionKDAKernel(LinearAttnKernelBase):
     """KDA packed decode and prefill implemented with Helion kernels.
 
-    Triton remains the fallback for the generic decode interface and speculative
-    target verification. The one-token decode path uses :meth:`packed_decode`,
-    while prefill uses :meth:`extend`.
+    The generic decode interface delegates to Triton, and the dispatcher routes
+    speculative target verification directly to Triton. The one-token decode
+    path uses :meth:`packed_decode`, while prefill uses :meth:`extend`.
     """
 
     supports_packed_decode = True
@@ -57,6 +55,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        lower_bound: float | None = None,
         **kwargs,
     ) -> torch.Tensor:
         assert self._packed_decode is not None
@@ -78,6 +77,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
                 cache_indices=cache_indices,
                 num_v_heads=num_v_heads,
                 head_v_dim=head_v_dim,
+                lower_bound=lower_bound,
                 **kwargs,
             )
 
@@ -98,6 +98,7 @@ class HelionKDAKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         return out.transpose(0, 1)
 
@@ -130,9 +131,6 @@ class HelionKDAKernel(LinearAttnKernelBase):
             **kwargs,
         )
 
-    def target_verify(self, *args, **kwargs) -> torch.Tensor:
-        return self._triton.target_verify(*args, **kwargs)
-
     def extend(
         self,
         q: torch.Tensor,
@@ -144,9 +142,9 @@ class HelionKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        A_log: Optional[torch.Tensor] = None,
-        dt_bias: Optional[torch.Tensor] = None,
-        lower_bound: Optional[float] = None,
+        A_log: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        lower_bound: float | None = None,
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
