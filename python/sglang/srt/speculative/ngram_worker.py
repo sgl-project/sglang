@@ -329,17 +329,39 @@ class NGRAMWorker(BaseSpecWorker):
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK and not _is_cpu:
-            draft_mask = (
-                torch.from_numpy(mask)
-                .to(device=self.device, dtype=torch.bool, non_blocking=True)
-                .reshape(bs, self.draft_token_num, self.draft_token_num)
-                .contiguous()
+            D = self.draft_token_num
+            draft_mask = tree_mask.view(bs, D, D)
+
+            assert (
+                batch.seq_lens_cpu is not None
+            ), "NGRAM FULL_MASK requires batch.seq_lens_cpu"
+
+            tree_mask_buf, _ = (
+                self.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
             )
-            tree_mask = build_ngram_full_tree_mask(
+
+            host_seq_lens_sum = (
+                int(batch.seq_lens_sum)
+                if batch.seq_lens_sum is not None
+                else int(batch.seq_lens_cpu.sum().item())
+            )
+            exact = D * host_seq_lens_sum + D * D * bs
+
+            seq = batch.seq_lens.to(dtype=torch.int32)
+            sizes = D * (seq + D)
+            offsets = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            if bs > 1:
+                torch.cumsum(sizes[:-1], dim=0, out=offsets[1:])
+
+            out = build_ngram_full_tree_mask(
                 draft_mask,
-                batch.seq_lens_cpu,
-                self.draft_token_num,
+                seq,
+                offsets,
+                D,
+                required_numel=exact,
+                tree_mask_buf=tree_mask_buf,
             )
+            tree_mask = out[:exact]
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens

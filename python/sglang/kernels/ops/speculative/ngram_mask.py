@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -15,7 +17,7 @@ def build_ngram_full_tree_mask_ref(
     bs, d1, d2 = draft_mask.shape
     assert d1 == d2 == draft_token_num
     device = draft_mask.device
-    seq_lens_list = seq_lens.tolist()
+    seq_lens_list = seq_lens.detach().cpu().tolist()
 
     pieces = []
     for i in range(bs):
@@ -32,7 +34,7 @@ def build_ngram_full_tree_mask_ref(
 def _build_ngram_full_tree_mask_kernel(
     draft_mask_ptr,  # (bs, D, D) bool/uint8, contiguous
     seq_lens_ptr,  # (bs,) int32
-    offsets_ptr,  # (bs,) int32, start of each req in out
+    offsets_ptr,  # (bs,) int32 — exclusive prefix sum
     out_ptr,  # (total,) bool/uint8
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -46,7 +48,7 @@ def _build_ngram_full_tree_mask_kernel(
     row_width = seq_len + D
     row_base = offset + rid * row_width
 
-    # ---- left: history visible (all True) ----
+    # history: all True
     cols = tl.arange(0, BLOCK_S)
     for start in tl.range(0, seq_len, BLOCK_S):
         c = start + cols
@@ -56,7 +58,7 @@ def _build_ngram_full_tree_mask_kernel(
             mask=c < seq_len,
         )
 
-    # ---- right: draft_mask[bid, rid, :] ----
+    # draft block
     dcols = tl.arange(0, BLOCK_D)
     in_range = dcols < D
     vals = tl.load(
@@ -74,45 +76,56 @@ def _build_ngram_full_tree_mask_kernel(
 def build_ngram_full_tree_mask(
     draft_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    offsets: torch.Tensor,
     draft_token_num: int,
     *,
+    required_numel: int,
+    tree_mask_buf: Optional[torch.Tensor] = None,
     block_s: int = 128,
 ) -> torch.Tensor:
-    """Build flattened FULL custom_mask for an ngram verify batch.
+    """Build a flattened FULL custom mask.
 
-    Args:
-        draft_mask: (bs, D, D) bool CUDA tensor. draft-to-draft visibility.
-        seq_lens: (bs,) int tensor (CPU or CUDA). history length per req.
-        draft_token_num: D.
-        block_s: Triton block size for the history fill loop.
+    Caller provides:
+    - ``seq_lens``: GPU sequence lengths, shape ``(bs,)``.
+    - ``offsets``: GPU exclusive prefix sum of
+        ``D * (seq_lens[b] + D)``, shape ``(bs,)``.
+    - ``required_numel``: exact number of valid output elements.
+    - ``tree_mask_buf``: optional preallocated output buffer.
 
     Returns:
-        (total,) bool CUDA tensor, total = sum_b D * (seq_lens[b] + D).
+        A flattened output buffer. If ``tree_mask_buf`` is provided,
+        the returned tensor may be larger than ``required_numel``.
     """
     if draft_mask.numel() == 0:
+        if tree_mask_buf is not None:
+            return tree_mask_buf
         return torch.empty(0, dtype=torch.bool, device=draft_mask.device)
 
-    assert draft_mask.is_cuda, "draft_mask must be on CUDA"
-    assert draft_mask.dim() == 3, draft_mask.shape
-    bs, d1, d2 = draft_mask.shape
-    assert d1 == d2 == draft_token_num, (draft_mask.shape, draft_token_num)
-    assert seq_lens.numel() == bs, (seq_lens.shape, bs)
+    assert (
+        draft_mask.dim() == 3
+        and draft_mask.shape[1] == draft_mask.shape[2] == draft_token_num
+    ), draft_mask.shape
+    bs = draft_mask.shape[0]
 
-    device = draft_mask.device
-    # Kernel loads bytes; bool is 1-byte. Force contiguous bool.
     draft_mask = draft_mask.to(dtype=torch.bool).contiguous()
-    seq = seq_lens.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
+    seq = seq_lens.to(dtype=torch.int32).contiguous()
+    offsets = offsets.to(dtype=torch.int32).contiguous()
 
-    # sizes[b] = D * (seq_lens[b] + D)
-    sizes = draft_token_num * (seq + draft_token_num)
-    offsets = torch.empty(bs, dtype=torch.int32, device=device)
-    offsets[0] = 0
-    if bs > 1:
-        torch.cumsum(sizes[:-1], dim=0, out=offsets[1:])
+    if tree_mask_buf is None:
+        out = torch.empty(
+            required_numel,
+            dtype=torch.bool,
+            device=draft_mask.device,
+        )
+    else:
+        assert tree_mask_buf.numel() >= required_numel, (
+            tree_mask_buf.shape,
+            required_numel,
+        )
+        assert tree_mask_buf.dtype in (torch.bool, torch.uint8), tree_mask_buf.dtype
+        out = tree_mask_buf.contiguous()
 
-    total = int(sizes.sum().item())
-    out = torch.empty(total, dtype=torch.bool, device=device)
-
+    block_s = triton.next_power_of_2(max(1, block_s))
     block_d = triton.next_power_of_2(draft_token_num)
     grid = (bs, draft_token_num)
     _build_ngram_full_tree_mask_kernel[grid](
