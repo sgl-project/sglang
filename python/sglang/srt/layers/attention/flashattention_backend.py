@@ -1192,7 +1192,18 @@ class FlashAttentionBackend(AttentionBackend):
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        causal = not (
+            layer.is_cross_attention
+            or layer.attn_type
+            in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+        )
+        # FlashAttention's sliding-window tuple is (left, right). Bidirectional
+        # encoder layers must see the same local context on both sides.
+        window_size = (
+            (layer.sliding_window_size, 0 if causal else layer.sliding_window_size)
+            if is_swa_layer
+            else (-1, -1)
+        )
         fa_k_descale, fa_v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1211,10 +1222,6 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
-            causal = False
-
         # Check if we should use local attention
         use_local_attn = (
             self.has_local_attention
