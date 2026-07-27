@@ -162,6 +162,15 @@ class TestScoreAndPool(CustomTestCase):
         expected = self.score_head(pooled)
         torch.testing.assert_close(out.embeddings, expected)
 
+    def test_mean_pooling_respects_packed_sequence_boundaries(self):
+        hidden = torch.tensor([[1.0], [3.0], [7.0], [9.0], [11.0]])
+        fb = _make_forward_batch(extend_seq_lens=[2, 3])
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+
+        pooled = pooler(hidden, fb).embeddings
+
+        torch.testing.assert_close(pooled, torch.tensor([[2.0], [9.0]]))
+
     def test_empty_delimiter_indices(self):
         """Empty delimiter tensor per request -> returns list with empty tensor."""
         input_ids = torch.arange(6)

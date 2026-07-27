@@ -1,0 +1,405 @@
+---
+title: Kimi-K3
+description: "Deploy Moonshot AI's Kimi-K3 with SGLang — a 2.8T-parameter hybrid Mixture-of-Experts vision-language model (Kimi Delta Attention + MLA, 16/896 active experts) with NVIDIA and AMD recipes."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install).
+
+<Tabs>
+
+<Tab title="Docker">
+
+```bash Command
+docker pull lmsysorg/sglang:kimi-k3 # CUDA13
+docker pull lmsysorg/sglang:kimi-k3-cu12 # CUDA12
+docker pull lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727 # ROCM
+```
+
+These tags publish with the public K3 launch; until then, build from the Dockerfiles linked below.
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+If you do not want to use a Docker image, reproduce the dependency installation steps from the [CUDA 13 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu13.Dockerfile) or [CUDA 12 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu12.Dockerfile).
+
+</Accordion>
+
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
+
+**PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#pd-disaggregation)); `Prefill` ships two strategies on the TP8 platforms, both chunked at 16k: `Default` (TP8) and `Long-Context` (`--pp-size 8 --tp-size 1`, see [Deep PP](#deep-pp-for-long-context-prefill)).
+
+**Strategy** — the operating point within that shape:
+
+- **Low-Latency** — plain TP, no DCP. For chat.
+- **Balanced** — the accuracy-preserving default: TP16/DCP16 on B200/GB200, TP8/DCP8 on B300/GB300, TP8 ROCm/AITER on MI35x.
+- **High-Throughput** — the large-scale lane: pick a **Cluster Size** and **Large-Scale Preset** in the Playground ([details](#large-scale-presets)). On H100/H200: Balanced plus `extra_buffer_lazy`.
+- **Long-Context** — B200 only: TP8/PP2 splits KV and KDA state across two pipeline stages.
+
+**Spec Decode** — independent of the strategy: DSPARK layers onto any `pp_size == 1` recipe, proposing 7 draft tokens per step (tune in the Playground); DFLASH has no published draft checkpoint. Its win is largest on short interactive traffic and fades as the prompt grows.
+
+<Note>
+`--mamba-full-memory-ratio` is the one sizing flag, computed live: set your average request length in the [Mamba ratio calculator](#mamba-ratio-calculator); everything else follows the panels, and the result is pinned into the command.
+</Note>
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/moonshotai/kimi-k3.jsx";
+import { benchmarks } from "/src/snippets/configs/moonshotai/kimi-k3-benchmarks.jsx";
+import { KimiK3MambaRatioCalculator } from "/src/snippets/_kimi_k3_mamba_ratio_calculator.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+### Mamba ratio calculator
+
+<KimiK3MambaRatioCalculator />
+
+<Accordion title="How --mamba-full-memory-ratio is calculated">
+
+`--mamba-full-memory-ratio` is the ratio between the KDA state pool and the MLA KV pool. Every parameter below except `L` is read live from the Deploy panel and Playground selection; the balanced value is the per-request cost ratio:
+
+```text
+ratio = (S + D) x state_bytes / (L x (mla_kv_bytes / DCP + draft_kv_bytes))
+```
+
+- `S` — KDA state slots per request: `extra_buffer=5`, `extra_buffer_lazy=4`, `no_buffer=3`, disabled radix cache `=1`. `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` frees one slot on the extra-buffer strategies; with the overlap scheduler off (or `pp > 1`, which disables it) the track buffer costs one slot instead of two.
+- `D` — verify intermediate states under speculative decoding: `0` when disabled, otherwise DSPARK block size + 1 (`8` at the default 7). ReplaySSM (`--enable-linear-replayssm-spec`) folds them into a per-slot ring, returning `D` to `0`.
+- `state_bytes` — one state slot's bytes, from K3's fixed geometry, the attention-TP width, and the SSM dtype.
+- `mla_kv_bytes` — one token's MLA latent KV bytes (KV-dtype dependent); DCP shards it across its ranks. The DSPARK draft model's KV (~1.4 KB per token) is replicated on every rank, so it enters flat — negligible without DCP, the same order as the sharded MLA share under DCP8.
+- `L` — average total request length in tokens: input + output.
+
+</Accordion>
+
+<a id="playground" style={{ scrollMarginTop: "96px" }} />
+
+## Advanced Features Playground
+
+The Playground is where you experiment with **SGLang features beyond the deployment matrix**. The Deploy panel above emits the recipes the SGLang team is converging on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Kimi-K3** is Moonshot AI's flagship hybrid MoE vision-language model: **2.8 trillion parameters**, **16 of 896 experts** active per token, roughly **2.5× the scaling efficiency of Kimi-K2**. The backbone interleaves **Kimi Delta Attention (KDA)** with MLA across 93 layers (plus Attention Residuals and Stable LatentMoE); serving supports image input and a **1M-token** window with prefix caching. Weights ship in **MXFP4**: the FlashInfer MXFP4 (trtllm-gen SiTU) runner serves them on Blackwell, Marlin (W4A16) elsewhere, MegaMoE for short-context batch throughput.
+
+K3 **always runs with thinking enabled**, with reasoning depth controlled by `reasoning_effort` (`low` / `high` / `max`; default `max`).
+
+<Note>
+Kimi-K3 is Moonshot AI's first open-source model in the trillion-plus class; **full model weights
+are scheduled to release by July 27, 2026**. The recipes on this page were validated on the public
+[`sgl-project/sglang` `kimi-k3` branch](https://github.com/sgl-project/sglang/tree/kimi-k3) — the HuggingFace
+repository (`moonshotai/Kimi-K3`) and a public `lmsysorg/sglang` image with K3 support will be
+available at launch.
+
+Every cell on this page is currently marked **Not Verified**: the recipes run, but none has a
+serving round on the final weights and current code behind it. Re-measure throughput and accuracy
+before you rely on any of them.
+</Note>
+
+**Recommended generation:** `temperature=1.0`, `top_p=0.95`, `presence_penalty=0`, `frequency_penalty=0` (fixed by the model; informational — do not hardcode in sample code).
+
+**Resources:** [HuggingFace](https://huggingface.co/moonshotai/Kimi-K3) · [Kimi-K3 Quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart).
+
+## 2. Configuration Tips
+
+**Memory: two pools, one flag.** K3 splits static memory into a worst-case-reserved **KDA state pool** (it sets the concurrency ceiling) and a paged **MLA KV pool**, divided by `--mamba-full-memory-ratio`. The command panel pins that flag to the [calculator](#mamba-ratio-calculator)'s output — set your average request length there; every other calculator input follows the panels. After boot, read back `max_total_num_tokens` (the KV side) and the admitted-request cap (the state side).
+
+Capacity levers, all in the Playground. Each trades precision or cache behavior for capacity — re-verify accuracy on your workload:
+
+| Lever | Effect |
+|---|---|
+| `--mamba-radix-cache-strategy extra_buffer_lazy` | 4 state slots per request instead of 5 |
+| `--mamba-ssm-dtype bfloat16` | ~halves state bytes; with spec on, KDA verification falls back from the fused kernel to Triton |
+| `--kv-cache-dtype fp8_e4m3` | halves KV bytes per token; under PD both roles must match at connect |
+| `--mem-fraction-static` 0.90–0.92 | cheapest first win when the boot log shows a large idle `avail mem` |
+| `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` | frees one more slot per request (experimental, under validation) |
+
+Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request — the calculator folds this in — and an unset `--max-running-requests` resets to 48 under spec (the command panel reminds you; set it explicitly to raise).
+
+**MoE runner.** Leave `--moe-runner-backend` unset on Blackwell: FlashInfer MXFP4 (W4A8, prebuilt trtllm-gen SiTU kernels) when the cubin pool is installed, Marlin (W4A16) otherwise; H100/H200 pin Marlin. The published Docker images already provision the **SiTU cubin pool**; to install it independently, run the same flow as the Dockerfile:
+
+```bash
+wget https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip
+sudo mkdir -p /opt/trtllm_gen_moe_cubin_pool
+sudo unzip -q trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip -d /opt/trtllm_gen_moe_cubin_pool
+export SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/opt/trtllm_gen_moe_cubin_pool/trtllm_gen_moe_cubin_pool_20260617_v0613rc1
+```
+
+Remaining kernel sources JIT once from the public `flashinfer` wheel (a few minutes, cached).
+
+**Attention backend.** Leave all three attention knobs unset on Blackwell: K3 resolves prefill, decode, and — under DSPARK — verification as a set (`trtllm_mla` across the board; `cutedsl_mla` takes decode and verification under DCP). On the non-DCP recipes, setting any one of the three cancels the auto-resolution for the others. H100/H200 pin `flashmla` for decode.
+
+**Context length.** `--context-length` bounds the longest accepted request plus some context-scaled buffers; it does not size the KV pool. For long context the lever that adds capacity is `fp8_e4m3` KV.
+
+**DSPARK.** Adds `--speculative-algorithm DSPARK` plus the draft checkpoint on top of the showing strategy. Leave `--speculative-draft-attention-backend` unset. No serving round on the final draft checkpoint has landed — measure against the same recipe running NOSPEC before adopting.
+
+**Per-platform notes:**
+
+| Platform | Topology | Notes |
+|---|---|---|
+| B300 1×8 | TP8 (+DCP8) | accuracy-first defaults on Low-Latency and Balanced |
+| GB300 2×4 | TP8/DCP8 | MNNVL transport and cuMem auto-detected |
+| B200 2×8 | TP16 (+DCP16); Long-Context TP8/PP2, 128K ctx, 8192 chunked prefill | DSPARK off on Long-Context (`pp_size == 1` required) |
+| GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
+| H200 2×8 | TP16/EP16 + symm-mem | same block on both ranks; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
+| H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
+| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention, graph bs up to 256; DSPARK supported |
+
+**DCP notes** (Blackwell Balanced / High-Throughput):
+
+- DCP is the only axis that shards the TP-replicated MLA KV; Low-Latency skips it.
+- Leave `--dcp-comm-backend` unset (fabric-resolved: `fi_a2a` on GB200/GB300, `a2a` on B200/B300).
+- No `--enable-symm-mem` under DCP (force-disabled for decode-graph correctness).
+- Explicit `tokenspeed_mla` force-rewrites `--kv-cache-dtype` to fp8; the default `cutedsl_mla` serves either dtype.
+- Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.
+- Don't add EP — its a2a buffers reclaim the KV that DCP buys. Compose only to measure.
+
+No cell has a serving round in this exact shape — treat them as starting points to verify.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+K3 always thinks; the `kimi_k3` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) separates that thinking from the final answer — thinking lands in `message.reasoning_content`, the answer in `message.content`. Control the reasoning depth with `reasoning_effort` (`low` / `high` / `max`; default `max`).
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="high",  # "low" | "high" | "max" (default max)
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.2 Tool Calling
+
+Enable the `kimi_k3` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. Because K3 is a thinking model, the follow-up turn may put text in `reasoning_content` as well as `content` — print both.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update...
+```
+
+</Accordion>
+
+### 3.3 HiCache (Hierarchical KV Caching)
+
+K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1 (GPU) / L2 (host) / L3 (Mooncake) — enable it from the **HiCache** card in the [Playground above](#playground) for long multi-turn workloads.
+
+- On the DCP recipes (Blackwell Balanced / High-Throughput), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags and run plain TP** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 NOSPEC keeps DCP.
+- Low-Latency and the Hopper recipes take all tiers unchanged.
+
+<a id="pd-disaggregation" />
+
+### 3.4 PD Disaggregation
+
+PD splits prefill and decode into separate server groups; because K3 is hybrid, the transfer moves **both** the paged MLA KV and the KDA recurrent state.
+
+- **Transfer**: the cells emit **NiXL** (RDMA); Mooncake stays selectable in the Playground.
+- **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host). The positional `8998` after `--prefill` must match `--disaggregation-bootstrap-port`, or only the decode worker registers.
+- **Decode state pool**: chunk cache — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
+
+#### Deep PP for long-context prefill
+
+The `Long-Context` prefill strategy is `--pp-size 8 --tp-size 1`: pipeline P2P overlaps the next microbatch's compute, unlike TP/EP collectives, and each stage owns whole layers (a clean slice of KV and state).
+
+- Use all eight stages; a shallow split still pays the in-stage all-reduce and can lose to TP8.
+- Pays only with several requests in flight (hence `Default` = TP8).
+- DSPARK off (`pp_size == 1` required).
+- Fan one prefill role out to several decode roles; budget for in-transfer KV on the decode side.
+
+<Accordion title="Router">
+
+```bash Command
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://<prefill-host>:30000 8998 \
+  --decode http://<decode-host>:30100 \
+  --host 0.0.0.0 --port 8000 \
+  --disable-circuit-breaker \
+  --health-check-interval-secs 999999
+```
+
+</Accordion>
+
+Clients then send requests to the router (`:8000`) instead of an individual role server.
+
+### 3.5 VLM Serving Profiles
+
+The open-source K3 serving contract currently supports **image input only** — its
+processor rejects video and audio input.
+
+#### Recommended high-speed VLM
+
+The command panel now opens on the **B300 · Unified · Balanced**
+recipe below. It makes the VLM-specific performance choices explicit:
+
+```bash Command
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp-size 8 \
+  --dcp-size 8 \
+  --mem-fraction-static 0.85 \
+  --mm-feature-transport cuda_ipc \
+  --mm-processor-worker-num 2 \
+  --mm-io-worker-num 16 \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- `--mm-feature-transport cuda_ipc` — single-node only: skips the CPU round trip, bounded pool (per-tensor CPU fallback when full), reserves up to `SGLANG_MM_FEATURE_CACHE_MB` on the base GPU. Multi-node recipes use CPU transport.
+- 2 processor / 16 I/O workers are the measured defaults; more adds contention.
+- Leave `--mm-attention-backend` unset — auto-selected, with a correctness fallback.
+- Don't add `--mm-enable-dp-encoder`; K3 already shards images across TP ranks.
+
+#### Should ViT BCG be enabled?
+
+Keep ViT BCG **off** for general serving; enable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` only for ViT-only / EPD encoder workloads with recurring image shapes and spare HBM.
+
+- The win is confined to the encoder — no reliable end-to-end TTFT/TPOT gain in full-model serving.
+- Each captured graph retains HBM (graph + per-entry metadata); measure on your own shapes.
+- The default cache captures after two hits and falls back to eager above 6,144 tokens; do not enlarge it without measuring.
+
+#### Low-HBM VLM
+
+Use this profile when keeping HBM headroom matters more than peak concurrency.
+It removes the 1 GiB CUDA IPC pool, keeps ViT BCG disabled, halves the context
+window, caps concurrency, and lowers the static-memory target:
+
+```bash Command
+SGLANG_VIT_ENABLE_CUDA_GRAPH=0 \
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp-size 8 \
+  --context-length 65536 \
+  --enable-symm-mem \
+  --mem-fraction-static 0.82 \
+  --mm-feature-transport cpu \
+  --mm-processor-worker-num 2 \
+  --mm-io-worker-num 16 \
+  --reasoning-parser kimi_k3 \
+  --tool-call-parser kimi_k3 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`--mem-fraction-static 0.82` is a conservative B300 starting point, not a portable minimum: raise it toward `0.85` if startup reports insufficient memory; if HBM must go back to other workloads, reduce context/concurrency first. The precision levers (`fp8_e4m3` KV, `bfloat16` SSM state) save far more but stay accuracy-gated.
+
+<a id="large-scale-presets" />
+
+### 3.6 Large-Scale Serving Presets (16–64 GPUs, Blackwell)
+
+**The KDA state pool is the concurrency ceiling** — DP, EP, and DCP do not shard it; only attention-TP width, SSM dtype, and cache strategy change the per-GPU bill. The MLA KV is cheap to shrink (fp8) or deduplicate (DCP).
+
+Two presets come out of this, at `N = 8k` GPUs:
+
+| Preset | What it trades | Pick it for |
+|---|---|---|
+| **Peak Throughput** — `dp = k`, attention-TP 8 | State shards 8-way. The per-step KDA all-reduce stays within one 8-GPU B200/B300 node, or spans two 4-GPU GB200/GB300 nodes over MNNVL. `--kv-cache-dtype fp8_e4m3` is load-bearing — bf16 KV does not fit 128 requests per replica. | Maximum sustained TPS — the default large-scale shape. |
+| **Peak Capacity (+DCP8)** — `dp = k` + `--dcp-size 8` | Deduplicates the attention-TP group's MLA KV: concurrency ceiling +72% at the same engine throughput, ~1.8× ITL. | Context ≥ ~16K, or per-replica concurrency past 128. |
+
+- **Radix cache** is independent of the preset: for prefix-free traffic (offline batch, evals) switch it off (Playground's **Prefix Cache** card) — one state slot per request instead of 4–5.
+- The fully data-parallel extreme (`--dp-size` = GPU count, attention-TP 1) — the shape behind the 64-GPU sweep's ~3K tok/s per GPU — is not a preset: 288 GB GPUs only, radix forced off, no head-to-head against the preset shape.
+
+The Peak Throughput preset at 32 GPUs on B200/B300 (4 nodes × 8; every node runs the same command with its own `--node-rank`). On GB200/GB300 the same 32-GPU shape uses 8 nodes × 4, and the Playground emits `--nnodes 8`:
+
+```bash Command
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=20480 \
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp-size 32 --ep-size 32 \
+  --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
+  --nnodes 4 --node-rank <rank> --dist-init-addr <node0-ip>:20000 \
+  --moe-a2a-backend megamoe --moe-runner-backend deep_gemm \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --mem-fraction-static 0.92 \
+  --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
+  --host 0.0.0.0 --port 30000
+```
+
+Scale by holding the per-replica shape fixed and moving only the replica count; pool sizing rides the calculator-driven `--mamba-full-memory-ratio`, which folds in DP, DCP, precision, and speculation:
+
+| GPUs | B200/B300 nodes | GB200/GB300 nodes | `--tp-size` / `--ep-size` | `--dp-size` |
+|---|---|---|---|---|
+| 16 | 2×8 | 4×4 | 16 | 2 |
+| 32 | 4×8 | 8×4 | 32 | 4 |
+| 64 | 8×8 | 16×4 | 64 | 8 |
+
+For Peak Capacity, add `--dcp-size 8` and re-derive the pool split with the [Mamba ratio calculator](#mamba-ratio-calculator).
+
+Both presets are one click away in the [Playground above](#playground): pick a **Cluster Size** and a **Large-Scale Preset** and the full command composes onto whichever cell is showing.
+
+Decisions the preset already makes:
+
+- **MegaMoE on `deep_gemm`** — the fastest a2a backend; needs the SiTU cubin pool ([§2](#2-configuration-tips)).
+- **SP-MoE and shared-expert overlap** engage automatically under EP a2a; the K3 all-reduce fusion does not.
+- **Spec Decode follows the Deploy knob.** Acceptance thins at large batch; spec × EP × DP-attention is validated only at 8-GPU EP8 × DP2 (full GSM8K) — experimental at these scales.
+
+<Note>
+No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
+</Note>
