@@ -403,9 +403,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # by default but leaves EOS disabled, so opt into EOS here to
                 # preserve the model's intended [BOS] text [EOS] input form.
                 if self.model_config.is_embedding_gemma and hasattr(
-                    self.tokenizer, "add_eos_token"
+                    self.tokenizer, "update_post_processor"
                 ):
-                    self.tokenizer.add_eos_token = True
+                    # The public attribute is read-only on the HF fast
+                    # tokenizer; change its backing flag and rebuild the post
+                    # processor exactly as the v5 compatibility restore does.
+                    self.tokenizer._add_eos_token = True
+                    self.tokenizer.update_post_processor()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
