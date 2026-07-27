@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -12,6 +12,9 @@ from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
+
+if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -55,6 +58,8 @@ class DFlashDraftInputV2(SpecInput):
     future_indices: Optional[torch.Tensor] = None
 
     verify_token_budget: Optional[int] = None
+
+    grammar: Optional["BaseGrammarObject"] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)

@@ -1,0 +1,39 @@
+diff --git a/csrc/api/sparse_fwd.h b/csrc/api/sparse_fwd.h
+index 66d7111..9f7e8e9 100644
+--- a/csrc/api/sparse_fwd.h
++++ b/csrc/api/sparse_fwd.h
+@@ -105,5 +105,8 @@
+     float sm_scale,
+     int d_v,
+     const std::optional<at::Tensor> &attn_sink,
+-    const std::optional<at::Tensor> &topk_length
++    const std::optional<at::Tensor> &topk_length,
++    const std::optional<at::Tensor> &out_buffer = std::nullopt,
++    const std::optional<at::Tensor> &max_logits_buffer = std::nullopt,
++    const std::optional<at::Tensor> &lse_buffer = std::nullopt
+ ) {
+@@ -162,4 +165,19 @@
+-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+-    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+-    at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
++    at::Tensor out = out_buffer.has_value()
++        ? out_buffer.value()
++        : torch::empty({s_q, h_q, d_v}, opts);
++    at::Tensor lse = lse_buffer.has_value()
++        ? lse_buffer.value()
++        : torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
++    at::Tensor max_logits = max_logits_buffer.has_value()
++        ? max_logits_buffer.value()
++        : torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
++    KU_CHECK_DEVICE(out);
++    KU_CHECK_DEVICE(lse);
++    KU_CHECK_DEVICE(max_logits);
++    KU_CHECK_DTYPE(out, torch::kBFloat16);
++    KU_CHECK_DTYPE(lse, torch::kFloat32);
++    KU_CHECK_DTYPE(max_logits, torch::kFloat32);
++    KU_CHECK_SHAPE(out, s_q, h_q, d_v);
++    KU_CHECK_SHAPE(lse, s_q, h_q);
++    KU_CHECK_SHAPE(max_logits, s_q, h_q);
+     KU_CHECK_CONTIGUOUS(out);
+     KU_CHECK_CONTIGUOUS(lse);
+     KU_CHECK_CONTIGUOUS(max_logits);

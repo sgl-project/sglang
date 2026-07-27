@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -95,6 +97,7 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                req.log_grammar_stats_once(self.metrics_collector)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -278,6 +281,8 @@ class SchedulerBatchResultProcessor:
                             next_token_id=next_token_id,
                             already_advanced=result.grammar_advanced,
                         )
+                    if req.finished():
+                        req.log_grammar_stats_once(self.metrics_collector)
 
                 else:
                     # being chunked reqs' prefill is not finished
@@ -653,7 +658,7 @@ class SchedulerBatchResultProcessor:
 
     def advance_grammar_fsm(
         self, result: GenerationBatchResult, batch: ScheduleBatch
-    ) -> None:
+    ) -> Optional[Dict[str, float]]:
         """Advance each req's grammar FSM over the tokens THIS batch committed, and
         (for decode) memoize the grammar-truncated run on ``result``.
 
@@ -666,15 +671,39 @@ class SchedulerBatchResultProcessor:
         batch was — e.g. the extend->decode boundary.
         """
         if result.grammar_advanced or not batch.has_grammar:
-            return
+            return None
         is_decode = batch.forward_mode.is_decode()
         if not (is_decode or batch.forward_mode.is_extend()):
-            return
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
-        next_token_ids = result.next_token_ids.tolist()
+            return None
+        total_started = time.perf_counter()
+        copy_wait_started = time.perf_counter()
+        prefetch_phase_seconds = {}
+        if batch.spec_algorithm.is_dspark():
+            if result.grammar_result_future is None:
+                raise RuntimeError(
+                    "DSpark grammar overlap requires the asynchronous result path"
+                )
+            prepared = result.grammar_result_future.result()
+            copy_wait_seconds = time.perf_counter() - copy_wait_started
+            next_token_ids = prepared.next_token_ids
+            tensor_to_list_seconds = 0.0
+            prefetch_phase_seconds = {
+                "barrier_prefetch_queue_delay": prepared.queue_delay_seconds,
+                "barrier_prefetch_copy_wait": prepared.copy_wait_seconds,
+                "barrier_prefetch_tensor_to_list": (prepared.tensor_to_list_seconds),
+                "barrier_prefetch_submit_to_ready": (prepared.submit_to_ready_seconds),
+            }
+        else:
+            if result.copy_done is not None:
+                result.copy_done.synchronize()
+            next_token_ids_tensor = result.next_token_ids
+            copy_wait_seconds = time.perf_counter() - copy_wait_started
+            tensor_to_list_started = time.perf_counter()
+            next_token_ids = next_token_ids_tensor.tolist()
+            tensor_to_list_seconds = time.perf_counter() - tensor_to_list_started
 
         if not is_decode:
+            fsm_accept_started = time.perf_counter()
             # Extend: advance over the single token each completed-prefill req emitted
             # (mirrors process_batch_result_prefill's per-req token indexing).
             for i, req in enumerate(batch.reqs):
@@ -687,18 +716,33 @@ class SchedulerBatchResultProcessor:
                     continue
                 self._accept_grammar_tokens(req, next_token_ids[i])
             result.grammar_advanced = True
-            return
+            return {
+                "barrier_result_copy_wait": copy_wait_seconds,
+                "barrier_tensor_to_list": tensor_to_list_seconds,
+                **prefetch_phase_seconds,
+                "barrier_fsm_accept": time.perf_counter() - fsm_accept_started,
+                "barrier_advance_total": time.perf_counter() - total_started,
+            }
 
         # Decode: only the spec-v2 path reaches here (the grammar barrier for
         # spec-overlap workers and _resolve_spec_v2_tokens). Non-spec grammar decode
         # advances its FSM in process_batch_result_decode and has no accept_lens, so
         # bail out defensively.
         if result.accept_lens is None:
-            return
-        accept_lens = result.accept_lens.tolist()
+            return None
+        if batch.spec_algorithm.is_dspark():
+            if prepared.accept_lens is None:
+                raise RuntimeError(
+                    "DSpark grammar decode requires asynchronous accept lengths"
+                )
+            accept_lens = prepared.accept_lens
+        else:
+            accept_lens = result.accept_lens.tolist()
+            tensor_to_list_seconds = time.perf_counter() - tensor_to_list_started
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
         retained = [None] * len(batch.reqs)
+        fsm_accept_started = time.perf_counter()
         for i, req in enumerate(batch.reqs):
             if req.grammar is None or req.is_retracted or req.finished():
                 continue
@@ -708,6 +752,13 @@ class SchedulerBatchResultProcessor:
             retained[i] = self._accept_grammar_tokens(req, accept_tokens)
         result.grammar_retained_tokens = retained
         result.grammar_advanced = True
+        return {
+            "barrier_result_copy_wait": copy_wait_seconds,
+            "barrier_tensor_to_list": tensor_to_list_seconds,
+            **prefetch_phase_seconds,
+            "barrier_fsm_accept": time.perf_counter() - fsm_accept_started,
+            "barrier_advance_total": time.perf_counter() - total_started,
+        }
 
     def process_batch_result_idle(
         self,
@@ -820,6 +871,8 @@ class SchedulerBatchResultProcessor:
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
+            if req.finished():
+                req.log_grammar_stats_once(self.metrics_collector)
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

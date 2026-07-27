@@ -87,6 +87,34 @@ def maybe_trigger_remote_instance_nccl_send_group(
 
 def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
     if server_args.kv_cache_dtype == "fp8_e4m3":
+        dynamic_scale_block_size = getattr(
+            model,
+            "dynamic_kv_cache_scale_block_size",
+            None,
+        )
+        if dynamic_scale_block_size is not None:
+            if (
+                isinstance(dynamic_scale_block_size, bool)
+                or not isinstance(dynamic_scale_block_size, int)
+                or dynamic_scale_block_size <= 0
+            ):
+                raise RuntimeError(
+                    f"Model {model.__class__} advertises an invalid dynamic "
+                    "FP8 KV cache scale block size: "
+                    f"{dynamic_scale_block_size!r}"
+                )
+            if server_args.quantization_param_path is not None:
+                raise RuntimeError(
+                    f"Model {model.__class__} uses native dynamic per-"
+                    f"{dynamic_scale_block_size}-element FP8 KV cache scales; "
+                    "an external static scaling-factor file is invalid."
+                )
+            logger.info(
+                "Using model-native dynamic per-%d-element FP8 KV cache "
+                "scales; no external scaling-factor file is required.",
+                dynamic_scale_block_size,
+            )
+            return
         if server_args.quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(server_args.quantization_param_path)

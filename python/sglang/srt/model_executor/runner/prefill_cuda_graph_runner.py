@@ -25,7 +25,8 @@ Backend selection comes from cuda_graph_config.prefill:
                       cuda_graph_config.prefill.full_prefill_max_req request
                       slots (auto-derived when unset); replay pads num_tokens
                       to the nearest bucket and pads unused request slots with
-                      zero-length sentinels. bs > slots falls back to eager.
+                      zero-length sentinels. bs > slots is routed to eager by
+                      the scheduler's shared admission policy.
                       Attention metadata is refreshed out-of-graph against the
                       slot-padded batch before capture/replay.
   - "tc_piecewise" — TcPiecewiseCudaGraphBackend: torch.compile
@@ -117,7 +118,7 @@ logger = logging.getLogger(__name__)
 # A replay executes every padded token in its capture bucket. Sparse bucket
 # lists can otherwise turn the lower launch overhead into substantially more
 # model work than an exact-shape eager forward.
-_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
+_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 4
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -280,6 +281,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ) from e
 
         self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._share_dspark_full_prefill_outputs = (
+            self._is_full_backend
+            and model_runner.spec_algorithm.is_dspark()
+            and not model_runner.is_draft_worker
+        )
+        self._dspark_full_prefill_output_buffers: Optional[
+            tuple[tuple[torch.Tensor, torch.Tensor], list[torch.Tensor]]
+        ] = None
+        self._dspark_full_prefill_expected_aux_outputs = 0
+        primary_attn_backend = getattr(
+            model_runner.attn_backend, "primary", model_runner.attn_backend
+        )
+        supports_prefill_tbo_graph = getattr(
+            primary_attn_backend, "tbo_supports_cuda_graph_for", None
+        )
+        self.enable_tbo_prefill_graph = (
+            model_runner.server_args.enable_two_batch_overlap
+            and self._is_full_backend
+            and (
+                supports_prefill_tbo_graph(ForwardMode.EXTEND)
+                if supports_prefill_tbo_graph is not None
+                else getattr(primary_attn_backend, "tbo_supports_cuda_graph", True)
+            )
+        )
         if self._is_full_backend:
             max_req = prefill_config.full_prefill_max_req
             if max_req is None:
@@ -359,6 +384,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._input_embeds_arg_idx = (
                 params.index("input_embeds") if "input_embeds" in params else None
             )
+            if self._share_dspark_full_prefill_outputs:
+                target_layer_ids = getattr(
+                    self.layer_model, "dspark_layers_to_capture", None
+                )
+                if (
+                    not isinstance(target_layer_ids, (list, tuple))
+                    or not target_layer_ids
+                ):
+                    raise RuntimeError(
+                        "DSpark FullCG shared outputs require a non-empty "
+                        "dspark_layers_to_capture configuration"
+                    )
+                self._dspark_full_prefill_expected_aux_outputs = len(target_layer_ids)
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -394,6 +432,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _uses_eager_prefill_tail(self) -> bool:
         return self.prefill_backend_name in (Backend.BREAKABLE, Backend.FULL)
+
+    def _capture_req_slots_for_tokens(self, num_tokens: int) -> int:
+        if not self._is_full_backend:
+            return self._capture_req_slots
+        # A prefill batch cannot contain more requests than token-axis
+        # elements unless it contains zero-length requests, which the graph
+        # path rejects. Shrinking the request axis with each token bucket lets
+        # Full capture useful sub-64-token shapes without reducing the global
+        # request-slot ceiling for larger batches.
+        return min(self._capture_req_slots, num_tokens)
 
     def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
         if not forward_batch.return_logprob:
@@ -471,6 +519,120 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             yield
 
+    def _stage_dspark_full_prefill_body_output(
+        self,
+        output: tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            list[torch.Tensor],
+        ],
+        *,
+        num_tokens: int,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        """Copy DSpark body outputs into one address-stable maximum-size tree.
+
+        Full CUDA graphs retain every tensor returned from capture. DSpark's
+        target body returns the final hidden state plus one full token-axis
+        tensor for each configured target tap. Retaining that tree separately
+        for every token bucket consumes the sum of all bucket sizes even
+        though a scheduler rank replays only one body graph at a time.
+
+        The first (largest) shape allocates a single shared tree during graph
+        warmup. Every graph records a copy into its matching prefix and returns
+        views of those same buffers. The eager tail consumes this tree
+        synchronously, then the DSpark prefill epilogue enqueues target-hidden
+        injection on the same stream before another target forward can replay,
+        so reuse cannot overlap a live consumer.
+        """
+        if (
+            not isinstance(output, tuple)
+            or len(output) != 2
+            or not isinstance(output[0], tuple)
+            or len(output[0]) != 2
+        ):
+            raise RuntimeError(
+                "DSpark FullCG body output must be "
+                "((hidden_states, pre_hc_head), auxiliary_hidden_states)"
+            )
+        main_outputs, auxiliary_hidden_states = output
+        hidden_states, pre_hc_head = main_outputs
+        if (
+            not isinstance(hidden_states, torch.Tensor)
+            or not isinstance(pre_hc_head, torch.Tensor)
+            or not isinstance(auxiliary_hidden_states, list)
+        ):
+            raise RuntimeError(
+                "DSpark FullCG body output has an incompatible tensor tree"
+            )
+        if len(
+            auxiliary_hidden_states
+        ) != self._dspark_full_prefill_expected_aux_outputs or not all(
+            isinstance(tensor, torch.Tensor) for tensor in auxiliary_hidden_states
+        ):
+            raise RuntimeError(
+                "DSpark FullCG body output does not match the configured "
+                "target hidden-state taps"
+            )
+
+        outputs = [hidden_states, pre_hc_head, *auxiliary_hidden_states]
+        for index, tensor in enumerate(outputs):
+            if tensor.ndim == 0 or tensor.shape[0] != num_tokens:
+                raise RuntimeError(
+                    "DSpark FullCG body output must use the captured token "
+                    f"axis: tensor={index} shape={tuple(tensor.shape)} "
+                    f"tokens={num_tokens}"
+                )
+
+        buffers = self._dspark_full_prefill_output_buffers
+        if buffers is None:
+            if num_tokens != self.max_num_tokens:
+                raise RuntimeError(
+                    "DSpark FullCG shared outputs must initialize from the "
+                    f"largest capture shape: got={num_tokens} "
+                    f"expected={self.max_num_tokens}"
+                )
+            allocated = [
+                torch.empty(
+                    (self.max_num_tokens, *tensor.shape[1:]),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
+                for tensor in outputs
+            ]
+            buffers = ((allocated[0], allocated[1]), allocated[2:])
+            self._dspark_full_prefill_output_buffers = buffers
+            total_bytes = sum(
+                tensor.numel() * tensor.element_size() for tensor in allocated
+            )
+            logger.info(
+                "Reserved shared DSpark FullCG body outputs: "
+                "tokens=%d tensors=%d bytes=%d",
+                self.max_num_tokens,
+                len(allocated),
+                total_bytes,
+            )
+
+        flat_buffers = [*buffers[0], *buffers[1]]
+        if len(flat_buffers) != len(outputs):
+            raise RuntimeError("DSpark FullCG shared output tree changed after warmup")
+        staged = []
+        for index, (buffer, tensor) in enumerate(zip(flat_buffers, outputs)):
+            if (
+                buffer.shape[1:] != tensor.shape[1:]
+                or buffer.dtype != tensor.dtype
+                or buffer.device != tensor.device
+            ):
+                raise RuntimeError(
+                    "DSpark FullCG shared output tensor changed after warmup: "
+                    f"tensor={index}"
+                )
+            view = buffer[:num_tokens]
+            view.copy_(tensor)
+            staged.append(view)
+        return (staged[0], staged[1]), staged[2:]
+
     @torch.no_grad()
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run forward inside the prefill set_tc_piecewise_forward_context.
@@ -499,16 +661,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         set_is_extend_in_batch(False)
 
+        if self._is_full_backend:
+            # Record address-stable metadata work exactly once per replay.
+            # DSV4 uses this to translate the SWA write locations once rather
+            # than allocating/recomputing them in every transformer layer.
+            self.model_runner.attn_backend.init_forward_metadata_in_graph(forward_batch)
+
         with self._prefill_forward_context(forward_batch):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                return self.layer_model.forward(
+                body_output = self.layer_model.forward(
                     forward_batch.input_ids,
                     positions,
                     forward_batch,
                     forward_batch.input_embeds,
                 )
+                if self._share_dspark_full_prefill_outputs:
+                    return self._stage_dspark_full_prefill_body_output(
+                        body_output, num_tokens=num_tokens
+                    )
+                return body_output
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -594,14 +767,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _has_inactive_dp_rank(self, forward_batch: ForwardBatch) -> bool:
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
-        # the same replay path. Sparse-DP batches (one or more ranks with
-        # zero local tokens) fall back to eager to avoid hanging ranks.
+        # the same replay path. Admitted sparse-DP prefills are converted to
+        # MAX_LEN before this check, so an inactive rank here is a contract
+        # violation rather than a reason to silently choose eager.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
         )
+
+    @staticmethod
+    def _reject_graph(forward_batch: ForwardBatch, reason: str) -> bool:
+        # The scheduler synchronizes this admission across DP ranks before
+        # padding. Once true, a local rejection would make one rank enter the
+        # graph while another enters eager collectives. Fail closed instead.
+        if forward_batch.can_run_dp_breakable_cuda_graph:
+            raise RuntimeError(
+                "DP prefill CUDA graph admission diverged after synchronization: "
+                f"{reason}"
+            )
+        return False
 
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, num_tokens: int
@@ -636,20 +822,40 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend = self.model_runner.attn_backend
         if self._is_full_backend:
             # Slot-padded shallow view: plan() must see exactly req_slots
-            # entries (real values in [:bs], sentinels in [bs:req_slots]
-            # already populated by replay_prepare).
-            r = self._capture_req_slots
+            # entries and the captured token bucket. Build it from the static
+            # batch so out_cache_loc/positions retain the padded token-axis
+            # storage captured by the graph. The live batch is intentionally
+            # raw-sized and cannot be used to refresh fixed-shape metadata.
+            r = self._capture_req_slots_for_tokens(num_tokens)
             bs = forward_batch.batch_size
             s = self._prefill_static_buffers
-            self._full_cg_seq_lens_cpu.zero_()
+            assert s is not None
+            assert self._full_cg_seq_lens_cpu is not None
+            if bs > r:
+                raise RuntimeError(
+                    "full prefill graph request count exceeds the selected "
+                    f"shape slots: requests={bs}, slots={r}, tokens={num_tokens}"
+                )
+            assert forward_batch.seq_lens_cpu is not None
+            assert forward_batch.extend_seq_lens_cpu is not None
+            assert forward_batch.extend_prefix_lens_cpu is not None
+            self._full_cg_seq_lens_cpu[:r].zero_()
             self._full_cg_seq_lens_cpu[:bs].copy_(forward_batch.seq_lens_cpu)
-            padded_view = copy.copy(forward_batch)
+            padded_view = copy.copy(static_forward_batch)
             padded_view.batch_size = r
             padded_view.seq_lens = s["seq_lens"][:r]
-            padded_view.seq_lens_cpu = self._full_cg_seq_lens_cpu
+            padded_view.seq_lens_cpu = self._full_cg_seq_lens_cpu[:r]
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            padded_view.extend_start_loc = s["extend_start_loc"][:r]
+            padded_view.orig_seq_lens = s["orig_seq_lens"][:r]
+            padded_view.extend_seq_lens_cpu = list(
+                forward_batch.extend_seq_lens_cpu
+            ) + [0] * (r - bs)
+            padded_view.extend_prefix_lens_cpu = list(
+                forward_batch.extend_prefix_lens_cpu
+            ) + [0] * (r - bs)
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
@@ -679,38 +885,65 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.set_attn_attend_prefix_cache(False)
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
-            return False
         if forward_batch.input_embeds is not None:
-            return False
+            return self._reject_graph(forward_batch, "input embeddings are unsupported")
         if forward_batch.replace_embeds is not None:
-            return False
+            return self._reject_graph(
+                forward_batch, "replacement embeddings are unsupported"
+            )
         if self._has_unsupported_mha_prefix(forward_batch):
-            return False
+            return self._reject_graph(
+                forward_batch, "MHA companion prefix is unsupported"
+            )
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
-            return False
+            return self._reject_graph(forward_batch, "target verify is unsupported")
+        if self.enable_tbo_prefill_graph and not forward_batch.can_run_tbo:
+            return self._reject_graph(
+                forward_batch,
+                "captured dense-prefill graph requires synchronized TBO",
+            )
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
-            return False
-        # BCG-with-captured-metadata under DP attention: every rank must
-        # have local tokens, and the batch must declare itself replayable.
-        # These gates are no-ops for non-DP / non-opt-in paths because
-        # global_num_tokens_cpu stays None.
+            return self._reject_graph(
+                forward_batch, "capture-hidden mode differs from capture"
+            )
+        # Captured prefill under DP attention: every rank must have local
+        # tokens after MAX_LEN conversion, and the batch must carry the shared
+        # admission decision.
         if self._has_inactive_dp_rank(forward_batch):
-            return False
+            return self._reject_graph(
+                forward_batch, "a DP rank remained inactive after padding"
+            )
         if (
             forward_batch.global_num_tokens_cpu is not None
             and not forward_batch.can_run_dp_breakable_cuda_graph
         ):
-            return False
+            return self._reject_graph(
+                forward_batch, "scheduler routed this shape to eager"
+            )
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob and not self._uses_eager_prefill_tail():
-            return False
+            return self._reject_graph(
+                forward_batch, "return_logprob requires an eager logits tail"
+            )
         if num_tokens > self.max_num_tokens:
-            return False
+            return self._reject_graph(
+                forward_batch, "padded token count exceeds captured buckets"
+            )
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
+            return self._reject_graph(
+                forward_batch, "capture-bucket padding exceeds the admitted factor"
+            )
+        if (
+            self._is_full_backend
+            and forward_batch.batch_size
+            > self._capture_req_slots_for_tokens(padded_num_tokens)
+        ):
+            return self._reject_graph(
+                forward_batch,
+                "request count exceeds the selected full-graph shape slots",
+            )
         # No exact-shape check here: load_batch bucket-pads to the nearest
         # captured shape. The factor above only rejects replays whose padded
         # model work is disproportionate to the useful token count.
@@ -740,7 +973,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        bs = self._capture_req_slots
+        bs = self._capture_req_slots_for_tokens(num_tokens)
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
         start_loc_cpu = [0] + [num_tokens] * (bs - 1)
@@ -853,7 +1086,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            self.tbo_plugin.capture_one_batch_size(
+                forward_batch,
+                num_tokens=num_tokens,
+                enabled=self.enable_tbo_prefill_graph,
+                attn_backend=self.model_runner.attn_backend,
+            )
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -944,6 +1182,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
         )
+        if self.enable_tbo_prefill_graph:
+            self.tbo_plugin.replay_prepare_prefill(
+                split_token_index=static_num_tokens // 2,
+                num_token_non_padded=num_tokens,
+            )
 
         registry = self.buffer_registry
 
@@ -1078,20 +1321,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             s["req_pool_indices"][:bs].copy_(forward_batch.req_pool_indices)
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
-            if self._is_full_backend and bs < self._capture_req_slots:
+            if self._is_full_backend:
                 # Sentinel tail for slots [bs:req_slots]: the captured graph
                 # reads all req_slots entries (e.g. the logits-processor
                 # cumsum), so stale values from the previous replay must be
                 # cleared. Zero lengths make the sentinels no-ops;
                 # extend_start_loc sentinels sit at the flat end of the real
                 # tokens.
-                r = self._capture_req_slots
-                s["seq_lens"][bs:r].zero_()
-                s["extend_seq_lens"][bs:r].zero_()
-                s["extend_prefix_lens"][bs:r].zero_()
-                s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
-                s["req_pool_indices"][bs:r].zero_()
-                s["orig_seq_lens"][bs:r].zero_()
+                r = self._capture_req_slots_for_tokens(static_num_tokens)
+                if bs > r:
+                    raise RuntimeError(
+                        "full prefill graph request count exceeds the selected "
+                        f"shape slots: requests={bs}, slots={r}, "
+                        f"tokens={static_num_tokens}"
+                    )
+                if bs < r:
+                    s["seq_lens"][bs:r].zero_()
+                    s["extend_seq_lens"][bs:r].zero_()
+                    s["extend_prefix_lens"][bs:r].zero_()
+                    s["extend_start_loc"][bs:r].fill_(self.raw_num_tokens)
+                    s["req_pool_indices"][bs:r].zero_()
+                    s["orig_seq_lens"][bs:r].zero_()
 
         # Refresh the static buffer the captured graph reads from.
         if (
@@ -1108,6 +1358,46 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
+
+    @classmethod
+    def _trim_replayed_body_output(
+        cls,
+        output,
+        *,
+        raw_num_tokens: int,
+        static_num_tokens: int,
+    ):
+        """Trim token-axis tensors without changing the model output tree.
+
+        Transformer bodies may return a tensor, nested tuples, or lists of
+        auxiliary hidden states. Slicing the top-level object corrupts tuple
+        structure (and turns a two-item tuple into a one-item tuple when the
+        raw batch has one token). Only tensors whose leading dimension is the
+        captured token bucket are token-axis outputs.
+        """
+        if isinstance(output, torch.Tensor):
+            if output.ndim > 0 and output.shape[0] == static_num_tokens:
+                return output[:raw_num_tokens]
+            return output
+        if isinstance(output, tuple):
+            return tuple(
+                cls._trim_replayed_body_output(
+                    item,
+                    raw_num_tokens=raw_num_tokens,
+                    static_num_tokens=static_num_tokens,
+                )
+                for item in output
+            )
+        if isinstance(output, list):
+            return [
+                cls._trim_replayed_body_output(
+                    item,
+                    raw_num_tokens=raw_num_tokens,
+                    static_num_tokens=static_num_tokens,
+                )
+                for item in output
+            ]
+        return output
 
     def _execute_body_capture(
         self,
@@ -1142,7 +1432,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         1, static_n
                     )[: ie.shape[0]].copy_(ie)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
-            return hs[:raw_num_tokens] if full_path else hs
+            return (
+                self._trim_replayed_body_output(
+                    hs,
+                    raw_num_tokens=raw_num_tokens,
+                    static_num_tokens=static_n,
+                )
+                if full_path
+                else hs
+            )
 
         original_layer_forward = self.layer_model.forward
         self.layer_model.forward = replay_layer_forward

@@ -13,8 +13,14 @@
 # ==============================================================================
 """The base class of a backend for grammar-guided constrained decoding."""
 
+import dataclasses
+import functools
+import json
 import logging
+import os
+import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -40,6 +46,10 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+    cache_source: str = "compile"
+    cache_resolution_time: Optional[float] = None
+    cache_lock_wait_time: Optional[float] = None
+    cache_phase_seconds: Dict[str, float] = field(default_factory=dict)
 
 
 class GrammarRow(NamedTuple):
@@ -103,6 +113,9 @@ class BaseGrammarObject:
     def copy(self) -> "BaseGrammarObject":
         return self
 
+    def cache_memory_bytes(self) -> int:
+        return 0
+
     @property
     def finished(self):
         return self._finished
@@ -156,20 +169,76 @@ class GrammarMask(NamedTuple):
 class InvalidGrammarObject(BaseGrammarObject):
     """Represents a grammar that failed to compile, carrying the original error message."""
 
-    def __init__(self, error_message: str = "Unknown grammar error"):
+    def __init__(
+        self,
+        error_message: str = "Unknown grammar error",
+        grammar_stats: Optional[GrammarStats] = None,
+    ):
         super().__init__()
         self.error_message = error_message
+        self.grammar_stats = grammar_stats
 
     def __repr__(self):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
+
+    def copy(self) -> "InvalidGrammarObject":
+        stats = (
+            None
+            if self.grammar_stats is None
+            else dataclasses.replace(self.grammar_stats)
+        )
+        return InvalidGrammarObject(self.error_message, stats)
 
 
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
     def __init__(self):
-        self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        executor_threads = int(
+            os.environ.get("SGLANG_GRAMMAR_COMPILATION_WORKERS", "8")
+        )
+        self.cache_limit_bytes = int(
+            os.environ.get("SGLANG_GRAMMAR_CACHE_BYTES", str(10 * 1024**3))
+        )
+        self.cache_limit_entries = int(
+            os.environ.get("SGLANG_GRAMMAR_CACHE_ENTRIES", "100000")
+        )
+        if (
+            executor_threads <= 0
+            or self.cache_limit_bytes <= 0
+            or self.cache_limit_entries <= 0
+        ):
+            raise ValueError(
+                "optimized grammar worker and cache limits must all be positive"
+            )
+        self.executor = ThreadPoolExecutor(
+            max_workers=executor_threads,
+            thread_name_prefix="sglang-grammar",
+        )
+        self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
+        self._cache_entry_bytes: Dict[Tuple[str, str], int] = {}
+        self._cache_bytes = 0
+        self._inflight: Dict[Tuple[str, str], Future[BaseGrammarObject]] = {}
+        self._cache_lock = threading.Lock()
+
+    @staticmethod
+    @functools.lru_cache(maxsize=16384)
+    def _normalize_cache_key(key: Tuple[str, str]) -> Tuple[str, str]:
+        key_type, key_string = key
+        if key_type not in {"json", "structural_tag"} or key_string == "$$ANY$$":
+            return key
+        try:
+            parsed = json.loads(key_string)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return key
+        return (
+            key_type,
+            json.dumps(
+                parsed,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
 
     def initialize_vocab_mask_buffer(
         self,
@@ -244,19 +313,149 @@ class BaseGrammarBackend:
     def get_cached_or_future_value(
         self, key: Tuple[str, str], require_reasoning: bool
     ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
-        value = self.cache.get(key)
-        if value:
-            copied_value = value.copy()
-            copied_value.maybe_init_reasoning(require_reasoning)
-            return copied_value, True
-        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
-        return value, False
+        key = self._normalize_cache_key(key)
+        with self._cache_lock:
+            value = self.cache.get(key)
+            if value is not None:
+                self.cache.move_to_end(key)
+                return (
+                    self._copy_for_request(
+                        value,
+                        require_reasoning=require_reasoning,
+                        cache_source="memory",
+                        resolution_time=0.0,
+                        preserve_compilation_time=False,
+                    ),
+                    True,
+                )
+
+            shared_future = self._inflight.get(key)
+            is_owner = shared_future is None
+            if shared_future is None:
+                shared_future = self.executor.submit(
+                    self._init_value_dispatch,
+                    key,
+                    False,
+                )
+                self._inflight[key] = shared_future
+
+        # Future.add_done_callback() invokes the callback synchronously when
+        # the future has already completed. Register outside _cache_lock so a
+        # fast compile cannot deadlock in _finish_inflight while reacquiring it.
+        if is_owner:
+            shared_future.add_done_callback(
+                lambda future, cache_key=key: self._finish_inflight(
+                    cache_key,
+                    future,
+                )
+            )
+
+        request_future: Future[BaseGrammarObject] = Future()
+        wait_started = time.perf_counter()
+
+        def finish_request(future: Future[BaseGrammarObject]) -> None:
+            if request_future.cancelled():
+                return
+            try:
+                prototype = future.result()
+                prototype_stats = prototype.grammar_stats
+                prototype_source = (
+                    prototype_stats.cache_source
+                    if prototype_stats is not None
+                    else "compile"
+                )
+                source = prototype_source if is_owner else "inflight"
+                request_future.set_result(
+                    self._copy_for_request(
+                        prototype,
+                        require_reasoning=require_reasoning,
+                        cache_source=source,
+                        resolution_time=time.perf_counter() - wait_started,
+                        preserve_compilation_time=is_owner,
+                    )
+                )
+            except BaseException as exc:
+                request_future.set_exception(exc)
+
+        shared_future.add_done_callback(finish_request)
+        return request_future, False
+
+    def _finish_inflight(
+        self,
+        key: Tuple[str, str],
+        future: Future[BaseGrammarObject],
+    ) -> None:
+        try:
+            prototype = future.result()
+        except BaseException:
+            with self._cache_lock:
+                self._inflight.pop(key, None)
+            return
+        with self._cache_lock:
+            self._inflight.pop(key, None)
+            self._set_cache_locked(key, prototype)
+
+    @staticmethod
+    def _copy_for_request(
+        prototype: BaseGrammarObject,
+        *,
+        require_reasoning: bool,
+        cache_source: str,
+        resolution_time: float,
+        preserve_compilation_time: bool,
+    ) -> BaseGrammarObject:
+        prototype_stats = getattr(prototype, "grammar_stats", None)
+        copied_value = prototype.copy()
+        copied_value.maybe_init_reasoning(require_reasoning)
+        copied_stats = getattr(copied_value, "grammar_stats", None)
+        if copied_stats is not None:
+            copied_stats.cache_source = cache_source
+            copied_stats.is_cache_hit = cache_source in {
+                "memory",
+                "disk",
+                "inflight",
+            }
+            copied_stats.cache_resolution_time = resolution_time
+            if not preserve_compilation_time:
+                copied_stats.compilation_time = None
+                copied_stats.cache_phase_seconds = {}
+            elif prototype_stats is not None:
+                copied_stats.compilation_time = prototype_stats.compilation_time
+                copied_stats.cache_lock_wait_time = prototype_stats.cache_lock_wait_time
+                copied_stats.cache_phase_seconds = dict(
+                    prototype_stats.cache_phase_seconds
+                )
+        return copied_value
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        key = self._normalize_cache_key(key)
+        with self._cache_lock:
+            self._set_cache_locked(key, value)
+
+    def _set_cache_locked(
+        self,
+        key: Tuple[str, str],
+        value: BaseGrammarObject,
+    ) -> None:
+        previous_size = self._cache_entry_bytes.pop(key, 0)
+        if key in self.cache:
+            self.cache.pop(key)
+        size = max(0, int(value.cache_memory_bytes()))
         self.cache[key] = value
+        self._cache_entry_bytes[key] = size
+        self._cache_bytes += size - previous_size
+        while (
+            self._cache_bytes > self.cache_limit_bytes
+            or len(self.cache) > self.cache_limit_entries
+        ):
+            evicted_key, _ = self.cache.popitem(last=False)
+            self._cache_bytes -= self._cache_entry_bytes.pop(evicted_key, 0)
 
     def reset(self):
-        self.cache.clear()
+        with self._cache_lock:
+            self.cache.clear()
+            self._cache_entry_bytes.clear()
+            self._cache_bytes = 0
 
 
 def register_vocab_mask_buffer(

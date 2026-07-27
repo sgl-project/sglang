@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillOutputWorkspace,
     SparsePrefillWorkspace,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -276,6 +277,47 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
+    def refresh_for_full_prefill_cuda_graph_replay_(
+        self, other: DSV4AttnMetadata
+    ) -> None:
+        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.page_size == other.page_size
+        assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
+
+        # A whole-forward graph captures every metadata tensor by address.
+        # Preserve those tensor owners and refresh only their contents. In
+        # particular, do not replace FlashMLASchedMeta: its lazily allocated
+        # scheduler tensors were created during capture and are graph inputs.
+        tensor_copy_fields = [
+            "raw_out_loc",
+            "seq_lens_casual",
+            "positions_casual",
+            "c4_out_loc",
+            "c128_out_loc",
+            "page_table",
+            "swa_page_indices",
+            "swa_topk_lengths",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+            "c4_topk_lengths_raw",
+            "c4_topk_lengths_clamp1",
+            "c4_sparse_topk_lengths",
+            "c4_sparse_page_indices",
+            "c4_sparse_raw_indices",
+        ]
+        for field_name in tensor_copy_fields:
+            src_val = getattr(other, field_name)
+            dst_val = getattr(self, field_name)
+            if src_val is None and dst_val is None:
+                continue
+            assert (
+                src_val is not None and dst_val is not None
+            ), f"{field_name=} {src_val=} {dst_val=}"
+            assert (
+                src_val.shape == dst_val.shape
+            ), f"{field_name=} {src_val.shape=} {dst_val.shape=}"
+            dst_val.copy_(src_val)
+
     def init_compression_metadata(self):
         assert self.page_table.dim() == 2
         assert (
@@ -424,6 +466,23 @@ class DSV4Metadata:
             )
         self.sparse_prefill_cache = None
 
+    def refresh_for_full_prefill_cuda_graph_replay_(
+        self, static_metadata: DSV4Metadata
+    ) -> None:
+        self.core_attn_metadata.refresh_for_full_prefill_cuda_graph_replay_(
+            static_metadata.core_attn_metadata
+        )
+        maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
+        maybe_copy_inplace(
+            self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
+        )
+        maybe_copy_inplace(
+            self.c128_compress_metadata, src=static_metadata.c128_compress_metadata
+        )
+        # Sparse-prefill's lazy workspace is deliberately excluded from full
+        # graph capture; losing such an owner would be a use-after-free.
+        assert self.sparse_prefill_cache is None
+
 
 @dataclass
 class DSV4RawVerifyMetadata:
@@ -438,6 +497,15 @@ class DSV4RawVerifyMetadata:
     extend_start_loc: Optional[torch.Tensor] = None
     verify_lens: Optional[torch.Tensor] = None
     total_verify_tokens: int = 0
+
+    # init_forward_metadata_in_graph materializes the full DSV4 metadata while
+    # CUDA capture is active. The graph retains only device addresses, not the
+    # Python tensor owners. Keep the captured object reachable from the raw
+    # per-shape metadata for the graph's entire lifetime; otherwise allocator
+    # reuse can turn c4_out_loc and the compressor plans into dangling pointers.
+    _captured_full_metadata: Optional[DSV4Metadata] = field(
+        default=None, repr=False, compare=False
+    )
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -461,6 +529,13 @@ class DSV4RawDecodeMetadata:
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
 
+    # See DSV4RawVerifyMetadata._captured_full_metadata. Decode graphs create
+    # the same address-captured C4/C128 metadata and require identical lifetime
+    # ownership.
+    _captured_full_metadata: Optional[DSV4Metadata] = field(
+        default=None, repr=False, compare=False
+    )
+
     def copy_(self, other: DSV4RawDecodeMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
@@ -471,6 +546,7 @@ class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
     DRAFT_EXTEND = "draft_extend"
+    PREFILL = "prefill"
 
     @classmethod
     def of(cls, forward_mode: ForwardMode) -> _GraphBucket:
@@ -480,6 +556,8 @@ class _GraphBucket(enum.Enum):
             return cls.TARGET_VERIFY
         if forward_mode.is_draft_extend_v2():
             return cls.DRAFT_EXTEND
+        if forward_mode.is_extend_without_speculative():
+            return cls.PREFILL
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
@@ -489,6 +567,17 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
+    # DSV4's measured useful TBO path is dense prefill. Decode and DSpark
+    # target verification retain their existing graph layouts (decode TBO
+    # regresses and compact-ragged verification has a different token axis).
+    tbo_supports_cuda_graph: bool = True
+    tbo_supports_decode_cuda_graph: bool = False
+    tbo_requires_decode_cuda_graph_state: bool = False
+    tbo_requires_global_cpu_seq_lens: bool = False
+
+    @staticmethod
+    def tbo_supports_cuda_graph_for(forward_mode: ForwardMode) -> bool:
+        return forward_mode.is_extend_without_speculative()
 
     def __init__(
         self,
@@ -563,6 +652,28 @@ class DeepseekV4AttnBackend(
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
+        self.is_draft_runner = model_runner.is_draft_worker
+        self.sparse_prefill_output_workspace: Optional[SparsePrefillOutputWorkspace] = (
+            None
+        )
+        if not self.is_draft_runner:
+            local_num_heads = model_runner.model_config.get_num_attention_heads(
+                get_parallel().attn_tp_size
+            )
+            self.sparse_prefill_output_workspace = SparsePrefillOutputWorkspace(
+                device=self.device,
+                capacity_tokens=model_runner.server_args.max_prefill_tokens,
+                num_heads=local_num_heads,
+                head_dim_v=self.head_dim_v,
+            )
+            logger.info(
+                "Reserved fixed FlashMLA sparse-prefill outputs: "
+                "tokens=%d heads=%d d_v=%d bytes=%d",
+                self.sparse_prefill_output_workspace.capacity_tokens,
+                local_num_heads,
+                self.head_dim_v,
+                self.sparse_prefill_output_workspace.reserved_bytes,
+            )
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda
             or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
@@ -570,7 +681,6 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
-        self.is_draft_runner = model_runner.is_draft_worker
         self.cuda_graph_custom_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -1096,14 +1206,23 @@ class DeepseekV4AttnBackend(
         # materialization is recorded inside the cuda graph; a no-op (Full
         # already) when PREP_IN_CUDA_GRAPH=0.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
-                raw_metadata=self.forward_metadata,
+            raw_metadata = self.forward_metadata
+            full_metadata = self.make_forward_metadata_from_raw_verify(
+                raw_metadata=raw_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
             )
+            # A CUDA graph owns addresses, not Python tensor lifetimes. Pin all
+            # dynamically materialized output-location and compressor-plan
+            # tensors on the persistent raw metadata object for this graph key.
+            raw_metadata._captured_full_metadata = full_metadata
+            self.forward_metadata = full_metadata
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
-                raw_metadata=self.forward_metadata,
+            raw_metadata = self.forward_metadata
+            full_metadata = self.make_forward_metadata_from_raw_decode(
+                raw_metadata=raw_metadata,
             )
+            raw_metadata._captured_full_metadata = full_metadata
+            self.forward_metadata = full_metadata
 
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
@@ -1169,6 +1288,10 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ) -> None:
+        # Prefill graphs are captured before the decode runner initializes its
+        # phase-specific CUDA-graph state. Create the shared metadata registry
+        # at its first use and preserve it when decode initialization follows.
+        self._ensure_cuda_graph_metadata_registry()
         bucket = _GraphBucket.of(forward_batch.forward_mode)
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -1328,6 +1451,33 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=out_cache_loc,
+            )
+        elif bucket == _GraphBucket.PREFILL:
+            # Full prefill graphs are keyed by both their fixed request slots
+            # and padded token bucket. Build graph-compatible metadata against
+            # those stable buffers, then refresh it in place before replay.
+            # Large DSV4 prefill uses a different sparse-attention path whose
+            # lazily built workspace is not replay-stable under a whole-forward
+            # graph; keep that optimized path eager instead of capturing an
+            # invalid graph.
+            num_tokens = forward_batch.positions.numel()
+            if (
+                num_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            ):
+                raise RuntimeError(
+                    "DSV4 full prefill CUDA graphs require the non-sparse "
+                    f"attention path, got {num_tokens=} and "
+                    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL="
+                    f"{envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()}"
+                )
+            assert forward_batch.out_cache_loc is not None
+            assert forward_batch.out_cache_loc.numel() == num_tokens
+            graph_key = (bs, num_tokens)
+            temp_metadata = self._build_forward_metadata(
+                forward_batch,
+                max_seq_len_override=chosen_max_seq_len,
+                use_prefill_cuda_graph=True,
             )
         else:
             self.online_c128_mtp.clear()
@@ -1494,11 +1644,13 @@ class DeepseekV4AttnBackend(
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+    def _ensure_cuda_graph_metadata_registry(self) -> None:
+        if hasattr(self, "cuda_graph_metadata_of_bucket_and_bs"):
+            return
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Union[int, Tuple[int, int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -1506,6 +1658,9 @@ class DeepseekV4AttnBackend(
                 ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
+        self._ensure_cuda_graph_metadata_registry()
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
@@ -1526,7 +1681,7 @@ class DeepseekV4AttnBackend(
 
     def replay_cuda_graph_metadata_from(
         self,
-        bs: int,
+        bs: Union[int, Tuple[int, int]],
         temp_metadata: Union[
             DSV4Metadata,
             DSV4RawVerifyMetadata,
@@ -1540,7 +1695,12 @@ class DeepseekV4AttnBackend(
             bucket_metadata[bs] = temp_metadata
             self.forward_metadata = temp_metadata
             return
-        chosen_metadata.copy_(temp_metadata)
+        if bucket == _GraphBucket.PREFILL:
+            assert isinstance(chosen_metadata, DSV4Metadata)
+            assert isinstance(temp_metadata, DSV4Metadata)
+            chosen_metadata.refresh_for_full_prefill_cuda_graph_replay_(temp_metadata)
+        else:
+            chosen_metadata.copy_(temp_metadata)
         self.forward_metadata = chosen_metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -1859,6 +2019,16 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
+        if self.sparse_prefill_output_workspace is None:
+            raise RuntimeError(
+                "DSV4 sparse prefill reached a draft worker; the fixed target "
+                "output workspace is mandatory"
+            )
+        out, max_logits, lse = self.sparse_prefill_output_workspace.get(
+            num_tokens=q_flat.shape[0],
+            num_heads=q_flat.shape[1],
+            head_dim_v=self.head_dim_v,
+        )
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -1867,6 +2037,9 @@ class DeepseekV4AttnBackend(
             d_v=self.head_dim_v,
             attn_sink=attn_sink,
             topk_length=combined_lens,
+            out=out,
+            max_logits=max_logits,
+            lse=lse,
         )
         return o
 

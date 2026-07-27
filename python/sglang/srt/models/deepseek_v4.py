@@ -705,8 +705,12 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        # Eager prefill has no padded attention-head output buffer to target.
+        # The fused kernel loads a complete head before storing and explicitly
+        # supports aliasing, so normalize/RoPE in place instead of allocating
+        # another full Q tensor (1 GiB at the 16K B300 prefill chunk).
         if q_out is None:
-            q_out = torch.empty_like(q)
+            q_out = q
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -2211,7 +2215,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -2219,10 +2223,17 @@ class DeepseekV4Model(nn.Module):
             _model_forward_tbo_merge_outputs,
         )
 
-        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
-        operations_strategy = OperationsStrategy.init_new_tbo(
-            layers, forward_batch.global_forward_mode
-        )
+        capture_layer_ids = set(self.dspark_layers_to_capture or [])
+        layer_groups = []
+        current_group = []
+        for layer_id in range(self.start_layer, self.end_layer):
+            current_group.append(self.layers[layer_id])
+            if layer_id in capture_layer_ids:
+                layer_groups.append((current_group, layer_id))
+                current_group = []
+        if current_group:
+            layer_groups.append((current_group, None))
+        assert layer_groups, "DSV4 TBO requires at least one local decoder layer"
 
         # Split the per-rank batch into the 2 ubatches (token-range slice + pad
         # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.
@@ -2246,24 +2257,29 @@ class DeepseekV4Model(nn.Module):
             tp_group = get_tp_group()
             world = tp_group.world_size
             children = forward_batch.tbo_children
-            local_lens = torch.tensor(
-                [int(c.tbo_padded_len) for c in children],
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
-            gathered = torch.empty(
-                (world, local_lens.shape[0]),
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
-            tp_group.all_gather_into_tensor(gathered, local_lens)
-            gathered_cpu = gathered.tolist()
+            if any(child.global_num_tokens_cpu is None for child in children):
+                local_lens = torch.tensor(
+                    [int(c.tbo_padded_len) for c in children],
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+                gathered = torch.empty(
+                    (world, local_lens.shape[0]),
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
+                tp_group.all_gather_into_tensor(gathered, local_lens)
+                gathered_cpu = gathered.tolist()
+                for idx, child in enumerate(children):
+                    sizes = [gathered_cpu[r][idx] for r in range(world)]
+                    child.global_num_tokens_cpu = sizes
+                    child.global_num_tokens_gpu = gathered[:, idx].contiguous()
+                    child.global_dp_buffer_len = sum(sizes)
+
             rank = tp_group.rank_in_group
-            for idx, child in enumerate(children):
-                sizes = [gathered_cpu[r][idx] for r in range(world)]
-                child.global_num_tokens_cpu = sizes
-                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
-                child.global_dp_buffer_len = sum(sizes)
+            for child in children:
+                sizes = child.global_num_tokens_cpu
+                assert sizes is not None and len(sizes) == world
                 # Gather the ubatch's input_ids -> global ONCE here (cached on the
                 # child) instead of per-layer in op_gather_a. The hash MoE reads
                 # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
@@ -2284,16 +2300,40 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
-        outputs_arr = execute_overlapped_operations(
-            inputs_arr=inputs_arr,
-            operations_arr=[operations_strategy.operations] * 2,
-            delta_stages=[0, operations_strategy.tbo_delta_stages],
-        )
+        dspark_aux_hidden_states = []
+        outputs_arr = inputs_arr
+
+        def merge_dspark_aux() -> torch.Tensor:
+            merged = hidden_states.new_zeros(
+                (hidden_states.shape[0], hidden_states.shape[-1])
+            )
+            for output in outputs_arr:
+                start, end = output["forward_batch"].tbo_parent_token_range
+                merged[start:end] = output["hidden_states"][: end - start].mean(dim=1)
+            return merged
+
+        for group_layers, captured_layer_id in layer_groups:
+            operations_strategy = OperationsStrategy.init_new_tbo(
+                group_layers, forward_batch.global_forward_mode
+            )
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=outputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
+            if captured_layer_id is not None:
+                dspark_aux_hidden_states.append(merge_dspark_aux())
 
         hidden_states, _ = _model_forward_tbo_merge_outputs(
             outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
         )
-        return hidden_states
+        if capture_layer_ids:
+            assert len(dspark_aux_hidden_states) == len(capture_layer_ids), (
+                "DSpark TBO did not capture every configured target layer: "
+                f"configured={sorted(capture_layer_ids)}, "
+                f"captured={len(dspark_aux_hidden_states)}"
+            )
+        return hidden_states, dspark_aux_hidden_states
 
     def forward(
         self,
@@ -2348,13 +2388,10 @@ class DeepseekV4Model(nn.Module):
                 "of them: DSpark static-verify is CP-off for v1."
             )
         dspark_aux_hidden_states: List[torch.Tensor] = []
-        # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
-        # execution cannot expose per-layer completed hidden states), so skip
-        # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if self._can_run_tbo(forward_batch):
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
-            hidden_states = self._forward_layers_tbo(
+            hidden_states, dspark_aux_hidden_states = self._forward_layers_tbo(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
@@ -2422,6 +2459,8 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    dynamic_kv_cache_scale_block_size = 64
+
     def __init__(
         self,
         config: DeepSeekV4Config,

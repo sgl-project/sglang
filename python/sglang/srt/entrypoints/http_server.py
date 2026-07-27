@@ -188,6 +188,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+SCHEDULER_HEALTH_MAX_STALENESS_SECONDS = 30.0
+SCHEDULER_HEALTH_MAX_FUTURE_SKEW_SECONDS = 5.0
 
 
 # Store global states
@@ -611,6 +613,63 @@ async def validate_json_request(raw_request: Request):
 
 
 ##### Native API endpoints #####
+
+
+@app.get("/health_scheduler")
+async def health_scheduler() -> Response:
+    """Check every DP scheduler without submitting an inference request."""
+
+    global_state = _global_state
+    if global_state is None:
+        return Response(status_code=503)
+
+    tokenizer_manager = global_state.tokenizer_manager
+    if tokenizer_manager.gracefully_exit:
+        logger.info("Scheduler health check received during shutdown. Returning 503.")
+        return Response(status_code=503)
+
+    if tokenizer_manager.server_status == ServerStatus.Starting:
+        return Response(status_code=503)
+
+    try:
+        snapshots = await tokenizer_manager.get_loads(include=["core"])
+    except Exception:
+        logger.exception("Scheduler health check could not read load snapshots")
+        return Response(status_code=503)
+
+    expected_ranks = set(range(tokenizer_manager.elastic_worker_count))
+    actual_ranks = [snapshot.dp_rank for snapshot in snapshots]
+    if len(actual_ranks) != len(expected_ranks) or set(actual_ranks) != expected_ranks:
+        logger.warning(
+            "Scheduler health check found DP ranks %s; expected %s",
+            sorted(actual_ranks),
+            sorted(expected_ranks),
+        )
+        return Response(status_code=503)
+
+    now = time.time()
+    for snapshot in snapshots:
+        if snapshot.timestamp <= 0:
+            logger.warning(
+                "Scheduler health check found an invalid timestamp for DP rank %s",
+                snapshot.dp_rank,
+            )
+            return Response(status_code=503)
+
+        age = now - snapshot.timestamp
+        if (
+            age > SCHEDULER_HEALTH_MAX_STALENESS_SECONDS
+            or age < -SCHEDULER_HEALTH_MAX_FUTURE_SKEW_SECONDS
+        ):
+            logger.warning(
+                "Scheduler health check found an out-of-range snapshot age "
+                "for DP rank %s: %.3fs",
+                snapshot.dp_rank,
+                age,
+            )
+            return Response(status_code=503)
+
+    return Response(status_code=200)
 
 
 @app.get("/health")

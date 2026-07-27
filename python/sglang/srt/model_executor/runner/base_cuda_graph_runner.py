@@ -56,7 +56,10 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, captured_req_width: int = 1
+    model_runner: ModelRunner,
+    captured_req_width: int = 1,
+    *,
+    enable_two_batch_overlap: bool | None = None,
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -72,7 +75,9 @@ def get_batch_sizes_to_capture(
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
-    if server_args.enable_two_batch_overlap:
+    if enable_two_batch_overlap is None:
+        enable_two_batch_overlap = server_args.enable_two_batch_overlap
+    if enable_two_batch_overlap:
         mul_base *= 2
         alignment_width = 1
 

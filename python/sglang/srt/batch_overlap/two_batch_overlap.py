@@ -41,7 +41,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
+from sglang.srt.utils import (
+    BumpAllocator,
+    empty_context,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -51,6 +57,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
+_tbo_max_prefill_tokens = get_int_env_var("SGLANG_TBO_MAX_PREFILL_TOKENS", 0)
 
 logger = logging.getLogger(__name__)
 
@@ -338,20 +345,31 @@ class TboCudaGraphRunnerPlugin:
             (2,), dtype=torch.int32, device=get_server_args().device
         )
 
-    def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+    def capture_one_batch_size(
+        self,
+        batch: ForwardBatch,
+        num_tokens: int,
+        *,
+        enabled: Optional[bool] = None,
+        attn_backend=None,
+    ):
+        if enabled is None:
+            enabled = is_tbo_enabled()
+        if not enabled or not batch.forward_mode.is_extend_without_speculative():
             return
-        token_num_per_seq = get_token_num_per_seq(
-            forward_mode=batch.forward_mode, spec_info=batch.spec_info
-        )
+        if _tbo_max_prefill_tokens > 0 and num_tokens > _tbo_max_prefill_tokens:
+            raise RuntimeError(
+                "prefill CUDA-graph TBO capture exceeds the configured dense "
+                f"ceiling: tokens={num_tokens}, "
+                f"limit={_tbo_max_prefill_tokens}"
+            )
 
         batch.tbo_split_seq_index = compute_split_seq_index(
             forward_mode=batch.forward_mode,
             num_tokens=num_tokens,
-            extend_lens=None,
-            token_num_per_seq=token_num_per_seq,
+            extend_lens=batch.extend_seq_lens_cpu,
+            token_num_per_seq=None,
         )
-        # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
 
         self._tbo_children_num_token_non_padded[...] = (
@@ -361,6 +379,46 @@ class TboCudaGraphRunnerPlugin:
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
+            attn_backend=attn_backend,
+        )
+        # Full prefill graphs use a fixed request axis.  The capture batch has
+        # one real sequence followed by zero-length sentinels, so a two-chunk
+        # split naturally gives child A one slot and child B every slot.  Pad
+        # child A to the same fixed geometry: replay can then refresh both
+        # child attention plans for arbitrary live request layouts without
+        # changing any captured tensor shape.
+        for child in batch.tbo_children:
+            TboForwardBatchPreparer.pad_sequence_axis_for_cuda_graph(
+                child,
+                target_batch_size=batch.batch_size,
+            )
+        # Full DP prefill graphs execute a fixed token bucket on every rank.
+        # Seed each child's fixed DP geometry before capture so model.forward
+        # never needs a CUDA->host size gather while the stream is recording.
+        if batch.global_num_tokens_cpu is not None:
+            world = len(batch.global_num_tokens_cpu)
+            for child in batch.tbo_children:
+                rows = int(child.tbo_padded_len)
+                child.global_num_tokens_cpu = [rows] * world
+                child.global_num_tokens_gpu = (
+                    torch.full_like(batch.global_num_tokens_gpu, rows)
+                    if batch.global_num_tokens_gpu is not None
+                    else None
+                )
+                child.global_dp_buffer_len = rows * world
+
+    def replay_prepare_prefill(
+        self,
+        *,
+        split_token_index: int,
+        num_token_non_padded: int,
+    ) -> None:
+        """Refresh graph-captured child logical token counts for prefill."""
+        self._tbo_children_num_token_non_padded[...] = (
+            TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
+                tbo_split_token_index=split_token_index,
+                num_token_non_padded=num_token_non_padded,
+            )
         )
 
     def replay_prepare(
@@ -410,19 +468,22 @@ class TboDPAttentionPreparer:
             return False, self._compute_local_forward_mode(local_batch)
 
         if local_batch is not None:
+            is_real_prefill = local_batch.forward_mode.is_extend_without_speculative()
+            within_prefill_limit = (
+                _tbo_max_prefill_tokens <= 0
+                or local_batch.extend_num_tokens <= _tbo_max_prefill_tokens
+            )
+            if not is_real_prefill or not within_prefill_limit:
+                self.local_tbo_split_seq_index = None
+                local_can_run_tbo = False
+                local_forward_mode = self._compute_local_forward_mode(local_batch)
+                return local_can_run_tbo, local_forward_mode
+
             token_num_per_seq = get_token_num_per_seq(
                 forward_mode=local_batch.forward_mode, spec_info=local_batch.spec_info
             )
 
-            if (
-                local_batch.forward_mode.is_target_verify()
-                or local_batch.forward_mode.is_decode()
-            ):
-                num_tokens = local_batch.batch_size() * token_num_per_seq
-            elif local_batch.forward_mode.is_prebuilt():
-                num_tokens = 0
-            else:
-                num_tokens = local_batch.extend_num_tokens
+            num_tokens = local_batch.extend_num_tokens
             self.local_tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=local_batch.forward_mode,
                 num_tokens=num_tokens,
@@ -449,8 +510,14 @@ class TboDPAttentionPreparer:
     def compute_output(self, partial_global_info):
         # Perform only one Device-to-Host (D2H) memory copy
         cpu_data = partial_global_info[:, :2].cpu()
-        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
-        forward_modes = cpu_data[:, 1].tolist()
+        return self.compute_output_from_values(
+            local_can_run_tbo=cpu_data[:, 0].tolist(),
+            forward_modes=cpu_data[:, 1].tolist(),
+        )
+
+    def compute_output_from_values(self, local_can_run_tbo, forward_modes):
+        """Resolve TBO from already-host-resident native DP sync values."""
+        local_can_run_tbo_aggregated = min(local_can_run_tbo)
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -514,7 +581,11 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def prepare_raw(
-        cls, batch: ForwardBatch, tbo_children_num_token_non_padded: torch.Tensor
+        cls,
+        batch: ForwardBatch,
+        tbo_children_num_token_non_padded: torch.Tensor,
+        *,
+        attn_backend=None,
     ):
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
@@ -538,7 +609,8 @@ class TboForwardBatchPreparer:
 
         # Sanity check: the global attn_backend should be a TboAttnBackend
         # whose children handle the two halves.
-        attn_backend = get_attn_backend()
+        if attn_backend is None:
+            attn_backend = get_attn_backend()
         assert isinstance(attn_backend, TboAttnBackend)
 
         [out_num_token_non_padded_a, out_num_token_non_padded_b] = (
@@ -818,6 +890,57 @@ class TboForwardBatchPreparer:
             raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
 
         return ForwardBatch(**output_dict)
+
+    @staticmethod
+    def pad_sequence_axis_for_cuda_graph(
+        batch: ForwardBatch,
+        *,
+        target_batch_size: int,
+    ) -> None:
+        """Pad a TBO child to a graph-stable request axis with zero sentinels."""
+        current_batch_size = batch.batch_size
+        if current_batch_size == target_batch_size:
+            return
+        if current_batch_size > target_batch_size:
+            raise RuntimeError(
+                "TBO CUDA-graph child request axis exceeds its parent: "
+                f"child={current_batch_size}, parent={target_batch_size}"
+            )
+
+        pad = target_batch_size - current_batch_size
+        token_end = batch.input_ids.shape[0]
+        tensor_fill = {
+            "req_pool_indices": 0,
+            "seq_lens": 0,
+            "seq_lens_cpu": 0,
+            "orig_seq_lens": 0,
+            "extend_seq_lens": 0,
+            "extend_prefix_lens": 0,
+            "extend_start_loc": token_end,
+        }
+        for field, fill_value in tensor_fill.items():
+            value = getattr(batch, field, None)
+            if value is None:
+                continue
+            padding = torch.full(
+                (pad, *value.shape[1:]),
+                fill_value,
+                dtype=value.dtype,
+                device=value.device,
+            )
+            setattr(batch, field, torch.cat((value, padding), dim=0))
+
+        list_fill = {
+            "extend_seq_lens_cpu": 0,
+            "extend_prefix_lens_cpu": 0,
+            "extend_logprob_start_lens_cpu": 0,
+        }
+        for field, fill_value in list_fill.items():
+            value = getattr(batch, field, None)
+            if value is not None:
+                setattr(batch, field, [*value, *([fill_value] * pad)])
+
+        batch.batch_size = target_batch_size
 
     @classmethod
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):

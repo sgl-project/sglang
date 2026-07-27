@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    ShutdownReq,
     sock_recv,
     sock_send,
 )
@@ -142,6 +143,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.gracefully_exit = False
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -159,19 +161,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (ShutdownReq, self.handle_shutdown_req),
                 (ConfigureLoggingReq, self.handle_configure_logging_req),
             ]
         )
 
     def event_loop(self):
         """The event loop that handles requests"""
-        while True:
+        while not self.gracefully_exit:
             with self.soft_watchdog.disable():
                 recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
+
+    def handle_shutdown_req(self, recv_req: ShutdownReq):
+        logger.info("Detokenizer received graceful shutdown request.")
+        self.gracefully_exit = True
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool

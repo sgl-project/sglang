@@ -214,8 +214,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             model_runner.server_args.enable_dp_attention or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = (
-            model_runner.server_args.enable_two_batch_overlap
+        configured_tbo = model_runner.server_args.enable_two_batch_overlap
+        decode_attn_backend = attn_backend or model_runner.attn_backend
+        decode_attn_backend = getattr(
+            decode_attn_backend, "primary", decode_attn_backend
+        )
+        self.enable_two_batch_overlap = configured_tbo and getattr(
+            decode_attn_backend, "tbo_supports_decode_cuda_graph", True
         )
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         if self.use_ngram_embedding:
@@ -275,7 +280,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.captured_req_width
+            model_runner,
+            self.captured_req_width,
+            enable_two_batch_overlap=self.enable_two_batch_overlap,
         )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -831,7 +838,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
             self.enable_torch_compile = False
             _, self.compile_bs = get_batch_sizes_to_capture(
-                self.model_runner, self.captured_req_width
+                self.model_runner,
+                self.captured_req_width,
+                enable_two_batch_overlap=self.enable_two_batch_overlap,
             )
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:

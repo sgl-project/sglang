@@ -338,25 +338,51 @@ class DraftBlockProposer:
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        global_bs = max(int(num_reqs) for num_reqs in batch.global_num_tokens)
+        if global_bs == 0:
+            return
+
+        # An IDLE ForwardBatch selects the ordinary one-token decode graph,
+        # while the peer runs the gamma-wide DSpark draft TARGET_VERIFY graph.
+        # Those graphs contain different DP all-gather geometries; once a DP
+        # rank drains before its peer, launching them at the same collective
+        # sequence deadlocks both GPUs. Materialize the idle rank as a full
+        # dummy draft tier so graph selection, token width, and every in-graph
+        # collective exactly match the active rank. Slot/cache index zero is
+        # the allocator's reserved dummy target.
         device = self.draft_model_runner.device
-        empty_long = torch.empty((0,), dtype=torch.int64, device=device)
+        num_dummy_tokens = global_bs * self.gamma
+        dummy_tokens = torch.full(
+            (num_dummy_tokens,),
+            int(self._mask_token_id),
+            dtype=torch.int64,
+            device=device,
+        )
+        dummy_slots = torch.zeros((global_bs,), dtype=torch.int64, device=device)
+        dummy_seq_lens = torch.ones((global_bs,), dtype=torch.int64, device=device)
         idle_batch = ForwardBatch(
-            forward_mode=ForwardMode.IDLE,
-            batch_size=0,
-            input_ids=empty_long,
-            req_pool_indices=empty_long,
-            seq_lens=empty_long,
-            out_cache_loc=empty_long,
-            seq_lens_sum=0,
-            seq_lens_cpu=torch.empty((0,), dtype=torch.int64),
-            positions=empty_long,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=global_bs,
+            input_ids=dummy_tokens,
+            req_pool_indices=dummy_slots,
+            seq_lens=dummy_seq_lens,
+            out_cache_loc=torch.zeros_like(dummy_tokens),
+            seq_lens_sum=global_bs * (self.gamma + 1),
+            seq_lens_cpu=torch.full((global_bs,), self.gamma + 1, dtype=torch.int64),
+            positions=torch.zeros_like(dummy_tokens),
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
-            self.draft_model_runner.forward(idle_batch)
+            idle_out = self.draft_model_runner.forward(idle_batch)
+        if not idle_out.can_run_graph:
+            raise RuntimeError(
+                "DSpark DP idle draft participation missed the required CUDA "
+                f"graph for {global_bs=} and gamma={self.gamma}; an eager idle "
+                "forward cannot safely share collectives with an active graph."
+            )
 
     def _run_forward(
         self,
@@ -430,6 +456,7 @@ class DraftBlockProposer:
     ) -> None:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         gnt, gnt_logprob = spec_scale_global_num_tokens(
             self._draft_block_spec_info,
             batch.global_num_tokens,

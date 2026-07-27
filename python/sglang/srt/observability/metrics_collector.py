@@ -302,6 +302,39 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.scheduler_phase_seconds_total = Counter(
+            name="sglang:scheduler_phase_seconds_total",
+            documentation=(
+                "Cumulative scheduler-thread wall time by phase. The phases "
+                "partition the overlap event loop except that loop_total is "
+                "also emitted as an authoritative end-to-end total."
+            ),
+            labelnames=[*labels.keys(), "phase"],
+        )
+        self.scheduler_phase_calls_total = Counter(
+            name="sglang:scheduler_phase_calls_total",
+            documentation="Number of scheduler-thread phase executions.",
+            labelnames=[*labels.keys(), "phase"],
+        )
+        self.scheduler_phase_max_seconds = Gauge(
+            name="sglang:scheduler_phase_max_seconds",
+            documentation=(
+                "Maximum scheduler-thread phase wall time in the latest "
+                "one-second reporting window."
+            ),
+            labelnames=[*labels.keys(), "phase"],
+            multiprocess_mode="mostrecent",
+        )
+        self.runtime_gc_frozen = Gauge(
+            name="sglang:runtime_gc_frozen",
+            documentation=(
+                "1 after the warmed scheduler object graph has been moved to "
+                "Python's permanent GC generation, else 0."
+            ),
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.runtime_gc_frozen.labels(**labels).set(0)
 
         # =================================================================
         # Memory pool usage ratios
@@ -786,6 +819,79 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of the total grammar requests.",
             labelnames=labels.keys(),
         )
+        self.grammar_cache_lookup_total = Counter(
+            name="sglang:grammar_cache_lookup_total",
+            documentation=(
+                "Grammar cache resolutions by source: compile, local_compile, "
+                "disk, inflight, or memory."
+            ),
+            labelnames=list(labels.keys()) + ["source"],
+        )
+        grammar_cache_time_buckets = [
+            0.0,
+            0.00001,
+            0.00002,
+            0.00005,
+            0.0001,
+            0.0002,
+            0.0005,
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+        ]
+        self.grammar_cache_resolution_time = Histogram(
+            name="sglang:grammar_cache_resolution_time_seconds",
+            documentation="End-to-end grammar cache resolution latency.",
+            labelnames=list(labels.keys()) + ["source"],
+            buckets=grammar_cache_time_buckets,
+        )
+        self.grammar_cache_lock_wait_time = Histogram(
+            name="sglang:grammar_cache_lock_wait_time_seconds",
+            documentation="Cross-process persistent grammar cache lock wait time.",
+            labelnames=labels.keys(),
+            buckets=grammar_cache_time_buckets,
+        )
+        self.grammar_cache_phase_time = Histogram(
+            name="sglang:grammar_cache_phase_time_seconds",
+            documentation="Internal persistent grammar cache phase latency.",
+            labelnames=list(labels.keys()) + ["phase"],
+            buckets=grammar_cache_time_buckets,
+        )
+        self.dspark_grammar_pipeline_seconds = Histogram(
+            name="sglang:dspark_grammar_pipeline_seconds",
+            documentation=(
+                "Post-launch wall latency of each DSpark grammar "
+                "pipeline phase; phases overlap target verification."
+            ),
+            labelnames=list(labels.keys()) + ["phase"],
+            buckets=grammar_cache_time_buckets,
+        )
+        self.dspark_grammar_active_matchers = Histogram(
+            name="sglang:dspark_grammar_active_matchers",
+            documentation="Native XGrammar matchers traversed per DSpark decode step.",
+            labelnames=labels.keys(),
+            buckets=[0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512],
+        )
+        self.dspark_grammar_batch_size = Histogram(
+            name="sglang:dspark_grammar_batch_size",
+            documentation="Requests in each structured DSpark decode step.",
+            labelnames=labels.keys(),
+            buckets=[1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256, 384, 512],
+        )
+        self.dspark_grammar_steps_total = Counter(
+            name="sglang:dspark_grammar_steps_total",
+            documentation="Optimized DSpark grammar steps by mask outcome.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
         self.grammar_schema_count = Histogram(
             name="sglang:grammar_schema_count",
             documentation="Histogram of grammar schema count.",
@@ -896,6 +1002,93 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 "Refer to ForwardMode for category labels."
             ),
             labelnames=list(labels.keys()) + ["category"],
+        )
+        self.prefill_graph_admissions_total = Counter(
+            name="sglang:prefill_graph_admissions_total",
+            documentation=(
+                "Prefill batches by CUDA graph admission outcome and captured "
+                "token bucket. bucket='none' denotes eager execution."
+            ),
+            labelnames=list(labels.keys()) + ["outcome", "bucket"],
+        )
+        self.prefill_graph_shapes_total = Counter(
+            name="sglang:prefill_graph_shapes_total",
+            documentation=(
+                "Full-prefill CUDA graph admissions jointly classified by "
+                "captured token bucket and bounded request-slot shape."
+            ),
+            labelnames=list(labels.keys()) + ["bucket", "request_slots"],
+        )
+        self.prefill_execution_tokens_total = Counter(
+            name="sglang:prefill_execution_tokens_total",
+            documentation=(
+                "Scheduled and actually executed prefill token-axis elements "
+                "by graph/eager path and capture bucket. Their ratio exposes "
+                "graph padding cost at the exact shape that caused it."
+            ),
+            labelnames=list(labels.keys()) + ["path", "kind", "bucket"],
+        )
+        prefill_token_buckets = (
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            96,
+            128,
+            192,
+            256,
+            384,
+            512,
+            768,
+            1024,
+            1536,
+            2048,
+            3072,
+            4096,
+            6144,
+            8192,
+            12288,
+            16384,
+        )
+        self.prefill_batch_scheduled_tokens = Histogram(
+            name="sglang:prefill_batch_scheduled_tokens",
+            documentation="Local scheduled tokens in each prefill batch.",
+            labelnames=list(labels.keys()) + ["path"],
+            buckets=prefill_token_buckets,
+        )
+        self.prefill_batch_requests = Histogram(
+            name="sglang:prefill_batch_requests",
+            documentation="Local request count in each prefill batch.",
+            labelnames=list(labels.keys()) + ["path"],
+            # Include each captured request-slot boundary and its immediate
+            # predecessor. Their cumulative-bucket difference proves that a
+            # live batch exercised the exact shape instead of merely landing
+            # somewhere below it.
+            buckets=(
+                1,
+                2,
+                3,
+                4,
+                7,
+                8,
+                15,
+                16,
+                31,
+                32,
+                63,
+                64,
+                95,
+                96,
+                127,
+                128,
+                191,
+                192,
+                255,
+                256,
+            ),
         )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
@@ -1154,6 +1347,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
 
+    def add_scheduler_phase(
+        self,
+        phase: str,
+        duration_seconds: float,
+        calls: int,
+        max_seconds: float,
+    ) -> None:
+        labels = {**self.labels, "phase": phase}
+        self.scheduler_phase_seconds_total.labels(**labels).inc(duration_seconds)
+        self.scheduler_phase_calls_total.labels(**labels).inc(calls)
+        self.scheduler_phase_max_seconds.labels(**labels).set(max_seconds)
+
+    def set_runtime_gc_frozen(self) -> None:
+        self.runtime_gc_frozen.labels(**self.labels).set(1)
+
     def observe_weight_load(self, duration_seconds: float, source: str) -> None:
         # Edge-triggered: engine is paused during the update, so log_stats
         # won't fire — write the gauge inline at end of update_weights_from_*.
@@ -1206,6 +1414,42 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
         mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def observe_prefill_execution(
+        self,
+        *,
+        outcome: str,
+        scheduled_tokens: int,
+        executed_tokens: int,
+        requests: int,
+        bucket_tokens: int,
+    ) -> None:
+        path = "cuda_graph" if outcome == "cuda_graph" else "eager"
+        bucket = str(bucket_tokens) if bucket_tokens > 0 else "none"
+        self.prefill_graph_admissions_total.labels(
+            **self.labels, outcome=outcome, bucket=bucket
+        ).inc(1)
+        if outcome == "cuda_graph":
+            request_slots = (
+                str(requests)
+                if requests in (0, 1, 2, 4, 8, 16, 32, 64, 96, 128, 192, 256)
+                else "other"
+            )
+            self.prefill_graph_shapes_total.labels(
+                **self.labels,
+                bucket=bucket,
+                request_slots=request_slots,
+            ).inc(1)
+        self.prefill_execution_tokens_total.labels(
+            **self.labels, path=path, kind="scheduled", bucket=bucket
+        ).inc(scheduled_tokens)
+        self.prefill_execution_tokens_total.labels(
+            **self.labels, path=path, kind="executed", bucket=bucket
+        ).inc(executed_tokens)
+        self.prefill_batch_scheduled_tokens.labels(**self.labels, path=path).observe(
+            scheduled_tokens
+        )
+        self.prefill_batch_requests.labels(**self.labels, path=path).observe(requests)
 
     def increment_eplb_balancedness(
         self, forward_mode: str, balancedness: float
@@ -1396,7 +1640,58 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.num_grammar_timeout.labels(**self.labels).inc(
                 grammar_stats.num_timeout
             )
+        source = grammar_stats.cache_source
+        self.grammar_cache_lookup_total.labels(
+            **self.labels,
+            source=source,
+        ).inc(1)
+        if grammar_stats.cache_resolution_time is not None:
+            self.grammar_cache_resolution_time.labels(
+                **self.labels,
+                source=source,
+            ).observe(grammar_stats.cache_resolution_time)
+        if grammar_stats.cache_lock_wait_time is not None:
+            self._log_histogram(
+                self.grammar_cache_lock_wait_time,
+                grammar_stats.cache_lock_wait_time,
+            )
+        for phase, phase_seconds in grammar_stats.cache_phase_seconds.items():
+            self.grammar_cache_phase_time.labels(
+                **self.labels,
+                phase=phase,
+            ).observe(phase_seconds)
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def observe_dspark_grammar_step(
+        self,
+        *,
+        batch_size: int,
+        active_matchers: int,
+        outcome_counts: Dict[str, int],
+        phase_seconds: Dict[str, float],
+    ) -> None:
+        self._log_histogram(self.dspark_grammar_batch_size, batch_size)
+        self._log_histogram(
+            self.dspark_grammar_active_matchers,
+            active_matchers,
+        )
+        for outcome, count in outcome_counts.items():
+            if count > 0:
+                self.dspark_grammar_steps_total.labels(
+                    **self.labels,
+                    outcome=outcome,
+                ).inc(count)
+        for phase, seconds in phase_seconds.items():
+            self.dspark_grammar_pipeline_seconds.labels(
+                **self.labels,
+                phase=phase,
+            ).observe(seconds)
+
+    def observe_dspark_grammar_gpu_gap(self, *, seconds: float) -> None:
+        self.dspark_grammar_pipeline_seconds.labels(
+            **self.labels,
+            phase="gpu_target_to_mask_ready",
+        ).observe(seconds)
 
     def emit_constants(
         self,
@@ -1869,9 +2164,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1949,6 +2246,44 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
+        self.hicache_backup_duration_seconds = Histogram(
+            name="sglang:hicache_backup_duration_seconds",
+            documentation="GPU duration of asynchronous HiCache D-to-H backups.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+        self.hicache_backup_num_tokens = Counter(
+            name="sglang:hicache_backup_tokens_total",
+            documentation="The number of tokens backed up from GPU to host HiCache.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_scheduler_phase_seconds_total = Counter(
+            name="sglang:hicache_scheduler_phase_seconds_total",
+            documentation=(
+                "Scheduler-thread wall time spent in HiCache control phases."
+            ),
+            labelnames=[*labels.keys(), "phase"],
+        )
+        self.hicache_scheduler_phase_calls_total = Counter(
+            name="sglang:hicache_scheduler_phase_calls_total",
+            documentation="Number of HiCache scheduler control-phase executions.",
+            labelnames=[*labels.keys(), "phase"],
+        )
+        self.hicache_scheduler_phase_max_seconds = Gauge(
+            name="sglang:hicache_scheduler_phase_max_seconds",
+            documentation=(
+                "Maximum HiCache scheduler control-phase wall time in the "
+                "latest one-second reporting window."
+            ),
+            labelnames=[*labels.keys(), "phase"],
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_pending_operations = Gauge(
+            name="sglang:hicache_pending_operations",
+            documentation="Current number of pending HiCache operations by kind.",
+            labelnames=[*labels.keys(), "kind"],
+            multiprocess_mode="mostrecent",
+        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
@@ -1961,6 +2296,35 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_hicache_backup(
+        self, num_tokens: int, duration_seconds: Optional[float]
+    ) -> None:
+        self.hicache_backup_num_tokens.labels(**self.labels).inc(num_tokens)
+        if duration_seconds is not None:
+            self.hicache_backup_duration_seconds.labels(**self.labels).observe(
+                duration_seconds
+            )
+
+    def observe_hicache_scheduler_phase(
+        self,
+        phase: str,
+        duration_seconds: float,
+        calls: int,
+        max_seconds: float,
+    ) -> None:
+        labels = {**self.labels, "phase": phase}
+        self.hicache_scheduler_phase_seconds_total.labels(**labels).inc(
+            duration_seconds
+        )
+        self.hicache_scheduler_phase_calls_total.labels(**labels).inc(calls)
+        self.hicache_scheduler_phase_max_seconds.labels(**labels).set(max_seconds)
+
+    def set_hicache_pending_operations(self, kind: str, count: int) -> None:
+        self.hicache_pending_operations.labels(
+            **self.labels,
+            kind=kind,
+        ).set(count)
 
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):

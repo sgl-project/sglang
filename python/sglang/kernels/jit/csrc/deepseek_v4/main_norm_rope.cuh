@@ -65,8 +65,12 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
 // ============================================================================
 
 struct FusedQNormRopeParams {
-  const void* __restrict__ q_input;     // (B, num_q_heads, kHeadDim) DType
-  void* __restrict__ q_output;          // (B, num_q_heads, kHeadDim) DType
+  // q_input and q_output may alias for the allocation-free eager-prefill
+  // path. Every warp loads its complete input head into registers before its
+  // first output store, so exact in-place execution is safe. Do not mark this
+  // pair restrict: doing so would make the intentional alias undefined.
+  const void* q_input;                  // (B, num_q_heads, kHeadDim) DType
+  void* q_output;                       // (B, num_q_heads, kHeadDim) DType
   const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32 (re/im interleaved)
   const void* __restrict__ positions;   // (B,) PosT
   int64_t q_input_stride_batch;

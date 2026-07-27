@@ -114,6 +114,14 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   return val;
 }
 
+SGL_DEVICE void fail_prefill_plan_bounds() {
+#ifndef USE_ROCM
+  __trap();
+#else
+  __builtin_trap();
+#endif
+}
+
 __global__ __launch_bounds__(1024, 1)  //
     void plan_compress_prefill_kernel0(const Prefill0Params params) {
   using namespace device;
@@ -154,6 +162,9 @@ __global__ __launch_bounds__(1024, 1)  //
     warp_max[tx] = 0;
     warp_min[tx] = 0xFFFFFFFFu;
   }
+  // Warp i may otherwise publish its reduction before warp 0 has initialized
+  // warp_{min,max}[i], allowing the initializer to clobber the result.
+  __syncthreads();
 
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
@@ -171,16 +182,16 @@ __global__ __launch_bounds__(1024, 1)  //
   const auto num_q = params.num_q_tokens;
   // MTP-uniform: every batch shares the same small extend_len `E`, so we can decompose
   // a global token id `k` into (batch_id, j) = (k / E, k % E) and skip the per-batch loop.
-  const bool is_mtp_extend = (s_min_extend == s_max_extend) && (s_max_extend > 0) && (s_max_extend <= 32);
+  // The product check is also a fail-safe against a corrupted min/max result:
+  // the fast path must cover exactly the allocated ragged-token domain.
+  const bool is_mtp_extend = (s_min_extend == s_max_extend) && (s_max_extend > 0) && (s_max_extend <= 32) &&
+                             (static_cast<uint64_t>(params.batch_size) * s_max_extend == num_q);
 
   // === Stage C: emit valid plans, slot allocation via shared-mem atomicAdd ===
   if (is_mtp_extend) {
     // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
     const uint32_t E = s_max_extend;
-    // num_q is the padded buffer size (graph bucket), not the work size: cap the
-    // loop at the real token count so batch_id = k / E stays < batch_size on an
-    // underfilled replay; Stage D pads [counter, num_q) with invalid.
-    const uint32_t num_real_q = params.batch_size * E;
+    const uint32_t num_real_q = num_q;
     for (uint32_t k = tx; k < num_real_q; k += block_size) {
       const uint32_t batch_id = k / E;
       const uint32_t j = k % E;
@@ -192,6 +203,7 @@ __global__ __launch_bounds__(1024, 1)  //
       if ((position + 1) % cr == 0) {
         const int32_t buffer_len = window_size - min(static_cast<int32_t>(j) + 1, window_size);
         const uint32_t out_idx = atomicAdd(&counter_c, 1u);
+        if (out_idx >= num_q) fail_prefill_plan_bounds();
         params.plan_c[out_idx] = {
             .seq_len = static_cast<uint32_t>(position + 1),
             .ragged_id = static_cast<uint16_t>(ragged_id),
@@ -207,6 +219,7 @@ __global__ __launch_bounds__(1024, 1)  //
       if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
       if (do_write) {
         const uint32_t out_idx = atomicAdd(&counter_w, 1u);
+        if (out_idx >= num_q) fail_prefill_plan_bounds();
         params.plan_w[out_idx] = pack_w(ragged_id, batch_id, position + 1);
       }
     }
@@ -227,6 +240,7 @@ __global__ __launch_bounds__(1024, 1)  //
         if ((position + 1) % cr == 0) {
           const int32_t buffer_len = window_size - min(j + 1, window_size);
           const uint32_t out_idx = atomicAdd(&counter_c, 1u);
+          if (out_idx >= num_q) fail_prefill_plan_bounds();
           params.plan_c[out_idx] = {
               .seq_len = static_cast<uint32_t>(position + 1),
               .ragged_id = static_cast<uint16_t>(ragged_id),
@@ -240,11 +254,15 @@ __global__ __launch_bounds__(1024, 1)  //
         if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
         if (do_write) {
           const uint32_t out_idx = atomicAdd(&counter_w, 1u);
+          if (out_idx >= num_q) fail_prefill_plan_bounds();
           params.plan_w[out_idx] = pack_w(ragged_id, static_cast<uint32_t>(batch_id), position + 1);
         }
       }
       base_e += static_cast<uint32_t>(el);
     }
+    // num_q can be a larger CUDA-graph token bucket; Stage D intentionally
+    // pads [base_e, num_q) with invalid records. Only overflow is illegal.
+    if (tx == 0 && base_e > num_q) fail_prefill_plan_bounds();
   }
   __syncthreads();
 
@@ -504,7 +522,11 @@ inline PrefillPlan plan_compress_prefill(
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  // The GPU planner accepts fixed request axes containing zero-length graph
+  // sentinels, so batch_size can legitimately exceed the child token bucket.
+  // kernel0 validates the stronger invariant sum(extend_lens) <= num_q_tokens
+  // on device before any out-of-bounds plan write is possible.
+  RuntimeCheck(num_q_tokens <= kMaxTokens);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 
@@ -556,6 +578,9 @@ inline PrefillPlan plan_compress_prefill(
     LaunchKernel(num_blocks_1, block_size_1, device)(plan_compress_prefill_kernel_1, params1);
     return PrefillPlan{std::move(C), std::move(W)};
   }
+
+  // The CPU planner still requires one or more query tokens per request.
+  RuntimeCheck(batch_size <= num_q_tokens);
 
   // CPU input path: only here do we need the pinned scratch buffer.
   const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);

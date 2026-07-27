@@ -15,6 +15,8 @@ Usage:
     python -m pytest test_base_grammar_backend.py -v
 """
 
+import os
+import threading
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -31,6 +33,35 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
+
+
+class _SizedGrammar(BaseGrammarObject):
+    def __init__(self, value: str, size: int):
+        super().__init__()
+        self.value = value
+        self.size = size
+        self.grammar_stats = GrammarStats()
+
+    def copy(self):
+        return _SizedGrammar(self.value, self.size)
+
+    def cache_memory_bytes(self):
+        return self.size
+
+
+class _BlockingGrammarBackend(BaseGrammarBackend):
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.compile_count = 0
+        super().__init__()
+
+    def dispatch_json(self, key_string):
+        self.compile_count += 1
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test did not release grammar compilation")
+        return _SizedGrammar(key_string, 8)
 
 
 class TestGrammarStats(unittest.TestCase):
@@ -180,27 +211,67 @@ class TestBaseGrammarBackend(unittest.TestCase):
         result = self.backend._init_value_dispatch(("json", "schema"), False)
         self.assertIsNone(result)
 
-    def test_cache_miss_duplicate_key_submits_separate_futures(self):
-        """Two cache misses for the same key each get their own Future.
-
-        The backend does not deduplicate in-flight compilations — that is
-        handled at the GrammarManager level via grammar_queue. Each call
-        to get_cached_or_future_value with an uncached key submits a new
-        task to the executor."""
-        key = ("json", "schema")
-        result1, hit1 = self.backend.get_cached_or_future_value(key, False)
-        result2, hit2 = self.backend.get_cached_or_future_value(key, False)
+    def test_cache_miss_duplicate_key_shares_compilation(self):
+        backend = _BlockingGrammarBackend()
+        self.addCleanup(backend.executor.shutdown, wait=True)
+        pretty = '{"type": "object", "properties": {"x": {"type": "string"}}}'
+        compact = '{"type":"object","properties":{"x":{"type":"string"}}}'
+        result1, hit1 = backend.get_cached_or_future_value(
+            ("json", pretty), require_reasoning=False
+        )
+        self.assertTrue(backend.started.wait(timeout=5))
+        result2, hit2 = backend.get_cached_or_future_value(
+            ("json", compact), require_reasoning=False
+        )
 
         self.assertFalse(hit1)
         self.assertFalse(hit2)
         self.assertIsInstance(result1, Future)
         self.assertIsInstance(result2, Future)
-        # They are independent futures, not shared
+        # Each request gets an independently cancellable wrapper.
         self.assertIsNot(result1, result2)
 
-        # Both should complete successfully
-        self.assertIsInstance(result1.result(timeout=5), InvalidGrammarObject)
-        self.assertIsInstance(result2.result(timeout=5), InvalidGrammarObject)
+        backend.release.set()
+        first = result1.result(timeout=5)
+        second = result2.result(timeout=5)
+        self.assertEqual(backend.compile_count, 1)
+        self.assertEqual(first.grammar_stats.cache_source, "compile")
+        self.assertEqual(second.grammar_stats.cache_source, "inflight")
+
+    def test_immediate_compile_completion_does_not_deadlock(self):
+        completed = Future()
+        completed.set_result(InvalidGrammarObject("done"))
+        self.backend.executor.shutdown(wait=True)
+        executor = MagicMock()
+        executor.submit.return_value = completed
+        executor.shutdown.return_value = None
+        self.backend.executor = executor
+
+        result, cache_hit = self.backend.get_cached_or_future_value(
+            ("json", "schema"), require_reasoning=False
+        )
+
+        self.assertFalse(cache_hit)
+        self.assertEqual(result.result(timeout=1).error_message, "done")
+        self.assertIn(("json", "schema"), self.backend.cache)
+
+    def test_cache_is_bounded_by_memory_and_lru_order(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_GRAMMAR_CACHE_BYTES": "10",
+                "SGLANG_GRAMMAR_CACHE_ENTRIES": "100",
+            },
+        ):
+            backend = BaseGrammarBackend()
+        self.addCleanup(backend.executor.shutdown, wait=True)
+
+        backend.set_cache(("regex", "first"), _SizedGrammar("first", 8))
+        backend.set_cache(("regex", "second"), _SizedGrammar("second", 8))
+
+        self.assertNotIn(("regex", "first"), backend.cache)
+        self.assertIn(("regex", "second"), backend.cache)
+        self.assertEqual(backend._cache_bytes, 8)
 
 
 class TestRegisterGrammarBackend(unittest.TestCase):

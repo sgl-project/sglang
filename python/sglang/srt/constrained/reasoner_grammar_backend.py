@@ -71,6 +71,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
         self._think_end_id_list = [think_end_id]
+        self.grammar_stats = grammar.grammar_stats if grammar is not None else None
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
@@ -193,6 +194,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj.tokens_after_end = self.tokens_after_end
         new_obj._finished = self._finished
         return new_obj
+
+    def cache_memory_bytes(self) -> int:
+        if self.grammar is None:
+            return 0
+        return self.grammar.cache_memory_bytes()
 
     @property
     def finished(self):

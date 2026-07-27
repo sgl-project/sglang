@@ -33,8 +33,15 @@ def decide_needs_cpu_seq_lens(
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    if server_args.enable_two_batch_overlap:
-        # FIXME: support TBO without seq lens cpu value
+    if server_args.enable_two_batch_overlap and any(
+        getattr(backend, "tbo_requires_global_cpu_seq_lens", True)
+        for backend in attn_backends
+        if backend is not None
+    ):
+        # Legacy TBO models split decode-family batches from a host mirror.
+        # Phase-aware implementations such as DSV4 prefill-only TBO can opt
+        # out so their decode/speculative loop keeps the GPU-only seq-lens
+        # relay.
         return True
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
     if algo.is_ngram():

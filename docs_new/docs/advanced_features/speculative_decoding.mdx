@@ -1,9 +1,9 @@
 ---
 title: "Speculative Decoding"
 metatags:
-    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, DFLASH, draft model configuration, and overlap-scheduler guidance."
+    description: "SGLang speculative decoding: EAGLE-2/EAGLE-3, MTP, DFLASH, DSPARK, draft model configuration, and overlap-scheduler guidance."
 ---
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, DFLASH, DSPARK, classic draft-model decoding, and an NGRAM-based variant.
 
 ## Summary
 
@@ -16,6 +16,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [DFlash Decoding](#dflash-decoding)
+- [DSpark Decoding](#dspark-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -31,6 +32,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
+- **You have a DSpark checkpoint**: Use **DSPARK** with `--speculative-algorithm DSPARK`. A bundled DSpark checkpoint does not need a separate draft path.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 
@@ -92,6 +94,13 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DFLASH</code> + <code>--speculative-draft-model-path ...</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No <code>--enable-dp-attention</code>; <code>pp_size == 1</code>; disables overlap scheduler &amp; mixed chunked prefill</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DSPARK</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Confidence-driven variable-length block draft</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Checkpoint-dependent</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--speculative-algorithm DSPARK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The target checkpoint can bundle the DSpark draft head; structured output requires the batched XGrammar API</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STANDALONE</td>
@@ -498,6 +507,39 @@ print(response.choices[0].message.content)
 
 ---
 
+## DSpark Decoding
+
+DSpark proposes a fixed-size token block and uses confidence-driven, variable-length target verification. DeepSeek V4 DSpark checkpoints can bundle the draft head into the target checkpoint, so you omit `--speculative-draft-model-path`.
+
+### Prerequisites
+
+- NVIDIA CUDA
+- A DSpark-compatible checkpoint such as `deepseek-ai/DeepSeek-V4-Flash-DSpark`
+- `--speculative-eagle-topk 1`
+- For constrained decoding, an XGrammar build that provides `BatchGrammarMatcher.batch_traverse_draft_tree`
+
+The draft checkpoint records its block size (`gamma`). `--speculative-num-draft-tokens` is the verify-window size and must equal `gamma + 1`. Omit it to read the value from the checkpoint, or set it explicitly to make checkpoint changes fail during startup.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V4-Flash-DSpark \
+    --served-model-name deepseek-ai/DeepSeek-V4-Flash \
+    --tp-size 2 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --speculative-algorithm DSPARK \
+    --speculative-num-steps 1 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 6 \
+    --enable-metrics
+```
+
+For a co-located DP2 deployment (`dp_size=2`, attention `tp_size=1`, `cp_size=1`), you can enable the native shared-memory scheduler exchange described in the [environment-variable reference](/docs/references/environment_variables#scheduler--batching). The path is fail-closed: startup rejects incompatible geometry, missing native support, invalid settings, or a synchronization timeout.
+
+With `--grammar-backend xgrammar`, DSpark batches grammar draft-tree traversal on CPU, overlaps the resulting mask transfer with target verification, and records cache and pipeline metrics. The server rejects this configuration at startup when the required XGrammar API is unavailable.
+
+---
+
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
@@ -746,7 +788,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>DFLASH</code>, <code>DSPARK</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>

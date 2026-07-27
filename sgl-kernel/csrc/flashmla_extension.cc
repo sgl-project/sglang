@@ -71,6 +71,30 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+static void sgl_sparse_prefill_fwd_into(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length,
+    const at::Tensor& out,
+    const at::Tensor& max_logits,
+    const at::Tensor& lse) {
+  sparse_attn_prefill_interface(
+      q,
+      kv,
+      indices,
+      static_cast<float>(sm_scale),
+      static_cast<int>(d_v),
+      attn_sink,
+      topk_length,
+      out,
+      max_logits,
+      lse);
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -116,6 +140,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
       "Tensor? topk_length=None) -> Tensor[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
+
+  m.def(
+      "sparse_prefill_fwd_into(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink, "
+      "Tensor? topk_length, Tensor(a!) out, Tensor(b!) max_logits, Tensor(c!) lse) -> ()");
+  m.impl("sparse_prefill_fwd_into", torch::kCUDA, &sgl_sparse_prefill_fwd_into);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

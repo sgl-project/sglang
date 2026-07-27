@@ -129,6 +129,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if params.enable_metrics:
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
+        self._hicache_phase_accumulator: dict[str, tuple[float, int, float]] = {}
+        self._hicache_pending_snapshot: dict[str, int] = {}
+        self._hicache_metrics_flush_deadline = time.perf_counter() + 1.0
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
@@ -858,9 +861,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        return self.cache_controller.write(
+        submit_started = time.perf_counter()
+        host_indices = self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
+        self._finish_hicache_phase("write_submit", submit_started)
+        return host_indices
 
     def _track_write_through_node(
         self,
@@ -990,11 +996,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        submit_started = time.perf_counter()
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=node_id,
             extra_pools=aux_xfers or None,
         )
+        self._finish_hicache_phase("load_prepare", submit_started)
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
@@ -1700,6 +1708,72 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _finish_hicache_phase(self, phase: str, started: float) -> float:
+        now = time.perf_counter()
+        duration = now - started
+        if self.metrics_collector is not None:
+            total, calls, maximum = self._hicache_phase_accumulator.get(
+                phase, (0.0, 0, 0.0)
+            )
+            self._hicache_phase_accumulator[phase] = (
+                total + duration,
+                calls + 1,
+                max(maximum, duration),
+            )
+            if now >= self._hicache_metrics_flush_deadline:
+                for (
+                    accumulated_phase,
+                    (
+                        accumulated_seconds,
+                        accumulated_calls,
+                        accumulated_max,
+                    ),
+                ) in self._hicache_phase_accumulator.items():
+                    self.metrics_collector.observe_hicache_scheduler_phase(
+                        accumulated_phase,
+                        accumulated_seconds,
+                        accumulated_calls,
+                        accumulated_max,
+                    )
+                for kind, count in self._hicache_pending_snapshot.items():
+                    self.metrics_collector.set_hicache_pending_operations(kind, count)
+                self._hicache_phase_accumulator.clear()
+                self._hicache_metrics_flush_deadline = now + 1.0
+        if duration >= 0.5:
+            logger.warning(
+                "Slow HiCache scheduler phase: phase=%s duration=%.3fs "
+                "pending_write=%d pending_load=%d",
+                phase,
+                duration,
+                len(self.ongoing_write_through),
+                len(self.ongoing_load_back),
+            )
+        return now
+
+    def _record_hicache_backup_ack(self, ack) -> None:
+        if self.metrics_collector is None:
+            return
+        duration_seconds = None
+        if ack.timing_enabled:
+            duration_seconds = ack.start_event.elapsed_time(ack.finish_event) / 1000.0
+        self.metrics_collector.observe_hicache_backup(
+            ack.num_tokens,
+            duration_seconds,
+        )
+
+    def _update_hicache_pending_metrics(self) -> None:
+        if self.metrics_collector is None or self.cache_controller is None:
+            return
+        cc = self.cache_controller
+        for kind, count in (
+            ("write_acks", len(cc.ack_write_queue)),
+            ("write_nodes", len(self.ongoing_write_through)),
+            ("load_acks", len(cc.ack_load_queue)),
+            ("load_nodes", len(self.ongoing_load_back)),
+            ("pp_sync", len(self.work_list)),
+        ):
+            self._hicache_pending_snapshot[kind] = count
+
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
         cc = self.cache_controller
@@ -1708,36 +1782,48 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            flush_started = time.perf_counter()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
+                    self._record_hicache_backup_ack(ack)
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            self._finish_hicache_phase("write_back_flush", flush_started)
+            self._update_hicache_pending_metrics()
             return
 
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. a backup returning 0 on a subset).
+        phase_started = time.perf_counter()
         finish_count = 0
         if self.pp_rank == 0:
             for ack in cc.ack_write_queue:
                 if not ack.finish_event.query():
                     break
                 finish_count += 1
+        phase_started = self._finish_hicache_phase("write_query", phase_started)
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        phase_started = self._finish_hicache_phase(
+            "write_completion_sync", phase_started
+        )
 
         # Process completed acks
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            self._record_hicache_backup_ack(ack)
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
+        self._finish_hicache_phase("write_finalize", phase_started)
+        self._update_hicache_pending_metrics()
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -1746,15 +1832,20 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         # Every rank must enter the all_reduce below; ongoing_load_back can
         # diverge across ranks.
+        phase_started = time.perf_counter()
         finish_count = 0
         if self.pp_rank == 0:
             for ack in cc.ack_load_queue:
                 if not ack.finish_event.query():
                     break
                 finish_count += 1
+        phase_started = self._finish_hicache_phase("load_query", phase_started)
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+        phase_started = self._finish_hicache_phase(
+            "load_completion_sync", phase_started
+        )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1772,6 +1863,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         duration_ms / 1000.0
                     )
             finish_count -= 1
+        self._finish_hicache_phase("load_finalize", phase_started)
+        self._update_hicache_pending_metrics()
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -1819,16 +1912,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        round_started = phase_started = time.perf_counter()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        phase_started = self._finish_hicache_phase("pp_sync_drain", phase_started)
         self.writing_check()
         self.loading_check()
+        phase_started = time.perf_counter()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        self._finish_hicache_phase("storage_control", phase_started)
+        self._finish_hicache_phase("event_round_total", round_started)
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
@@ -1837,7 +1935,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.cache_controller is not None:
-            return self.cache_controller.start_loading()
+            submit_started = time.perf_counter()
+            producer_id = self.cache_controller.start_loading()
+            self._finish_hicache_phase("load_submit", submit_started)
+            return producer_id
         return 0
 
     # ---- Query / Inspection APIs ----

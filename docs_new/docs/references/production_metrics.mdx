@@ -274,3 +274,25 @@ Average estimated memory bandwidth in GB/s:
 - These metrics are estimates intended for observability and trend analysis.
 - Estimated memory bytes reflect modeled traffic and are not a direct hardware
   counter from GPU profilers.
+
+## Scheduler, prefill graph, grammar, and HiCache metrics
+
+The runtime exports additional per-rank metrics when `--enable-metrics` is set:
+
+| Metric family | What it measures |
+| --- | --- |
+| `sglang:scheduler_phase_*` | Scheduler-thread time, calls, and one-second maximum by phase |
+| `sglang:runtime_gc_frozen` | Whether the warmed scheduler object graph moved to Python's permanent GC generation |
+| `sglang:prefill_graph_admissions_total` | Full-prefill CUDA graph admissions and eager-routing reasons |
+| `sglang:prefill_graph_shapes_total` | Captured token bucket and request-slot shape used by each graph replay |
+| `sglang:prefill_execution_tokens_total` | Scheduled versus executed token-axis elements, including graph padding |
+| `sglang:prefill_batch_scheduled_tokens` and `sglang:prefill_batch_requests` | Prefill batch shape by graph or eager path |
+| `sglang:grammar_cache_lookup_total` | Grammar resolutions from memory, an in-flight compile, disk, local compile, or a new compile |
+| `sglang:grammar_cache_*_time_seconds` | End-to-end cache latency, persistent-cache lock wait, and internal cache phases |
+| `sglang:dspark_grammar_*` | DSpark structured-output batch size, active matchers, mask outcomes, and overlapped pipeline phases |
+| `sglang:hicache_backup_*` | HiCache GPU-to-host backup tokens and duration |
+| `sglang:hicache_scheduler_phase_*` | Scheduler-thread HiCache control time, calls, and one-second maximum |
+| `sglang:hicache_pending_operations` | Outstanding HiCache operations by kind |
+| `sglang:dp2_mlp_sync_*` and `sglang:dp2_verify_tier_sync_*` | Native co-located DP2 exchange state and timing, including arrival skew and post-arrival transport cost |
+
+Use the `dp_rank` label when aggregating scheduler metrics. Gauges such as `sglang:gen_throughput` are emitted per rank; sum them for aggregate DP throughput. Counters can also be summed across ranks when you want deployment-wide work, while histograms should retain the rank label when diagnosing imbalance.

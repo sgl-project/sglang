@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     ProfileReq,
+    ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -208,6 +209,7 @@ class DataParallelController:
             self.control_message_step = 1
 
         self.init_dispatcher()
+        self.gracefully_exit = False
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DataParallelController",
@@ -327,15 +329,57 @@ class DataParallelController:
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
+    def _dispatch_atomic_routed_batch(self, batch_req):
+        """Keep an explicitly routed HTTP batch atomic through DP dispatch."""
+        if len(batch_req) == 0:
+            return False
+
+        routed_dp_rank = batch_req[0].routed_dp_rank
+        if routed_dp_rank is None or any(
+            req.routed_dp_rank != routed_dp_rank for req in batch_req
+        ):
+            return False
+        if (
+            routed_dp_rank < 0
+            or routed_dp_rank >= len(self.workers)
+            or routed_dp_rank not in self._active_workers
+            or self.workers[routed_dp_rank] is None
+        ):
+            raise ValueError(f"DP rank {routed_dp_rank} is not active.")
+
+        time_stats = []
+        for req in batch_req:
+            req_time_stats = DPControllerReqTimeStats.new_from_obj(
+                unwrap_from_pickle(req.time_stats)
+            )
+            req_time_stats.set_dp_dispatch_time()
+            req.time_stats = wrap_as_pickle(req_time_stats)
+            time_stats.append(req_time_stats)
+
+        # One ZMQ message means the scheduler receives and queues the entire
+        # batch before it can form the next prefill.  Sending each item as its
+        # own message lets the scheduler wake after an arbitrary prefix,
+        # fragmenting a 64-request API batch into smaller GPU launches.
+        sock_send(self.workers[routed_dp_rank], batch_req)
+
+        for req, req_time_stats in zip(batch_req, time_stats):
+            req.time_stats = req_time_stats
+            req.time_stats.set_dp_dispatch_finish_time()
+        return True
+
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
+        if self._dispatch_atomic_routed_batch(batch_req):
+            return
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
+        if self._dispatch_atomic_routed_batch(batch_req):
+            return
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
 
@@ -348,6 +392,7 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                (ShutdownReq, self.handle_shutdown),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
@@ -358,6 +403,11 @@ class DataParallelController:
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
+
+    def handle_shutdown(self, recv_req: ShutdownReq) -> None:
+        logger.info("DataParallelController received graceful shutdown request.")
+        self.send_control_message(recv_req)
+        self.gracefully_exit = True
 
     def launch_dp_schedulers(self, server_args, port_args):
         base_gpu_id = 0
@@ -794,7 +844,7 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
-        while True:
+        while not self.gracefully_exit:
             while True:
                 self.soft_watchdog.feed()
                 try:
@@ -849,9 +899,12 @@ def run_data_parallel_controller_process(
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"Scheduler {proc.pid} exited with status {proc.exitcode}"
+                )
+            logger.info(f"Scheduler {proc.pid} exited cleanly.")
+        logger.info("DataParallelController graceful shutdown complete.")
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")

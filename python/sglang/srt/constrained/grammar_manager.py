@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
+    GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
 )
@@ -112,7 +113,18 @@ class GrammarManager:
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
+                    dispatch_type = (
+                        req.grammar_key[0] if req.grammar_key is not None else None
+                    )
+                    req.grammar = InvalidGrammarObject(
+                        "Aborted by AbortReq.",
+                        GrammarStats(
+                            dispatch_type=dispatch_type,
+                            is_grammar_aborted=True,
+                        ),
+                    )
                 req.set_finish_with_abort("Aborted by AbortReq.")
+                req.log_grammar_stats_once(self.scheduler.metrics_collector)
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
@@ -166,6 +178,7 @@ class GrammarManager:
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
                         req.set_finish_with_abort(error_msg)
+                        req.log_grammar_stats_once(self.scheduler.metrics_collector)
                     else:
                         self._apply_request_reasoning_budget(req)
         elif self._enable_strict_thinking:
@@ -282,12 +295,18 @@ class GrammarManager:
                     f"Grammar compilation raised an exception: {e}, "
                     f"grammar_key={req.grammar_key}"
                 )
-                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                req.grammar = InvalidGrammarObject(
+                    f"Grammar compilation failed: {e}",
+                    GrammarStats(
+                        dispatch_type=req.grammar_key[0],
+                        is_grammar_aborted=True,
+                    ),
+                )
             self._apply_request_reasoning_budget(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+                req.log_grammar_stats_once(self.scheduler.metrics_collector)
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -296,11 +315,19 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            self.grammar_backend.set_cache(
-                req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
+            invalid_grammar = InvalidGrammarObject(
+                "Grammar preprocessing timed out",
+                GrammarStats(
+                    dispatch_type=req.grammar_key[0],
+                    is_grammar_aborted=True,
+                    num_timeout=1,
+                ),
             )
+            req.grammar = invalid_grammar
+            self.grammar_backend.set_cache(req.grammar_key, invalid_grammar.copy())
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
+            req.log_grammar_stats_once(self.scheduler.metrics_collector)
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

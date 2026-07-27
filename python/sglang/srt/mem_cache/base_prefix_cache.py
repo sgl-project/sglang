@@ -237,6 +237,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            labels["rank"] = str(torch.distributed.get_rank())
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         radix_cache_cls = resolve_collector_class(

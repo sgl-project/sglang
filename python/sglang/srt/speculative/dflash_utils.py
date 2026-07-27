@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -793,9 +794,19 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req,
+    enable_overlap: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+) -> Optional[str]:
     if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+        if not spec_algorithm.is_dspark():
+            return "DFLASH speculative decoding does not support return_logprob yet."
+        # max_new_tokens=1 completes from the pure target-model prefill result,
+        # before speculative decode.  Anything longer could reach DSpark
+        # verification, whose accepted-token logprobs are not reconstructed.
+        if req.sampling_params.max_new_tokens != 1:
+            return "DSpark return_logprob requires a one-token, prefill-only request."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."

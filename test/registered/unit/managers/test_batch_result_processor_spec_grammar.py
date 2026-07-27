@@ -42,6 +42,9 @@ class _FakeSpecAlgorithm:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dspark(self) -> bool:
+        return False
+
 
 class _FakeForwardMode:
     def is_decode(self) -> bool:

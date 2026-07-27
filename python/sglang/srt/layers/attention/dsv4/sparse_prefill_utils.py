@@ -80,6 +80,78 @@ class SparsePrefillWorkspace:
         return self._buffer[:num_tokens]
 
 
+class SparsePrefillOutputWorkspace:
+    """Fixed, long-lived FlashMLA sparse-prefill outputs.
+
+    A full DSV4 TP2 prefill chunk produces a roughly 1 GiB BF16 attention
+    output. Allocating it inside every FlashMLA call makes runtime success
+    depend on a fresh contiguous block being available after variable decode
+    batches have fragmented the allocator. Reserve the exact maximum before
+    CUDA-graph capture and reuse it for every eager sparse-prefill layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        capacity_tokens: int,
+        num_heads: int,
+        head_dim_v: int,
+    ) -> None:
+        assert capacity_tokens > 0
+        assert num_heads > 0
+        assert head_dim_v > 0
+        self.capacity_tokens = capacity_tokens
+        self.num_heads = num_heads
+        self.head_dim_v = head_dim_v
+        self.out = torch.empty(
+            (capacity_tokens, num_heads, head_dim_v),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.max_logits = torch.empty(
+            (capacity_tokens, num_heads),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.lse = torch.empty(
+            (capacity_tokens, num_heads),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    @property
+    def reserved_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.out, self.max_logits, self.lse)
+        )
+
+    def get(
+        self,
+        *,
+        num_tokens: int,
+        num_heads: int,
+        head_dim_v: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if num_tokens <= 0 or num_tokens > self.capacity_tokens:
+            raise RuntimeError(
+                "sparse-prefill output exceeds its fixed workspace capacity: "
+                f"tokens={num_tokens}, capacity={self.capacity_tokens}"
+            )
+        if num_heads != self.num_heads or head_dim_v != self.head_dim_v:
+            raise RuntimeError(
+                "sparse-prefill output geometry changed after reservation: "
+                f"got heads={num_heads}, d_v={head_dim_v}; expected "
+                f"heads={self.num_heads}, d_v={self.head_dim_v}"
+            )
+        return (
+            self.out[:num_tokens],
+            self.max_logits[:num_tokens],
+            self.lse[:num_tokens],
+        )
+
+
 def combined_topk_width(topk: int, window_size: int) -> int:
     """Width of the padded combined_indices last dim that
     ``combine_topk_swa_indices`` would produce for these args."""

@@ -57,6 +57,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
@@ -90,6 +91,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
+            # Some attention backends materialize per-shape CUDA tensors during
+            # the warmup and let post_warmup_hook replace their Python owners.
+            # Their custom kernels are asynchronous and are not necessarily
+            # visible to PyTorch's allocator stream tracking. Finish all work
+            # before the hook can release/reuse those captured addresses.
+            self._device_module.synchronize()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -110,6 +117,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
 
+        # A CUDA graph retains device addresses, not Python tensor owners.
+        # Keep every per-shape ForwardBatch reachable for the graph's lifetime;
+        # callers deliberately pass capture_inputs for tensors that are not in
+        # a runner-owned static buffer (for example DP global token counts).
+        if capture_inputs is not None:
+            self._capture_inputs[shape_key] = capture_inputs
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
@@ -132,4 +145,5 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._pool = None

@@ -49,6 +49,8 @@ def get_compress_state_ring_size(
 
 
 class DeepSeekV4SingleKVPool(KVCache):
+    dynamic_kv_cache_scale_block_size = 64
+
     def __init__(
         self,
         size: int,
@@ -76,7 +78,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
 
         self.scale_pad = 1
-        self.quantize_block_size = 64
+        self.quantize_block_size = self.dynamic_kv_cache_scale_block_size
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
         self._create_buffers()

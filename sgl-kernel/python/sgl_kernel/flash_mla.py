@@ -315,6 +315,9 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    max_logits: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
@@ -325,6 +328,9 @@ def flash_mla_sparse_fwd(
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float
         d_v: The dimension of value vectors. Can only be 512
+        out: Optional preallocated [s_q, h_q, d_v] bfloat16 output.
+        max_logits: Optional preallocated [s_q, h_q] float32 scratch output.
+        lse: Optional preallocated [s_q, h_q] float32 scratch output.
 
     Returns:
         (output, max_logits, lse)
@@ -335,6 +341,25 @@ def flash_mla_sparse_fwd(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    preallocated = (out, max_logits, lse)
+    if any(tensor is not None for tensor in preallocated):
+        if not all(tensor is not None for tensor in preallocated):
+            raise ValueError("out, max_logits, and lse must be provided together")
+        assert out is not None and max_logits is not None and lse is not None
+        torch.ops.sgl_kernel.sparse_prefill_fwd_into.default(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            attn_sink,
+            topk_length,
+            out,
+            max_logits,
+            lse,
+        )
+        return out, max_logits, lse
 
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length

@@ -995,6 +995,7 @@ class Req(ReqDllmMixin):
             None
         )
         self.grammar_wait_ct = 0
+        self.grammar_stats_logged = False
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -1148,6 +1149,18 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    def log_grammar_stats_once(self, metrics_collector) -> None:
+        if self.grammar_stats_logged or metrics_collector is None:
+            return
+        grammar = self.grammar
+        if grammar is None or isinstance(grammar, Future):
+            return
+        grammar_stats = grammar.grammar_stats
+        if grammar_stats is None:
+            return
+        metrics_collector.log_grammar_stats(grammar_stats)
+        self.grammar_stats_logged = True
 
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)

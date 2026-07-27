@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import tempfile
 import time
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import (
@@ -18,6 +20,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -26,6 +29,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -42,6 +46,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 4
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -84,6 +89,109 @@ class PrefillStats:
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillExecutionObservation:
+    outcome: str
+    scheduled_tokens: int
+    executed_tokens: int
+    requests: int
+    bucket_tokens: int
+
+
+def classify_prefill_execution(
+    *,
+    batch: ScheduleBatch,
+    can_run_cuda_graph: bool,
+    server_args: ServerArgs,
+    dp_rank: int,
+) -> PrefillExecutionObservation:
+    """Classify one local prefill without synchronizing the hot path."""
+    prefill_config = server_args.cuda_graph_config.prefill
+    capture_tokens = prefill_config.bs
+    global_num_tokens = batch.global_num_tokens
+    if global_num_tokens is not None and dp_rank < len(global_num_tokens):
+        scheduled_tokens = max(int(global_num_tokens[dp_rank]), 0)
+    else:
+        # Non-DP callers do not carry the shared geometry. Keep their metrics
+        # useful without pretending a page-rounded log counter is exact.
+        scheduled_tokens = max(int(getattr(batch, "extend_num_tokens", 0) or 0), 0)
+    requests = batch.batch_size()
+    global_tokens = (
+        max(int(tokens) for tokens in global_num_tokens)
+        if global_num_tokens
+        else scheduled_tokens
+    )
+    bucket_index = bisect_left(capture_tokens, global_tokens) if capture_tokens else 0
+    bucket_tokens = (
+        capture_tokens[bucket_index]
+        if capture_tokens and bucket_index < len(capture_tokens)
+        else 0
+    )
+
+    if can_run_cuda_graph:
+        if bucket_tokens <= 0:
+            raise RuntimeError(
+                "prefill CUDA graph executed without a captured token bucket"
+            )
+        return PrefillExecutionObservation(
+            outcome="cuda_graph",
+            scheduled_tokens=scheduled_tokens,
+            executed_tokens=bucket_tokens,
+            requests=requests,
+            bucket_tokens=bucket_tokens,
+        )
+
+    if prefill_config.backend not in (Backend.BREAKABLE, Backend.FULL):
+        outcome = "backend_disabled"
+    elif not capture_tokens:
+        outcome = "no_capture_buckets"
+    elif (
+        prefill_config.backend == Backend.FULL
+        and bucket_tokens > 0
+        and requests
+        > min(
+            (
+                prefill_config.full_prefill_max_req
+                or max(server_args.chunked_prefill_size // 512, 1)
+            ),
+            bucket_tokens,
+        )
+    ):
+        outcome = "request_slots"
+    elif global_tokens <= 0:
+        outcome = "no_tokens"
+    elif bucket_tokens <= 0:
+        sparse_threshold_text = os.environ.get("SGLANG_DSV4_SPARSE_PREFILL_THRESHOLD")
+        if sparse_threshold_text is not None and global_tokens > int(
+            sparse_threshold_text
+        ):
+            # The DSpark launcher validates this threshold against the pinned
+            # DSV4 backend and requires dense graphs through the exact
+            # transition before ingress. A larger batch therefore takes the
+            # model's dedicated FlashMLA sparse-attention implementation, not
+            # an accidental generic eager fallback.
+            outcome = "dsv4_sparse_attention"
+        else:
+            outcome = "token_oversize"
+    elif bucket_tokens > global_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+        outcome = "padding_crossover"
+    elif not batch.can_run_dp_breakable_cuda_graph:
+        outcome = "synchronized_constraint"
+    else:
+        # The fail-closed runner rejects a local graph/eager divergence before
+        # reaching metrics. Retain a distinct label in case a future backend
+        # deliberately applies an additional shared constraint.
+        outcome = "runner_constraint"
+
+    return PrefillExecutionObservation(
+        outcome=outcome,
+        scheduled_tokens=scheduled_tokens,
+        executed_tokens=scheduled_tokens,
+        requests=requests,
+        bucket_tokens=0,
+    )
 
 
 @dataclass(kw_only=True)
@@ -157,7 +265,7 @@ class SchedulerMetricsReporter:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
-        self.fwd_occupancy = float("nan")
+        self.fwd_occupancy = 0.0
 
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
@@ -610,6 +718,16 @@ class SchedulerMetricsReporter:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
+            if batch is not None:
+                observation = classify_prefill_execution(
+                    batch=batch,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    server_args=self.scheduler.server_args,
+                    dp_rank=self.scheduler.ps.dp_rank,
+                )
+                self.metrics_collector.observe_prefill_execution(
+                    **dataclasses.asdict(observation)
+                )
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=prefill_stats.log_input_tokens,
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
@@ -1078,11 +1196,10 @@ class SchedulerMetricsReporter:
         self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
-            # Window start: keep the last published value instead of NaN-ing
-            # the gauge. Readers sample it asynchronously, and the window
-            # boundary can phase-lock with the decode-log cadence, turning a
-            # one-tick NaN into NaN on every log line. NaN is published only
-            # when truly stale (reset_device_timer_window after idle).
+            # Keep the last finite value while the new window gets its second
+            # sample. Readers scrape asynchronously, so publishing a sentinel
+            # here can phase-lock with the log cadence and poison every scrape.
+            # True scheduler idle is represented explicitly as zero below.
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
         else:
@@ -1098,7 +1215,10 @@ class SchedulerMetricsReporter:
     def reset_device_timer_window(self):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
-            self.fwd_occupancy = float("nan")
+            self._device_timer_window_gpu_time = 0.0
+            self._device_timer_window_start = None
+            # Scheduler idle is a measured zero, not an undefined sample.
+            self.fwd_occupancy = 0.0
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
@@ -1150,4 +1270,7 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
+        # Do not retain an active-window sample (or publish NaN) while idle.
+        self.stats.fwd_occupancy = 0.0
+        self.fwd_occupancy = 0.0
         self.metrics_collector.log_stats(self.stats)

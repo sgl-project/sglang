@@ -9,6 +9,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/get_model_info`
 - `/server_info`
 - `/health`
+- `/health_scheduler`
 - `/health_generate`
 - `/flush_cache`
 - `/update_weights`
@@ -104,10 +105,18 @@ print_highlight(response.text)
 
 ## Health Check
 - `/health`: Check the health of the server.
+- `/health_scheduler`: Check that every DP scheduler is present and publishing a fresh load snapshot without running inference. It returns `503` during startup or shutdown, when a rank is missing or duplicated, when a snapshot is stale, or when scheduler state cannot be read.
 - `/health_generate`: Check the health of the server by generating one token.
 
 ```python Example
 url = f"http://localhost:{port}/health_generate"
+
+response = requests.get(url)
+print_highlight(response.text)
+```
+
+```python Example
+url = f"http://localhost:{port}/health_scheduler"
 
 response = requests.get(url)
 print_highlight(response.text)

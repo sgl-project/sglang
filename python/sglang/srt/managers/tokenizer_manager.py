@@ -1359,13 +1359,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         Current policy:
         - Respect explicit server flag `enable_tokenizer_batch_encode`.
-        - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
-        - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
+        - If no request has text or multimodal input (all use pre-tokenized
+          input_ids or input_embeds), batch the requests without tokenization.
+        - Under DP attention, the fast batch transport is safe when every item
+          has the same explicit routed DP rank.
         """
+        has_atomic_dp_route = (
+            batch_size > 0
+            and requests[0].routed_dp_rank is not None
+            and all(
+                requests[i].routed_dp_rank == requests[0].routed_dp_rank
+                for i in range(1, batch_size)
+            )
+        )
         return batch_size > 0 and (
             self.server_args.enable_tokenizer_batch_encode
             or (
-                (not self.server_args.enable_dp_attention)
+                (not self.server_args.enable_dp_attention or has_atomic_dp_route)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -2765,16 +2775,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 break
 
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
-        if self._subprocess_watchdog is not None:
-            self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit (see
-        # ShutdownReq), then wait for them before hard-killing the rest.
+        subprocess_watchdog = self._subprocess_watchdog
+        if subprocess_watchdog is None:
+            raise RuntimeError(
+                "graceful shutdown requires the SGLang subprocess watchdog"
+            )
+        subprocess_watchdog.stop()
+        # Each scheduler forwards ShutdownReq to the detokenizer before it
+        # releases host memory and destroys its distributed process groups.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        kill_process_tree(os.getpid(), include_parent=True)
-        sys.exit(0)
+        subprocess_watchdog.wait_for_clean_exit(timeout=180)
+        logger.info("All SGLang child processes exited cleanly.")
+        # The signal handler replaced uvicorn's SIGTERM callback, so there is
+        # no server.should_exit path left to drive. At this point every child
+        # and GPU/distributed resource has already been joined; terminate the
+        # CPU-only parent directly with a successful container status.
+        os._exit(0)
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""

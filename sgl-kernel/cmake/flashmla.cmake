@@ -7,6 +7,52 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# The DSV4 sparse-prefill path owns persistent output buffers. Extend the
+# pinned FlashMLA interface so its kernel can write directly into them instead
+# of allocating a ~1 GiB output at runtime. Exact pre/post hashes make
+# reconfiguration idempotent while every unknown source state fails closed.
+set(FLASHMLA_SPARSE_PREFILL_HEADER
+    "${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_fwd.h")
+set(FLASHMLA_SPARSE_PREFILL_HEADER_UPSTREAM_SHA256
+    "87800f0f73f055a1bcbe13a9a0c1e388e36b106e0405c06afb5fa86d11221cc8")
+set(FLASHMLA_SPARSE_PREFILL_HEADER_PATCHED_SHA256
+    "006aa754f22360e02547c967788e5a43d5beb092f626b0f5a07a1766e0ef71a8")
+file(SHA256 "${FLASHMLA_SPARSE_PREFILL_HEADER}"
+    FLASHMLA_SPARSE_PREFILL_HEADER_SHA256)
+if(FLASHMLA_SPARSE_PREFILL_HEADER_SHA256 STREQUAL
+   FLASHMLA_SPARSE_PREFILL_HEADER_UPSTREAM_SHA256)
+    find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+    execute_process(
+        COMMAND
+            "${FLASHMLA_PATCH_EXECUTABLE}"
+            --batch
+            --forward
+            -p1
+            --input=${CMAKE_CURRENT_LIST_DIR}/flashmla-sparse-prefill-out.patch
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE FLASHMLA_SPARSE_PREFILL_PATCH_RESULT
+        OUTPUT_VARIABLE FLASHMLA_SPARSE_PREFILL_PATCH_STDOUT
+        ERROR_VARIABLE FLASHMLA_SPARSE_PREFILL_PATCH_STDERR
+    )
+    if(NOT FLASHMLA_SPARSE_PREFILL_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply the pinned FlashMLA sparse-prefill output patch:\n"
+            "${FLASHMLA_SPARSE_PREFILL_PATCH_STDOUT}\n"
+            "${FLASHMLA_SPARSE_PREFILL_PATCH_STDERR}"
+        )
+    endif()
+    file(SHA256 "${FLASHMLA_SPARSE_PREFILL_HEADER}"
+        FLASHMLA_SPARSE_PREFILL_HEADER_SHA256)
+endif()
+if(NOT FLASHMLA_SPARSE_PREFILL_HEADER_SHA256 STREQUAL
+   FLASHMLA_SPARSE_PREFILL_HEADER_PATCHED_SHA256)
+    message(FATAL_ERROR
+        "FlashMLA sparse-prefill header is neither the exact pinned source "
+        "nor the exact optimized source: "
+        "${FLASHMLA_SPARSE_PREFILL_HEADER_SHA256}"
+    )
+endif()
+
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass

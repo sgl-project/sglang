@@ -1238,25 +1238,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             # Joined ranks require real token counts instead of MAX_LEN padding.
             dp_padding_mode = DpPaddingMode.SUM_LEN
-        # Prefill breakable CUDA graph requires every DP rank to run the SAME
-        # captured shape. Under SUM_LEN each rank pads to its own local token
-        # count and can select a different capture bucket, so the in-graph DP
-        # collectives (all_gather / reduce_scatter) mismatch across ranks and
-        # corrupt the output. Force MAX_LEN so every rank pads to the global
-        # max and picks the same bucket (mirrors the decode cuda graph
-        # contract, which always runs MAX_LEN).
-        #
-        # Only force MAX_LEN when the batch fits a captured breakable prefill
-        # graph; larger prefills fall back to eager and keep the
-        # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
-        # (all-gathered), so the decision is consistent cluster-wide.
-        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
-        if (
-            self.can_run_dp_breakable_cuda_graph
-            and self.is_extend_in_batch
-            and prefill_cg.bs
-            and max(global_num_tokens) <= max(prefill_cg.bs)
-        ):
+        # A captured prefill CUDA graph requires every DP rank to run the SAME
+        # token shape. Under SUM_LEN each rank can select a different capture
+        # bucket, so in-graph DP collectives mismatch and corrupt or deadlock
+        # the forward. Scheduler-side admission has already min-reduced all
+        # local constraints and applied the shared bucket crossover. Honor
+        # that single decision unconditionally by forcing MAX_LEN.
+        if self.can_run_dp_breakable_cuda_graph:
+            assert self.is_extend_in_batch
             dp_padding_mode = DpPaddingMode.MAX_LEN
         self.dp_padding_mode = dp_padding_mode
 

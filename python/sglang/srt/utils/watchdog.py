@@ -200,6 +200,32 @@ class SubprocessWatchdog:
             self._thread.join(timeout=self._interval * 2)
             self._thread = None
 
+    def wait_for_clean_exit(self, timeout: float) -> None:
+        """Wait for every tracked child to exit successfully.
+
+        The watchdog must be stopped before expected shutdown exits occur,
+        otherwise it correctly interprets the first child exit as a crash.
+        All children run concurrently, so they share one absolute deadline.
+        """
+        if timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout}")
+
+        self.stop()
+        deadline = time.monotonic() + timeout
+        failures = []
+        for proc, name in zip(self._processes, self._names):
+            remaining = max(0.0, deadline - time.monotonic())
+            proc.join(remaining)
+            if proc.is_alive():
+                failures.append(f"{name}(pid={proc.pid}, timed out)")
+            elif proc.exitcode != 0:
+                failures.append(f"{name}(pid={proc.pid}, exitcode={proc.exitcode})")
+
+        if failures:
+            raise RuntimeError(
+                "SGLang subprocess shutdown was not clean: " + ", ".join(failures)
+            )
+
     def _monitor_loop(self) -> None:
         try:
             while not self._stop_event.wait(self._interval):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -15,13 +16,15 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.single_node_dp2_sync import (
+    exchange_single_node_dp2_mlp_info,
+    single_node_dp2_sync_enabled,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
-    Phase,
-    check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -35,6 +38,59 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 4
+
+
+def _can_run_dp_prefill_cuda_graph_locally(
+    local_batch: Optional[ScheduleBatch],
+    server_args: ServerArgs,
+) -> bool:
+    """Return this rank's shape-independent prefill graph eligibility.
+
+    The result is min-reduced by the DP MLP sync. Idle ranks are permissive:
+    once any peer contributes an admitted prefill, MAX_LEN padding converts
+    them to the same captured EXTEND shape.
+    """
+    prefill_config = server_args.cuda_graph_config.prefill
+    if prefill_config.backend not in (Backend.BREAKABLE, Backend.FULL):
+        return False
+    if local_batch is None or local_batch.forward_mode.is_idle():
+        return True
+    if local_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+        return False
+    if local_batch.input_embeds is not None or local_batch.replace_embeds is not None:
+        return False
+    if prefill_config.backend == Backend.FULL:
+        max_requests = prefill_config.full_prefill_max_req
+        if max_requests is None:
+            max_requests = max(server_args.chunked_prefill_size // 512, 1)
+        if local_batch.batch_size() > max_requests:
+            return False
+    return True
+
+
+def _finalize_dp_prefill_cuda_graph_admission(
+    local_admission: bool,
+    *,
+    global_num_tokens: list[int],
+    is_extend_in_batch: bool,
+    server_args: ServerArgs,
+) -> bool:
+    """Apply the shared token-bucket crossover to a DP-reduced admission."""
+    if not local_admission or not is_extend_in_batch:
+        return False
+
+    capture_tokens = server_args.cuda_graph_config.prefill.bs
+    if not capture_tokens:
+        return False
+    num_tokens = max(global_num_tokens)
+    if num_tokens <= 0:
+        return False
+    bucket_index = bisect_left(capture_tokens, num_tokens)
+    if bucket_index == len(capture_tokens):
+        return False
+    padded_num_tokens = capture_tokens[bucket_index]
+    return padded_num_tokens <= num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
 
 
 def _resolve_elastic_world_dp_size(
@@ -90,8 +146,11 @@ class MLPSyncBatchInfo:
 
     # some gathered elements
     tp0_info: torch.Tensor = None
+    global_forward_modes: list[int] = None
+    used_native_sync: bool = False
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_local_can_run_tbo: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -132,6 +191,42 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        if single_node_dp2_sync_enabled():
+            if use_all_reduce or device != "cpu":
+                raise RuntimeError(
+                    "strict DP2 shared-memory MLP sync requires the fixed CPU "
+                    "all-gather path"
+                )
+            global_info = exchange_single_node_dp2_mlp_info(
+                self.num_tokens,
+                self.num_tokens_for_logprob,
+                self.can_cuda_graph,
+                self.is_extend_in_batch,
+                self.local_can_run_tbo,
+                self.local_forward_mode,
+                self.can_run_breakable_cuda_graph,
+                group=group,
+                dp_size=self.dp_size,
+                tp_size=self.tp_size,
+                cp_size=self.cp_size,
+            )
+            self.used_native_sync = True
+            self.global_num_tokens = [global_info[0], global_info[7]]
+            self.global_num_tokens_for_logprob = [
+                global_info[1],
+                global_info[8],
+            ]
+            self.can_cuda_graph = bool(global_info[2] and global_info[9])
+            self.is_extend_in_batch = bool(global_info[3] or global_info[10])
+            self.global_forward_modes = [global_info[5], global_info[12]]
+            self.global_local_can_run_tbo = [global_info[4], global_info[11]]
+            self.can_run_breakable_cuda_graph = bool(global_info[6] and global_info[13])
+            if _ENABLE_METRICS_DP_ATTENTION:
+                self.dp_cooperation_info = DPCooperationInfo.create(
+                    self.global_forward_modes
+                )
+            return
+
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -226,6 +321,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    server_args: ServerArgs,
     dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
@@ -260,14 +356,12 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
-    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
-    # still resolves to True (idle ranks become a padded dummy extend).
-    can_run_breakable_cuda_graph = (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-    ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    # Historical field name: this is now the rank-local admission for either
+    # captured prefill backend. The seven-field DP exchange min-reduces it
+    # before the shared token-bucket decision below.
+    can_run_breakable_cuda_graph = _can_run_dp_prefill_cuda_graph_locally(
+        local_batch, server_args
+    )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -320,11 +414,33 @@ def prepare_mlp_sync_batch_raw(
             use_all_reduce=use_world_group,
         )
 
-        mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
-            tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info[:, 4:6],
+        if mlp_sync_info.used_native_sync:
+            (
+                mlp_sync_info.tbo_split_seq_index,
+                mlp_sync_info.global_forward_mode,
+            ) = tbo_preparer.compute_output_from_values(
+                mlp_sync_info.global_local_can_run_tbo,
+                mlp_sync_info.global_forward_modes,
             )
+        else:
+            mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
+                tbo_preparer.compute_output(
+                    mlp_sync_info.tp0_info[:, 4:6],
+                )
+            )
+
+    mlp_sync_info.can_run_breakable_cuda_graph = (
+        _finalize_dp_prefill_cuda_graph_admission(
+            mlp_sync_info.can_run_breakable_cuda_graph,
+            global_num_tokens=(
+                mlp_sync_info.global_num_tokens
+                if not skip_all_gather
+                else [mlp_sync_info.num_tokens]
+            ),
+            is_extend_in_batch=mlp_sync_info.is_extend_in_batch,
+            server_args=server_args,
         )
+    )
 
     # Decide whether to emit idle batch
     if skip_all_gather:
@@ -349,10 +465,11 @@ def prepare_mlp_sync_batch_raw(
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and not skip_all_gather:
+        forward_modes = mlp_sync_info.global_forward_modes
+        if forward_modes is None:
+            forward_modes = mlp_sync_info.tp0_info[:, 5].tolist()
         local_batch.recv_skipper_forward_mode = (
-            SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info[:, 5].tolist()
-            )
+            SchedulerRecvSkipper.derive_forward_mode(forward_modes)
         )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
@@ -387,6 +504,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            server_args=self.server_args,
             dwdp=self.server_args.dwdp_size > 1,
         )
 

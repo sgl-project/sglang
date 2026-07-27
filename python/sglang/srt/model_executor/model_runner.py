@@ -1542,13 +1542,14 @@ class ModelRunner:
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
+                and not envs.SGLANG_PREFILL_CUDA_GRAPH_EAGER_VALIDATION.get()
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
                 category = (
                     "target_verify"
                     if forward_batch.forward_mode.is_target_verify()
-                    else "extend"
+                    else "extend_cuda_graph"
                 )
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)

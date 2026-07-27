@@ -1,6 +1,9 @@
 import logging
+import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -10,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import PreparedGrammarResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
@@ -34,6 +38,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_grammar_pipeline import (
+    DSparkGrammarPipeline,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -53,14 +60,18 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
-from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
-    build_grammar_vocab_mask,
-    draft_tp_context,
-)
+from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class GrammarResultCopy:
+    next_token_ids: torch.Tensor
+    accept_lens: Optional[torch.Tensor]
+    done: torch.cuda.Event
+    future: Future[PreparedGrammarResult]
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -72,6 +83,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
+        metrics_collector=None,
     ):
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -254,6 +266,97 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._grammar_pipeline = DSparkGrammarPipeline(
+            device=self.device,
+            max_batch_size=max(server_args.cuda_graph_config.decode.bs),
+            chain_length=self.verify_num_draft_tokens,
+            vocab_size=int(self.target_worker.model_runner.model_config.vocab_size),
+            traversal_threads=int(
+                os.environ.get("SGLANG_GRAMMAR_TRAVERSAL_THREADS", "12")
+            ),
+            metrics_collector=metrics_collector,
+        )
+        self._grammar_result_copy_stream = torch.get_device_module(self.device).Stream()
+        self._grammar_result_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"dspark-grammar-result-dp{self.ps.dp_rank}",
+        )
+
+    @staticmethod
+    def _prepare_grammar_result(
+        *,
+        next_token_ids: torch.Tensor,
+        accept_lens: Optional[torch.Tensor],
+        done: torch.cuda.Event,
+        submitted_at: float,
+    ) -> PreparedGrammarResult:
+        """Wait and materialize the early result without blocking the scheduler."""
+        worker_started = time.perf_counter()
+        done.synchronize()
+        copy_ready = time.perf_counter()
+        next_token_ids_list = next_token_ids.tolist()
+        accept_lens_list = accept_lens.tolist() if accept_lens is not None else None
+        prepared_at = time.perf_counter()
+        return PreparedGrammarResult(
+            next_token_ids=next_token_ids_list,
+            accept_lens=accept_lens_list,
+            queue_delay_seconds=worker_started - submitted_at,
+            copy_wait_seconds=copy_ready - worker_started,
+            tensor_to_list_seconds=prepared_at - copy_ready,
+            submit_to_ready_seconds=prepared_at - submitted_at,
+        )
+
+    def _start_grammar_result_copy(
+        self,
+        *,
+        next_token_ids: torch.Tensor,
+        accept_lens: Optional[torch.Tensor],
+    ) -> GrammarResultCopy:
+        """Publish the minimal next-step grammar dependency before forward end."""
+        if not next_token_ids.is_cuda:
+            raise RuntimeError("DSpark early grammar result must be CUDA-resident")
+        if accept_lens is not None and not accept_lens.is_cuda:
+            raise RuntimeError(
+                "DSpark early grammar accept lengths must be CUDA-resident"
+            )
+
+        device_module = torch.get_device_module(self.device)
+        current_stream = device_module.current_stream()
+        copy_stream = self._grammar_result_copy_stream
+        copy_stream.wait_stream(current_stream)
+        with device_module.stream(copy_stream):
+            next_token_ids_cpu = torch.empty(
+                next_token_ids.shape,
+                dtype=next_token_ids.dtype,
+                pin_memory=True,
+            )
+            next_token_ids_cpu.copy_(next_token_ids, non_blocking=True)
+            next_token_ids.record_stream(copy_stream)
+            accept_lens_cpu = None
+            if accept_lens is not None:
+                accept_lens_cpu = torch.empty(
+                    accept_lens.shape,
+                    dtype=accept_lens.dtype,
+                    pin_memory=True,
+                )
+                accept_lens_cpu.copy_(accept_lens, non_blocking=True)
+                accept_lens.record_stream(copy_stream)
+            done = device_module.Event()
+            done.record(copy_stream)
+        submitted_at = time.perf_counter()
+        future = self._grammar_result_executor.submit(
+            self._prepare_grammar_result,
+            next_token_ids=next_token_ids_cpu,
+            accept_lens=accept_lens_cpu,
+            done=done,
+            submitted_at=submitted_at,
+        )
+        return GrammarResultCopy(
+            next_token_ids_cpu,
+            accept_lens_cpu,
+            done,
+            future,
+        )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -364,9 +467,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
+        # Pure prefill already runs the target model, including its eager
+        # logits tail, and returns that LogitsProcessorOutput unchanged. It
+        # therefore supports prompt/output logprobs without involving the
+        # speculative verifier. Decode and mixed batches still fail closed:
+        # DSpark does not yet reconstruct their accepted-token logprobs.
+        #
+        # DP attention can represent a local decode or idle peer of a global
+        # prefill with is_extend_in_batch set. The dispatch immediately below
+        # routes exactly those batches through _forward_prefill so every rank
+        # participates in the target-model collectives. The request validator
+        # limits DSpark logprobs to one output token, so a local decode form is
+        # only the overlap scheduler's already-issued retirement step; it
+        # cannot expose speculative accepted-token logprobs.
+        supports_prefill_logprob = (
+            batch.forward_mode.is_extend() or batch.is_extend_in_batch
+        )
+        if getattr(batch, "return_logprob", False) and not supports_prefill_logprob:
             raise ValueError(
-                "DSpark speculative decoding does not support return_logprob yet."
+                "DSpark speculative decode does not support return_logprob yet: "
+                f"forward_mode={batch.forward_mode.name}, "
+                f"is_extend_in_batch={batch.is_extend_in_batch}."
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -392,6 +513,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
+        if batch.has_grammar:
+            grammar_copy = self._start_grammar_result_copy(
+                next_token_ids=next_token_ids,
+                accept_lens=None,
+            )
+            batch_output.grammar_next_token_ids = grammar_copy.next_token_ids
+            batch_output.grammar_accept_lens = grammar_copy.accept_lens
+            batch_output.grammar_copy_done = grammar_copy.done
+            batch_output.grammar_result_future = grammar_copy.future
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
@@ -558,6 +688,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and batch.global_num_tokens is not None
             else None
         )
+        dp_tier_num_tokens = self._dp_verify_tier_num_tokens(batch)
         layout = self._verify_planner.schedule_layout(
             req_pool_indices=batch.req_pool_indices,
             prefix_lens=prefix_lens,
@@ -565,21 +696,35 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence=confidence,
             budget=verify_token_budget,
             global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            dp_tier_num_tokens=dp_tier_num_tokens,
         )
+        if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            logger.info(
+                "DSpark verify graph tier: iter=%d local_bs=%d global_bs=%s "
+                "local_tier=%d global_tiers=%s dp_tier=%s graph_tokens=%s",
+                int(batch.forward_iter),
+                bs,
+                global_num_reqs,
+                int(batch.spec_verify_tier_num_tokens),
+                batch.global_spec_verify_tier_num_tokens,
+                dp_tier_num_tokens,
+                None if layout is None else layout.graph_num_tokens,
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = torch.cat(
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
-        # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+        grammar_step = (
+            self._grammar_pipeline.begin(
+                verify_ids_2d=verify_ids_2d,
+                requests=batch.reqs,
+                draft_input=draft_input,
+            )
+            if batch.has_grammar
+            else None
         )
-
-        # A live grammar forces the eager path: the folded epilogue accepts inside
-        # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
@@ -611,18 +756,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
 
-        if batch.has_grammar:
-            # run_compact scatters its rows back to (bs * chain_len), so the mask
-            # lines up with the logits on both verify paths.
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
+        if grammar_step is not None:
+            self._grammar_pipeline.mark_target_verify_enqueued(grammar_step)
+            grammar_result = self._grammar_pipeline.finish(
+                grammar_step,
+                grammar_barrier=grammar_barrier,
             )
-            if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
+            if grammar_result is not None:
+                grammar_result.grammar.apply_vocab_mask(
+                    logits=logits_output.next_token_logits,
+                    vocab_mask=grammar_result.vocab_mask,
+                )
+                self._grammar_pipeline.mark_consumed(grammar_result)
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
@@ -637,6 +782,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        grammar_copy = (
+            self._start_grammar_result_copy(
+                next_token_ids=accept.out_tokens.reshape(-1),
+                accept_lens=accept.commit_lens,
+            )
+            if batch.has_grammar
+            else None
         )
         if on_publish is not None:
             if confidence is not None:
@@ -697,6 +850,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            grammar_next_token_ids=(
+                grammar_copy.next_token_ids if grammar_copy is not None else None
+            ),
+            grammar_accept_lens=(
+                grammar_copy.accept_lens if grammar_copy is not None else None
+            ),
+            grammar_copy_done=(grammar_copy.done if grammar_copy is not None else None),
+            grammar_result_future=(
+                grammar_copy.future if grammar_copy is not None else None
+            ),
         )
 
     def get_confidence_budget_prepare(self):

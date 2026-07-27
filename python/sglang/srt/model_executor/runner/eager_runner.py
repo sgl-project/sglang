@@ -291,7 +291,7 @@ class EagerRunner(BaseRunner):
         category = (
             "target_verify"
             if forward_batch.forward_mode.is_target_verify()
-            else "extend"
+            else "extend_eager"
         )
         ctx = (
             model_runner.device_timer.wrap(metadata={"category": category})

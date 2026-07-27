@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
@@ -20,6 +21,18 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGrammarResult:
+    """Minimal DSpark result materialized off the scheduler critical path."""
+
+    next_token_ids: list[int]
+    accept_lens: Optional[list[int]]
+    queue_delay_seconds: float
+    copy_wait_seconds: float
+    tensor_to_list_seconds: float
+    submit_to_ready_seconds: float
 
 
 def _async_d2h(t: torch.Tensor) -> torch.Tensor:
@@ -64,6 +77,14 @@ class GenerationBatchResult:
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
+    # DSpark grammar overlap needs the previous accepted tokens before the next
+    # target-verify mask can be built. The worker publishes this minimal D2H
+    # result immediately after accept, before the hidden-state commit and the
+    # rest of the forward tail. The normal result copy remains independent.
+    grammar_next_token_ids: Optional[torch.Tensor] = None
+    grammar_accept_lens: Optional[torch.Tensor] = None
+    grammar_copy_done: Optional[torch.cuda.Event] = None
+    grammar_result_future: Optional[Future[PreparedGrammarResult]] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # Grammar FSM advance memoization (spec-v2 overlap). advance_grammar_fsm sets

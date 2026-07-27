@@ -48,7 +48,13 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
-_LARGE_INDEXER_QUERY_THRESHOLD = 11673
+# FlashMLA's dense scheduling-metadata kernel reserves
+# sizeof(int) * (5 * num_queries + 1) bytes of dynamic shared memory. B300
+# exposes 232448 bytes per block, so its hard ceiling is 11622 queries. Keep
+# the dense/graph range on a 64-token-aligned 11616 boundary; larger prefills
+# use DSV4's dedicated SM100 sparse-attention kernel instead of FlashMLA's
+# serial low-shared-memory metadata path.
+_LARGE_INDEXER_QUERY_THRESHOLD = 11616
 
 
 def copy_metadata(

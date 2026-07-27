@@ -156,8 +156,10 @@ class DSparkAttention(MqaAttentionBase):
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self._use_fast_kernel:
+            # Match the target model's allocation-free eager path. Capture and
+            # TP-padded calls still supply their fixed q_out buffer.
             if q_out is None:
-                q_out = torch.empty_like(q)
+                q_out = q
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
         else:
@@ -553,6 +555,7 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    dynamic_kv_cache_scale_block_size = 64
 
     def __init__(
         self,

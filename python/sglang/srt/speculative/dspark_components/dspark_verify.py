@@ -202,9 +202,26 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, can_run_cuda_graph = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if not can_run_cuda_graph:
+            graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+            graph_diagnostics = (
+                f"batch_size={verify_forward_batch.batch_size}, "
+                f"batch_can_dp_graph={verify_forward_batch.can_run_dp_cuda_graph}, "
+                f"global_tokens={verify_forward_batch.global_num_tokens_cpu}, "
+                f"runner_hidden={getattr(graph_runner, 'capture_hidden_mode', None)}, "
+                f"runner_max_bs={getattr(graph_runner, 'max_bs', None)}, "
+                f"runner_tokens={getattr(graph_runner, 'capture_num_tokens', None)}, "
+                f"attn_ragged={getattr(graph_runner.attn_backend, 'supports_ragged_verify_graph', None)}"
+            )
+            raise RuntimeError(
+                "DSpark DP idle target-verify participation missed the "
+                "required ragged CUDA graph; an eager idle verify cannot "
+                "safely share collectives with an active graph "
+                f"(layout_tokens={num_dummy_tokens}; {graph_diagnostics})."
+            )
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

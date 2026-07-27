@@ -20,6 +20,9 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.single_node_dp2_sync import (
+    exchange_single_node_dp2_verify_tier,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -331,14 +334,13 @@ class DSparkVerifyPlanner:
             batch.global_spec_verify_tier_num_tokens = None
             return
         cpu_group = get_tp_group().cpu_group
-        local_tensor = torch.tensor([local_tier_num_tokens], dtype=torch.int64)
-        gathered = torch.empty(
-            (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64
+        batch.global_spec_verify_tier_num_tokens = exchange_single_node_dp2_verify_tier(
+            local_tier_num_tokens,
+            group=cpu_group,
+            dp_size=2,
+            tp_size=get_parallel().attn_tp_size,
+            cp_size=get_parallel().attn_cp_size,
         )
-        torch.distributed.all_gather_into_tensor(
-            gathered, local_tensor, group=cpu_group
-        )
-        batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
@@ -429,11 +431,20 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
-            # Verify-all: the uniform layout (or None, past the captured grid)
-            # is constant per (bs, tier); serve it from cache instead of paying
-            # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+        bs = int(req_pool_indices.shape[0])
+        full_budget = bs * (
+            self.verify_num_draft_tokens - max(self._schedule_cfg.min_verify_len, 1)
+        )
+        if self._ragged_verify_mode is RaggedVerifyMode.COMPACT and (
+            self._is_verify_all
+            or (bs > 0 and budget is not None and budget >= full_budget)
+        ):
+            # A locally full budget does not imply the peer is full. Keep the
+            # fast uniform local layout, but key its graph padding from the
+            # already-agreed DP token tier. Otherwise one rank can select the
+            # full global-width graph while its peer selects the smaller shared
+            # tier, deadlocking their in-graph collectives.
+            key = (bs, global_num_reqs, dp_tier_num_tokens)
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
                     bs=key[0],
@@ -442,6 +453,7 @@ class DSparkVerifyPlanner:
                     ragged_verify_mode=self._ragged_verify_mode,
                     model_runner=self.model_runner,
                     tier_num_reqs=global_num_reqs,
+                    tier_num_tokens=dp_tier_num_tokens,
                 )
             return self._uniform_layout_cache[key]
         verify_lens = self._schedule_verify_lens(
@@ -739,12 +751,14 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    tier_num_tokens: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
     if ragged_layout_exceeds_captured_grid(
         num_reqs=tier_num_reqs,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_tokens_hint=tier_num_tokens,
     ):
         return None
     verify_lens_cpu = [verify_num_draft_tokens] * bs
@@ -758,6 +772,7 @@ def uniform_ragged_layout(
         ragged_verify_mode=ragged_verify_mode,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_num_tokens=tier_num_tokens,
     )
     return RaggedVerifyLayout.from_verify_lens(
         verify_lens_cpu=verify_lens_cpu,

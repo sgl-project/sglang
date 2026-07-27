@@ -668,6 +668,12 @@ class LogicalHostPool:
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
+    def destroy(self) -> None:
+        """Release host resources; this logical index pool owns no buffers.
+
+        HostPoolGroup.destroy() requires every member to provide this method.
+        """
+
     def available_size(self):
         return len(self.free_slots)
 

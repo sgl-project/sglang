@@ -134,6 +134,38 @@ class TestSubprocessWatchdog(CustomTestCase):
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
 
+    def test_wait_for_clean_exit_accepts_successful_children(self):
+        proc = self._spawn(noop_worker)
+        monitor = self._watch(proc, names=["scheduler"])
+
+        monitor.wait_for_clean_exit(timeout=2)
+
+        self.assertEqual(proc.exitcode, 0)
+        self.assertFalse(self.sigquit_triggered.is_set())
+
+    def test_wait_for_clean_exit_reports_failed_children(self):
+        proc = self._spawn(crashing_worker)
+        proc.join(timeout=2)
+        monitor = self._watch(proc, names=["scheduler"])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"scheduler\(pid=\d+, exitcode=1\)",
+        ):
+            monitor.wait_for_clean_exit(timeout=2)
+
+    def test_wait_for_clean_exit_reports_timeout(self):
+        proc = self._spawn(healthy_worker)
+        monitor = self._watch(proc, names=["scheduler"])
+
+        with self.assertRaisesRegex(RuntimeError, "scheduler.*timed out"):
+            monitor.wait_for_clean_exit(timeout=0.01)
+
+    def test_wait_for_clean_exit_rejects_nonpositive_timeout(self):
+        monitor = self._watch([])
+        with self.assertRaisesRegex(ValueError, "timeout must be positive"):
+            monitor.wait_for_clean_exit(timeout=0)
+
 
 if __name__ == "__main__":
     import unittest

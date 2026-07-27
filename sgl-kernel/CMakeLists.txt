@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
-project(sgl-kernel LANGUAGES CXX CUDA)
+project(sgl-kernel LANGUAGES C CXX CUDA)
 
 # utils
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
@@ -22,6 +22,18 @@ find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COM
 # CXX
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+
+# Low-latency, fail-closed metadata exchange for co-located DP2 schedulers.
+# This has no CUDA or PyTorch dependency and is loaded by SGLang through
+# ctypes only when SGLANG_DSPARK_DP2_SHM_MLP_SYNC=1.
+add_library(sglang_dp2_sync SHARED csrc/cpu/dp2_sync.c)
+target_compile_features(sglang_dp2_sync PRIVATE c_std_11)
+target_compile_options(
+    sglang_dp2_sync
+    PRIVATE -O3 -Wall -Wextra -Werror
+)
+target_link_libraries(sglang_dp2_sync PRIVATE rt)
+install(TARGETS sglang_dp2_sync LIBRARY DESTINATION "sgl_kernel")
 
 # CUDA
 enable_language(CUDA)

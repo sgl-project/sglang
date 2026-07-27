@@ -175,39 +175,17 @@ def _recv_fd(sock):
 
 
 def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
-    """Export retained VMM handles, preferring FABRIC and falling back to POSIX fds.
+    """Export retained VMM handles through the strict same-host POSIX fd path.
 
-    FABRIC is used only if every rank can export it; otherwise all ranks use POSIX
-    fds. Returns ``(fabric_handles, posix_fds, use_fabric)`` (one list populated);
-    raises if both fail on any rank. Caller owns the returned ``posix_fds``.
+    This topology has both ranks in containers on one Linux host.
+    CUDA FABRIC handles require an IMEX channel and only transport allocation
+    handles; they do not alter the peer mapping after import. Select the native
+    same-host SCM_RIGHTS path directly instead of probing another transport and
+    falling back. Returns ``([], posix_fds, False)`` and raises if export fails
+    on any rank. The caller owns the returned ``posix_fds``.
     """
     drv = _get_cuda_driver()
-    FABRIC = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     POSIX_FD = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-
-    fabric_handles: List[bytes] = []
-    fabric_error: Optional[Exception] = None
-    try:
-        for alloc_h in retained_handles:
-            fabric_h = check_drv(
-                drv.cuMemExportToShareableHandle(alloc_h, FABRIC, 0),
-                "cuMemExportToShareableHandle(FABRIC)",
-            )
-            fabric_handles.append(bytes(fabric_h.data))
-        fabric_ok = True
-    except Exception as e:
-        fabric_error = e
-        fabric_ok = False
-        fabric_handles = []
-        logger.info(
-            "FABRIC handle export failed on rank %s; falling back to "
-            "POSIX fd transport: %s",
-            rank,
-            e,
-        )
-
-    if all_ranks_ok(group, fabric_ok):
-        return fabric_handles, [], True
 
     posix_fds: List[int] = []
     posix_error: Optional[Exception] = None
@@ -215,13 +193,16 @@ def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
         for alloc_h in retained_handles:
             fd = check_drv(
                 drv.cuMemExportToShareableHandle(alloc_h, POSIX_FD, 0),
-                "cuMemExportToShareableHandle(POSIX_FD)",
+                "strict single-node cuMemExportToShareableHandle(POSIX_FD)",
             )
             posix_fds.append(int(fd))
         posix_ok = True
     except Exception as e:
         posix_error = e
         posix_ok = False
+
+    all_posix_ok = all_ranks_ok(group, posix_ok)
+    if not all_posix_ok:
         for fd in posix_fds:
             try:
                 os.close(fd)
@@ -229,14 +210,11 @@ def export_shareable_handles(retained_handles, group: ProcessGroup, rank: int):
                 pass
         posix_fds = []
 
-    if not all_ranks_ok(group, posix_ok):
-        cause = posix_error or fabric_error
-        message = (
-            "VMM handle export failed: FABRIC export failed on at least one "
-            "rank and POSIX fd export failed on at least one rank"
-        )
-        if cause is not None:
-            message += f"; local rank {rank} error: {cause}"
+        message = "strict single-node VMM POSIX fd export failed on at least one rank"
+        if posix_error is not None:
+            message += f"; local rank {rank} error: {posix_error}"
+        else:
+            message += f"; local rank {rank} export succeeded but a peer failed"
         raise RuntimeError(message) from posix_error
 
     return [], posix_fds, False

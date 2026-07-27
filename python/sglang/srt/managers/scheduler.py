@@ -67,7 +67,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    get_tp_group,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -228,6 +231,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -378,6 +382,16 @@ class Scheduler(
         )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        hicache_gate_control = os.environ.get("SGLANG_HICACHE_GATE_CONTROL", "disabled")
+        if hicache_gate_control not in {"disabled", "armed"}:
+            raise ValueError(
+                "SGLANG_HICACHE_GATE_CONTROL must be 'disabled' or 'armed', "
+                f"got {hicache_gate_control!r}"
+            )
+        self.hicache_gate_control_armed = hicache_gate_control == "armed"
+        self.hicache_gate_last_requested_tokens = 0
+        self.hicache_gate_last_evictable_tokens = 0
+        self.hicache_gate_last_evicted_tokens = 0
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
@@ -425,6 +439,8 @@ class Scheduler(
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
+        self._scheduler_phase_accumulator: dict[str, tuple[float, int, float]] = {}
+        self._scheduler_phase_flush_deadline = time.perf_counter() + 1.0
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
@@ -807,6 +823,8 @@ class Scheduler(
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
         )
+        if self.spec_algorithm.is_dspark():
+            draft_worker_kwargs["metrics_collector"] = self.metrics_collector
 
         if self.server_args.speculative_draft_load_format is not None:
             # Write the draft load_format onto server_args (not just the bag):
@@ -1582,6 +1600,46 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
+    def _finish_scheduler_phase(self, phase: str, started: float) -> float:
+        """Record one latency-critical scheduler phase and return the next start."""
+        now = time.perf_counter()
+        duration = now - started
+        if self.server_args.enable_metrics:
+            total, calls, maximum = self._scheduler_phase_accumulator.get(
+                phase, (0.0, 0, 0.0)
+            )
+            self._scheduler_phase_accumulator[phase] = (
+                total + duration,
+                calls + 1,
+                max(maximum, duration),
+            )
+            if phase == "loop_total" and now >= self._scheduler_phase_flush_deadline:
+                for (
+                    accumulated_phase,
+                    (
+                        accumulated_seconds,
+                        accumulated_calls,
+                        accumulated_max,
+                    ),
+                ) in self._scheduler_phase_accumulator.items():
+                    self.metrics_collector.add_scheduler_phase(
+                        accumulated_phase,
+                        accumulated_seconds,
+                        accumulated_calls,
+                        accumulated_max,
+                    )
+                self._scheduler_phase_accumulator.clear()
+                self._scheduler_phase_flush_deadline = now + 1.0
+        if duration >= 1.0:
+            logger.warning(
+                "Slow scheduler phase: phase=%s duration=%.3fs running=%d waiting=%d",
+                phase,
+                duration,
+                len(self.running_batch.reqs),
+                len(self.waiting_queue),
+            )
+        return now
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1598,10 +1656,16 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
+            loop_started = phase_started = time.perf_counter()
+
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            phase_started = self._finish_scheduler_phase(
+                "request_ingest", phase_started
+            )
             if self._engine_paused:
+                self._finish_scheduler_phase("loop_total", loop_started)
                 continue
 
             # Get the next batch to run
@@ -1614,6 +1678,7 @@ class Scheduler(
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
+            phase_started = self._finish_scheduler_phase("schedule_plan", phase_started)
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1627,6 +1692,7 @@ class Scheduler(
                         self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
                         pass
+            phase_started = self._finish_scheduler_phase("result_sync", phase_started)
 
             # Launch the current batch
             if batch:
@@ -1636,6 +1702,9 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+            phase_started = self._finish_scheduler_phase(
+                "forward_submit", phase_started
+            )
 
             # Process the last batch
             if self.last_batch:
@@ -1644,17 +1713,22 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+            phase_started = self._finish_scheduler_phase(
+                "result_process", phase_started
+            )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+            phase_started = self._finish_scheduler_phase("sample", phase_started)
 
             # Update last_batch
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+            self._finish_scheduler_phase("loop_total", loop_started)
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -1701,8 +1775,15 @@ class Scheduler(
         (before generate_token_bitmask) so the CPU advance overlaps the target
         verify forward. Idempotent; no-op when the queue is empty or has no grammar.
         """
+        phase_seconds = {}
         for prev_batch, prev_result in self.result_queue:
-            self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+            result_phase_seconds = self.batch_result_processor.advance_grammar_fsm(
+                prev_result, prev_batch
+            )
+            if result_phase_seconds is not None:
+                for phase, seconds in result_phase_seconds.items():
+                    phase_seconds[phase] = phase_seconds.get(phase, 0.0) + seconds
+        return phase_seconds
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -2253,7 +2334,11 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                self.spec_algorithm,
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -2798,6 +2883,23 @@ class Scheduler(
                 # We need to discard it.
                 chunked_req_to_exclude.add(last_batch.chunked_req)
 
+            # A one-token DSpark logprob request is completed by this target
+            # prefill. Under overlap scheduling its result is still queued, so
+            # merging the live batch into running_batch would launch a stale
+            # speculative decode before the prefill result retires the request.
+            # The result queue owns a shallow batch snapshot and still streams
+            # the sampled token and exact target logprobs. Exclude only final
+            # prefill chunks; middle chunks must continue until prefill ends.
+            if (
+                self.spec_algorithm.is_dspark()
+                and last_batch.contains_last_prefill_chunk
+            ):
+                chunked_req_to_exclude.update(
+                    req
+                    for req in last_batch.reqs
+                    if req.return_logprob and req.sampling_params.max_new_tokens == 1
+                )
+
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
 
@@ -2825,12 +2927,14 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        plan_phase_started = time.perf_counter()
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+        self._finish_scheduler_phase("plan_prefill", plan_phase_started)
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2842,7 +2946,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            plan_phase_started = time.perf_counter()
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
+            self._finish_scheduler_phase("plan_mlp_sync_prefill", plan_phase_started)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -2851,20 +2957,26 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
+                plan_phase_started = time.perf_counter()
                 running_batch = self.update_running_batch(running_batch)
+                self._finish_scheduler_phase("plan_decode_update", plan_phase_started)
                 ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 
         # Handle DP attention and log stats
+        plan_phase_started = time.perf_counter()
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
+        self._finish_scheduler_phase("plan_mlp_sync_final", plan_phase_started)
 
         # Handle ngram embedding
+        plan_phase_started = time.perf_counter()
         ret = self.ngram_embedding_manager.prepare_for_forward(
             ret, chunked_req=self.chunked_req
         )
+        self._finish_scheduler_phase("plan_ngram", plan_phase_started)
 
         if ret:
             set_schedule_time_batch(ret)
@@ -3998,6 +4110,12 @@ class Scheduler(
                 / self.metrics_reporter.spec_total_num_forward_ct
             )
 
+        ret["hicache_gate_control"] = {
+            "armed": self.hicache_gate_control_armed,
+            "last_requested_tokens": self.hicache_gate_last_requested_tokens,
+            "last_evictable_tokens": self.hicache_gate_last_evictable_tokens,
+            "last_evicted_tokens": self.hicache_gate_last_evicted_tokens,
+        }
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
@@ -4022,6 +4140,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "hicache_gate_evict_device_tokens",
             ]
         )
 
@@ -4063,6 +4182,37 @@ class Scheduler(
                     )
                     if_success = False
                     break
+            elif k == "hicache_gate_evict_device_tokens":
+                if not self.hicache_gate_control_armed:
+                    logging.warning(
+                        "hicache_gate_evict_device_tokens rejected: the one-shot "
+                        "startup control is not armed."
+                    )
+                    if_success = False
+                    break
+                if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                    logging.warning(
+                        "hicache_gate_evict_device_tokens must be a positive integer, "
+                        f"got {v!r}."
+                    )
+                    if_success = False
+                    break
+                if (
+                    not self.enable_hierarchical_cache
+                    or getattr(self.tree_cache, "cache_controller", None) is None
+                ):
+                    logging.warning(
+                        "hicache_gate_evict_device_tokens requires an active "
+                        "hierarchical cache."
+                    )
+                    if_success = False
+                    break
+                if not self.is_fully_idle():
+                    logging.warning(
+                        "hicache_gate_evict_device_tokens requires an idle scheduler."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -4079,7 +4229,54 @@ class Scheduler(
             ) = 0
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
+            # The HiCache startup-gate command is likewise not a server arg.
+            # Disarm it before touching cache state: a failed operation is a
+            # fail-closed startup error, never permission to retry through a
+            # different or degraded path.
             remaining = dict(server_args_dict)
+            hicache_gate_evict_tokens = remaining.pop(
+                "hicache_gate_evict_device_tokens", None
+            )
+            if hicache_gate_evict_tokens is not None:
+                self.hicache_gate_control_armed = False
+                self.hicache_gate_last_requested_tokens = int(hicache_gate_evict_tokens)
+                try:
+                    self.tree_cache.writing_check(write_back=True)
+                    self.hicache_gate_last_evictable_tokens = int(
+                        self.tree_cache.evictable_size()
+                    )
+                    # Selective write-through may intentionally leave cold
+                    # device leaves unbacked. The isolation proof must never
+                    # delete and silently recompute those leaves: temporarily
+                    # force the existing write-back eviction path so every
+                    # evicted leaf is preserved on host first.
+                    cache_controller = self.tree_cache.cache_controller
+                    original_write_policy = cache_controller.write_policy
+                    try:
+                        cache_controller.write_policy = "write_back"
+                        evict_result = self.tree_cache.evict(
+                            EvictParams(num_tokens=int(hicache_gate_evict_tokens))
+                        )
+                    finally:
+                        cache_controller.write_policy = original_write_policy
+                    self.hicache_gate_last_evicted_tokens = int(
+                        evict_result.num_tokens_evicted
+                    )
+                    if self.hicache_gate_last_evicted_tokens <= 0:
+                        raise RuntimeError(
+                            "one-shot HiCache gate control did not evict any "
+                            "device tokens"
+                        )
+                    logger.info(
+                        "HiCache startup gate device eviction completed: "
+                        "requested=%d evictable=%d evicted=%d",
+                        self.hicache_gate_last_requested_tokens,
+                        self.hicache_gate_last_evictable_tokens,
+                        self.hicache_gate_last_evicted_tokens,
+                    )
+                except Exception:
+                    logger.exception("HiCache startup gate device eviction failed.")
+                    if_success = False
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
@@ -4527,10 +4724,15 @@ class Scheduler(
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
+        if self.server_args.enable_metrics:
+            self.metrics_collector.set_runtime_gc_frozen()
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 
     def handle_shutdown(self, recv_req: ShutdownReq):
+        # The tokenizer waits for every tracked child, so let the detokenizer
+        # leave its blocking receive loop before this scheduler tears down.
+        self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         # Break the event loop; the finally in run_scheduler_process releases resources.
         self.gracefully_exit = True
         return None
@@ -4751,4 +4953,17 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                logger.info("Graceful scheduler teardown: releasing host resources.")
                 scheduler.release_host_resources()
+                # Host-buffer release times differ slightly between ranks.
+                # Rendezvous on the CPU group before destroying every tracked
+                # subgroup and the default process group, otherwise the first
+                # rank to exit tears down TCPStore while its peer's NCCL
+                # heartbeat is still active.
+                logger.info("Graceful scheduler teardown: waiting for peer rank.")
+                get_world_group().barrier()
+                logger.info(
+                    "Graceful scheduler teardown: destroying distributed groups."
+                )
+                cleanup_dist_env_and_memory()
+                logger.info("Graceful scheduler teardown complete.")
