@@ -517,6 +517,8 @@ class UnifiedMambaPool(MambaPool):
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
+        # PP disagg state transfer maps entries by global layer id.
+        self.mamba_layer_ids = list(mamba_layer_ids)
         conv_views, temporal_view = unified_buffer.mamba_views_for(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
 
