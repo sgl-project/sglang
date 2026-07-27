@@ -66,6 +66,7 @@ runtime_common = [
   "transformers==5.12.1",
   "uvicorn",
   "uvloop",
+  "xxhash",
   "xgrammar==0.2.1",
 ]
 
