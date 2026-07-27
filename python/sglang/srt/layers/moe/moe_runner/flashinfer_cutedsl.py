@@ -241,10 +241,9 @@ def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) 
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
-    with torch.inference_mode(False):
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            resolve_cutedsl_standard_scales(layer)
-        )
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = layer._cutedsl_scales
@@ -284,12 +283,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
-    it depends on final weight shapes and EP configuration.  The wrapper's
-    CUDA-graph buffers are allocated inside CuteDslMoEWrapper.__init__, which
-    typically runs during the autotune dummy forward under inference_mode().
-    We wrap the creation in inference_mode(False) so that those pre-allocated
-    buffers are normal tensors -- inference tensors cannot be inplace-updated
-    during later CUDA graph capture, which runs outside inference_mode.
+    it depends on final weight shapes and EP configuration. The wrapper's
+    CUDA-graph buffers and resolved scales are later updated in place, so they
+    must be normal tensors even when initialization runs under inference_mode().
     """
     if layer._cutedsl_wrapper is not None:
         return
@@ -349,7 +345,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
         )
-    with torch.inference_mode(False):
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
@@ -412,32 +407,6 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
-def _quantize_hidden_states_nvfp4(
-    hidden_states: torch.Tensor,
-    input_scale: torch.Tensor,
-    use_per_token_activation: bool,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    quantized = fp4_quantize(
-        hidden_states,
-        input_scale,
-        sf_vec_size=NVFP4_SF_VEC_SIZE,
-        is_sf_swizzled_layout=False,
-        per_token_activation=use_per_token_activation,
-    )
-    if use_per_token_activation:
-        x_fp4_bytes, x_sf_bytes, per_token_scale = quantized
-    else:
-        x_fp4_bytes, x_sf_bytes = quantized
-        per_token_scale = None
-
-    seq_len, hidden_size = hidden_states.shape
-    x_fp4 = x_fp4_bytes.reshape(seq_len, hidden_size // 2)
-    x_sf = x_sf_bytes.view(torch.float8_e4m3fn).reshape(
-        seq_len, hidden_size // NVFP4_SF_VEC_SIZE
-    )
-    return x_fp4, x_sf, per_token_scale
-
-
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
     dispatch_output: StandardDispatchOutput,
@@ -462,10 +431,27 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    x_fp4, x_sf, per_token_scale = _quantize_hidden_states_nvfp4(
-        hidden_states,
-        quant_info.a1_scale,
-        quant_info.use_per_token_activation,
+    if quant_info.use_per_token_activation:
+        x_fp4, x_sf, per_token_scale = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=NVFP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+            per_token_activation=True,
+        )
+    else:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=NVFP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+        per_token_scale = None
+
+    seq_len, hidden_size = hidden_states.shape
+    x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+    x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+        seq_len, hidden_size // NVFP4_SF_VEC_SIZE
     )
 
     output = quant_info.wrapper.run(
@@ -529,10 +515,27 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         x_fp4 = hidden_states
         per_token_scale = None
     else:
-        x_fp4, x_sf, per_token_scale = _quantize_hidden_states_nvfp4(
-            hidden_states,
-            quant_info.a1_scale,
-            quant_info.use_per_token_activation,
+        if quant_info.use_per_token_activation:
+            x_fp4, x_sf, per_token_scale = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=NVFP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+                per_token_activation=True,
+            )
+        else:
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=NVFP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+            per_token_scale = None
+
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // NVFP4_SF_VEC_SIZE
         )
 
     output = quant_info.wrapper.run(
