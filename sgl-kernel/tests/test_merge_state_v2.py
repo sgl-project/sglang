@@ -142,6 +142,24 @@ DTYPES = [torch.half, torch.bfloat16]
 all_case_info: list[tuple] = []
 
 
+def skip_if_not_enough_cuda_memory(required_bytes: int):
+    if not torch.cuda.is_available():
+        pytest.skip(
+            "Currently only support compare triton merge_attn_states "
+            "with custom cuda merge_attn_states kernel"
+        )
+
+    torch.cuda.empty_cache()
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < required_bytes:
+        required_gib = required_bytes / 1024**3
+        free_gib = free_bytes / 1024**3
+        pytest.skip(
+            f"Large merge_state_v2 regression needs {required_gib:.2f} GiB "
+            f"of free GPU memory, but only {free_gib:.2f} GiB is available"
+        )
+
+
 def generate_markdown_table():
     global all_case_info
     table_header = (
@@ -375,6 +393,81 @@ def test_merge_attn_states(
         len(NUM_BATCH_TOKENS) * len(HEAD_SIZES) * len(NUM_QUERY_HEADS) * len(DTYPES)
     ):
         generate_markdown_table()
+
+
+@torch.inference_mode()
+def test_merge_attn_states_large_head_offset_regression():
+    num_heads = 128
+    head_size = 128
+    output_dtype = torch.half
+    first_overflow_token = 2**32 // (num_heads * head_size)
+    num_tokens = first_overflow_token + 8
+    assert first_overflow_token * num_heads * head_size == 2**32
+
+    data_numel = num_tokens * num_heads * head_size
+    lse_numel = num_tokens * num_heads
+    required_bytes = 3 * data_numel * output_dtype.itemsize
+    required_bytes += 3 * lse_numel * torch.float32.itemsize
+    required_bytes = int(required_bytes * 1.1)
+    skip_if_not_enough_cuda_memory(required_bytes)
+
+    try:
+        prefix_output = torch.empty(
+            (num_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
+        )
+        suffix_output = torch.empty_like(prefix_output)
+        output = torch.empty_like(prefix_output)
+        prefix_lse = torch.empty(
+            (num_tokens, num_heads), dtype=torch.float32, device="cuda"
+        )
+        suffix_lse = torch.empty_like(prefix_lse)
+        output_lse = torch.empty_like(prefix_lse)
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        pytest.skip(
+            f"Large merge_state_v2 regression could not allocate tensors: {exc}"
+        )
+
+    sample_positions = [
+        (first_overflow_token, 0),
+        (first_overflow_token, 17),
+        (num_tokens - 1, num_heads - 1),
+    ]
+    head_offsets = torch.arange(head_size, dtype=torch.float32, device="cuda")
+
+    for sample_idx, (token_idx, head_idx) in enumerate(sample_positions):
+        prefix_values = 1.0 + sample_idx + head_offsets * 0.01
+        suffix_values = -0.5 - sample_idx + head_offsets * 0.02
+        prefix_output[token_idx, head_idx].copy_(prefix_values.to(output_dtype))
+        suffix_output[token_idx, head_idx].copy_(suffix_values.to(output_dtype))
+        prefix_lse[token_idx, head_idx] = 0.25 + sample_idx
+        suffix_lse[token_idx, head_idx] = -0.75 + sample_idx * 0.5
+        output[token_idx, head_idx].fill_(-123.0)
+        output_lse[token_idx, head_idx] = -123.0
+
+    output, output_lse = merge_state_v2(
+        prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+    )
+    torch.cuda.synchronize()
+
+    for token_idx, head_idx in sample_positions:
+        p_lse = prefix_lse[token_idx, head_idx]
+        s_lse = suffix_lse[token_idx, head_idx]
+        max_lse = torch.maximum(p_lse, s_lse)
+        p_se = torch.exp(p_lse - max_lse)
+        s_se = torch.exp(s_lse - max_lse)
+        out_se = p_se + s_se
+        expected = prefix_output[token_idx, head_idx].float() * (
+            p_se / out_se
+        ) + suffix_output[token_idx, head_idx].float() * (s_se / out_se)
+        expected_lse = torch.log(out_se) + max_lse
+
+        torch.testing.assert_close(
+            output[token_idx, head_idx].float(), expected, atol=1e-3, rtol=1e-3
+        )
+        torch.testing.assert_close(
+            output_lse[token_idx, head_idx], expected_lse, atol=1e-5, rtol=1e-5
+        )
 
 
 if __name__ == "__main__":
