@@ -7,6 +7,7 @@ from typing import Any
 
 import torch  # type: ignore
 
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
@@ -150,6 +151,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self.crossattn_cache: list | None = None
         self.causal_kv_cache_neg: list | None = None
         self.crossattn_cache_neg: list | None = None
+        # KV-cache quantization config (resolved per-forward from ServerArgs)
+        self._kv_quant_args: QVGKVQuantArgs | None = None
         # Model-dependent constants (aligned with causal_inference.py assumptions)
         self.num_transformer_blocks = self.transformer.config.arch_config.num_layers
         self.num_frames_per_block = (
@@ -413,6 +416,15 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 raise ValueError("realtime_causal_kv_cache_num_frames must be positive")
             self.sliding_window_num_frames = int(kv_cache_num_frames)
 
+        # KV-cache quantization config (env fallback handled in the factory)
+        self._kv_quant_args = server_args.kv_cache_quant_config
+
+    def _resolve_kv_quant_args(self) -> QVGKVQuantArgs:
+        """KV-quant config from ServerArgs (disabled by default)."""
+        if self._kv_quant_args is not None:
+            return self._kv_quant_args
+        return QVGKVQuantArgs()
+
     def _causal_sequence_shard_enabled(self, batch: Req) -> bool:
         return False
 
@@ -485,8 +497,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
             or crossattn_cache is None
             or len(causal_kv_cache) != self.num_transformer_blocks
             or len(crossattn_cache) != self.num_transformer_blocks
-            or causal_kv_cache[0].k.shape[1] != policy.expected_cache_tokens
-            or causal_kv_cache[0].k.shape[2] != policy.num_attention_heads
+            or causal_kv_cache[0].cache_size != policy.expected_cache_tokens
+            or causal_kv_cache[0].num_cache_heads != policy.num_attention_heads
             or causal_kv_cache[0].sink_tokens != policy.expected_sink_tokens
         )
 
@@ -1110,44 +1122,30 @@ class CausalDMDDenoisingStage(DenoisingStage):
         attention_window_size: int | None = None,
         allow_growth: bool = False,
     ) -> list[CausalSelfAttentionKVCache]:
-        causal_kv_cache = []
-        int_index = 0 if use_int_indices else None
+        from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
+            make_causal_self_attention_kv_cache,
+        )
+
         if attention_window_size is None:
             attention_window_size = kv_cache_size
-        for _ in range(self.num_transformer_blocks):
-            causal_kv_cache.append(
-                CausalSelfAttentionKVCache(
-                    k=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    v=torch.zeros(
-                        [
-                            batch_size,
-                            kv_cache_size,
-                            num_attention_heads,
-                            attention_head_dim,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    global_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    local_end_index=torch.zeros(1, dtype=torch.long, device=device),
-                    global_end_index_int=int_index,
-                    local_end_index_int=int_index,
-                    cache_size=kv_cache_size,
-                    sink_tokens=sink_tokens,
-                    global_sink_tokens=global_sink_tokens,
-                    attention_window_size=attention_window_size,
-                    allow_growth=allow_growth,
-                )
+        quant_args = self._resolve_kv_quant_args()
+        causal_kv_cache = [
+            make_causal_self_attention_kv_cache(
+                quant_args=quant_args,
+                batch_size=batch_size,
+                kv_cache_size=kv_cache_size,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                dtype=dtype,
+                device=device,
+                use_int_indices=use_int_indices,
+                sink_tokens=sink_tokens,
+                global_sink_tokens=global_sink_tokens,
+                attention_window_size=attention_window_size,
+                allow_growth=allow_growth,
             )
+            for _ in range(self.num_transformer_blocks)
+        ]
         return causal_kv_cache
 
     @torch.no_grad()
