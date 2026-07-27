@@ -16,6 +16,39 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    /// Engine-reported load monitoring and scheduling configuration.
+    pub load_monitor: LoadMonitorConfig,
+}
+
+/// Configuration for the Router-owned load-reporting control plane.
+///
+/// Timing and endpoint constants intentionally are not configurable in the
+/// first version; only listener placement and the engine-reachable callback IP
+/// are exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadMonitorConfig {
+    /// Enables active registration, gRPC ingestion, snapshot publication, and
+    /// freshness classification for snapshot consumers.
+    pub enabled: bool,
+    /// Address used by the independent gRPC listener.
+    pub bind_host: String,
+    /// Requested gRPC listener port. Zero asks the operating system to select
+    /// an available port.
+    pub bind_port: u16,
+    /// Engine-reachable Router IP sent to `/v1/start_reporting`.
+    pub report_ip: Option<String>,
+}
+
+impl Default for LoadMonitorConfig {
+    /// Returns the disabled load-monitor configuration.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_host: "0.0.0.0".to_string(),
+            bind_port: 0,
+            report_ip: None,
+        }
+    }
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /

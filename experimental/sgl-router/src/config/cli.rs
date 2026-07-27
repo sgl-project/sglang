@@ -12,8 +12,9 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DiscoveryBackend, K8sDiscoveryConfig, LoadMonitorConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -125,6 +126,23 @@ pub struct Cli {
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
 
+    // ---- engine-reported load monitor ----
+    /// Enable Router-initiated engine load reporting and snapshot scheduling.
+    #[arg(long)]
+    pub load_monitor: bool,
+    /// Address for the independent load-monitor gRPC listener. Defaults to
+    /// `0.0.0.0` when `--load-monitor` is enabled.
+    #[arg(long)]
+    pub load_monitor_bind_host: Option<String>,
+    /// Port for the independent load-monitor gRPC listener. Defaults to `0`,
+    /// allowing the operating system to select a free port.
+    #[arg(long)]
+    pub load_monitor_bind_port: Option<u16>,
+    /// Router IP reachable from engines and advertised to
+    /// `/v1/start_reporting`. Required with `--load-monitor`.
+    #[arg(long)]
+    pub load_monitor_report_ip: Option<String>,
+
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -144,6 +162,21 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+
+        let tuned_load_monitor = self.load_monitor_bind_host.is_some()
+            || self.load_monitor_bind_port.is_some()
+            || self.load_monitor_report_ip.is_some();
+        if !self.load_monitor && tuned_load_monitor {
+            return Err(anyhow!(
+                "--load-monitor-bind-host / --load-monitor-bind-port / \
+                 --load-monitor-report-ip require --load-monitor"
+            ));
+        }
+        if self.load_monitor && self.load_monitor_report_ip.is_none() {
+            return Err(anyhow!(
+                "--load-monitor-report-ip is required when --load-monitor is enabled"
+            ));
+        }
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -274,6 +307,14 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+            },
+            load_monitor: LoadMonitorConfig {
+                enabled: self.load_monitor,
+                bind_host: self
+                    .load_monitor_bind_host
+                    .unwrap_or_else(|| "0.0.0.0".to_string()),
+                bind_port: self.load_monitor_bind_port.unwrap_or(0),
+                report_ip: self.load_monitor_report_ip,
             },
         };
         config.validate()?;
@@ -663,6 +704,9 @@ mod tests {
             "http://10.0.0.1:30000",
             "--policy",
             "load_based",
+            "--load-monitor",
+            "--load-monitor-report-ip",
+            "127.0.0.1",
         ]))
         .unwrap();
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
@@ -736,6 +780,9 @@ mod tests {
             "cache_aware_zmq",
             "--cache-threshold",
             "0.7",
+            "--load-monitor",
+            "--load-monitor-report-ip",
+            "127.0.0.1",
         ]))
         .unwrap();
         let ca = c.model.cache_aware.expect("cache_aware set");
@@ -751,6 +798,9 @@ mod tests {
             "http://x:30000",
             "--policy",
             "cache_aware_zmq",
+            "--load-monitor",
+            "--load-monitor-report-ip",
+            "127.0.0.1",
         ]))
         .unwrap();
         assert!(c.model.cache_aware.is_none());
@@ -836,6 +886,9 @@ mod tests {
             "120",
             "--sticky-eviction-interval-secs",
             "15",
+            "--load-monitor",
+            "--load-monitor-report-ip",
+            "127.0.0.1",
         ]))
         .unwrap();
         let s = c.model.sticky.expect("sticky config built");
@@ -958,5 +1011,50 @@ mod tests {
             err.contains("--sticky-idle-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    /// Enabling monitoring requires an engine-reachable callback IP.
+    #[test]
+    fn rejects_load_monitor_without_report_ip() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--load-monitor",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--load-monitor-report-ip is required"),
+            "got: {err}"
+        );
+    }
+
+    /// Monitor address knobs cannot be silently ignored while disabled.
+    #[test]
+    fn rejects_load_monitor_address_knob_while_disabled() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--load-monitor-bind-port",
+            "12345",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("require --load-monitor"), "got: {err}");
+    }
+
+    /// Non-load-scored policies keep their legacy behavior while disabled.
+    #[test]
+    fn accepts_non_load_scored_policies_without_monitor() {
+        for policy in ["round_robin", "random"] {
+            let config = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--policy",
+                policy,
+            ]))
+            .unwrap();
+            assert!(!config.load_monitor.enabled, "policy {policy}");
+        }
     }
 }
