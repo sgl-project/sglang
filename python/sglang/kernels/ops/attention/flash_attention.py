@@ -46,6 +46,7 @@ def flash_attn_with_kvcache(
     sfv=None,
     rel_bias=None,
     rel_bias_prep_cache=None,
+    decode_uniform_q=False,
     ver=3,
     out=None,
 ):
@@ -212,6 +213,7 @@ def flash_attn_with_kvcache(
             sfv=sfv,
             rel_bias=rel_bias,
             rel_bias_prep_cache=rel_bias_prep_cache,
+            decode_uniform_q=decode_uniform_q,
             return_softmax_lse=return_softmax_lse,
         )
     else:

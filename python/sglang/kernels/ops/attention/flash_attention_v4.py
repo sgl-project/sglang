@@ -66,6 +66,7 @@ def flash_attn_varlen_func(
     ] = None,  # MXFP8 UE8M0 per-32-elem block scales (in-kernel V dequant)
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    decode_uniform_q: bool = False,
     return_softmax_lse: bool = False,
     **_: object,
 ):
@@ -115,6 +116,8 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    if decode_uniform_q:
+        rel_bias_kwargs["decode_uniform_q"] = True
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -188,6 +191,7 @@ def flash_attn_with_kvcache(
     sfv: Optional[torch.Tensor] = None,
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    decode_uniform_q: bool = False,
     return_softmax_lse: bool = False,
     **_: object,
 ):
@@ -230,7 +234,8 @@ def flash_attn_with_kvcache(
         sfv=sfv,
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
-        return_softmax_lse=True,
+        decode_uniform_q=decode_uniform_q,
+        return_softmax_lse=(return_softmax_lse if decode_uniform_q else True),
     )
 
     if return_softmax_lse:
