@@ -25,6 +25,8 @@
 //                      required whenever benchmarks carry accuracy data
 //   latencyPercentile  optional, TEMPORARY — "Mean" | "P50" (default "P50"); the
 //                      percentile the TTFT/TPOT values are, shown as "TTFT (<pct>)".
+//                      A benchmarks entry may carry its own latencyPercentile to
+//                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by `hw|quant`
@@ -577,7 +579,7 @@ export const Deployment = ({ config, benchmarks }) => {
   const renderBenchmarkCard = (entry) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
-    const pct = config.latencyPercentile || "P50";
+    const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],

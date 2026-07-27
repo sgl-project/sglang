@@ -288,10 +288,7 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
-
-    @property
-    def can_run_cuda_graph(self) -> bool:
-        return False
+    can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
