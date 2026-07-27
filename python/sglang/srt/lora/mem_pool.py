@@ -385,23 +385,6 @@ class LoRAMemoryPool:
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
 
-    def _get_standard_shape(
-        self,
-        module_name: str,
-        base_model: torch.nn.Module,
-        max_lora_dim: int,
-        layer_idx: int,
-    ) -> Tuple[int]:
-        """Get 3D shape for standard (non-MoE) modules."""
-        input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
-        c = get_stacked_multiply(module_name, base_model)
-        effective_tp_size = self._effective_tp_size(module_name)
-        if effective_tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, effective_tp_size)
-        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
-
     def get_lora_A_shape(
         self,
         module_name: str,
@@ -1087,7 +1070,7 @@ class LoRAMemoryPool:
 
                 # Handle standard modules
                 temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                    temp_A_buffer[target_module], self.tp_rank
+                    temp_A_buffer[target_module]
                 )
                 cache_keys = temp_A_cache_keys[target_module]
                 assert cache_keys is not None
@@ -1097,7 +1080,7 @@ class LoRAMemoryPool:
                 )
 
                 temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                    temp_B_buffer[target_module], self.tp_rank
+                    temp_B_buffer[target_module]
                 )
                 cache_keys = temp_B_cache_keys[target_module]
                 assert cache_keys is not None
@@ -1433,7 +1416,7 @@ class LoRAMemoryPool:
                     # Slice B along vocab dimension for this TP rank
                     if self.tp_size > 1:
                         lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
-                            lora_b_weights, self.tp_rank
+                            lora_b_weights
                         )
                         cache_key = append_cache_key_suffix(name, f"tp{self.tp_rank}")
                     else:

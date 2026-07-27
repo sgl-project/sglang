@@ -366,6 +366,13 @@ class LoRAManager:
                     notify(slot_ids)
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_idle():
+            # DP-attention idle forward: zero local tokens; clear per-batch
+            # state so the LoRA layers take the base path instead of reading
+            # the previous batch's stale metadata.
+            self.lora_backend.reset_batch_state()
+            return
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -398,16 +405,6 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
-
-    def prepare_idle_lora_batch(self):
-        """Reset per-batch LoRA state for a DP-attention idle forward.
-
-        Idle forwards run the model with zero local tokens and skip
-        prepare_lora_batch(); clearing batch_info makes the LoRA layers fall
-        back to the base path instead of reading the previous batch's stale
-        metadata.
-        """
-        self.lora_backend.batch_info = None
 
     def update_lora_info(self):
         """
