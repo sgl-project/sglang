@@ -247,6 +247,8 @@ K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1
 - On the DCP recipes (Blackwell Balanced / High-Throughput), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags and run plain TP** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 NOSPEC keeps DCP.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
 
+<a id="pd-disaggregation" />
+
 ### 3.4 PD Disaggregation
 
 PD splits prefill and decode into separate server groups; because K3 is hybrid, the transfer moves **both** the paged MLA KV and the KDA recurrent state.
