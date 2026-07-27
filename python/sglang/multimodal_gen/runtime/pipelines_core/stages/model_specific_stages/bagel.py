@@ -12,6 +12,7 @@ from PIL import Image
 from torchvision.transforms import functional as TF
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -881,7 +882,10 @@ class BagelUnderstandingStage(PipelineStage):
         ) as image_encoder:
             assert image_encoder is not None
             self.image_encoder = image_encoder
-            vision_embeddings = image_encoder.encode_image(image)
+            # Native attention layers read their backend metadata from the
+            # standard forward context, even though this stage does not denoise.
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                vision_embeddings = image_encoder.encode_image(image)
 
         with self.use_declared_component(
             component_name="transformer",
@@ -1072,7 +1076,10 @@ class BagelEditBeforeDenoisingStage(BagelBeforeDenoisingStage):
         ) as image_encoder:
             assert image_encoder is not None
             self.image_encoder = image_encoder
-            vision_embeddings = image_encoder.encode_image(image)
+            # Keep Editing's custom conditioning stage compatible with the same
+            # native attention contract used by generic image-encoding stages.
+            with set_forward_context(current_timestep=0, attn_metadata=None):
+                vision_embeddings = image_encoder.encode_image(image)
 
         text_input_ids = self._tokenize_prompt(batch.prompt, special_token_ids).to(
             device

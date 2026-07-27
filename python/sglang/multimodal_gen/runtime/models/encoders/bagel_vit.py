@@ -24,6 +24,46 @@ from sglang.multimodal_gen.configs.models.encoders.bagel_vit import (
 from sglang.multimodal_gen.configs.pipeline_configs.bagel import (
     calculate_bagel_resize_dimensions,
 )
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+
+# Latest Torch SDPA is faster for BAGEL's shorter vision sequences on SM100,
+# while FA4 wins decisively for large inputs. At 2,304 tokens the measured gain
+# is marginal; 2,500 tokens and above show a clear win. Keep that policy scoped
+# to the architecture on which it was measured.
+_FA4_MIN_SEQUENCE_LENGTH = 2500
+
+
+def _uses_sm100_fa4_crossover(backend: AttentionBackendEnum) -> bool:
+    """Return whether a selected backend uses the measured SM100 policy."""
+    if backend != AttentionBackendEnum.FA:
+        return False
+    device_capability = current_platform.get_device_capability()
+    return device_capability is not None and device_capability.to_int() == 100
+
+
+def _run_siglip_attention(
+    attention: LocalAttention,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    use_sm100_fa4_crossover: bool,
+) -> Tensor:
+    """Use SDPA below the validated SM100 FA4 sequence-length crossover."""
+    if use_sm100_fa4_crossover and query.shape[1] < _FA4_MIN_SEQUENCE_LENGTH:
+        attended = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=attention.softmax_scale,
+        )
+        return attended.transpose(1, 2)
+    return attention(query, key, value)
 
 
 class _SiglipAttention(nn.Module):
@@ -36,27 +76,35 @@ class _SiglipAttention(nn.Module):
         self.k_proj = nn.Linear(arch.hidden_size, arch.hidden_size)
         self.v_proj = nn.Linear(arch.hidden_size, arch.hidden_size)
         self.out_proj = nn.Linear(arch.hidden_size, arch.hidden_size)
+        self.attn = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_heads,
+            causal=False,
+            supported_attention_backends=arch._supported_attention_backends,
+        )
+        self._use_sm100_fa4_crossover = _uses_sm100_fa4_crossover(self.attn.backend)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         """Apply non-causal self-attention to one packed image."""
         sequence_length = hidden_states.shape[0]
         query = self.q_proj(hidden_states).view(
-            sequence_length, self.num_heads, self.head_dim
+            1, sequence_length, self.num_heads, self.head_dim
         )
         key = self.k_proj(hidden_states).view(
-            sequence_length, self.num_heads, self.head_dim
+            1, sequence_length, self.num_heads, self.head_dim
         )
         value = self.v_proj(hidden_states).view(
-            sequence_length, self.num_heads, self.head_dim
+            1, sequence_length, self.num_heads, self.head_dim
         )
-        attended = F.scaled_dot_product_attention(
-            query.transpose(0, 1).unsqueeze(0),
-            key.transpose(0, 1).unsqueeze(0),
-            value.transpose(0, 1).unsqueeze(0),
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        attended = attended.squeeze(0).transpose(0, 1).reshape(sequence_length, -1)
+        attended = _run_siglip_attention(
+            self.attn,
+            query,
+            key,
+            value,
+            self._use_sm100_fa4_crossover,
+        ).squeeze(0)
+        attended = attended.reshape(sequence_length, -1)
         return self.out_proj(attended)
 
 
@@ -254,6 +302,10 @@ class BagelImageEncoder(nn.Module):
         Returns:
             Semantic image tokens shaped ``[tokens, llm_hidden_size]``.
 
+        Note:
+            Callers must establish ``set_forward_context`` before invoking the
+            encoder because native attention backends consume that context.
+
         Raises:
             ValueError: If patch and position counts differ or a position is out
                 of range.
@@ -281,6 +333,10 @@ class BagelImageEncoder(nn.Module):
 
         Returns:
             LLM-width semantic image tokens on this component's device.
+
+        Note:
+            Callers must establish ``set_forward_context`` before invoking the
+            encoder because native attention backends consume that context.
 
         Raises:
             ValueError: If image geometry exceeds the checkpoint tables.

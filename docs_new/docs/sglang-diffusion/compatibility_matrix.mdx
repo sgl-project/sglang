@@ -188,7 +188,9 @@ Understanding remain singleton-only. TP=2 shards the BAGEL attention, MLP,
 token embedding, and optional language head; the VAE, vision encoder, and small
 auxiliary projections remain replicated. BAGEL's request-level native
 TaylorSeer is available for T2I, Thinking, and editing, but not Understanding;
-it is independent of the unsupported generic Cache-DiT path.
+it is independent of the unsupported generic Cache-DiT path. On SM100, the
+vision encoder uses FA4 for inputs with at least 2,500 patches when FA4 CUTE is
+available and retains Torch SDPA for shorter sequences or capability fallback.
 </Note>
 
 <Note>

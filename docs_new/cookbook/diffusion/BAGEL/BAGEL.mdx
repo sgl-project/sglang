@@ -105,6 +105,28 @@ cache and runtime workspaces. The pipeline applies BAGEL's official outer image
 resize before the independent ViT resize, but never runs VAE encode/decode or a
 denoising loop.
 
+### Vision encoder attention
+
+Editing and Understanding use SGLang's native attention backend selection for
+the BAGEL vision encoder. On SM100 GPUs with `flash_attn.cute` available, inputs
+with at least 2,500 image patches use FA4; shorter inputs stay on Torch SDPA.
+The threshold keeps the marginal 2,304-patch crossover on SDPA and enables FA4
+where checkpoint-backed measurements show a clear benefit. If FA4 CUTE is
+unavailable, or on other GPU architectures, capability checks fall back to
+Torch SDPA.
+
+To force the reference SDPA path for a comparison or a latency-sensitive
+one-shot run, add this component override to either server command:
+
+```bash
+--component-attention-backends image_encoder=torch_sdpa
+```
+
+FA4 uses CUTE JIT compilation, so the first eligible image shape in a process has
+a one-time compilation cost. Repeated requests reuse the compiled kernel. The
+component override affects only the vision encoder; the BAGEL transformer keeps
+its independently selected attention backend.
+
 ## Use tensor parallelism
 
 All four BAGEL pipeline variants support TP=2. Transformer attention, MLP, token

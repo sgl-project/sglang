@@ -8,12 +8,19 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     ImageEncoderArchConfig,
     ImageEncoderConfig,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
 class BagelImageEncoderArchConfig(ImageEncoderArchConfig):
     """Architecture values stored in the official BAGEL checkpoint."""
 
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.TORCH_SDPA,
+        }
+    )
     hidden_size: int = 1152
     intermediate_size: int = 4304
     num_hidden_layers: int = 26

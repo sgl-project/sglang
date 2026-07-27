@@ -20,6 +20,9 @@ from transformers import AutoTokenizer
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
     set_default_torch_dtype,
@@ -434,10 +437,20 @@ class BagelPipeline(ComposedPipelineBase):
                 "image_encoder",
                 precision_attr="image_encoder_precision",
             )
-            with set_default_torch_dtype(dtype), torch.device("meta"):
-                image_encoder = BagelImageEncoder(
-                    server_args.pipeline_config.image_encoder_config
+            component_backend = None
+            matched_backend_key = None
+            if hasattr(server_args, "resolve_component_attention_backend"):
+                component_backend, matched_backend_key = (
+                    server_args.resolve_component_attention_backend("image_encoder")
                 )
+            with component_attn_backend_context_manager(
+                component_backend,
+                component_name=matched_backend_key or "image_encoder",
+            ):
+                with set_default_torch_dtype(dtype), torch.device("meta"):
+                    image_encoder = BagelImageEncoder(
+                        server_args.pipeline_config.image_encoder_config
+                    )
             self._stream_weights(
                 image_encoder,
                 os.path.join(checkpoint_path, "ema.safetensors"),
