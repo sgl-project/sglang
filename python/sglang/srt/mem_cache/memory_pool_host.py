@@ -677,7 +677,9 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
-        if io_backend == "kernel_ascend" and self.ascend_mamba_async_enabled:
+        if io_backend == "kernel_ascend" and getattr(
+            self, "ascend_mamba_async_enabled", False
+        ):
             self._transfer_state_async(
                 device_pool=device_pool,
                 host_indices=host_indices,
@@ -729,7 +731,9 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
-        if io_backend == "kernel_ascend" and self.ascend_mamba_async_enabled:
+        if io_backend == "kernel_ascend" and getattr(
+            self, "ascend_mamba_async_enabled", False
+        ):
             self._transfer_state_async(
                 device_pool=device_pool,
                 host_indices=host_indices,
