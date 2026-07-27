@@ -308,6 +308,90 @@ class DiffusionServerBase:
             max_retries=0,
         )
 
+    def _test_chat_completion_smoke(
+        self,
+        ctx: ServerContext,
+        case: DiffusionTestCase,
+    ) -> None:
+        """Validate a text-generating diffusion server through the Chat API.
+
+        Args:
+            ctx: Running server context for the test case.
+            case: Image-to-text test case with one prompt and one image URL.
+
+        Raises:
+            AssertionError: If the request inputs or response contract are invalid.
+        """
+        sampling_params = case.sampling_params
+        assert sampling_params is not None
+        prompt = sampling_params.prompt
+        image_url = sampling_params.image_path
+        assert (
+            isinstance(prompt, str) and prompt.strip()
+        ), f"{case.id}: chat smoke requires a non-empty prompt"
+        assert (
+            isinstance(image_url, str) and image_url.strip()
+        ), f"{case.id}: chat smoke requires one image URL"
+
+        def generate_fn(
+            case_id: str,
+            client: openai.Client,
+        ) -> tuple[str, bytes]:
+            response = client.chat.completions.create(
+                model=case.server_args.model_path,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url},
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                max_completion_tokens=64,
+                temperature=0,
+            )
+
+            assert (
+                isinstance(response.id, str) and response.id
+            ), f"{case_id}: chat completion must return a request id"
+            assert (
+                len(response.choices) == 1
+            ), f"{case_id}: expected exactly one chat completion choice"
+            choice = response.choices[0]
+            content = choice.message.content
+            assert (
+                isinstance(content, str) and content.strip()
+            ), f"{case_id}: assistant content must be non-empty text"
+            assert choice.finish_reason in (
+                "stop",
+                "length",
+            ), f"{case_id}: unsupported finish reason {choice.finish_reason!r}"
+
+            usage = response.usage
+            assert usage is not None, f"{case_id}: token usage must be present"
+            assert (
+                usage.prompt_tokens > 0
+            ), f"{case_id}: prompt token count must be positive"
+            assert (
+                usage.completion_tokens > 0
+            ), f"{case_id}: completion token count must be positive"
+            assert usage.total_tokens == (
+                usage.prompt_tokens + usage.completion_tokens
+            ), f"{case_id}: total token count must equal prompt plus completion"
+            return response.id, content.encode("utf-8")
+
+        client = self._client(ctx)
+        self._run_generation_with_server_watchdog(
+            ctx,
+            case.id,
+            generate_fn,
+            client,
+        )
+
     def _fail_if_server_stopped_or_crashed(
         self, ctx: ServerContext, case_id: str
     ) -> None:
@@ -1332,6 +1416,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         case: DiffusionTestCase,
         diffusion_server: ServerContext,
     ):
+        task_type = get_model_task_type_for_server_args(case.server_args)
+        if task_type.is_text_gen():
+            # Text generation has no media payload or diffusion perf record.
+            # Exercise its native OpenAI endpoint and stop before image/video checks.
+            self._test_chat_completion_smoke(diffusion_server, case)
+            return
+
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 

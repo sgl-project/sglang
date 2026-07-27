@@ -2,6 +2,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_warmup import (
+    MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BAGEL_T2I_CI_SAMPLING_PARAMS,
     MODELOPT_FLUX1_FP8_TRANSFORMER,
@@ -489,6 +492,30 @@ if current_platform.is_cuda():
             run_perf_check=True,
             run_consistency_check=False,
             run_component_accuracy_check=False,
+        )
+    )
+    ONE_GPU_CASES.append(
+        DiffusionTestCase(
+            "bagel_understanding_i2t",
+            DiffusionServerArgs(
+                model_path=DEFAULT_BAGEL_MODEL_NAME_FOR_TEST,
+                modality="text",
+                extras=[
+                    "--revision",
+                    DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--pipeline-class-name",
+                    "BagelUnderstandingPipeline",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="Describe this image in one short sentence.",
+                image_path=MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+            run_models_api_check=False,
+            run_t2v_input_reference_check=False,
         )
     )
 
