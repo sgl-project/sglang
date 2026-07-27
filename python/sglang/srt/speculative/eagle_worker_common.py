@@ -564,20 +564,14 @@ def run_eagle_verify(
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
-    vocab_mask = None
+    grammar_mask = None
     if batch.has_grammar:
-        # Grammar barrier: advance the previous batch's grammar FSM over its
-        # committed tokens before building this batch's bitmask. Runs after the
-        # target forward launch, so the FSM advance and the traversal below both
-        # overlap the target verify forward. No-op if there is nothing pending.
-        if grammar_barrier is not None:
-            grammar_barrier()
-        vocab_mask = build_grammar_vocab_mask(
+        grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
-            verify_input=verify_input,
             tree=grammar_tree,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
+            barrier=grammar_barrier,
         )
 
     # Sample
@@ -587,7 +581,7 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

@@ -473,6 +473,7 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        self.mamba_layer_ids = list(mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -874,6 +875,7 @@ class MambaPool:
         return (
             not _is_npu
             and len(convs) > 0
+            and convs[0].shape[0] > 0
             and convs[0].is_cuda
             and all(c.dtype == torch.bfloat16 and c.is_contiguous() for c in convs)
         )
@@ -1069,6 +1071,16 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_layer_ids(self):
+        """Global model-layer id for each RDMA state entry.
+
+        Aligned element-wise with get_contiguous_buf_infos(), which flattens
+        the state list tensor-major x layer. Lets PD transfer match entries
+        by layer id when prefill (PP stage) holds a subset of the mamba layers.
+        """
+        state_tensor_count = sum(1 for _ in self._iter_transfer_state_tensors())
+        return list(self.mamba_layer_ids) * state_tensor_count
 
     def get_state_slice_outer_counts(self):
         """Get the number of rows preceding each tensor's TP slice axis."""
@@ -3625,6 +3637,11 @@ class HybridLinearKVPool(KVCache):
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
+    def get_kv_layer_ids(self):
+        """Global layer ids aligned with the full-attention KV buffers."""
+        layer_ids = list(self.full_attention_layer_id_mapping)
+        return layer_ids if self.use_mla else layer_ids * 2
+
     def get_state_buf_infos(self):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
@@ -3634,6 +3651,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_layer_ids(self):
+        """Global layer id per mamba state entry, aligned with get_state_buf_infos()."""
+        return self.mamba_pool.get_state_layer_ids()
 
     def get_state_slice_outer_counts(self):
         """Get the row count preceding each mamba state slice axis."""

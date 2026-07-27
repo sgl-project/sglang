@@ -113,6 +113,7 @@ LOAD_FORMAT_CHOICES = [
     "npcache",
     "dummy",
     "sharded_state",
+    "presharded",
     "gguf",
     "bitsandbytes",
     "mistral",
@@ -517,14 +518,31 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"presharded" performs a normal first-time load (with quantization), '
+            "then dumps a per-rank/per-tensor sharded checkpoint with content "
+            "deduplication into "
+            "<model_path>/presharded/<parallelism+quant subfolder>/. "
+            "Subsequent runs with the same parallelism+quantization config "
+            "load directly from this presharded checkpoint and skip "
+            "re-quantization. "
+            "The dump directory must be on a shared filesystem across all "
+            "ranks/nodes. Optional model_loader_extra_config roots: "
+            "presharded_path (target) and draft_presharded_path (speculative "
+            "draft); each replaces <model_path>/presharded and still gets a "
+            "config subfolder appended. Use a writable path when model_path "
+            "is read-only (e.g. HF cache mounts).",
             choices=LOAD_FORMAT_CHOICES,
         ),
         NS("model"),
     ] = "auto"
     model_loader_extra_config: A[
         str,
-        "Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format.",
+        "Extra config for model loader. This will be passed to the model loader "
+        "corresponding to the chosen load_format. For load_format=presharded, "
+        "JSON may include presharded_path (target cache root), "
+        "draft_presharded_path (draft cache root), max_file_bytes, "
+        "hash_num_threads, and verify_on_load.",
         NS("model"),
     ] = "{}"
     trust_remote_code: A[
@@ -1739,6 +1757,18 @@ class ServerArgs:
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
+    flashinfer_autotune_skip_ops: A[
+        Optional[List[str]],
+        Arg(
+            help=(
+                "FlashInfer custom-op identifiers to skip during autotuning. "
+                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
+                "temporarily skips mxfp8_gemm by default due to an IMA."
+            ),
+            nargs="+",
+        ),
+        NS("exec.kernel"),
+    ] = None
     mamba_backend: A[
         str,
         Arg(
@@ -3608,6 +3638,75 @@ class ServerArgs:
                 "prompt attention."
             )
 
+        # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
+        # attention. Prefix reuse and split prefills would reuse K/V states
+        # whose values depend on later prompt tokens, so both are invalid.
+        # Breakable CUDA Graph captures one complete prefill and is the graph
+        # mode validated for this encoder-style attention.
+        if getattr(model_config, "is_embedding_gemma", False):
+            # This is an encoder-only model even though its HF architecture is
+            # named Gemma3TextModel. Marking it as embedding mode enables the
+            # FlashAttention raw-K/V fast path, which does not write or read
+            # the paged KV cache during its single prefill forward.
+            self.is_embedding = True
+            self.disable_radix_cache = True
+            self.chunked_prefill_size = -1
+            # Submit a list-valued embeddings request atomically so BCG can
+            # replay its full prefill batch instead of starting item zero
+            # while the remaining texts are still being tokenized.
+            self.enable_tokenizer_batch_encode = True
+            requested_prefill_backend = (
+                self.prefill_attention_backend or self.attention_backend
+            )
+            if (
+                is_cuda()
+                and (is_sm90_supported() or is_sm100_supported())
+                and requested_prefill_backend in (None, "fa3", "fa4")
+            ):
+                # Hopper/Blackwell's default FA backend can consume raw K/V
+                # tensors for a single embedding prefill. Enable its no-KV
+                # pool path before memory-pool sizing; an explicit non-FA
+                # backend retains the existing paged-KV behavior.
+                self.prefill_only_disable_kv_cache = True
+                self._validate_prefill_only_disable_kv_cache_args()
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                # CUDA-graph sizing has already run by this point and derives
+                # its generic maximum from the 8K chunked-prefill default.
+                # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
+                # default to a full eight-way 2K embedding batch; callers can
+                # still override this for larger aggregate prefills.
+                prefill_config = self.cuda_graph_config.prefill
+                # Unit-level capability tests may invoke this hook without
+                # running the full CUDA-graph configuration parser, which is
+                # where this internal lock set is normally initialized.
+                # Treat that minimal construction as having no user-locked
+                # graph settings.
+                cuda_graph_config_locked = getattr(
+                    self, "_cuda_graph_config_locked", set()
+                )
+                if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
+                    prefill_config.max_bs = max(
+                        prefill_config.max_bs or 0,
+                        model_config.context_len,
+                        16384,
+                    )
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        prefill_config.bs = (
+                            self._generate_prefill_cuda_graph_batch_sizes(
+                                prefill_config.max_bs
+                            )
+                        )
+            elif not is_cuda():
+                # BCG is CUDA-only. Other graph backends do not support this
+                # encoder-style prefill, so retain the eager Triton path.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.info(
+                "EmbeddingGemma detected: disabling radix cache and chunked "
+                "prefill; using breakable CUDA graph for CUDA prefill."
+            )
+
         if (
             model_config.is_multimodal
             and not model_config.is_multimodal_chunked_prefill_supported
@@ -4218,6 +4317,8 @@ class ServerArgs:
                 "MoE A2A backend",
                 lambda: _resolved_view(self).moe_a2a_backend != "none",
             ),
+            # Dynamo blocks LoRA under tc_piecewise (per-batch LoRABatchInfo
+            # rebinds break guards); breakable/full support LoRA.
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
@@ -4293,8 +4394,6 @@ class ServerArgs:
                 "decode context parallel (dcp_size > 1)",
                 lambda: self.dcp_size > 1,
             ),
-            # BCG capture + LoRA adapter weights exceed host RAM headroom.
-            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
             # BCG bucket sizes exceed FlashInfer MoE A2A's dispatch cap.
             (
                 "MoE A2A backend",
@@ -7287,16 +7386,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
-        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
-        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not (is_cuda() or is_hip()):
                 logger.warning(
