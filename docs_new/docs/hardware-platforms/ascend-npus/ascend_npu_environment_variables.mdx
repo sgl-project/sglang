@@ -42,6 +42,11 @@ This document provides a list of commonly used environment variables and aims to
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
     </tr>
+    <tr>
+      <td><code>SGLANG_DIFFUSION_FA_MXFP8</code></td>
+      <td>Diffusion only. Opts in to MXFP8 Flash Attention quantization on top of an MXFP8 linear weight quant config (applies to both online <code>--quantization mxfp8</code> and offline <code>--quantization modelslim</code>). See <a href="/docs/sglang-diffusion/environment_variables">Diffusion environment variables</a> for the canonical definition and behavior difference.</td>
+      <td><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

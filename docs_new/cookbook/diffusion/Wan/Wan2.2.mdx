@@ -245,6 +245,23 @@ sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 \
     --lora-path Cseti/wan2.2-14B-Arcane_Jinx-lora-v1
 ```
 
+#### 4.2.4 Ascend NPU MXFP8 Quantization
+
+On Ascend A5 NPUs you can run Wan2.2 with MXFP8 quantization in both online (`--quantization mxfp8`) and
+offline (msModelSlim `W8A8_MXFP8`) modes. By default this is **W8A8** (linear-only); to additionally
+quantize self-attention Q/K/V and run FA v2 (W8A8 + FA FP8), opt in with `SGLANG_DIFFUSION_FA_MXFP8=1`:
+
+```shell Command
+SGLANG_DIFFUSION_FA_MXFP8=1 sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+For the full quantization + repack workflow, supported schemes, and the behavior difference between W8A8
+and W8A8 + FA FP8, see [Diffusion Quantization on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_quantization#diffusion-model-quantization-on-ascend-npu) and the [SGLang-Diffusion environment variables](/docs/sglang-diffusion/environment_variables).
+
 ## 5. Benchmark
 
 Test Environment:

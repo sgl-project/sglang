@@ -157,6 +157,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Experimental opt-in for fused W8A8 FP8 GEMM in diffusion weight-only FP8 linears. When disabled, FP8 weights are dequantized to the compute dtype before matmul. Enabling this dynamically quantizes activations to FP8 and may change output quality.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_FA_MXFP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to MXFP8 Flash Attention quantization on top of an MXFP8 linear weight quant config (Ascend NPU only; requires <code>torch_npu</code> with <code>npu_dynamic_mx_quant</code> and <code>npu_fused_infer_attention_score_v2</code>). Applies to both online (<code>--quantization mxfp8</code>) and offline msmodelslim (<code>--quantization modelslim</code>, <code>W8A8_MXFP8</code>) checkpoints. When unset, MXFP8 applies only to the linear weights and attention stays on standard FA; when set to <code>1</code>, supported self-attention layers additionally quantize Q/K/V and run FA v2 (cross-attention always uses standard FA).</td>
+    </tr>
   </tbody>
 </table>
 

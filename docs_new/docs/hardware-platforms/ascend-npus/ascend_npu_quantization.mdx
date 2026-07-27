@@ -477,7 +477,7 @@ SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion mo
 
 ### Online MXFP8 Quantization
 
-Online quantization dynamically quantizes FP16/BF16 weights to MXFP8 at load time using `npu_dynamic_mx_quant` + `npu_quant_matmul` CANN kernels. Pass `--quantization mxfp8` to override auto-detection.
+Online quantization dynamically quantizes FP16/BF16 weights to MXFP8 at load time using `npu_dynamic_mx_quant` + `npu_quant_matmul` CANN kernels. Pass `--quantization mxfp8` to override auto-detection. This is **W8A8** (linear-only); attention stays on standard FA.
 
 ```bash Command
 # Start the diffusion server with online MXFP8 quantization
@@ -490,6 +490,21 @@ sglang serve \
 ```bash Command
 # One-shot generation
 sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --prompt "a beautiful sunset over the mountains" \
+  --save-output
+```
+
+> **MXFP8 Flash Attention (opt-in):** `--quantization mxfp8` alone keeps attention on standard FA. To also
+> quantize self-attention Q/K/V and run FA v2 (W8A8 + FA FP8), set `SGLANG_DIFFUSION_FA_MXFP8=1` — it works
+> for both online and offline (msmodelslim `W8A8_MXFP8`) checkpoints. See
+> [Diffusion environment variables](/docs/sglang-diffusion/environment_variables) for the canonical definition.
+> Only self-attention uses the MXFP8 FA path; cross-attention always uses standard FA.
+
+```bash Command
+# Online MXFP8 + MXFP8 Flash Attention (Q/K/V quantized, FA v2)
+SGLANG_DIFFUSION_FA_MXFP8=1 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --quantization mxfp8 \
   --prompt "a beautiful sunset over the mountains" \
@@ -534,5 +549,9 @@ sglang generate \
   --prompt "a beautiful sunset over the mountains" \
   --save-output
 ```
+
+> This is **W8A8** (linear-only). To also run MXFP8 Q/K/V attention quant (FA v2) on this offline
+> checkpoint, prepend `SGLANG_DIFFUSION_FA_MXFP8=1` — same flag as the online path (see the opt-in note
+> in [Online MXFP8 Quantization](#online-mxfp8-quantization)).
 
 For pre-quantized checkpoints available on ModelScope, see [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
