@@ -135,6 +135,107 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _is_draft_weight_name(weight_name: str, draft_model_idx: int) -> bool:
+    """Whether an index entry belongs to the requested MTP draft layer.
+
+    Checkpoints in the wild use both ``mtp.<idx>.`` (DeepSeek native format)
+    and ``model.mtp.layers.<idx>.`` (HF-style format). Other tensors below
+    ``mtp`` are draft-wide parameters, such as the shared norm, and must be
+    kept for every layer.
+    """
+    hf_layer_prefix = "model.mtp.layers."
+    if weight_name.startswith(hf_layer_prefix):
+        layer = weight_name[len(hf_layer_prefix) :].split(".", 1)[0]
+        return layer.isdigit() and int(layer) == draft_model_idx
+
+    native_prefix = "mtp."
+    if weight_name.startswith(native_prefix):
+        layer_or_name = weight_name[len(native_prefix) :].split(".", 1)[0]
+        return not layer_or_name.isdigit() or int(layer_or_name) == draft_model_idx
+
+    return weight_name.startswith("model.mtp.")
+
+
+def _select_runai_draft_weight_files(
+    model_name_or_path: str,
+    hf_folder: str,
+    hf_weights_files: List[str],
+    draft_model_idx: int,
+) -> Optional[List[str]]:
+    """Select shards containing the requested MTP draft weights.
+
+    Object-storage metadata is downloaded before workers are launched, so its
+    index is read from ObjectStorageModel's local cache. Returning ``None``
+    tells the caller to stream every shard when the index is unavailable or
+    the checkpoint layout is not recognized.
+    """
+    from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
+
+    index_folder = (
+        ObjectStorageModel.get_path(model_name_or_path)
+        if is_runai_obj_uri(model_name_or_path)
+        else hf_folder
+    )
+    index_path = os.path.join(index_folder, SAFE_WEIGHTS_INDEX_NAME)
+
+    try:
+        with open(index_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
+        weight_map = index.get("weight_map", {})
+        if not isinstance(weight_map, dict):
+            raise TypeError("weight_map must be an object")
+    except (AttributeError, OSError, ValueError, TypeError) as exc:
+        logger.warning(
+            "Unable to read safetensors index for RunAI draft shard selection "
+            "from %s (%s); streaming all %d shards",
+            index_path,
+            exc,
+            len(hf_weights_files),
+        )
+        return None
+
+    wanted_shards = {
+        shard
+        for weight_name, shard in weight_map.items()
+        if _is_draft_weight_name(weight_name, draft_model_idx)
+    }
+    if not wanted_shards:
+        logger.info(
+            "No MTP draft weights for layer %d found in %s; streaming all %d shards",
+            draft_model_idx,
+            index_path,
+            len(hf_weights_files),
+        )
+        return None
+
+    normalized_shards = {str(shard).replace("\\", "/") for shard in wanted_shards}
+    selected = [
+        weight_file
+        for weight_file in hf_weights_files
+        if any(
+            str(weight_file).replace("\\", "/") == shard
+            or str(weight_file).replace("\\", "/").endswith("/" + shard)
+            for shard in normalized_shards
+        )
+    ]
+    if not selected:
+        logger.warning(
+            "Safetensors index identified %d RunAI draft shards, but none "
+            "matched the listed weight files; streaming all %d shards",
+            len(wanted_shards),
+            len(hf_weights_files),
+        )
+        return None
+
+    logger.info(
+        "RunAI draft layer %d selected %d of %d safetensors shards",
+        draft_model_idx,
+        len(selected),
+        len(hf_weights_files),
+    )
+    return selected
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
@@ -3973,6 +4074,34 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
             )
+
+        draft_architectures = (
+            getattr(source.model_config.hf_config, "architectures", ())
+            if source.model_config is not None
+            else ()
+        )
+        is_mtp_draft = (
+            source.model_config is not None
+            and getattr(source.model_config, "is_draft_model", False)
+            and (
+                self.load_config.draft_model_idx is not None
+                or any(
+                    "MTP" in architecture.upper() or "NEXTN" in architecture.upper()
+                    for architecture in draft_architectures
+                    if isinstance(architecture, str)
+                )
+            )
+        )
+        if is_mtp_draft:
+            draft_model_idx = self.load_config.draft_model_idx or 0
+            selected_files = _select_runai_draft_weight_files(
+                source.model_or_path,
+                hf_folder,
+                hf_weights_files,
+                draft_model_idx,
+            )
+            if selected_files is not None:
+                hf_weights_files = selected_files
 
         weights_iterator = runai_safetensors_weights_iterator(
             hf_weights_files, self._is_distributed, self.target_device_str
