@@ -34,10 +34,10 @@ def set_kv_buffer_prefix_valid_tiled(
     loc = tl.load(loc_2d_ptr + bid * block_size + row)
     src_row = bid * block_size + row
 
-    src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))
-    src_v_ptr = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8))
-    dst_k_ptr = tl.cast(dst_k_ptr, tl.pointer_type(tl.uint8))
-    dst_v_ptr = tl.cast(dst_v_ptr, tl.pointer_type(tl.uint8))
+    # src_k_ptr = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))
+    # src_v_ptr = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8))
+    # dst_k_ptr = tl.cast(dst_k_ptr, tl.pointer_type(tl.uint8))
+    # dst_v_ptr = tl.cast(dst_v_ptr, tl.pointer_type(tl.uint8))
 
     src_k_row_ptr = src_k_ptr + src_row * src_k_row_stride + byte_off
     src_v_row_ptr = src_v_ptr + src_row * src_v_row_stride + byte_off

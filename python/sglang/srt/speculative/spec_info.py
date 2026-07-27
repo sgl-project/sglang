@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -33,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +111,12 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dspark()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +124,13 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash_family()
+
+    def supports_ragged_verify(self) -> bool:
+        """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+        (per-request verify lengths); gates the token-bucket-keyed verify
+        graphs in the decode cuda graph runner."""
+        return self.is_dspark()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -134,10 +148,17 @@ class SpeculativeAlgorithm(Enum):
         device: torch.device,
         req_to_token_pool,
         needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
 
     def build_disagg_draft_input(
         self,
@@ -166,13 +187,22 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
         )
 
+        # Validate for every algorithm at startup: the metrics paths read the
+        # ragged-verify mode env and must not be where a typo'd value raises.
+        from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
+
+        read_ragged_verify_mode()
+
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -188,6 +218,8 @@ class SpeculativeAlgorithm(Enum):
         # graph support. We can use it for target verify, or we can use it for
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
+        if self.is_dspark() and is_draft_worker:
+            return num_draft_tokens - 1
         return num_draft_tokens
 
     def create_worker(
@@ -203,6 +235,13 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                DSparkWorkerV2,
+            )
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -254,6 +293,14 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Per-request verify lengths for the ragged-verify graphs (see
+    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
+    # supports_ragged_verify() override it per step. Must stay a class-level
+    # default, not an __init__ assignment: dataclass subclasses declare it as
+    # a field and run __post_init__ -> super().__init__ *after* field
+    # assignment, so an init-time default would clobber the passed layout.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -324,7 +371,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash():
+    elif spec_algorithm.is_dflash_family():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

@@ -210,6 +210,15 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type
             in ("gemma4", "gemma4_unified")
         )
+        self.is_kimi_k3 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and "KimiK3ForConditionalGeneration"
+            in getattr(
+                self.tokenizer_manager.model_config.hf_config,
+                "architectures",
+                [],
+            )
+        )
 
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
@@ -723,6 +732,15 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = []
 
         template_content_format = self.template_manager.jinja_template_content_format
+        # Kimi-K3 implements chat rendering in the tokenizer's Python
+        # apply_chat_template() instead of exposing tokenizer.chat_template.
+        # The generic detector consequently reports "string", which drops
+        # image_url parts before the tokenizer and multimodal processor see
+        # them. Preserve the structured content for K3 so the common path
+        # collects image_data and the K3 encoder emits its raw image
+        # placeholder in the correct message position.
+        if self.is_kimi_k3:
+            template_content_format = "openai"
 
         # Try custom encoding first (override in subclass for custom renderers)
         thinking_requested = (request.chat_template_kwargs or {}).get(

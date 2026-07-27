@@ -1962,7 +1962,7 @@ class DeepseekV2AttentionMLA(
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             return forward_mha_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
-            return forward_mla_core_npu(self, *inner_state)
+            return self.forward_absorb_core(*inner_state, llama_4_scaling=None)
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             return forward_dsa_core_npu(self, *inner_state)
         else:

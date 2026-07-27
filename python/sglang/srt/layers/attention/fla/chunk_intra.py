@@ -1004,6 +1004,7 @@ def chunk_kda_fwd_intra(
             USE_SAFE_GATE=safe_gate,
             FUSE_RECOMPUTE=True,
             FUSE_DIAGONAL=fuse_diagonal,
+            inject_barrier_all=True,
         )
         return w, u, None, kg, Aqk, None
 

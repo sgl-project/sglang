@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -55,6 +56,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A8mxfp4MoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -559,6 +561,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                     symmetric=weight_quant.symmetric,
                     actorder=weight_quant.actorder,
                 )
+            elif is_npu() and weight_quant.num_bits == 4:
+                return UnquantizedLinearMethod()
             else:
                 raise ImportError(
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
@@ -705,6 +709,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     self._is_dynamic_token_w4(weight_quant, input_quant)
                     and input_quant is None
                 ):
+                    if self.quant_format == "mxfp4-pack-quantized":
+                        if os.getenv("SGLANG_W4A8_MXFP4_MOE"):
+                            return NPUCompressedTensorsW4A8mxfp4MoE()
+                        else:
+                            raise NotImplementedError(
+                                f"The {self.quant_format} only support W4A16_MXFP4 or W4A8_MXFP4 scheme now."
+                            )
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
@@ -973,6 +984,8 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        if isinstance(scheme, UnquantizedLinearMethod):
+            return scheme.apply(layer, x, bias=bias)
         return scheme.apply_weights(layer, x, bias=bias)
 
 

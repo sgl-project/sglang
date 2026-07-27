@@ -48,6 +48,13 @@ def _reshape_kv_for_fia_nz(
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
+import math
+
+def next_power_of_2(n):
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
 
 @dataclass
 class ForwardMetadata:
@@ -323,6 +330,15 @@ class AscendAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and model_runner.is_draft_worker
+        ):
+            self.speculative_num_draft_tokens = (
+                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    int(self.speculative_num_draft_tokens), is_draft_worker=True
+                )
+            )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia, self.use_mla
         )
@@ -423,14 +439,23 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
-            seq_lens_max += self.speculative_num_draft_tokens
+            # Overlap scheduling can publish the CPU sequence length one step
+            # ahead of the device tensor. FIA consumes seq_lens_cpu below, so
+            # derive the block-table width from the same source. Otherwise a
+            # page-aligned request can expose KV_S=N while asking FIA for N+1.
+            seq_lens_max = (
+                forward_batch.seq_lens_cpu.max().item()
+                + self.speculative_num_draft_tokens
+            )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
+            seq_lens_max = forward_batch.seq_lens.max()
             seq_lens_max += self.speculative_step_id + 1
+        else:
+            seq_lens_max = forward_batch.seq_lens.max()
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
@@ -2720,13 +2745,32 @@ class AscendAttnBackend(AttentionBackend):
                     layer.tp_q_head_num,
                     self.qk_rope_head_dim,
                 )
+                if (layer.tp_q_head_num & (layer.tp_q_head_num - 1)) != 0:
+                    power_of_2_head = next_power_of_2(layer.tp_q_head_num)
+                    padding_head = power_of_2_head - layer.tp_q_head_num
+                    q_padding_tensor = torch.empty(
+                        [num_tokens, q.shape[1], padding_head, q.shape[-1]],
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    q = torch.cat((q, q_padding_tensor), dim=-2)
+                    q_rope_padding_tensor = torch.empty(
+                        [num_tokens, q_rope.shape[1], padding_head, q_rope.shape[-1]],
+                        dtype=q_rope.dtype,
+                        device=q_rope.device,
+                    )
+                    q_rope = torch.cat((q_rope, q_rope_padding_tensor), dim=-2)
+                    tp_q_head_num = power_of_2_head
+                else:
+                    tp_q_head_num = layer.tp_q_head_num
+
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q,
                     kv_c,
                     kv_c,
                     query_rope=q_rope,
                     key_rope=k_pe,
-                    num_heads=layer.tp_q_head_num,
+                    num_heads=tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="BSND",
                     atten_mask=None,
@@ -2738,6 +2782,7 @@ class AscendAttnBackend(AttentionBackend):
                     block_size=self.page_size,
                     actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
                 )
+                attn_output = attn_output[:,:,:layer.tp_q_head_num,:]
             else:
                 assert (
                     self.graph_mode == False

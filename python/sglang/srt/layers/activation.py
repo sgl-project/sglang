@@ -87,6 +87,23 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+class SituAndMul(nn.Module):
+    def __init__(self, beta: float, linear_beta: Optional[float]) -> None:
+        super().__init__()
+        self.beta = beta
+        self.linear_beta = linear_beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = x.chunk(2, dim=-1)
+        output_dtype = x.dtype
+        gate = gate.float()
+        up = up.float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(output_dtype)
+
+
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

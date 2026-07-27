@@ -69,6 +69,8 @@ class MoeRunnerConfig:
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
+    activation_situ_beta: Optional[float] = None
+    activation_situ_linear_beta: Optional[float] = None
 
 
 @dataclass

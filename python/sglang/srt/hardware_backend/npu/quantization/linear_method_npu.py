@@ -117,11 +117,12 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         else:
             original_dtype = x.dtype
             quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,
-            layer.weight_scale,
-            pertoken_scale=dynamic_scale.flatten(),
+            layer.weight_scale.to(torch.float32),
+            pertoken_scale=dynamic_scale.flatten().to(torch.float32),
             bias=bias,
             output_dtype=original_dtype,
         )

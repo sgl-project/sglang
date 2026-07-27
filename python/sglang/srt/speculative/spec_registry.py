@@ -76,6 +76,12 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dspark(self) -> bool:
+        return False
+
+    def is_dflash_family(self) -> bool:
+        return False
+
     def is_standalone(self) -> bool:
         return False
 
@@ -83,6 +89,9 @@ class CustomSpecAlgo:
         return False
 
     def supports_target_verify_for_draft(self) -> bool:
+        return False
+
+    def supports_ragged_verify(self) -> bool:
         return False
 
     def has_draft_kv(self) -> bool:

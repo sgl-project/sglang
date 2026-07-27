@@ -183,6 +183,8 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        activation_situ_beta: Optional[float] = None,
+        activation_situ_linear_beta: Optional[float] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -273,6 +275,8 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

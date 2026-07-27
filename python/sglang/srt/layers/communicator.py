@@ -714,6 +714,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        skip_layernorm: bool = False,
     ):
         if cache is not None:
             self._context.cache = cache
@@ -724,6 +725,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            skip_layernorm=skip_layernorm,
         )
 
     def postprocess_layer(
@@ -1010,6 +1012,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        **kwargs,
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
@@ -1023,6 +1026,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        **kwargs,
     ):
         """All-reduce hidden states inside the attention TP group, then layernorm.
 
@@ -1044,6 +1048,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        **kwargs,
     ):
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
@@ -1127,15 +1132,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        skip_layernorm=False,
     ):
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+        if residual_input_mode == ScatterMode.TP_ATTN_FULL and residual is not None:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
-        if hidden_states.shape[0] != 0:
+        if not skip_layernorm and hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
@@ -1145,6 +1151,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual: torch.Tensor,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        **kwargs,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
@@ -1164,6 +1171,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        **kwargs,
     ):
         """Allgather tokens for MoE when moe_dp_size < attn_cp_size.
 

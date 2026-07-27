@@ -266,6 +266,7 @@ class ReqToTokenPool:
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -297,6 +298,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -307,6 +309,7 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class MambaPool:
@@ -437,7 +440,10 @@ class MambaPool:
                     )
 
                     conv_state = _init_npu_conv_state(
-                        conv_state[0], conv_state_shape, speculative_num_draft_tokens
+                        conv_state[0],
+                        conv_state_shape,
+                        speculative_num_draft_tokens,
+                        is_kda=cache_params.is_kda,
                     )
 
                 if _is_cpu and _cpu_has_amx_support:
@@ -494,6 +500,10 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
+                intermediate_conv_shapes = [
+                    (shape[1], shape[0]) if cache_params.is_kda else shape
+                    for shape in conv_state_shape
+                ]
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -535,7 +545,7 @@ class MambaPool:
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
                     intermediate_conv_window_cache = []
-                    for conv_shape in conv_state_shape:
+                    for conv_shape in intermediate_conv_shapes:
                         conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
                         shared_win = (
                             speculative_num_draft_tokens + win - 1
@@ -585,7 +595,7 @@ class MambaPool:
                             dtype=conv_dtype,
                             device="cuda",
                         )
-                        for conv_shape in conv_state_shape
+                        for conv_shape in intermediate_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
@@ -1835,7 +1845,11 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
+        # The tiled helper assumes a flat, contiguous token-major KV buffer.
+        # NPU uses a paged 4-D buffer, so filter valid rows and delegate to the
+        # page-aware set_kv_buffer path instead.
         if not (_is_cuda or _is_hip):
+            self._debug_prefix_valid_backend = "valid_rows_set_kv_buffer"
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
             valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
@@ -1852,6 +1866,7 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        self._debug_prefix_valid_backend = "triton_tiled"
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
             cache_v,
@@ -2427,6 +2442,7 @@ class HybridLinearKVPool(KVCache):
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
+            mla_pool_extra_args = {}
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
@@ -2436,6 +2452,10 @@ class HybridLinearKVPool(KVCache):
                 )
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
+                # The NPU pool keeps DSA index cache in a separate tensor.
+                # Hybrid KDA/MLA models do not use DSA, but the constructor
+                # still requires the argument explicitly.
+                mla_pool_extra_args["index_head_dim"] = None
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2446,6 +2466,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **mla_pool_extra_args,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)

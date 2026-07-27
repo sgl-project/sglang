@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -14,6 +15,9 @@ if TYPE_CHECKING:
         DispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+from sglang.srt.layers.activation import SituAndMul
+from sglang.srt.hardware_backend.npu.utils import situ_and_mul_quant
 
 
 def npu_fused_experts_w4a4(
@@ -248,7 +252,7 @@ def npu_fused_experts_w8a8_decode(
     )[0]
 
     # act_fn: swiglu
-    hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+    hidden_states, activate_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
         hidden_states, quant_mode=1, activate_left=True
     )
 
@@ -256,7 +260,7 @@ def npu_fused_experts_w8a8_decode(
         x=[hidden_states],
         weight=[w2],
         scale=[w2_scale],
-        per_token_scale=[swiglu_out_scale],
+        per_token_scale=[activate_out_scale],
         group_list=expert_tokens,
         split_item=2,
         group_type=0,
@@ -480,6 +484,13 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
     ):
         self.quant_config = quant_config
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        if self.moe_runner_config.activation == "situ":
+            self.act_fn = situ_and_mul_quant
 
     def _maybe_apply_deepep(
         self,
@@ -725,7 +736,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         # act_fn: swiglu
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+        hidden_states, activate_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
             x=hidden_states,
             weight_scale=layer.w13_weight_scale,
             activation_scale=hidden_states_scale,
@@ -742,7 +753,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             x=[hidden_states],
             weight=[layer.w2_weight],
             scale=[layer.w2_weight_scale_bf16],
-            per_token_scale=[swiglu_out_scale],
+            per_token_scale=[activate_out_scale],
             split_item=2,
             group_list_type=group_list_type,
             group_type=0,
@@ -936,16 +947,19 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             output_dtype=_output_dtype,
         )[0]
 
-        # act_fn: swiglu
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-
+        # act_fn:
+        if self.moe_runner_config.activation == "situ":
+            hidden_states, activate_out_scale = self.act_fn(hidden_states, expert_tokens, group_list_type)
+        else: 
+            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+            hidden_states, activate_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        
         output = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
             scale=w2_scale,
             bias=bias2,
-            per_token_scale=[swiglu_out_scale],
+            per_token_scale=[activate_out_scale],
             group_list=expert_tokens,
             split_item=2,
             group_type=0,
@@ -987,17 +1001,21 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             group_list_type=group_list_type,
             output_dtype=output_dtype,
         )[0]
-
-        hidden_states, swiglu_out_scale = swiglu_quant(
-            hidden_states, group_list, group_list_type
-        )
+        if self.moe_runner_config.activation == "situ":
+            hidden_states, activate_out_scale = self.act_fn(
+                hidden_states, group_list, group_list_type
+            )
+        else:
+            hidden_states, activate_out_scale = swiglu_quant(
+                hidden_states, group_list, group_list_type
+            )
 
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
             scale=[layer.w2_weight_scale],
             bias=[layer.w2_scale_bias],
-            per_token_scale=[swiglu_out_scale],
+            per_token_scale=[activate_out_scale],
             group_list=group_list,
             split_item=2,
             group_type=0,

@@ -3,7 +3,7 @@ import uuid
 
 import torch
 
-from python.sglang.srt.mem_cache.storage.simm.hicache_simm import HiCacheSiMM
+from sglang.srt.mem_cache.storage.simm.hicache_simm import HiCacheSiMM
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 
 logging.basicConfig(

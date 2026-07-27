@@ -235,6 +235,18 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
 
         graph_key = self._make_graph_key(self.bs)
 
+        if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            logger.info(
+                "NPU graph replay: worker=%s key_size=%s mode=%s raw_bs=%d "
+                "raw_tokens=%d tokens_per_bs=%d",
+                "draft" if self.model_runner.is_draft_worker else "target",
+                graph_key.size,
+                forward_batch.forward_mode.name,
+                self.raw_bs,
+                self.raw_num_token,
+                self.num_tokens_per_bs,
+            )
+
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)

@@ -1501,7 +1501,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1537,6 +1537,30 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
+    ] = None
+    speculative_dspark_sps_table_path: A[
+        Optional[str],
+        "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
+        "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
+        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
+        "constant-SPS table: the budget degenerates to verify-all (zero throughput "
+        "gain by itself).",
+    ] = None
+    speculative_dspark_confidence_sts_path: A[
+        Optional[str],
+        "DSPARK only. Optional path to a per-position STS (sequential temperature "
+        "scaling) calibration JSON, fit offline with sglang.benchmark.dspark_sts_fit. "
+        "Calibrates the confidence-head survival probabilities the ragged-verify "
+        "scheduler consumes. Omit to use identity (no calibration); losslessness is "
+        "unaffected either way.",
+    ] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DSPARK compact ragged-verify only. Fill per-request verify lengths to the cuda-graph tier already paid for. Off by default.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -4356,8 +4380,22 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM"]:
+        elif model_arch in [
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+        ]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
+            if (
+                model_arch == "KimiK3ForConditionalGeneration"
+                and self.speculative_algorithm == "DSPARK"
+                and self.speculative_draft_attention_backend is None
+                and is_cuda()
+                and is_sm100_supported()
+            ):
+                self.speculative_draft_attention_backend = "trtllm_mha"
+                logger.info(
+                    "Kimi-K3 DSPARK: defaulting draft attention backend to trtllm_mha."
+                )
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
@@ -4574,6 +4612,8 @@ class ServerArgs:
             "GraniteMoeHybridForCausalLM",
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
         ]:
             return self.linear_attn_backend == "triton"
 

@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -48,7 +49,9 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import is_npu, make_layers
+
+_is_npu = is_npu()
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
 
@@ -103,14 +106,14 @@ class KimiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
-            renormalize=moe_renormalize,
+            renormalize=moe_renormalize if not _is_npu else False,
             use_grouped_topk=True,
             num_expert_group=config.num_expert_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk if not _is_npu else True,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
@@ -382,14 +385,15 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
-        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
+        # For prefill: activate gate via fused_kda_gate (same as 212 server).
+        # This computes -exp(A_log) * softplus(g + dt_bias) and reshapes to [T, H, K].
         # For decode: gate activation is handled inside fused_recurrent kernel.
+        beta = beta.float()
         if not forward_batch.forward_mode.is_decode():
-            forget_gate = forget_gate.unflatten(
-                -1, (-1, self.head_dim)
-            )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
+            forget_gate = fused_kda_gate(
+                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
+            )
+            beta = beta.sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -421,6 +425,7 @@ class KimiDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.alt_stream = alt_stream
+        self.layer_idx = layer_idx
 
         self.is_moe = config.is_moe
 
@@ -499,7 +504,9 @@ class KimiDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
         hidden_states = self.mlp(hidden_states)
+
         return hidden_states, residual
 
 
