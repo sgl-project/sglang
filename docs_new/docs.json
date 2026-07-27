@@ -1040,6 +1040,7 @@
                   {
                     "group": "Google",
                     "pages": [
+                      "cookbook/autoregressive/Google/EmbeddingGemma",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
