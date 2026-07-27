@@ -412,7 +412,7 @@ def prealloc_symmetric_memory_pool(
     is_draft_worker: bool,
     enable_symm_mem: bool,
     device: str,
-    forward_stream: torch.cuda.Stream,
+    capture_stream: torch.cuda.Stream,
 ):
     # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
     if (
@@ -424,8 +424,10 @@ def prealloc_symmetric_memory_pool(
 
     from sglang.srt.distributed import get_tp_group
 
-    # Memory allocation is tied to a cuda stream, use the forward stream
-    with torch.get_device_module(device).stream(forward_stream):
+    # Allocation is tied to a cuda stream; use the graph-capture stream so the
+    # symm buffers captured on that stream can reuse this arena (CCA matches
+    # free blocks by stream).
+    with torch.get_device_module(device).stream(capture_stream):
         logger.info(
             f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
         )
