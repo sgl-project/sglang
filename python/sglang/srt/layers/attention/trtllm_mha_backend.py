@@ -291,9 +291,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self._swa_kv_pool is not None:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
+                assert self.forward_metadata.swa_out_cache_loc is not None
+                return self.forward_metadata.swa_out_cache_loc
         return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(
@@ -598,21 +597,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Shared capture+replay body for the cuda-graph init path.
-
-        One fused triton kernel (update_trtllm_mha_graph_metadata) rebuilds
-        cache_seqlens, cu_seqlens_k/q, the page table(s), and swa_out_cache_loc.
-        The previous aten-op implementation issued ~25 host dispatches per graph
-        replay, whose per-rank jitter was paid as spin time inside the first
-        all-reduce of every replayed graph.
-
-        The page table is rewritten to the static ``max_num_pages`` width (the
-        same upper bound ``_fill_page_table_device`` uses); the kernel
-        bounds the actual KV reads by the on-device ``cache_seqlens``, so no
-        runtime host max / seq_lens_cpu D2H sync is needed.
-
-        Public entry: :py:meth:`init_forward_metadata_in_graph`.
-        """
+        """Rebuild the static CUDA graph metadata before capture or replay."""
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
@@ -635,18 +620,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             if spec_info is not None and spec_info.ragged_verify_layout is not None:
-                # Ragged verify: the per-request k-extension is not a
-                # uniform scalar seqlen_offset, so the fused kernel cannot
-                # rebuild this metadata. It is written eagerly on every
-                # capture/replay-prep in init_forward_metadata_out_graph;
-                # record nothing here.
+                # Ragged verify metadata is rebuilt by _write_ragged_verify_graph_metadata.
                 return
             seqlen_offset = metadata.max_seq_len_q
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
-            # Static per-request query width, fixed by the captured graph shape.
-            # Do not inspect replay-time tensors here; this body is recorded into
-            # the CUDA graph.
+            # The per-request query width is fixed by the captured graph shape.
             num_tokens_per_req = metadata.max_seq_len_q
             cu_seqlens_q = metadata.cu_seqlens_q
             q_stride = num_tokens_per_req
@@ -777,6 +756,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
+        self._apply_cuda_graph_metadata(
+            bs=bs,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            out_cache_loc=forward_batch.out_cache_loc,
+        )
+
     def _assert_ragged_verify_supported(self) -> None:
         if self.is_xqa_impl:
             raise NotImplementedError(
@@ -813,8 +801,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._fill_page_table_device(
             metadata, req_pool_indices, metadata.cache_seqlens_int32
         )
-        # The fused in-graph kernel also skips ragged batches, so refill the
-        # SWA write-target buffer here (out_cache_loc -> SWA locs).
+        # Refill the SWA write-target buffer for ragged batches.
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
@@ -823,16 +810,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     forward_batch.out_cache_loc
                 )
             )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        self._apply_cuda_graph_metadata(
-            bs=forward_batch.batch_size,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            forward_mode=forward_batch.forward_mode,
-            spec_info=forward_batch.spec_info,
-            out_cache_loc=forward_batch.out_cache_loc,
-        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
