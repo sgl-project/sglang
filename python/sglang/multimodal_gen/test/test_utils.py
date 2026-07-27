@@ -233,12 +233,20 @@ def print_divider(length: int, char: str = "-"):
 
 
 def is_image_url(image_path: str | Path | None) -> bool:
-    """Check if image_path is a URL."""
+    """Check whether an image source is an HTTP(S) or data URL.
+
+    Args:
+        image_path: Candidate image path or URL.
+
+    Returns:
+        ``True`` for remote HTTP(S) images and embedded image data URLs.
+    """
     if image_path is None:
         return False
-    return isinstance(image_path, str) and (
-        image_path.startswith("http://") or image_path.startswith("https://")
-    )
+    if not isinstance(image_path, str):
+        return False
+    normalized = image_path.lower()
+    return normalized.startswith(("http://", "https://", "data:image/"))
 
 
 def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:

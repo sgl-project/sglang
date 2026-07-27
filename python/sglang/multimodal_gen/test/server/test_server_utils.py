@@ -93,20 +93,34 @@ def _urlopen_with_retry(url: str, timeout: int = 30, max_retries: int = 3) -> by
 
 
 def download_image_from_url(url: str) -> Path:
-    """Download an image from a URL to a temporary file.
+    """Materialize an HTTP(S) or embedded data image in a temporary file.
 
     Args:
-        url: The URL of the image to download
+        url: HTTP(S) or ``data:image`` URL to materialize.
 
     Returns:
-        Path to the downloaded temporary file
+        Path to the temporary image file.
     """
     logger.info(f"Downloading image from URL: {url}")
 
     # Determine file extension from URL
     ext = ".jpg"  # default
-    if url.lower().endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
-        ext = url[url.rfind(".") :]
+    normalized_url = url.lower()
+    data_url_extensions = {
+        "data:image/png": ".png",
+        "data:image/jpeg": ".jpg",
+        "data:image/jpg": ".jpg",
+        "data:image/webp": ".webp",
+        "data:image/gif": ".gif",
+    }
+    for prefix, suffix in data_url_extensions.items():
+        if normalized_url.startswith(prefix):
+            ext = suffix
+            break
+    else:
+        path_without_query = normalized_url.split("?", maxsplit=1)[0]
+        if path_without_query.endswith((".png", ".jpeg", ".jpg", ".webp", ".gif")):
+            ext = path_without_query[path_without_query.rfind(".") :]
 
     # Create temporary file
     temp_file = (
