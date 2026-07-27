@@ -33,6 +33,11 @@ register_cuda_ci(
     runner_config="4-gpu-b200",
 )
 
+M3_NUM_ROUTED_EXPERTS = 128
+M3_NUM_EXPERTS = 129
+M3_HIDDEN_SIZE = 6144
+M3_INTERMEDIATE_SIZE_PER_TP = 384
+
 
 def test_standard_contiguous_layout_is_opt_in():
     assert envs.SGLANG_ENABLE_DEEPGEMM_PURE_TP_CONTIGUOUS_MOE.default is False
@@ -96,14 +101,11 @@ def _make_packed_scale(
 @pytest.fixture(scope="module")
 def m3_quant_info() -> DeepGemmMoeQuantInfo:
     torch.manual_seed(1)
-    num_experts = 9
-    hidden_size = 256
-    intermediate_size = 256
     block_size = 32
-    gateup_size = intermediate_size * 2
+    gateup_size = M3_INTERMEDIATE_SIZE_PER_TP * 2
     w13_weight = (
         torch.randn(
-            (num_experts, gateup_size, hidden_size),
+            (M3_NUM_EXPERTS, gateup_size, M3_HIDDEN_SIZE),
             device="cuda",
             dtype=torch.float32,
         )
@@ -112,7 +114,11 @@ def m3_quant_info() -> DeepGemmMoeQuantInfo:
     )
     w2_weight = (
         torch.randn(
-            (num_experts, hidden_size, intermediate_size),
+            (
+                M3_NUM_EXPERTS,
+                M3_HIDDEN_SIZE,
+                M3_INTERMEDIATE_SIZE_PER_TP,
+            ),
             device="cuda",
             dtype=torch.float32,
         )
@@ -124,15 +130,15 @@ def m3_quant_info() -> DeepGemmMoeQuantInfo:
         w2_weight=w2_weight,
         use_fp8=True,
         w13_scale=_make_packed_scale(
-            num_experts,
+            M3_NUM_EXPERTS,
             gateup_size,
-            hidden_size,
+            M3_HIDDEN_SIZE,
             block_size,
         ),
         w2_scale=_make_packed_scale(
-            num_experts,
-            hidden_size,
-            intermediate_size,
+            M3_NUM_EXPERTS,
+            M3_HIDDEN_SIZE,
+            M3_INTERMEDIATE_SIZE_PER_TP,
             block_size,
         ),
         block_shape=[1, block_size],
@@ -143,10 +149,10 @@ def m3_quant_info() -> DeepGemmMoeQuantInfo:
 @pytest.fixture(scope="module")
 def m3_config() -> MoeRunnerConfig:
     return MoeRunnerConfig(
-        num_experts=9,
-        num_local_experts=9,
-        hidden_size=256,
-        intermediate_size_per_partition=256,
+        num_experts=M3_NUM_EXPERTS,
+        num_local_experts=M3_NUM_EXPERTS,
+        hidden_size=M3_HIDDEN_SIZE,
+        intermediate_size_per_partition=M3_INTERMEDIATE_SIZE_PER_TP,
         layer_id=0,
         top_k=5,
         num_fused_shared_experts=1,
@@ -164,18 +170,18 @@ def m3_config() -> MoeRunnerConfig:
 def _make_dispatch(num_tokens: int) -> StandardDispatchOutput:
     torch.manual_seed(100 + num_tokens)
     hidden_states = torch.randn(
-        (num_tokens, 256),
+        (num_tokens, M3_HIDDEN_SIZE),
         device="cuda",
         dtype=torch.bfloat16,
     )
     routed_ids = (
-        torch.rand((num_tokens, 8), device="cuda")
+        torch.rand((num_tokens, M3_NUM_ROUTED_EXPERTS), device="cuda")
         .topk(4, dim=-1)
         .indices.to(torch.int32)
     )
     shared_ids = torch.full(
         (num_tokens, 1),
-        8,
+        M3_NUM_ROUTED_EXPERTS,
         device="cuda",
         dtype=torch.int32,
     )
@@ -234,7 +240,12 @@ def _run_standard_deep_gemm(
             use_psum_layout,
             gemm1_zero_padding,
             gemm2_zero_padding,
-        ) = _select_contiguous_gemm_options(runner_input)
+        ) = _select_contiguous_gemm_options(
+            runner_input,
+            running_state,
+            config,
+            quant_info.w13_weight.size(1),
+        )
         expected_layout = (
             runner_input.psum_layout if expected_psum else runner_input.m_indices
         )
@@ -263,7 +274,9 @@ def _run_standard_deep_gemm(
 @pytest.mark.parametrize(
     "num_tokens,expected_psum,expected_gemm2_zero_padding",
     [
-        pytest.param(1, True, False, id="baseline"),
+        pytest.param(1, False, True, id="baseline"),
+        pytest.param(5, False, True, id="before-psum"),
+        pytest.param(6, True, False, id="after-psum"),
         pytest.param(25, True, False, id="presence-bincount"),
         pytest.param(26, True, False, id="atomic-bincount"),
     ],
@@ -293,7 +306,6 @@ def test_standard_contiguous_deep_gemm_matches_masked(
         "use_symmetric_memory",
         lambda *args, **kwargs: nullcontext(),
     )
-
     masked = _run_standard_deep_gemm(
         _make_dispatch(num_tokens),
         m3_quant_info,

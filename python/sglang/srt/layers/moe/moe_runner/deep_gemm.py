@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import einops
@@ -141,19 +142,57 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
             ), "MXFP8 requires DEEPGEMM_SCALE_UE8M0=True"
 
 
+_DEEP_GEMM_GROUPED_BLOCK_N = 128
+
+
+@cache
+def _get_num_sms(device: torch.device) -> int:
+    if device.type != "cuda":
+        return 1
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _has_full_psum_wave(
+    num_tokens: int,
+    runner_config: MoeRunnerConfig,
+    gateup_size: int,
+    device: torch.device,
+) -> bool:
+    num_shared_experts = runner_config.num_fused_shared_experts or 0
+    routed_topk = runner_config.top_k - num_shared_experts
+    num_routed_experts = runner_config.num_local_experts - num_shared_experts
+    max_active_experts = min(
+        runner_config.num_local_experts,
+        min(num_tokens * routed_topk, num_routed_experts) + num_shared_experts,
+    )
+    blocks_per_expert = ceil_div(gateup_size, _DEEP_GEMM_GROUPED_BLOCK_N)
+    return max_active_experts * blocks_per_expert >= _get_num_sms(device)
+
+
 def _select_contiguous_gemm_options(
     runner_input: DeepGemmRunnerInput,
+    running_state: dict,
+    runner_config: MoeRunnerConfig,
+    gateup_size: int,
 ) -> tuple[torch.Tensor, bool, bool, bool]:
-    use_psum_layout = runner_input.psum_layout is not None
+    num_tokens = running_state["hidden_states_shape"][0]
+    use_psum_layout = runner_input.psum_layout is not None and _has_full_psum_wave(
+        num_tokens,
+        runner_config,
+        gateup_size,
+        running_state["hidden_states_device"],
+    )
     grouped_layout = (
         runner_input.psum_layout if use_psum_layout else runner_input.m_indices
     )
     assert grouped_layout is not None
+    gemm1_ensure_zero_padding = not use_psum_layout
+    gemm2_ensure_zero_padding = not use_psum_layout
     return (
         grouped_layout,
         use_psum_layout,
-        not use_psum_layout,
-        not use_psum_layout,
+        gemm1_ensure_zero_padding,
+        gemm2_ensure_zero_padding,
     )
 
 
@@ -215,14 +254,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
+        N = quant_info.w13_weight.size(1)
         (
             grouped_layout,
             use_psum_layout,
             gemm1_ensure_zero_padding,
             gemm2_ensure_zero_padding,
-        ) = _select_contiguous_gemm_options(runner_input)
+        ) = _select_contiguous_gemm_options(
+            runner_input,
+            running_state,
+            self.config,
+            N,
+        )
 
-        N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         use_mxfp8 = quant_info.use_mxfp8
         if use_mxfp8:
@@ -427,14 +471,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
+        N = quant_info.w13_weight.size(1)
         (
             grouped_layout,
             use_psum_layout,
             gemm1_ensure_zero_padding,
             gemm2_ensure_zero_padding,
-        ) = _select_contiguous_gemm_options(runner_input)
+        ) = _select_contiguous_gemm_options(
+            runner_input,
+            running_state,
+            self.config,
+            N,
+        )
 
-        N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
 
         w13_weight = quant_info.w13_weight

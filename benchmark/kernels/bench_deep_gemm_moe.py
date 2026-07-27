@@ -345,7 +345,12 @@ def make_contig_core_stages(core, runner_input, quant_info, state):
         use_psum_layout,
         gemm1_zero_padding,
         gemm2_zero_padding,
-    ) = _select_contiguous_gemm_options(runner_input)
+    ) = _select_contiguous_gemm_options(
+        runner_input,
+        state,
+        core.config,
+        gateup_size,
+    )
 
     gateup_output = torch.empty(
         (all_tokens, gateup_size),
