@@ -73,6 +73,12 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 }
 
 #[tokio::main]
+/// Starts the Router control plane, data plane, and graceful shutdown sequence.
+///
+/// # Errors
+///
+/// Returns startup, listener, configuration, or server failures to the process
+/// entry point so the binary exits non-zero.
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     // Bootstrap subscriber so a config-resolution error has structured
@@ -91,6 +97,24 @@ async fn main() -> Result<()> {
         cfg.server.host,
         cfg.server.port
     );
+
+    // The reporting listener binds before discovery starts. Registration can
+    // therefore advertise the real port even when the configured port is 0.
+    let (load_monitor, grpc_handle) = if cfg.load_monitor.enabled {
+        let (monitor, handle) = sgl_router::load_monitor::bind_and_serve(cfg.load_monitor.clone())
+            .await
+            .context("start load-monitor gRPC server")?;
+        tracing::info!(
+            address = %handle.local_addr(),
+            "load-monitor gRPC listener ready",
+        );
+        (Arc::new(monitor), Some(handle))
+    } else {
+        (
+            Arc::new(sgl_router::load_monitor::LoadMonitor::disabled()),
+            None,
+        )
+    };
 
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
@@ -121,12 +145,10 @@ async fn main() -> Result<()> {
         .context("build policy registry")?,
     );
 
-    // Shared ActiveLoadRegistry + janitor task. The janitor reaps
-    // request entries whose lifetime exceeded `stale_request_timeout`,
-    // so a leaked guard (proxy task panic, etc.) does not inflate a
-    // worker's load forever. The registry is built BEFORE the manager
-    // is spawned so the manager can call `forget_worker` on
-    // `DiscoveryEvent::Removed`.
+    // Shared ActiveLoadRegistry + janitor task. The janitor reaps request
+    // entries whose lifetime exceeded `stale_request_timeout`, so a leaked
+    // guard does not inflate a worker's load forever. The registry is built
+    // before the manager so removed workers can be pruned promptly.
     let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
     let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
         Arc::new(sgl_router::policies::active_load::SystemTimeClock),
@@ -148,12 +170,13 @@ async fn main() -> Result<()> {
         .context("spawn discovery")?;
     let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
         Some(Arc::clone(&kv_index));
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config_and_monitor(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
+        Some(Arc::clone(&load_monitor)),
     ));
 
     let proxy = Arc::new(
@@ -164,16 +187,16 @@ async fn main() -> Result<()> {
     );
 
     let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
+        sgl_router::server::app_context::AppContext::with_active_load_and_monitor(
             cfg.clone(),
             tokenizers,
             proxy,
             registry,
             policies,
             active_load,
+            Arc::clone(&load_monitor),
         ),
     );
-    ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
 
@@ -181,11 +204,24 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
-    tracing::info!("listening on {bind}");
-
+    let actual_http_addr = listener
+        .local_addr()
+        .context("read HTTP listener address")?;
     let (sigterm, sigint) = install_signal_handlers()?;
+    ctx.mark_ready();
+    tracing::info!(address = %actual_http_addr, "HTTP listener ready");
 
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
+    let http_shutdown = tokio_util::sync::CancellationToken::new();
+    let http_shutdown_for_signal = http_shutdown.clone();
+    let load_monitor_for_signal = Arc::clone(&load_monitor);
+    let shutdown_task = tokio::spawn(async move {
+        shutdown_signal(sigterm, sigint).await;
+        http_shutdown_for_signal.cancel();
+        load_monitor_for_signal.stop_registrations().await;
+    });
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        http_shutdown.cancelled().await;
+    });
     let server_result = serve.await.context("axum serve");
 
     // Best-effort: cancel discovery + manager + janitor on shutdown.
@@ -194,10 +230,19 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    if !shutdown_task.is_finished() {
+        shutdown_task.abort();
+    }
+    let _ = shutdown_task.await;
+    load_monitor.stop_registrations().await;
     janitor_handle.shutdown().await;
+    if let Some(handle) = grpc_handle {
+        handle.shutdown(&load_monitor).await;
+    }
     server_result
 }
 
+/// Waits for either Unix termination signal and logs the selected cause.
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),

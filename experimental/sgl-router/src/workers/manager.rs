@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::load_monitor::LoadMonitor;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
@@ -24,6 +25,44 @@ use tokio::task::JoinHandle;
 /// per interval. See `reconcile_unresolved_workers` for the (benign)
 /// case of a worker that answers but never advertises a model name.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Shared services used by the worker-manager event loop.
+///
+/// Grouping these dependencies keeps event handling signatures stable as new
+/// registry consumers, such as the load monitor, are added.
+#[derive(Clone)]
+struct ManagerContext {
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
+    introspector: Arc<WorkerIntrospector>,
+}
+
+impl ManagerContext {
+    /// Creates the dependency bundle consumed by the manager loop.
+    ///
+    /// Each optional service remains disabled when its argument is `None`; the
+    /// returned context owns `Arc` handles and is cheap to clone into tasks.
+    fn new(
+        registry: Arc<WorkerRegistry>,
+        cfg: Option<Arc<Config>>,
+        kv_index: Option<Arc<KvEventIndex>>,
+        active_load: Option<Arc<ActiveLoadRegistry>>,
+        load_monitor: Option<Arc<LoadMonitor>>,
+        introspector: Arc<WorkerIntrospector>,
+    ) -> Self {
+        Self {
+            registry,
+            cfg,
+            kv_index,
+            active_load,
+            load_monitor,
+            introspector,
+        }
+    }
+}
 
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
@@ -69,12 +108,25 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
 ) {
-    run_with_introspector(
+    run_with_config_and_monitor(rx, registry, cfg, kv_index, active_load, None).await;
+}
+
+/// Runs the worker manager with an optional load-monitor topology consumer.
+pub async fn run_with_config_and_monitor(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
+) {
+    run_with_introspector_and_monitor(
         rx,
         registry,
         cfg,
         kv_index,
         active_load,
+        load_monitor,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -93,13 +145,30 @@ pub async fn run_with_introspector(
     active_load: Option<Arc<ActiveLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
-    run_with_introspector_and_reconcile(
+    run_with_introspector_and_monitor(rx, registry, cfg, kv_index, active_load, None, introspector)
+        .await;
+}
+
+/// Runs the testable manager entry point with an optional load monitor.
+pub async fn run_with_introspector_and_monitor(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
+    introspector: Arc<WorkerIntrospector>,
+) {
+    run_manager(
         rx,
-        registry,
-        cfg,
-        kv_index,
-        active_load,
-        introspector,
+        ManagerContext::new(
+            registry,
+            cfg,
+            kv_index,
+            active_load,
+            load_monitor,
+            introspector,
+        ),
         RECONCILE_INTERVAL,
     )
     .await
@@ -126,12 +195,30 @@ pub async fn run_with_introspector(
 ///   `pending` with the discovery events so re-registrations stay
 ///   serialized per id against concurrent `Added` / `Removed`.
 pub async fn run_with_introspector_and_reconcile(
-    mut rx: mpsc::Receiver<DiscoveryEvent>,
+    rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
     introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
+) {
+    run_manager(
+        rx,
+        ManagerContext::new(registry, cfg, kv_index, active_load, None, introspector),
+        reconcile_interval,
+    )
+    .await;
+}
+
+/// Runs the manager loop with a caller-selected reconcile cadence.
+///
+/// The receiver supplies topology events, `context` owns all optional
+/// downstream consumers, and the future returns only after pending worker
+/// registrations have drained.
+async fn run_manager(
+    mut rx: mpsc::Receiver<DiscoveryEvent>,
+    context: ManagerContext,
     reconcile_interval: Duration,
 ) {
     // In-flight registrations, keyed by worker id. Subsequent
@@ -165,24 +252,16 @@ pub async fn run_with_introspector_and_reconcile(
                 // only holds in-flight registrations (typically << total
                 // workers).
                 pending.retain(|_, h| !h.is_finished());
-                handle_discovery_event(
-                    event,
-                    &registry,
-                    &cfg,
-                    &kv_index,
-                    &active_load,
-                    &introspector,
-                    &mut pending,
-                )
-                .await;
+                handle_discovery_event(event, &context, &mut pending).await;
             }
             _ = reconcile.tick() => {
                 pending.retain(|_, h| !h.is_finished());
                 reconcile_unresolved_workers(
-                    &registry,
-                    &cfg,
-                    &kv_index,
-                    &introspector,
+                    &context.registry,
+                    &context.cfg,
+                    &context.kv_index,
+                    &context.load_monitor,
+                    &context.introspector,
                     &mut pending,
                 );
             }
@@ -205,11 +284,7 @@ pub async fn run_with_introspector_and_reconcile(
 /// contract `pending` enforces.
 async fn handle_discovery_event(
     event: DiscoveryEvent,
-    registry: &Arc<WorkerRegistry>,
-    cfg: &Option<Arc<Config>>,
-    kv_index: &Option<Arc<KvEventIndex>>,
-    active_load: &Option<Arc<ActiveLoadRegistry>>,
-    introspector: &Arc<WorkerIntrospector>,
+    context: &ManagerContext,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
     match event {
@@ -223,12 +298,21 @@ async fn handle_discovery_event(
             if let Some(prev) = pending.remove(&id) {
                 let _ = prev.await;
             }
-            let registry_t = registry.clone();
-            let cfg_t = cfg.clone();
-            let kv_index_t = kv_index.clone();
-            let introspector_t = introspector.clone();
+            let registry_t = context.registry.clone();
+            let cfg_t = context.cfg.clone();
+            let kv_index_t = context.kv_index.clone();
+            let introspector_t = context.introspector.clone();
+            let load_monitor_t = context.load_monitor.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                register_one(
+                    spec,
+                    registry_t,
+                    cfg_t,
+                    kv_index_t,
+                    load_monitor_t,
+                    introspector_t,
+                )
+                .await;
             });
             pending.insert(id, handle);
         }
@@ -243,9 +327,9 @@ async fn handle_discovery_event(
             }
             // Look up the URL before dropping the entry so the
             // KV-event index can clear its per-(url, dp_rank) state.
-            let worker_url = registry.get(&id).map(|w| w.url.clone());
-            registry.remove(&id);
-            match (kv_index, worker_url) {
+            let worker_url = context.registry.get(&id).map(|w| w.url.clone());
+            context.registry.remove(&id);
+            match (&context.kv_index, worker_url) {
                 (Some(idx), Some(url)) => {
                     idx.remove_worker(&url).await;
                 }
@@ -271,8 +355,11 @@ async fn handle_discovery_event(
             // per-worker counters slot will not be re-created
             // (selectors no longer see the worker, so no new
             // requests can register against it).
-            if let Some(al) = active_load {
+            if let Some(al) = &context.active_load {
                 al.forget_worker(&id);
+            }
+            if let Some(monitor) = &context.load_monitor {
+                monitor.reconcile(context.registry.all()).await;
             }
         }
         DiscoveryEvent::ModeChanged { id, mode } => {
@@ -287,7 +374,7 @@ async fn handle_discovery_event(
             //
             // workers_for_mode filters at query time via w.mode(), so no
             // secondary index needs updating.
-            match registry.get(&id) {
+            match context.registry.get(&id) {
                 Some(w) => {
                     tracing::info!("discovery: ~worker {id} mode→{mode:?}");
                     w.set_mode(mode);
@@ -299,6 +386,9 @@ async fn handle_discovery_event(
                         "discovery: ModeChanged for unknown worker — out-of-order event from backend",
                     );
                 }
+            }
+            if let Some(monitor) = &context.load_monitor {
+                monitor.reconcile(context.registry.all()).await;
             }
         }
     }
@@ -336,6 +426,7 @@ fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
+    load_monitor: &Option<Arc<LoadMonitor>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -374,8 +465,17 @@ fn reconcile_unresolved_workers(
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
         let introspector_t = introspector.clone();
+        let load_monitor_t = load_monitor.clone();
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            register_one(
+                spec,
+                registry_t,
+                cfg_t,
+                kv_index_t,
+                load_monitor_t,
+                introspector_t,
+            )
+            .await;
         });
         pending.insert(id, handle);
     }
@@ -391,6 +491,7 @@ async fn register_one(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
@@ -441,12 +542,18 @@ async fn register_one(
             error = %e,
             "worker manager: refused to register worker due to mixed PD/plain configuration",
         );
+        if let Some(monitor) = load_monitor {
+            monitor.reconcile(registry.all()).await;
+        }
         return;
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
         idx.add_worker(&worker_url, info.event_config).await;
+    }
+    if let Some(monitor) = load_monitor {
+        monitor.reconcile(registry.all()).await;
     }
 }
 
@@ -487,6 +594,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            load_monitor: Default::default(),
         }
     }
 
