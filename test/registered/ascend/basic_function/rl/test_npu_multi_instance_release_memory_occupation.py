@@ -17,8 +17,7 @@ NPU-specific adaptations:
   - `dist.init_process_group` uses `backend="hccl"` (Huawei Collective
     Communication Library) instead of the nccl default.
   - Engine kwargs add `attention_backend="ascend"`,
-    `disable_cuda_graph=True`, `disable_piecewise_cuda_graph=True` (NPU
-    cannot use CUDA graphs).
+    `disable_cuda_graph=True`, `disable_piecewise_cuda_graph=True`.
   - Model paths use NPU-local weights (Llama-3.2-1B-Instruct / Llama-3.2-1B
     base) instead of the HF hub defaults.
   - `mp.set_start_method("spawn", force=True)` is set at module import so
