@@ -14,7 +14,7 @@ from sglang.srt.lora.marlin_lora_temp.policy import (
 from sglang.srt.lora.trtllm_lora_temp.specialized_expand import _get_gated_a_half
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 # Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
 pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")

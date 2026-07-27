@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 # case self-skips when no GPU is present), so they run on the cheapest CI tier.
 # The int8 GPU decode path is covered end-to-end by
 # test_int8_mamba_checkpoint_e2e (now in the extra stage).
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 H, V, K = 32, 128, 128
 L = 4

@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=133, stage="extra-b", runner_config="4-gpu-b200")
 
 GPT_OSS_MODEL_PATH = "openai/gpt-oss-120b"
 GSM8K_BASELINE_ACCURACY = 0.88

@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-b200")
 
 # Skipped on CI: newly-added inkling LoRA test, disabled pending stabilization.
 pytestmark = pytest.mark.skip(reason="new inkling LoRA test; disabled on CI")

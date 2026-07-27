@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import pytest as _pytest_defer
@@ -41,7 +41,7 @@ def setUpModule():
     raise unittest.SkipTest(_DEFER_REASON)
 
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

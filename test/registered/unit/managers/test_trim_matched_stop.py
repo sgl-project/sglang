@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 GPT_OSS_CALL_TOKEN = 200012
 
