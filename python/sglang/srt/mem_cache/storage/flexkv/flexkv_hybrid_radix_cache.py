@@ -24,7 +24,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -97,6 +100,9 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if self.flexkv_connector.enable_layerwise:
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
+        # Same hook HiCache uses: scheduler.release_host_resources → destroy().
+        self.token_to_kv_pool_host = FlexKVHostReleaseShim(self.flexkv_connector)
+
         self._load_markers: dict[str, _LoadMarker] = {}
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
         self._store_generation = 0
@@ -113,7 +119,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             self._inflight_store_nodes.clear()
 
     def shutdown(self) -> None:
-        self.flexkv_connector.shutdown()
+        # Prefer token_to_kv_pool_host.destroy() (HiCache path); keep this alias.
+        self.token_to_kv_pool_host.destroy()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self._inner_cache.match_prefix(params)

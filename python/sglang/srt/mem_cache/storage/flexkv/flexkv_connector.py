@@ -25,8 +25,10 @@ Modes:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import signal
 import socket
 import struct
 import time
@@ -63,6 +65,34 @@ except ImportError as exc:  # pragma: no cover - runtime check
 logger = logging.getLogger(__name__)
 
 
+class FlexKVHostReleaseShim:
+    """HiCache-compatible host-release hook for ``release_host_resources``.
+
+    Scheduler already does::
+
+        host_pool = getattr(tree_cache, "token_to_kv_pool_host", None)
+        if host_pool is not None:
+            host_pool.destroy()
+
+    FlexKV has no local pinned HostKVCache; ``destroy()`` forwards to
+    ``FlexKVConnector.shutdown()`` so unpin stays on that same path.
+    """
+
+    def __init__(self, connector: "FlexKVConnector") -> None:
+        self._connector = connector
+
+    def destroy(self) -> None:
+        print(
+            f"[FLEXKV] HostReleaseShim.destroy begin {self._connector._label}",
+            flush=True,
+        )
+        self._connector.shutdown()
+        print(
+            f"[FLEXKV] HostReleaseShim.destroy done {self._connector._label}",
+            flush=True,
+        )
+
+
 class FlexKVConnector:
     """A FlexKV-side façade used by :class:`FlexKVRadixCache`.
 
@@ -75,7 +105,9 @@ class FlexKVConnector:
       * ``store_kv`` — page-aligned write back.
       * ``check_completed_stores`` — drain async store completions.
       * ``prefetch_async`` / ``check_prefetch_progress`` /
-        ``cancel_prefetch`` — opportunistic CPU↔SSD/Remote staging.
+        ``pop_prefetch_loaded_tokens`` / ``cancel_prefetch`` —
+        opportunistic SSD/Remote → CPU staging (wired from the scheduler
+        when ``--enable-flexkv`` is set).
       * ``release_pending`` — cancel a held task whose load won't run.
       * ``reset`` / ``shutdown``.
     """
@@ -236,6 +268,33 @@ class FlexKVConnector:
             or self.cache_config.enable_remote
             or self.cache_config.enable_kv_sharing
         )
+        self._shutdown_done = False
+
+        # Keep FlexKV lifecycle self-contained (avoid scattering hooks in
+        # scheduler / tokenizer / http_server):
+        #   * Ignore process-group Ctrl+C so this scheduler process stays
+        #     alive until ShutdownReq → process exit → atexit unpin.
+        #   * atexit runs kv_manager.shutdown() (cudaHostUnregister).
+        #   * Stretch the parent's scheduler-exit wait so kill_process_tree
+        #     does not SIGKILL mid-unpin (generic env, not FlexKV-named in TM).
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:  # noqa: BLE001
+            pass
+        # Graceful shutdown timeout hierarchy (see FlexKV config.py):
+        #   tokenizer wait (this env)                   = 1200s
+        #     > TM parent-side wait (FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S) = 900s
+        #       > per-worker wait   (FLEXKV_WORKER_SHUTDOWN_TIMEOUT_S)           = 600s
+        # If you tune one, keep the ordering: worker < TM < scheduler-wait.
+        # This must be >= FLEXKV_TRANSFER_MANAGER_SHUTDOWN_TIMEOUT_S + buffer,
+        # otherwise tokenizer's kill_process_tree fires mid-unpin.
+        os.environ.setdefault("SGLANG_SCHEDULER_SHUTDOWN_WAIT_S", "1200")
+        # Compat with older server.sh / docs.
+        os.environ.setdefault(
+            "SGLANG_FLEXKV_SHUTDOWN_WAIT_S",
+            os.environ["SGLANG_SCHEDULER_SHUTDOWN_WAIT_S"],
+        )
+        atexit.register(self.shutdown)
 
         logger.info(
             "[FlexKV] Connector ready %s: layerwise=%s, prefetch=%s",
@@ -937,11 +996,26 @@ class FlexKVConnector:
             self.layer_done_counter.reset()
 
     def shutdown(self) -> None:
+        """Idempotent: unpin FlexKV CPU host buffers via kv_manager.shutdown()."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        # print+flush: survives abrupt exit better than logger buffering into | tee.
+        logger.info("[FlexKV] connector shutdown begin %s", self._label)
         if self._sync_ctx.is_sync_leader and self.kv_manager is not None:
+            logger.info(
+                f"[FLEXKV] kv_manager.shutdown begin {self._label}",
+            )
             try:
                 self.kv_manager.shutdown()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] kv_manager.shutdown: %s", exc)
+            self.kv_manager = None
+        else:
+            logger.info(
+                f"[FLEXKV] connector shutdown skip kv_manager "
+                f"(leader={self._sync_ctx.is_sync_leader}) {self._label}",
+            )
         if self._remote_process is not None:
             try:
                 self._remote_process.terminate()
@@ -952,6 +1026,7 @@ class FlexKVConnector:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[FlexKV] remote process shutdown: %s", exc)
             self._remote_process = None
+        logger.info("[FlexKV] connector shutdown done %s", self._label)
 
     # ------------------------------------------------------------------
     # Private helpers

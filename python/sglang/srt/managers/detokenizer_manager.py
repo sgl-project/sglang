@@ -518,6 +518,9 @@ def run_detokenizer_process(
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+    # Parent owns Ctrl+C → ShutdownReq; ignore SIGINT so process-group interrupt
+    # does not KeyboardInterrupt this child into a false SIGQUIT crash path.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     manager = None
     try:
