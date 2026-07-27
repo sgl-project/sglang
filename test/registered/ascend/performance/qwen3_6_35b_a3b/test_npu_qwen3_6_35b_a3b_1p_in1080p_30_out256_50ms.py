@@ -41,7 +41,7 @@ QWEN3_6_35B_A3B_1080P_OTHER_ARGS = [
     -1,
     "--max-prefill-tokens",
     150000,
-    "--max-prefill-tokens",
+    "--max-total-tokens",
     200000,
     "--disable-radix-cache",
     "--trust-remote-code",
