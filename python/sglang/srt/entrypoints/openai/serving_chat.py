@@ -705,10 +705,16 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        has_media = bool(
+            processed_messages.image_data is not None
+            or processed_messages.video_data is not None
+            or processed_messages.audio_data is not None
+        )
+
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal:
+        elif has_media:
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
             # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
             # input_ids with single placeholders; pass those through so the MM processor

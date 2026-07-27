@@ -484,7 +484,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
+        has_media = bool(
+            processed_messages.image_data is not None
+            or processed_messages.video_data is not None
+            or processed_messages.audio_data is not None
+        )
+
+        if has_media or isinstance(processed_messages.prompt_ids, str):
             request_prompts = [processed_messages.prompt]
             engine_prompts = [processed_messages.prompt]
         else:
