@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -74,6 +75,40 @@ class TestModelOptNvfp4(CustomTestCase):
         layer.weight_loader_v2(scale, torch.tensor(0.5, dtype=torch.float32), 1)
 
         torch.testing.assert_close(scale, torch.tensor([0.25, 0.5]))
+
+
+class TestModelOptFp4Config(CustomTestCase):
+    @staticmethod
+    def _flat_config(input_group_size=16):
+        return {
+            "config_groups": {
+                "group_0": {
+                    "input_activations": {"group_size": input_group_size},
+                    "weights": {"group_size": 16},
+                }
+            },
+            "ignore": ["lm_head"],
+            "quant_algo": "NVFP4",
+        }
+
+    def test_parses_flat_group_size(self):
+        result = ModelOptFp4Config.from_config(self._flat_config())
+
+        self.assertEqual(result.group_size, 16)
+
+    def test_rejects_inconsistent_group_sizes(self):
+        across_groups = self._flat_config()
+        across_groups["config_groups"]["group_1"] = {"weights": {"group_size": 32}}
+
+        for name, config in (
+            ("within_group", self._flat_config(input_group_size=32)),
+            ("across_groups", across_groups),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError, r"Inconsistent group_size values: \[16, 32\]"
+                ):
+                    ModelOptFp4Config.from_config(config)
 
 
 if __name__ == "__main__":
