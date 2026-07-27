@@ -2,13 +2,14 @@
 
 This benchmark is intentionally not registered in CI. It compares the retained
 full-tail Triton path (``live_prefix_only=False``) with the target-verify
-live-prefix path from the same checkout:
+live-prefix path from the same checkout across request batch sizes:
 
     python3 python/sglang/kernels/jit/benchmark/bench_dsv4_live_prefix_metadata.py
 
 The comparison is conservative because the retained compressed-metadata
 kernel already includes the new live-length mask on its page-table loads.
-Timings include CUDA-graph replay overhead.
+Timings include CUDA-graph replay overhead. Each request contributes
+``VERIFY_WIDTH`` causal metadata rows.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ MAX_CONTEXT_LEN = 1 << 20
 # Match the context-plus-sentinel request-token capacity in the server profile.
 CAPTURE_SEQ_LEN = MAX_CONTEXT_LEN + 1
 DEFAULT_MAX_SEQ_LENS = (1 << 10, 1 << 12, 1 << 15, MAX_CONTEXT_LEN)
+DEFAULT_BATCH_SIZES = (1, 4, 8, 16, 32)
 
 
 @dataclass
@@ -50,29 +52,38 @@ class Captured:
     output: object
 
 
-def make_inputs(max_seq_len: int) -> Inputs:
+def make_inputs(max_seq_len: int, batch_size: int) -> Inputs:
     if not VERIFY_WIDTH <= max_seq_len <= MAX_CONTEXT_LEN:
         raise ValueError(
             f"max_seq_len must be in [{VERIFY_WIDTH}, {MAX_CONTEXT_LEN}], "
             f"got {max_seq_len}"
         )
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
 
-    # One BS1 target-verify request produces four consecutive causal rows.
-    seq_lens = torch.arange(
+    # Every target-verify request produces VERIFY_WIDTH consecutive causal rows.
+    causal_seq_lens = torch.arange(
         max_seq_len - VERIFY_WIDTH + 1,
         max_seq_len + 1,
         dtype=torch.int32,
         device="cuda",
     )
+    req_to_token = torch.arange(
+        CAPTURE_SEQ_LEN, dtype=torch.int32, device="cuda"
+    ).unsqueeze(0) + (
+        torch.arange(batch_size, dtype=torch.int32, device="cuda").unsqueeze(1)
+        * CAPTURE_SEQ_LEN
+    )
+    num_rows = batch_size * VERIFY_WIDTH
     return Inputs(
-        # Identity token locations make logical and physical page IDs equal.
-        req_to_token=torch.arange(
-            CAPTURE_SEQ_LEN, dtype=torch.int32, device="cuda"
-        ).unsqueeze(0),
-        req_pool_indices=torch.zeros(VERIFY_WIDTH, dtype=torch.int64, device="cuda"),
-        seq_lens=seq_lens,
+        # Give each request a disjoint identity-mapped physical-token range.
+        req_to_token=req_to_token,
+        req_pool_indices=torch.arange(
+            batch_size, dtype=torch.int64, device="cuda"
+        ).repeat_interleave(VERIFY_WIDTH),
+        seq_lens=causal_seq_lens.repeat(batch_size),
         raw_out_loc=(
-            torch.arange(1, VERIFY_WIDTH + 1, dtype=torch.int64, device="cuda") * 128
+            torch.arange(1, num_rows + 1, dtype=torch.int64, device="cuda") * 128
         ),
     )
 
@@ -205,6 +216,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_SEQ_LENS,
         help="Maximum length among the four causal verify rows.",
     )
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=DEFAULT_BATCH_SIZES,
+        help="Logical target-verify request batch sizes.",
+    )
     parser.add_argument("--warmup-iters", type=int, default=1000)
     parser.add_argument("--replay-iters", type=int, default=2000)
     return parser.parse_args()
@@ -224,27 +242,30 @@ def main() -> None:
         print("warning: production live-prefix dispatch is currently gated to SM100")
 
     header = (
-        f"{'max_seq_len':>12}  {'full_tail_p50_us':>16}  "
-        f"{'live_prefix_p50_us':>18}  {'saved_us':>10}  {'speedup':>9}"
+        f"{'batch_size':>10}  {'kernel_rows':>11}  {'max_seq_len':>12}  "
+        f"{'full_tail_p50_us':>16}  {'live_prefix_p50_us':>18}  "
+        f"{'saved_us':>10}  {'speedup':>9}"
     )
     print(header)
     print("-" * len(header))
 
-    for max_seq_len in args.max_seq_lens:
-        inputs = make_inputs(max_seq_len)
-        check_live_prefixes(inputs)
-        full_tail_us, live_prefix_us = bench_cuda_graph_pair(
-            lambda: run_metadata(inputs, live_prefix_only=False),
-            lambda: run_metadata(inputs, live_prefix_only=True),
-            warmup_iters=args.warmup_iters,
-            replay_iters=args.replay_iters,
-        )
-        saved_us = full_tail_us - live_prefix_us
-        print(
-            f"{max_seq_len:12d}  {full_tail_us:16.3f}  "
-            f"{live_prefix_us:18.3f}  {saved_us:10.3f}  "
-            f"{full_tail_us / live_prefix_us:8.2f}x"
-        )
+    for batch_size in args.batch_sizes:
+        for max_seq_len in args.max_seq_lens:
+            inputs = make_inputs(max_seq_len, batch_size)
+            check_live_prefixes(inputs)
+            full_tail_us, live_prefix_us = bench_cuda_graph_pair(
+                lambda: run_metadata(inputs, live_prefix_only=False),
+                lambda: run_metadata(inputs, live_prefix_only=True),
+                warmup_iters=args.warmup_iters,
+                replay_iters=args.replay_iters,
+            )
+            saved_us = full_tail_us - live_prefix_us
+            print(
+                f"{batch_size:10d}  {batch_size * VERIFY_WIDTH:11d}  "
+                f"{max_seq_len:12d}  {full_tail_us:16.3f}  "
+                f"{live_prefix_us:18.3f}  {saved_us:10.3f}  "
+                f"{full_tail_us / live_prefix_us:8.2f}x"
+            )
 
 
 if __name__ == "__main__":
