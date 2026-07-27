@@ -261,6 +261,11 @@ class TestMlxReferenceCorrectness(CustomTestCase):
             self.runner.remove_request(f"solo-{i}")
             solo.append(seq)
 
+        self.assertTrue(
+            any(self.eos_ids.isdisjoint(seq) for seq in solo),
+            "at least one case must exercise the full batch horizon without EOS",
+        )
+
         # Batched: prefill all, then advance them together in one decode_batch.
         rids = [f"batch-{i}" for i in range(len(ids_list))]
         batched = [[self._prefill(rid, ids)] for rid, ids in zip(rids, ids_list)]
