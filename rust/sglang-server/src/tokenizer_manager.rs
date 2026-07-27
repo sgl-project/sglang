@@ -43,6 +43,36 @@ pub enum TmEvent {
 /// admits a rid) and ingress (which releases it once its abort has taken effect).
 pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
 
+/// Who asked for an abort — which decides who releases the rid.
+///
+/// The registry entry must have exactly ONE owner. `AbortGuard` is that owner: it
+/// releases a rid directly when the request finished naturally, and delegates to
+/// [`Ingress::on_abort`](crate::tokenizer_manager::ingress::Ingress) for a rid it
+/// aborted, so the release lands after the deregister and the ring push rather
+/// than after the mere enqueue.
+///
+/// The detokenizer also issues aborts (a failed request, a decoder error, a full
+/// sink), and those must NOT release: the handler's guard is still armed and still
+/// owns the entry. Releasing there admitted a retry while the original guard was
+/// live, and the guard's later abort — or its later release — then tore the retry
+/// down or opened a second admission slot for a third request that overwrote its
+/// detok sink.
+#[derive(Clone, Debug)]
+pub enum AbortSource {
+    /// From an `AbortGuard` drop. Owns the release.
+    Guard(String),
+    /// From a detokenizer terminal path. Aborts the scheduler work; releases nothing.
+    Detok(String),
+}
+
+impl AbortSource {
+    pub fn rid(&self) -> &str {
+        match self {
+            Self::Guard(rid) | Self::Detok(rid) => rid,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Senders {
     /// → TokenizerManager ingress loop.
@@ -57,7 +87,7 @@ pub struct Senders {
     /// abort is a small `String` and is always accepted, so releases can be
     /// unconditional again. It cannot grow without bound in practice — one entry
     /// per in-flight request, each already bounded by the inbox that admitted it.
-    pub abort: flume::Sender<String>,
+    pub abort: flume::Sender<AbortSource>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
     pub tok: flume::Sender<Request>,
     /// → Detokenizer shards, indexed by `RidHash::shard(detok.len())`.

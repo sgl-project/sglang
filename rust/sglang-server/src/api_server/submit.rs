@@ -128,7 +128,7 @@ mod tests {
     use crate::tokenizer_manager::{LiveRids, Senders};
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Waker};
 
     /// `AppState` with a caller-supplied tm inbox and rid registry, so a test can
     /// observe both sides of a submit.
@@ -155,14 +155,6 @@ mod tests {
             input_ids: Some(vec![1, 2, 3]),
             ..Default::default()
         }))
-    }
-
-    /// Poll a future exactly once, then drop it — the cancellation a client
-    /// disconnect performs when axum drops the handler mid-`await`.
-    fn poll_once_then_drop<F: Future>(fut: F) -> Poll<F::Output> {
-        let mut fut = Box::pin(fut);
-        let mut cx = Context::from_waker(Waker::noop());
-        fut.as_mut().poll(&mut cx)
     }
 
     /// Two in-flight requests may not share a rid: detok `Register` is an
@@ -248,8 +240,23 @@ mod tests {
             .unwrap();
         let state = state_with(tm_tx, live.clone());
 
-        let polled = poll_once_then_drop(submit(&state, generate(""), false));
-        assert!(polled.is_pending(), "the full inbox must make submit pend");
+        // Keep the future ALIVE across the poll: asserting only that the registry
+        // is empty afterwards is satisfied just as well by a rid that was never
+        // inserted, so a `submit` that reserved AFTER the send — or that gained an
+        // await point BEFORE the reservation — would pass vacuously. Pinning the
+        // rid as present AT the pend point is what makes this a real assertion.
+        let mut fut = Box::pin(submit(&state, generate(""), false));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the full inbox must make submit pend"
+        );
+        assert!(
+            live.lock().unwrap().contains(""),
+            "the rid must already be reserved when submit parks on the send — \
+             reserving after it leaves a window where a duplicate is admitted"
+        );
+        drop(fut); // the client disconnected
         assert!(
             live.lock().unwrap().is_empty(),
             "a submit cancelled at the send_async await must release its rid"
