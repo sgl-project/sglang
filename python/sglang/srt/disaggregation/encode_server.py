@@ -319,6 +319,7 @@ class MMEncoder:
         self._element_size = torch.tensor(
             [], dtype=self._embedding_dtype
         ).element_size()
+        self._embedding_dims = self._infer_embedding_dims()
 
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.embedding_cache_controller import (
@@ -329,7 +330,7 @@ class MMEncoder:
             embedding_store = EmbeddingStoreFactory.create_backend(
                 self.server_args.mm_global_cache_backend,
             )
-            hidden_dims = self._infer_embedding_dims()
+            hidden_dims = self._embedding_dims
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
@@ -341,10 +342,6 @@ class MMEncoder:
             )
         else:
             self.mm_global_cache = None
-
-        # Pre-compute embedding metadata (needed by all ranks for mooncake)
-        if self.server_args.encoder_transfer_backend == "mooncake":
-            self._embedding_dims = self._infer_embedding_dims()
 
         if self.rank == 0:
             logger.info(
@@ -452,7 +449,7 @@ class MMEncoder:
                     dims[Modality.AUDIO] = int(val)
                     break
 
-        logger.info(f"Global cache embedding dims: {dims}")
+        logger.info(f"Encoder embedding dims: {dims}")
         return dims
 
     def _resolve_audio_sr(self) -> int:
@@ -1544,77 +1541,38 @@ class MMEncoder:
                 backend=self.server_args.encoder_transfer_backend,
             )
 
-    async def _encode_zmq(
+    def _setup_per_request_encode(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
+        use_mooncake: bool,
     ):
-        """Compute synchronously and stage a CPU embedding for ZMQ transfer."""
-        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=False)
+        """Setup metadata and event management for async encode.
+        Returns ((nbytes, total_tokens, embedding_dim), event).
+        """
+        total_tokens = sum(ctx.token_counts)
+        embedding_dim = self._embedding_dims[ctx.modality]
+        nbytes = total_tokens * embedding_dim * self._element_size
 
-        if self.profiler is not None:
-            self.profiler.step()
-
-        if self.rank == 0:
-            if mm_embedding is None:
-                raise InternalError(
-                    f"Rank 0 produced no embedding for request {ctx.req_id}"
-                )
+        event = None
+        if self.rank == 0 and use_mooncake:
             mm_data = EmbeddingData(
                 ctx.req_id,
                 num_parts,
                 part_idx,
                 ctx.grid_thw,
                 ctx.modality,
-                mm_embedding,
+                embedding=None,
+                embedding_shape=[total_tokens, embedding_dim],
                 **ctx.aux_data,
             )
             self.embedding_to_send[ctx.req_id] = mm_data
-        if mm_embedding is None:
-            return (0, 0, 0, None, None)
-        return (
-            mm_embedding.nbytes,
-            mm_embedding.shape[0],
-            mm_embedding.shape[1],
-            None,
-            None,
-        )
-
-    def _setup_mooncake_async_encode(
-        self,
-        req_id: str,
-        num_parts: int,
-        part_idx: int,
-        grid_thw,
-        token_counts: List[int],
-        modality: Modality,
-        aux_data: dict,
-    ):
-        """Setup metadata and event management for mooncake async encode.
-        Returns (nbytes, total_tokens, embedding_dim, event)."""
-        total_tokens = sum(token_counts)
-        embedding_dim = self._embedding_dims[modality]
-        nbytes = total_tokens * embedding_dim * self._element_size
-
-        event = None
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                grid_thw,
-                modality,
-                embedding=None,
-                embedding_shape=[total_tokens, embedding_dim],
-                **aux_data,
-            )
-            self.embedding_to_send[req_id] = mm_data
             event = asyncio.Event()
-            self._forward_ready_events[req_id] = event
-            self._forward_results[req_id] = {}
+            self._forward_ready_events[ctx.req_id] = event
+            self._forward_results[ctx.req_id] = {}
 
-        return nbytes, total_tokens, embedding_dim, event
+        return (nbytes, total_tokens, embedding_dim), event
 
     def _handle_mooncake_encode_error(
         self, req_id, num_parts, part_idx, modality, error_msg, error_code
@@ -1636,7 +1594,7 @@ class MMEncoder:
             self.embedding_to_send[req_id] = mm_data
         return 0, 0, 0, error_msg, error_code
 
-    def _launch_mooncake_background_task(self, coro):
+    def _launch_encode_background_task(self, coro):
         """Launch an async background task and track it."""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
@@ -1733,21 +1691,19 @@ class MMEncoder:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    def _encode_mooncake(
+    def _start_per_request_encode(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
+        use_mooncake: bool,
     ):
-        """Return Mooncake metadata before computing the embedding asynchronously."""
-        nbytes, total_tokens, embedding_dim, event = self._setup_mooncake_async_encode(
-            ctx.req_id,
+        """Launch one common forward; callers decide whether to await it."""
+        metadata, event = self._setup_per_request_encode(
+            ctx,
             num_parts,
             part_idx,
-            ctx.grid_thw,
-            ctx.token_counts,
-            ctx.modality,
-            ctx.aux_data,
+            use_mooncake,
         )
 
         # All ranks launch in dispatch order. The model feature method must
@@ -1755,48 +1711,71 @@ class MMEncoder:
         # not available in a ThreadPoolExecutor worker.
         async def _run_forward():
             try:
-                emb = await self._compute_embedding(ctx, keep_on_gpu=True)
+                emb = await self._compute_embedding(ctx, keep_on_gpu=use_mooncake)
                 # The transfer engine operates outside the CUDA stream, so GPU
                 # writes must complete before a transfer can start.
-                if emb is not None and emb.is_cuda:
+                if use_mooncake and emb is not None and emb.is_cuda:
                     torch.cuda.current_stream(emb.device).synchronize()
                 if self.rank == 0:
                     if emb is None:
                         raise InternalError(
                             f"Rank 0 produced no embedding for request {ctx.req_id}"
                         )
-                    # Direct embeddings share this registration across /send
-                    # calls. Global-cache embeddings register inside _send.
-                    if not ctx.use_global_cache:
-                        try:
-                            self.engine.register(emb.data_ptr(), emb.nbytes)
-                            self._forward_results[ctx.req_id]["mr_ptr"] = emb.data_ptr()
-                        except Exception as reg_err:
-                            logger.warning(
-                                f"Shared-MR register failed for {ctx.req_id}, "
-                                f"falling back to per-/send register: {reg_err}"
-                            )
-                            self._forward_results[ctx.req_id]["mr_ptr"] = None
-                    self._forward_results[ctx.req_id]["embedding"] = emb
+                    actual_metadata = (
+                        emb.nbytes,
+                        emb.shape[0],
+                        emb.shape[1],
+                    )
+                    if actual_metadata != metadata:
+                        raise InternalError(
+                            f"Embedding metadata mismatch for {ctx.req_id}: "
+                            f"expected={metadata}, actual={actual_metadata}"
+                        )
+                    if use_mooncake:
+                        # Direct embeddings share this registration across /send
+                        # calls. Global-cache embeddings register inside _send.
+                        if not ctx.use_global_cache:
+                            try:
+                                self.engine.register(emb.data_ptr(), emb.nbytes)
+                                self._forward_results[ctx.req_id][
+                                    "mr_ptr"
+                                ] = emb.data_ptr()
+                            except Exception as reg_err:
+                                logger.warning(
+                                    f"Shared-MR register failed for {ctx.req_id}, "
+                                    f"falling back to per-/send register: {reg_err}"
+                                )
+                                self._forward_results[ctx.req_id]["mr_ptr"] = None
+                        self._forward_results[ctx.req_id]["embedding"] = emb
+                    else:
+                        self.embedding_to_send[ctx.req_id] = EmbeddingData(
+                            ctx.req_id,
+                            num_parts,
+                            part_idx,
+                            ctx.grid_thw,
+                            ctx.modality,
+                            emb,
+                            **ctx.aux_data,
+                        )
             except Exception as e:
-                logger.error(f"Encoder forward failed for {ctx.req_id}: {e}")
+                if not use_mooncake:
+                    raise
+
+                error_msg = str(e)
+                logger.error(
+                    f"Encoder forward failed for {ctx.req_id}: {error_msg}",
+                    exc_info=True,
+                )
                 if self.rank == 0:
-                    self._forward_results[ctx.req_id]["error"] = str(e)
+                    self._forward_results[ctx.req_id]["error"] = error_msg
             finally:
-                if self.rank == 0:
+                if self.rank == 0 and event is not None:
                     event.set()
                 if self.profiler is not None:
                     self.profiler.step()
 
-        self._launch_mooncake_background_task(_run_forward())
-
-        if self.rank == 0:
-            logger.info(
-                f"Returning metadata immediately for {ctx.req_id}, "
-                f"encoder forward running async"
-            )
-
-        return (nbytes, total_tokens, embedding_dim, None, None)
+        task = self._launch_encode_background_task(_run_forward())
+        return metadata, task
 
     async def encode(
         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
@@ -1822,17 +1801,21 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            if use_mooncake:
-                return self._encode_mooncake(
-                    ctx,
-                    num_parts,
-                    part_idx,
-                )
-            return await self._encode_zmq(
+            metadata, encode_task = self._start_per_request_encode(
                 ctx,
                 num_parts,
                 part_idx,
+                use_mooncake,
             )
+            if use_mooncake:
+                if self.rank == 0:
+                    logger.info(
+                        f"Returning metadata immediately for {ctx.req_id}, "
+                        f"encoder forward running async"
+                    )
+                return (*metadata, None, None)
+            await encode_task
+            return (*metadata, None, None)
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
