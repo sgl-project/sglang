@@ -185,7 +185,7 @@ spec:
                   name: github-token
                   key: token
             - name: SGLANG_GIT_REF
-              value: 8de158c6e9d4fae849cc15cc77b1185db1d20511
+              value: f1485d48a5d4de38f46a10add6a63f5b7b0fc92f
             - name: MINWM_CHECKPOINT
               value: /s3/world-model/evals/minwm/checkpoint-staging/wan22-5B-varlen-multishot-texiao-addsplithq-da25148-dmd-0724-5eba381389f-merge/global_step_011000/generator/model.pt
             - name: MINWM_CHECKPOINT_SOURCE
