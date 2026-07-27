@@ -92,6 +92,19 @@ class BlockStoredMetadata(msgspec.Struct, omit_defaults=True, gc=False):
     cache_salt: str
 
 
+# Canonical component-placement names carried in ``BlockStored.component_types``.
+# A single unified/hybrid radix node can hold several independent KV components
+# (full attention, sliding window, mamba state); these strings let a consumer
+# distinguish which of them is actually resident at a given ``medium``. They are
+# the single source of truth for the on-wire vocabulary: a component-aware cache
+# maps its internal component enum to these constants (see
+# ``UnifiedTreeCore._COMPONENT_TYPE_TO_WIRE``). Kept as plain strings here to
+# avoid importing the mem_cache layer into the event schema (import cycle).
+KV_COMPONENT_FULL = "full"
+KV_COMPONENT_SWA = "swa"
+KV_COMPONENT_MAMBA = "mamba"
+
+
 class OffloadedState:
     """
     OffloadedState represents the state of a KV cache block offloaded to the hicache.
@@ -116,6 +129,13 @@ class BlockStored(KVCacheEvent):
     block_size: int
     lora_id: Optional[int]
     medium: Optional[str] = None
+    # Components resident at ``medium`` (see KV_COMPONENT_*); ``None`` = whole block.
+    # ``array_like`` structs are always encoded with every field present, so this
+    # occupies a trailing slot even when unset -- as a nil that positional
+    # decoders read as an absent optional, leaving them unaffected. When it is
+    # populated the slot holds a list, which decoders that expect a different
+    # type there cannot consume; hence the opt-in server flag.
+    component_types: Optional[list[str]] = None
 
 
 class BlockStoredWithMetadata(BlockStored, tag="BlockStored", kw_only=True):
