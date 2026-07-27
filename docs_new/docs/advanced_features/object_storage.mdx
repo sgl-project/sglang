@@ -18,7 +18,7 @@ When loading models from object storage, SGLang uses a two-phase approach:
 1. **Amazon S3**: `s3://bucket-name/path/to/model/`
 2. **Google Cloud Storage**: `gs://bucket-name/path/to/model/`
 3. **Azure Blob**: `az://some-azure-container/path/`
-4. **S3 compatible**: `s3://bucket-name/path/to/model/`
+4. **S3-compatible** (Backblaze B2, Cloudflare R2, MinIO, etc.): `s3://bucket-name/path/to/model/`
 
 ## Quick Start
 
@@ -118,6 +118,47 @@ python -m sglang.launch_server \
     </tr>
   </tbody>
 </table>
+
+## Loading from S3-compatible storage
+
+The `s3://` scheme also works against any S3-compatible object store by pointing the underlying boto3 client at a custom endpoint. SGLang accepts the endpoint, region, and credentials either as query-string parameters on the model URI or as standard AWS environment variables.
+
+### URI form (query-string parameters)
+
+```bash
+python -m sglang.launch_server \
+  --model-path "s3://my-bucket/llama-3-70b?endpoint_url=<your-s3-compatible-endpoint>&region_name=<your-region>"
+```
+
+Recognized query parameters: `endpoint_url`, `region_name`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token` (for STS / temporary credentials). Names match boto3 verbatim; aliases are not accepted. They are stripped from the URI before listing or downloading objects. Unknown query keys (typos like `?endpiont_url=...`) raise `ValueError` so misconfiguration surfaces immediately instead of failing later as a credentials/endpoint mismatch.
+
+> **Warning**: Prefer environment variables (next section) for credentials. Query-string values can leak into shell history, container metadata, and access logs. Any query-string value (not just credentials) that contains reserved or special characters must be URL-encoded: `parse_qs` decodes `+` as a space and treats `&`, `=`, and `#` as delimiters. For example, a secret containing `+` must be written as `%2B`, and a space or embedded `&` in `endpoint_url` must likewise be percent-encoded. Plain alphanumeric values need no encoding.
+
+### Environment-variable alternative
+
+```bash
+export AWS_ENDPOINT_URL=<your-s3-compatible-endpoint>
+export AWS_DEFAULT_REGION=<your-region>
+export AWS_ACCESS_KEY_ID=<your-access-key-id>
+export AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
+
+python -m sglang.launch_server --model-path s3://my-bucket/llama-3-70b/
+```
+
+Environment variables are resolved by boto3's default chain when no query-string value is given for that key. SGLang only forwards values it parses from the URI query string (or accepts explicitly from the programmatic `S3Connector(...)` API); env vars like `AWS_ENDPOINT_URL`, `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` are picked up by boto3 itself.
+
+### Example: Backblaze B2
+
+[Backblaze B2](https://www.backblaze.com/docs/cloud-storage-s3-compatible-api) exposes an S3-compatible API. The endpoint is shown on the bucket detail page (e.g. `https://s3.us-west-004.backblazeb2.com`); the `keyID` and `applicationKey` of a bucket-scoped [Application Key](https://www.backblaze.com/docs/cloud-storage-application-keys) map to `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+```bash
+export AWS_ENDPOINT_URL=https://s3.us-west-004.backblazeb2.com
+export AWS_DEFAULT_REGION=us-west-004
+export AWS_ACCESS_KEY_ID=<your-B2-application-key-id>
+export AWS_SECRET_ACCESS_KEY=<your-B2-application-key>
+
+python -m sglang.launch_server --model-path s3://my-bucket/llama-3-70b/
+```
 
 ## Performance Considerations
 
