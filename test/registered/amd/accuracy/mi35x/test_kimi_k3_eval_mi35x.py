@@ -2,11 +2,15 @@
 
 Tests moonshotai/Kimi-K3 with GSM8K few-shot benchmark on MI35x.
 
-Server arguments follow the Kimi-K3 cookbook's MI350X/MI355X 1x8 cell
-(Unified / Balanced): TP8 with the Triton attention backend and the AITER
-FlyDSL A8W4 SiTU MoE path. That cell is published as `verified: false` and
-carries no benchmark entry, so this is the first end-to-end K3 signal on
-ROCm.
+Server arguments follow the Day-0 recipe in the AMD tracking issue
+(sgl-project/sglang#32548) for the non-speculative config: TP8 with the
+Triton attention backend, the AITER FlyDSL A8W4 SiTU MoE path, and the radix
+cache disabled.
+
+That issue reports throughput on MI355 TP8 but no accuracy, and the cookbook
+cell for this topology is still published as `verified: false`. So the recipe
+is known to run at speed; what is missing, and what this test supplies, is
+evidence that it produces correct tokens.
 
 K3's native MXFP4 weights need gfx95x, so this runs on MI35x only -- mxfp4
 does not register on gfx942 (MI300/MI325). The 2.8T checkpoint is ~1.5 TB in
@@ -51,10 +55,13 @@ KIMI_K3_MODEL_PATH = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 SERVER_LAUNCH_TIMEOUT = 9000
 ACCURACY_THRESHOLD = 0.92
 TP_SIZE = 8
-# Bounded so the KDA state pool and the MLA KV pool both stay well inside the
-# ~53 GB per GPU left after weights. Kept equal to --cuda-graph-max-bs-decode:
-# graph capture across K3's 93 attention + 92 MoE layers is expensive, and
-# capturing above the concurrency ceiling buys nothing.
+# The one deviation from the tracking-issue recipe, which leaves concurrency
+# unbounded and captures decode graphs to 256. Those runs drove bounded
+# concurrency (<= 32); this eval submits every question at once, so it needs an
+# explicit ceiling to stay inside the ~53 GB per GPU left after weights.
+# --cuda-graph-max-bs-decode is kept equal to it, since capture across K3's 93
+# attention + 92 MoE layers is expensive and capturing above the concurrency
+# ceiling buys nothing.
 MAX_RUNNING_REQUESTS = 64
 
 
@@ -78,6 +85,7 @@ class TestKimiK3EvalMI35x(CustomTestCase):
             "bfloat16",
             "--mem-fraction-static",
             "0.85",
+            "--disable-radix-cache",
             "--cuda-graph-max-bs-decode",
             str(MAX_RUNNING_REQUESTS),
             "--max-running-requests",
