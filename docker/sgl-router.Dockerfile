@@ -37,6 +37,8 @@ RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/rust-toolchain.toml ./
+COPY experimental/sgl-router/build.rs ./
+COPY experimental/sgl-router/proto ./proto
 # Stub a minimal src tree so cargo can resolve the workspace, generate
 # the lockfile (gitignored upstream), then prepare the chef recipe.
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
@@ -69,6 +71,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Now bring in the real sources and the manifest they need.
 COPY experimental/sgl-router/Cargo.toml ./
+COPY experimental/sgl-router/build.rs ./
+COPY experimental/sgl-router/proto ./proto
 COPY experimental/sgl-router/src ./src
 
 # --locked is intentionally omitted: the lockfile is generated in-container
