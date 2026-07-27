@@ -1406,6 +1406,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+      - name: Warm up AITER blockscale B-preshuffle CKTile
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sgl-workspace/aiter \
+            python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter_blockscale_cktile.py
+
       - name: Accuracy + MTP Accept Length Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 MTP, unified_kv_triton)
         timeout-minutes: 240
         run: |
