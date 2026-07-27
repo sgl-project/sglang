@@ -43,12 +43,21 @@ if [ ! -d "$DEEPEP_DIR/csrc" ]; then
 fi
 cd "$DEEPEP_DIR"
 
-echo "== [1/6] internode_ll.cu: LL topk caps 11/9/11 -> 16"
+echo "== [1/6] internode_ll.cu: LL topk caps 9/11 -> 16"
+TOPK_CAPS_EXPECTED=$(grep -Eci "kNumMaxTop[Kk] = (9|11|16)" csrc/kernels/internode_ll.cu || true)
+[ "$TOPK_CAPS_EXPECTED" -ge 2 ] || {
+  echo "ERROR: expected >=2 recognized topk caps, found $TOPK_CAPS_EXPECTED"
+  exit 1
+}
 sed -i 's/constexpr int kNumMaxTopK = 11;/constexpr int kNumMaxTopK = 16;/' csrc/kernels/internode_ll.cu
 sed -i 's/constexpr int kNumMaxTopk = 9;/constexpr int kNumMaxTopk = 16;/'  csrc/kernels/internode_ll.cu
 sed -i 's/constexpr int kNumMaxTopk = 11;/constexpr int kNumMaxTopk = 16;/' csrc/kernels/internode_ll.cu
-N=$(grep -ci "kNumMaxTop[Kk] = 16" csrc/kernels/internode_ll.cu)
-[ "$N" -ge 3 ] || { echo "ERROR: expected >=3 topk caps patched, found $N"; exit 1; }
+TOPK_CAPS_PATCHED=$(grep -ci "kNumMaxTop[Kk] = 16" csrc/kernels/internode_ll.cu || true)
+TOPK_CAPS_UNPATCHED=$(grep -Eci "kNumMaxTop[Kk] = (9|11)" csrc/kernels/internode_ll.cu || true)
+if [ "$TOPK_CAPS_PATCHED" -ne "$TOPK_CAPS_EXPECTED" ] || [ "$TOPK_CAPS_UNPATCHED" -ne 0 ]; then
+  echo "ERROR: expected $TOPK_CAPS_EXPECTED topk caps patched, found $TOPK_CAPS_PATCHED patched and $TOPK_CAPS_UNPATCHED unpatched"
+  exit 1
+fi
 
 echo "== [2/6] launch.cuh: SWITCH_HIDDEN += case 3584 (K3 latent MoE)"
 grep -q "case_macro(3584)" csrc/kernels/launch.cuh || \
