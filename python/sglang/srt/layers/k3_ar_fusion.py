@@ -2,7 +2,8 @@
 
 Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
 available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
-1 = attempt anywhere and warn when unavailable).
+1 = attempt anywhere and warn when unavailable), except that DCP always
+disables the fusion while its NCCL issue is under development.
 
 Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels,
 mirroring the NCCL-window design (pool + registered segments + find-window
@@ -70,23 +71,34 @@ def _init_state() -> Optional[_State]:
     if explicit:
         if not envs.SGLANG_K3_AR_FUSION.get():
             return None
-    else:
-        # Auto: attempt only inside the validated envelope — SM100/SM103
-        # (the arches the fused kernels were measured on) and no
-        # --enable-symm-mem (its pynccl allocator context misroutes the
-        # o_proj/MoE outputs away from the k3 symm pool -> the pull path's
-        # symm-pool contract fails, see _find_mc_ptr). DCP composes: the
-        # TP-group reduces the fusion covers (KDA o_proj, latent|shared MoE)
-        # are DCP-transparent, validated on DCP8 fp8/fi_a2a GB300 (GSM8K
-        # in-band; bs=1 +19%, bs=64 +9%). The CustomAllReduceV2 multicast
-        # probe below is the remaining capability gate.
-        # SGLANG_K3_AR_FUSION=1 still force-attempts anywhere.
-        from sglang.srt.runtime_context import get_server_args
+
+    if not explicit:
         from sglang.srt.utils.common import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None
-        server_args = get_server_args()
+
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if server_args.dcp_size > 1:
+        logger.warning(
+            "K3 all-reduce fusion is disabled because DCP plus fused "
+            "all-reduce can trigger an NCCL bug; support is still under "
+            "development (dcp_size=%d).",
+            server_args.dcp_size,
+        )
+        return None
+
+    if not explicit:
+        # Auto: attempt only inside the validated envelope — SM100/SM103
+        # (the arches the fused kernels were measured on) and no
+        # --enable-symm-mem (its pynccl allocator context misroutes the
+        # o_proj/MoE outputs away from the k3 symm pool -> the pull path's
+        # symm-pool contract fails, see _find_mc_ptr). The CustomAllReduceV2
+        # multicast probe below is the remaining capability gate.
+        # SGLANG_K3_AR_FUSION=1 still force-attempts outside this auto
+        # envelope, except under DCP.
         if server_args.enable_symm_mem or server_args.moe_a2a_backend != "none":
             logger.info(
                 "K3 all-reduce fusion auto-probe: skipping "
