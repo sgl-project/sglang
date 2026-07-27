@@ -2,6 +2,10 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
+from sglang.multimodal_gen.runtime.distributed import (
+    get_decode_parallel_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -146,8 +150,15 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     @property
     def parallelism_type(self) -> StageParallelismType:
         # Stage 2 is distilled and always runs with CFG disabled, so non-main
-        # CFG ranks should wait at a barrier rather than run a redundant forward.
+        # CFG ranks only need the result when the decoder will use all ranks.
         if self.server_args.enable_cfg_parallel:
+            if (
+                model_parallel_is_initialized()
+                and get_decode_parallel_world_size() > 1
+                and self.vae is not None
+                and self.vae.use_parallel_decode
+            ):
+                return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 

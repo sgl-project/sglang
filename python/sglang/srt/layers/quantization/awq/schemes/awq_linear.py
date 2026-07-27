@@ -16,11 +16,11 @@ __all__ = ["AWQLinearScheme", "AWQAscendLinearScheme"]
 
 
 class AWQLinearScheme(AWQLinearSchemeBase):
-    def __init__(self, quant_config: "AWQConfig"):
+    def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
         self.kernel = self._init_kernel(quant_config)
 
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
             AWQLinearKernel,
         )
@@ -102,7 +102,7 @@ class AWQLinearScheme(AWQLinearSchemeBase):
 
 
 class AWQAscendLinearScheme(AWQLinearScheme):
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
             AWQAscendLinearKernel,
         )

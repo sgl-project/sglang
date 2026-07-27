@@ -21,8 +21,8 @@ class ReqToTokenEntry:
 
 def collect_active_slots(
     *,
-    maybe_inaccurate_forward_batch: "ForwardBatch",
-    req_to_token_pool: "ReqToTokenPool",
+    maybe_inaccurate_forward_batch: ForwardBatch,
+    req_to_token_pool: ReqToTokenPool,
     exclude_out_cache_loc: bool = True,
 ) -> list[ReqToTokenEntry]:
     """Collect every (req_pool_idx, position, value) triple for currently-active reqs.
@@ -79,7 +79,7 @@ def collect_active_slots(
 
 
 def pick_out_cache_loc_slot(
-    *, maybe_inaccurate_forward_batch: "ForwardBatch"
+    *, maybe_inaccurate_forward_batch: ForwardBatch
 ) -> Optional[int]:
     out_cache_loc = maybe_inaccurate_forward_batch.out_cache_loc
     if out_cache_loc is None:

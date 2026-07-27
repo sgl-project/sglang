@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 class ScriptedLockRefExhauster:
 
-    def __init__(self, scheduler: "Scheduler") -> None:
+    def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
         self._locked: List[Any] = []
 

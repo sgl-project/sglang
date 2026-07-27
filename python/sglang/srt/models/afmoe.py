@@ -32,8 +32,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
@@ -47,7 +45,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -58,12 +56,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
 
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
         fused_moe_npu as fused_moe,
     )
 
@@ -160,8 +159,8 @@ class AfmoeMoE(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.rank = get_parallel().tp_rank
+        self.tp_size = get_parallel().tp_size
 
         self.n_routed_experts = getattr(config, "num_experts", None)
         if self.n_routed_experts is None:
@@ -309,7 +308,7 @@ class AfmoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

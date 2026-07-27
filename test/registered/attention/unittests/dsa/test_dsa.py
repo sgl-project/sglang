@@ -31,9 +31,6 @@ from sglang.test.kits.attention_unittest.attention_methods.dsa_attention import 
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dsa_sparse_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_dsa_eagle_draft_extend_cuda_graph_runner_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dsa_eagle_draft_cuda_graph_runner_case,
 )
@@ -217,8 +214,8 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                     self, self.DECODE_IMPL_CASE, impl
                 )
 
-    # Speculative forward-mode coverage. TARGET_VERIFY, DRAFT_EXTEND,
-    # and DRAFT_EXTEND_V2 all route through the `dsa_decode_impl`
+    # Speculative forward-mode coverage. TARGET_VERIFY and
+    # DRAFT_EXTEND_V2 both route through the `dsa_decode_impl`
     # dispatcher (the same kernel selection as plain DECODE) but
     # produce different `seqlens_expanded` and `cu_seqlens_q` from
     # `dsa_backend.py:469-529`. `DSAMockModelRunner.__init__` derives
@@ -229,16 +226,6 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             name="dsa_sparse_target_verify",
             backend="dsa",
             forward_mode=ForwardMode.TARGET_VERIFY,
-            num_heads=4,
-            num_kv_heads=1,
-            page_size=DSA_PAGE_SIZE,
-            prefix_lens=(128,),
-            extend_lens=(3,),
-        ),
-        DSAAttentionCase(
-            name="dsa_sparse_draft_extend",
-            backend="dsa",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
             num_heads=4,
             num_kv_heads=1,
             page_size=DSA_PAGE_SIZE,
@@ -381,29 +368,6 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
         for case in self.EAGLE_DRAFT_CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_dsa_eagle_draft_cuda_graph_runner_case(self, case)
-
-    # EAGLE production draft-extend CUDA-graph runner. Routes through
-    # `DraftBackendFactory._create_dsa_prefill_backend` which returns a
-    # single `DeepseekSparseAttnBackend` (not multi-step); the forward
-    # goes through `forward_extend` with `dsa_decode_impl` selected via
-    # `is_draft_extend(include_v2=True)`.
-    EAGLE_DRAFT_EXTEND_CASES = (
-        DSAAttentionCase(
-            name="runner_eagle_draft_extend_cuda_graph_dsa",
-            backend="dsa",
-            forward_mode=ForwardMode.DRAFT_EXTEND,
-            num_heads=4,
-            num_kv_heads=1,
-            page_size=DSA_PAGE_SIZE,
-            prefix_lens=(128, 192),
-            extend_lens=(2, 3),
-        ),
-    )
-
-    def test_runner_mode_eagle_draft_extend_cuda_graph_runner_cases(self):
-        for case in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_dsa_eagle_draft_extend_cuda_graph_runner_case(self, case)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
     # `flashmla_kv` (the only FP8-compatible decode kernel). The

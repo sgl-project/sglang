@@ -24,11 +24,6 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
-class FusedMoEMode(IntEnum):
-    FUSED_DEEP_MOE = 1
-    DISPATCH_FFN_COMBINE = 2
-
-
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
@@ -99,7 +94,12 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
-    import sgl_kernel_npu  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        logger.warning("NPU custom kernel packages unavailable: %s", e)
+
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -135,6 +135,9 @@ def _is_nz_aligned(tensor: torch.Tensor) -> bool:
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+    *,
+    customize_dtype=None,
+    input_dtype=None,
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
@@ -142,6 +145,12 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
+        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
+            ``customize_dtype=torch.float8_e4m3fn``,
+            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
+            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
+            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
+            ND fallback would corrupt results.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -161,6 +170,21 @@ def npu_format_cast(
         )
         return tensor
 
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
+    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
+    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
+    # silent ND fallback would corrupt results.
+    if customize_dtype is not None or input_dtype is not None:
+        return torch.ops.npu.npu_format_cast(
+            tensor,
+            int(acl_format),
+            customize_dtype=customize_dtype,
+            input_dtype=input_dtype,
+        )
+
     if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
         k, n = tensor.shape[-2], tensor.shape[-1]
         logger.warning_once(
@@ -171,10 +195,6 @@ def npu_format_cast(
             n,
             tensor.dtype,
         )
-        return tensor
-
-    # Skip format cast for meta tensors (used in offloader)
-    if tensor.device.type == "meta":
         return tensor
 
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)

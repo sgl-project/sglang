@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 def install_canary(
     *,
-    server_args: "ServerArgs",
-    model_runner: "ModelRunner",
-    token_oracle_manager: Optional["TokenOracleManager"] = None,
+    server_args: ServerArgs,
+    model_runner: ModelRunner,
+    token_oracle_manager: Optional[TokenOracleManager] = None,
 ) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
     if config.mode is CanaryMode.NONE:
@@ -39,9 +39,8 @@ def install_canary(
 
     assert not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE), (
         "kv-canary: piecewise cuda graph is not supported by the current "
-        "SingleForwardManager design; set "
-        "--cuda-graph-backend-prefill=disabled (or =breakable) when canary "
-        "is enabled"
+        "SingleForwardManager design; set --cuda-graph-backend-prefill=disabled "
+        "(or =breakable) when canary is enabled"
     )
 
     perturb_config = PerturbConfig.from_env()
@@ -101,19 +100,24 @@ def install_canary(
     return manager
 
 
-def _patch_model_forward(
-    *, model_runner: "ModelRunner", manager: CanaryManager
-) -> None:
+def _patch_model_forward(*, model_runner: ModelRunner, manager: CanaryManager) -> None:
     def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
-        forward_batch = _extract_forward_batch(args, kwargs)
-        assert (
-            forward_batch is not None
-        ), "kv-canary: patched model.forward called without a ForwardBatch"
+        with manager.model_forward_bracket_scope() as should_bracket:
+            if not should_bracket:
+                # Nested model.forward calls share the active SingleForwardManager.
+                # Only the outermost call may run kv-canary pre/post ops; otherwise
+                # the phase checker sees a second pre-op before the first post-op.
+                return original(*args, **kwargs)
 
-        canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
-        output = original(*args, **kwargs)
-        manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
-        return output
+            forward_batch = _extract_forward_batch(args, kwargs)
+            assert (
+                forward_batch is not None
+            ), "kv-canary: patched model.forward called without a ForwardBatch"
+
+            canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            output = original(*args, **kwargs)
+            manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
+            return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
 

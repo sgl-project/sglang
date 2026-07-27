@@ -26,7 +26,7 @@ class MlxModelCacheLayout:
         cls,
         layers: Sequence[Any],
         attention_attrs: Sequence[str | None],
-    ) -> "MlxModelCacheLayout":
+    ) -> MlxModelCacheLayout:
         if len(layers) != len(attention_attrs):
             raise ValueError(
                 "Layer count and attention attribute count differ: "

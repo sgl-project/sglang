@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
     _should_use_channels_last_3d,
 )
-from sglang.multimodal_gen.runtime.models.vaes.parallel import wan_common_utils
+from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
 
 class _FakeServerArgs:
@@ -176,14 +176,10 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wan_common_utils.current_platform, "is_cuda", return_value=False
-            ),
-            patch.object(
-                wan_common_utils.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
-            out = wan_common_utils.match_conv3d_input_format(x, weight)
+            out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
 
@@ -197,14 +193,10 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wan_common_utils.current_platform, "is_cuda", return_value=True
-            ),
-            patch.object(
-                wan_common_utils.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=True),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
-            out = wan_common_utils.match_conv3d_input_format(x, weight)
+            out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 

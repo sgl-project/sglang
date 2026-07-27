@@ -57,7 +57,10 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import get_device, logger
 
 try:
-    from transformers import LogitsWarper
+    # `LogitsWarper` was removed in transformers v4.48 (merged into
+    # `LogitsProcessor`, same `__call__(input_ids, scores)` contract). Alias it
+    # so the annotations and `_tts_deps` below stay valid.
+    from transformers.generation import LogitsProcessor as LogitsWarper
     from vector_quantize_pytorch import GroupedResidualFSQ
 
     _tts_deps = True

@@ -20,7 +20,7 @@ from contextlib import contextmanager
 import torch
 
 _in_torch_compile_warmup = False
-_pcg_capture_stream: "torch.cuda.Stream | None" = None
+_pcg_capture_stream: torch.cuda.Stream | None = None
 
 
 def is_in_torch_compile_warmup() -> bool:
@@ -43,7 +43,7 @@ def enable_torch_compile_warmup():
         _in_torch_compile_warmup = False
 
 
-def get_pcg_capture_stream() -> "torch.cuda.Stream | None":
+def get_pcg_capture_stream() -> torch.cuda.Stream | None:
     return _pcg_capture_stream
 
 

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -259,6 +260,50 @@ def _make_custom_masks(
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
 
+def _make_flashinfer_dflash_swa_builtin_masks(
+    case,
+    *,
+    device: str,
+) -> list[torch.Tensor]:
+    """Mirror FlashInfer DFLASH verify's production no-custom-mask path."""
+    draft_token_num = _check_target_verify_case(case)
+    window = int(case.sliding_window_size)
+    masks_by_req = []
+    q_idx = torch.arange(
+        draft_token_num,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(1)
+    for prefix_len in case.prefix_lens:
+        seq_len = prefix_len + draft_token_num
+        prefix_start = max(0, int(prefix_len) - window)
+        k_idx = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
+        masks_by_req.append((k_idx >= prefix_start) & (k_idx <= prefix_len + q_idx))
+
+    return masks_by_req
+
+
+def _expected_case_and_masks_for_spec_verify(
+    case,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind,
+    device: str,
+):
+    if (
+        spec_kind == "dflash"
+        and case.backend == "flashinfer"
+        and getattr(case, "sliding_window_size", None) is not None
+    ):
+        reference_case = replace(case, sliding_window_size=None)
+        return reference_case, _make_flashinfer_dflash_swa_builtin_masks(
+            case, device=device
+        )
+
+    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    return case, masks_by_req
+
+
 def _make_retrieve_tensors(
     case,
     *,
@@ -299,6 +344,14 @@ def _make_spec_verify_input(
     if spec_kind == "dflash":
         if topk != 1:
             raise ValueError("DFlash verify is linear and expects topk=1.")
+        if (
+            case.backend == "flashinfer"
+            and getattr(case, "sliding_window_size", None) is not None
+        ):
+            # Production DFLASH disables custom verify masks for FlashInfer
+            # backends. SWA metadata clips the cached prefix; the backend causal
+            # path handles the draft block.
+            custom_mask = None
         return DFlashVerifyInput(
             draft_token=batch.input_ids,
             positions=batch.positions,
@@ -375,12 +428,18 @@ def _target_verify_expected_output(
     case,
     inputs,
     topk: int,
+    spec_kind: SpecVerifyKind,
     device: str,
 ):
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     return reference_fn(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -457,6 +516,7 @@ def _run_spec_verify_cuda_graph_case(
                 case=spec_case,
                 inputs=inputs,
                 topk=topk,
+                spec_kind=spec_kind,
                 device=device,
             )
         ),
@@ -498,7 +558,12 @@ def run_dense_spec_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
@@ -509,7 +574,7 @@ def run_dense_spec_verify_case(
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -825,6 +890,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     cuda_graph_capture_batch_size: int = 2,
+    force_gpu_only_seq_lens: bool = False,
 ):
     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
@@ -871,6 +937,11 @@ def run_dsv4_eagle_verify_cuda_graph_case(
         batch.spec_info = _make_eagle_verify_input(
             spec_case, batch, topk=topk, device=device
         )
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            batch.spec_info.seq_lens_cpu = None
+            batch.spec_info.seq_lens_sum = None
 
     def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
         # Capture uses uniform prefixes per request; each request still

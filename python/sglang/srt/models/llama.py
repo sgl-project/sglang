@@ -28,8 +28,6 @@ from transformers import LlamaConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -54,7 +52,8 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -113,15 +112,27 @@ class LlamaMLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=use_reduce_scatter,
-        )
+        x, _ = self.down_proj(x)
         return x
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_GATE_UP_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_GATE_UP_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
 
 
 class LlamaAttention(nn.Module):
@@ -144,7 +155,7 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.start_layer = start_layer
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -251,6 +262,22 @@ class LlamaAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        from sglang.srt.model_loader.auto_loader import STANDARD_QKV_MAPPING
+
+        loaded: set[str] = set()
+        params_dict = dict(self.named_parameters())
+        for name, tensor in weights:
+            target = STANDARD_QKV_MAPPING.try_load(name, tensor, params_dict)
+            if target is not None:
+                loaded.add(target)
+                continue
+            if name in params_dict:
+                wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+                wl(params_dict[name], tensor)
+                loaded.add(name)
+        return loaded
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -435,8 +462,8 @@ class LlamaModel(nn.Module):
     # factors (or else raise an exception). Thus, handled exceptions should
     # make sure to leave KV cache scale factors in a known good (dummy) state
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -503,7 +530,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -628,6 +655,13 @@ class LlamaForCausalLM(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
+            return self._load_weights_v2(weights)
+        return self._legacy_load_weights(weights)
+
+    def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -699,6 +733,44 @@ class LlamaForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
+
+    def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """AutoWeightsLoader path with RemapRegistry for FP8 suffix normalization."""
+        from sglang.srt.model_loader.auto_loader import (
+            AutoWeightsLoader,
+            filter_pp_weights,
+            get_weight_remap,
+        )
+
+        if hasattr(self.model, "start_layer"):
+            weights = filter_pp_weights(
+                weights, self.model.start_layer, self.model.end_layer
+            )
+
+        skip_prefixes = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector", "model.vision_tower"],
+            ignore_unexpected_suffixes=[".bias", ".kv_scale"],
+        )
+        mapper = get_weight_remap(self)
+        loaded = loader.load_weights(weights, mapper=mapper)
+
+        if self.config.tie_word_embeddings:
+            params_dict = dict(self.named_parameters())
+            if "lm_head.weight" in params_dict:
+                embed = dict(self.model.named_parameters()).get("embed_tokens.weight")
+                if embed is not None:
+                    lm_head = params_dict["lm_head.weight"]
+                    wl = getattr(lm_head, "weight_loader", default_weight_loader)
+                    wl(lm_head, embed.data)
+                    loaded.add("lm_head.weight")
+
+        return loaded
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1
@@ -785,8 +857,8 @@ class LlamaForCausalLM(nn.Module):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -804,8 +876,8 @@ class LlamaForCausalLM(nn.Module):
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
         else:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            current_platform.empty_cache()
+            current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

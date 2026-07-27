@@ -12,7 +12,7 @@ RECV_MSG_ARRIVAL_TIMEOUT_S: float = 60.0
 
 
 def _http_post_and_await_recv_msg(
-    ctx: "ScriptedContext",
+    ctx: ScriptedContext,
     *,
     path: str,
     json: Optional[Dict[str, Any]],
@@ -29,7 +29,7 @@ def _http_post_and_await_recv_msg(
 
 
 def _http_post_fire_and_forget(
-    ctx: "ScriptedContext",
+    ctx: ScriptedContext,
     *,
     path: str,
     json: Optional[Dict[str, Any]],
@@ -38,7 +38,7 @@ def _http_post_fire_and_forget(
 
 
 def _submit_post(
-    ctx: "ScriptedContext",
+    ctx: ScriptedContext,
     *,
     path: str,
     json: Optional[Dict[str, Any]],

@@ -1,6 +1,6 @@
-"""Generate a Markdown dashboard for diffusion cross-framework comparisons.
+"""Generate a Markdown dashboard for SGLang-Diffusion nightly benchmarks.
 
-Reads current comparison results + historical data from sgl-project/ci-data repo
+Reads current comparison results + historical data from sgl-project/ci-data-diffusion repo
 and produces a Markdown report with tables and trend charts saved as PNG files.
 
 Usage:
@@ -15,20 +15,19 @@ Usage:
 import argparse
 import json
 import os
-import sys
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# History fetching (from sgl-project/ci-data repo via GitHub API)
+# History fetching (from sgl-project/ci-data-diffusion repo via GitHub API)
 # ---------------------------------------------------------------------------
 
 CI_DATA_REPO_OWNER = "sgl-project"
-CI_DATA_REPO_NAME = "ci-data"
+CI_DATA_REPO_NAME = "ci-data-diffusion"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
 MAX_HISTORY_RUNS = 29
 
-# Base URL for chart images pushed to sgl-project/ci-data
+# Base URL for chart images pushed to sgl-project/ci-data-diffusion
 CHARTS_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/{CI_DATA_REPO_OWNER}/{CI_DATA_REPO_NAME}"
     f"/{CI_DATA_BRANCH}/{HISTORY_PREFIX}/charts"
@@ -58,7 +57,7 @@ def _github_get(url: str, token: str) -> dict | list | None:
 
 
 def fetch_history_from_github(token: str) -> list[dict]:
-    """Fetch recent comparison result JSONs from sgl-project/ci-data repo."""
+    """Fetch recent comparison result JSONs from sgl-project/ci-data-diffusion repo."""
     print("Fetching historical comparison data from GitHub...")
     url = (
         f"https://api.github.com/repos/{CI_DATA_REPO_OWNER}/{CI_DATA_REPO_NAME}"
@@ -252,7 +251,7 @@ def generate_dashboard(
     Returns the markdown string.
     """
     lines: list[str] = []
-    lines.append("# Diffusion Cross-Framework Performance Dashboard\n")
+    lines.append("# SGLang-Diffusion Nightly Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
@@ -297,8 +296,8 @@ def generate_dashboard(
         all_frameworks.insert(0, "sglang")
     other_frameworks = [fw for fw in all_frameworks if fw != "sglang"]
 
-    # ---- Section 1: Cross-Framework Comparison (current run) ----
-    lines.append("## Cross-Framework Performance Comparison\n")
+    # ---- Section 1: SGLang-Diffusion performance (current run) ----
+    lines.append("## SGLang-Diffusion Performance\n")
 
     # Compute risk assessments for all cases
     risk_map: dict[str, tuple[str, str]] = {}
@@ -345,7 +344,7 @@ def generate_dashboard(
             row += f" {_fmt_speedup(sg_lat, case_fws.get(ofw))} |"
         lines.append(row)
 
-    # ---- Section 2: Cross-Framework Speedup Trend (only if multiple frameworks) ----
+    # ---- Section 2: Speedup-over-time vs. other frameworks (rendered only when present) ----
     if history and other_frameworks:
         lines.append("\n## SGLang vs vLLM-Omni Speedup Over Time\n")
 
@@ -750,7 +749,7 @@ def _create_alert_issue(alert_reasons: list[str]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate diffusion cross-framework comparison dashboard"
+        description="Generate SGLang-Diffusion nightly benchmark dashboard"
     )
     parser.add_argument(
         "--results",
@@ -775,7 +774,7 @@ def main():
     parser.add_argument(
         "--fetch-history",
         action="store_true",
-        help="Fetch history from ci-data GitHub repo",
+        help="Fetch history from ci-data-diffusion GitHub repo",
     )
     parser.add_argument(
         "--step-summary",

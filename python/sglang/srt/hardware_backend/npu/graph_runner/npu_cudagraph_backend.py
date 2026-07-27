@@ -24,6 +24,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -52,6 +53,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
+        self._device_id = self._device_module.current_device()
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -75,9 +77,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def capture_one(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         forward_fn: Callable[[], Any],
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
@@ -110,18 +112,21 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with skip_guard_context, graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=self._capture_stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = forward_fn()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
-    def can_run(self, forward_batch: ForwardBatch, shape_key: Any) -> bool:
+    def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
 
     @contextmanager
@@ -130,7 +135,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay(
         self,
-        shape_key: Any,
+        shape_key: ShapeKey,
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
@@ -139,20 +144,31 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def replay_with_input_update(
         self,
-        shape_key: Any,
-        seq_lens: list,
-        attr_name: str,
-        attr_type: Any,
+        shape_key: ShapeKey,
+        seq_lens: Any,
+        attr_name: str = None,
+        attr_type: Any = None,
+        cpu_update_input: list = None,
     ) -> Any:
         """Rebind seq_lens on the recorded NPU graph in a background
-        thread, then replay. Used when the model is not deepseek-nsa."""
-        if isinstance(attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+        thread, then replay. Used when the model is not deepseek-nsa.
+
+        Two calling conventions:
+        1. (legacy) seq_lens + attr_name + attr_type:
+           Constructs cpu_update_input=[{attr_name: seq_lens}] internally.
+        2. cpu_update_input: A list of {attr_name: seq_lens} dicts,
+           one per speculative step.  Used by EAGLE draft runners.
+        """
+        if cpu_update_input is None:
+            if isinstance(attr_type, torch.Tensor):
+                seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+            cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
 
         def _update():
-            graph.update(cpu_update_input=[{attr_name: seq_lens}])
+            self._device_module.set_device(self._device_id)
+            graph.update(cpu_update_input=cpu_update_input)
 
         thread = threading.Thread(target=_update)
         thread.start()

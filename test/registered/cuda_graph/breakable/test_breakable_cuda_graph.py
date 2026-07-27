@@ -12,7 +12,7 @@ import unittest
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,21 +24,7 @@ from sglang.test.test_utils import (
 
 # CI Registration — large suite to fit the integration test's server startup.
 register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
-
-
-def _skip_if_no_cuda(test_func):
-    return unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")(
-        test_func
-    )
-
-
-def _skip_if_no_cuda_bindings(test_func):
-    try:
-        from cuda.bindings import runtime as rt  # noqa: F401
-
-        return test_func
-    except ImportError:
-        return unittest.skip("cuda-python not installed")(test_func)
+register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
 class TestBreakableCUDAGraphBasic(CustomTestCase):
@@ -48,10 +34,6 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -186,6 +168,28 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
+    def test_eager_output_is_held_strongly_for_replay_bridge(self):
+        """The replay closure must keep the eager output bridge buffer alive."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def scale(src):
+            return src * 3.0
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream):
+            t = x + 1.0
+            broken = scale(t)
+            y.copy_(broken)
+
+        replay_closure = graph._break_fns[0].__closure__ or ()
+        self.assertTrue(
+            any(cell.cell_contents is broken for cell in replay_closure),
+            "eager output bridge buffer must be strongly captured",
+        )
+
 
 class TestCopyOutput(CustomTestCase):
     """Test the _copy_output helper for structured output writeback."""
@@ -194,10 +198,6 @@ class TestCopyOutput(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             _copy_output,
@@ -256,10 +256,6 @@ class TestBreakGraphHelper(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA not available")
-        try:
-            from cuda.bindings import runtime  # noqa: F401
-        except ImportError:
-            raise unittest.SkipTest("cuda-python not installed")
 
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
             BreakableCUDAGraph,

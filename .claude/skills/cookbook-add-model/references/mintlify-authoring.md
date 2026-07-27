@@ -61,9 +61,12 @@ table is a live reference.
 - **Tool-call follow-up on thinking models**: the final assistant turn may put text in
   `reasoning_content` instead of (or with) `content` — print both so the output isn't a
   misleading `None`.
-- **Every runnable block** is immediately followed by `**Output Example:**` + a
-  ` ```text Output ` block with **real** server output (verbatim, not paraphrased).
-  `Pending update...` is acceptable only with the user's explicit acknowledgement.
+- **§3 commands and outputs are collapsible (required)**: every runnable example
+  lives in an `<Accordion title="… (Python)">` and its **real** server output
+  (verbatim, not paraphrased) in an immediately following
+  `<Accordion title="Example Output">` — match the DeepSeek-V4 §3 pattern. No
+  inline `**Output Example:**` headings / bare blocks. `Pending update...` is
+  acceptable only with the user's explicit acknowledgement.
 - **Do not hardcode sampling params** (`temperature`, `top_p`) in sample code — SGLang
   uses `generation_config.json` defaults. Listing "Recommended generation" in §1 is fine.
 - Format raw API objects (`ChatCompletionMessage(...)`) into readable Reasoning /
