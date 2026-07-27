@@ -3,13 +3,15 @@ from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
+
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (  # noqa: E402
     SchedulerKvEventsPublisher,
 )
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
 
 class TestSchedulerKvEventsPublisher(unittest.TestCase):
     def setUp(self):
@@ -49,7 +51,9 @@ class TestSchedulerKvEventsPublisher(unittest.TestCase):
             enable_kv_cache_events=True,
         )
 
-        with unittest.mock.patch("sglang.srt.managers.scheduler_components.kv_events_publisher.sock_send") as mock_sock_send:
+        with unittest.mock.patch(
+            "sglang.srt.managers.scheduler_components.kv_events_publisher.sock_send"
+        ) as mock_sock_send:
             publisher.emit_kv_metrics()
             mock_sock_send.assert_called_once()
             metrics = mock_sock_send.call_args[0][1]
@@ -75,13 +79,16 @@ class TestSchedulerKvEventsPublisher(unittest.TestCase):
             enable_kv_cache_events=True,
         )
 
-        with unittest.mock.patch("sglang.srt.managers.scheduler_components.kv_events_publisher.sock_send") as mock_sock_send:
+        with unittest.mock.patch(
+            "sglang.srt.managers.scheduler_components.kv_events_publisher.sock_send"
+        ) as mock_sock_send:
             publisher.emit_kv_metrics()
             mock_sock_send.assert_called_once()
             metrics = mock_sock_send.call_args[0][1]
 
             self.assertEqual(metrics.kv_total_blocks, 512)  # 8192 // 16
             self.assertEqual(metrics.kv_active_blocks, 256)  # 0.5 * 512
+
 
 if __name__ == "__main__":
     unittest.main()
