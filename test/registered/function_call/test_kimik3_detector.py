@@ -282,6 +282,59 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertEqual(reasoning, "I am thinking")
         self.assertEqual(content, "Answer here")
 
+    def test_non_stream_elided_think_close(self):
+        # after tool results the model can emit <|close|>think<|open|>response<|sep|>
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            "Both calls returned. Now compare briefly."
+            f"<|close|>think{RESPONSE_OPEN}the comparison{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+        )
+        self.assertEqual(result.reasoning_text, "Both calls returned. Now compare briefly.")
+        self.assertEqual(result.normal_text, "the comparison")
+
+    def test_non_stream_elided_think_close_prefers_earlier_canonical(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse(
+            f"deep thought{THINK_CLOSE}{RESPONSE_OPEN}the answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+        )
+        self.assertEqual(result.reasoning_text, "deep thought")
+        self.assertEqual(result.normal_text, "the answer")
+
+    def test_non_stream_elided_think_close_into_tools(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        tools_channel = (
+            f"{TOOLS_OPEN}"
+            + _call_block("python", 1, {"code": ("string", "1")})
+            + f"{TOOLS_CLOSE}"
+        )
+        result = detector.detect_and_parse(f"t<|close|>think{tools_channel}")
+        self.assertEqual(result.reasoning_text, "t")
+        self.assertEqual(result.normal_text, tools_channel)
+
+    def test_streaming_elided_think_close_split_markers(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        chunks = [
+            "I am thinking<|close|>thi",
+            "nk<|open|>respon",
+            "se<|sep|>Ans",
+            "wer here",
+            "<|close|>response<|sep|>",
+            "<|close|>message<|sep|>",
+        ]
+        reasoning, content = self._stream(detector, chunks)
+        self.assertEqual(reasoning, "I am thinking")
+        self.assertEqual(content, "Answer here")
+
+    def test_streaming_elided_think_close_char_by_char(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=True)
+        full = (
+            f"{THINK_OPEN}abc<|close|>think"
+            f"{RESPONSE_OPEN}xyz{RESPONSE_CLOSE}{MESSAGE_CLOSE}"
+        )
+        reasoning, content = self._stream(detector, list(full))
+        self.assertEqual(reasoning, "abc")
+        self.assertEqual(content, "xyz")
+
     def test_streaming_char_by_char(self):
         detector = KimiK3ReasoningDetector(force_reasoning=True)
         full = (

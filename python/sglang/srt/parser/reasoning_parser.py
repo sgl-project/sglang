@@ -13,6 +13,8 @@ from sglang.srt.function_call.kimik3_format import (
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
     THINK_CLOSE,
+    THINK_CLOSE_ELIDED,
+    THINK_CLOSE_NOSEP,
     THINK_OPEN,
     TOOLS_OPEN,
 )
@@ -461,14 +463,24 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return _strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
         return _strip_response_wrappers(text)
 
+    def _find_think_close(self, text: str, start: int = 0) -> Tuple[int, int]:
+        """Earliest canonical or sep-elided think close as ``(idx, end)``; the elided ``end`` keeps ``<|open|>`` in the remainder."""
+        idx = text.find(self.think_end_token, start)
+        elided_idx = text.find(THINK_CLOSE_ELIDED, start)
+        if elided_idx != -1 and (idx == -1 or elided_idx < idx):
+            return elided_idx, elided_idx + len(THINK_CLOSE_NOSEP)
+        if idx != -1:
+            return idx, idx + len(self.think_end_token)
+        return -1, -1
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
-        if not in_reasoning and self.think_end_token not in text:
+        if not in_reasoning and self._find_think_close(text)[0] == -1:
             return StreamingParseResult(normal_text=self._clean_content(text))
 
         open_idx = text.find(self.think_start_token)
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
-        close_idx = text.find(self.think_end_token, start)
+        close_idx, close_end = self._find_think_close(text, start)
         if close_idx == -1:
             tools_idx = text.find(self.tool_start_token, start)
             if tools_idx != -1:
@@ -479,7 +491,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             return StreamingParseResult(reasoning_text=text[start:])
 
         reasoning_text = text[start:close_idx]
-        rest = text[close_idx + len(self.think_end_token) :]
+        rest = text[close_end:]
         return StreamingParseResult(
             reasoning_text=reasoning_text, normal_text=self._clean_content(rest)
         )
@@ -507,10 +519,10 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                     self._buffer = buf
                     self.stripped_think_start = True
 
-            close_idx = buf.find(self.think_end_token)
+            close_idx, close_end = self._find_think_close(buf)
             if close_idx != -1:
                 reasoning_text = buf[:close_idx]
-                self._buffer = buf[close_idx + len(self.think_end_token) :]
+                self._buffer = buf[close_end:]
                 self._in_reasoning = False
                 self._reasoning_done = True
                 return StreamingParseResult(
@@ -532,7 +544,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, self.tool_start_token]
+            markers = [self.think_end_token, THINK_CLOSE_ELIDED, self.tool_start_token]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = _partial_suffix_len(buf, markers)

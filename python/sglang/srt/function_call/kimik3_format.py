@@ -1,5 +1,8 @@
 THINK_OPEN = "<|open|>think<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
+# after tool results the model may drop the <|sep|> and open the next section directly
+THINK_CLOSE_NOSEP = "<|close|>think"
+THINK_CLOSE_ELIDED = THINK_CLOSE_NOSEP + "<|open|>"
 RESPONSE_OPEN = "<|open|>response<|sep|>"
 RESPONSE_CLOSE = "<|close|>response<|sep|>"
 TOOLS_OPEN = "<|open|>tools<|sep|>"
