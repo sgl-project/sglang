@@ -678,10 +678,7 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
-        with (
-            envs.SGLANG_DSA_FUSE_TOPK.override(True),
-            envs.SGLANG_OPT_USE_TOPK_V2.override(False),
-        ):
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
                 topk,
@@ -1004,6 +1001,56 @@ class TestDSAIndexer(CustomTestCase):
                         with_row_starts=True,
                         query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
                     )
+
+    def test_topk_v2_respects_topk_backend(self):
+        seq_lens = torch.tensor([2048, 4096], dtype=torch.int32, device=self.device)
+        expected_plan = torch.empty(3, dtype=torch.int32, device=self.device)
+
+        for topk_backend, should_use_topk_v2 in [
+            (DSATopKBackend.SGL_KERNEL, True),
+            (DSATopKBackend.FLASHINFER, False),
+        ]:
+            with self.subTest(topk_backend=topk_backend.value):
+                backend = object.__new__(DeepseekSparseAttnBackend)
+                backend.device = self.device
+                backend.real_page_size = 64
+                backend.hisparse_coordinator = None
+                backend.speculative_num_draft_tokens = 0
+                backend.use_fused_topk = True
+                backend.dsa_topk_backend = topk_backend
+                backend.dsa_index_topk = 2048
+                backend.dsa_decode_impl = "fa3"
+                backend.req_to_token = torch.empty(
+                    2, 4096, dtype=torch.int32, device=self.device
+                )
+
+                with (
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+                    patch(
+                        "sglang.kernels.ops.attention.dsv4.topk.plan_topk_v2",
+                        return_value=expected_plan,
+                    ) as mock_plan_topk_v2,
+                ):
+                    self.assertEqual(
+                        topk_backend.should_use_topk_v2(), should_use_topk_v2
+                    )
+                    actual_plan = backend._build_topk_v2_plan(seq_lens)
+                    backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2)
+
+                if should_use_topk_v2:
+                    self.assertIs(actual_plan, expected_plan)
+                    mock_plan_topk_v2.assert_called_once_with(seq_lens)
+                else:
+                    self.assertIsNone(actual_plan)
+                    mock_plan_topk_v2.assert_not_called()
+                self.assertEqual(
+                    backend.dsa_drop_wide_page_table,
+                    should_use_topk_v2,
+                )
+                self.assertEqual(
+                    backend.decode_cuda_graph_metadata["page_table"] is None,
+                    should_use_topk_v2,
+                )
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

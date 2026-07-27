@@ -34,6 +34,9 @@ class DSATopKBackend(Enum):
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
 
+    def should_use_topk_v2(self) -> bool:
+        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
     def topk_func(
         self,
         score: torch.Tensor,
@@ -88,18 +91,19 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
-        # Decode-shaped PAGED top-k (plain decode AND spec verify / draft-extend,
-        # whose expanded rows match the same shape) routes to the DeepSeek-V4 top-k
-        # v2 JIT kernel, which fuses top-k selection and the page-table transform in
-        # one launch and consumes the indexer's own page_size>=1 table directly, so
-        # no page_size=1 table is materialized. Shared by DeepSeek-V3.2 and GLM DSA.
+        # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
+        # verify / draft-extend, whose expanded rows match the same shape) routes
+        # to the DeepSeek-V4 top-k v2 JIT kernel. It fuses top-k selection and the
+        # page-table transform in one launch and consumes the indexer's own
+        # page_size>=1 table directly, so no page_size=1 table is materialized.
+        # Shared by DeepSeek-V3.2 and GLM DSA.
         # This is a deterministic dispatch on the work shape, not a best-effort
         # attempt: the fused-decode CUDA graph drops the page_size=1 table for
         # exactly this case (see dsa_drop_wide_page_table), so once the shape
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
@@ -288,7 +292,6 @@ def _topk_transform_v2_paged(
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_512_v2
-    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
     num_rows = logits.shape[0]
 
@@ -317,7 +320,7 @@ def _topk_transform_v2_paged(
         plan is not None and plan.shape[0] == num_rows + 1
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
-    page_size = get_token_to_kv_pool().page_size
+    page_size = attn_metadata.page_size
     out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
     topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
     return out
