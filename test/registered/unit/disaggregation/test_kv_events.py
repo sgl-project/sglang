@@ -12,6 +12,7 @@ import unittest
 import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
     BlockStored,
     BlockStoredMetadata,
     BlockStoredWithMetadata,
@@ -102,6 +103,11 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
 
 
 class TestBlockStoredWireFormat(CustomTestCase):
+    """Cache-salt metadata layout. ``component_types`` (added on the base
+    ``BlockStored``) occupies the trailing base slot at index 7, so an unsalted
+    event is now 8 elements and the typed ``metadata`` of the salted subclass
+    lands at index 8 -- these indices are the positional contract."""
+
     def _event(self, metadata=None):
         event_type = BlockStored if metadata is None else BlockStoredWithMetadata
         kwargs = dict(
@@ -116,17 +122,24 @@ class TestBlockStoredWireFormat(CustomTestCase):
             kwargs["metadata"] = metadata
         return event_type(**kwargs)
 
-    def test_unsalted_event_keeps_legacy_array_shape(self):
+    def test_unsalted_event_has_no_metadata_slot(self):
+        # array_like structs encode every field: an unsalted event is a plain
+        # BlockStored carrying the trailing component_types (None here) and no
+        # metadata dict.
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
-        self.assertEqual(len(decoded), 7)
+        self.assertEqual(len(decoded), 8)
+        self.assertIsNone(decoded[7])
 
     def test_salted_event_appends_typed_metadata(self):
         event = self._event(BlockStoredMetadata(cache_salt="tenant-a"))
         encoded = msgspec.msgpack.encode(event)
         decoded = msgspec.msgpack.decode(encoded)
         round_tripped = msgspec.msgpack.decode(encoded, type=BlockStoredWithMetadata)
-        self.assertEqual(len(decoded), 8)
-        self.assertEqual(decoded[7], {"cache_salt": "tenant-a"})
+        # index 7 is the base component_types slot (unset -> None); the typed
+        # metadata trails it on the subclass at index 8.
+        self.assertEqual(len(decoded), 9)
+        self.assertIsNone(decoded[7])
+        self.assertEqual(decoded[8], {"cache_salt": "tenant-a"})
         self.assertEqual(round_tripped.metadata.cache_salt, "tenant-a")
 
     def test_salted_event_remains_compatible_with_typed_batch_consumers(self):
@@ -138,6 +151,44 @@ class TestBlockStoredWireFormat(CustomTestCase):
             msgspec.msgpack.encode(batch), type=KVEventBatch
         )
         self.assertEqual(round_tripped.events[0].block_hashes, [123])
+
+
+class TestBlockStoredWireLayout(CustomTestCase):
+    """The encoded BlockStored tuple is a positional contract shared with other
+    engines' subscribers, so pin the slot layout rather than the field list."""
+
+    def _encode(self, **overrides) -> list:
+        event = BlockStored(
+            block_hashes=[11],
+            parent_block_hash=None,
+            token_ids=[10, 11],
+            block_size=2,
+            lora_id=None,
+            **overrides,
+        )
+        return msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+
+    def test_component_types_is_the_trailing_slot(self):
+        # array_like structs always encode every field, so an unset
+        # component_types is a trailing nil -- indistinguishable from an absent
+        # optional to a positional decoder. Anything else here would shift the
+        # slots a subscriber reads.
+        self.assertEqual(
+            self._encode(medium="GPU"),
+            ["BlockStored", [11], None, [10, 11], 2, None, "GPU", None],
+        )
+        self.assertEqual(
+            self._encode(medium="GPU", component_types=["full", "swa"]),
+            ["BlockStored", [11], None, [10, 11], 2, None, "GPU", ["full", "swa"]],
+        )
+
+    def test_block_removed_stays_whole_block(self):
+        # A removal always means the base component left the tier, so no
+        # component dimension is added here.
+        removed = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(BlockRemoved(block_hashes=[11], medium="GPU"))
+        )
+        self.assertEqual(removed, ["BlockRemoved", [11], "GPU"])
 
 
 if __name__ == "__main__":
