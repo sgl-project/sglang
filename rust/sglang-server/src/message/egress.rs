@@ -234,8 +234,26 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // rids, so the caller would fail nobody and every request in the frame
             // would hang. Re-read just the rid column, which is positional element 0
             // and independent of every other field's type.
-            decoded.rids = rmp_serde::from_slice::<(Vec<String>,)>(header)
-                .map(|(rids,)| rids.iter().map(|r| RidHash::from_rid(r)).collect())
+            // Two-stage via `rmpv`: read the header as a generic value, then take
+            // element 0. A serde tuple cannot do this — `(Vec<String>,)` decodes
+            // ONLY a 1-element array, while real headers carry 4 or 16 columns, so
+            // it returned `Err(LengthMismatch(1))` every time and named nobody.
+            // Arity independence is the whole point: the trigger for this path is
+            // Python appending a column an older Rust build does not know.
+            decoded.rids = rmpv::decode::read_value(&mut &header[..])
+                .ok()
+                .and_then(|v| match v {
+                    rmpv::Value::Array(cols) => cols.into_iter().next(),
+                    _ => None,
+                })
+                .and_then(|c| match c {
+                    rmpv::Value::Array(rids) => Some(
+                        rids.iter()
+                            .filter_map(|r| r.as_str().map(RidHash::from_rid))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
                 .unwrap_or_default();
             return decoded;
         }
@@ -981,5 +999,35 @@ mod tests {
             sz <= 128,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
+    }
+}
+
+#[cfg(test)]
+mod rid_recovery_tests {
+    use super::*;
+
+    /// A header this build cannot type-decode (Python appended a column) must
+    /// still name its requests, or every one of them hangs. The previous
+    /// `(Vec<String>,)` tuple decoded ONLY a 1-element array, so it failed on every
+    /// real header — arity independence is the entire point of this path.
+    #[test]
+    fn rid_recovery_works_at_every_header_arity() {
+        use rmpv::Value;
+        for extra_cols in [0usize, 3, 15, 16] {
+            let mut cols = vec![Value::Array(vec![Value::from("a"), Value::from("b")])];
+            // Columns of a type this build would reject (strings where u32 is
+            // expected) — the "Python widened a column" case.
+            cols.extend((0..extra_cols).map(|_| Value::from("unexpected")));
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &Value::Array(cols)).unwrap();
+            let framed = frame_egress_batch_cols(&header, &[]);
+            let decoded = for_each_chunk(&framed[1..], |_| {});
+            assert!(!decoded.ok, "arity {extra_cols}: must reject");
+            assert_eq!(
+                decoded.rids,
+                vec![RidHash::from_rid("a"), RidHash::from_rid("b")],
+                "arity {extra_cols}: rids must survive so the caller can fail them"
+            );
+        }
     }
 }
