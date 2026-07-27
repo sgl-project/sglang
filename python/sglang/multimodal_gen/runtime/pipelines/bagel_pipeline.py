@@ -102,8 +102,9 @@ class BagelPipeline(ComposedPipelineBase):
         unsupported: list[str] = []
         if getattr(server_args, "enable_cfg_parallel", False):
             unsupported.append("CFG parallel")
-        if int(getattr(server_args, "tp_size", 1) or 1) != 1:
-            unsupported.append("TP")
+        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        if tp_size not in (1, 2):
+            unsupported.append(f"TP size {tp_size} (validated sizes: 1, 2)")
         if int(getattr(server_args, "sp_degree", 1) or 1) != 1:
             unsupported.append("SP")
         if int(getattr(server_args, "ulysses_degree", 1) or 1) != 1:

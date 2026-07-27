@@ -30,11 +30,89 @@ from sglang.multimodal_gen.configs.models.dits.bagel import (
     BagelDiTArchConfig,
     BagelDiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
+
+
+class _BagelColumnParallelLinear(ColumnParallelLinear):
+    """Return only the tensor from SGLang's tensor-parallel linear API."""
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        return super().forward(hidden_states)[0]
+
+
+class _BagelRowParallelLinear(RowParallelLinear):
+    """Return the all-reduced tensor from SGLang's row-parallel linear API."""
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        return super().forward(hidden_states)[0]
+
+
+def _tp_size() -> int:
+    """Return one before distributed initialization and the live TP size after it."""
+    return get_tp_world_size() if model_parallel_is_initialized() else 1
+
+
+def _column_parallel_linear(
+    input_size: int,
+    output_size: int,
+    *,
+    bias: bool,
+    gather_output: bool = False,
+) -> nn.Module:
+    """Shard an output dimension only when the runtime initialized TP."""
+    tp_size = _tp_size()
+    if output_size % tp_size != 0:
+        raise ValueError(
+            f"BAGEL column dimension {output_size} must be divisible by TP size "
+            f"{tp_size}"
+        )
+    if tp_size == 1:
+        return nn.Linear(input_size, output_size, bias=bias)
+    return _BagelColumnParallelLinear(
+        input_size,
+        output_size,
+        bias=bias,
+        gather_output=gather_output,
+    )
+
+
+def _row_parallel_linear(input_size: int, output_size: int, *, bias: bool) -> nn.Module:
+    """Shard an input dimension and all-reduce its output when TP is active."""
+    tp_size = _tp_size()
+    if input_size % tp_size != 0:
+        raise ValueError(
+            f"BAGEL row dimension {input_size} must be divisible by TP size {tp_size}"
+        )
+    if tp_size == 1:
+        return nn.Linear(input_size, output_size, bias=bias)
+    return _BagelRowParallelLinear(
+        input_size,
+        output_size,
+        bias=bias,
+        input_is_parallel=True,
+    )
+
+
+def _vocab_parallel_embedding(vocab_size: int, hidden_size: int) -> nn.Module:
+    """Shard the token table while keeping the TP=1 module unchanged."""
+    if _tp_size() == 1:
+        return nn.Embedding(vocab_size, hidden_size)
+    return VocabParallelEmbedding(vocab_size, hidden_size)
 
 
 @dataclass
@@ -343,8 +421,19 @@ class _BagelMoTAttention(nn.Module):
         hidden_size = config.hidden_size
         query_size = config.num_attention_heads * config.attention_head_dim
         kv_size = config.num_key_value_heads * config.attention_head_dim
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        tp_size = _tp_size()
+        if config.num_attention_heads % tp_size != 0:
+            raise ValueError(
+                f"BAGEL attention heads {config.num_attention_heads} must be "
+                f"divisible by TP size {tp_size}"
+            )
+        if config.num_key_value_heads % tp_size != 0:
+            raise ValueError(
+                f"BAGEL KV heads {config.num_key_value_heads} must be divisible "
+                f"by TP size {tp_size}"
+            )
+        self.num_heads = config.num_attention_heads // tp_size
+        self.num_kv_heads = config.num_key_value_heads // tp_size
         self.head_dim = config.attention_head_dim
         self.layer_index = layer_index
         self.attention_backend = attention_backend
@@ -353,30 +442,30 @@ class _BagelMoTAttention(nn.Module):
         self.backend = attention_backend
         self.generation_enabled = load_generation_expert
 
-        self.und_q_proj = nn.Linear(hidden_size, query_size, bias=True)
-        self.und_k_proj = nn.Linear(hidden_size, kv_size, bias=True)
-        self.und_v_proj = nn.Linear(hidden_size, kv_size, bias=True)
-        self.und_o_proj = nn.Linear(query_size, hidden_size, bias=False)
+        self.und_q_proj = _column_parallel_linear(hidden_size, query_size, bias=True)
+        self.und_k_proj = _column_parallel_linear(hidden_size, kv_size, bias=True)
+        self.und_v_proj = _column_parallel_linear(hidden_size, kv_size, bias=True)
+        self.und_o_proj = _row_parallel_linear(query_size, hidden_size, bias=False)
         self.und_q_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.und_k_norm = _BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.gen_q_proj = (
-            nn.Linear(hidden_size, query_size, bias=True)
+            _column_parallel_linear(hidden_size, query_size, bias=True)
             if load_generation_expert
             else None
         )
         self.gen_k_proj = (
-            nn.Linear(hidden_size, kv_size, bias=True)
+            _column_parallel_linear(hidden_size, kv_size, bias=True)
             if load_generation_expert
             else None
         )
         self.gen_v_proj = (
-            nn.Linear(hidden_size, kv_size, bias=True)
+            _column_parallel_linear(hidden_size, kv_size, bias=True)
             if load_generation_expert
             else None
         )
         self.gen_o_proj = (
-            nn.Linear(query_size, hidden_size, bias=False)
+            _row_parallel_linear(query_size, hidden_size, bias=False)
             if load_generation_expert
             else None
         )
@@ -554,34 +643,40 @@ class _BagelMoTMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.generation_enabled = load_generation_expert
-        self.und_gate = nn.Linear(
+        self.und_gate = _column_parallel_linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
-        self.und_up = nn.Linear(
+        self.und_up = _column_parallel_linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
-        self.und_down = nn.Linear(
+        self.und_down = _row_parallel_linear(
             config.intermediate_size, config.hidden_size, bias=False
         )
         self.gen_gate = (
-            nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            _column_parallel_linear(
+                config.hidden_size, config.intermediate_size, bias=False
+            )
             if load_generation_expert
             else None
         )
         self.gen_up = (
-            nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            _column_parallel_linear(
+                config.hidden_size, config.intermediate_size, bias=False
+            )
             if load_generation_expert
             else None
         )
         self.gen_down = (
-            nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+            _row_parallel_linear(
+                config.intermediate_size, config.hidden_size, bias=False
+            )
             if load_generation_expert
             else None
         )
 
     @staticmethod
     def _expert(
-        hidden_states: Tensor, gate: nn.Linear, up: nn.Linear, down: nn.Linear
+        hidden_states: Tensor, gate: nn.Module, up: nn.Module, down: nn.Module
     ) -> Tensor:
         return down(F.silu(gate(hidden_states)) * up(hidden_states))
 
@@ -754,6 +849,7 @@ class BagelTransformer(BaseDiT):
         super().__init__(config, hf_config or {})
         arch = config.arch_config
         selected_attention_backend = self._resolve_attention_backend(attention_backend)
+        self.tp_size = _tp_size()
 
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
@@ -765,7 +861,7 @@ class BagelTransformer(BaseDiT):
         self.max_latent_size = arch.max_latent_size
         self.generation_enabled = bool(config.load_generation_expert)
 
-        self.embed_tokens = nn.Embedding(arch.vocab_size, arch.hidden_size)
+        self.embed_tokens = _vocab_parallel_embedding(arch.vocab_size, arch.hidden_size)
         self.rotary_emb = _Qwen2RotaryEmbedding(
             arch.attention_head_dim, arch.rope_theta
         )
@@ -787,7 +883,12 @@ class BagelTransformer(BaseDiT):
             else None
         )
         self.lm_head = (
-            nn.Linear(arch.hidden_size, arch.vocab_size, bias=False)
+            _column_parallel_linear(
+                arch.hidden_size,
+                arch.vocab_size,
+                bias=False,
+                gather_output=True,
+            )
             if config.load_lm_head
             else None
         )
@@ -1868,30 +1969,44 @@ class BagelTransformer(BaseDiT):
     def _load_parameter(
         self, name: str, parameter: nn.Parameter, tensor: Tensor
     ) -> None:
-        if tuple(parameter.shape) != tuple(tensor.shape):
-            raise ValueError(
-                f"BAGEL weight shape mismatch for {name}: expected "
-                f"{tuple(parameter.shape)}, got {tuple(tensor.shape)}"
-            )
+        weight_loader = getattr(parameter, "weight_loader", None)
         if parameter.is_meta:
             parent: nn.Module = self
             parts = name.split(".")
             for part in parts[:-1]:
                 parent = getattr(parent, part)
-            setattr(
-                parent,
-                parts[-1],
-                nn.Parameter(tensor.to(dtype=parameter.dtype), requires_grad=False),
-            )
+            if weight_loader is None:
+                if tuple(parameter.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"BAGEL weight shape mismatch for {name}: expected "
+                        f"{tuple(parameter.shape)}, got {tuple(tensor.shape)}"
+                    )
+                materialized = nn.Parameter(
+                    tensor.to(dtype=parameter.dtype), requires_grad=False
+                )
+            else:
+                materialized = nn.Parameter(
+                    torch.empty(
+                        parameter.shape,
+                        dtype=parameter.dtype,
+                        device=tensor.device,
+                    ),
+                    requires_grad=False,
+                )
+                materialized.__dict__.update(parameter.__dict__)
+                weight_loader(materialized, tensor)
+            setattr(parent, parts[-1], materialized)
             return
 
-        weight_loader = getattr(parameter, "weight_loader", None)
         if weight_loader is not None:
             weight_loader(parameter, tensor)
-        else:
-            parameter.data.copy_(
-                tensor.to(device=parameter.device, dtype=parameter.dtype)
+            return
+        if tuple(parameter.shape) != tuple(tensor.shape):
+            raise ValueError(
+                f"BAGEL weight shape mismatch for {name}: expected "
+                f"{tuple(parameter.shape)}, got {tuple(tensor.shape)}"
             )
+        parameter.data.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
 
 
 EntryClass = BagelTransformer

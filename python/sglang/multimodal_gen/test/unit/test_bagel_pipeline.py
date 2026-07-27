@@ -311,15 +311,25 @@ class TestBagelLoaderContract(unittest.TestCase):
     def test_runtime_capability_gates_report_all_invalid_modes(self) -> None:
         args = _server_args()
         args.enable_cfg_parallel = True
-        args.tp_size = 2
         args.enable_torch_compile = True
         args.dit_cpu_offload = True
 
         with self.assertRaisesRegex(
             ValueError,
-            "CFG parallel.*DiT CPU offload.*TP.*torch.compile|"
-            "CFG parallel.*DiT CPU offload.*torch.compile.*TP",
+            "CFG parallel.*DiT CPU offload.*torch.compile",
         ):
+            BagelPipeline._validate_runtime_capabilities(args)
+
+    def test_runtime_capability_allows_tp_two_and_rejects_unvalidated_sizes(
+        self,
+    ) -> None:
+        args = _server_args()
+        args.tp_size = 2
+
+        BagelPipeline._validate_runtime_capabilities(args)
+
+        args.tp_size = 3
+        with self.assertRaisesRegex(ValueError, "TP size 3"):
             BagelPipeline._validate_runtime_capabilities(args)
 
     def test_checkpoint_requires_all_markers_and_bagel_architecture(self) -> None:

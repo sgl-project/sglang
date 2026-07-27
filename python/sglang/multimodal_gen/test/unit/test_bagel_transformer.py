@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -8,10 +13,64 @@ from sglang.multimodal_gen.configs.models.dits.bagel import (
     BagelDiTConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import TimestepEmbedder
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.models.dits.bagel_transformer import (
     BagelTransformer,
     _sdpa_attention,
 )
+
+
+def _tp2_config(*, load_lm_head: bool = False) -> BagelDiTConfig:
+    arch = BagelDiTArchConfig(
+        hidden_size=8,
+        intermediate_size=12,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        attention_head_dim=2,
+        vocab_size=128,
+        max_position_embeddings=16,
+        latent_patch_size=2,
+        max_latent_size=2,
+        latent_channel=1,
+        latent_downsample=2,
+        timestep_frequency_embedding_size=4,
+        latent_position_embedding_rows=4,
+        start_of_image_token_id=3,
+        end_of_image_token_id=4,
+    )
+    return BagelDiTConfig(arch_config=arch, load_lm_head=load_lm_head)
+
+
+@contextmanager
+def _fake_tp2(rank: int) -> Iterator[SimpleNamespace]:
+    fake_tp_group = SimpleNamespace(
+        world_size=2,
+        rank_in_group=rank,
+        # Cache-shape tests only need the collective to preserve tensor shape.
+        all_reduce=lambda tensor: tensor,
+    )
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.model_parallel_is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.bagel_transformer.get_tp_world_size",
+            return_value=2,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.linear.get_tp_group",
+            return_value=fake_tp_group,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding.get_tp_group",
+            return_value=fake_tp_group,
+        ),
+    ):
+        yield fake_tp_group
 
 
 @pytest.fixture
@@ -189,6 +248,133 @@ def test_meta_initialization_materializes_all_state_for_streaming_load(
     assert loaded == {name for name, _ in weights}
     assert not any(parameter.is_meta for parameter in model.parameters())
     assert not any(buffer.is_meta for buffer in model.buffers())
+
+
+def test_tp2_uses_local_attention_heads_and_linear_shard_shapes() -> None:
+    with _fake_tp2(rank=1), torch.device("meta"):
+        model = BagelTransformer(_tp2_config(load_lm_head=True))
+
+    attention = model.layers[0].attn
+    mlp = model.layers[0].mlp
+    assert model.tp_size == 2
+    assert isinstance(model.embed_tokens, VocabParallelEmbedding)
+    assert tuple(model.embed_tokens.weight.shape) == (64, 8)
+    assert model.lm_head is not None
+    assert tuple(model.lm_head.weight.shape) == (64, 8)
+    assert model.lm_head.gather_output is True
+    assert attention.num_heads == 2
+    assert attention.num_kv_heads == 1
+    assert tuple(attention.und_q_proj.weight.shape) == (4, 8)
+    assert tuple(attention.und_k_proj.weight.shape) == (2, 8)
+    assert tuple(attention.und_v_proj.weight.shape) == (2, 8)
+    assert tuple(attention.und_o_proj.weight.shape) == (8, 4)
+    assert tuple(mlp.und_gate.weight.shape) == (6, 8)
+    assert tuple(mlp.und_up.weight.shape) == (6, 8)
+    assert tuple(mlp.und_down.weight.shape) == (8, 6)
+
+
+def test_tp2_rank1_loads_full_checkpoint_column_and_row_shards() -> None:
+    embedding_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8)
+    query_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    query_bias = torch.arange(8, dtype=torch.float32)
+    output_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 100
+    lm_head_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8) + 1000
+    with _fake_tp2(rank=1):
+        model = BagelTransformer(_tp2_config(load_lm_head=True))
+        loaded = model.load_weights(
+            [
+                ("language_model.model.embed_tokens.weight", embedding_weight),
+                (
+                    "language_model.model.layers.0.self_attn.q_proj.weight",
+                    query_weight,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.q_proj.bias",
+                    query_bias,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.o_proj.weight",
+                    output_weight,
+                ),
+                ("language_model.lm_head.weight", lm_head_weight),
+            ],
+            strict=False,
+        )
+
+    attention = model.layers[0].attn
+    assert model.lm_head is not None
+    assert loaded == {
+        "embed_tokens.weight",
+        "layers.0.attn.und_q_proj.weight",
+        "layers.0.attn.und_q_proj.bias",
+        "layers.0.attn.und_o_proj.weight",
+        "lm_head.weight",
+    }
+    torch.testing.assert_close(model.embed_tokens.weight, embedding_weight[64:])
+    torch.testing.assert_close(attention.und_q_proj.weight, query_weight[4:])
+    torch.testing.assert_close(attention.und_q_proj.bias, query_bias[4:])
+    torch.testing.assert_close(attention.und_o_proj.weight, output_weight[:, 4:])
+    torch.testing.assert_close(model.lm_head.weight, lm_head_weight[64:])
+
+
+def test_tp2_meta_load_materializes_local_shards_and_preserves_loader_attrs() -> None:
+    embedding_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8)
+    query_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    output_weight = torch.arange(64, dtype=torch.float32).reshape(8, 8) + 100
+    lm_head_weight = torch.arange(1024, dtype=torch.float32).reshape(128, 8) + 1000
+    with _fake_tp2(rank=1):
+        with torch.device("meta"):
+            model = BagelTransformer(_tp2_config(load_lm_head=True))
+        model.load_weights(
+            [
+                ("language_model.model.embed_tokens.weight", embedding_weight),
+                (
+                    "language_model.model.layers.0.self_attn.q_proj.weight",
+                    query_weight,
+                ),
+                (
+                    "language_model.model.layers.0.self_attn.o_proj.weight",
+                    output_weight,
+                ),
+                ("language_model.lm_head.weight", lm_head_weight),
+            ],
+            strict=False,
+        )
+
+    embedding_parameter = model.embed_tokens.weight
+    query_parameter = model.layers[0].attn.und_q_proj.weight
+    output_parameter = model.layers[0].attn.und_o_proj.weight
+    assert model.lm_head is not None
+    lm_head_parameter = model.lm_head.weight
+    assert not embedding_parameter.is_meta
+    assert not query_parameter.is_meta
+    assert not output_parameter.is_meta
+    assert not lm_head_parameter.is_meta
+    assert callable(embedding_parameter.weight_loader)
+    assert callable(query_parameter.weight_loader)
+    assert callable(output_parameter.weight_loader)
+    assert callable(lm_head_parameter.weight_loader)
+    assert embedding_parameter.output_dim == 0
+    assert query_parameter.output_dim == 0
+    assert output_parameter.input_dim == 1
+    assert lm_head_parameter.output_dim == 0
+    torch.testing.assert_close(embedding_parameter, embedding_weight[64:])
+    torch.testing.assert_close(query_parameter, query_weight[4:])
+    torch.testing.assert_close(output_parameter, output_weight[:, 4:])
+    torch.testing.assert_close(lm_head_parameter, lm_head_weight[64:])
+
+
+def test_tp2_prefix_cache_stores_only_local_kv_heads() -> None:
+    with _fake_tp2(rank=0):
+        model = BagelTransformer(_tp2_config(), attention_backend="torch_sdpa").eval()
+        prefix = model.prefill_context(torch.tensor([1, 2, 3]))
+
+    key = prefix.kv_cache.key_cache[0]
+    value = prefix.kv_cache.value_cache[0]
+    assert key is not None
+    assert value is not None
+    assert key.shape == (3, 1, 2)
+    assert value.shape == (3, 1, 2)
 
 
 def test_attention_backend_selection_is_explicit(

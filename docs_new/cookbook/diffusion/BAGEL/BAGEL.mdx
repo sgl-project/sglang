@@ -16,8 +16,9 @@ Run text-to-image generation, Thinking, editing, and Understanding as separate
 pipeline processes. Thinking T2I is selected when the process starts;
 Understanding reasoning is a per-request option on the dedicated Understanding
 process. The current integration does not support editing masks, multiple input
-images, multi-output requests, dynamic batching, tensor or sequence parallelism,
-Cache-DiT, or layer-wise offload.
+images, multi-output requests, dynamic batching, sequence/CFG parallelism,
+Cache-DiT, or layer-wise offload. Transformer tensor parallelism is validated at
+TP=2.
 </Warning>
 
 ## Prerequisites
@@ -25,7 +26,7 @@ Cache-DiT, or layer-wise offload.
 - Install SGLang Diffusion by following the
   [installation guide](/docs/sglang-diffusion/installation).
 - Use one NVIDIA CUDA GPU with enough memory for the BF16 checkpoint and the
-  requested image resolution.
+  requested image resolution, or two GPUs with TP=2.
 - Use the official `ByteDance-Seed/BAGEL-7B-MoT` checkpoint. The examples pin a
   checkpoint revision for reproducibility.
 
@@ -99,6 +100,22 @@ The slim Understanding weight set is approximately 15 GiB in BF16 before KV
 cache and runtime workspaces. The pipeline applies BAGEL's official outer image
 resize before the independent ViT resize, but never runs VAE encode/decode or a
 denoising loop.
+
+## Use tensor parallelism
+
+All four BAGEL pipeline variants support TP=2. Transformer attention, MLP, token
+embedding, and the optional language head are sharded; the VAE, vision encoder,
+and small auxiliary projections remain replicated. Add the same flags to any
+server command above:
+
+```bash
+sglang serve \
+  --model-path ByteDance-Seed/BAGEL-7B-MoT \
+  --revision 5019f57d168e5816e8f3f701b17cc816bb7cf24b \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --port 30000
+```
 
 ## Generate an image
 
