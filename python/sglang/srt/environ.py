@@ -936,6 +936,12 @@ class Envs:
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
     # ====================================================================
+    # Linear attention (KDA)
+    # Fuse KDA conv1d + gating-delta-rule into one kernel on the MTP
+    # target-verify chain path (speculative_eagle_topk == 1). Experimental.
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+
+    # ====================================================================
     # DeepSeek V4
     SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
     SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)

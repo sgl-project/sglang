@@ -24,6 +24,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,

@@ -6,6 +6,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -281,6 +282,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        # Fused chain-verify fast path: one kernel replaces the transpose-copy +
+        # conv1d + transpose-copy + recurrence sequence on the MTP verify chain.
+        # Opt-in; anything the fused kernel does not cover falls back to the
+        # reference two-kernel path below.
+        self._fused_chain_verify_fn = None
+        if (
+            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            and self.kernel_dispatcher.decode_kernel.supports_fused_chain_verify
+        ):
+            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+                fused_kda_conv_gating_verify,
+            )
+
+            self._fused_chain_verify_fn = fused_kda_conv_gating_verify
+            rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend).
         self.verify_intermediate_state_indices = torch.arange(
@@ -535,6 +551,43 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = seq_len // draft_token_num
+        conv_state_indices = cache_indices[:batch_size]
+
+        # Fused chain-verify fast path: one kernel replaces the transpose-copy +
+        # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
+        # retrieve_* are None there; the tree path and any unsupported shape keep
+        # the reference kernels.
+        if (
+            self._fused_chain_verify_fn is not None
+            and retrieve_next_token is None
+            and layer.conv_weights.shape[-1] == 4
+            and draft_token_num >= 3
+        ):
+            return self._fused_chain_verify_fn(
+                mixed_qkv=mixed_qkv,
+                conv_weight=layer.conv_weights,
+                conv_bias=layer.bias,
+                conv_state=conv_states,
+                conv_state_indices=conv_state_indices,
+                intermediate_conv_window=(
+                    intermediate_conv_window_cache.transpose(-1, -2)
+                ),
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=conv_state_indices,
+                intermediate_states_buffer=intermediate_state_cache,
+                scale=layer.head_k_dim**-0.5,
+                T=draft_token_num,
+                num_q_heads=layer.q_dim // layer.head_q_dim,
+                num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                lower_bound=layer.lower_bound,
+            )
 
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
