@@ -1459,7 +1459,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Their hit lengths are stored in completed_tokens.
         pool_transfers = [
             transfer
-            for transfer in operation.pool_transfers
+            for transfer in operation.pool_transfers or []
             if transfer.indices_from_pool != PoolName.KV
         ]
         hit_pages = (
