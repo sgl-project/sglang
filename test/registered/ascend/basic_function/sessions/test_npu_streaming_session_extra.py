@@ -281,7 +281,7 @@ class NPUStreamingSessionExtraServerBase(StreamingSessionServerBase):
                 cls.model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--enable-streaming-session"] + list(cls.extra_args),
+                other_args=cls.extra_args,
                 env=cls.npu_env,
             )
         cls.tokenizer = get_tokenizer(cls.model)
