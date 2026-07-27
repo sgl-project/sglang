@@ -212,12 +212,11 @@ fn take_hidden(
 /// [`ChunkEvent`] as it's decoded — one pass, no intermediate `Vec`, peak memory
 /// one request. Column order matches `push_generation`.
 ///
-/// `false` means the frame was rejected, but says nothing about how much of it was
-/// routed: the header/length checks below run before any `route` call, while a
-/// per-request decode failure can only be detected after earlier requests have
-/// already been handed out. The caller keeps whatever it was given (it logs and
-/// still forwards; see `tokenizer_manager::egress`), so treat `false` as "this
-/// frame is untrustworthy", not "nothing was delivered".
+/// `ok == false` means the frame was rejected. The caller discards everything it
+/// routed and fails the frame's requests instead of forwarding a partial fan-out
+/// (see `tokenizer_manager::egress`), so a rejected frame delivers nothing —
+/// `rids` exists precisely so those requests can be failed rather than left
+/// waiting for a `Done` that no longer exists.
 pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded {
     let mut decoded = Decoded::default();
     if body.len() < 4 {
@@ -228,8 +227,18 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         return decoded;
     };
     let data = &body[4 + hlen..];
-    let Ok(h) = rmp_serde::from_slice::<BatchHeader>(header) else {
-        return decoded;
+    let h = match rmp_serde::from_slice::<BatchHeader>(header) {
+        Ok(h) => h,
+        Err(_) => {
+            // A typed decode failure (any column whose Python type widens) yields no
+            // rids, so the caller would fail nobody and every request in the frame
+            // would hang. Re-read just the rid column, which is positional element 0
+            // and independent of every other field's type.
+            decoded.rids = rmp_serde::from_slice::<(Vec<String>,)>(header)
+                .map(|(rids,)| rids.iter().map(|r| RidHash::from_rid(r)).collect())
+                .unwrap_or_default();
+            return decoded;
+        }
     };
     // Every rid in the frame, known as soon as the header parses — so a rejection
     // below can still name the requests that were waiting on it.
@@ -411,7 +420,12 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
-            ..Default::default()
+            // Listed explicitly, NOT `..Default::default()`: a new column added to
+            // `ChunkEvent` and wired into the response must fail to compile here
+            // until it is actually decoded. With the struct-update syntax it
+            // compiled clean and silently shipped zeros.
+            text: String::new(),
+            completion_tokens: 0,
         })
     };
 

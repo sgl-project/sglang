@@ -93,11 +93,12 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
         stream: false,
         ..Default::default()
     };
-    let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(Box::new(probe))).await {
-        // Hold the receiver so the probe's sink stays open until it completes.
-        Ok((id, rid, rx)) => (id, rid, rx),
-        Err(resp) => return resp,
-    };
+    let (id, rid, _keepalive) =
+        match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
+            // Hold the receiver so the probe's sink stays open until it completes.
+            Ok((id, rid, rx)) => (id, rid, rx),
+            Err(resp) => return resp,
+        };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
     let _abort_guard = AbortGuard::new(state.senders.clone(), state.live_rids.clone(), id, rid);
@@ -171,7 +172,7 @@ async fn generate(
 /// parsing JSON chokes on. And a streaming request gets 200 plus one SSE error
 /// frame and `[DONE]`, not a 400: the client has already committed to reading a
 /// stream, and Python answers it inside `stream_results()`.
-fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
+pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
     let body = error_value(code.as_u16(), message);
     if !stream {
         return (code, Json(body)).into_response();
@@ -188,10 +189,11 @@ fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req))).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let (id, rid_str, mut rx) =
+        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
@@ -282,7 +284,7 @@ async fn generate_batch(
     let mut guard = AbortGuard::new_empty(state.senders.clone(), state.live_rids.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
-        match submit(state, RequestKind::Generate(Box::new(req))).await {
+        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((id, rid, rx)) => {
                 guard.arm(id, rid.clone());
                 receivers.push((id, rid, rx));

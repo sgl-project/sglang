@@ -2,10 +2,7 @@
 //! module: mint the client-visible rid (uuid hex, Python-parity), build the
 //! `Request`, and hand it to the TM with an egress receiver for the response.
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
 use super::AppState;
@@ -21,6 +18,10 @@ use crate::tokenizer_manager::TmEvent;
 pub(super) async fn submit(
     state: &AppState,
     kind: RequestKind,
+    // `stream`: the client is reading an SSE stream, so it expects 200 plus an
+    // error frame rather than a 4xx — same rule `pre_submit_error` applies
+    // everywhere else.
+    stream: bool,
 ) -> Result<(RidHash, String, mpsc::Receiver<EgressItem>), Response> {
     let rid = match &kind {
         // Generate rids are already final: `GenerateBody::into_requests` normalized the
@@ -41,11 +42,11 @@ pub(super) async fn submit(
             .expect("live_rids poisoned")
             .insert(rid.clone())
         {
-            return Err((
+            return Err(super::native_api::pre_submit_error(
                 StatusCode::BAD_REQUEST,
-                format!("Duplicate request ID detected: {rid}"),
-            )
-                .into_response());
+                &format!("Duplicate request ID detected: {rid}"),
+                stream,
+            ));
         }
         // RAII from here on. Every path out of this function that is NOT a
         // successful hand-off must release the rid, including the one that never
@@ -81,7 +82,11 @@ pub(super) async fn submit(
         Err(_) => {
             tracing::error!(%rid, "tm inbox closed; request rejected");
             // Return 503 so the client can retry.
-            Err((StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())
+            Err(super::native_api::pre_submit_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable",
+                stream,
+            ))
         }
     }
 }
