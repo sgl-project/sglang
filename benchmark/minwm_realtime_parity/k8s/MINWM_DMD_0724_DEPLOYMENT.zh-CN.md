@@ -326,9 +326,11 @@ SHA-256。这样避免本机带宽成为瓶颈，也留下可重复验证的 sta
 
 - MinWM exact：不下发 override，复现 base config 的
   `local_attn_size=-1/sink_size=0` 完整历史；
-- bounded serving：下发 `sink=9/window=18`，限制长 session 的 KV 容量。它是
-  MinWM 和 LingBot 都支持的性能/内存策略，但历史开始淘汰后不会与完整历史
-  baseline bitwise 一致。
+- bounded serving：当前部署默认使用 `sink=4/window=20`，限制长 session 的 KV
+  容量；Web UI 与 `sglang serve` 默认值保持一致，单次 WebSocket 请求仍可覆盖。
+  它是 MinWM 和 LingBot 都支持的性能/内存策略，但历史开始淘汰后不会与完整历史
+  baseline bitwise 一致。此前完成的 `sink=9/window=18` parity 属于历史验收合同，
+  结果不会因当前 serving preset 改变而重命名或覆盖。
 
 第一次用 9/18 失败的真正原因是 whole-DiT `torch.compile` 编译了有状态 cache
 滚动代码，Inductor 生成的动态 slice kernel 引用了未绑定 symbol：
