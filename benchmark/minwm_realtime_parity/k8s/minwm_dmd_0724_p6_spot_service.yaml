@@ -273,6 +273,8 @@ spec:
                 -e 's/id="fps" type="number" value="25"/id="fps" type="number" value="24"/' \
                 -e 's/id="sinkSize" type="number" value="9"/id="sinkSize" type="number" value="4"/' \
                 -e 's/id="windowFrames" type="number" value="18"/id="windowFrames" type="number" value="20"/' \
+                -e 's/value="live" selected/value="live"/' \
+                -e 's/value="timeline"/value="timeline" selected/' \
                 -e 's/<b>25 fps<\/b> target/<b>24 fps<\/b> target/' \
                 -e 's/<div class="section-title">LingBot<\/div>/<div class="section-title">MinWM<\/div>/' \
                 "${WEBUI_DIR}/index.html"

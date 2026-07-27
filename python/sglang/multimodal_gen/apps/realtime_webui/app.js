@@ -248,6 +248,7 @@ const scratchCtx = scratchCanvas.getContext("2d", { alpha: false });
 const recordingCanvas = document.createElement("canvas");
 const recordingCtx = recordingCanvas.getContext("2d", { alpha: false });
 const playbackController = new RealtimePlaybackController({
+  mode: "live",
   targetFps: DEFAULT_TARGET_FPS,
 });
 
@@ -284,7 +285,10 @@ function drawIdle() {
 function resetStreamStats() {
   pendingHeader = null;
   clearFrameQueue();
-  playbackController.reset({ targetFps: previewPlaybackTargetFps() });
+  playbackController.reset({
+    mode: selectedPlaybackMode(),
+    targetFps: previewPlaybackTargetFps(),
+  });
   frames = 0;
   bytes = 0;
   fpsSamples = [];
@@ -444,7 +448,10 @@ function isWorkerDecodableRawContentType(contentType) {
 
 function updateStats() {
   const playback = playbackController.snapshot();
-  const queueParts = [`buffer ${formatMs(playback.bufferMs)}`];
+  const queueParts = [
+    playback.mode === "timeline" ? "full timeline" : "low latency",
+    `buffer ${formatMs(playback.bufferMs)}`,
+  ];
   queueParts.push(`q ${playback.queueFrames}`);
   if (playback.buffering && playback.queueFrames) queueParts.push("hold");
   if (pendingDecodeBatches) queueParts.push(`decode ${pendingDecodeBatches}`);
@@ -456,6 +463,8 @@ function updateStats() {
   if (lastDecodeDropAt && now - lastDecodeDropAt < RECENT_DROP_DISPLAY_MS) {
     queueParts.push(`decode drop +${lastDecodeDropCount}`);
   }
+  const totalDroppedFrames = playback.droppedFrames + droppedDecodeFrames;
+  if (totalDroppedFrames) queueParts.push(`dropped ${totalDroppedFrames} total`);
   $("queueText").textContent = queueParts.join(" · ");
   $("frameText").textContent = `frames ${frames}`;
   $("byteText").textContent = `${(bytes / 1048576).toFixed(1)} MB`;
@@ -477,6 +486,24 @@ function previewPlaybackTargetFps() {
 
 function syncPlaybackTargetFps() {
   playbackController.setTargetFps(previewPlaybackTargetFps());
+  updateStats();
+}
+
+function selectedPlaybackMode() {
+  return $("playbackMode")?.value === "timeline" ? "timeline" : "live";
+}
+
+function syncPlaybackMode({ addToHistory = true } = {}) {
+  const mode = selectedPlaybackMode();
+  playbackController.setMode(mode);
+  if (addToHistory) {
+    addHistory(
+      mode === "timeline"
+        ? "playback · full timeline (no frame skipping)"
+        : "playback · low latency (may skip old frames)",
+    );
+  }
+  trimDecodeQueue();
   updateStats();
 }
 
@@ -979,6 +1006,7 @@ function enqueueDecodeBatch(header, data, epoch) {
 }
 
 function trimDecodeQueue() {
+  if (selectedPlaybackMode() === "timeline") return;
   if (recordingActive) return;
   if (!decodeQueue.length) return;
   const playback = playbackController.snapshot();
@@ -1921,6 +1949,10 @@ async function applyQueryParams() {
   if (model) $("model").value = model;
   $("transportFormat").value = params.get("transport") || DEFAULT_PREVIEW_OUTPUT_FORMAT;
   $("transportQuality").value = params.get("quality") || String(DEFAULT_PREVIEW_OUTPUT_QUALITY);
+  const playbackParam = params.get("playback");
+  if (playbackParam === "live" || playbackParam === "timeline") {
+    $("playbackMode").value = playbackParam;
+  }
   const srParam = params.get("sr");
   $("superResolution").checked = srParam === "1" || srParam === "true";
   const smoothParam = params.get("smooth");
@@ -1931,6 +1963,7 @@ async function applyQueryParams() {
   setPreviewScale(params.get("preview_scale") || params.get("zoom"));
   updateSuperResolutionControls();
   syncPlaybackTargetFps();
+  syncPlaybackMode({ addToHistory: false });
 
   const presetKey = params.get("preset");
   let appliedPreset = false;
@@ -2073,6 +2106,7 @@ $("recordBtn").onclick = () => {
 $("firstFrame").onchange = () => drawReferencePreview($("firstFrame").files[0]);
 $("size").addEventListener("input", () => updateOutputSizeText());
 $("fps").addEventListener("input", syncPlaybackTargetFps);
+$("playbackMode").addEventListener("change", () => syncPlaybackMode());
 $("superResolution").addEventListener("change", updateSuperResolutionControls);
 $("upscalingScale").addEventListener("change", () => updateOutputSizeText());
 $("frameInterpolation").addEventListener("change", () => {

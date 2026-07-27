@@ -1,5 +1,6 @@
 (function attachRealtimePlaybackController(global) {
   const DEFAULT_CONFIG = {
+    mode: "live",
     targetFps: 25,
     minSourceFps: 1,
     serverFpsAlphaUp: 0.28,
@@ -48,10 +49,14 @@
   class RealtimePlaybackController {
     constructor(config = {}) {
       this.config = { ...DEFAULT_CONFIG, ...config };
-      this.reset({ targetFps: this.config.targetFps });
+      this.reset({
+        targetFps: this.config.targetFps,
+        mode: this.config.mode,
+      });
     }
 
-    reset({ targetFps } = {}) {
+    reset({ targetFps, mode } = {}) {
+      this.mode = this.#normalizeMode(mode || this.mode || this.config.mode);
       this.targetFps = Math.max(1, Number(targetFps || this.config.targetFps));
       this.sourceFps = this.targetFps;
       this.serverFps = this.targetFps;
@@ -80,6 +85,12 @@
       this.serverStatChunks = new Set();
       this.lastFinalReceiveAt = 0;
       this.receiveStalled = false;
+    }
+
+    setMode(mode) {
+      this.mode = this.#normalizeMode(mode);
+      this.#updatePlaybackRate(this.lastRateUpdateAt || 0);
+      return this.snapshot();
     }
 
     setTargetFps(targetFps) {
@@ -154,11 +165,13 @@
 
       if (this.pendingEventId && eventId >= this.pendingEventId) {
         const oldEventFrameCount = this.#oldEventFrameCount(eventId);
-        const graceFrames = this.#eventGraceFrames();
-        const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
-        if (dropCount > 0) {
-          droppedFrames.push(...this.queue.splice(graceFrames, dropCount));
-          this.#recordDrop(dropCount, "event cutover", now);
+        if (this.mode === "live") {
+          const graceFrames = this.#eventGraceFrames();
+          const dropCount = Math.max(0, oldEventFrameCount - graceFrames);
+          if (dropCount > 0) {
+            droppedFrames.push(...this.queue.splice(graceFrames, dropCount));
+            this.#recordDrop(dropCount, "event cutover", now);
+          }
         }
         cutover = {
           eventId,
@@ -192,6 +205,7 @@
 
       const bufferMs = this.bufferDurationMs;
       if (
+        this.mode === "live" &&
         hasPendingInput &&
         this.receiveStalled &&
         this.renderedFrames &&
@@ -261,6 +275,7 @@
 
     snapshot() {
       return {
+        mode: this.mode,
         queueFrames: this.queue.length,
         bufferMs: this.bufferDurationMs,
         targetLeadMs: this.targetLeadMs,
@@ -378,6 +393,16 @@
     }
 
     #updatePlaybackRate(now) {
+      if (this.mode === "timeline") {
+        this.playbackRate = 1;
+        this.renderFps = clamp(
+          this.sourceFps,
+          this.config.minSourceFps,
+          this.targetFps,
+        );
+        this.lastRateUpdateAt = now;
+        return;
+      }
       const bufferMs = this.bufferDurationMs;
       const targetLeadMs = Math.max(1, this.targetLeadMs);
       const error = (bufferMs - targetLeadMs) / targetLeadMs;
@@ -427,6 +452,7 @@
 
     #trimBacklog(now) {
       const droppedFrames = [];
+      if (this.mode === "timeline") return droppedFrames;
       while (this.queue.length && this.bufferDurationMs > this.maxLeadMs) {
         const firstChunk = this.queue[0].chunkIndex;
         let dropCount = 0;
@@ -441,6 +467,10 @@
         this.#recordDrop(dropCount, "backlog", now);
       }
       return droppedFrames;
+    }
+
+    #normalizeMode(mode) {
+      return mode === "timeline" ? "timeline" : "live";
     }
 
     #oldEventFrameCount(nextEventId) {

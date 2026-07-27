@@ -342,7 +342,7 @@ NameError: name 's22' is not defined
 这不是 KV 参数不兼容。修复只在 MinWM self-attention 调用 cache update 的边界
 graph break，把 cursor、滚动 copy 和动态 slice 留在 eager；通用 cache 和 DiT
 其余计算路径仍可编译。同时修复 MinWM stage 的请求间 override 泄漏。部署 manifest
-保留 UI 的 9/18 bounded preset，exact benchmark 仍显式留空。UI 也不再把 LingBot
+保留 UI 的 4/20 bounded preset，exact benchmark 仍显式留空。UI 也不再把 LingBot
 的 `0.05/frame`、`4/6 deg/frame` 写成 MinWM 的物理动作幅度，而显示为
 `checkpoint-relative`。
 
@@ -383,6 +383,38 @@ Rust toolchain。MinWM WebSocket serving 不使用这个 extension，因此启�
 
 长期方案应该构建一份固定镜像，预装 SGLang wheel 和完全锁定的依赖；当前 cold
 Pod 启动仍会花约 2 分钟安装依赖，GP3 冷读模型时还可能额外花 4 分钟。
+
+### 7.7 实时预览和动作验收需要不同的丢帧策略
+
+人工复现 `W 5s → S 5s → idle 5s → W 5s → S 5s` 时，旧 Web UI 会出现
+“卡顿后直接跳到最新画面”。2026-07-27 对运行中的同一实例做了拆分测量：
+
+| 层级 | 实测 |
+| --- | ---: |
+| 模型端 source | 23.8–24.0 FPS |
+| 浏览器 WebP decode | 13–23 ms/chunk |
+| 浏览器 render（卡顿窗口） | 7–10 FPS |
+| display lag | 4.2–9.8 秒 |
+
+因此这次现象不是 B200/DiT 吞吐下降，而是浏览器播放线程落后。旧播放器为保证
+“按键后尽快看到最新结果”，会在两个位置主动丢旧帧：
+
+1. 解码队列超过约 2 秒时丢旧的 encoded frame batch；
+2. 播放 backlog 过长或新的 action/prompt event 生效时，按 chunk 裁掉旧 event
+   的排队帧。
+
+第二条会让 action-to-display latency 变小，却破坏人工验收的完整时间线：人按了
+5 秒，画面中不一定还能看到完整的 5 秒区间。为此 Web UI 增加两种明确模式：
+
+- `Low latency (may skip)`：保留原策略，用于交互体验；允许追赶和丢旧帧。
+- `Full timeline (no frame skipping)`：解码、backlog 和 event cutover 都不丢帧，
+  用于动作时长、prompt switch 和 parity 观察。浏览器若跟不上，代价是显示延迟和
+  内存队列增长，而不是时间线被压缩。
+
+通用 Realtime Studio 仍默认低延迟模式，以免无界积压改变产品语义；本 MinWM
+部署默认完整时间线模式。UI 会持续显示模式、队列深度和累计 dropped frame 数，
+也可用 `?playback=timeline` 显式选择。记录 MP4 的路径仍在 preview 丢帧之前接收
+source frames，因此两种模式都不会把预览丢帧误写成模型输出缺帧。
 
 ## 8. 运维命令
 
@@ -462,3 +494,5 @@ us-east-1d 的重复测试部署后来才获得一台 p6-b200 Spot，但 Pod 已
    action、seed、attention backend 和请求 payload？
 8. Spot 节点被回收后，哪些 Kubernetes/AWS 资源能保留，哪些必须重新创建或
    重新加载？
+9. 为什么人工验证 5 秒 action 区间时应使用 `Full timeline`，而追求按键后尽快
+   看到新画面时应使用 `Low latency`？两种模式各自牺牲了什么？

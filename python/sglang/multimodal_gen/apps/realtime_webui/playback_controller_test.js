@@ -109,8 +109,64 @@ function settleEventCutoverKeepsWiderGrace() {
   assert.ok(result.droppedFrames.length <= 12);
 }
 
+function timelineModeNeverDropsBacklog() {
+  const controller = new RealtimePlaybackController({
+    mode: "timeline",
+    targetFps: 25,
+  });
+  let now = 100;
+  for (let chunk = 0; chunk < 20; chunk += 1) {
+    enqueueChunk(controller, { chunk, now, durationMs: 480 });
+    now += 20;
+  }
+  const snapshot = controller.snapshot();
+  assert.equal(snapshot.mode, "timeline");
+  assert.equal(snapshot.droppedFrames, 0);
+  assert.equal(snapshot.queueFrames, 240);
+}
+
+function timelineModePreservesFramesAcrossEventCutover() {
+  const controller = new RealtimePlaybackController({
+    mode: "timeline",
+    targetFps: 25,
+  });
+  enqueueChunk(controller, { chunk: 1, frameCount: 24, durationMs: 960, now: 1000 });
+  controller.noteInputEvent(5, 1050);
+  const result = enqueueChunk(controller, {
+    chunk: 2,
+    eventId: 5,
+    frameCount: 12,
+    durationMs: 480,
+    now: 1150,
+  });
+  assert.ok(result.cutover);
+  assert.equal(result.droppedFrames.length, 0);
+  assert.equal(controller.snapshot().droppedFrames, 0);
+  assert.equal(controller.queue.length, 36);
+  assert.equal(controller.queue[24].eventId, 5);
+}
+
+function switchingBackToLiveTrimsTimelineBacklog() {
+  const controller = new RealtimePlaybackController({
+    mode: "timeline",
+    targetFps: 25,
+  });
+  let now = 100;
+  for (let chunk = 0; chunk < 20; chunk += 1) {
+    enqueueChunk(controller, { chunk, now, durationMs: 480 });
+    now += 20;
+  }
+  controller.setMode("live");
+  const decision = controller.render(now, { hasPendingInput: true });
+  assert.ok(decision.droppedFrames.length > 0);
+  assert.equal(decision.snapshot.mode, "live");
+}
+
 stableSourceDoesNotDrop();
 slowServerCapsRenderFps();
 backlogDropsContiguousOldFrames();
 eventCutoverKeepsShortGrace();
 settleEventCutoverKeepsWiderGrace();
+timelineModeNeverDropsBacklog();
+timelineModePreservesFramesAcrossEventCutover();
+switchingBackToLiveTrimsTimelineBacklog();
