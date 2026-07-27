@@ -5,7 +5,7 @@
 // (benchmark/H200/script/v1/launch-k3.sh, benchmark/B300/script/v1/launch-k3.sh)
 // and the B200 2×8 / GB200 4×4 / H100 4×8 / MI35x 1×8 reference launches.
 // Kimi-K3 is a hybrid MoE VLM: 93 layers = 69 KDA (linear) + 24 MLA, 896 routed
-// experts + 1 shared. Served today from the DarkSharpness/sglang-kimi fork.
+// experts + 1 shared. Served today from the public sgl-project/sglang kimi-k3 branch.
 
 export const config = {
   modelName: "Kimi-K3",
