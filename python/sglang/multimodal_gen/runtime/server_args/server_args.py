@@ -299,10 +299,6 @@ class ServerArgs(DisaggServerArgsMixin):
     # ``None`` resolves to DEFAULT_BCG_TEXT_BUCKETS.
     bcg_text_buckets: list[int] = None
 
-    enable_deterministic_inference: bool = False
-    enable_fused_moe_sum_all_reduce: bool = False
-    enable_symm_mem: bool = False
-
     # NVTX profiling
     enable_layerwise_nvtx_marker: bool = False
 
