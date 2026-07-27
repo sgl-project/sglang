@@ -1,10 +1,13 @@
 import importlib.util
+import logging
 import sys
 from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,6 +17,19 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class _KVResponseStatus(Enum):
     SUCCESS = "success"
+    NOTFOUND = "not_found"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class _FlexKVScatterChannel(str, Enum):
+    LOOKUP = "lookup"
+    LAYERWISE_MANIFEST = "layerwise_manifest"
+    STORE_COMPLETION = "store_completion"
+    PREFETCH_START = "prefetch_start"
+    PREFETCH_PROGRESS = "prefetch_progress"
+    RESET = "reset"
 
 
 def _module(name: str, **attrs):
@@ -34,6 +50,7 @@ def _load_connector_class():
             CMD_STORE_COMPLETE=5,
             FlexKVComm=object,
             FlexKVLayerDoneCounter=object,
+            FlexKVScatterChannel=_FlexKVScatterChannel,
             send_fds=lambda *args, **kwargs: None,
         ),
         "flexkv": _module("flexkv"),
@@ -85,7 +102,7 @@ def _load_connector_class():
 FlexKVConnector = _load_connector_class()
 
 
-def _load_layer_done_counter_class():
+def _load_flexkv_comm_module():
     module_name = "_flexkv_comm_lifecycle_under_test"
     parallel_state_name = "sglang.srt.distributed.parallel_state"
     parallel_state_stub = _module(
@@ -108,10 +125,61 @@ def _load_layer_done_counter_class():
             spec.loader.exec_module(module)
     finally:
         sys.modules.pop(module_name, None)
-    return module.FlexKVLayerDoneCounter
+    return module
 
 
-FlexKVLayerDoneCounter = _load_layer_done_counter_class()
+_flexkv_comm_module = _load_flexkv_comm_module()
+FlexKVComm = _flexkv_comm_module.FlexKVComm
+FlexKVLayerDoneCounter = _flexkv_comm_module.FlexKVLayerDoneCounter
+FlexKVScatterChannel = _flexkv_comm_module.FlexKVScatterChannel
+
+
+def _cp_leader_comm():
+    comm = FlexKVComm.__new__(FlexKVComm)
+    comm.world_rank = 0
+    comm.pp_size = 1
+    comm.is_pp_stage_leader = True
+    comm._pp_stage_leader_ranks = []
+    comm.is_pp_leader = True
+    comm._cp_leader_ranks = [0, 1]
+    comm.is_cp_leader = True
+    comm._tp_group_ranks = []
+    comm.is_tp_leader = True
+    comm._scatter_group = MagicMock(side_effect=lambda data, *_args: data)
+    return comm
+
+
+def test_scatter_uses_distinct_tags_for_lookup_and_store_completion():
+    comm = _cp_leader_comm()
+
+    lookup = comm.scatter(
+        {"task_id": 17, "hit": 0},
+        channel=FlexKVScatterChannel.LOOKUP,
+    )
+    completed = comm.scatter(
+        [],
+        channel=FlexKVScatterChannel.STORE_COMPLETION,
+    )
+
+    lookup_tag = comm._scatter_group.call_args_list[0].args[3]
+    completion_tag = comm._scatter_group.call_args_list[1].args[3]
+    assert lookup == {"task_id": 17, "hit": 0}
+    assert completed == []
+    assert lookup_tag != completion_tag
+
+
+def test_scatter_reports_channel_payload_mismatch_before_dict_indexing():
+    comm = _cp_leader_comm()
+    comm._scatter_group.side_effect = lambda _data, *_args: []
+
+    with pytest.raises(
+        TypeError,
+        match=r"channel=lookup source=received expected=dict got=list",
+    ):
+        comm.scatter(
+            {"task_id": 17, "hit": 0},
+            channel=FlexKVScatterChannel.LOOKUP,
+        )
 
 
 class _FakeLayerLoadingEvent:
@@ -157,6 +225,7 @@ class _FakeLayerLoadingEvent:
 
 def _sync_context():
     return SimpleNamespace(
+        is_pp_active=False,
         is_pp_receiver=False,
         should_send_slot_mapping_to_remote=False,
         is_pp_sender=False,
@@ -177,6 +246,7 @@ def test_layerwise_reset_waits_for_returned_batch_task_id():
     connector.layer_done_counter.events = [MagicMock(), MagicMock(), MagicMock()]
     connector.layer_done_counter.events[1].pending_transfers.return_value = 1
     connector._pending_lookups = {"request": 17}
+    connector._pending_lookup_contexts = {}
     connector._sync_ctx = _sync_context()
     connector.kv_manager = MagicMock()
     connector.kv_manager.launch.return_value = [91]
@@ -190,6 +260,9 @@ def test_layerwise_reset_waits_for_returned_batch_task_id():
     connector._inflight_loads = {}
     connector._completed_layerwise = []
     connector._inflight_stores = {}
+    connector._inflight_store_contexts = {}
+    connector._prefetch_contexts = {}
+    connector._launched_load_contexts = {}
     connector._layerwise_generation = 0
 
     loaded, producer_id = connector.start_load_kv_layerwise(
@@ -235,6 +308,7 @@ def test_lookup_uses_swa_aware_match_when_swa_pool_is_registered():
     )
     connector._swa_kv_pool = object()
     connector._pending_lookups = {}
+    connector._pending_lookup_contexts = {}
     connector.page_size = 1
 
     task_id, hit_length = connector.lookup_kv(
@@ -247,6 +321,151 @@ def test_lookup_uses_swa_aware_match_when_swa_pool_is_registered():
     connector.kv_manager.get_match.assert_called_once()
     assert connector.kv_manager.get_match.call_args.kwargs["swa_aware"] is True
     assert connector._pending_lookups == {"request": 17}
+
+
+def test_lookup_log_contains_request_context(caplog):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = _sync_context()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.get_match.return_value = (
+        17,
+        np.array([True, True, False]),
+    )
+    connector._swa_kv_pool = None
+    connector._pending_lookups = {}
+    connector._pending_lookup_contexts = {}
+    connector.page_size = 1
+
+    with caplog.at_level(logging.INFO):
+        connector.lookup_kv(
+            [11, 12, 13],
+            torch.tensor([True, True, True]),
+            rid="internal-key",
+            sglang_req_id="request-123",
+        )
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if "operation=lookup" in record.message
+    )
+    assert 'sglang_req_id="request-123"' in message
+    assert "flexkv_task_id=17" in message
+    assert "cache_op_id" not in message
+    assert "first_block_hash" not in message
+    assert "status=hit" in message
+    assert "[INFO][FlexKV-SGLang]" in message
+    assert "schema_version" not in message
+    assert "lookup_time=" in message
+    assert message.index("operation=lookup") < message.index("action=complete")
+    assert message.index("action=complete") < message.index("status=hit")
+
+
+def test_disabled_normal_log_skips_field_formatting():
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = _sync_context()
+    context = SimpleNamespace(
+        operation="lookup",
+        sglang_req_id="request-123",
+        task_id=17,
+        start_ns=0,
+    )
+    method_globals = FlexKVConnector._log_cache_op.__globals__
+    logger = method_globals["logger"]
+
+    with (
+        patch.object(logger, "isEnabledFor", return_value=False),
+        patch.object(logger, "log") as log,
+        patch.object(method_globals["json"], "dumps") as dumps,
+        patch.object(method_globals["time"], "perf_counter_ns") as clock,
+    ):
+        connector._log_cache_op(context, "launch", "running")
+
+    dumps.assert_not_called()
+    clock.assert_not_called()
+    log.assert_not_called()
+
+
+def test_failed_store_response_is_logged_as_terminal_warning(caplog):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = _sync_context()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.put_match.return_value = (31, np.array([True, True]))
+    connector.kv_manager.try_wait.return_value = {
+        31: SimpleNamespace(status=_KVResponseStatus.FAILED)
+    }
+    connector.page_size = 1
+    connector._inflight_stores = {}
+    connector._inflight_store_contexts = {}
+    connector._to_cpu_int64 = lambda value: value
+    connector._build_swa_slot_mapping = lambda value: None
+
+    with caplog.at_level(logging.INFO):
+        connector.store_kv(
+            "internal-store-key",
+            [11, 12],
+            torch.tensor([3, 4]),
+            sglang_req_id="request-123",
+        )
+        completed = connector.check_completed_stores()
+
+    assert completed == ["internal-store-key"]
+    launch = next(
+        record
+        for record in caplog.records
+        if "operation=store" in record.message and "action=launch" in record.message
+    )
+    assert launch.levelno == logging.INFO
+    assert "[INFO][FlexKV-SGLang]" in launch.message
+    assert "transfer_mode=no-layerwise" in launch.message
+    expected_order = (
+        "operation=store",
+        "action=launch",
+        "status=running",
+        "direction=D2H",
+        'sglang_req_id="request-123"',
+        "flexkv_task_id=31",
+        "transfer_mode=no-layerwise",
+    )
+    positions = [launch.message.index(field) for field in expected_order]
+    assert positions == sorted(positions)
+    terminal = next(
+        record
+        for record in caplog.records
+        if "operation=store" in record.message and "action=complete" in record.message
+    )
+    assert terminal.levelno == logging.WARNING
+    assert "status=failed" in terminal.message
+    assert 'sglang_req_id="request-123"' in terminal.message
+    assert "store_time=" in terminal.message
+
+
+def test_failed_prefetch_response_is_terminal(caplog):
+    connector = FlexKVConnector.__new__(FlexKVConnector)
+    connector._sync_ctx = _sync_context()
+    connector.kv_manager = MagicMock()
+    connector.kv_manager.prefetch_async.return_value = 44
+    connector.kv_manager.try_wait.return_value = {
+        44: SimpleNamespace(status=_KVResponseStatus.FAILED)
+    }
+    connector.page_size = 1
+    connector._prefetch_enabled = True
+    connector._ongoing_prefetches = {}
+    connector._prefetch_contexts = {}
+
+    with caplog.at_level(logging.INFO):
+        connector.prefetch_async("request-123", [11, 12], sglang_req_id="request-123")
+        done = connector.check_prefetch_progress("request-123")
+
+    assert done is True
+    terminal = next(
+        record
+        for record in caplog.records
+        if "operation=prefetch" in record.message
+        and "action=complete" in record.message
+    )
+    assert terminal.levelno == logging.WARNING
+    assert "status=failed" in terminal.message
 
 
 def test_layerwise_counter_groups_restore_requests_in_one_prefill_batch():

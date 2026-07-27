@@ -888,6 +888,12 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # A storage load-back remains request-owned until cache_finished_req or
+        # cache_unfinished_req transfers those slots into the prefix cache.
+        # Keep that ownership separate from prefix_indices: the latter is
+        # rebuilt on every prefix match and cannot identify an in-flight restore.
+        self.pending_restore_generation: Optional[int] = None
+        self.pending_restore_slots: Optional[torch.Tensor] = None
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None

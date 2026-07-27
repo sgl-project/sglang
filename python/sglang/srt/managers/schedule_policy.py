@@ -682,6 +682,32 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _get_chunked_prefill_len(
+        self,
+        prefix_len: int,
+        chunk_tokens_limit: int,
+        truncation_align_size: Optional[int],
+    ) -> int:
+        """Return the schedulable chunk length, or 0 when admission must stop.
+
+        This calculation is intentionally side-effect free so storage load-back
+        can run only after every chunk admission check has passed. Otherwise a
+        waiting request can allocate and launch an H2D restore, be rejected by
+        one of these checks, and leak the restored slots on its next retry.
+        """
+        trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+        if trunc_len <= 0:
+            return 0
+
+        if truncation_align_size is not None:
+            if trunc_len < truncation_align_size:
+                return 0
+            trunc_len = truncation_align_size * (trunc_len // truncation_align_size)
+
+        now_input_len = trunc_len + prefix_len
+        now_input_len = now_input_len // self.page_size * self.page_size
+        return max(0, now_input_len - prefix_len)
+
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -1086,6 +1112,33 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
+            # Do every deterministic admission check before init_load_back.
+            # Storage restore allocates GPU slots and may launch asynchronous
+            # H2D. A request rejected after that point remains in waiting_queue;
+            # its next prefix match overwrites req.prefix_indices and used to
+            # orphan the restored slots.
+            projected_prefix_len = prefix_len + req.host_hit_length
+            projected_input_tokens = self.ceil_paged_tokens(
+                len(req.full_untruncated_fill_ids) - projected_prefix_len
+            )
+            if self.dllm_config is not None:
+                if self.rem_dllm_tokens <= 0:
+                    return AddReqResult.OTHER
+                assert (
+                    truncation_align_size is None
+                ), "truncation_align_size is not supported for dllm prefill"
+            elif (
+                chunk_tokens_limit is not None
+                and projected_input_tokens > chunk_tokens_limit
+                and self._get_chunked_prefill_len(
+                    projected_prefix_len,
+                    chunk_tokens_limit,
+                    truncation_align_size,
+                )
+                <= 0
+            ):
+                return AddReqResult.OTHER
+
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -1118,13 +1171,6 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
@@ -1146,26 +1192,11 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
-                        return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
-                        )
-
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
+                trunc_len = self._get_chunked_prefill_len(
+                    len(req.prefix_indices),
+                    chunk_tokens_limit,
+                    truncation_align_size,
+                )
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

@@ -44,6 +44,13 @@ class _LoadMarker:
     device_length: int
 
 
+@dataclass
+class _RestoreLease:
+    generation: int
+    req: Req
+    device_indices: torch.Tensor
+
+
 class FlexKVHybridRadixCache(BasePrefixCache):
     """Compose FlexKV I/O with an existing hybrid radix implementation.
 
@@ -104,6 +111,8 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self.token_to_kv_pool_host = FlexKVHostReleaseShim(self.flexkv_connector)
 
         self._load_markers: dict[str, _LoadMarker] = {}
+        self._restore_leases: dict[str, _RestoreLease] = {}
+        self._restore_generation = 0
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
         self._store_generation = 0
         self._node_lock = threading.Lock()
@@ -113,6 +122,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # asynchronous store or layerwise load is in flight. Drain those tasks
         # before the inner cache releases the slots.
         self.flexkv_connector.reset()
+        self._free_uncommitted_restores()
         self._inner_cache.reset()
         self._load_markers.clear()
         with self._node_lock:
@@ -127,6 +137,18 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         if self.disable or params.req is None:
             return result
 
+        # An active lease owns GPU slots that have not reached the inner radix
+        # cache yet. The scheduler normally defers this request until commit;
+        # keep this guard here as a second line of defense for direct callers.
+        # Starting another lookup would overwrite the rid-keyed pending task and
+        # allocate another restore generation for the same request.
+        if params.req.rid in self._restore_leases:
+            logger.warning(
+                "Skipping duplicate FlexKV lookup for uncommitted restore rid=%s",
+                params.req.rid,
+            )
+            return result
+
         key = params.key.page_aligned(self.page_size)
         token_ids = key.raw_token_ids()
         device_length = int(result.device_indices.numel())
@@ -136,7 +158,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
         token_mask[device_length:] = True
         _, hit_length = self.flexkv_connector.lookup_kv(
-            token_ids, token_mask, rid=params.req.rid
+            token_ids,
+            token_mask,
+            rid=params.req.rid,
+            sglang_req_id=params.req.rid,
         )
         if hit_length <= 0:
             return result
@@ -155,6 +180,15 @@ class FlexKVHybridRadixCache(BasePrefixCache):
 
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, Any]:
         req = params.req
+        if req.rid in self._restore_leases:
+            self._load_markers.pop(req.rid, None)
+            self.flexkv_connector.release_pending(req.rid)
+            logger.warning(
+                "Skipping duplicate FlexKV load-back for uncommitted restore rid=%s",
+                req.rid,
+            )
+            return self._empty_indices(), req.last_node
+
         marker = self._load_markers.pop(req.rid, None)
         if marker is None or params.host_hit_length <= 0:
             self.flexkv_connector.release_pending(req.rid)
@@ -165,19 +199,34 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             self.flexkv_connector.release_pending(req.rid)
             return self._empty_indices(), req.last_node
 
+        # Register ownership before launching the connector. If launch raises,
+        # its write status may be unknown; reset must drain the connector before
+        # these slots can be freed safely.
+        generation = self._restore_generation
+        self._restore_generation += 1
+        lease = _RestoreLease(
+            generation=generation,
+            req=req,
+            device_indices=device_indices,
+        )
+        self._restore_leases[req.rid] = lease
+        req.pending_restore_generation = generation
+        req.pending_restore_slots = device_indices
+
         if self.flexkv_connector.enable_layerwise:
             loaded, _ = self.flexkv_connector.start_load_kv_layerwise(
                 req.rid, device_indices
             )
         else:
             loaded = self.flexkv_connector.retrieve_kv(req.rid, device_indices)
-        if loaded <= 0:
-            self.token_to_kv_pool_allocator.free(device_indices)
-            return self._empty_indices(), req.last_node
 
-        if loaded < device_indices.numel():
-            self.token_to_kv_pool_allocator.free(device_indices[loaded:])
-            device_indices = device_indices[:loaded]
+        # Admission planning uses the lookup hit length. Keep load-back
+        # all-or-nothing so a successful restore cannot invalidate the checks
+        # that deliberately ran before this allocation. Both connector paths
+        # normally return either the entire mapping or zero.
+        if loaded != device_indices.numel():
+            self._free_restore_lease(lease)
+            return self._empty_indices(), req.last_node
 
         if (
             self.supports_swa()
@@ -195,6 +244,55 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         req.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
         return device_indices, req.last_node
+
+    def has_uncommitted_restore(self, req: Req) -> bool:
+        # Treat rid as the single-flight key even if a malformed caller creates
+        # a second Req object with the same rid. Letting that object start a new
+        # lookup would overwrite connector state owned by the first request.
+        return req.rid in self._restore_leases
+
+    def _commit_restore(self, req: Req) -> None:
+        lease = self._restore_leases.get(req.rid)
+        if lease is None:
+            req._flexkv_uncached_restore = False
+            return
+
+        generation = getattr(req, "pending_restore_generation", None)
+        slots = getattr(req, "pending_restore_slots", None)
+        if (
+            lease.req is not req
+            or generation != lease.generation
+            or slots is not lease.device_indices
+        ):
+            logger.error(
+                "FlexKV restore lease mismatch on commit rid=%s lease_gen=%s req_gen=%s",
+                req.rid,
+                lease.generation,
+                generation,
+            )
+            return
+
+        self._restore_leases.pop(req.rid, None)
+        req._flexkv_uncached_restore = False
+        req.pending_restore_generation = None
+        req.pending_restore_slots = None
+
+    def _free_restore_lease(self, lease: _RestoreLease) -> None:
+        tracked = self._restore_leases.get(lease.req.rid)
+        if tracked is not lease:
+            raise RuntimeError(
+                "FlexKV restore lease changed before free: "
+                f"rid={lease.req.rid} generation={lease.generation}"
+            )
+        self.token_to_kv_pool_allocator.free(lease.device_indices)
+        self._restore_leases.pop(lease.req.rid)
+        lease.req.pending_restore_generation = None
+        lease.req.pending_restore_slots = None
+        lease.req._flexkv_uncached_restore = False
+
+    def _free_uncommitted_restores(self) -> None:
+        for lease in list(self._restore_leases.values()):
+            self._free_restore_lease(lease)
 
     def _alloc_restore_slots(
         self, req: Req, host_hit_length: int
@@ -301,6 +399,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         kv_length = int(kwargs.get("kv_len_to_handle", req.kv_committed_len))
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
         self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
+        self._commit_restore(req)
         if not is_insert:
             return
 
@@ -309,7 +408,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def cache_unfinished_req(self, req: Req, **kwargs) -> None:
         self._apply_restore_swa_boundary(req)
         self._inner_cache.cache_unfinished_req(req, **kwargs)
-        req._flexkv_uncached_restore = False
+        self._commit_restore(req)
 
         # A chunk boundary is not a reusable request boundary and its state may
         # still be changing. The non-chunked call marks prefill completion, when
@@ -345,7 +444,12 @@ class FlexKVHybridRadixCache(BasePrefixCache):
             store_key = f"{req.rid}:flexkv-store:{self._store_generation}"
             self._store_generation += 1
         try:
-            task_id = self.flexkv_connector.store_kv(store_key, token_ids, indices)
+            task_id = self.flexkv_connector.store_kv(
+                store_key,
+                token_ids,
+                indices,
+                sglang_req_id=req.rid,
+            )
         except Exception:
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
             raise
@@ -389,10 +493,15 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._load_markers.pop(rid, None)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
+        # Do not free an active restore here. Scheduled aborts immediately flow
+        # through cache_finished_req(is_insert=False), which transfers/frees the
+        # request slots before committing the lease. A direct free here could
+        # race the layerwise H2D writer. Waiting requests cannot own a lease
+        # because every admission rejection runs before init_load_back.
 
     def prefetch_from_storage(self, rid: str, last_host_node: Any, token_ids) -> None:
         del last_host_node
-        self.flexkv_connector.prefetch_async(rid, list(token_ids))
+        self.flexkv_connector.prefetch_async(rid, list(token_ids), sglang_req_id=rid)
 
     def check_prefetch_progress(self, rid: str) -> bool:
         return self.flexkv_connector.check_prefetch_progress(rid)
