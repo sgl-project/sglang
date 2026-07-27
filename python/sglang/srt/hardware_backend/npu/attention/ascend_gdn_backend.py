@@ -1,14 +1,9 @@
 from typing import Optional, Tuple, Union
 
-import sgl_kernel_npu  # noqa: F401
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
-)
-from sgl_kernel_npu.mamba.causal_conv1d import (
-    causal_conv1d_fn_npu,
-    causal_conv1d_update_npu,
 )
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
@@ -26,8 +21,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 fused_gdn_gating = fused_gdn_gating_npu
-causal_conv1d_fn = causal_conv1d_fn_npu
-causal_conv1d_update = causal_conv1d_update_npu
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
