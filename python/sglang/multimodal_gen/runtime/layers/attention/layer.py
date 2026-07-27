@@ -1020,9 +1020,7 @@ class USPAttention(nn.Module):
 
         if q.shape[2:] == k.shape[2:] == v.shape[2:]:
             head_dim = q.shape[-1]
-            qkv_shard = torch.stack((q_shard, k_shard, v_shard), dim=3).flatten(
-                3, 4
-            )
+            qkv_shard = torch.stack((q_shard, k_shard, v_shard), dim=3).flatten(3, 4)
             qkv_shard = _usp_input_all_to_all(qkv_shard, head_dim=2)
 
             h_local = qkv_shard.shape[2]
@@ -1044,12 +1042,8 @@ class USPAttention(nn.Module):
             h_start = sp_rank * h_local
             kv_h_start = sp_rank * kv_h_local
             q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
-            k_rep = k_rep[
-                :, :, kv_h_start : kv_h_start + kv_h_local, :
-            ].contiguous()
-            v_rep = v_rep[
-                :, :, kv_h_start : kv_h_start + kv_h_local, :
-            ].contiguous()
+            k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+            v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
             q = torch.cat([q_rep, q_shard], dim=1)
             k = torch.cat([k_rep, k_shard], dim=1)
