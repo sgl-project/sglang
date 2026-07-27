@@ -174,7 +174,7 @@ class PrefillDelayer:
         # Each rank creates start_time independently. Reduce the deadline
         # decision across every participant so TP ranks cannot straddle it and
         # choose prefill versus decode on the same scheduler pass.
-        global_queue_timeout_expired = global_info[:, :, 5].max().item() > 0
+        global_queue_timeout_expired = global_info[:, :, 5].max() > 0
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
