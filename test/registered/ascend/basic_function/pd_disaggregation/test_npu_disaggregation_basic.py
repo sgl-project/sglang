@@ -35,16 +35,31 @@ from sglang.test.test_utils import (
 register_npu_ci(est_time=400, suite="full-16-npu-a3", nightly=True)
 
 
-class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
+class DisaggregationTestBase(PDDisaggregationServerBase):
+    """
+    Base class for PD-disaggregation tests on Ascend NPU.
+    Subclasses only need to define class variables to customize:
+      -- model: model path
+      -- prefill_extra_args / decode_extra_args: extra args
+      -- extra_env_vars: dict of env vars to set during test
+      -- gsm8k_score_threshold: if set, call run_gsm8k to test accuracy.
+    """
+
+    model = None
+    prefill_extra_args = []
+    decode_extra_args = []
+    extra_env_vars = {}
+    gsm8k_score_threshold = 0.0
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
         cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-        cls.pause_generate_url = cls.lb_url
-        cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
+        for key, value in cls.extra_env_vars.items():
+            os.environ[key] = value
 
+        # Non blocking start servers
         cls.start_prefill()
         cls.start_decode()
 
@@ -63,10 +78,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
+            1,
+        ] + cls.prefill_extra_args
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -84,10 +97,10 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp-size",
-            "1",
+            1,
             "--base-gpu-id",
-            "4",
-        ]
+            1,
+        ] + cls.decode_extra_args
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
             cls.model,
@@ -99,11 +112,14 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
     @classmethod
     def tearDownClass(cls):
         os.environ.pop("ASCEND_MF_STORE_URL", None)
+        for key, value in cls.extra_env_vars.items():
+            os.environ.pop(key, None)
         super().tearDownClass()
 
-    def test_gsm8k(self):
+    def run_gsm8k(self):
         args = SimpleNamespace(
             base_url=self.base_url,
+            model=self.model,
             eval_name="gsm8k",
             api="completion",
             max_tokens=512,
@@ -111,9 +127,24 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             num_threads=128,
         )
         metrics = run_eval(args)
-        logging.warning(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["score"], 0.62)
+        self.assertGreater(metrics["score"], self.gsm8k_score_threshold)
+
+
+class TestDisaggregationAccuracy(DisaggregationTestBase, PauseResumeInPlaceMixin):
+    """Test the basic functions of PD separation."""
+
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    gsm8k_score_threshold = 0.62
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.pause_generate_url = cls.lb_url
+        cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+
+    def test_gsm8k(self):
+        self.run_gsm8k()
 
     def test_logprob(self):
         prompt = "The capital of france is "
@@ -238,72 +269,11 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         )
 
 
-class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
-        os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
+class TestDisaggregationMooncakeFailure(DisaggregationTestBase):
+    """Test fault tolerance against random transport layer failures in a PD separation scenario."""
 
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB", None)
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    extra_env_vars = {"DISAGGREGATION_TEST_FAILURE_PROB": "0.05"}
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -333,244 +303,49 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
 
 class TestDisaggregationMooncakeSpec(
-    JSONConstrainedMixin, SpecGrammarKit, PDDisaggregationServerBase
+    JSONConstrainedMixin, SpecGrammarKit, DisaggregationTestBase
 ):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-        cls.spec_args = [
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-draft-model-path",
-            EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH,
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "16",
-            "--cuda-graph-max-bs",
-            "8",
-            "--dtype=float16",
-        ]
-        cls.start_prefill()
-        cls.start_decode()
+    """Testing confirmed that EAGLE introduces no loss in accuracy in the PD separation scenario."""
 
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    gsm8k_score_threshold = 0.74
+    extra_env_vars = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
+    spec_args = [
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-draft-model-path",
+        EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "16",
+        "--cuda-graph-max-bs",
+        "8",
+        "--dtype=float16",
+    ]
+    prefill_extra_args = spec_args
+    decode_extra_args = spec_args
+    def test_gsm8k(self):
+        self.run_gsm8k()
 
-        cls.launch_lb()
 
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args + cls.spec_args,
-        )
+class TestDisaggregationSimulatedRetract(DisaggregationTestBase):
+    """Test accuracy results in "retract" mode for the PD separation scenario."""
 
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args + cls.spec_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", None)
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    gsm8k_score_threshold = 0.62
+    extra_env_vars = {"SGLANG_TEST_RETRACT": "true"}
 
     def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-
-        self.assertGreater(metrics["score"], 0.74)
+        self.run_gsm8k()
 
 
-class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        os.environ["SGLANG_TEST_RETRACT"] = "true"
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
+class TestDisaggregationPauseResumeDecodeRetract(DisaggregationTestBase):
+    """Test the pause/resume functionality of the Decode node in Retract mode within a PD separation scenario."""
 
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_RETRACT", None)
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-
-        self.assertGreater(metrics["score"], 0.62)
-
-
-class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 
     def test_retract_pause_decode_running_batch(self):
         """Retract-mode pause on a disagg decode node must preserve in-flight
@@ -724,80 +499,20 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             )
 
 
-class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
+class TestDisaggregationPauseResumePrefillLeak(DisaggregationTestBase):
     """Regression test: pause_generation must not leak prefill requests into
     running_batch.  With a small --max-running-requests the leak fills the
     scheduling budget and blocks all subsequent prefills."""
 
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
     MAX_RUNNING = 4
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        cls.extra_prefill_args = [
-            "--max-running-requests",
-            str(cls.MAX_RUNNING),
-            "--enable-metrics",
-        ]
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
-
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args + cls.extra_prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args + cls.extra_prefill_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
+    spec_agrs = [
+        "--max-running-requests",
+        str(MAX_RUNNING),
+        "--enable-metrics",
+    ]
+    prefill_extra_args = spec_agrs
+    decode_extra_args = spec_agrs
 
     def test_retract_pause_no_leak_on_prefill(self):
         """Retract-mode pause on a disagg prefill node must not leak prefill
@@ -945,13 +660,11 @@ _CHUNKED_ABORT_LONG_PROMPT = (
     "Sphinx of black quartz, judge my vow. "
 ) * 900
 
-
 def _decode_response(response: requests.Response) -> Any:
     try:
         return response.json()
     except ValueError:
         return response.text
-
 
 def _is_abort_result(status_code: int, body: Any) -> bool:
     if status_code == 200:
@@ -969,75 +682,16 @@ def _is_abort_result(status_code: int, body: Any) -> bool:
     return "abort" in text.lower()
 
 
-class TestDisaggChunkedPrefillAbort(PDDisaggregationServerBase):
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24667"
-        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-        cls.extra_prefill_args = [
-            "--max-running-requests",
-            "4",
-            "--chunked-prefill-size",
-            "128",
-        ]
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
+class TestDisaggChunkedPrefillAbort(DisaggregationTestBase):
+    """Test the request ID cancellation function under the chunked prefill mode in a PD-separated scenario."""
 
-        cls.start_prefill()
-        cls.start_decode()
-
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
-        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-
-        cls.launch_lb()
-
-    @classmethod
-    def start_prefill(cls):
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            2,
-        ]
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = popen_launch_pd_server(
-            cls.model,
-            cls.prefill_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=prefill_args + cls.extra_prefill_args,
-        )
-
-    @classmethod
-    def start_decode(cls):
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp-size",
-            "1",
-            "--base-gpu-id",
-            "4",
-        ]
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = popen_launch_pd_server(
-            cls.model,
-            cls.decode_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=decode_args + cls.extra_prefill_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("ASCEND_MF_STORE_URL", None)
-        super().tearDownClass()
+    model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+    spec_arges = [
+        "--max-running-requests",
+        "4",
+        "--chunked-prefill-size",
+        "128",
+    ]
 
     def _post_abort(self, rid: str):
         for url in (self.prefill_url, self.decode_url):

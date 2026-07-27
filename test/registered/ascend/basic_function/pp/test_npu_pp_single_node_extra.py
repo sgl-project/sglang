@@ -12,6 +12,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
 )
 
@@ -19,11 +21,15 @@ register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 IMAGE_SGL_LOGO_URL = IMAGES_1_1_PATH
 
 
-class TestQwenVLPPAccuracy(unittest.TestCase):
+class TestQwenVLPPAccuracy(CustomTestCase):
+    """
+    Using a multimodal language model,
+    configure the pp-size and evaluate GSM8K accuracy as well as the correctness of image reasoning.
+    """
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_VL_8B_THINKING_MODEL_PATH
-        cls.base_url = "http://127.0.0.1:23333"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
