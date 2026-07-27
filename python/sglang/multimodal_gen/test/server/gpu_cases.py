@@ -6,6 +6,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     MINIMUM_PICTURE_BASE64_FOR_WARMUP,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    BAGEL_DYNAMIC_BATCHING_CI_REQUESTS,
     BAGEL_T2I_CI_SAMPLING_PARAMS,
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
@@ -486,12 +487,20 @@ if current_platform.is_cuda():
                 extras=[
                     "--revision",
                     DEFAULT_BAGEL_MODEL_REVISION_FOR_TEST,
+                    "--batching-mode",
+                    "dynamic",
+                    "--batching-max-size",
+                    "2",
+                    "--batching-delay-ms",
+                    "500",
+                    "--enable-batching-metrics",
                 ],
             ),
             BAGEL_T2I_CI_SAMPLING_PARAMS,
             run_perf_check=True,
             run_consistency_check=False,
             run_component_accuracy_check=False,
+            dynamic_batching_requests=BAGEL_DYNAMIC_BATCHING_CI_REQUESTS,
         )
     )
     ONE_GPU_CASES.append(

@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.multimodal_gen.configs.sample.bagel import BagelSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
@@ -12,6 +14,58 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class TestSchedulerDynamicBatching(unittest.TestCase):
+    def test_bagel_requests_merge_once_and_split_in_request_order(self) -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.receiver = object()
+        scheduler.worker = SimpleNamespace(
+            is_sleeping=lambda: False,
+            execute_forward=Mock(
+                return_value=OutputBatch(output=torch.tensor([[11.0], [22.0]]))
+            ),
+        )
+        scheduler._batching_max_size = 2
+        scheduler._batching_delay_s = 0.5
+        prompts = [
+            "A blue cube resting on a white table.",
+            "A tiny red sphere floating above a quiet lake at sunrise.",
+        ]
+        requests = [
+            Req(
+                sampling_params=BagelSamplingParams(
+                    request_id=f"request-{index}",
+                    prompt=prompt,
+                    seed=seed,
+                    height=256,
+                    width=256,
+                    num_inference_steps=2,
+                    guidance_scale=4.0,
+                    flow_shift=3.0,
+                    generator_device="cpu",
+                    save_output=False,
+                )
+            )
+            for index, (prompt, seed) in enumerate(zip(prompts, (11, 22)))
+        ]
+
+        self.assertTrue(scheduler._can_dynamic_batch(*requests))
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.scheduler.trace_slice",
+            return_value=nullcontext(),
+        ):
+            outputs = scheduler._handle_generation(requests)
+
+        scheduler.worker.execute_forward.assert_called_once()
+        merged_request = scheduler.worker.execute_forward.call_args.args[0][0]
+        self.assertEqual(merged_request.prompt, prompts)
+        self.assertEqual(merged_request.extra["dynamic_batch_seeds"], [11, 22])
+        self.assertEqual(
+            merged_request.request_id,
+            "dynamic_batch::request-0",
+        )
+        self.assertEqual(len(outputs), 2)
+        torch.testing.assert_close(outputs[0].output, torch.tensor([[11.0]]))
+        torch.testing.assert_close(outputs[1].output, torch.tensor([[22.0]]))
+
     def test_taylorseer_mismatch_prevents_request_merge(self) -> None:
         scheduler = Scheduler.__new__(Scheduler)
         requests = [
