@@ -281,9 +281,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_json_returns_the_vertex_error_shape() {
+    async fn invalid_requests_return_the_vertex_error_shape() {
         let (app, tm_rx) = app_at(DEFAULT_PREDICT_ROUTE);
-        let response = post_json(app, DEFAULT_PREDICT_ROUTE, r#"{"instances":"#).await;
+        let response = post_json(app.clone(), DEFAULT_PREDICT_ROUTE, r#"{"instances":"#).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response_json(response).await;
@@ -292,9 +292,25 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|message| !message.is_empty())
         );
+
+        let response = post_json(
+            app,
+            DEFAULT_PREDICT_ROUTE,
+            r#"{"instances":[{"prompt":"The capital of France is"}]}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "error": {
+                    "message": "Either text, input_ids or input_embeds should be provided."
+                }
+            })
+        );
         assert!(
             tm_rx.try_recv().is_err(),
-            "malformed JSON must not reach generation"
+            "invalid requests must not reach generation"
         );
     }
 
@@ -316,36 +332,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unary_generation_traverses_the_handler_and_wraps_predictions() {
+    async fn batch_generation_traverses_the_handler_and_wraps_every_prediction() {
         let (app, tm_rx) = app_at(DEFAULT_PREDICT_ROUTE);
         let backend = tokio::spawn(async move {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(1), tm_rx.recv_async())
-                .await
-                .expect("Vertex generation must reach the TM inbox")
-                .unwrap();
-            let TmEvent::Ingress(request) = event else {
-                panic!("Vertex generation must enter through the TM inbox");
-            };
-            let RequestKind::Generate(generate) = &request.kind else {
-                panic!("Vertex generation must submit a generate request");
-            };
-            assert_eq!(generate.rid, "vertex_0");
-            assert_eq!(generate.text.as_deref(), Some("The capital is"));
-            request
-                .sink
-                .try_send(EgressItem::Done(ChunkEvent {
-                    text: " Paris".to_string(),
-                    completion_tokens: 1,
-                    ..Default::default()
-                }))
-                .unwrap();
+            for (rid, text, output) in [
+                ("vertex_0", "The capital of France is", " Paris"),
+                ("vertex_1", "The capital of China is", " Beijing"),
+            ] {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), tm_rx.recv_async())
+                        .await
+                        .expect("every Vertex instance must reach the TM inbox")
+                        .unwrap();
+                let TmEvent::Ingress(request) = event else {
+                    panic!("Vertex generation must enter through the TM inbox");
+                };
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("Vertex generation must submit a generate request");
+                };
+                assert_eq!(generate.rid, rid);
+                assert_eq!(generate.text.as_deref(), Some(text));
+                request
+                    .sink
+                    .try_send(EgressItem::Done(ChunkEvent {
+                        text: output.to_string(),
+                        completion_tokens: 1,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+            }
         });
 
         let response = post_json(
             app,
             DEFAULT_PREDICT_ROUTE,
             r#"{
-                "instances": [{"text": "The capital is"}],
+                "instances": [
+                    {"text": "The capital of France is"},
+                    {"text": "The capital of China is"}
+                ],
                 "parameters": {"rid": "vertex"}
             }"#,
         )
@@ -354,7 +379,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
+        assert_eq!(body["predictions"].as_array().unwrap().len(), 2);
         assert_eq!(body.pointer("/predictions/0/text"), Some(&json!(" Paris")));
+        assert_eq!(
+            body.pointer("/predictions/1/text"),
+            Some(&json!(" Beijing"))
+        );
     }
 
     #[test]
