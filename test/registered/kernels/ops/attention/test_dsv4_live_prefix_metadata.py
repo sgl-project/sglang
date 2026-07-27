@@ -781,6 +781,11 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
                     return_value=topk_v2,
                 ),
             ):
+                # __init__ resolves the frozen terms once; mirror that here so
+                # the mocks are in scope for the compute, not just the gate.
+                backend.live_prefix_metadata_supported = (
+                    backend._compute_live_prefix_metadata_supported()
+                )
                 return backend._can_use_live_prefix_target_verify_metadata(
                     use_prefill_cuda_graph=cuda_graph
                 )
