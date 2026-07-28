@@ -1400,14 +1400,13 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # Qwen3.5 ModelOpt checkpoints keep the embedded MTP model in BF16.
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
             preserve_online_draft_quantization = (
-                self.quantization == "nvfp4_online"
-                and self.is_draft_model
-                and "Qwen3_5ForCausalLMMTP"
-                in (getattr(self.hf_config, "architectures", None) or [])
-                and getattr(self.hf_text_config, "model_type", None)
-                == "qwen3_5_moe_text"
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
 
