@@ -478,15 +478,6 @@ def gate_chunk_cumsum_operands(
 
 _INTRA_MATRIX_CONFIG = helion.Config(
     block_sizes=[32],
-    loop_orders=[[2, 1, 0]],
-    num_warps=1,
-    num_stages=2,
-    indexing="pointer",
-)
-
-
-_INTRA_MATRIX_FORWARD_CONFIG = helion.Config(
-    block_sizes=[32],
     loop_orders=[[1, 2, 0]],
     num_warps=1,
     num_stages=2,
@@ -508,8 +499,6 @@ def _intra_matrices_wide(
     chunk_indices: torch.Tensor,
     scale: float,
     is_varlen: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
-    preinvert_diagonal: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
-    newton_schulz: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute a full 16x64 causal matrix row per CTA."""
     B = q.size(0)
@@ -686,11 +675,7 @@ def _intra_matrices_wide(
             akk_diag * row_beta[:, None],
             0.0,
         )
-        if preinvert_diagonal:
-            diagonal_matrix = _invert_lower_16(
-                diagonal_matrix,
-                newton_schulz,
-            )
+        diagonal_matrix = _invert_lower_16_forward_substitution(diagonal_matrix)
         hl.store(
             aqk_rows,
             [row[:, None], diag_col[None, :]],
@@ -707,13 +692,6 @@ def _intra_matrices_wide(
     return aqk, akk
 
 
-_intra_matrices_wide_forward = helion.kernel(
-    static_shapes=True,
-    config=_INTRA_MATRIX_FORWARD_CONFIG,
-    ignore_warnings=_IGNORED_WARNINGS,
-)(_intra_matrices_wide.fn)
-
-
 def _invert_lower_16_forward_substitution(matrix: torch.Tensor) -> torch.Tensor:
     lane = hl.arange(16)
     strictly_lower = lane[:, None] > lane[None, :]
@@ -726,53 +704,80 @@ def _invert_lower_16_forward_substitution(matrix: torch.Tensor) -> torch.Tensor:
     return inverse + (lane[:, None] == lane[None, :]).float()
 
 
-def _invert_lower_16_newton_schulz(matrix: torch.Tensor) -> torch.Tensor:
-    lane = hl.arange(16)
-    strictly_lower = lane[:, None] > lane[None, :]
-    diagonal = lane[:, None] == lane[None, :]
-    lower = torch.where(strictly_lower, matrix, 0.0)
-    system = (lower + diagonal.float()).to(torch.bfloat16)
-    inverse = diagonal.float() - lower
-    for _ in range(3):
-        inverse_bf16 = inverse.to(torch.bfloat16)
-        correction = hl.dot(system, inverse_bf16, out_dtype=torch.float32)
-        inverse = 2.0 * inverse_bf16.float() - hl.dot(
-            inverse_bf16,
-            correction.to(torch.bfloat16),
-            out_dtype=torch.float32,
-        )
-        inverse = torch.where(strictly_lower | diagonal, inverse, 0.0)
-    return inverse
+def _assemble_lower_64_inverse(
+    matrix: tuple[torch.Tensor, ...],
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, ...]:
+    """Assemble the 64x64 inverse from pre-inverted 16x16 diagonal blocks."""
+    m00, m10, m11, m20, m21, m22, m30, m31, m32, m33 = matrix
+    i00, i11, i22, i33 = m00, m11, m22, m33
+
+    i10 = -hl.dot(
+        hl.dot(i11, m10, out_dtype=torch.float32),
+        i00,
+        out_dtype=torch.float32,
+    )
+    i21 = -hl.dot(
+        hl.dot(i22, m21, out_dtype=torch.float32),
+        i11,
+        out_dtype=torch.float32,
+    )
+    i32 = -hl.dot(
+        hl.dot(i33, m32, out_dtype=torch.float32),
+        i22,
+        out_dtype=torch.float32,
+    )
+    i20 = -hl.dot(
+        i22,
+        hl.dot(m20, i00, out_dtype=torch.float32)
+        + hl.dot(m21, i10, out_dtype=torch.float32),
+        out_dtype=torch.float32,
+    )
+    i31 = -hl.dot(
+        i33,
+        hl.dot(m31, i11, out_dtype=torch.float32)
+        + hl.dot(m32, i21, out_dtype=torch.float32),
+        out_dtype=torch.float32,
+    )
+    i30 = -hl.dot(
+        i33,
+        hl.dot(m30, i00, out_dtype=torch.float32)
+        + hl.dot(m31, i10, out_dtype=torch.float32)
+        + hl.dot(m32, i20, out_dtype=torch.float32),
+        out_dtype=torch.float32,
+    )
+    return tuple(
+        block.to(output_dtype)
+        for block in (i00, i10, i11, i20, i21, i22, i30, i31, i32, i33)
+    )
 
 
-def _invert_lower_16(
-    matrix: torch.Tensor,
-    newton_schulz: hl.constexpr,
-) -> torch.Tensor:
-    if newton_schulz:
-        return _invert_lower_16_newton_schulz(matrix)
-    return _invert_lower_16_forward_substitution(matrix)
+def _apply_lower_64_blocks(
+    matrix: tuple[torch.Tensor, ...],
+    rhs: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Apply a 64x64 lower-triangular matrix to four 16-row blocks."""
+    i00, i10, i11, i20, i21, i22, i30, i31, i32, i33 = matrix
+    x0, x1, x2, x3 = rhs
+    y0 = hl.dot(i00, x0, out_dtype=torch.float32)
+    y1 = hl.dot(i10, x0, out_dtype=torch.float32) + hl.dot(
+        i11, x1, out_dtype=torch.float32
+    )
+    y2 = (
+        hl.dot(i20, x0, out_dtype=torch.float32)
+        + hl.dot(i21, x1, out_dtype=torch.float32)
+        + hl.dot(i22, x2, out_dtype=torch.float32)
+    )
+    y3 = (
+        hl.dot(i30, x0, out_dtype=torch.float32)
+        + hl.dot(i31, x1, out_dtype=torch.float32)
+        + hl.dot(i32, x2, out_dtype=torch.float32)
+        + hl.dot(i33, x3, out_dtype=torch.float32)
+    )
+    return y0, y1, y2, y3
 
 
-_FORWARD_SOLVE_RECOMPUTE_CONFIG = helion.Config(
-    block_sizes=[64, 64],
-    loop_orders=[[0, 1]],
-    num_warps=1,
-    num_stages=3,
-    indexing="pointer",
-)
-
-
-_NEWTON_SOLVE_RECOMPUTE_CONFIG = helion.Config(
-    block_sizes=[64, 64],
-    loop_orders=[[0, 1]],
-    num_warps=2,
-    num_stages=3,
-    indexing="pointer",
-)
-
-
-_NEWTON_SOLVE_RECOMPUTE_LONG_CONFIG = helion.Config(
+_SOLVE_RECOMPUTE_CONFIG = helion.Config(
     block_sizes=[64, 64],
     loop_orders=[[0, 1]],
     num_warps=1,
@@ -783,7 +788,7 @@ _NEWTON_SOLVE_RECOMPUTE_LONG_CONFIG = helion.Config(
 
 @helion.kernel(
     static_shapes=True,
-    config=_FORWARD_SOLVE_RECOMPUTE_CONFIG,
+    config=_SOLVE_RECOMPUTE_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )
 def _intra_solve_recompute(
@@ -794,15 +799,8 @@ def _intra_solve_recompute(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
     is_varlen: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
-    newton_schulz: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
-    diagonal_preinverted: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Solve the 64x64 system and emit W and U from pre-scaled operands.
-
-    Forward substitution preserves the Triton baseline's floating-point order.
-    Newton-Schulz is an opt-in algebraically equivalent inverse with a different
-    floating-point operation order.
-    """
+    """Solve the 64x64 system and emit W and U from pre-scaled operands."""
     B = wk.size(0)
     T = wk.size(1)
     H = hl.specialize(wk.size(2))
@@ -906,60 +904,10 @@ def _intra_solve_recompute(
             extra_mask=valid3[:, None] & valid3[None, :],
         ).float()
 
-        if diagonal_preinverted:
-            i00 = m00
-            i11 = m11
-            i22 = m22
-            i33 = m33
-        else:
-            i00 = _invert_lower_16(m00, newton_schulz)
-            i11 = _invert_lower_16(m11, newton_schulz)
-            i22 = _invert_lower_16(m22, newton_schulz)
-            i33 = _invert_lower_16(m33, newton_schulz)
-        i10 = -hl.dot(
-            hl.dot(i11, m10, out_dtype=torch.float32),
-            i00,
-            out_dtype=torch.float32,
+        inverse = _assemble_lower_64_inverse(
+            (m00, m10, m11, m20, m21, m22, m30, m31, m32, m33),
+            wk.dtype,
         )
-        i21 = -hl.dot(
-            hl.dot(i22, m21, out_dtype=torch.float32),
-            i11,
-            out_dtype=torch.float32,
-        )
-        i32 = -hl.dot(
-            hl.dot(i33, m32, out_dtype=torch.float32),
-            i22,
-            out_dtype=torch.float32,
-        )
-        i20 = -hl.dot(
-            i22,
-            hl.dot(m20, i00, out_dtype=torch.float32)
-            + hl.dot(m21, i10, out_dtype=torch.float32),
-            out_dtype=torch.float32,
-        )
-        i31 = -hl.dot(
-            i33,
-            hl.dot(m31, i11, out_dtype=torch.float32)
-            + hl.dot(m32, i21, out_dtype=torch.float32),
-            out_dtype=torch.float32,
-        )
-        i30 = -hl.dot(
-            i33,
-            hl.dot(m30, i00, out_dtype=torch.float32)
-            + hl.dot(m31, i10, out_dtype=torch.float32)
-            + hl.dot(m32, i20, out_dtype=torch.float32),
-            out_dtype=torch.float32,
-        )
-        i00 = i00.to(wk.dtype)
-        i10 = i10.to(wk.dtype)
-        i11 = i11.to(wk.dtype)
-        i20 = i20.to(wk.dtype)
-        i21 = i21.to(wk.dtype)
-        i22 = i22.to(wk.dtype)
-        i30 = i30.to(wk.dtype)
-        i31 = i31.to(wk.dtype)
-        i32 = i32.to(wk.dtype)
-        i33 = i33.to(wk.dtype)
 
         beta0 = hl.load(beta_rows, [flat0], extra_mask=valid0).float()
         beta1 = hl.load(beta_rows, [flat1], extra_mask=valid1).float()
@@ -990,20 +938,9 @@ def _intra_solve_recompute(
             vb1 = (v1 * beta1[:, None]).to(v.dtype)
             vb2 = (v2 * beta2[:, None]).to(v.dtype)
             vb3 = (v3 * beta3[:, None]).to(v.dtype)
-            u0 = hl.dot(i00, vb0, out_dtype=torch.float32)
-            u1 = hl.dot(i10, vb0, out_dtype=torch.float32) + hl.dot(
-                i11, vb1, out_dtype=torch.float32
-            )
-            u2 = (
-                hl.dot(i20, vb0, out_dtype=torch.float32)
-                + hl.dot(i21, vb1, out_dtype=torch.float32)
-                + hl.dot(i22, vb2, out_dtype=torch.float32)
-            )
-            u3 = (
-                hl.dot(i30, vb0, out_dtype=torch.float32)
-                + hl.dot(i31, vb1, out_dtype=torch.float32)
-                + hl.dot(i32, vb2, out_dtype=torch.float32)
-                + hl.dot(i33, vb3, out_dtype=torch.float32)
+            u0, u1, u2, u3 = _apply_lower_64_blocks(
+                inverse,
+                (vb0, vb1, vb2, vb3),
             )
             hl.store(
                 u_rows,
@@ -1051,20 +988,9 @@ def _intra_solve_recompute(
                 [flat3[:, None], tile_k.index[None, :]],
                 extra_mask=valid3[:, None],
             )
-            w0 = hl.dot(i00, wk0, out_dtype=torch.float32)
-            w1 = hl.dot(i10, wk0, out_dtype=torch.float32) + hl.dot(
-                i11, wk1, out_dtype=torch.float32
-            )
-            w2 = (
-                hl.dot(i20, wk0, out_dtype=torch.float32)
-                + hl.dot(i21, wk1, out_dtype=torch.float32)
-                + hl.dot(i22, wk2, out_dtype=torch.float32)
-            )
-            w3 = (
-                hl.dot(i30, wk0, out_dtype=torch.float32)
-                + hl.dot(i31, wk1, out_dtype=torch.float32)
-                + hl.dot(i32, wk2, out_dtype=torch.float32)
-                + hl.dot(i33, wk3, out_dtype=torch.float32)
+            w0, w1, w2, w3 = _apply_lower_64_blocks(
+                inverse,
+                (wk0, wk1, wk2, wk3),
             )
             hl.store(
                 w_rows,
@@ -1094,19 +1020,6 @@ def _intra_solve_recompute(
     return w, u
 
 
-_intra_solve_recompute_newton = helion.kernel(
-    static_shapes=True,
-    config=_NEWTON_SOLVE_RECOMPUTE_CONFIG,
-    ignore_warnings=_IGNORED_WARNINGS,
-)(_intra_solve_recompute.fn)
-
-_intra_solve_recompute_newton_long = helion.kernel(
-    static_shapes=True,
-    config=_NEWTON_SOLVE_RECOMPUTE_LONG_CONFIG,
-    ignore_warnings=_IGNORED_WARNINGS,
-)(_intra_solve_recompute.fn)
-
-
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1118,7 +1031,6 @@ def chunk_kda_fwd_intra(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None = None,
-    newton_schulz: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Helion equivalent of SGLang's intra-chunk KDA preparation."""
     is_varlen = cu_seqlens is not None
@@ -1130,11 +1042,7 @@ def chunk_kda_fwd_intra(
         metadata = torch.empty(0, device=q.device, dtype=torch.int32)
         chunk_indices = torch.empty(0, 2, device=q.device, dtype=torch.long)
 
-    preinvert_diagonal = not newton_schulz
-    matrix_kernel = (
-        _intra_matrices_wide_forward if preinvert_diagonal else _intra_matrices_wide
-    )
-    aqk, akk = matrix_kernel(
+    aqk, akk = _intra_matrices_wide(
         q,
         k,
         g,
@@ -1143,18 +1051,8 @@ def chunk_kda_fwd_intra(
         chunk_indices,
         scale,
         is_varlen,
-        preinvert_diagonal,
-        newton_schulz,
     )
-    if newton_schulz:
-        solve_kernel = (
-            _intra_solve_recompute_newton_long
-            if q.size(1) * q.size(2) >= 65536
-            else _intra_solve_recompute_newton
-        )
-    else:
-        solve_kernel = _intra_solve_recompute
-    w, u = solve_kernel(
+    w, u = _intra_solve_recompute(
         akk,
         wk,
         v,
@@ -1162,8 +1060,6 @@ def chunk_kda_fwd_intra(
         metadata,
         chunk_indices,
         is_varlen,
-        newton_schulz,
-        preinvert_diagonal,
     )
     return w, u, kg, aqk
 
@@ -1494,17 +1390,11 @@ def chunk_kda(
     output_intermediate_states: bool = False,
     **kwargs: object,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Match the public forward contract of SGLang's Triton ``chunk_kda``.
-
-    ``newton_schulz=True`` in ``kwargs`` selects an algebraically equivalent
-    inverse with a different floating-point operation order. The default uses
-    Triton's forward-substitution order.
-    """
+    """Match the public forward contract of SGLang's Triton ``chunk_kda``."""
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if initial_state is None or initial_state_indices is None:
         raise ValueError("KDA prefill requires an indexed initial-state pool")
-    newton_schulz = bool(kwargs.get("newton_schulz"))
 
     q = q.contiguous()
     k = k.contiguous()
@@ -1541,7 +1431,6 @@ def chunk_kda(
         scale,
         cu_seqlens,
         chunk_indices,
-        newton_schulz,
     )
 
     is_varlen = cu_seqlens is not None

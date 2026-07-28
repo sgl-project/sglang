@@ -280,12 +280,7 @@ def test_fixed_partial_prefill_and_state_pool_contract() -> None:
     assert torch.equal(helion_state[untouched], state[untouched])
 
 
-@pytest.mark.parametrize(
-    "newton_schulz",
-    [False, True],
-    ids=["forward-substitution", "newton-schulz"],
-)
-def test_packed_varlen_safe_gate_contract(newton_schulz: bool) -> None:
+def test_packed_varlen_safe_gate_contract() -> None:
     torch.manual_seed(1011)
     lengths = [1, 15, 17]
     tokens, heads, key_dim, value_dim = sum(lengths), 2, 32, 32
@@ -315,11 +310,10 @@ def test_packed_varlen_safe_gate_contract(newton_schulz: bool) -> None:
         cu_seqlens=cu_seqlens,
         A_log=a_log,
         lower_bound=-0.01,
-        newton_schulz=newton_schulz,
     )
 
 
-def test_newton_schulz_uses_stable_subchunk_gates() -> None:
+def test_prefill_uses_stable_subchunk_gates() -> None:
     torch.manual_seed(1117)
     tokens, heads, key_dim, value_dim = 64, 1, 32, 32
     q = torch.nn.functional.normalize(
@@ -348,7 +342,6 @@ def test_newton_schulz_uses_stable_subchunk_gates() -> None:
         state,
         indices,
         cu_seqlens=cu_seqlens,
-        newton_schulz=True,
     )
 
 
