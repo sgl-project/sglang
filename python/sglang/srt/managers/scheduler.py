@@ -41,7 +41,12 @@ from torch.distributed import barrier
 from sglang.kernels.ops.mamba.triton_ops import (
     initialize_mamba_selective_state_update_backend,
 )
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    is_deepseek_v4,
+    is_minimax_sparse,
+)
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -291,10 +296,40 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _prewarm_hccl_group(device, group, device_module):
+    warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(warmup_tensor, group=group)
+    device_module.synchronize()
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+
+DECODE_STEP_MAX_US = 2_000_000
+
+
+def _accumulate_decode_moment(
+    totals: list[float],
+    batch_size: int,
+    step_us: int,
+    generated: int,
+) -> None:
+    if batch_size <= 0 or step_us <= 0:
+        return
+    b = float(batch_size)
+    t = float(step_us)
+    g = float(generated)
+    totals[0] += 1.0
+    totals[1] += b
+    totals[2] += t
+    totals[3] += b * b
+    totals[4] += b * t
+    totals[5] += g
+
 
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -464,6 +499,22 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        if _is_npu and is_deepseek_v4(
+            self.tp_worker.model_runner.model_config.hf_config
+        ):
+            rank = (
+                self.ps.dp_rank
+                if self.ps.dp_rank is not None
+                else self.tp_group.rank_in_group
+            )
+            logger.info("HCCL DP prewarm start: rank=%s", rank)
+            _prewarm_hccl_group(
+                device=self.tp_group.device,
+                group=self.tp_group.device_group,
+                device_module=self.tp_group.device_module,
+            )
+            logger.info("HCCL DP prewarm done: rank=%s", rank)
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -861,6 +912,12 @@ class Scheduler(
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
+
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.ep_join_mode == "recover"
+        ):
+            model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -1649,14 +1706,12 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # Spec algorithms that don't advance the grammar FSM inside verify() (see
-        # supports_grammar_overlap) still need overlap forced off for grammar decode
-        # batches, so the FSM is advanced before the next batch's bitmask.
+        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
+        # path for host-draft algorithms, not a pending migration.
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and not batch.spec_algorithm.supports_grammar_overlap()
-            and batch.has_grammar
+            and batch.grammar_needs_sync()
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
@@ -1842,6 +1897,10 @@ class Scheduler(
         )
 
     def init_load_inquirer(self) -> None:
+        self.total_prefill_uncached_tokens = 0
+        self.total_prefill_busy_us = 0
+        self.decode_moment_totals: list[float] = [0.0] * 6
+        self._prev_decode_launch_ts: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
@@ -1862,6 +1921,9 @@ class Scheduler(
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
             get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
     def init_output_streamer(self) -> None:
@@ -2384,25 +2446,25 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
+            tree_cache = self.tree_cache
+            if tree_cache.is_backuped(req.last_host_node) or tree_cache.is_root(
+                req.last_host_node
+            ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
-
                 prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    tree_cache.get_prefix_hash_values(req.last_host_node)
+                    if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                tree_cache.prefetch_from_storage(
                     req.rid,
-                    last_host_node,
+                    req.last_host_node,
                     new_input_tokens,
-                    last_hash,
+                    tree_cache.get_last_hash_value(req.last_host_node),
                     prefix_keys,
                 )
 
@@ -3313,6 +3375,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3494,18 +3557,24 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     resolve_forward_inputs(batch, self.future_map)
-                    pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                    pooler_output, can_run_cuda_graph = (
+                        self.tp_worker.forward_batch_embedding(batch)
+                    )
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
+                        can_run_cuda_graph=can_run_cuda_graph,
                     )
                     ret.copy_to_cpu()
             else:
                 resolve_forward_inputs(batch, self.future_map)
-                pooler_output = self.tp_worker.forward_batch_embedding(batch)
+                pooler_output, can_run_cuda_graph = (
+                    self.tp_worker.forward_batch_embedding(batch)
+                )
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
+                    can_run_cuda_graph=can_run_cuda_graph,
                 )
 
         self._maybe_report_active_ranks()
@@ -3602,6 +3671,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._record_step_counters(batch, result)
+
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
@@ -3611,6 +3682,33 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _record_step_counters(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        mode = batch.forward_mode
+        is_prefill = mode.is_extend_without_speculative()
+        if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
+            return
+        if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill:
+            # Busy span = run_batch entry -> result processed.
+            span_us = int((time.monotonic() - batch.launch_ts) * 1e6)
+            self.total_prefill_busy_us += span_us
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
+        else:
+            batch_size = len(batch.reqs)
+            if self._prev_decode_launch_ts is not None:
+                step_us = int((batch.launch_ts - self._prev_decode_launch_ts) * 1e6)
+                if 0 < step_us < DECODE_STEP_MAX_US:
+                    _accumulate_decode_moment(
+                        self.decode_moment_totals,
+                        batch_size,
+                        step_us,
+                        batch_size + result.num_correct_drafts,
+                    )
+            self._prev_decode_launch_ts = batch.launch_ts
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
