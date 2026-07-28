@@ -169,6 +169,27 @@ def _prepare_flashinfer_trtllm_bf16_weights(
     if w2.shape[0] != num_experts:
         raise ValueError("W13 and W2 must have the same number of experts")
 
+    def validate_w13_bias_shape(bias: torch.Tensor) -> None:
+        valid_rows = {2 * intermediate_size, 2 * kernel_intermediate_size}
+        if (
+            bias.dim() != 2
+            or bias.shape[0] != num_experts
+            or bias.shape[1] not in valid_rows
+        ):
+            raise ValueError(
+                "W13 bias must have shape "
+                f"({num_experts}, {2 * intermediate_size}) or "
+                f"({num_experts}, {2 * kernel_intermediate_size}), got "
+                f"{tuple(bias.shape)}"
+            )
+
+    def validate_w2_bias_shape(bias: torch.Tensor) -> None:
+        if bias.dim() != 2 or tuple(bias.shape) != (num_experts, hidden_size):
+            raise ValueError(
+                f"W2 bias must have shape ({num_experts}, {hidden_size}), got "
+                f"{tuple(bias.shape)}"
+            )
+
     def get_w13_halves(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         compact_rows = 2 * intermediate_size
         padded_rows = 2 * kernel_intermediate_size
@@ -220,6 +241,7 @@ def _prepare_flashinfer_trtllm_bf16_weights(
     ]
 
     if w13_bias is not None:
+        validate_w13_bias_shape(w13_bias)
         if kernel_hidden_size == hidden_size:
             raise ValueError(
                 "FlashInfer TRT-LLM W13 bias folding requires a padded hidden channel"
@@ -235,6 +257,7 @@ def _prepare_flashinfer_trtllm_bf16_weights(
         ] = gate_bias[:, :intermediate_size].to(prepared_w13.dtype)
 
     if w2_bias is not None:
+        validate_w2_bias_shape(w2_bias)
         if kernel_hidden_size == hidden_size:
             raise ValueError(
                 "FlashInfer TRT-LLM W2 bias folding requires a padded hidden channel"
@@ -497,56 +520,57 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
-            hidden_size = layer.moe_runner_config.hidden_size
-            intermediate_size = layer.intermediate_size_per_partition_unpadded
-            prepared_w13, prepared_w2, kernel_hidden_size = (
-                _prepare_flashinfer_trtllm_bf16_weights(
-                    layer.w13_weight.data,
-                    layer.w2_weight.data,
-                    getattr(layer, "w13_weight_bias", None),
-                    getattr(layer, "w2_weight_bias", None),
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+            if layer.moe_runner_config.is_gated:
+                hidden_size = layer.moe_runner_config.hidden_size
+                intermediate_size = layer.intermediate_size_per_partition_unpadded
+                prepared_w13, prepared_w2, kernel_hidden_size = (
+                    _prepare_flashinfer_trtllm_bf16_weights(
+                        layer.w13_weight.data,
+                        layer.w2_weight.data,
+                        getattr(layer, "w13_weight_bias", None),
+                        getattr(layer, "w2_weight_bias", None),
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+                    )
                 )
-            )
-            copy_or_rebind_param(layer, "w13_weight", prepared_w13)
-            copy_or_rebind_param(layer, "w2_weight", prepared_w2)
+                copy_or_rebind_param(layer, "w13_weight", prepared_w13)
+                copy_or_rebind_param(layer, "w2_weight", prepared_w2)
 
-            num_local_experts = layer.num_local_experts
-            device = prepared_w13.device
-            gemm1_alpha = layer.moe_runner_config.gemm1_alpha
-            gemm1_clamp_limit = layer.moe_runner_config.gemm1_clamp_limit
-            self._flashinfer_kernel_hidden_size = kernel_hidden_size
-            self._flashinfer_input_pad_value = float(
-                getattr(layer, "w13_weight_bias", None) is not None
-                or getattr(layer, "w2_weight_bias", None) is not None
-            )
-            self._flashinfer_gemm1_alpha = (
-                torch.full(
-                    (num_local_experts,),
-                    gemm1_alpha,
-                    dtype=torch.float32,
-                    device=device,
+                num_local_experts = layer.num_local_experts
+                device = prepared_w13.device
+                gemm1_alpha = layer.moe_runner_config.gemm1_alpha
+                gemm1_clamp_limit = layer.moe_runner_config.gemm1_clamp_limit
+                self._flashinfer_kernel_hidden_size = kernel_hidden_size
+                self._flashinfer_input_pad_value = float(
+                    getattr(layer, "w13_weight_bias", None) is not None
+                    or getattr(layer, "w2_weight_bias", None) is not None
                 )
-                if gemm1_alpha is not None
-                else None
-            )
-            self._flashinfer_gemm1_beta = (
-                torch.ones(num_local_experts, dtype=torch.float32, device=device)
-                if gemm1_alpha is not None
-                else None
-            )
-            self._flashinfer_gemm1_clamp_limit = (
-                torch.full(
-                    (num_local_experts,),
-                    gemm1_clamp_limit,
-                    dtype=torch.float32,
-                    device=device,
+                self._flashinfer_gemm1_alpha = (
+                    torch.full(
+                        (num_local_experts,),
+                        gemm1_alpha,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if gemm1_alpha is not None
+                    else None
                 )
-                if gemm1_clamp_limit is not None
-                else None
-            )
+                self._flashinfer_gemm1_beta = (
+                    torch.ones(num_local_experts, dtype=torch.float32, device=device)
+                    if gemm1_alpha is not None
+                    else None
+                )
+                self._flashinfer_gemm1_clamp_limit = (
+                    torch.full(
+                        (num_local_experts,),
+                        gemm1_clamp_limit,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if gemm1_clamp_limit is not None
+                    else None
+                )
 
             from flashinfer.fused_moe.core import (
                 _maybe_get_cached_w3_w1_permute_indices,
@@ -653,6 +677,29 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return
 
         expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+        kernel_hidden_size = ((layer.hidden_size + 127) // 128) * 128
+        if weight_name.endswith(".experts.w13_weight"):
+            prepared_shape = (
+                layer.num_local_experts,
+                expected_shape[1],
+                kernel_hidden_size,
+            )
+        else:
+            prepared_shape = (
+                layer.num_local_experts,
+                kernel_hidden_size,
+                expected_shape[2],
+            )
+        prepared_numel = prepared_shape[0] * prepared_shape[1] * prepared_shape[2]
+        if (
+            layer.moe_runner_config.is_gated
+            and kernel_hidden_size != layer.hidden_size
+            and param.data.numel() == prepared_numel
+        ):
+            param.data = torch.empty(
+                expected_shape, dtype=param.data.dtype, device=param.data.device
+            )
+            return
         if param.data.numel() != expected_numel:
             raise RuntimeError(
                 f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
