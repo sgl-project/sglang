@@ -18,6 +18,7 @@ from transformers import (
 )
 
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -96,6 +97,9 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
             logits_config = copy.copy(self.config)
             logits_config.vocab_size = self._output_vocab_size
             self.logits_processor = LogitsProcessor(logits_config)
+
+        if not self.pp_group.is_last_rank:
+            self.lm_head = PPMissingLayer()
 
     def pad_input_ids(
         self, input_ids: List[int], mm_inputs: MultimodalInputs

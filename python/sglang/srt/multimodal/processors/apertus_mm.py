@@ -27,6 +27,7 @@ _DEFAULT_IMAGE_START_TOKEN_ID = 131073
 _DEFAULT_IMAGE_END_TOKEN_ID = 131074
 _DEFAULT_AUDIO_START_TOKEN_ID = 131080
 _DEFAULT_AUDIO_END_TOKEN_ID = 131081
+_DEFAULT_AUDIO_SAMPLE_RATE = 24_000
 
 
 class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
@@ -59,6 +60,11 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
         )
         self.audio_end_token_id = getattr(
             tokenizer, "audio_end_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
+        )
+        self.audio_sample_rate = getattr(
+            getattr(_processor, "feature_extractor", None),
+            "sampling_rate",
+            _DEFAULT_AUDIO_SAMPLE_RATE,
         )
 
     @staticmethod
@@ -378,7 +384,7 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
                 image_data=image_data,
                 audio_data=audio_data,
                 multimodal_tokens=self.mm_tokens,
-                audio_sample_rate=24_000,
+                audio_sample_rate=self.audio_sample_rate,
             )
             images = base_output.images or []
             audios = base_output.audios or []
