@@ -450,14 +450,20 @@ class MooncakeKVManager(CommonKVManager):
         self, room: int, *, create: bool
     ) -> Optional[RoomTransferLifetime]:
         with self._room_lifetimes_lock:
-            lifetime = self._room_lifetimes.get(room)
-            if lifetime is None and create:
-                # Reclaim before inserting, so the entry being created can never
-                # be the one that gets evicted.
-                if len(self._room_lifetimes) >= MAX_TRACKED_ROOMS:
-                    self._emergency_reclaim_rooms_locked()
-                lifetime = self._room_lifetimes[room] = RoomTransferLifetime()
-            return lifetime
+            return self._room_lifetime_locked(room, create=create)
+
+    def _room_lifetime_locked(
+        self, room: int, *, create: bool
+    ) -> Optional[RoomTransferLifetime]:
+        """Return a room lifetime while the caller holds its generation lock."""
+        lifetime = self._room_lifetimes.get(room)
+        if lifetime is None and create:
+            # Reclaim before inserting, so the entry being created can never be
+            # the one that gets evicted.
+            if len(self._room_lifetimes) >= MAX_TRACKED_ROOMS:
+                self._emergency_reclaim_rooms_locked()
+            lifetime = self._room_lifetimes[room] = RoomTransferLifetime()
+        return lifetime
 
     def _retire_rooms_locked(self, rooms: List[int]) -> None:
         """Forget every piece of state keyed by these rooms, atomically.
@@ -2281,26 +2287,33 @@ class MooncakeKVManager(CommonKVManager):
         # ownership barrier is created by whichever side gets here first. A closed
         # barrier means the room was aborted or released, and accepting
         # destinations for it would let us transfer into pages decode has freed.
-        lifetime = self._room_lifetime(room, create=True)
-        if lifetime.is_closed():
-            logger.debug("Dropping KV metadata for room %s: transfers are closed", room)
-            return False
-        lifetime.add_abort_token(transfer_info.abort_token)
+        # Lifetime validation and every room-keyed write are one generation
+        # transaction. The sweeper takes this same lock, so it cannot retire the
+        # lifetime between validation and publication and leave orphan metadata
+        # that a later generation could inherit.
+        with self._room_lifetimes_lock:
+            lifetime = self._room_lifetime_locked(room, create=True)
+            if lifetime.is_closed():
+                logger.debug(
+                    "Dropping KV metadata for room %s: transfers are closed", room
+                )
+                return False
+            lifetime.add_abort_token(transfer_info.abort_token)
 
-        infos = self.transfer_infos.setdefault(room, {})
-        infos[mooncake_session_id] = transfer_info
-        # NOTE: after bootstrapping we can mark the req as waiting for input
-        if len(infos) == required_dst_info_num:
-            self.resolve_kv_replica_factor(infos)
-            self.req_to_decode_prefix_len[room] = next(
-                (
-                    info.decode_prefix_len
-                    for info in infos.values()
-                    if info.decode_prefix_len is not None
-                ),
-                0,
-            )
-            self.update_status(room, KVPoll.WaitingForInput)
+            infos = self.transfer_infos.setdefault(room, {})
+            infos[mooncake_session_id] = transfer_info
+            # NOTE: after bootstrapping we can mark the req as waiting for input
+            if len(infos) == required_dst_info_num:
+                self.resolve_kv_replica_factor(infos)
+                self.req_to_decode_prefix_len[room] = next(
+                    (
+                        info.decode_prefix_len
+                        for info in infos.values()
+                        if info.decode_prefix_len is not None
+                    ),
+                    0,
+                )
+                self.update_status(room, KVPoll.WaitingForInput)
         return True
 
     def start_decode_thread(self):

@@ -743,8 +743,14 @@ class CommonKVManager(BaseKVManager):
         thread-safe. *flags* accepts ``zmq.NOBLOCK`` for messages the caller
         retries, so one unreachable peer cannot hold this lock for SNDTIMEO.
         """
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
+        # The endpoint lock must cover connection validation as well as send.
+        # Otherwise one thread can receive the cached socket from _connect(),
+        # then another can observe a disconnect and close/replace that socket
+        # before the first thread acquires this lock.
+        with self._socket_lock:
+            send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
+        with send_lock:
+            sock = self._connect(endpoint, is_ipv6=is_ipv6)
             sock.send_multipart(parts, flags)
 
     def get_mha_kv_ptrs_with_pp(

@@ -1286,6 +1286,37 @@ class TestRoomStateRetirement(unittest.TestCase):
         self.assertIn(ROOM, mgr.request_status)
         self.assertEqual(len(mgr._room_lifetimes), 2, "the tracked-room cap is soft")
 
+    def test_metadata_publication_holds_the_lifetime_generation_lock(self):
+        mgr = make_prefill_manager()
+        mgr.session_lock = threading.Lock()
+        mgr.failed_sessions, mgr.session_failures = set(), {}
+        mgr.decode_kv_args_table = {}
+        mgr.resolve_kv_replica_factor = Mock()
+
+        def assert_generation_locked():
+            self.assertTrue(
+                mgr._room_lifetimes_lock.locked(),
+                "room metadata must publish under the lifetime generation lock",
+            )
+
+        class GenerationGuardedDict(dict):
+            def setdefault(self, *args, **kwargs):
+                assert_generation_locked()
+                return super().setdefault(*args, **kwargs)
+
+            def __setitem__(self, key, value):
+                assert_generation_locked()
+                return super().__setitem__(key, value)
+
+        mgr.transfer_infos = GenerationGuardedDict()
+        mgr.req_to_decode_prefix_len = GenerationGuardedDict()
+        mgr.request_status = GenerationGuardedDict()
+
+        self._room_with_metadata(mgr)
+        self.assertIn(ROOM, mgr._room_lifetimes)
+        self.assertIn(ROOM, mgr.transfer_infos)
+        self.assertIn(ROOM, mgr.request_status)
+
     def test_retirement_is_atomic_against_a_new_generation(self):
         # The lifetime and the rest of the room's state must go in one step: a
         # request created in between would have its own metadata deleted.
@@ -1377,6 +1408,41 @@ class TestRoomCollisionIsolation(unittest.TestCase):
         self.assertIn(ROOM, mgr.request_status, "the owner's status must survive")
         self.assertIn(ROOM, mgr.required_prefill_response_num_table)
         self.assertIs(mgr._receivers[ROOM], owner)
+
+
+class TestEndpointSendSerialization(unittest.TestCase):
+    def test_connection_validation_and_send_share_the_endpoint_lock(self):
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_send_locks = {}
+        endpoint = "tcp://127.0.0.1:1"
+        observed = []
+
+        class Socket:
+            def send_multipart(self, parts, flags=0):
+                observed.append(
+                    (
+                        "send",
+                        mgr._socket_send_locks[endpoint].locked(),
+                        parts,
+                        flags,
+                    )
+                )
+
+        def connect(*_args, **_kwargs):
+            observed.append(("connect", mgr._socket_send_locks[endpoint].locked()))
+            return Socket()
+
+        mgr._connect = Mock(side_effect=connect)
+        mgr._send_multipart_locked(endpoint, [b"status"], flags=zmq.NOBLOCK)
+
+        self.assertEqual(
+            observed,
+            [
+                ("connect", True),
+                ("send", True, [b"status"], zmq.NOBLOCK),
+            ],
+        )
 
 
 class TestWatermarkDelivery(unittest.TestCase):
@@ -1652,6 +1718,42 @@ class TestChunkedPrefillAbort(unittest.TestCase):
             scheduler.chunked_req = req
             scheduler_mod.Scheduler.process_pending_chunked_abort(scheduler)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+
+    def test_pending_bootstrap_failure_preserves_user_abort(self):
+        from sglang.srt.disaggregation import prefill as prefill_mod
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        user_abort = FINISH_ABORT("Aborted")
+        req = SimpleNamespace(
+            rid="chunked",
+            bootstrap_room=ROOM,
+            disagg_kv_sender=Mock(),
+            time_stats=SimpleNamespace(trace_ctx=Mock()),
+            req_pool_idx=None,
+            kv=None,
+            mamba_pool_idx=None,
+            metadata_buffer_index=-1,
+            pending_bootstrap=True,
+            finished_reason=user_abort,
+            return_logprob=False,
+        )
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(tp_rank=0),
+            tree_cache=Mock(),
+            req_to_metadata_buffer_idx_allocator=Mock(),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            enable_hicache_storage=False,
+        )
+
+        with patch.object(prefill_mod, "prepare_abort") as prepare_abort:
+            prefill_mod.SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure(
+                scheduler, req
+            )
+
+        prepare_abort.assert_not_called()
+        self.assertIs(req.finished_reason, user_abort)
+        self.assertFalse(req.pending_bootstrap)
 
 
 class TestTransferInfoWire(unittest.TestCase):
