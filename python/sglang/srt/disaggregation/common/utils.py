@@ -1,9 +1,10 @@
+import concurrent.futures
 import ctypes
 import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -25,6 +26,10 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    # Identity of the request that queued this chunk, for backends that must not
+    # let a recycled bootstrap_room attach queued work to a new request. Opaque
+    # to the queue; see MooncakeKVManager.try_lease_chunk.
+    owner: Optional[object] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
@@ -127,3 +132,61 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def drain_transfer_futures(futures: Sequence[concurrent.futures.Future]) -> int:
+    """Wait for every transfer future to leave the running state.
+
+    Returns the first non-zero transfer status, or re-raises the first
+    exception. Unlike a plain ``as_completed`` loop that returns on the first
+    error, this never returns while a sibling future may still be reading or
+    writing KV pages: ``Future.cancel()`` is a no-op once a future is running,
+    so returning early would let the caller release pages that are still being
+    transferred.
+    """
+    first_status = 0
+    first_exception = None
+    for future in concurrent.futures.as_completed(futures):
+        try:
+            status = future.result()
+        except concurrent.futures.CancelledError:
+            continue
+        except BaseException as e:  # noqa: BLE001 - re-raised after draining
+            if first_exception is None:
+                first_exception = e
+                _cancel_pending(futures)
+            continue
+        if status != 0 and first_status == 0:
+            first_status = status
+            _cancel_pending(futures)
+    # as_completed() already yielded every future, so this only reaps the ones
+    # cancelled above; it is what makes the "no work in flight" guarantee hold.
+    concurrent.futures.wait(futures)
+    if first_exception is not None:
+        raise first_exception
+    return first_status
+
+
+def submit_transfer_calls(
+    executor: concurrent.futures.Executor,
+    calls: Sequence[Tuple[Callable[..., int], tuple]],
+) -> int:
+    """Submit transfer work and drain it via ``drain_transfer_futures``.
+
+    A failure part-way through submission still drains the futures that were
+    accepted, so the caller never regains KV page ownership early.
+    """
+    futures: List[concurrent.futures.Future] = []
+    try:
+        for fn, args in calls:
+            futures.append(executor.submit(fn, *args))
+    except BaseException:
+        _cancel_pending(futures)
+        concurrent.futures.wait(futures)
+        raise
+    return drain_transfer_futures(futures)
+
+
+def _cancel_pending(futures: Sequence[concurrent.futures.Future]) -> None:
+    for future in futures:
+        future.cancel()

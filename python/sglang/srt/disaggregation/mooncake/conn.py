@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import itertools
 import logging
 import os
+import queue
 import struct
 import threading
 import time
-from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from collections import OrderedDict, defaultdict
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferBarrierEscalation,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -36,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     group_concurrent_contiguous,
     pack_int_lists,
+    submit_transfer_calls,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
@@ -47,7 +55,7 @@ from sglang.srt.disaggregation.utils import (
     compute_mamba_state_slice_byte_blocks,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
-from sglang.srt.environ import envs
+from sglang.srt.environ import TransferBarrierLevel, envs
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -68,6 +76,164 @@ FAILED_SESSION_RECOVERIES = Counter(
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
 
+TRANSFER_QUIESCE_TIMEOUTS = Counter(
+    "sglang:kv_transfer_quiesce_timeouts_total",
+    "Requests released while KV transfer work may still have been in flight.",
+)
+
+# How often a decode rank re-sends an unacknowledged abort notification.
+ABORT_RETRY_INTERVAL_S = 0.5
+# How often the bookkeeping thread re-checks drained rooms and sweeps lifetimes.
+TRANSFER_BOOKKEEPING_INTERVAL_S = 0.01
+# How often that thread runs the (cheap) room-lifetime sweep.
+ROOM_SWEEP_INTERVAL_S = 1.0
+# How long an ABORT_ACK may stay owed to a peer that is not reading its socket.
+ABORT_ACK_MAX_AGE_S = 60.0
+# Hard cap on owed ABORT_ACKs, so an abort storm against a dead peer cannot grow
+# the pending list, or the per-tick sweep over it, without bound.
+MAX_PENDING_ABORT_ACKS = 4096
+# Soft cap on tracked room lifetimes. Reaching it means the periodic sweep is not
+# keeping up, so an insert also does a *bounded* scan for reclaimable rooms.
+MAX_TRACKED_ROOMS = 4096
+# Entries examined per emergency scan, so an insert can never become O(n).
+MAX_EMERGENCY_SCAN = 256
+
+
+class RoomTransferLifetime:
+    """Ownership barrier for one bootstrap room's KV pages on this rank.
+
+    Mooncake transfers hand raw KV pointers to native code (RDMA, the transfer
+    executor, CUDA staging copies). Those readers and writers outlive the
+    Python call that started them, so a request that becomes terminal while
+    they run would let the allocator hand the same pages to another request.
+
+    Every piece of native transfer work holds a *lease*. ``close()`` stops new
+    leases from being handed out; the room is *quiesced* once it is closed and
+    every outstanding lease has been returned. Only then is it safe to release
+    the room's KV pages.
+
+    Abort tokens minted by decode peers are recorded here so that a late or
+    duplicated abort for a recycled room cannot close a live room.
+    """
+
+    __slots__ = ("_cond", "_leases", "_open", "_abort_tokens", "created_at", "_claimed")
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._leases = 0
+        self._open = True
+        self._abort_tokens: set = set()
+        self.created_at = time.monotonic()
+        # True once a local sender has taken responsibility for the room. An
+        # unclaimed room was created by decode metadata alone, so nothing will
+        # ever release it and the sweep must.
+        self._claimed = False
+
+    def try_lease(self) -> bool:
+        """Take a lease, or return False if the room no longer admits work."""
+        with self._cond:
+            if not self._open:
+                return False
+            self._leases += 1
+            return True
+
+    def end_lease(self) -> None:
+        with self._cond:
+            self._leases -= 1
+            if self._leases == 0:
+                self._cond.notify_all()
+
+    def close(self) -> None:
+        """Stop admitting transfer work (idempotent)."""
+        with self._cond:
+            self._open = False
+            if self._leases == 0:
+                self._cond.notify_all()
+
+    def is_closed(self) -> bool:
+        with self._cond:
+            return not self._open
+
+    def is_quiesced(self) -> bool:
+        with self._cond:
+            return not self._open and self._leases == 0
+
+    def outstanding_leases(self) -> int:
+        with self._cond:
+            return self._leases
+
+    def claim(self) -> None:
+        with self._cond:
+            self._claimed = True
+
+    def is_claimed(self) -> bool:
+        with self._cond:
+            return self._claimed
+
+    def is_reclaimable(self) -> bool:
+        """Whether forgetting this room can no longer affect a live transfer.
+
+        Safe in both cases: a quiesced room admits no work and has none running,
+        and an unclaimed room has no sender, so it can never take a lease (only
+        ``add_transfer_request`` enqueues work, and only a sender calls it).
+        """
+        with self._cond:
+            return (not self._open and self._leases == 0) or not self._claimed
+
+    def wait_quiesced(self, timeout: Optional[float]) -> bool:
+        """Block until quiesced. Returns False if *timeout* elapsed first."""
+        with self._cond:
+            return self._cond.wait_for(
+                lambda: not self._open and self._leases == 0, timeout
+            )
+
+    def add_abort_token(self, token: bytes) -> None:
+        if not token:
+            return
+        with self._cond:
+            self._abort_tokens.add(token)
+
+    def authorizes_abort(self, token: bytes) -> bool:
+        """Whether *token* may close this room.
+
+        A tokenless abort comes from a peer that predates the token protocol and
+        is honoured unconditionally, as before.
+
+        A room that has not received any decode metadata yet has no tokens to
+        compare against, and accepts the abort. That is deliberate, and it is the
+        safe direction of the trade: an abort can legitimately arrive before this
+        rank has any metadata for the room (the decode gave up during bootstrap),
+        and dropping it would leave this rank free to transfer into pages the
+        decode has already released -- the corruption this barrier exists to
+        prevent. Accepting instead risks one spurious request failure if a
+        recycled bootstrap_room draws a delayed abort from its previous occupant,
+        which is availability rather than correctness, and requires a collision in
+        a 64-bit space. Distinguishing the two cases would need a generation tag
+        on every room-scoped message; that is not worth a wire change here.
+        """
+        if not token:
+            return True
+        with self._cond:
+            return not self._abort_tokens or token in self._abort_tokens
+
+
+@dataclasses.dataclass
+class _PendingAbortAck:
+    """An ABORT_ACK owed to a decode rank once its room has drained."""
+
+    room: int
+    endpoint: str
+    dst_port: int
+    token: bytes
+    lifetime: Optional[RoomTransferLifetime]
+    # Give up after this: a peer that has not drained its socket for this long is
+    # gone, and it has its own barrier deadline. Retrying forever would grow the
+    # pending list, and the sweep over it, without bound.
+    deadline: float = 0.0
+
+    def key(self) -> Tuple[int, str, int, bytes]:
+        return (self.room, self.endpoint, self.dst_port, self.token)
+
 
 # decode
 @dataclasses.dataclass
@@ -82,6 +248,9 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    # Nonce this decode rank will require us to echo in ABORT_ACK. Empty when the
+    # peer predates the ownership-barrier protocol.
+    abort_token: bytes = b""
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -110,6 +279,7 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
+            abort_token=msg[9] if len(msg) > 9 else b"",
         )
 
 
@@ -179,11 +349,26 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.transfer_barrier = TransferBarrierLevel(
+            envs.SGLANG_DISAGGREGATION_TRANSFER_BARRIER.get()
+        )
+        # WARN releases after this long without proof; STRICT never does.
+        self.quiesce_timeout = envs.SGLANG_DISAGGREGATION_QUIESCE_TIMEOUT.get()
+        self.max_unquiesced = envs.SGLANG_DISAGGREGATION_MAX_UNQUIESCED.get()
+        self._unquiesced_rooms: set = set()
+        self._unquiesced_lock = threading.Lock()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # room -> ownership barrier for that room's KV pages. Shares its
+            # lifecycle with self.transfer_infos: created when the room is first
+            # seen (by the sender or by decode metadata, whichever comes first)
+            # and dropped by MooncakeKVSender.clear().
+            self._room_lifetimes: OrderedDict[int, RoomTransferLifetime] = OrderedDict()
+            self._room_lifetimes_lock = threading.Lock()
+            self._start_transfer_bookkeeping()
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -246,12 +431,425 @@ class MooncakeKVManager(CommonKVManager):
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # room -> live receiver. Used to route ABORT_ACKs and to drop late
+            # transport messages for rooms that are tearing down.
+            self._receivers: Dict[int, MooncakeKVReceiver] = {}
+            self._receivers_lock = threading.Lock()
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+
+    # ------------------------------------------------------------------
+    # Transfer ownership barrier (prefill side)
+    # ------------------------------------------------------------------
+
+    def _room_lifetime(
+        self, room: int, *, create: bool
+    ) -> Optional[RoomTransferLifetime]:
+        with self._room_lifetimes_lock:
+            lifetime = self._room_lifetimes.get(room)
+            if lifetime is None and create:
+                # Reclaim before inserting, so the entry being created can never
+                # be the one that gets evicted.
+                if len(self._room_lifetimes) >= MAX_TRACKED_ROOMS:
+                    self._emergency_reclaim_rooms_locked()
+                lifetime = self._room_lifetimes[room] = RoomTransferLifetime()
+            return lifetime
+
+    def _retire_rooms_locked(self, rooms: List[int]) -> None:
+        """Forget every piece of state keyed by these rooms, atomically.
+
+        Must happen under ``_room_lifetimes_lock`` and in one step: dropping the
+        lifetime first and the rest afterwards would let a request that draws the
+        same bootstrap_room in between have its own destinations and status
+        deleted, and leaving them behind would let it inherit the old decode's
+        addresses.
+        """
+        for room in rooms:
+            del self._room_lifetimes[room]
+            self.transfer_infos.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+            self.request_status.pop(room, None)
+
+    def _emergency_reclaim_rooms_locked(self) -> None:
+        """Bounded reclaim when the periodic sweep is not keeping up.
+
+        Scans at most ``MAX_EMERGENCY_SCAN`` of the oldest entries so an insert
+        can never degrade to O(tracked rooms); the sweep does the rest.
+        """
+        # islice over the live view keeps this O(MAX_EMERGENCY_SCAN); the keys are
+        # copied out first because the dict cannot be mutated while iterating.
+        candidates = [
+            room
+            for room, lifetime in itertools.islice(
+                self._room_lifetimes.items(), MAX_EMERGENCY_SCAN
+            )
+            if lifetime.is_reclaimable()
+        ]
+        self._retire_rooms_locked(candidates)
+        if not candidates:
+            logger.warning_once(
+                "Tracking more than %d Mooncake bootstrap rooms with none "
+                "reclaimable; KV metadata may be arriving for rooms this rank "
+                "never serves.",
+                MAX_TRACKED_ROOMS,
+            )
+
+    def _sweep_room_lifetimes(self) -> int:
+        """Reclaim rooms that no local sender will ever release.
+
+        Entries younger than the bootstrap timeout are always kept: that is the
+        window in which a sender may still appear and claim the room, and in
+        which a tombstone must keep rejecting a late abort. After it, a quiesced
+        or never-claimed room is dead weight.
+        """
+        cutoff = time.monotonic() - self._room_sweep_ttl
+        with self._room_lifetimes_lock:
+            stale = [
+                room
+                for room, lifetime in self._room_lifetimes.items()
+                if lifetime.created_at <= cutoff and lifetime.is_reclaimable()
+            ]
+            self._retire_rooms_locked(stale)
+        if stale:
+            logger.debug("Reclaimed %d abandoned Mooncake rooms", len(stale))
+        return len(stale)
+
+    def _forget_room_lifetime(self, room: int) -> None:
+        with self._room_lifetimes_lock:
+            self._room_lifetimes.pop(room, None)
+
+    def try_lease_room(self, room: int) -> Optional[RoomTransferLifetime]:
+        """Take a transfer lease on *room*, or None if it admits no more work.
+
+        Deliberately does not create a missing lifetime: an absent room has
+        already been released, so admitting work would reintroduce the
+        use-after-free this barrier exists to prevent. Callers must return the
+        lease with ``end_lease()`` from a ``finally`` block.
+        """
+        lifetime = self._room_lifetime(room, create=False)
+        if lifetime is None or not lifetime.try_lease():
+            return None
+        return lifetime
+
+    def try_lease_chunk(
+        self, kv_chunk: TransferKVChunk
+    ) -> Optional[RoomTransferLifetime]:
+        """Lease the room for *kv_chunk*, matching on request identity.
+
+        A bootstrap_room is recycled, so a chunk that outlived its request must
+        not attach to whichever request holds that room now: its indices name the
+        old request's pages and its destinations the old decode's. The chunk
+        carries the lifetime it was queued against, and only that exact object
+        may be leased.
+        """
+        owner = kv_chunk.owner
+        lifetime = self._room_lifetime(kv_chunk.room, create=False)
+        if lifetime is None or (owner is not None and owner is not lifetime):
+            return None
+        if not lifetime.try_lease():
+            return None
+        return lifetime
+
+    def open_room_transfers(self, room: int) -> bool:
+        """Claim *room*'s ownership barrier for a local sender.
+
+        Returns False when the room has already been closed, which happens when
+        a decode abort overtakes this rank's sender: transferring then would
+        write into pages the decode instance has released.
+        """
+        lifetime = self._room_lifetime(room, create=True)
+        lifetime.claim()
+        return not lifetime.is_closed()
+
+    def close_room_transfers(self, room: int) -> Optional[RoomTransferLifetime]:
+        """Stop admitting transfers for *room* (no-op if already released)."""
+        lifetime = self._room_lifetime(room, create=False)
+        if lifetime is not None:
+            lifetime.close()
+        return lifetime
+
+    def _close_room_for_abort(
+        self, room: int, token: bytes
+    ) -> Optional[RoomTransferLifetime]:
+        """Close *room* on behalf of a decode abort, if the token authorizes it.
+
+        The lifetime is created when missing so that an abort which overtakes
+        the prefill sender still leaves a tombstone; the sender then fails the
+        request instead of transferring into pages the decode has released.
+        """
+        lifetime = self._room_lifetime(room, create=False)
+        if lifetime is not None and not lifetime.authorizes_abort(token):
+            logger.debug(
+                "Ignoring abort for room %s: token was not issued for this room",
+                room,
+            )
+            return None
+        if lifetime is None:
+            lifetime = self._room_lifetime(room, create=True)
+        lifetime.close()
+        return lifetime
+
+    def _start_transfer_bookkeeping(self) -> None:
+        """Start the single thread that owns deferred ABORT_ACKs and room GC.
+
+        An ABORT_ACK promises the decode rank that this rank can no longer touch
+        the room's pages, so it may only be sent once the room has drained.
+        Waiting for that on the bootstrap thread would stall KV metadata, and
+        waiting on a thread per abort does not survive an abort storm, so one
+        periodic thread does both jobs.
+        """
+        self._abort_ack_queue: queue.Queue[_PendingAbortAck] = queue.Queue()
+        self._abort_ack_pending: set = set()
+        self._abort_ack_lock = threading.Lock()
+        self._room_sweep_ttl = max(1.0, float(self.bootstrap_timeout))
+        threading.Thread(
+            target=self._transfer_bookkeeping_loop,
+            name="MooncakeTransferBookkeeping",
+            daemon=True,
+        ).start()
+
+    def request_abort_ack(
+        self,
+        lifetime: Optional[RoomTransferLifetime],
+        room: int,
+        decode_ip: str,
+        decode_port: int,
+        token: bytes,
+    ) -> None:
+        pending = _PendingAbortAck(
+            room,
+            decode_ip,
+            decode_port,
+            token,
+            lifetime,
+            deadline=time.monotonic() + ABORT_ACK_MAX_AGE_S,
+        )
+        with self._abort_ack_lock:
+            if pending.key() in self._abort_ack_pending:
+                return
+            if len(self._abort_ack_pending) >= MAX_PENDING_ABORT_ACKS:
+                logger.warning_once(
+                    "More than %d ABORT_ACKs are owed; dropping new ones. Their "
+                    "decode peers fall back to their own barrier policy.",
+                    MAX_PENDING_ABORT_ACKS,
+                )
+                return
+            self._abort_ack_pending.add(pending.key())
+        self._abort_ack_queue.put(pending)
+
+    def _transfer_bookkeeping_loop(self) -> None:
+        waiting: List[_PendingAbortAck] = []
+        next_sweep = time.monotonic() + ROOM_SWEEP_INTERVAL_S
+        while True:
+            # This thread is the only one that can honour an ABORT_ACK, and a
+            # decode peer that never gets one waits out its whole quiescence
+            # deadline. It must therefore never exit, whatever goes wrong.
+            try:
+                waiting = self._drain_abort_acks(waiting)
+                now = time.monotonic()
+                if now >= next_sweep:
+                    next_sweep = now + ROOM_SWEEP_INTERVAL_S
+                    self._sweep_room_lifetimes()
+            except Exception:
+                # Belt and braces: _drain_abort_acks already isolates individual
+                # entries, but this thread is the only one that can honour an
+                # ABORT_ACK, so it must outlive any bug in here.
+                logger.exception(
+                    "Mooncake transfer bookkeeping iteration failed; continuing"
+                )
+                time.sleep(TRANSFER_BOOKKEEPING_INTERVAL_S)
+
+    def _drain_abort_acks(
+        self, waiting: List[_PendingAbortAck]
+    ) -> List[_PendingAbortAck]:
+        """Send every owed ACK whose room has drained; return those still owed."""
+        try:
+            # Poll quickly while ACKs are owed, otherwise just often enough to
+            # keep the room sweep running.
+            pending = self._abort_ack_queue.get(
+                timeout=(
+                    TRANSFER_BOOKKEEPING_INTERVAL_S
+                    if waiting
+                    else ROOM_SWEEP_INTERVAL_S
+                )
+            )
+        except queue.Empty:
+            pass
+        else:
+            waiting.append(pending)
+
+        still_waiting = []
+        now = time.monotonic()
+        for pending in waiting:
+            # Isolated per entry: a single unsatisfiable ACK must not starve the
+            # ones behind it, which would strand their peers until they time out.
+            try:
+                if now >= pending.deadline:
+                    logger.warning(
+                        "Giving up on the ABORT_ACK owed to %s:%s for room %s",
+                        pending.endpoint,
+                        pending.dst_port,
+                        pending.room,
+                    )
+                    self._retire_abort_ack(pending)
+                elif (
+                    pending.lifetime is not None and not pending.lifetime.is_quiesced()
+                ):
+                    still_waiting.append(pending)
+                elif not self._send_abort_ack(pending):
+                    # The peer's socket is backed up. Retry on the next tick
+                    # rather than blocking every other peer's ACK behind it.
+                    still_waiting.append(pending)
+            except Exception:
+                logger.exception(
+                    "Dropping unsendable ABORT_ACK for room %s; its decode peer "
+                    "will fall back to its own barrier policy",
+                    pending.room,
+                )
+                self._retire_abort_ack(pending)
+        return still_waiting
+
+    def _retire_abort_ack(self, pending: _PendingAbortAck) -> None:
+        with self._abort_ack_lock:
+            self._abort_ack_pending.discard(pending.key())
+
+    def _send_abort_ack(self, pending: _PendingAbortAck) -> bool:
+        """Try to send one ACK without blocking. False means "retry later"."""
+        try:
+            self._send_manager_message(
+                pending.endpoint,
+                pending.dst_port,
+                [
+                    b"ABORT_ACK",
+                    str(pending.room).encode("ascii"),
+                    pending.token,
+                ],
+                nonblocking=True,
+            )
+        except zmq.Again:
+            return False
+        except Exception as e:
+            # A broken endpoint must not owe an ACK forever; the decode peer
+            # falls back to its own quiescence deadline.
+            logger.debug("Failed to send ABORT_ACK for room %s: %s", pending.room, e)
+        else:
+            logger.debug(
+                "Sent ABORT_ACK for room %s to %s:%s",
+                pending.room,
+                pending.endpoint,
+                pending.dst_port,
+            )
+        self._retire_abort_ack(pending)
+        return True
+
+    # ------------------------------------------------------------------
+    # Live receiver registry (decode side)
+    # ------------------------------------------------------------------
+
+    def register_receiver(self, receiver: MooncakeKVReceiver) -> bool:
+        """Claim *receiver*'s room. False if the room is still owned elsewhere."""
+        with self._receivers_lock:
+            if (
+                self._receivers.setdefault(receiver.bootstrap_room, receiver)
+                is receiver
+            ):
+                return True
+        return False
+
+    def unregister_receiver(self, receiver: MooncakeKVReceiver) -> None:
+        with self._receivers_lock:
+            if self._receivers.get(receiver.bootstrap_room) is receiver:
+                del self._receivers[receiver.bootstrap_room]
+
+    def _is_tearing_down(self, room: int) -> bool:
+        """Whether *room* is releasing ownership, so late messages must be dropped."""
+        with self._receivers_lock:
+            receiver = self._receivers.get(room)
+        return receiver is not None and receiver.is_failure_quiescing()
+
+    def _handle_abort_ack(self, msg: List[bytes]) -> None:
+        room = int(msg[1].decode("ascii"))
+        # Peers that predate the ownership barrier reply without echoing the
+        # token; such an ACK carries no drain guarantee (see record_abort_ack).
+        token = msg[2] if len(msg) > 2 else None
+        logger.debug("Received ABORT_ACK for room %s", room)
+        with self._receivers_lock:
+            receiver = self._receivers.get(room)
+        if receiver is not None:
+            receiver.record_abort_ack(token)
+
+    # ------------------------------------------------------------------
+
+    def release_without_proof(self, room: int, reason: str) -> bool:
+        """Whether *room* may release its KV pages without proof of quiescence.
+
+        WARN trades a narrow, loud corruption window for liveness. STRICT refuses,
+        and fails the worker once too many requests are stuck, because a restart
+        releases every page safely while a silent overwrite does not.
+        """
+        TRANSFER_QUIESCE_TIMEOUTS.inc()
+        if self.transfer_barrier != TransferBarrierLevel.STRICT:
+            logger.error(
+                "Releasing KV pages for bootstrap_room=%s without proof that "
+                "transfer work stopped: %s. An in-flight write may still land in "
+                "them. Set SGLANG_DISAGGREGATION_TRANSFER_BARRIER=2 to refuse "
+                "instead.",
+                room,
+                reason,
+            )
+            return True
+
+        with self._unquiesced_lock:
+            self._unquiesced_rooms.add(room)
+            stuck = len(self._unquiesced_rooms)
+        logger.error(
+            "Withholding KV pages for bootstrap_room=%s: %s (%d/%d requests "
+            "stuck). STRICT will not reuse a page it cannot prove is idle.",
+            room,
+            reason,
+            stuck,
+            self.max_unquiesced,
+        )
+        if stuck >= self.max_unquiesced:
+            # Unrecoverable: the only way to reclaim these pages safely is to
+            # stop using this address space entirely. The scheduler's top-level
+            # handler turns this into engine teardown.
+            raise KVTransferBarrierEscalation(
+                f"{stuck} KV transfers cannot be proven quiesced "
+                f"(SGLANG_DISAGGREGATION_MAX_UNQUIESCED={self.max_unquiesced}); "
+                "refusing to reuse their pages. Restarting this worker is the "
+                "only safe way to reclaim them. Check for an unreachable or "
+                "wedged peer."
+            )
+        return False
+
+    def forget_unquiesced(self, room: int) -> None:
+        with self._unquiesced_lock:
+            self._unquiesced_rooms.discard(room)
+
+    def _send_manager_message(
+        self,
+        remote: str,
+        dst_port: int,
+        parts: List[bytes],
+        nonblocking: bool = False,
+    ) -> None:
+        """Send one multipart message to a peer's manager socket.
+
+        *nonblocking* raises ``zmq.Again`` instead of waiting for a backed-up
+        peer; use it for messages the caller retries.
+        """
+        na = NetworkAddress(remote, dst_port)
+        self._send_multipart_locked(
+            na.to_tcp(),
+            parts,
+            is_ipv6=na.is_ipv6,
+            flags=zmq.NOBLOCK if nonblocking else 0,
+        )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -383,11 +981,9 @@ class MooncakeKVManager(CommonKVManager):
 
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
-        na = NetworkAddress(req.endpoint, req.dst_port)
-        self._connect(
-            na.to_tcp(),
-            is_ipv6=na.is_ipv6,
-        ).send_multipart(
+        self._send_manager_message(
+            req.endpoint,
+            req.dst_port,
             [
                 b"CHUNK_READY",
                 str(req.room).encode("ascii"),
@@ -396,7 +992,7 @@ class MooncakeKVManager(CommonKVManager):
                 str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                 req.mooncake_session_id.encode("ascii"),
                 str(prefill_unique_rank).encode("ascii"),
-            ]
+            ],
         )
 
     def _do_staging_transfer(
@@ -707,22 +1303,13 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return submit_transfer_calls(
+                executor,
+                [
+                    (process_layer, (src_ptr, dst_ptr, item_len))
+                    for (src_ptr, dst_ptr, item_len) in layers_params
+                ],
+            )
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -858,24 +1445,15 @@ class MooncakeKVManager(CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = []
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
-
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        calls = [
+            (process_layer_tp_aware, (src_k_ptrs[i], dst_k_ptrs[i]))
+            for i in range(layers_current_pp_stage)
+        ]
+        calls += [
+            (process_layer_tp_aware, (src_v_ptrs[i], dst_v_ptrs[i]))
+            for i in range(layers_current_pp_stage)
+        ]
+        return submit_transfer_calls(executor, calls)
 
     def send_aux(
         self,
@@ -935,10 +1513,9 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
+        self._send_manager_message(
+            remote,
+            dst_port,
             [
                 MooncakeKVManager.AUX_DATA_HEADER,
                 str(room).encode("ascii"),
@@ -946,7 +1523,7 @@ class MooncakeKVManager(CommonKVManager):
                 str(aux_index).encode("ascii"),
                 struct.pack(">I", len(data)),
                 data,
-            ]
+            ],
         )
 
     def _handle_aux_data(self, msg: List[bytes]):
@@ -1338,13 +1915,14 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+        self._send_manager_message(
+            remote,
+            dst_port,
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
-            ]
+            ],
         )
 
     def transfer_worker(
@@ -1363,6 +1941,7 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            lifetime = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1372,8 +1951,13 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
+                # Hold the room's transfer lease for the whole chunk. Until it is
+                # returned the scheduler cannot observe the request as terminal,
+                # so these KV pages stay owned by this transfer.
+                lifetime = self.try_lease_chunk(kv_chunk)
                 if (
-                    kv_chunk.room not in self.request_status
+                    lifetime is None
+                    or kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
                     logger.debug(
@@ -1598,6 +2182,9 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if lifetime is not None:
+                    lifetime.end_lease()
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1624,41 +2211,7 @@ class MooncakeKVManager(CommonKVManager):
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":
-                    room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
-                    decode_ip = waiting_req_bytes[2].decode("ascii")
-                    decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    # No need to abort the room if it has already succeeded
-                    if (
-                        room_to_be_aborted in self.request_status
-                        and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    ):
-                        self.update_status(room_to_be_aborted, KVPoll.Failed)
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"marked as Failed"
-                        )
-                    else:
-                        logger.debug(
-                            f"Received abort notification for room {room_to_be_aborted}, "
-                            f"ignoring (already completed or unknown)"
-                        )
-                    # Send ACK back to decode endpoint
-                    try:
-                        na = NetworkAddress(decode_ip, decode_port)
-                        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-                            [
-                                b"ABORT_ACK",
-                                str(room_to_be_aborted).encode("ascii"),
-                            ]
-                        )
-                        logger.debug(
-                            f"Sent ABORT_ACK for room {room_to_be_aborted} to "
-                            f"{decode_ip}:{decode_port}"
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            f"Failed to send ABORT_ACK for room {room_to_be_aborted}: {e}"
-                        )
+                    self._handle_abort_notification(waiting_req_bytes)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1675,28 +2228,74 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
+                    self._handle_bootstrap_metadata(waiting_req_bytes)
 
         threading.Thread(target=bootstrap_thread).start()
+
+    def _handle_abort_notification(self, msg: List[bytes]) -> None:
+        """Handle an ABORT from a decode rank (runs on the bootstrap thread)."""
+        room = int(msg[1].decode("ascii"))
+        decode_ip = msg[2].decode("ascii")
+        decode_port = int(msg[3].decode("ascii"))
+        # Peers that predate the ownership barrier send no token; their aborts
+        # are honoured unconditionally, as before.
+        abort_token = msg[4] if len(msg) > 4 else b""
+
+        lifetime = self._close_room_for_abort(room, abort_token)
+        # No need to abort the room if it has already succeeded
+        if (
+            lifetime is not None
+            and room in self.request_status
+            and self.check_status(room) != KVPoll.Success
+        ):
+            self.update_status(room, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room}, marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room}, "
+                f"ignoring (already completed or unknown)"
+            )
+        # The ACK tells decode its pages are safe to reuse, so the pump sends it
+        # once this room's transfers have drained.
+        self.request_abort_ack(lifetime, room, decode_ip, decode_port, abort_token)
+
+    def _handle_bootstrap_metadata(self, msg: List[bytes]) -> bool:
+        """Record a decode rank's KV destinations (runs on the bootstrap thread).
+
+        Returns False if the metadata was dropped.
+        """
+        room = int(msg[0].decode("ascii"))
+        mooncake_session_id = msg[3].decode("ascii")
+        required_dst_info_num = int(msg[7].decode("ascii"))
+        transfer_info = TransferInfo.from_zmq(msg)
+
+        # Metadata can arrive before this rank creates the sender, so the room's
+        # ownership barrier is created by whichever side gets here first. A closed
+        # barrier means the room was aborted or released, and accepting
+        # destinations for it would let us transfer into pages decode has freed.
+        lifetime = self._room_lifetime(room, create=True)
+        if lifetime.is_closed():
+            logger.debug("Dropping KV metadata for room %s: transfers are closed", room)
+            return False
+        lifetime.add_abort_token(transfer_info.abort_token)
+
+        infos = self.transfer_infos.setdefault(room, {})
+        infos[mooncake_session_id] = transfer_info
+        # NOTE: after bootstrapping we can mark the req as waiting for input
+        if len(infos) == required_dst_info_num:
+            self.resolve_kv_replica_factor(infos)
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in infos.values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
+            )
+            self.update_status(room, KVPoll.WaitingForInput)
+        return True
 
     def start_decode_thread(self):
         def decode_thread():
@@ -1709,10 +2308,18 @@ class MooncakeKVManager(CommonKVManager):
                 # Staging: prefill notifies a chunk written to staging buffer
                 if msg[0] == b"CHUNK_READY":
                     room = int(msg[1].decode("ascii"))
+                    if self._is_tearing_down(room):
+                        continue
                     chunk_idx = int(msg[2].decode("ascii"))
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
-                    session_id = msg[5].decode("ascii")
+                    # Prefer the prefill's unique rank id when present so that
+                    # writers are counted per rank rather than per session.
+                    writer_id = (
+                        msg[6].decode("ascii")
+                        if len(msg) > 6
+                        else msg[5].decode("ascii")
+                    )
                     handler = self._staging_handler
                     assert (
                         handler is not None
@@ -1722,27 +2329,30 @@ class MooncakeKVManager(CommonKVManager):
                         chunk_idx,
                         page_start,
                         num_pages,
-                        session_id,
+                        writer_id,
                         self._chunk_writer_counts,
                     )
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
+                    if self._is_tearing_down(int(msg[1].decode("ascii"))):
+                        continue
                     self._handle_staging_req(msg)
                     continue
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
-                    ack_aborted_room = int(msg[1].decode("ascii"))
-                    logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    self._handle_abort_ack(msg)
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
+
+                if self._is_tearing_down(bootstrap_room):
+                    continue
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
@@ -1792,6 +2402,18 @@ class MooncakeKVManager(CommonKVManager):
             )
             return
 
+        lifetime = self._room_lifetime(bootstrap_room, create=False)
+        if lifetime is None or lifetime.is_closed():
+            # The room was aborted (possibly by a decode notification that
+            # overtook this rank's own bookkeeping) or already released.
+            logger.debug(
+                "Room %s no longer admits transfers, dropping chunk", bootstrap_room
+            )
+            return
+        # Stamp the chunk with this request's identity so a recycled room cannot
+        # pick it up (see try_lease_chunk).
+        chunk_owner = lifetime
+
         if bootstrap_room not in self.transfer_infos:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
@@ -1816,6 +2438,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                owner=chunk_owner,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1889,6 +2512,17 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self._quiescing = False
+        self._quiesce_deadline = float("inf")
+        self._quiesce_timed_out = False
+        # Join the room's ownership barrier, which decode metadata may already
+        # have created, and fail fast if an abort got here first.
+        if not self.kv_mgr.open_room_transfers(self.bootstrap_room):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room,
+                "Aborted by the decode instance before KV transfer started.",
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self._init_trace_ctx()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
@@ -1938,6 +2572,52 @@ class MooncakeKVSender(CommonKVSender):
         else:
             return self.conclude_state
 
+    # ------------------------------------------------------------------
+    # Transfer ownership barrier
+    #
+    # A failed request keeps its KV pages until this rank's transfer workers
+    # have returned. ``poll()`` still reports the logical state; the scheduler
+    # defers the terminal transition via ``advance_failure_quiescence`` (see
+    # ``disaggregation.utils.poll_and_all_reduce``).
+    # ------------------------------------------------------------------
+
+    def _close_barrier(self) -> None:
+        """Stop admitting transfer work for this room (idempotent)."""
+        if self._quiescing:
+            return
+        self._quiescing = True
+        self._quiesce_deadline = time.monotonic() + self.kv_mgr.quiesce_timeout
+        self.kv_mgr.close_room_transfers(self.bootstrap_room)
+
+    def is_failure_quiescing(self) -> bool:
+        return self._quiescing
+
+    def advance_failure_quiescence(self) -> bool:
+        self._close_barrier()
+        if self.kv_mgr.transfer_barrier == TransferBarrierLevel.OFF:
+            return True
+        lifetime = self.kv_mgr._room_lifetime(self.bootstrap_room, create=False)
+        if lifetime is None or lifetime.is_quiesced():
+            self.kv_mgr.forget_unquiesced(self.bootstrap_room)
+            return True
+        if self._quiesce_timed_out:
+            # WARN already decided to release; do not re-report it every poll.
+            return True
+        if time.monotonic() < self._quiesce_deadline:
+            return False
+        released = self.kv_mgr.release_without_proof(
+            self.bootstrap_room,
+            f"{lifetime.outstanding_leases()} transfer worker(s) still hold it "
+            f"after {self.kv_mgr.quiesce_timeout:.1f}s",
+        )
+        self._quiesce_timed_out = released
+        return released
+
+    def clear(self) -> None:
+        super().clear()
+        self.kv_mgr.forget_unquiesced(self.bootstrap_room)
+        self.kv_mgr._forget_room_lifetime(self.bootstrap_room)
+
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
@@ -1971,6 +2651,9 @@ class MooncakeKVSender(CommonKVSender):
 
     def abort(self):
         super().abort()
+        # Close the barrier now rather than on the next poll, so no further
+        # chunks are queued for a request the scheduler has given up on.
+        self._close_barrier()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -1984,7 +2667,32 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        # Ownership barrier state. Only meaningful once send_metadata() has told
+        # a prefill rank where to write: before that no peer can touch our pages.
+        self._metadata_sent = False
+        self._quiescing = False
+        self._quiesce_complete = False
+        self._quiesce_deadline = float("inf")
+        self._abort_targets: List[Tuple[dict, bytes]] = []
+        self._expected_abort_acks: set = set()
+        self._received_abort_acks: set = set()
+        self._peer_lacks_barrier = False
+        self._last_abort_send = float("-inf")
+        self._abort_lock = threading.Lock()
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        # Per-room state (ABORT_ACK routing, staging teardown) may only be
+        # touched by the receiver that owns the room. A second live receiver for
+        # the same bootstrap_room means the room numbers collided upstream:
+        # everything keyed by room is then ambiguous, so say so loudly rather
+        # than corrupt the owner's state. Abort nonces are per receiver, so this
+        # one still terminates -- via its quiescence deadline.
+        self._owns_room = mgr.register_receiver(self)
+        if not self._owns_room:
+            logger.error(
+                "bootstrap_room %s is already in use by an unfinished KV transfer; "
+                "colliding bootstrap rooms make per-room state ambiguous",
+                self.bootstrap_room,
+            )
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -2090,7 +2798,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        for bootstrap_info in self.bootstrap_infos:
+        # From here on a prefill rank may write into our KV pages, so the pages
+        # must not be released until every peer confirms it has stopped.
+        self._metadata_sent = True
+        for bootstrap_info, abort_token in self._abort_targets_snapshot():
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             try:
@@ -2110,6 +2821,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             ),
                             str(self.required_dst_info_num).encode("ascii"),
                             str(decode_prefix_len or 0).encode("ascii"),
+                            abort_token,
                         ]
                     )
             except zmq.ZMQError:
@@ -2135,6 +2847,175 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return timeout_result
 
         return status
+
+    # ------------------------------------------------------------------
+    # Transfer ownership barrier
+    #
+    # Our KV pages are the *destination* of the prefill's RDMA writes, so we
+    # cannot release them on the strength of a local decision alone: every
+    # prefill rank we handed indices to has to confirm it has stopped writing.
+    # ------------------------------------------------------------------
+
+    def abort(self):
+        super().abort()
+        # Stop admitting staging work now rather than on the next poll.
+        self._close_barrier()
+
+    def _close_barrier(self) -> None:
+        """Stop admitting transfer work for this room (idempotent)."""
+        if self._quiescing:
+            return
+        self._quiescing = True
+        self._quiesce_deadline = time.monotonic() + self.kv_mgr.quiesce_timeout
+
+    def is_failure_quiescing(self) -> bool:
+        return self._quiescing
+
+    def advance_failure_quiescence(self) -> bool:
+        self._close_barrier()
+        if self._quiesce_complete or not self._metadata_sent:
+            # No prefill rank was ever handed this request's page indices, so
+            # nothing can be writing into them.
+            return True
+        if self.kv_mgr.transfer_barrier == TransferBarrierLevel.OFF:
+            self._quiesce_complete = True
+            return True
+        if not self._owns_room:
+            # Another live receiver owns this bootstrap_room, so our ABORT_ACKs
+            # are routed to it and proof can never reach us. Do not pretend to
+            # wait for it; the collision itself is already reported as an error.
+            return self._conclude_without_proof(
+                f"bootstrap_room {self.bootstrap_room} is owned by another "
+                "receiver, so its acknowledgements are unroutable"
+            )
+        if self._peers_quiesced():
+            self._quiesce_complete = True
+            self.kv_mgr.forget_unquiesced(self.bootstrap_room)
+            return True
+        if time.monotonic() < self._quiesce_deadline:
+            return False
+        with self._abort_lock:
+            missing = len(self._expected_abort_acks - self._received_abort_acks)
+            total = len(self._expected_abort_acks)
+        return self._conclude_without_proof(
+            f"{missing} of {total} prefill ranks unacknowledged after "
+            f"{self.kv_mgr.quiesce_timeout:.1f}s"
+        )
+
+    def _conclude_without_proof(self, reason: str) -> bool:
+        released = self.kv_mgr.release_without_proof(self.bootstrap_room, reason)
+        if released:
+            self._quiesce_complete = True
+        return released
+
+    def _peers_quiesced(self) -> bool:
+        self._send_abort_notification()
+        with self._abort_lock:
+            if self._peer_lacks_barrier:
+                # A peer that acknowledges without echoing a nonce does so before
+                # its transfers drain, so its ACK is not proof. WARN accepts that
+                # and keeps a rolling upgrade working; STRICT cannot, by
+                # definition, so such a peer never satisfies the barrier.
+                return self.kv_mgr.transfer_barrier != TransferBarrierLevel.STRICT
+            return self._expected_abort_acks <= self._received_abort_acks
+
+    def _abort_targets_snapshot(self) -> List[Tuple[dict, bytes]]:
+        """Per-peer abort nonces, minted once and reused across retries.
+
+        One nonce per prefill rank lets an ABORT_ACK identify *which* peer has
+        drained, and prevents a stale ACK for a recycled room from satisfying
+        this request.
+        """
+        with self._abort_lock:
+            if not self._abort_targets and self.bootstrap_infos:
+                self._abort_targets = [
+                    (bootstrap_info, os.urandom(16).hex().encode("ascii"))
+                    for bootstrap_info in self.bootstrap_infos
+                ]
+                self._expected_abort_acks = {
+                    token for _info, token in self._abort_targets
+                }
+            return list(self._abort_targets)
+
+    def record_abort_ack(self, token: Optional[bytes]) -> None:
+        with self._abort_lock:
+            if not token:
+                # A prefill that predates the ownership barrier acknowledges the
+                # notification without echoing a nonce, and does so before its
+                # transfers have drained. It cannot promise quiescence, so stop
+                # waiting rather than stalling until the deadline.
+                self._peer_lacks_barrier = True
+                logger.warning_once(
+                    "Prefill peer acknowledged an abort without a transfer-quiescence "
+                    "token, so it acknowledges before its transfers drain and cannot "
+                    "prove quiescence. Upgrade the prefill instances; until then this "
+                    "request's pages are released on the "
+                    "SGLANG_DISAGGREGATION_TRANSFER_BARRIER policy rather than on "
+                    "proof, and STRICT will refuse to release them at all."
+                )
+                return
+            if token in self._expected_abort_acks:
+                self._received_abort_acks.add(token)
+
+    def _send_abort_notification(self):
+        """(Re-)notify prefill ranks that have not acknowledged the abort."""
+        targets = self._abort_targets_snapshot()
+        if not targets:
+            return
+        now = time.monotonic()
+        with self._abort_lock:
+            if now - self._last_abort_send < ABORT_RETRY_INTERVAL_S:
+                return
+            self._last_abort_send = now
+            targets = [
+                (info, token)
+                for info, token in targets
+                if token not in self._received_abort_acks
+            ]
+
+        for bootstrap_info, token in targets:
+            # Best-effort notification to prefill side that this request was
+            # aborted. This runs on the scheduler loop, and these sockets have no
+            # send timeout, so it must never wait for a peer: zmq.NOBLOCK turns a
+            # backed-up or dead prefill into a retry on the next poll instead of
+            # an unbounded stall of the whole engine.
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            token,
+                        ],
+                        zmq.NOBLOCK,
+                    )
+            except zmq.Again:
+                # Retried by the next _send_abort_notification() tick.
+                with self._abort_lock:
+                    self._last_abort_send = float("-inf")
+            except Exception as e:
+                logger.debug(
+                    "Failed to send abort notification for room %s: %s",
+                    self.bootstrap_room,
+                    e,
+                )
+
+    def clear(self) -> None:
+        if not self._owns_room:
+            # Everything CommonKVReceiver.clear() drops is keyed by
+            # bootstrap_room and therefore belongs to the receiver that owns it.
+            # Tearing it down here would fail the owner's live request as well.
+            logger.debug(
+                "Skipping shared cleanup for bootstrap_room %s: owned elsewhere",
+                self.bootstrap_room,
+            )
+            return
+        super().clear()
+        self.kv_mgr.forget_unquiesced(self.bootstrap_room)
+        self.kv_mgr.unregister_receiver(self)
 
     def failure_exception(self):
         if self.conclude_state is None:
