@@ -339,9 +339,7 @@ async def handle_encode_request(request: dict):
 
         modality_str = modality.name.lower()
         time_stats.modality = modality_str
-        time_stats.set_metrics_collector(
-            encode_server_module.encoder_metrics_collector
-        )
+        time_stats.set_metrics_collector(encode_server_module.encoder_metrics_collector)
         time_stats.set_mm_encode_start_time()
         if encode_server_module.encoder_metrics_collector is not None:
             encode_server_module.encoder_metrics_collector.inc_requests_received(
