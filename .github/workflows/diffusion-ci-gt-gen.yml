@@ -62,6 +62,7 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
+  SGLANG_DIFFUSION_GT_PER_PLATFORM: "1"
 
 jobs:
   compute-official-gt-matrix:
