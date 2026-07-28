@@ -100,6 +100,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
   </thead>
   <tbody>
     <tr><td style={{padding: "6px 12px"}}><code>none</code></td><td style={{padding: "6px 12px"}}>0.0</td></tr>
+    <tr><td style={{padding: "6px 12px"}}><code>minimal</code></td><td style={{padding: "6px 12px"}}>0.1</td></tr>
     <tr><td style={{padding: "6px 12px"}}><code>low</code></td><td style={{padding: "6px 12px"}}>0.2</td></tr>
     <tr><td style={{padding: "6px 12px"}}><code>medium</code></td><td style={{padding: "6px 12px"}}>0.7</td></tr>
     <tr><td style={{padding: "6px 12px"}}><code>high</code></td><td style={{padding: "6px 12px"}}>0.9</td></tr>
@@ -297,6 +298,6 @@ The **Long Context** deploy strategy adds `--kv-cache-dtype mxfp8` on top of the
 
 **Blackwell only.** MXFP8 KV cache requires Blackwell (B200 / B300 / GB200 / GB300), it's not offered on Hopper (H200).
 
-The tradeoff is a ~5% decode latency penalty from the extra quantize/dequantize work versus BF16 KV, so treat it as a capacity lever, not a speed one — stay on **Balanced** if you have headroom in the memory pool and just want lower latency.
+The tradeoff is not just a ~5% decode latency penalty from the extra quantize/dequantize work versus BF16 KV — storing KV in MXFP8 also introduces some accuracy loss at long context lengths. Treat it as a capacity lever, not a speed one — stay on **Balanced** if you have headroom in the memory pool and just want lower latency or maximum output quality.
 
-To try it, select the **Long Context** strategy in the Deploy panel above for any NVFP4 cell; the panel regenerates the launch command with `--kv-cache-dtype mxfp8` inserted. Verified end-to-end on B200.
+To try it, select the **Long Context** strategy in the Deploy panel above for any NVFP4 cell; the panel regenerates the launch command with `--kv-cache-dtype mxfp8` inserted. Verified end-to-end on B200, B300, and GB300.

@@ -39,6 +39,29 @@ if TYPE_CHECKING:
 _ATTN_DP_RANK: Optional[int] = None
 _ATTN_DP_SIZE: Optional[int] = None
 
+
+def world_dp_gather_enabled() -> bool:
+    """Whether DP gathers should use expanded WORLD after joiner admission."""
+    dp = get_flags().dp
+    return dp.use_world_group_for_gather and not dp.joiner_skip_all_gather
+
+
+def enable_joiner_all_gather():
+    get_flags().dp.joiner_skip_all_gather = False
+
+
+def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK
+    _ATTN_DP_SIZE = new_dp_size
+    _ATTN_DP_RANK = new_dp_rank
+    get_flags().dp.use_world_group_for_gather = True
+    logger.debug(
+        "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
+        new_dp_size,
+        new_dp_rank,
+    )
+
+
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
@@ -171,6 +194,10 @@ class _DpGatheredBufferWrapper:
         return cls._local_dp_buffer_len
 
     @classmethod
+    def set_local_dp_buffer_len(cls, local_dp_buffer_len: int) -> None:
+        cls._local_dp_buffer_len = local_dp_buffer_len
+
+    @classmethod
     def get_dp_global_num_tokens(cls) -> List[int]:
         return cls._global_num_tokens
 
@@ -222,6 +249,10 @@ def get_global_dp_buffer_len() -> int:
 
 def get_local_dp_buffer_len() -> int:
     return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+
+
+def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
+    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
 
 
 def get_dp_global_num_tokens() -> List[int]:
@@ -287,7 +318,6 @@ def initialize_dp_attention(
     )
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
-    moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
     dp.enabled = enable_dp_attention
@@ -299,6 +329,11 @@ def initialize_dp_attention(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+
+    if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
+        _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
+        if server_args.is_ep_scale_joiner:
+            dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
@@ -408,17 +443,24 @@ def _dp_gather_via_all_reduce(
         )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
-    NUM_GPUS_PER_NODE = 8
-    if (
-        not local_tokens.dtype.is_floating_point
-        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-    ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
+    if world_dp_gather_enabled():
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
+        )
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        NUM_GPUS_PER_NODE = 8
+        if (
+            not local_tokens.dtype.is_floating_point
+            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+        ):
+            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -427,8 +469,17 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    use_world = world_dp_gather_enabled()
+
     if get_attn_tensor_model_parallel_world_size() == 1:
-        get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        if use_world:
+            torch.distributed.all_gather_into_tensor(
+                global_tokens,
+                local_tokens,
+                group=torch.distributed.group.WORLD,
+            )
+        else:
+            get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
@@ -438,7 +489,14 @@ def _dp_gather_via_all_gather(
         get_attn_tensor_model_parallel_world_size()
     )[get_attn_tensor_model_parallel_rank()]
     get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    if use_world:
+        torch.distributed.all_gather_into_tensor(
+            global_tokens,
+            scattered_local_tokens,
+            group=torch.distributed.group.WORLD,
+        )
+    else:
+        get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
 # Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
@@ -461,6 +519,7 @@ def is_dp_gatherv_active() -> bool:
         dp_reduce_scatter_tensor) consistent."""
     return (
         _USE_DP_GATHERV
+        and not world_dp_gather_enabled()
         and get_attn_tensor_model_parallel_world_size() == 1
         and get_tensor_model_parallel_world_size() == get_attention_dp_size()
         and not _DpGatheredBufferWrapper.is_dp_max_padding()
@@ -541,7 +600,10 @@ def _dp_gather(
                 global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
             )
             return
-    if forward_batch.dp_padding_mode.is_max_len():
+    if (
+        forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+    ):
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )

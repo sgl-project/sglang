@@ -406,7 +406,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def compute_dsv4_state_lens_extend(
-        self, reqs: List[Req], seq_lens: List[int]
+        self, reqs: List[Req], seq_lens: List[int], prefix_lens: List[int]
     ) -> Optional[DSV4StateLens]:
         """Per-req c{4,128}_state pool alloc lens for extend (tail-only).
 
@@ -437,15 +437,25 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c4_seq: List[int] = []
         c128_prefix: List[int] = []
         c128_seq: List[int] = []
-        for req, seq_len in zip(reqs, seq_lens):
+        for req, seq_len, prefix_len in zip(reqs, seq_lens, prefix_lens):
             tail = seq_len % 128
             c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
             c128_alloc_len = tail
+            chunk_len = seq_len - prefix_len
+
+            if prefix_len > 0:
+                c4_count = min(c4_alloc_len, chunk_len)
+                c128_count = min(c128_alloc_len, chunk_len)
+            else:
+                c4_count = c4_alloc_len
+                c128_count = c128_alloc_len
+                req.c4_state_alloc_offset = seq_len - c4_alloc_len
+                req.c128_state_alloc_offset = seq_len - c128_alloc_len
 
             prev_c4 = getattr(req, "c4_state_kv_len", 0)
             prev_c128 = getattr(req, "c128_state_kv_len", 0)
-            new_c4 = prev_c4 + c4_alloc_len
-            new_c128 = prev_c128 + c128_alloc_len
+            new_c4 = prev_c4 + c4_count
+            new_c128 = prev_c128 + c128_count
 
             c4_prefix.append(prev_c4)
             c4_seq.append(new_c4)
@@ -454,8 +464,8 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
             req.c4_state_kv_len = new_c4
             req.c128_state_kv_len = new_c128
-            req.c4_state_alloc_offset = seq_len - c4_alloc_len
-            req.c128_state_alloc_offset = seq_len - c128_alloc_len
+            req.c4_state_write_offset = seq_len - c4_count
+            req.c128_state_write_offset = seq_len - c128_count
 
         return self._pack_state_lens(
             c4_prefix,
@@ -584,9 +594,32 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+        return self._wrap_full_alloc(
+            out_full_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
+        )
+
+    def _wrap_full_alloc(
+        self,
+        out_full_loc,
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        loc_dtype,
+        req_pool_indices,
+        dsv4_state_lens,
+    ) -> Optional[DSV4OutCacheLoc]:
+        # Shared tail of alloc_extend / alloc_extend_swa_tail: translate the full
+        # loc to swa, then add the c4/c128(+state) pools into a DSV4OutCacheLoc.
         if out_full_loc is None:
             return None
-
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
         assert out_swa_loc is not None, (
             "translate_loc_from_full_to_swa returned None — "
@@ -599,7 +632,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             prefix_lens_cpu,
             seq_lens,
             seq_lens_cpu,
-            last_loc.dtype,
+            loc_dtype,
             req_pool_indices,
             dsv4_state_lens,
         )
@@ -627,6 +660,44 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self._alloc_c_and_state(
             out_full_loc,
             out_swa_loc,
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc.dtype,
+            req_pool_indices,
+            dsv4_state_lens,
+        )
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+        *,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        dsv4_state_lens: Optional[DSV4StateLens] = None,
+        req_to_token_pool=None,
+    ) -> Optional[DSV4OutCacheLoc]:
+        """Disagg-decode prealloc variant of :meth:`alloc_extend`: super() does
+        full+swa-tail, then _alloc_c_and_state adds c4/c128(+state) → DSV4OutCacheLoc.
+        """
+        self._cur_req_to_token_pool = req_to_token_pool
+        out_full_loc = super().alloc_extend_swa_tail(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            swa_tail_len,
+        )
+        return self._wrap_full_alloc(
+            out_full_loc,
             prefix_lens,
             prefix_lens_cpu,
             seq_lens,
@@ -676,8 +747,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             n = kv_len // ratio
             if n > 0 and hasattr(req_to_token_pool, table_attr):
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, :n]
+                slots = slots[slots > 0]
                 # to int64 — paged allocator's free does cpu()//page_size on it.
-                allocator.free(slots.to(torch.int64))
+                if slots.numel() > 0:
+                    allocator.free(slots.to(torch.int64))
 
         # State pools: free only the tail [c{N}_state_alloc_offset, kv_len).
         for ratio, allocator, table_attr, off_attr in (
@@ -699,7 +772,9 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             off = getattr(req, off_attr, 0)
             if kv_len > off:
                 slots = getattr(req_to_token_pool, table_attr)[req_pool_idx, off:kv_len]
-                allocator.free(slots.to(torch.int64))
+                slots = slots[slots > 0]
+                if slots.numel() > 0:
+                    allocator.free(slots.to(torch.int64))
 
     def backup_state(self):
         # EAGLE/NEXTN draft preprocess allocates speculative c{4,128} KV via

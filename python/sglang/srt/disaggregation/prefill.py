@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -73,6 +74,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 def should_force_retry(req: Req) -> bool:
@@ -143,11 +146,34 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
-            raise RuntimeError(
-                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
-                "(e.g. GQA, MHA). MLA models should not set this flag."
-            )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+            if self.is_mla_backend:
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                    "(e.g. GQA, MHA). MLA models should not set this flag."
+                )
+            server_args = self.scheduler.server_args
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            cps = server_args.chunked_prefill_size or 8192
+            # Staging slices each send into a fixed page-aligned grid, so an
+            # unbounded (-1) or non-page-aligned chunk size has no valid grid.
+            if cps <= 0 or cps % page_size != 0:
+                raise RuntimeError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
+                    f"chunked_prefill_size that is a multiple of page_size "
+                    f"({page_size}); got {server_args.chunked_prefill_size}."
+                )
+            if self.pp_size > 1:
+                # Staging writer accounting has no pp dimension.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
+                )
+            if server_args.enable_prefill_context_parallel:
+                # CP rewrites index_slice per rank, breaking the chunk grid.
+                raise RuntimeError(
+                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
+                    "prefill context parallelism."
+                )
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -196,6 +222,12 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layer_ids = (
+            self.token_to_kv_pool.get_kv_layer_ids()
+            if self.draft_token_to_kv_pool is None
+            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
+            else []
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
@@ -554,8 +586,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
-            self._apply_war_barrier()
-
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -572,6 +602,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
+                self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1038,6 +1069,15 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        # Early-send issues the KV read before this step's forward is enqueued,
+        # but under overlap scheduling the PRIOR step's prefill forward may still
+        # be writing these prefix pages on forward_stream. Record a completion
+        # event now so the transfer worker can wait on those writes before the
+        # RDMA read, instead of racing them.
+        if self.enable_overlap:
+            ev = torch.cuda.Event()
+            ev.record(self.forward_stream)
+            req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
@@ -1143,24 +1183,37 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                elif st == StateType.C128_STATE:
-                    state_indices.append(_c128_state_payload())
-                else:
-                    state_indices.append(None)
+            # MINIMAX_INDEX_K reuses _dsa_payload: index rows live at the same loc
+            # as main KV on the same page_size.
+            payloads = {
+                StateType.MAMBA: _mamba_payload,
+                StateType.SWA: _swa_payload,
+                StateType.DSA: _dsa_payload,
+                StateType.MINIMAX_INDEX_K: _dsa_payload,
+                StateType.SWA_RING: _swa_ring_payload,
+                StateType.C128_STATE: _c128_state_payload,
+            }
+            if _is_npu and isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                DeepSeekV4TokenToKVPool,
+            ):
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    dsv4_state_payloads,
+                )
+
+                payloads.update(
+                    dsv4_state_payloads(
+                        self.req_to_token_pool,
+                        req.req_pool_idx,
+                        seq_len,
+                        page_size,
+                        self.sliding_window_size,
+                        prefix_len=0,
+                    )
+                )
+            state_indices = [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
 
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, start_idx:end_idx
