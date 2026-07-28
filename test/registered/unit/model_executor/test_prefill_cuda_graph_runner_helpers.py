@@ -7,10 +7,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _resolve_transformer_layer_model,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _LayerModel:
