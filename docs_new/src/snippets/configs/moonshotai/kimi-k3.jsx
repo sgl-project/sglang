@@ -1310,6 +1310,39 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    {
+      // Same chunked-PP shape as the Default cell, with mem-fraction raised to
+      // 0.90 for KV headroom — the B300/GB300 Long-Context recipes make the same
+      // trade. Keeping TP at 1 is what buys the context length here: with TP > 1
+      // the MLA KV is replicated across the TP ranks, so TP2 x PP8 would hold
+      // roughly half the tokens of TP1 x PP16 for the same memory.
+      // Not yet benchmarked on long-context workloads.
+      match: { hw: "gb200", pdMode: "prefill", strategy: "long-context" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--pp-size 16",
+        "--mem-fraction-static 0.90",
+        "--chunked-prefill-size 16384",
+        "--max-prefill-tokens 16384",
+        "--disable-flashinfer-autotune",
+        "--weight-loader-prefetch-checkpoints",
+        "--reasoning-parser kimi_k3",
+        "--tool-call-parser kimi_k3",
+        "--disaggregation-mode prefill",
+        "--disaggregation-transfer-backend nixl",
+        "--disaggregation-bootstrap-port 8998",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     // ----- Decode role: the unified cell for the same hw and strategy, plus
     // the PD role and transport flags, and re-sized KDA state.
