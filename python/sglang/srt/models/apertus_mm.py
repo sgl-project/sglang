@@ -74,9 +74,10 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         self.image_token_offset = config.image_token_offset
         self.audio_token_offset = config.audio_token_offset
         self._input_vocab_size = config.text_config.vocab_size
-        self._output_vocab_size = (
-            getattr(config.text_config, "output_vocab_size", None)
-            or self._input_vocab_size
+        self._output_vocab_size = getattr(
+            config.text_config,
+            "output_vocab_size",
+            self._input_vocab_size,
         )
         self._pad_logits_to_input_vocab = (
             self._output_vocab_size != self._input_vocab_size

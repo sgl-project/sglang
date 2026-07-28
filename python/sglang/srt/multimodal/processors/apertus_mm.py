@@ -69,10 +69,10 @@ class Apertus1p5SGLangProcessor(SGLangBaseProcessor):
             tokenizer, "eoi_token_id", _DEFAULT_IMAGE_END_TOKEN_ID
         )
         self.audio_start_token_id = getattr(
-            tokenizer, "audio_start_token_id", _DEFAULT_AUDIO_START_TOKEN_ID
+            tokenizer, "boa_token_id", _DEFAULT_AUDIO_START_TOKEN_ID
         )
         self.audio_end_token_id = getattr(
-            tokenizer, "audio_end_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
+            tokenizer, "eoa_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
         )
         self.audio_sample_rate = getattr(
             getattr(_processor, "feature_extractor", None),
