@@ -547,11 +547,11 @@ class TestPrefillOwnership(unittest.TestCase):
         self.assertTrue(live.try_lease())
         with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 4):
             for room in range(200):
-                mgr._close_room_for_abort(room, b"")
+                mgr._close_room_for_abort(room, b"").created_at = 0
             # ... and rooms known only from decode metadata, which no local
             # sender will ever release, must be bounded too.
             for room in range(1000, 1200):
-                mgr._room_lifetime(room, create=True)
+                mgr._room_lifetime(room, create=True).created_at = 0
         self.assertLessEqual(len(mgr._room_lifetimes), 8)
         self.assertIn(
             -1, mgr._room_lifetimes, "a claimed, leased room must never be evicted"
@@ -1156,9 +1156,36 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
         with patch(
             "sglang.srt.disaggregation.utils.dist.all_reduce",
             side_effect=lambda tensor, **kw: None,
+        ) as all_reduce:
+            with self.assertRaises(KVTransferBarrierEscalation):
+                poll_and_all_reduce([poller], object())
+        self.assertEqual(
+            all_reduce.call_count,
+            2,
+            "a local escalation must be coordinated before it reaches the scheduler",
+        )
+
+    def test_a_peer_escalation_reaches_every_scheduler(self):
+        poller = SimpleNamespace(
+            poll=Mock(return_value=KVPoll.Failed),
+            advance_failure_quiescence=Mock(return_value=False),
+            is_failure_quiescing=Mock(return_value=True),
+        )
+        collective = Mock()
+
+        def reduce(tensor, **_kwargs):
+            collective()
+            if collective.call_count == 2:
+                # The local rank is still waiting, but a peer encoded escalation
+                # into the coordinated quiescence state.
+                tensor.fill_(0)
+
+        with patch(
+            "sglang.srt.disaggregation.utils.dist.all_reduce", side_effect=reduce
         ):
             with self.assertRaises(KVTransferBarrierEscalation):
                 poll_and_all_reduce([poller], object())
+        self.assertEqual(collective.call_count, 2)
 
     def test_an_ordinary_backend_fault_is_still_contained(self):
         poller = SimpleNamespace(
@@ -1217,12 +1244,25 @@ class TestRoomStateRetirement(unittest.TestCase):
         mgr = make_prefill_manager()
         self._room_with_metadata(mgr)
         self.assertIn(ROOM, mgr.transfer_infos)
+        mgr._room_lifetimes[ROOM].created_at = 0
         with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
             mgr._room_lifetime(ROOM + 1, create=True)
         self.assertNotIn(ROOM, mgr._room_lifetimes)
         self.assertNotIn(ROOM, mgr.transfer_infos)
         self.assertNotIn(ROOM, mgr.request_status)
         self.assertNotIn(ROOM, mgr.req_to_decode_prefix_len)
+
+    def test_emergency_reclaim_preserves_live_metadata_first_room(self):
+        mgr = make_prefill_manager(room_sweep_ttl=300.0)
+        self._room_with_metadata(mgr)
+
+        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
+            mgr._room_lifetime(ROOM + 1, create=True)
+
+        self.assertIn(ROOM, mgr._room_lifetimes)
+        self.assertIn(ROOM, mgr.transfer_infos)
+        self.assertIn(ROOM, mgr.request_status)
+        self.assertEqual(len(mgr._room_lifetimes), 2, "the tracked-room cap is soft")
 
     def test_retirement_is_atomic_against_a_new_generation(self):
         # The lifetime and the rest of the room's state must go in one step: a
@@ -1274,6 +1314,29 @@ class TestRoomStateRetirement(unittest.TestCase):
 
 class TestRoomCollisionIsolation(unittest.TestCase):
     """A receiver that lost a room collision must not damage the owner."""
+
+    def test_constructor_rejects_loser_before_shared_state_or_metadata(self):
+        mgr = make_decode_manager()
+        mgr.get_session_id = Mock(side_effect=["owner", "loser"])
+        mgr.addr_to_rooms_tracker = {"prefill:1": set()}
+        mgr.required_prefill_response_num_table = {}
+        mgr.prefill_response_tracker = {}
+
+        owner = MooncakeKVReceiver(mgr, "prefill:1", ROOM)
+        mgr.update_status.reset_mock()
+        loser = MooncakeKVReceiver(mgr, "prefill:1", ROOM)
+
+        self.assertIs(mgr._receivers[ROOM], owner)
+        self.assertEqual(loser.poll(), KVPoll.Failed)
+        self.assertFalse(loser._owns_room)
+        mgr.update_status.assert_not_called()
+        self.assertEqual(mgr.addr_to_rooms_tracker["prefill:1"], {ROOM})
+
+        loser.init(0)
+        loser.send_metadata(np.array([123], dtype=np.int32))
+        loser.abort()
+        mgr.update_status.assert_not_called()
+        self.assertIs(mgr._receivers[ROOM], owner)
 
     def test_the_loser_does_not_tear_down_shared_state(self):
         mgr = make_decode_manager()

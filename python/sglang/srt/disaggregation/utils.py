@@ -190,14 +190,34 @@ def _gate_failures_on_quiescence(pollers, polls: List[int], groups) -> List[int]
     if not any(failed):
         return polls
 
-    quiesced = [
-        _advance_quiescence(poller) if is_failed else 1
-        for poller, is_failed in zip(pollers, failed)
-    ]
-    quiesced = _reduce_polls(quiesced, groups)
+    # Three ordered states let MIN carry both ownership and escalation through
+    # the same collective:
+    #   0 = a rank requires worker teardown, 1 = still owns pages, 2 = quiesced.
+    # In particular, a local KVTransferBarrierEscalation must not escape before
+    # peers enter this collective or they will wait forever.
+    local_escalation = None
+    quiescence_states = []
+    for poller, is_failed in zip(pollers, failed):
+        if not is_failed:
+            quiescence_states.append(2)
+            continue
+        try:
+            quiescence_states.append(1 + _advance_quiescence(poller))
+        except KVTransferBarrierEscalation as exc:
+            local_escalation = exc
+            quiescence_states.append(0)
+
+    quiescence_states = _reduce_polls(quiescence_states, groups)
+    if any(state == 0 for state in quiescence_states):
+        if local_escalation is not None:
+            raise local_escalation
+        raise KVTransferBarrierEscalation(
+            "A peer cannot prove that KV transfers are quiesced; escalating on "
+            "every participant after transfer-barrier coordination."
+        )
     return [
-        int(KVPoll.Transferring) if is_failed and not ok else poll
-        for poll, is_failed, ok in zip(polls, failed, quiesced)
+        int(KVPoll.Transferring) if is_failed and state == 1 else poll
+        for poll, is_failed, state in zip(polls, failed, quiescence_states)
     ]
 
 
