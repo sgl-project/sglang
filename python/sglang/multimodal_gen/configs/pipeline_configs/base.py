@@ -224,6 +224,7 @@ class PipelineConfig:
     # VAE configuration
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
+    vae_decode_precision: str | None = None
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
@@ -799,6 +800,17 @@ class PipelineConfig:
             help="Precision for VAE",
         )
         parser.add_argument(
+            f"--{prefix_with_dot}vae-decode-precision",
+            type=str,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_decode_precision",
+            default=PipelineConfig.vae_decode_precision,
+            choices=["fp32", "fp16", "bf16"],
+            help=(
+                "Optional decode-only VAE precision override. "
+                "Defaults to --vae-precision when unset."
+            ),
+        )
+        parser.add_argument(
             f"--{prefix_with_dot}vae-tiling",
             action=StoreBoolean,
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
@@ -1123,8 +1135,8 @@ class PipelineConfig:
                 elif isinstance(current_value, tuple) and all(
                     isinstance(v, ModelConfig) for v in current_value
                 ):
-                    assert len(current_value) == len(
-                        new_value
+                    assert (
+                        len(current_value) == len(new_value)
                     ), "Users shouldn't delete or add text encoder config objects in your json"
                     for target_config, source_config in zip(
                         current_value, new_value, strict=True
