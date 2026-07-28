@@ -49,7 +49,7 @@ class DisaggregationTestBase(PDDisaggregationServerBase):
     prefill_extra_args = []
     decode_extra_args = []
     extra_env_vars = {}
-    gsm8k_score_threshold = 0.0
+    gsm8k_score_threshold = 1.0
 
     @classmethod
     def setUpClass(cls):
