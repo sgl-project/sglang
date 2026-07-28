@@ -16,6 +16,7 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_CLOSE_ELIDED,
     THINK_CLOSE_NOSEP,
     THINK_OPEN,
+    TOOLS_CLOSE,
     TOOLS_OPEN,
 )
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -573,7 +574,14 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
     # think markers included: when the template does not pre-open a think section
     # the model may still emit a stray close, which lands in the content channel
-    _CONTENT_STRIP = (THINK_CLOSE, THINK_OPEN, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE)
+    _CONTENT_STRIP = (
+        THINK_CLOSE,
+        THINK_OPEN,
+        RESPONSE_OPEN,
+        RESPONSE_CLOSE,
+        MESSAGE_CLOSE,
+        TOOLS_CLOSE,
+    )
 
     def _strip_markers(self, text: str) -> str:
         for marker in self._CONTENT_STRIP:

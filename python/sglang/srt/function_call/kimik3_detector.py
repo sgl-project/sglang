@@ -67,7 +67,8 @@ def _strip_response_wrappers(text: str) -> str:
             text = text[open_idx + len(RESPONSE_OPEN) :]
     else:
         text = text.replace(RESPONSE_CLOSE, "")
-    return text.replace(MESSAGE_CLOSE, "")
+    # a tools close with no matching open is never content
+    return text.replace(MESSAGE_CLOSE, "").replace(TOOLS_CLOSE, "")
 
 
 class KimiK3Detector(BaseFormatDetector):
@@ -235,7 +236,13 @@ class KimiK3Detector(BaseFormatDetector):
         if limit is None:
             holdback = _partial_suffix_len(
                 self._buffer,
-                [self.bot_token, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE],
+                [
+                    self.bot_token,
+                    RESPONSE_OPEN,
+                    RESPONSE_CLOSE,
+                    MESSAGE_CLOSE,
+                    TOOLS_CLOSE,
+                ],
             )
             limit = len(self._buffer) - holdback
         if limit <= self._sent_normal_idx:

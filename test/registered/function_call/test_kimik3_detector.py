@@ -362,6 +362,20 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertEqual(reasoning, "thinking...")
         self.assertNotIn("<|close|>", reasoning + content)
 
+    def test_non_stream_stray_tools_close(self):
+        # tools close with no matching open, seen leading claude code replies
+        detector = KimiK3ReasoningDetector(force_reasoning=False)
+        result = detector.detect_and_parse(f"{TOOLS_CLOSE}the file says hello")
+        self.assertEqual(result.normal_text, "the file says hello")
+
+    def test_streaming_stray_tools_close_split(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=False)
+        reasoning, content = self._stream(
+            detector, ["<|close|>too", "ls<|sep|>the file", " says hello"]
+        )
+        self.assertEqual(content, "the file says hello")
+        self.assertNotIn("<|", content)
+
     def test_streaming_stray_close_when_not_forced(self):
         # template did not pre-open think but the model emits a close anyway;
         # seen as a leading <|close|>think<|sep|> in claude code output
