@@ -16,20 +16,11 @@ pub enum TensorData {
 }
 
 impl TensorData {
-    /// Raw little-endian bytes, for content hashing and zero-copy handoff.
+    /// Raw native-endian bytes, for content hashing and zero-copy handoff.
     pub fn as_bytes(&self) -> &[u8] {
-        // Safety: f32/i64 are plain-old-data with no padding.
-        unsafe {
-            match self {
-                TensorData::F32(v) => std::slice::from_raw_parts(
-                    v.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&v[..]),
-                ),
-                TensorData::I64(v) => std::slice::from_raw_parts(
-                    v.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&v[..]),
-                ),
-            }
+        match self {
+            TensorData::F32(v) => bytemuck::cast_slice(v),
+            TensorData::I64(v) => bytemuck::cast_slice(v),
         }
     }
 }
