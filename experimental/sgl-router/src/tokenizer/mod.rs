@@ -52,6 +52,12 @@ impl ChatEncoder {
 struct ChatEncoderEntry {
     encoder: ChatEncoder,
     fallback_warned: AtomicBool,
+    /// Lazily-computed verdict of the incremental-extension self-check (see
+    /// [`extension_concat_safe`]): whether `render(msgs + [reply])` provably
+    /// tokenizes to `encode(render(msgs)) ++ encode(turn suffix)` for this
+    /// encoder+tokenizer pair. Computed once, on the first
+    /// [`TokenizerRegistry::encode_chat_extension`] call for the model.
+    extension_safe: std::sync::OnceLock<bool>,
 }
 
 impl ChatEncoderEntry {
@@ -59,6 +65,7 @@ impl ChatEncoderEntry {
         Self {
             encoder,
             fallback_warned: AtomicBool::new(false),
+            extension_safe: std::sync::OnceLock::new(),
         }
     }
 
@@ -333,6 +340,66 @@ impl TokenizerRegistry {
         }
     }
 
+    /// Incremental chat-extension encode: the ids of `render(messages + [reply])`
+    /// computed as `prompt_ids ++ encode(reply's rendered turn suffix)` —
+    /// O(reply) work instead of O(whole conversation). The cache-sim response
+    /// tee calls this once per completed response, so at production rates the
+    /// full-re-encode alternative would roughly double the router's
+    /// tokenization CPU; this path makes the steady-state cost proportional to
+    /// the generated output only.
+    ///
+    /// `prompt_ids` MUST be this request's ingress [`Self::encode_chat`] output
+    /// (engine-equivalent ids) — never the raw-prompt fallback tokenization,
+    /// which renders differently and would produce a garbage concatenation.
+    ///
+    /// Correctness rests on two per-model properties: the encoder renders a
+    /// trailing assistant turn concatenatively, and the tokenizer never
+    /// BPE-merges across the prompt/turn boundary (DSV4's prompt render ends
+    /// in `<think>`/`</think>`, added tokens merges can't cross). Both are
+    /// proven together by a one-time end-to-end self-check
+    /// ([`extension_concat_safe`], cached on the encoder entry; it probes
+    /// chat, thinking, and effort-preamble modes, with and without tools).
+    /// Returns `None` — caller falls back to a full re-encode — when the model
+    /// has no encoder, the self-check failed, or the suffix render/encode
+    /// fails.
+    ///
+    /// `opts` MUST be the same [`dsv4::RenderOpts`] the ingress resolved for
+    /// this request ([`dsv4::resolve_render_opts`]): thinking mode changes
+    /// whether the reply's `reasoning_content` renders into the turn suffix.
+    pub fn encode_chat_extension(
+        &self,
+        model_id: &str,
+        prompt_ids: &[u32],
+        reply: &serde_json::Value,
+        opts: dsv4::RenderOpts,
+    ) -> Option<Vec<u32>> {
+        let entry = Arc::clone(&*self.encoders.get(model_id)?);
+        let tokenizer = self.get(model_id)?;
+        let safe = *entry.extension_safe.get_or_init(|| {
+            let ok = extension_concat_safe(&entry.encoder, &tokenizer);
+            if !ok {
+                tracing::warn!(model = %model_id,
+                    "chat encoder failed the incremental-extension self-check; \
+                     cache-sim response extensions fall back to a full \
+                     conversation re-encode (correct, but costs O(context) \
+                     tokenize CPU per response instead of O(output))");
+            }
+            ok
+        });
+        if !safe {
+            return None;
+        }
+        let suffix = assistant_turn_suffix(&entry.encoder, reply, opts)?;
+        let suffix_ids = adapter::encode(&tokenizer, &suffix).ok()?;
+        if suffix_ids.is_empty() {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(prompt_ids.len() + suffix_ids.len());
+        ids.extend_from_slice(prompt_ids);
+        ids.extend(suffix_ids);
+        Some(ids)
+    }
+
     pub fn ids(&self) -> Vec<String> {
         self.inner.iter().map(|kv| kv.key().clone()).collect()
     }
@@ -361,6 +428,137 @@ impl TokenizerRegistry {
             .expect("test tokenizer_config has a chat_template");
         self.attach_chat_encoder_for_test(model_id, ChatEncoder::Jinja(Box::new(template)));
     }
+}
+
+/// The reply's rendered turn suffix: the text `render` appends for a trailing
+/// assistant message under `opts`. Derived generically — render the reply as a
+/// lone one-message conversation and strip the constant empty-conversation
+/// prefix (BOS, effort preamble, empty system turn, …) — so every
+/// [`ChatEncoder`] variant gets it without a per-variant seam. For DSV4 chat
+/// mode this yields exactly `content [+ DSML tool calls] + EOS`; thinking mode
+/// prepends `reasoning_content + </think>` (a trailing turn is always at/after
+/// the last user index, so `drop_thinking` never strips it — same as in the
+/// full conversation). Tools are irrelevant here: they render into the
+/// system-turn prefix, which the strip removes. An encoder for which the
+/// derivation is wrong (e.g. a Jinja template that appends a generation
+/// prompt, or errors on an empty conversation) fails
+/// [`extension_concat_safe`] and never takes the incremental path in
+/// production.
+fn assistant_turn_suffix(
+    encoder: &ChatEncoder,
+    reply: &serde_json::Value,
+    opts: dsv4::RenderOpts,
+) -> Option<String> {
+    let empty = encoder
+        .render(&serde_json::Value::Array(Vec::new()), None, opts)
+        .ok()?;
+    let solo = encoder
+        .render(&serde_json::Value::Array(vec![reply.clone()]), None, opts)
+        .ok()?;
+    solo.strip_prefix(&empty).map(str::to_owned)
+}
+
+/// One-time per-model probe backing [`TokenizerRegistry::encode_chat_extension`]:
+/// verify on boundary-stressing conversations that
+/// `encode(render(msgs + [reply]))` equals
+/// `encode(render(msgs)) ++ encode(assistant_turn_suffix(reply))` — the exact
+/// transformation the incremental path applies, checked end-to-end, so it
+/// subsumes both of its assumptions at once (concatenative turn rendering AND
+/// no BPE merge across the prompt/turn boundary). Probes cross every render
+/// mode (chat / thinking / thinking+max-effort, since thinking changes the
+/// boundary token from `</think>` to `<think>` and what a turn renders) and
+/// tools presence (tools flip DSV4's `drop_thinking`, and the suffix render
+/// never sees the request's tools) against merge-prone reply openings
+/// (letter / space / newline / punctuation), a tool-call turn, a
+/// reasoning-carrying turn, and a multi-turn history. Probabilistic in
+/// principle (BPE merges are local, so a boundary that survives these
+/// openings has no merge rule crossing it in practice) and exact for DSV4,
+/// whose prompt render ends in the added tokens `<think>`/`</think>` that
+/// merges cannot cross.
+fn extension_concat_safe(encoder: &ChatEncoder, tokenizer: &Tokenizer) -> bool {
+    let opt_variants = [
+        dsv4::RenderOpts::chat(),
+        dsv4::RenderOpts {
+            thinking: true,
+            reasoning_effort: dsv4::ReasoningEffort::None,
+        },
+        // High renders identically to None today, but it is a distinct engine
+        // state — probe it so an engine build that gives `high` its own
+        // rendering can't be silently blessed by a verdict that never saw it.
+        dsv4::RenderOpts {
+            thinking: true,
+            reasoning_effort: dsv4::ReasoningEffort::High,
+        },
+        dsv4::RenderOpts {
+            thinking: true,
+            reasoning_effort: dsv4::ReasoningEffort::Max,
+        },
+    ];
+    let tools_probe = serde_json::json!([{
+        "type": "function",
+        "function": {"name": "probe", "parameters": {"type": "object"}},
+    }]);
+    let tool_variants = [None, Some(&tools_probe)];
+    let bases = [
+        serde_json::json!([{"role": "user", "content": "Hello there"}]),
+        serde_json::json!([
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer",
+             "reasoning_content": "prior reasoning"},
+            {"role": "user", "content": "second question"},
+        ]),
+    ];
+    let replies = [
+        serde_json::json!({"role": "assistant", "content": "ok then"}),
+        serde_json::json!({"role": "assistant", "content": " space first"}),
+        serde_json::json!({"role": "assistant", "content": "\nnewline first"}),
+        serde_json::json!({"role": "assistant", "content": ", punctuation"}),
+        serde_json::json!({"role": "assistant", "content": "answer",
+                           "reasoning_content": "let me think about this"}),
+        serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+            "id": "probe_call_1", "type": "function",
+            "function": {"name": "probe", "arguments": "{\"a\": 1}"},
+        }]}),
+    ];
+    for opts in opt_variants {
+        for tools in tool_variants {
+            for base in &bases {
+                let Ok(prompt_text) = encoder.render(base, tools, opts) else {
+                    return false;
+                };
+                let Ok(prompt_ids) = adapter::encode(tokenizer, &prompt_text) else {
+                    return false;
+                };
+                for reply in &replies {
+                    let mut msgs = base.as_array().expect("probe base is an array").clone();
+                    msgs.push(reply.clone());
+                    let Ok(full_text) =
+                        encoder.render(&serde_json::Value::Array(msgs), tools, opts)
+                    else {
+                        return false;
+                    };
+                    let Ok(full_ids) = adapter::encode(tokenizer, &full_text) else {
+                        return false;
+                    };
+                    let Some(suffix) = assistant_turn_suffix(encoder, reply, opts) else {
+                        return false;
+                    };
+                    let Ok(suffix_ids) = adapter::encode(tokenizer, &suffix) else {
+                        return false;
+                    };
+                    let concat: Vec<u32> = prompt_ids
+                        .iter()
+                        .chain(suffix_ids.iter())
+                        .copied()
+                        .collect();
+                    if full_ids != concat {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Whether `model_id` denotes a DeepSeek-V4 model, which the engine encodes via
@@ -652,6 +850,112 @@ mod tests {
             .render(&messages, None, dsv4::RenderOpts::chat())
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
+    }
+
+    /// The incremental extension is byte-identical to a full re-encode of
+    /// `messages + [reply]` on the DSV4 encoder — the production case the
+    /// O(output) path exists for — across chat and thinking modes, with and
+    /// without tools. The fixture tokenizer is merge-free (byte-level, zero
+    /// merges), so the self-check provably passes and the incremental path
+    /// must engage (a `None` here means the self-check or suffix derivation
+    /// regressed).
+    #[test]
+    fn encode_chat_extension_matches_full_reencode_for_dsv4() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "dsv4".into(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        reg.attach_chat_encoder_for_test("dsv4", ChatEncoder::DeepSeekV4);
+
+        let messages = serde_json::json!([
+            {"role": "user", "content": "what is 2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "and 3+3?"},
+        ]);
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "add", "parameters": {"type": "object"}},
+        }]);
+        let opt_variants = [
+            dsv4::RenderOpts::chat(),
+            dsv4::RenderOpts {
+                thinking: true,
+                reasoning_effort: dsv4::ReasoningEffort::Max,
+            },
+        ];
+        let replies = [
+            serde_json::json!({"role": "assistant", "content": "6, obviously"}),
+            serde_json::json!({"role": "assistant", "content": "6",
+                               "reasoning_content": "3+3 is 6"}),
+            serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "add", "arguments": "{\"a\":3,\"b\":3}"},
+            }]}),
+        ];
+        for opts in opt_variants {
+            for tools in [None, Some(&tools)] {
+                let prompt_ids = reg
+                    .encode_chat("dsv4", &messages, tools, opts)
+                    .expect("encode_chat");
+                for reply in &replies {
+                    let inc = reg
+                        .encode_chat_extension("dsv4", &prompt_ids, reply, opts)
+                        .expect("dsv4 + merge-free fixture must take the incremental path");
+                    let mut msgs = messages.as_array().unwrap().clone();
+                    msgs.push(reply.clone());
+                    let full = reg
+                        .encode_chat("dsv4", &serde_json::Value::Array(msgs), tools, opts)
+                        .expect("full re-encode");
+                    assert_eq!(
+                        inc, full,
+                        "incremental extension must be byte-identical to a full \
+                         re-encode for {reply} (thinking={})",
+                        opts.thinking,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A model without a chat encoder can't extend incrementally — `None`
+    /// sends the caller down the full-re-encode fallback.
+    #[test]
+    fn encode_chat_extension_none_without_encoder() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        let reply = serde_json::json!({"role": "assistant", "content": "x"});
+        assert!(reg
+            .encode_chat_extension("tiny", &[1, 2], &reply, dsv4::RenderOpts::chat())
+            .is_none());
+    }
+
+    /// An encoder that can't render the self-check probes (here: every render
+    /// raises) fails `extension_concat_safe`, so the extension refuses the
+    /// incremental path rather than concatenating garbage.
+    #[test]
+    fn encode_chat_extension_none_when_self_check_fails() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            TokenizerShards::single(adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap()),
+        );
+        reg.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ raise_exception('nope') }}",
+                "bos_token": "<s>",
+            }),
+        );
+        let reply = serde_json::json!({"role": "assistant", "content": "x"});
+        assert!(
+            reg.encode_chat_extension("tiny", &[1, 2], &reply, dsv4::RenderOpts::chat())
+                .is_none(),
+            "a failing self-check must force the full-re-encode fallback"
+        );
     }
 
     #[test]

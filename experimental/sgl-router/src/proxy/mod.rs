@@ -435,6 +435,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Response extension carrying the full buffered body of a non-streaming
+/// upstream response, inserted by [`Proxy::forward_json_to`]. A refcount bump
+/// on the very buffer the response `Body` serves — extensions are never
+/// serialized to the client, so this is free read-only access to the body for
+/// observational consumers (the cache-sim response tee) without consuming and
+/// rebuilding the response.
+#[derive(Clone)]
+pub struct BufferedResponseBody(pub Bytes);
+
 #[derive(Debug)]
 pub struct Proxy {
     /// HTTP/1.1 forwarding client. The always-safe default, and also the
@@ -714,12 +723,20 @@ impl Proxy {
             // worker that answers a probe with 503 isn't wedged shut.
             BreakerOutcome::Neutral => breaker.record_backpressure(),
         }
-        let mut out = Response::new(Body::from(bytes));
+        let mut out = Response::new(Body::from(bytes.clone()));
         *out.status_mut() = status;
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),
         );
+        // Stash the buffered bytes as a response extension (a refcount bump on
+        // the same buffer the Body holds, never serialized to the client) so a
+        // caller that needs to READ the body — the cache-sim response tee —
+        // can do so without consuming and rebuilding the response. The
+        // consume-and-rebuild alternative had an unreachable-but-typed error
+        // branch whose only possible behavior was corrupting the client's
+        // response; this has none.
+        out.extensions_mut().insert(BufferedResponseBody(bytes));
         Ok(out)
     }
 
@@ -756,6 +773,12 @@ impl Proxy {
     /// Installed ONLY for 2xx upstream responses (an error body's chunk
     /// pacing is not inter-token latency). Callers use this to record
     /// `sgl_router_itl_seconds`.
+    ///
+    /// `capture` — when `Some`, the pump additionally buffers the raw upstream
+    /// bytes and hands them to `capture.on_done` exactly once IF the stream
+    /// completes cleanly (see [`sse::StreamCapture`]). Installed ONLY for 2xx
+    /// upstream responses. The chat handler uses this to tee the completed
+    /// generation to the theoretical cache-sim's insert-only extension path.
     // Each parameter is a distinct, required input to a single upstream
     // forward (target, protocol, breaker, path, headers, body, plus the
     // streaming-lifetime callbacks). Bundling them into a struct purely to
@@ -774,6 +797,7 @@ impl Proxy {
         abort_rid: Option<&str>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
+        capture: Option<sse::StreamCapture>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -906,6 +930,11 @@ impl Proxy {
         } else {
             None
         };
+        // Same gate for the raw-bytes capture (the cache-sim response tee): an
+        // error body is not a completed generation, so don't buffer it. The
+        // pump additionally discards the capture on any unclean ending — see
+        // `sse::StreamCapture`.
+        let capture = if status.is_success() { capture } else { None };
         // Diagnostic: count this stream as an active SSE pump for its whole
         // lifetime by packing a pump-phase guard into the stream guards (created
         // post-headers, dropped when the pump task ends).
@@ -959,6 +988,7 @@ impl Proxy {
             first_byte_hook,
             abort_reason_handle,
             inter_chunk_hook,
+            capture,
             self.stream_send_stall,
         );
         let mut out = Response::new(body);
@@ -1257,6 +1287,7 @@ mod tests {
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                     None,
@@ -1725,6 +1756,7 @@ mod tests {
                 Some("stream-rid-1"),
                 None,
                 None,
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1775,6 +1807,7 @@ mod tests {
                 Some("stream-rid-2"),
                 None,
                 None,
+                None,
             )
             .await
             .expect("streaming dispatch should reach the worker");
@@ -1808,6 +1841,7 @@ mod tests {
                 None,
                 None,
                 Some("stream-rid-3"),
+                None,
                 None,
                 None,
             )
@@ -1862,6 +1896,7 @@ mod tests {
                 None,
                 None,
                 Some("headers-timeout-rid"),
+                None,
                 None,
                 None,
             )
@@ -1965,6 +2000,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("headers arrive well within the timeout");
@@ -2033,6 +2069,7 @@ mod tests {
                     None,
                     None,
                     Some(&format!("breaker-test-rid-{i}")),
+                    None,
                     None,
                     None,
                 )

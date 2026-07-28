@@ -1279,7 +1279,7 @@ impl MetricsRegistry {
 
         // cache_sim_tee_total
         out.push_str(
-            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken.\n",
+            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed for the ingress /ingest_ids tee, extend_sent|extend_http_error|extend_error for the response-completion /extend_ids tee; dropped/closed are shared queue outcomes). Observational tee to the theoretical cache-sim; a nonzero http_error (cache-sim 4xx/5xx) or error (transport) while serving is healthy means the tee is broken — extend_http_error specifically suggests a cache-sim too old to have /extend_ids.\n",
         );
         out.push_str("# TYPE sgl_router_cache_sim_tee_total counter\n");
         let guard = self.cache_sim_tee_total.lock();

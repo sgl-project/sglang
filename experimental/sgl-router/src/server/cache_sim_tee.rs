@@ -35,14 +35,29 @@ const CHANNEL_CAPACITY: usize = 4096;
 /// slow/hung one must not let tee requests pile up.
 const POST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Which cache-sim ingest a teed message targets. Two distinct endpoints on
+/// the same service, with distinct accounting semantics on the receiver:
+/// `Ingest` (`/ingest_ids`) counts a request against the hit-rate denominator;
+/// `Extend` (`/extend_ids`) is insert-only — it seeds the sim's block stores
+/// with a completed response's prompt+output sequence so the NEXT round of the
+/// conversation measures the hit a real engine's KV cache would serve, without
+/// inflating the denominator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TeeKind {
+    Ingest,
+    Extend,
+}
+
 struct TeeMsg {
+    kind: TeeKind,
     model: String,
     input_ids: Vec<u32>,
 }
 
-/// Wire body of `POST /ingest_ids`. Hand-mirrored (no shared crate) by the
-/// receiver's `IdsBody` in gpu-platform-proto `sglang-router-cache-sim`
-/// (`src/server.rs`) — keep the two `{model, input_ids}` shapes in lockstep.
+/// Wire body of `POST /ingest_ids` and `POST /extend_ids` (same shape).
+/// Hand-mirrored (no shared crate) by the receiver's `IdsBody` in
+/// gpu-platform-proto `sglang-router-cache-sim` (`src/server.rs`) — keep the
+/// two `{model, input_ids}` shapes in lockstep.
 #[derive(Serialize)]
 struct IngestIdsBody<'a> {
     model: &'a str,
@@ -78,9 +93,17 @@ impl CacheSimTee {
             .timeout(POST_TIMEOUT)
             .build()
             .expect("cache-sim tee: build reqwest client");
-        let ingest_url = format!("{}/ingest_ids", url.trim_end_matches('/'));
-        tracing::info!(url = %ingest_url, "cache-sim tee enabled");
-        tokio::spawn(run_sender(rx, client, ingest_url, Arc::clone(&metrics)));
+        let base = url.trim_end_matches('/');
+        let ingest_url = format!("{base}/ingest_ids");
+        let extend_url = format!("{base}/extend_ids");
+        tracing::info!(ingest = %ingest_url, extend = %extend_url, "cache-sim tee enabled");
+        tokio::spawn(run_sender(
+            rx,
+            client,
+            ingest_url,
+            extend_url,
+            Arc::clone(&metrics),
+        ));
         Arc::new(Self { tx, metrics })
     }
 
@@ -89,10 +112,23 @@ impl CacheSimTee {
     /// id lists are a no-op. Cheap enough to call unconditionally on the hot
     /// path.
     pub fn offer(&self, model: &str, input_ids: &[u32]) {
+        self.offer_kind(TeeKind::Ingest, model, input_ids);
+    }
+
+    /// Offer one completed response's FULL token sequence (prompt + generated
+    /// output, re-rendered the way the next round's request will be) to the
+    /// insert-only `/extend_ids` path. Same never-blocks contract as
+    /// [`Self::offer`].
+    pub fn offer_extend(&self, model: &str, input_ids: &[u32]) {
+        self.offer_kind(TeeKind::Extend, model, input_ids);
+    }
+
+    fn offer_kind(&self, kind: TeeKind, model: &str, input_ids: &[u32]) {
         if input_ids.is_empty() {
             return;
         }
         let msg = TeeMsg {
+            kind,
             model: model.to_owned(),
             input_ids: input_ids.to_vec(),
         };
@@ -117,7 +153,8 @@ impl CacheSimTee {
 async fn run_sender(
     mut rx: mpsc::Receiver<TeeMsg>,
     client: reqwest::Client,
-    url: String,
+    ingest_url: String,
+    extend_url: String,
     metrics: Arc<MetricsRegistry>,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -125,12 +162,24 @@ async fn run_sender(
             model: &msg.model,
             input_ids: &msg.input_ids,
         };
+        // Per-kind outcome labels so a version-skewed cache-sim (no
+        // /extend_ids yet → 404) shows up as `extend_http_error` while the
+        // ingest tee stays visibly healthy.
+        let (url, sent, http_error, error) = match msg.kind {
+            TeeKind::Ingest => (&ingest_url, "sent", "http_error", "error"),
+            TeeKind::Extend => (
+                &extend_url,
+                "extend_sent",
+                "extend_http_error",
+                "extend_error",
+            ),
+        };
         // Serializing {model, input_ids} cannot realistically fail; count it
         // rather than unwrap-panicking the sole sender task.
         let bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(_) => {
-                metrics.record_cache_sim_tee("error");
+                metrics.record_cache_sim_tee(error);
                 continue;
             }
         };
@@ -141,15 +190,15 @@ async fn run_sender(
         // stays transport-only (connect refused / DNS / the 2s timeout) so a
         // dashboard can tell "cache-sim rejecting" from "cache-sim unreachable".
         match client
-            .post(&url)
+            .post(url)
             .header("content-type", "application/json")
             .body(bytes)
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => metrics.record_cache_sim_tee("sent"),
-            Ok(_) => metrics.record_cache_sim_tee("http_error"),
-            Err(_) => metrics.record_cache_sim_tee("error"),
+            Ok(r) if r.status().is_success() => metrics.record_cache_sim_tee(sent),
+            Ok(_) => metrics.record_cache_sim_tee(http_error),
+            Err(_) => metrics.record_cache_sim_tee(error),
         }
     }
 }
@@ -223,6 +272,60 @@ mod tests {
         assert!(
             rendered.contains(r#"sgl_router_cache_sim_tee_total{result="sent"} 1"#),
             "tee sent counter not rendered:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offer_extend_posts_to_extend_ids() {
+        // Mock cache-sim: capture the last /extend_ids body, reply 204; a hit
+        // on /ingest_ids would be a routing bug (fail via the captured-path
+        // assertion below).
+        type Captured = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+        let captured: Captured = Arc::new(Mutex::new(None));
+        let handler = |path: &'static str| {
+            move |State(cap): State<Captured>, body: axum::body::Bytes| async move {
+                *cap.lock().unwrap() = Some((path.to_string(), body.to_vec()));
+                axum::http::StatusCode::NO_CONTENT
+            }
+        };
+        let app = Router::new()
+            .route("/ingest_ids", post(handler("/ingest_ids")))
+            .route("/extend_ids", post(handler("/extend_ids")))
+            .with_state(Arc::clone(&captured));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let metrics = MetricsRegistry::new();
+        let tee = CacheSimTee::spawn(format!("http://{addr}"), Arc::clone(&metrics));
+        tee.offer_extend("m", &[10, 11, 12, 13]);
+
+        let mut got = None;
+        for _ in 0..80 {
+            if let Some(g) = captured.lock().unwrap().clone() {
+                got = Some(g);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let (path, body) = got.expect("cache-sim never received a POST");
+        assert_eq!(path, "/extend_ids", "extend must not land on /ingest_ids");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["model"], "m");
+        assert_eq!(v["input_ids"], serde_json::json!([10, 11, 12, 13]));
+
+        // Metered under the extend-specific label.
+        let mut rendered = String::new();
+        for _ in 0..80 {
+            rendered = metrics.render();
+            if rendered.contains(r#"sgl_router_cache_sim_tee_total{result="extend_sent"} 1"#) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            rendered.contains(r#"sgl_router_cache_sim_tee_total{result="extend_sent"} 1"#),
+            "extend_sent counter not rendered:\n{rendered}"
         );
     }
 

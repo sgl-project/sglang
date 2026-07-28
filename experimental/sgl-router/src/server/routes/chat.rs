@@ -5,10 +5,11 @@ use crate::config::{RetryConfig, DEFAULT_RETRY_ITL_REL_FACTOR};
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
-use crate::proxy::sse::StreamEnd;
+use crate::proxy::sse::{StreamCapture, StreamEnd};
 use crate::proxy::AbortReason;
 use crate::server::app::{RequestPhase, RequestPhaseCell};
 use crate::server::app_context::AppContext;
+use crate::server::cache_sim_extend::{self, ReplySource};
 use crate::server::error::ApiError;
 use crate::server::header_utils::SERVER_TIMING;
 use crate::server::metrics::{
@@ -295,6 +296,43 @@ async fn chat_completions_inner(
     if let (Some(tee), Some(t)) = (ctx.cache_sim_tee.as_ref(), request_tokens.as_ref()) {
         tee.offer(&model_str, &t.ids);
     }
+    // Arm the response-completion extend tee (see `cache_sim_extend`): when the
+    // response finishes, the assistant reply's rendered turn is appended to
+    // this request's token sequence and teed insert-only, so the NEXT round's
+    // prompt — which re-sends this response as history — measures as the cache
+    // hit a real engine's KV cache would serve. Two gates: the ingress
+    // tokenization must have succeeded (if this request couldn't tokenize, the
+    // next round's probe can't either, so seeding is pointless), and the
+    // extension must be matchable at all (`extension_can_match`: DSV4 thinking
+    // mode without tools re-renders history divergently, so its extensions
+    // could only ever be dead blocks — mirroring the engine's own miss).
+    let extend_tee_armed = ctx.cache_sim_tee.is_some()
+        && request_tokens.is_some()
+        && request_value
+            .as_ref()
+            .is_some_and(cache_sim_extend::extension_can_match);
+    // The ingress ids the extension appends to, enabling the O(output)
+    // incremental encode at response time. ONLY the chat-encoder
+    // (engine-equivalent) tokenization qualifies: the raw-prompt fallback
+    // renders differently, so concatenating a chat-rendered suffix onto it
+    // would produce garbage — those requests take the full-re-encode fallback
+    // instead (`prompt = None`). Bundled with the request's resolved
+    // `RenderOpts` (the same resolution `request_tokens_for` used) so the
+    // reply's turn suffix renders in the same thinking/effort mode as the
+    // prompt. Cost when armed: one Vec clone (4 B/token), held until the
+    // response completes.
+    let extend_prompt: Option<cache_sim_extend::IngressPrompt> = if extend_tee_armed {
+        request_tokens
+            .as_ref()
+            .filter(|t| t.engine_equivalent)
+            .zip(request_value.as_ref())
+            .map(|(t, v)| cache_sim_extend::IngressPrompt {
+                ids: t.ids.clone(),
+                opts: crate::tokenizer::dsv4::resolve_render_opts(v),
+            })
+    } else {
+        None
+    };
     // Diagnostic: ingress-tokenize cost, sampled. Fires for EVERY request that
     // reaches here — including those about to be shed at admission below — so a
     // shed request's pre-admission time (the latency the access log shows on a
@@ -537,6 +575,42 @@ async fn chat_completions_inner(
         })
     };
 
+    // Builds the raw-bytes capture the SSE pump feeds for a streaming
+    // response, so the completed generation can be teed to the cache-sim's
+    // insert-only extension path (see `cache_sim_extend`). `None` (no capture,
+    // no buffering) unless the extend tee is armed. Owns its own clones so the
+    // per-arm `model_str` moves below don't conflict; `Bytes` clones are
+    // refcount bumps. Callable once per dispatch attempt — a failed attempt's
+    // capture is discarded by the pump (unclean end) and never fires.
+    let make_extend_capture = {
+        let armed = extend_tee_armed;
+        let ctx = Arc::clone(&ctx);
+        let model = model_str.clone();
+        let request_body = body.clone();
+        let prompt = extend_prompt.clone();
+        move || -> Option<StreamCapture> {
+            if !armed {
+                return None;
+            }
+            let ctx = Arc::clone(&ctx);
+            let model = model.clone();
+            let request_body = request_body.clone();
+            let prompt = prompt.clone();
+            Some(StreamCapture {
+                max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
+                on_done: Box::new(move |buf| {
+                    cache_sim_extend::spawn_extend_tee(
+                        ctx,
+                        model,
+                        request_body,
+                        prompt,
+                        ReplySource::Sse(buf),
+                    );
+                }),
+            })
+        }
+    };
+
     // Forward the router-computed tokens to the engine as `input_ids` so it
     // skips re-tokenizing the same prompt — but only when they are
     // engine-equivalent (chat-encoder path) AND the request contains nothing
@@ -738,6 +812,7 @@ async fn chat_completions_inner(
                 request_id.as_deref(),
                 Some(make_stream_end_hook(&decode_worker.url)),
                 Some(make_itl_hook(&decode_worker.url)),
+                make_extend_capture(),
             );
             tokio::select! {
                 biased;
@@ -847,6 +922,7 @@ async fn chat_completions_inner(
                     request_id.as_deref(),
                     Some(make_stream_end_hook(&metrics_worker_url)),
                     Some(make_itl_hook(&worker.url)),
+                    make_extend_capture(),
                 );
                 // Bias `fetch` over the cancellation branch: a successful
                 // response that completes in the same poll as the token firing
@@ -1189,6 +1265,28 @@ async fn chat_completions_inner(
         // middleware records those as pre-routing rejections (empty worker_url).
         (Err(e), _) => e.into_response(),
     };
+    // Response-completion tee, non-streaming half (streaming rides the SSE
+    // pump's `StreamCapture` instead): `forward_json_to` stashes the buffered
+    // body on the response as a `BufferedResponseBody` extension (a refcount
+    // bump on the same buffer the `Body` serves), so the tee reads it without
+    // consuming or rebuilding the response — the client's response object is
+    // untouched by this block.
+    if extend_tee_armed && !streaming && response.status().is_success() {
+        if let Some(crate::proxy::BufferedResponseBody(bytes)) = response
+            .extensions()
+            .get::<crate::proxy::BufferedResponseBody>(
+        ) {
+            if bytes.len() <= cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES {
+                cache_sim_extend::spawn_extend_tee(
+                    Arc::clone(&ctx),
+                    log_ctx.model_id.clone(),
+                    body.clone(),
+                    extend_prompt,
+                    ReplySource::Json(bytes.clone()),
+                );
+            }
+        }
+    }
     // Router TTFT observability — streaming responses that reached a worker and
     // got 2xx headers. Gated on `streaming` because on a non-streaming response
     // "time to first byte" is just total latency (there is no first token to be

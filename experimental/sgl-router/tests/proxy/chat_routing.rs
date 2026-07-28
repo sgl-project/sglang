@@ -1430,6 +1430,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             None,
             None,
             None,
+            None,
         )
         .await;
 

@@ -83,6 +83,27 @@ pub struct StreamEnd {
     pub client_disconnect: bool,
 }
 
+/// Capture sink for the raw upstream bytes of one streaming response.
+///
+/// When passed to the pump, every upstream `Ok` chunk is ALSO appended to an
+/// internal buffer (the client copy is untouched), and `on_done` fires exactly
+/// once at pump end with the complete byte stream — but only when the stream
+/// finished CLEANLY: transport ok, no pump panic, no in-band error envelope,
+/// no client disconnect, and total size within `max_bytes`. Any other ending
+/// silently discards the buffer — a truncated or failed response must never be
+/// mistaken for a completed generation by whatever consumes the capture (the
+/// cache-sim response tee re-tokenizes it as if it were a finished assistant
+/// turn).
+///
+/// Memory: up to `max_bytes` per in-flight captured stream, held only while
+/// the stream runs. On overflow the capture (not the stream) is dropped.
+pub struct StreamCapture {
+    /// Hard cap on the buffered bytes; past it the capture is discarded.
+    pub max_bytes: usize,
+    /// Consumer of the cleanly-completed stream's raw bytes.
+    pub on_done: Box<dyn FnOnce(Vec<u8>) + Send + 'static>,
+}
+
 /// Carryover cap for the in-band error scanner (mirrors the gateway's
 /// sseClassifyingBody bound). A single line longer than this without a
 /// newline resets the buffer — detection of that one pathological line is
@@ -267,6 +288,7 @@ where
         on_first_byte,
         abort_reason,
         on_inter_chunk,
+        None,
         STREAM_SEND_STALL,
     )
 }
@@ -284,12 +306,23 @@ pub fn bytes_stream_to_body_with_stall<S, E>(
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
     abort_reason: Option<Arc<AtomicU8>>,
     on_inter_chunk: Option<Box<dyn Fn(f64) + Send + 'static>>,
+    capture: Option<StreamCapture>,
     send_stall: std::time::Duration,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
+    // Capture plumbing mirrors `outcome_holder`: the pump (inside the
+    // catch_unwind closure) feeds the shared buffer; the outer scope decides
+    // at the end whether the stream ended cleanly enough to hand it to
+    // `on_done`. `None` in the inner Option marks an overflowed (discarded)
+    // capture; feeding stops but the stream is unaffected.
+    let capture_state: Option<Arc<parking_lot::Mutex<Option<Vec<u8>>>>> = capture
+        .as_ref()
+        .map(|_| Arc::new(parking_lot::Mutex::new(Some(Vec::new()))));
+    let capture_max = capture.as_ref().map_or(0, |c| c.max_bytes);
+    let capture_feed = capture_state.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
     // Byte-bounded read-ahead budget shared between the pump (acquires permits
     // before sending) and the client-facing stream (returns them as it yields).
@@ -345,9 +378,11 @@ where
             client_disconnect: false,
         }));
         let outcome_setter = Arc::clone(&outcome_holder);
-        // The in-band scan exists solely to inform `on_complete`; skip the
-        // per-chunk work entirely when nobody is listening.
-        let mut scanner = on_complete.as_ref().map(|_| InbandErrorScanner::default());
+        // The in-band scan exists solely to inform `on_complete` and to veto a
+        // capture delivery; skip the per-chunk work entirely when nobody is
+        // listening.
+        let mut scanner =
+            (on_complete.is_some() || capture.is_some()).then(InbandErrorScanner::default);
         let pump = AssertUnwindSafe(async move {
             // Hold the guards for the task's lifetime — dropped when this
             // block exits (stream done or client disconnect).  Leading
@@ -421,6 +456,23 @@ where
                         scan.feed(bytes);
                         if scan.found {
                             outcome_setter.lock().saw_inband_error = true;
+                        }
+                    }
+                    // Feed the capture buffer (client copy untouched). Overflow
+                    // discards the capture — a partial buffer must never reach
+                    // `on_done` looking complete — and stops further feeding.
+                    if let (Some(cap), Ok(bytes)) = (capture_feed.as_ref(), &item) {
+                        let mut guard = cap.lock();
+                        if let Some(buf) = guard.as_mut() {
+                            if buf.len().saturating_add(bytes.len()) > capture_max {
+                                tracing::debug!(
+                                    max_bytes = capture_max,
+                                    "SSE capture overflowed its budget; discarding capture"
+                                );
+                                *guard = None;
+                            } else {
+                                buf.extend_from_slice(bytes);
+                            }
                         }
                     }
                 }
@@ -597,10 +649,20 @@ where
                 "SSE pump panicked: {msg}"
             ))));
         }
+        let mut end = *outcome_holder.lock();
+        end.transport_ok = end.transport_ok && !panicked;
         if let Some(hook) = on_complete {
-            let mut end = *outcome_holder.lock();
-            end.transport_ok = end.transport_ok && !panicked;
             hook(end);
+        }
+        // Hand the captured bytes to `on_done` ONLY for a cleanly-completed
+        // stream (see `StreamCapture`'s doc for why every other ending — error,
+        // panic, in-band error, client disconnect, overflow — discards).
+        if let Some(cap) = capture {
+            if end.transport_ok && !end.saw_inband_error && !end.client_disconnect {
+                if let Some(buf) = capture_state.and_then(|s| s.lock().take()) {
+                    (cap.on_done)(buf);
+                }
+            }
         }
     });
     // Client-facing stream: as each chunk is yielded to the client, return the
@@ -725,6 +787,159 @@ mod tests {
         let body = bytes_stream_to_body(s, None, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
+    }
+
+    /// Build a capture whose `on_done` stores the delivered bytes, plus the
+    /// shared slot to read them back. `None` in the slot after the stream
+    /// settles ⇒ the capture was (correctly) discarded.
+    fn capture_into() -> (StreamCapture, Arc<std::sync::Mutex<Option<Vec<u8>>>>) {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let slot_c = Arc::clone(&slot);
+        (
+            StreamCapture {
+                max_bytes: 1024,
+                on_done: Box::new(move |buf| {
+                    *slot_c.lock().unwrap() = Some(buf);
+                }),
+            },
+            slot,
+        )
+    }
+
+    /// Poll the capture slot until `on_done` fires (the pump task delivers it
+    /// asynchronously after the body is drained) or the budget elapses.
+    async fn wait_capture(slot: &Arc<std::sync::Mutex<Option<Vec<u8>>>>) -> Option<Vec<u8>> {
+        for _ in 0..80 {
+            if let Some(b) = slot.lock().unwrap().clone() {
+                return Some(b);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn capture_delivers_full_bytes_on_clean_stream_end() {
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"a\":1}\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let (capture, slot) = capture_into();
+        let body = bytes_stream_to_body_with_stall(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(capture),
+            STREAM_SEND_STALL,
+        );
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+        let captured = wait_capture(&slot).await.expect("capture must deliver");
+        assert_eq!(captured, b"data: {\"a\":1}\n\ndata: [DONE]\n\n".to_vec());
+    }
+
+    #[tokio::test]
+    async fn capture_discarded_on_upstream_error() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"data: {\"a\":1}\n\n")),
+            Err(std::io::Error::other("upstream died mid-stream")),
+        ];
+        let (capture, slot) = capture_into();
+        let body = bytes_stream_to_body_with_stall(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(capture),
+            STREAM_SEND_STALL,
+        );
+        let _ = body.collect().await;
+        assert!(
+            wait_capture(&slot).await.is_none(),
+            "a transport-errored stream must never deliver a capture",
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_discarded_on_inband_error_even_without_on_complete() {
+        // The scanner must arm for capture alone — no on_complete installed.
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"data: {\"error\": {\"message\": \"boom\"}}\n\n",
+        ))];
+        let (capture, slot) = capture_into();
+        let body = bytes_stream_to_body_with_stall(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(capture),
+            STREAM_SEND_STALL,
+        );
+        let _ = body.collect().await;
+        assert!(
+            wait_capture(&slot).await.is_none(),
+            "an in-band-errored stream must never deliver a capture",
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_discarded_on_overflow_stream_unaffected() {
+        let big = vec![b'x'; 4096]; // > the 1024 max_bytes in capture_into()
+        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from(big.clone()))];
+        let (capture, slot) = capture_into();
+        let body = bytes_stream_to_body_with_stall(
+            stream::iter(chunks),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(capture),
+            STREAM_SEND_STALL,
+        );
+        // The client copy is untouched by the overflow…
+        let bytes = body.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 4096);
+        // …but the capture is gone.
+        assert!(
+            wait_capture(&slot).await.is_none(),
+            "an overflowed capture must be discarded, not truncated",
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_discarded_on_client_disconnect() {
+        // Endless upstream; the client drops the body after the first chunk.
+        let s = stream::unfold(0u64, |n| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"x")), n + 1))
+        })
+        .boxed();
+        let (capture, slot) = capture_into();
+        let body = bytes_stream_to_body_with_stall(
+            s,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(capture),
+            STREAM_SEND_STALL,
+        );
+        let mut stream = body.into_data_stream();
+        let _first = stream.next().await;
+        drop(stream); // client walks away mid-generation
+        assert!(
+            wait_capture(&slot).await.is_none(),
+            "a client-disconnected stream must never deliver a capture",
+        );
     }
 
     #[tokio::test]
