@@ -103,7 +103,26 @@ class TranscriptionAdapter(ABC):
         """Parameters for ``StreamingASRState`` when using chunked streaming.
 
         Only used when ``supports_chunked_streaming`` is True.
-        Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.
+        Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``,
+        and optionally ``window_chunk_num`` (max chunks of audio per
+        inference; 0/absent = re-encode the whole utterance every chunk).
+        """
+        return {}
+
+    @property
+    def supports_segment_streaming(self) -> bool:
+        """Whether fixed audio segments can be transcribed as successive
+        turns of one engine streaming session (--asr-streaming-mode
+        segment), so prior segments' KV is reused instead of re-encoded.
+        Requires a model trained to continue a transcript from prior
+        user(audio)/assistant(text) rounds."""
+        return False
+
+    @property
+    def segment_streaming_config(self) -> dict:
+        """Parameters for segment streaming. Keys: ``segment_duration_sec``.
+
+        Only used when ``supports_segment_streaming`` is True.
         """
         return {}
 

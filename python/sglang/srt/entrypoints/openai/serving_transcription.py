@@ -45,12 +45,15 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.realtime import (
     handle_realtime_transcription,
 )
+from sglang.srt.entrypoints.openai.segment_streaming import SegmentStreamingASR
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    compute_window_drop,
+    decode_audio_mono,
+    encode_wav,
     needs_space,
     process_asr_chunk,
-    split_audio_chunks,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -240,6 +243,16 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
+        if (
+            self.tokenizer_manager.server_args.asr_streaming_mode == "segment"
+            and self._adapter.supports_segment_streaming
+        ):
+            return StreamingResponse(
+                self._generate_segment_asr_stream(
+                    adapted_request, request, raw_request
+                ),
+                media_type="text/event-stream",
+            )
         if self._adapter.supports_chunked_streaming:
             # No background abort_task: each chunk is a separate request;
             # client disconnection is detected via is_disconnected() in the loop.
@@ -369,6 +382,85 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         yield "data: [DONE]\n\n"
 
+    async def _generate_segment_asr_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: TranscriptionRequest,
+        raw_request: Request,
+    ) -> AsyncGenerator[str, None]:
+        """Segment-based streaming: each fixed-duration segment is one
+        turn of an engine streaming session, so prior segments' KV is
+        reused instead of re-encoded (see segment_streaming.py). Emitted
+        deltas are final — no rollback zone, unlike the chunked path.
+        """
+        created_time = int(time.time())
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+        model = request.model
+        segment_sec = self._adapter.segment_streaming_config["segment_duration_sec"]
+        last_char = ""
+
+        seg_asr = SegmentStreamingASR(
+            tokenizer_manager=self.tokenizer_manager,
+            adapter=self._adapter,
+            sampling_params=adapted_request.sampling_params,
+            routing_key=self.extract_routing_key(raw_request),
+        )
+        try:
+            data, sample_rate = decode_audio_mono(request.audio_data)
+            segment_samples = int(segment_sec * sample_rate)
+            n_segments = max(1, -(-len(data) // segment_samples))  # ceil
+
+            for i in range(n_segments):
+                if await raw_request.is_disconnected():
+                    logger.info("[segment_asr] client disconnected, stopping")
+                    break
+                start = i * segment_samples
+                end = min(start + segment_samples, len(data))
+                wav = await asyncio.to_thread(encode_wav, data[start:end], sample_rate)
+                delta = await seg_asr.transcribe_segment(wav)
+
+                for word in delta.split(" "):
+                    if not word:
+                        continue
+                    content = f" {word}" if needs_space(last_char, word) else word
+                    last_char = content[-1]
+                    chunk_resp = TranscriptionStreamResponse(
+                        id=request_id,
+                        created=created_time,
+                        model=model,
+                        choices=[
+                            TranscriptionStreamChoice(
+                                delta=DeltaMessage(content=content),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+            chunk_resp = TranscriptionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=model,
+                choices=[
+                    TranscriptionStreamChoice(
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[segment_asr] unrecoverable error")
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+        finally:
+            await seg_asr.close()
+
+        yield "data: [DONE]\n\n"
+
     async def _generate_chunked_asr_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -395,13 +487,32 @@ class OpenAIServingTranscription(OpenAIServingBase):
         last_char = ""
 
         try:
-            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
+            data, sample_rate = decode_audio_mono(request.audio_data)
+            chunk_samples = int(state.chunk_size_sec * sample_rate)
+            n_chunks = max(1, -(-len(data) // chunk_samples))  # ceil
+            # Sample offset of the audio window's start; advances when the
+            # window rolls so per-chunk cost stays O(window), not O(total).
+            window_start = 0
 
-            for i, chunk_audio in enumerate(chunks):
+            for i in range(n_chunks):
                 if await raw_request.is_disconnected():
                     logger.info("[streaming_asr] client disconnected, stopping")
                     break
-                is_last = i == len(chunks) - 1
+                is_last = i == n_chunks - 1
+                end = min((i + 1) * chunk_samples, len(data))
+
+                drop = compute_window_drop(
+                    buffered=end - window_start,
+                    inferred=i * chunk_samples - window_start,
+                    chunk_size=chunk_samples,
+                    state=state,
+                )
+                if drop > 0:
+                    window_start += drop
+                    state.start_new_window()
+                chunk_audio = await asyncio.to_thread(
+                    encode_wav, data[window_start:end], sample_rate
+                )
 
                 delta = await process_asr_chunk(
                     tokenizer_manager=self.tokenizer_manager,

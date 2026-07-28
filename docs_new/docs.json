@@ -724,6 +724,7 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
+              "docs/advanced_features/streaming_asr",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",

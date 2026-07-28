@@ -27,6 +27,8 @@ from openai.types.realtime import (
     InputAudioBufferClearEvent,
     InputAudioBufferCommitEvent,
     InputAudioBufferCommittedEvent,
+    InputAudioBufferSpeechStartedEvent,
+    InputAudioBufferSpeechStoppedEvent,
     RealtimeErrorEvent,
     SessionCreatedEvent,
     SessionUpdatedEvent,
@@ -51,6 +53,9 @@ from openai.types.realtime.realtime_conversation_item_user_message import (
     RealtimeConversationItemUserMessage,
 )
 from openai.types.realtime.realtime_error import RealtimeError
+from openai.types.realtime.realtime_transcription_session_audio_input_turn_detection import (
+    ServerVad,
+)
 from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
@@ -62,8 +67,17 @@ from sglang.srt.entrypoints.openai.realtime.protocol import (
     TranscriptionSessionAudioInput,
     TranscriptionSessionConfig,
 )
+from sglang.srt.entrypoints.openai.realtime.vad import (
+    VAD_FRAME_SAMPLES,
+    VAD_SAMPLE_RATE,
+    StreamingVAD,
+    VADConfig,
+    VADEvent,
+    offset_to_ms,
+)
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
+    compute_window_drop,
     needs_space,
     normalize_whitespace,
     process_asr_chunk,
@@ -81,6 +95,9 @@ logger = logging.getLogger(__name__)
 # PCM16: 16-bit samples → 2 bytes each. Used for frame-length validation
 # and bytes/sec arithmetic against `np.frombuffer(..., dtype=np.int16)` below.
 _SAMPLE_WIDTH = 2
+
+# Sentinel: turn_detection validation failed and an error was already sent.
+_INVALID = object()
 
 
 def _resample_to_target_rate(pcm: bytes, src_rate: int, target_rate: int) -> bytes:
@@ -134,6 +151,7 @@ class _SessionConfig:
     language: Optional[str] = None
     client_model: Optional[str] = None
     sampling_params: Optional[Dict[str, Any]] = None
+    turn_detection: Optional[VADConfig] = None
     configured: bool = False
 
 
@@ -204,6 +222,13 @@ class RealtimeConnection:
         )
 
         self.item = _ItemState(current_item_id=f"item_{random_uuid()}")
+
+        # Server-side VAD (turn_detection: server_vad); None = client commits.
+        self.vad: Optional[StreamingVAD] = None
+        # Session-clock sample offset (model rate) of pcm_buffer byte 0.
+        # Advances whenever buffer bytes are consumed or dropped, so VAD
+        # sample offsets can be mapped to buffer byte offsets.
+        self._buffer_origin_samples = 0
 
     async def run(self) -> None:
         await self._send(
@@ -313,11 +338,21 @@ class RealtimeConnection:
         transcription = audio.transcription
 
         # Validate first, then mutate config only after the whole update is accepted.
-        if audio.turn_detection is not None:
+        # Partial-update: an absent turn_detection keeps the current VAD;
+        # only an explicit null disables it (mirrors the transcription block).
+        if "turn_detection" in audio.model_fields_set:
+            vad = await self._validate_turn_detection(audio.turn_detection)
+            if vad is _INVALID:
+                return
+            vad_cfg = vad.config if isinstance(vad, StreamingVAD) else None
+        else:
+            vad = self.vad
+            vad_cfg = self.config.turn_detection
+        if vad_cfg != self.config.turn_detection and self.audio.pcm_buffer:
             await self._send_error(
-                "not_supported",
-                "Server-side VAD is not implemented; "
-                "set audio.input.turn_detection: null and commit explicitly.",
+                "invalid_state",
+                "Cannot change turn_detection while audio is buffered; "
+                "commit or clear the current item first.",
                 param="session.audio.input.turn_detection",
             )
             return
@@ -390,6 +425,8 @@ class RealtimeConnection:
         self.config.sampling_params = self.adapter.build_sampling_params(
             TranscriptionRequest(language=self.config.language)
         )
+        self.config.turn_detection = vad_cfg
+        self.vad = vad if isinstance(vad, StreamingVAD) else None
         self.config.configured = True
 
         # Side effects: log + ack.
@@ -415,6 +452,84 @@ class RealtimeConnection:
                 session=self._build_session_info(),
             )
         )
+
+    async def _validate_turn_detection(self, td: Any):
+        """Validate the requested turn_detection and build its VAD.
+
+        Returns None (VAD off), a ready StreamingVAD, or the _INVALID
+        sentinel after sending the error event. Constructing the VAD here
+        keeps the mutation pass in _on_session_update free of failure
+        paths (silero-vad import / model load happen on this side).
+        """
+        if td is None:
+            return None
+        if not isinstance(td, ServerVad):
+            await self._send_error(
+                "not_supported",
+                "turn_detection.type must be 'server_vad'; semantic_vad "
+                "is not implemented.",
+                param="session.audio.input.turn_detection.type",
+            )
+            return _INVALID
+        if td.idle_timeout_ms is not None:
+            await self._send_error(
+                "not_supported",
+                "turn_detection.idle_timeout_ms is not supported; set to null.",
+                param="session.audio.input.turn_detection.idle_timeout_ms",
+            )
+            return _INVALID
+        # silero-vad scores 512-sample windows @ 16 kHz; audio is VAD-scored
+        # after resampling to the model rate, so the model rate must match.
+        if self.model_sample_rate != VAD_SAMPLE_RATE:
+            await self._send_error(
+                "not_supported",
+                f"server_vad requires a {VAD_SAMPLE_RATE} Hz model input rate; "
+                f"this model expects {self.model_sample_rate} Hz.",
+                param="session.audio.input.turn_detection",
+            )
+            return _INVALID
+
+        cfg = VADConfig(
+            threshold=td.threshold if td.threshold is not None else 0.5,
+            prefix_padding_ms=(
+                td.prefix_padding_ms if td.prefix_padding_ms is not None else 300
+            ),
+            silence_duration_ms=(
+                td.silence_duration_ms if td.silence_duration_ms is not None else 500
+            ),
+        )
+        if not 0.0 <= cfg.threshold <= 1.0:
+            await self._send_error(
+                "invalid_value",
+                f"turn_detection.threshold must be in [0, 1], got {cfg.threshold}",
+                param="session.audio.input.turn_detection.threshold",
+            )
+            return _INVALID
+        if cfg.prefix_padding_ms < 0 or cfg.silence_duration_ms <= 0:
+            await self._send_error(
+                "invalid_value",
+                "turn_detection.prefix_padding_ms must be >= 0 and "
+                "silence_duration_ms must be > 0",
+                param="session.audio.input.turn_detection",
+            )
+            return _INVALID
+
+        if self.vad is not None and self.vad.config == cfg:
+            return self.vad
+        try:
+            vad = StreamingVAD(cfg)
+        except ImportError as e:
+            await self._send_error(
+                "not_supported",
+                str(e),
+                param="session.audio.input.turn_detection",
+            )
+            return _INVALID
+        # Align the VAD clock with the buffer clock. The caller rejects a
+        # turn_detection change while audio is buffered, so buffer byte 0
+        # is "now" on the session clock.
+        vad.samples_consumed = self._buffer_origin_samples
+        return vad
 
     async def _on_input_audio_buffer_append(
         self, event: InputAudioBufferAppendEvent
@@ -474,6 +589,16 @@ class RealtimeConnection:
             )
         self.audio.pcm_buffer.extend(data)
 
+        if self.vad is not None:
+            await self._process_vad(data)
+            if not self.vad.is_speech:
+                # Between utterances: keep only the speech-start prefix
+                # window and skip inference, so an open mic idles
+                # indefinitely without burning compute on silence or
+                # hitting the buffer cap.
+                self._trim_pre_speech_buffer()
+                return False
+
         new_audio_bytes = len(self.audio.pcm_buffer) - self.audio.last_inference_offset
         if new_audio_bytes >= self.audio.chunk_size_bytes:
             ok = await self._run_inference(is_last=False)
@@ -488,12 +613,24 @@ class RealtimeConnection:
         if not self.config.configured:
             await self._send_error("invalid_state", "Send session.update before commit")
             return
+        if self.vad is not None:
+            await self._send_error(
+                "invalid_state",
+                "Cannot commit: the buffer is committed automatically when "
+                "turn_detection is server_vad.",
+            )
+            return
         if not self.audio.pcm_buffer and not self.audio.state.full_transcript:
             await self._send_error(
                 "invalid_state", "Cannot commit an empty audio buffer"
             )
             return
+        await self._commit_item()
 
+    async def _commit_item(self) -> None:
+        """Commit the current item: announce it, run the final inference
+        pass, emit transcription.completed, and roll to the next item.
+        Shared by the manual commit handler and VAD auto-commit."""
         has_new_audio = len(self.audio.pcm_buffer) > self.audio.last_inference_offset
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
@@ -572,16 +709,91 @@ class RealtimeConnection:
         # shouldn't include it.
         self._reset_inference_state()
         self.item.current_item_id = f"item_{random_uuid()}"
+        if self.vad is not None:
+            # Abandoned speech must not leak a dangling is_speech into the
+            # next utterance.
+            self.vad.end_utterance()
         await self._send(
             InputAudioBufferClearedEvent(
                 event_id=f"event_{random_uuid()}", type="input_audio_buffer.cleared"
             )
         )
 
+    async def _process_vad(self, data: bytes) -> None:
+        """Score newly appended model-rate PCM and act on VAD transitions:
+        speech_started/speech_stopped events, auto-commit on stop."""
+        assert self.vad is not None
+        for emit in self.vad.process(data):
+            if emit.event_type == VADEvent.SPEECH_STARTED:
+                await self._send(
+                    InputAudioBufferSpeechStartedEvent(
+                        event_id=f"event_{random_uuid()}",
+                        type="input_audio_buffer.speech_started",
+                        audio_start_ms=offset_to_ms(emit.sample_offset),
+                        item_id=self.item.current_item_id,
+                    )
+                )
+            else:
+                await self._send(
+                    InputAudioBufferSpeechStoppedEvent(
+                        event_id=f"event_{random_uuid()}",
+                        type="input_audio_buffer.speech_stopped",
+                        audio_end_ms=offset_to_ms(emit.sample_offset),
+                        item_id=self.item.current_item_id,
+                    )
+                )
+                await self._auto_commit(emit.sample_offset)
+
+    async def _auto_commit(self, stop_offset_samples: int) -> None:
+        """Commit the utterance that ended at stop_offset_samples. Audio
+        past that offset (the silence run, possibly the head of a rapid
+        next turn) is carried over into the next item's buffer."""
+        keep_from = (stop_offset_samples - self._buffer_origin_samples) * _SAMPLE_WIDTH
+        keep_from = min(max(keep_from, 0), len(self.audio.pcm_buffer))
+        tail = bytes(self.audio.pcm_buffer[keep_from:])
+        del self.audio.pcm_buffer[keep_from:]
+        if self.audio.pcm_buffer or self.audio.state.full_transcript:
+            await self._commit_item()
+        self.audio.pcm_buffer.extend(tail)
+
+    def _maybe_roll_audio_window(self) -> None:
+        """Bound per-inference cost: once the buffered audio exceeds the
+        adapter's window, drop the head whose transcript is already
+        emitted (it conditions the next inference as the prompt prefix).
+        Keeps per-chunk cost O(window) instead of O(utterance)."""
+        drop = compute_window_drop(
+            buffered=len(self.audio.pcm_buffer),
+            inferred=self.audio.last_inference_offset,
+            chunk_size=self.audio.chunk_size_bytes,
+            state=self.audio.state,
+        )
+        if drop <= 0:
+            return
+        del self.audio.pcm_buffer[:drop]
+        self._buffer_origin_samples += drop // _SAMPLE_WIDTH
+        self.audio.last_inference_offset -= drop
+        self.audio.state.start_new_window()
+
+    def _trim_pre_speech_buffer(self) -> None:
+        """Drop idle audio, keeping the prefix_padding window plus one VAD
+        frame of detection latency ahead of a future speech_started. Only
+        called while not in speech, where last_inference_offset is 0, so
+        trimming never shifts audio an inference pass already consumed."""
+        assert self.vad is not None
+        keep_bytes = (
+            self.vad.config.prefix_padding_ms * self.model_sample_rate // 1000
+            + VAD_FRAME_SAMPLES
+        ) * _SAMPLE_WIDTH
+        drop = len(self.audio.pcm_buffer) - keep_bytes
+        if drop > 0:
+            del self.audio.pcm_buffer[:drop]
+            self._buffer_origin_samples += drop // _SAMPLE_WIDTH
+
     async def _run_inference(self, is_last: bool) -> bool:
         """Run ASR on the current cumulative buffer. Returns False on failure:
         commit-time emits transcription.failed and rolls the item; append-time
         emits a generic error envelope and closes the WebSocket."""
+        self._maybe_roll_audio_window()
         wav_data = await asyncio.to_thread(
             _pcm_to_wav, bytes(self.audio.pcm_buffer), self.model_sample_rate
         )
@@ -665,6 +877,9 @@ class RealtimeConnection:
 
     def _reset_inference_state(self) -> None:
         """Missing any of these resets leaks state across items."""
+        # Dropped buffer bytes advance the session clock so future VAD
+        # offsets still map to buffer byte offsets.
+        self._buffer_origin_samples += len(self.audio.pcm_buffer) // _SAMPLE_WIDTH
         self.audio.state = StreamingASRState(**self.adapter.chunked_streaming_config)
         self.audio.pcm_buffer.clear()  # in-place; reuses the buffer's allocation
         self.item.emitted_deltas.clear()
@@ -689,7 +904,20 @@ class RealtimeConnection:
                             "language": self.config.language,
                         },
                         "noise_reduction": None,
-                        "turn_detection": None,
+                        "turn_detection": (
+                            None
+                            if self.config.turn_detection is None
+                            else {
+                                "type": "server_vad",
+                                "threshold": self.config.turn_detection.threshold,
+                                "prefix_padding_ms": (
+                                    self.config.turn_detection.prefix_padding_ms
+                                ),
+                                "silence_duration_ms": (
+                                    self.config.turn_detection.silence_duration_ms
+                                ),
+                            }
+                        ),
                     }
                 },
             }
