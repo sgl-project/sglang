@@ -63,7 +63,8 @@ def test_zimage_rmsnorm_tanh_residual_matches_native_bf16(shape):
     expected = (residual + gated).to(torch.bfloat16)
 
     assert actual is not None
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    # Triton's exp-based tanh can differ slightly from torch.tanh in BF16.
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
