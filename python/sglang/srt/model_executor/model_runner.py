@@ -2051,11 +2051,8 @@ class ModelRunner:
         self.forward_pass_id = 0
         ElasticEPStateManager.mark_configuring_data_plane()
 
-        state = ElasticEPStateManager.instance()
-        for rank in ranks_to_join:
-            state.active_ranks[rank] = 1
-        state.snapshot_active_to_last()
-        state.sync_active_to_cpu()
+        inst = ElasticEPStateManager.instance()
+        inst.activate_ranks(ranks_to_join)
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
@@ -2299,10 +2296,7 @@ class ModelRunner:
         ElasticEPStateManager.mark_configuring_data_plane()
 
         inst = ElasticEPStateManager.instance()
-        for rank in ranks_to_recover:
-            inst.active_ranks[rank] = 1
-        inst.snapshot_active_to_last()
-        inst.sync_active_to_cpu()
+        inst.activate_ranks(ranks_to_recover)
         if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
 
@@ -2451,7 +2445,7 @@ class ModelRunner:
             )
         if pending_size is not None:
             pending_since = inst.pending_since if inst is not None else None
-            timeout_s = getattr(self.server_args, "elastic_ep_scale_timeout", 600)
+            timeout_s = self.server_args.elastic_ep_scale_timeout
             if (
                 pending_since is not None
                 and time.monotonic() - pending_since > timeout_s
@@ -2618,7 +2612,7 @@ class ModelRunner:
             return
 
         pending_since = inst.pending_since if inst is not None else None
-        timeout_s = getattr(self.server_args, "elastic_ep_scale_timeout", 600)
+        timeout_s = self.server_args.elastic_ep_scale_timeout
         if (
             pending_since is not None
             and time.monotonic() - pending_since > timeout_s

@@ -89,8 +89,8 @@ class NixlEPBuffer:
 
     @classmethod
     def on_retire(cls, retiree_ranks: list) -> None:
-        """Retire-time NIXL handshake, called from survivors inside
-        :func:`elastic_ep.try_retire_ranks`.
+        """Retire-time NIXL handshake, called by survivors from
+        :func:`elastic_ep._pre_nixl_retire`.
 
         Drops the NIXL C++ Buffer's per-peer QP state for every retiree so
         the retiree can safely proceed to LOCAL_CLEANUP / ``sys.exit(0)``
@@ -100,9 +100,10 @@ class NixlEPBuffer:
         ``_finalize_scale_down`` and won't touch NIXL again until it
         exits ``commit_scale``, ~7-8s later on this workload).
 
-        Analog of Mooncake's ``EPBuffer.update_ep_member``: runs at
-        retire time inside ``try_retire_ranks``, not lazily on the first
-        post-shrink dispatch (which is what
+        Analog of Mooncake's ``EPBuffer.update_ep_member``: runs at the
+        NIXL_RETIRE FSM state (see
+        :class:`sglang.srt.elastic_ep.scale_down_state.ScaleDownSurvivorState`),
+        not lazily on the first post-shrink dispatch (which is what
         :meth:`_update_connections` used to do via the ``on_scale``
         stub).
 
@@ -112,11 +113,12 @@ class NixlEPBuffer:
         picks the last k slots of the current effective size.
 
         Only survivors call this; the retiree is exiting and its
-        ``buffer`` is reclaimed by process teardown. The caller
-        (:func:`elastic_ep._refresh_nixl_ep_members`) issues the WORLD
-        barrier that both survivors and retiree observe so the retiree
-        does not leave ``try_retire_ranks`` until every survivor has
-        completed the disconnect.
+        ``buffer`` is reclaimed by process teardown. The async
+        :func:`elastic_ep.nixl_retire_barrier_post` /
+        :func:`elastic_ep.nixl_retire_barrier_check` /
+        :func:`elastic_ep.nixl_retire_barrier_consume` family in the
+        FSM's NIXL_RETIRE state ensures every survivor has completed
+        its disconnect before any retiree advances to LOCAL_CLEANUP.
         """
         state = cls._state()
         if state.buffer is None:

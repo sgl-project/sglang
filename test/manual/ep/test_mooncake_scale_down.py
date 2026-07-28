@@ -3047,8 +3047,8 @@ class TestMooncakeScaleDown5To4To5To4(_MooncakeShrinkEndToEndBase):
          slot). The joiner subprocess ``sys.exit(0)``s from its
          ``local_cleanup`` hook when its slot is marked retired.
 
-    Historical context: the v2 grow FSM ``TestMooncakeGrowV2ThenShrink
-    _4To5To4`` reproducibly crashed at step 5 with a Mooncake
+    Historical context: an earlier "v2 grow" design (since discarded)
+    crashed at the equivalent of step 5 with a Mooncake
     ``resetPeerState: peer_rank out of range: 4 size: 4`` abort
     because the launch cohort was 4 and P2PProxy's per-peer array
     didn't grow to include appended rank 4. Redesigning around the
@@ -3056,9 +3056,8 @@ class TestMooncakeScaleDown5To4To5To4(_MooncakeShrinkEndToEndBase):
     launch-cohort member from the start, so P2PProxy sizes its
     per-peer array to 5 slots at boot; step 5's retire just flips
     ``active_ranks[4]`` back to 0 (Mooncake-native shrink), same as
-    MC03A. Discarding the v2 FSM entirely (in favour of the well-
-    tested v1 recover path -- see MC08) removes the crash class
-    without any special-case handling.
+    MC03A. Reusing the v1 recover path (see MC08) removes the crash
+    class without any special-case handling.
 
     See :meth:`TestMooncakeGrow4To5RecoverOnly.test_recover_grow` for
     the grow-half narration; the shrink half mirrors MC03A verbatim.

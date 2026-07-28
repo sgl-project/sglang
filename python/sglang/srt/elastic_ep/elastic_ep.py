@@ -78,6 +78,38 @@ class ElasticEPState:
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
+    def _set_active_bits(self, global_ranks: List[int], value: int) -> None:
+        if self.active_ranks is None:
+            return
+        numel = self.active_ranks.numel()
+        for global_rank in global_ranks:
+            if 0 <= global_rank < numel:
+                self.active_ranks[global_rank] = value
+        self.snapshot_active_to_last()
+        self.sync_active_to_cpu()
+
+    def activate_ranks(self, global_ranks: List[int]) -> None:
+        """Flip ``active_ranks[g] = 1`` for each g in ``global_ranks``,
+        then update the pinned CPU snapshot + last-known-good mirror.
+
+        Shared entrypoint for every code path that grows the live
+        cohort: append-only scale-up
+        (:meth:`ModelRunner._finalize_scale_up`), recover-mode grow
+        (:meth:`ModelRunner._finalize_scale_recover`), and Mooncake-
+        native rejoin (:func:`try_recover_ranks`). Out-of-range ranks
+        are silently ignored (mirrors the pre-refactor bounds guards).
+        """
+        self._set_active_bits(global_ranks, 1)
+
+    def deactivate_ranks(self, global_ranks: List[int]) -> None:
+        """Flip ``active_ranks[g] = 0`` for each g in ``global_ranks``.
+
+        Shared entrypoint for :func:`try_retire_ranks` and any other
+        retirement/eviction path. Out-of-range ranks are silently
+        ignored.
+        """
+        self._set_active_bits(global_ranks, 0)
+
 
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
@@ -471,6 +503,71 @@ _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FALLBACK_S = 0.2
 # derivation.
 _NIXL_RETIRE_CYCLE_ID_CATCH_UP_S = 5.0
 _NIXL_RETIRE_ARRIVAL_COUNTER_KEY = "sglang_nixl_retire_arrival_counter"
+
+
+def _barrier_target_from_effective_ep(
+    rank: int, world_size: int, log_prefix: str
+) -> int:
+    """Retire-barrier target: number of ranks that will actually post.
+
+    This is the ``effective_ep_size`` at the retire boundary (the full
+    cohort BEFORE the impending retirees flip their mask), not the
+    launch ``world_size``. For the common case (shrink from the full
+    launch cohort or from a fully-recovered cohort) they are equal,
+    but for a chained shrink (e.g. ``4 -> 3 -> 2``) the second shrink
+    only has 3 live ranks -- waiting for ``world_size == 4`` posts
+    would deadlock the survivors for the full 300s barrier timeout.
+
+    Reading ``effective_ep_size`` is safe here because
+    :meth:`ElasticEPStateManager.commit_scale` (which lowers it to the
+    post-shrink target) runs strictly AFTER the barrier releases; the
+    read at post time returns the pre-shrink cohort size.
+
+    Called by both :func:`nixl_retire_barrier_post` and
+    :func:`retire_barrier_post`; kept as a shared helper to keep the
+    two barriers' cohort-size derivation in lockstep.
+    """
+    try:
+        effective = ElasticEPStateManager.get_effective_ep_size()
+        if effective > 0:
+            return effective
+    except Exception as exc:
+        logger.debug(
+            "%s rank=%d get_effective_ep_size failed (%s); falling "
+            "back to world_size=%d for retire barrier target",
+            log_prefix,
+            rank,
+            exc,
+            world_size,
+        )
+    return world_size
+
+
+def _rollback_arrival_counter(store, rank: int, key: str) -> None:
+    """Reset the shared ARRIVAL_KEY back to 0 after a failed leader.
+
+    Used by the elected-leader epoch derivation when the leader (arrival
+    == 1) increments ARRIVAL_KEY but then fails on the CYCLE_KEY write.
+    Without this rollback the counter stays permanently elevated and no
+    future ``store.add`` returns 1: every rank becomes a follower on the
+    next cycle, every rank times out in the catch-up poll, and the
+    barrier is silently disabled for the rest of the deployment.
+
+    Only the elected leader for a cycle may call this. Followers observe
+    the counter already >= 2 and cannot safely reset without racing a
+    peer that has already moved on to the next cycle.
+    """
+    try:
+        store.set(key, "0")
+    except Exception as exc:
+        logger.debug(
+            "[Elastic EP][retire] rank=%d (leader) ARRIVAL_KEY rollback "
+            "on %s failed (%s); next cycle may busy-poll before the "
+            "counter drains",
+            rank,
+            key,
+            exc,
+        )
 # Cohort-wide monotonic cycle counter maintained on the shared
 # TCPStore. Bumped exactly once per retire boundary by the elected
 # first-arriver; consumed by every other rank in the same boundary
@@ -656,31 +753,12 @@ def nixl_retire_barrier_post(
     world_size = torch.distributed.get_world_size()
 
     # Barrier target: the count of ranks that will actually post at THIS
-    # retire boundary. That's the full cohort *before* the impending
-    # retirees flip their mask, i.e. ``effective_ep_size``. For the
-    # common case (shrink from the full launch cohort or from a
-    # fully-recovered cohort) this equals ``world_size``, but for a
-    # chained shrink (e.g. 4 -> 3 -> 2), the second shrink runs with
-    # only 3 ranks alive -- retirees on the 3-rank cohort post 3
-    # times, and waiting for ``world_size == launch_ep == 4`` posts
-    # deadlocks the survivors for the full 300s timeout.
-    # ``effective_ep_size`` is set to the post-shrink target only in
-    # :meth:`ElasticEPStateManager.commit_scale`, which runs strictly
-    # after this barrier releases, so reading it here gives us the
-    # pre-shrink cohort size.
-    barrier_target = world_size
-    try:
-        effective = ElasticEPStateManager.get_effective_ep_size()
-        if effective > 0:
-            barrier_target = effective
-    except Exception as exc:
-        logger.debug(
-            "[Elastic EP][retire] rank=%d get_effective_ep_size failed (%s); "
-            "falling back to world_size=%d for NIXL retire barrier target",
-            my_rank,
-            exc,
-            world_size,
-        )
+    # Shared helper: for a chained shrink like ``4 -> 3 -> 2`` this
+    # yields the pre-shrink cohort size (3), NOT the launch
+    # ``world_size`` (4); mirrors :func:`retire_barrier_post`.
+    barrier_target = _barrier_target_from_effective_ep(
+        my_rank, world_size, "[Elastic EP][retire]"
+    )
 
     store = None
     try:
@@ -765,6 +843,14 @@ def nixl_retire_barrier_post(
         # outer timeout mechanism (600 s ``elastic_ep_scale_timeout``
         # in ``maybe_retire_ep_ranks``). This is a strict degradation,
         # but a bounded-latency failure beats an indefinite split.
+        #
+        # Leader rolls back its ARRIVAL_KEY increment so the next cycle
+        # can still elect a leader -- see :func:`_rollback_arrival_counter`
+        # for the full rationale.
+        if arrival == 1:
+            _rollback_arrival_counter(
+                store, my_rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY
+            )
         logger.warning(
             "[Elastic EP][retire] rank=%d arrival=%d could not observe "
             "cycle id within %.1fs; skipping NIXL retire barrier for "
@@ -1090,12 +1176,8 @@ def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
         return False
 
     inst = ElasticEPStateManager.instance()
-    if inst is not None and inst.active_ranks is not None:
-        for global_rank in global_ranks:
-            if 0 <= global_rank < inst.active_ranks.numel():
-                inst.active_ranks[global_rank] = 1
-        inst.snapshot_active_to_last()
-        inst.sync_active_to_cpu()
+    if inst is not None:
+        inst.activate_ranks(global_ranks)
 
     for group in _iter_live_parallel_groups():
         _flip_active_rank_mask(group, global_ranks, value=1)
@@ -1390,8 +1472,8 @@ def try_retire_ranks(global_ranks: List[int]) -> bool:
     state.GroupCoordinator.__init__` and passed by reference into
     ``MooncakeBackendOptions``), so a direct in-place write is the
     Mooncake-recommended way to update it -- consistent with how
-    :func:`ElasticEPStateManager._finalize_scale_up`-style code paths
-    already flip the mask via ``inst.active_ranks[rank] = 1`` for grow.
+    :meth:`ModelRunner._finalize_scale_up`-style code paths already
+    flip the mask via :meth:`ElasticEPState.activate_ranks` for grow.
 
     Retirees stay in the WORLD PG's membership list; their slots remain
     reserved so a future :func:`try_recover_ranks` on the same rank can
@@ -1412,12 +1494,8 @@ def try_retire_ranks(global_ranks: List[int]) -> bool:
     # the barrier.
 
     inst = ElasticEPStateManager.instance()
-    if inst is not None and inst.active_ranks is not None:
-        for global_rank in global_ranks:
-            if 0 <= global_rank < inst.active_ranks.numel():
-                inst.active_ranks[global_rank] = 0
-        inst.snapshot_active_to_last()
-        inst.sync_active_to_cpu()
+    if inst is not None:
+        inst.deactivate_ranks(global_ranks)
 
     for group in _iter_live_parallel_groups():
         _flip_active_rank_mask(group, global_ranks, value=0)
@@ -1540,6 +1618,13 @@ def _derive_shared_retire_barrier_epoch(
                 rank,
                 exc,
             )
+            # Leader rolls back ARRIVAL_KEY so the next cycle can still
+            # elect a leader; symmetric with the reset in
+            # :func:`retire_barrier_consume` for the success path. See
+            # :func:`nixl_retire_barrier_post` for the full rationale.
+            _rollback_arrival_counter(
+                store, rank, _RETIRE_BARRIER_ARRIVAL_COUNTER_KEY
+            )
             return None, arrival
 
     deadline = time.monotonic() + _RETIRE_BARRIER_CYCLE_ID_CATCH_UP_S
@@ -1597,10 +1682,10 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
     (all ranks have paused new work and posted the barrier). Without
     this store fast-path, ``is_completed()`` may return ``True`` on
     one rank while others still poll ``False`` forever; the racing
-    rank then advances to FLIP_MASK and blocks on the inner WORLD
-    barrier inside ``_refresh_nixl_ep_members``, which in turn blocks
-    peer ranks' next-tick ``mlp_sync``, and the FSM stalls -- the
-    whole cohort deadlocks.
+    rank then advances to FLIP_MASK and calls
+    :func:`_pre_nixl_retire` (NIXL peer disconnect) while a slow
+    peer is still processing the NIXL retire store barrier, starving
+    ``mlp_sync`` on WORLD -- the whole cohort deadlocks.
 
     Epoch derivation uses an elected-leader pattern over the shared
     TCPStore so every rank in the cohort agrees on the same
@@ -1628,32 +1713,15 @@ def retire_barrier_post() -> Optional[_RetireBarrierState]:
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
-    # Barrier target: the count of ranks that will actually post at
-    # THIS retire boundary -- the pre-shrink cohort's ``effective_ep_size``,
-    # NOT the launch ``world_size``. On chained shrinks (e.g. 4 -> 3 -> 2)
-    # only ``effective`` ranks call ``post``; waiting for ``world_size``
-    # arrivals caps the store counter below the target and falls through
-    # to the unreliable ``handle.is_completed()`` path in
-    # :func:`retire_barrier_check` (Mooncake WORLD is_completed has been
-    # observed to return False forever after wait() has returned on the
-    # peer). Mirrors the sibling :func:`nixl_retire_barrier_post` fix.
-    # ``effective_ep_size`` is the pre-shrink cohort here because
-    # :meth:`ElasticEPStateManager.commit_scale` runs strictly AFTER
-    # this barrier releases.
-    barrier_target = world_size
-    try:
-        effective = ElasticEPStateManager.get_effective_ep_size()
-        if effective > 0:
-            barrier_target = effective
-    except Exception as exc:
-        logger.debug(
-            "[Elastic EP][retire_barrier] rank=%d get_effective_ep_size "
-            "failed (%s); falling back to launch world_size=%d for outer "
-            "retire barrier target",
-            rank,
-            exc,
-            world_size,
-        )
+    # Barrier target: the pre-shrink cohort's ``effective_ep_size``
+    # (see :func:`_barrier_target_from_effective_ep`). On chained
+    # shrinks only ``effective`` ranks call ``post``; waiting for
+    # launch ``world_size`` arrivals would cap the store counter
+    # below the target and fall through to the unreliable
+    # ``handle.is_completed()`` path in :func:`retire_barrier_check`.
+    barrier_target = _barrier_target_from_effective_ep(
+        rank, world_size, "[Elastic EP][retire_barrier]"
+    )
 
     from sglang.srt.distributed.utils import get_global_tcp_store
 
@@ -1889,8 +1957,10 @@ def retiree_local_cleanup() -> None:
     groups (both torch default WORLD and every sglang parallel group)
     stay at their launch-time membership; destroying them here would
     trigger the well-known "destroy blocks on live NCCL/Mooncake
-    comms" hang (see the ``# Why`` note at
-    ``parallel_state.py:2775-2784``).
+    comms" hang: ``torch.distributed.destroy_process_group()`` blocks
+    until every in-flight collective on every PG completes, which
+    never happens when peers are still holding live Mooncake QPs
+    against this retiree.
 
     RDMA endpoint teardown is deferred to kernel-driven process
     cleanup for two reasons:
