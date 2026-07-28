@@ -1494,6 +1494,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.inserted_host_node = node.id
             return result
 
+        # Drop the refill only under write-through (a non-write-back policy).
+        if node is not self.root_node and not node.backuped and not self.is_write_back:
+            logger.info(
+                "HiCache prefetch dropped %d-token refill under un-backed-up node %d",
+                len(host_value),
+                node.id,
+            )
+            result.host_insert_dropped = True
+            return result
+
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
         new_node.key = key
