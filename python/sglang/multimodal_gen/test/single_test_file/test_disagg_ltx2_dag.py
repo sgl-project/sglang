@@ -29,6 +29,7 @@ from sglang.multimodal_gen.test.single_test_file.test_disagg_server import (
     DisaggCluster,
     _DisaggTestBase,
 )
+
 _LTX23_MODEL = "Lightricks/LTX-2.3"
 _TOPOLOGY_DIR = Path(__file__).resolve().parents[2] / "configs" / "disagg_topologies"
 
