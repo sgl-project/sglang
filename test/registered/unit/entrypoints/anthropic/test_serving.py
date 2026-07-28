@@ -404,7 +404,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertTrue(tool_message["is_error"])
 
     def test_tool_result_without_is_error_is_not_flagged(self):
-        """A successful tool_result must not be flagged as an error."""
         request = self._tool_result_request("user")
 
         chat_request = self._serving()._convert_to_chat_completion_request(request)

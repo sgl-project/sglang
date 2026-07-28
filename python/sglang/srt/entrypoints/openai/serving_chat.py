@@ -81,7 +81,29 @@ logger = logging.getLogger(__name__)
 TOOL_ERROR_PREFIX = "[Tool execution failed] "
 
 
-def normalize_tool_content(role: str, content, is_error: bool = False):
+def fold_tool_error_into_content(message: Dict[str, Any]) -> None:
+    """Fold ``is_error`` into a tool message's content in-place, then drop it.
+
+    ``is_error`` is an SGLang extension with no OpenAI equivalent, and every
+    encoder renders tool content verbatim, so the failure has to become part
+    of the content itself or the model reads a failed call as a normal result.
+    """
+    is_error = message.pop("is_error", None)
+    if not is_error or message.get("role") != "tool":
+        return
+
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = TOOL_ERROR_PREFIX + content
+    elif isinstance(content, list):
+        # Kept as a list (some templates iterate it), so the marker rides along
+        # as an extra text part rather than prefixing a string.
+        message["content"] = [
+            {"type": "text", "text": TOOL_ERROR_PREFIX.strip()}
+        ] + content
+
+
+def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
     OpenAI clients may send tool content as a list of content parts
@@ -89,16 +111,8 @@ def normalize_tool_content(role: str, content, is_error: bool = False):
     a plain string for tool messages. Only flatten when ALL items are
     pure OpenAI text parts; preserve lists containing non-text-type items
     that some templates intentionally iterate over.
-
-    ``is_error`` has no OpenAI-side equivalent, so a failed tool call is
-    marked inline: chat templates render tool content verbatim and would
-    otherwise present the failure as a normal result.
     """
-    if role != "tool":
-        return content
-    if not isinstance(content, list):
-        if is_error and isinstance(content, str):
-            return TOOL_ERROR_PREFIX + content
+    if role != "tool" or not isinstance(content, list):
         return content
     parts = content
     is_openai_text_parts = all(
@@ -107,12 +121,7 @@ def normalize_tool_content(role: str, content, is_error: bool = False):
     )
     if is_openai_text_parts:
         text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
-        flattened = " ".join(text_parts)
-        return TOOL_ERROR_PREFIX + flattened if is_error else flattened
-    if is_error:
-        # Kept as a list (some templates iterate it), so the marker has to ride
-        # along as an extra text part rather than prefixing a string.
-        return [{"type": "text", "text": TOOL_ERROR_PREFIX.strip()}] + parts
+        return " ".join(text_parts)
     return content
 
 
@@ -910,6 +919,10 @@ class OpenAIServingChat(OpenAIServingBase):
         messages = [msg.model_dump() for msg in request.messages]
         for message in messages:
             normalize_assistant_tool_call_arguments(message)
+            # Before encoder dispatch: the custom and dsv4/dsv32 encoders never
+            # reach the Jinja branch below and would render a failed tool call
+            # as an ordinary result.
+            fold_tool_error_into_content(message)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -1022,12 +1035,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
                 processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"],
-                    processed_msg.get("content"),
-                    is_error=bool(msg_dict.get("is_error")),
+                    processed_msg["role"], processed_msg.get("content")
                 )
-                # Folded into the content above; chat templates never see it.
-                processed_msg.pop("is_error", None)
 
                 openai_compatible_messages.append(processed_msg)
 

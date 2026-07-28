@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import (
     TOOL_ERROR_PREFIX,
     OpenAIServingChat,
+    fold_tool_error_into_content,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -715,6 +716,50 @@ class ServingChatTestCase(unittest.TestCase):
                 )
 
                 self.chat._process_messages(req, is_multimodal=False)
+
+    def test_tool_error_marker_reaches_custom_encoders(self):
+        """The dsv4/dsv32 encoders bypass the Jinja branch entirely.
+
+        Folding ``is_error`` only there let those encoders render a failed
+        tool call as an ordinary ``<result>...</result>``.
+        """
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Where is it raining?"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Beijing"}',
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_1",
+                            "content": "boom",
+                            "is_error": True,
+                        },
+                    ],
+                )
+
+                self.chat._process_messages(req, is_multimodal=False)
+
+                encoded = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertIn(TOOL_ERROR_PREFIX.strip(), encoded)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -2418,39 +2463,43 @@ class TestNormalizeToolContent(unittest.TestCase):
         )
         self.assertEqual(result, "plain rich")
 
-    def test_is_error_marks_string_content(self):
-        """Chat templates render tool content verbatim, so without an inline
+
+class TestFoldToolErrorIntoContent(unittest.TestCase):
+    """Unit tests for fold_tool_error_into_content()."""
+
+    def test_marks_string_content(self):
+        """Every encoder renders tool content verbatim, so without an inline
         marker the model reads a failed call as a normal result."""
-        result = normalize_tool_content("tool", "boom", is_error=True)
-        self.assertTrue(result.startswith(TOOL_ERROR_PREFIX))
-        self.assertIn("boom", result)
+        message = {"role": "tool", "content": "boom", "is_error": True}
+        fold_tool_error_into_content(message)
+        self.assertEqual(message["content"], TOOL_ERROR_PREFIX + "boom")
 
-    def test_is_error_marks_flattened_parts(self):
-        result = normalize_tool_content(
-            "tool", [{"type": "text", "text": "boom"}], is_error=True
-        )
-        self.assertTrue(result.startswith(TOOL_ERROR_PREFIX))
-        self.assertIn("boom", result)
-
-    def test_is_error_marks_non_text_part_list(self):
+    def test_marks_list_content_as_extra_part(self):
         """An image-bearing tool_result stays a list, so marking only the
-        string/flattened paths would silently drop the failure marker."""
-        content = [{"type": "image_url", "image_url": {"url": "x"}}]
-        result = normalize_tool_content("tool", content, is_error=True)
-        self.assertEqual(result[0]["text"], TOOL_ERROR_PREFIX.strip())
-        self.assertEqual(result[1:], content)
+        string path would silently drop the failure marker."""
+        parts = [{"type": "image_url", "image_url": {"url": "x"}}]
+        message = {"role": "tool", "content": list(parts), "is_error": True}
+        fold_tool_error_into_content(message)
+        self.assertEqual(message["content"][0]["text"], TOOL_ERROR_PREFIX.strip())
+        self.assertEqual(message["content"][1:], parts)
 
-    def test_is_error_default_leaves_content_untouched(self):
-        """A successful result must never carry the failure marker."""
-        self.assertEqual(normalize_tool_content("tool", "fine"), "fine")
-        self.assertEqual(
-            normalize_tool_content("tool", [{"type": "text", "text": "fine"}]), "fine"
-        )
+    def test_is_error_is_always_dropped(self):
+        """It is an SGLang extension; leaking it would reach chat templates."""
+        for is_error in (True, False):
+            with self.subTest(is_error=is_error):
+                message = {"role": "tool", "content": "x", "is_error": is_error}
+                fold_tool_error_into_content(message)
+                self.assertNotIn("is_error", message)
 
-    def test_is_error_ignored_for_non_tool_role(self):
-        content = [{"type": "text", "text": "hi"}]
-        result = normalize_tool_content("user", content, is_error=True)
-        self.assertIs(result, content)
+    def test_successful_result_is_untouched(self):
+        message = {"role": "tool", "content": "fine", "is_error": False}
+        fold_tool_error_into_content(message)
+        self.assertEqual(message["content"], "fine")
+
+    def test_non_tool_role_is_untouched(self):
+        message = {"role": "user", "content": "hi", "is_error": True}
+        fold_tool_error_into_content(message)
+        self.assertEqual(message["content"], "hi")
 
 
 class InklingReasoningEffortTest(unittest.TestCase):
