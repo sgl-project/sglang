@@ -25,7 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -50,15 +50,16 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-try:
+if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
-except ImportError:
-    CudaStream = None  # type: ignore[misc,assignment]
 from torch.distributed import barrier
 
-from sglang.kernels.ops.mamba.triton_ops import (
-    initialize_mamba_selective_state_update_backend,
-)
+try:
+    from sglang.kernels.ops.mamba.triton_ops import (
+        initialize_mamba_selective_state_update_backend,
+    )
+except ImportError:
+    initialize_mamba_selective_state_update_backend = None
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -811,7 +812,8 @@ class Scheduler(
                 )
 
     def init_mamba_backend(self) -> None:
-        initialize_mamba_selective_state_update_backend(self.server_args)
+        if initialize_mamba_selective_state_update_backend is not None:
+            initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
         # For the MM models, check the text_config for MoE settings

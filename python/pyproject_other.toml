@@ -17,8 +17,9 @@ classifiers = [
 dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm"]
 
 [project.optional-dependencies]
-# runtime_base: all pure-Python packages from runtime_common, WITHOUT packages
-# that pull in torch (torchao, timm). Used by srt_empty for device-agnostic install.
+# runtime_base: torch-free subset of runtime_common.
+# Used by srt_empty for device-agnostic install on non-NVIDIA platforms.
+# NOTE: Do NOT add packages that depend on torch/triton here — they belong in runtime_common.
 runtime_base = [
   "aiohttp",
   "anthropic>=0.20.0",
@@ -26,7 +27,6 @@ runtime_base = [
   "av",
   "blobfile==3.0.0",
   "build",
-  "compressed-tensors",
   "datasets",
   "easydict",
   "einops",
@@ -44,7 +44,6 @@ runtime_base = [
   "openai==2.6.1",
   "openai-harmony==0.0.4",
   "orjson",
-  "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
   "pillow",
@@ -67,14 +66,16 @@ runtime_base = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.1",
 ]
 
 # runtime_common: backward-compatible — same install result as before the split.
 runtime_common = [
   "sglang[runtime_base]",
+  "compressed-tensors",
+  "outlines==0.1.11",
   "timm==1.0.16",
   "torchao==0.9.0",
+  "xgrammar==0.2.1",
 ]
 
 # srt_empty: device-agnostic install — pure Python packages only, no torch dependency chain.
