@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_WEIGHTS_CONDITION,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
+    MINWM_TOTAL_LATENT_FRAMES_CONDITION,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -47,6 +48,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 MINWM_ACTION_HISTORY_CACHE = "minwm_action_history"
 MINWM_INITIAL_NOISE_CACHE = "minwm_initial_noise"
+MINWM_INITIAL_NOISE_CURSOR_CACHE = "minwm_initial_noise_cursor"
 
 
 def _parity_dump(name: str, value) -> None:
@@ -79,8 +81,6 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
         if batch.latents is not None:
             return batch
         condition = batch.image_latent
-        if condition is None:
-            raise ValueError("MinWM realtime inference requires a first-frame latent")
         chunk_size = int(
             batch.realtime_chunk_size
             or self.transformer.config.arch_config.num_frames_per_block
@@ -88,49 +88,89 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
         generator = (
             batch.generator[0] if isinstance(batch.generator, list) else batch.generator
         )
+        if condition is not None:
+            batch_size = condition.shape[0]
+            latent_height, latent_width = condition.shape[3:]
+            latent_dtype = condition.dtype
+        else:
+            spatial_factor = int(
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+            )
+            if batch.height is None or batch.width is None:
+                raise ValueError("MinWM T2V requires height and width")
+            batch_size = int(batch.batch_size)
+            latent_height = int(batch.height) // spatial_factor
+            latent_width = int(batch.width) // spatial_factor
+            latent_dtype = batch.prompt_embeds[0].dtype
         shape_tail = (
             self.transformer.config.arch_config.out_channels,
-            condition.shape[3],
-            condition.shape[4],
+            latent_height,
+            latent_width,
         )
         noise_bfchw = None
         if batch.session is not None:
             state = get_realtime_causal_dit_state(batch.session)
             condition_inputs = batch.condition_inputs or {}
             total_chunks = condition_inputs.get(MINWM_TOTAL_CHUNKS_CONDITION)
+            total_latent_frames = condition_inputs.get(
+                MINWM_TOTAL_LATENT_FRAMES_CONDITION
+            )
             if batch.block_idx == 0:
                 if total_chunks is not None and int(total_chunks) < 1:
                     raise ValueError("MinWM total chunk count must be positive")
-                generated_frames = chunk_size * int(total_chunks or 1)
-                # V3 draws one BFCHW tensor for reference+generated latents, then
-                # overwrites the reference with its clean VAE latent. Preserve that
-                # otherwise-invisible reference RNG consumption and, for a bounded
-                # session, the original single-call CUDA RNG fill order.
+                if total_latent_frames is not None:
+                    generated_frames = int(total_latent_frames)
+                elif condition is None:
+                    first_block = int(
+                        self.transformer.config.arch_config.num_frame_first_block
+                    )
+                    regular_block = int(
+                        self.transformer.config.arch_config.num_frames_per_block
+                    )
+                    generated_frames = first_block + regular_block * (
+                        int(total_chunks or 1) - 1
+                    )
+                else:
+                    generated_frames = chunk_size * int(total_chunks or 1)
+                # I2V consumes and overwrites one reference-noise slot. T2V
+                # generates its first block, so every sampled slot is retained.
+                reference_slots = int(condition is not None)
                 full_noise = torch.randn(
-                    (condition.shape[0], 1 + generated_frames, *shape_tail),
+                    (
+                        batch_size,
+                        reference_slots + generated_frames,
+                        *shape_tail,
+                    ),
                     generator=generator,
                     device=get_local_torch_device(),
-                    dtype=condition.dtype,
+                    dtype=latent_dtype,
                 )
-                state.runtime_cache[MINWM_INITIAL_NOISE_CACHE] = full_noise[:, 1:]
-                _parity_dump("image_latent.pt", condition)
+                state.runtime_cache[MINWM_INITIAL_NOISE_CACHE] = full_noise[
+                    :, reference_slots:
+                ]
+                state.runtime_cache[MINWM_INITIAL_NOISE_CURSOR_CACHE] = 0
+                if condition is not None:
+                    _parity_dump("image_latent.pt", condition)
                 _parity_dump("initial_noise_bfchw.pt", full_noise)
             cached_noise = state.runtime_cache.get(MINWM_INITIAL_NOISE_CACHE)
             if cached_noise is not None:
-                start = int(batch.block_idx) * chunk_size
+                start = int(
+                    state.runtime_cache.get(MINWM_INITIAL_NOISE_CURSOR_CACHE, 0)
+                )
                 end = start + chunk_size
                 if end <= cached_noise.shape[1]:
                     noise_bfchw = cached_noise[:, start:end]
-                elif total_chunks is not None:
+                    state.runtime_cache[MINWM_INITIAL_NOISE_CURSOR_CACHE] = end
+                elif total_chunks is not None or total_latent_frames is not None:
                     raise ValueError(
                         "MinWM realtime request exceeded its pre-sampled noise horizon"
                     )
         if noise_bfchw is None:
             noise_bfchw = torch.randn(
-                (condition.shape[0], chunk_size, *shape_tail),
+                (batch_size, chunk_size, *shape_tail),
                 generator=generator,
                 device=get_local_torch_device(),
-                dtype=condition.dtype,
+                dtype=latent_dtype,
             )
         batch.latents = noise_bfchw.permute(0, 2, 1, 3, 4).contiguous()
         batch.raw_latent_shape = batch.latents.shape
@@ -139,7 +179,7 @@ class MinWMChunkLatentPreparationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
-            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
+            "image_latent", batch.image_latent, V.none_or_tensor_with_dims(5)
         )
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         result.add_check("latents", batch.latents, V.none_or_tensor)
@@ -199,13 +239,28 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         if not self._minwm_unbounded_cache:
             return
         total_chunks = (batch.condition_inputs or {}).get(MINWM_TOTAL_CHUNKS_CONDITION)
-        if total_chunks is not None:
+        total_latent_frames = (batch.condition_inputs or {}).get(
+            MINWM_TOTAL_LATENT_FRAMES_CONDITION
+        )
+        if total_latent_frames is not None:
+            self.sliding_window_num_frames = int(total_latent_frames) + int(
+                batch.image_latent is not None
+            )
+        elif total_chunks is not None:
             # minWM main uses local_attn_size=-1: retain the reference and every
             # generated latent. A bounded realtime request can allocate that
             # complete horizon once instead of treating 128 as a sliding window.
-            self.sliding_window_num_frames = 1 + int(total_chunks) * int(
-                self.num_frames_per_block
-            )
+            if batch.image_latent is not None:
+                self.sliding_window_num_frames = 1 + int(total_chunks) * int(
+                    self.num_frames_per_block
+                )
+            else:
+                first_block = int(
+                    self.transformer.config.arch_config.num_frame_first_block
+                )
+                self.sliding_window_num_frames = first_block + (
+                    int(total_chunks) - 1
+                ) * int(self.num_frames_per_block)
 
     def _reset_causal_cache_config_defaults(self) -> None:
         """Prevent request-local sink/window overrides from leaking to the next session."""
@@ -424,7 +479,9 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             self._reset_crossattn_cache(cache_ctx.crossattn_cache)
 
         if batch.block_idx == 0 and cache_ctx.current_start_frame == 0:
-            if batch.image_latent is None or batch.image_latent.shape[2] != 1:
+            if batch.image_latent is None:
+                return cache_ctx
+            if batch.image_latent.shape[2] != 1:
                 raise ValueError(
                     "MinWM requires exactly one encoded reference latent on chunk zero"
                 )
@@ -519,7 +576,7 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
-            "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
+            "image_latent", batch.image_latent, V.none_or_tensor_with_dims(5)
         )
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)])
@@ -619,9 +676,7 @@ class MinWMCausalVaeDecodingStage(CausalVaeDecodingStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         generated_latents = batch.latents
-        if batch.block_idx == 0:
-            if batch.image_latent is None:
-                raise ValueError("MinWM decoder requires the reference latent")
+        if batch.block_idx == 0 and batch.image_latent is not None:
             batch.latents = torch.cat([batch.image_latent, generated_latents], dim=2)
         try:
             return super().forward(batch, server_args)

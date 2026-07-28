@@ -18,6 +18,7 @@ from common import (  # noqa: E402
 
 
 DRAGON_CASES = Path(__file__).with_name("cases_dragon_ride_60s_832x480.json")
+STEP1600_T2V_CASES = Path(__file__).with_name("cases_step1600_t2v_30s_832x480.json")
 
 
 def test_dragon_ride_contract_is_exactly_sixty_generated_seconds() -> None:
@@ -31,12 +32,7 @@ def test_dragon_ride_contract_is_exactly_sixty_generated_seconds() -> None:
     assert contract["chunks"] == 90
     labels = action_label_sequence(case, contract)
     assert labels == (
-        [9] * 30
-        + [18] * 30
-        + [0] * 30
-        + [9] * 30
-        + [18] * 30
-        + [0] * 210
+        [9] * 30 + [18] * 30 + [0] * 30 + [9] * 30 + [18] * 30 + [0] * 210
     )
 
     message = build_minwm_message(case, contract, Path("/tmp/dragon.png"))
@@ -51,6 +47,22 @@ def test_dragon_ride_contract_is_exactly_sixty_generated_seconds() -> None:
     assert actions[480] == actions[120]
     assert actions[600] == [0] * 8
     assert actions[-1] == [0] * 8
+
+
+def test_step1600_t2v_contract_preserves_first_regular_and_remainder_chunks() -> None:
+    manifest = load_cases(STEP1600_T2V_CASES)
+    default_contract = manifest["contract"]
+    standard = manifest["cases"][1]
+    short = manifest["cases"][2]
+
+    assert default_contract["latent_chunk_sizes"] == [1] + [4] * 45 + [1]
+    assert action_label_sequence(standard, default_contract) == (
+        [0] + [9] * 30 + [2] * 60 + [1] * 60 + [27] * 31
+    )
+    assert short["contract"]["latent_chunk_sizes"] == [1] + [4] * 40 + [1]
+    assert action_label_sequence(short, default_contract) == (
+        [0] + [27] * 40 + [1] * 40 + [2] * 40 + [36] * 41
+    )
 
 
 def test_materialize_http_first_frame_verifies_sha256(

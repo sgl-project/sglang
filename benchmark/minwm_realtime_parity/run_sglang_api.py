@@ -20,6 +20,7 @@ from common import (
     load_cases,
     materialize_first_frame,
     prompt_switch_event,
+    resolve_case_contract,
     save_video,
     sha256_file,
     write_json,
@@ -130,7 +131,7 @@ def decode_frames(header: dict, payload: bytes, previous: bytes | None):
     return frames
 
 
-async def run_case(args, case, contract, first_frame: Path):
+async def run_case(args, case, contract, first_frame: Path | None):
     import websockets
 
     if contract.get("action_output_format") == "primitive_float":
@@ -139,14 +140,11 @@ async def run_case(args, case, contract, first_frame: Path):
             * int(contract["generated_pixel_frames"])
         }
     else:
-        action_condition = {
-            "action_labels": action_label_sequence(case, contract)
-        }
+        action_condition = {"action_labels": action_label_sequence(case, contract)}
     payload = {
         "type": "init",
         "model": args.model,
         "prompt": case["prompt"],
-        "first_frame": first_frame.read_bytes(),
         "size": f"{contract['width']}x{contract['height']}",
         "fps": int(contract["fps"]),
         "seed": int(contract["seed"]),
@@ -157,6 +155,10 @@ async def run_case(args, case, contract, first_frame: Path):
         "realtime_output_format": "raw",
         "condition_inputs": action_condition,
     }
+    if first_frame is None:
+        payload["num_frames"] = int(contract["generated_pixel_frames"])
+    else:
+        payload["first_frame"] = first_frame.read_bytes()
     if args.sink_size is not None:
         payload["realtime_causal_sink_size"] = args.sink_size
     if args.kv_cache_num_frames is not None:
@@ -305,9 +307,14 @@ async def async_main(args) -> None:
     inputs = results / "inputs"
     records = []
     for case in cases:
+        case_contract = resolve_case_contract(case, contract)
         case_dir = results / "cases" / case["id"]
         case_dir.mkdir(parents=True, exist_ok=True)
-        first_frame = materialize_first_frame(case, inputs)
+        first_frame = (
+            materialize_first_frame(case, inputs)
+            if case.get("first_frame") is not None
+            else None
+        )
         warmups = []
         for warmup_index in range(args.warmup_runs):
             (
@@ -316,7 +323,7 @@ async def async_main(args) -> None:
                 _,
                 warmup_timing,
                 warmup_prompt_switch,
-            ) = await run_case(args, case, contract, first_frame)
+            ) = await run_case(args, case, case_contract, first_frame)
             warmups.append(
                 {
                     "frames": int(warmup_frames.shape[0]),
@@ -337,15 +344,15 @@ async def async_main(args) -> None:
                 flush=True,
             )
         frames, stats, request, timing, prompt_switch = await run_case(
-            args, case, contract, first_frame
+            args, case, case_contract, first_frame
         )
-        expected_frames = int(contract["reference_pixel_frames"]) + int(
-            contract["generated_pixel_frames"]
+        expected_frames = int(case_contract["reference_pixel_frames"]) + int(
+            case_contract["generated_pixel_frames"]
         )
         expected_shape = (
             expected_frames,
-            int(contract["height"]),
-            int(contract["width"]),
+            int(case_contract["height"]),
+            int(case_contract["width"]),
             3,
         )
         if frames.shape != expected_shape:
@@ -364,6 +371,7 @@ async def async_main(args) -> None:
             "chunk_stats": stats,
             "client_timing": timing,
             "prompt_switch": prompt_switch,
+            "contract": case_contract,
             "request": {
                 key: value
                 for key, value in request.items()

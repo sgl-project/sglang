@@ -21,6 +21,7 @@ MINWM_ACTION_LABELS_CONDITION = "minwm_action_labels"
 MINWM_ACTION_WEIGHTS_CONDITION = "minwm_action_weights"
 MINWM_PROMPT_UPDATED_CONDITION = "minwm_prompt_updated"
 MINWM_TOTAL_CHUNKS_CONDITION = "minwm_total_chunks"
+MINWM_TOTAL_LATENT_FRAMES_CONDITION = "minwm_total_latent_frames"
 
 
 def _minwm_native_component_names() -> tuple[str, ...]:

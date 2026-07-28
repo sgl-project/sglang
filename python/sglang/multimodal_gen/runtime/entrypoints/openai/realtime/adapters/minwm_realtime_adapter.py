@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_WEIGHTS_CONDITION,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
+    MINWM_TOTAL_LATENT_FRAMES_CONDITION,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.runtime.realtime.control_signals import (
     ControlSignalQueue,
 )
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCameraControlState
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
@@ -203,9 +205,78 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
         await save_realtime_first_frame(
             session,
             request,
-            required_error="MinWM realtime inference requires first_frame",
             cache_remote_urls=True,
         )
+        if request.first_frame is None and request.num_frames is not None:
+            total_latent_frames = self._t2v_total_latent_frames(
+                request, get_global_server_args()
+            )
+            arch_config = (
+                get_global_server_args().pipeline_config.dit_config.arch_config
+            )
+            first_block = int(arch_config.num_frame_first_block)
+            regular_block = int(arch_config.num_frames_per_block)
+            remaining = total_latent_frames - first_block
+            total_chunks = 1 + max(0, remaining + regular_block - 1) // regular_block
+            if request.max_chunks is not None and request.max_chunks != total_chunks:
+                raise ValueError(
+                    "MinWM T2V max_chunks does not match num_frames: "
+                    f"expected {total_chunks}, got {request.max_chunks}"
+                )
+            request.max_chunks = total_chunks
+
+    @staticmethod
+    def _t2v_total_latent_frames(
+        request: RealtimeVideoGenerationsRequest,
+        server_args: ServerArgs,
+    ) -> int | None:
+        num_frames_value = getattr(request, "num_frames", None)
+        if (
+            getattr(request, "first_frame", None) is not None
+            or num_frames_value is None
+        ):
+            return None
+        num_frames = int(num_frames_value)
+        temporal_factor = int(
+            server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
+        )
+        if num_frames < 1 or (num_frames - 1) % temporal_factor:
+            raise ValueError(
+                "MinWM T2V num_frames must equal "
+                f"1 + N * {temporal_factor}, got {num_frames}"
+            )
+        total_latent_frames = 1 + (num_frames - 1) // temporal_factor
+        first_block = int(
+            server_args.pipeline_config.dit_config.arch_config.num_frame_first_block
+        )
+        if total_latent_frames < first_block:
+            raise ValueError(
+                "MinWM T2V num_frames is shorter than num_frame_first_block"
+            )
+        return total_latent_frames
+
+    def get_chunk_size(
+        self,
+        session: GenerateSession,
+        server_args: ServerArgs,
+        chunk: RealtimeChunkContext,
+    ) -> int:
+        request = session.request
+        if request is None or getattr(request, "first_frame", None) is not None:
+            return super().get_chunk_size(session, server_args, chunk)
+        arch_config = server_args.pipeline_config.dit_config.arch_config
+        first_block = int(arch_config.num_frame_first_block)
+        regular_block = int(arch_config.num_frames_per_block)
+        if chunk.index == 0:
+            return first_block
+        total_latent_frames = self._t2v_total_latent_frames(request, server_args)
+        if total_latent_frames is None:
+            return regular_block
+        generated_before = first_block + (chunk.index - 1) * regular_block
+        remaining = total_latent_frames - generated_before
+        if remaining <= 0:
+            raise ValueError("MinWM T2V request exceeded num_frames")
+        return min(regular_block, remaining)
 
     def ingest_event(self, session: GenerateSession, event: RealtimeEvent) -> str:
         state = self._state(session)
@@ -262,6 +333,9 @@ class MinWMRealtimeAdapter(BaseRealtimeModelAdapter):
             )
         if request.max_chunks is not None:
             condition_inputs[MINWM_TOTAL_CHUNKS_CONDITION] = int(request.max_chunks)
+        total_latent_frames = self._t2v_total_latent_frames(request, server_args)
+        if total_latent_frames is not None:
+            condition_inputs[MINWM_TOTAL_LATENT_FRAMES_CONDITION] = total_latent_frames
         if prompt_updated:
             condition_inputs[MINWM_PROMPT_UPDATED_CONDITION] = True
         return RealtimeChunkInputs(prompt=prompt, condition_inputs=condition_inputs)

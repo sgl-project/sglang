@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minwm import (
     MINWM_ACTION_WEIGHTS_CONDITION,
     MINWM_PROMPT_UPDATED_CONDITION,
     MINWM_TOTAL_CHUNKS_CONDITION,
+    MINWM_TOTAL_LATENT_FRAMES_CONDITION,
     MinWMCausalDMDConfig,
     minwm_t5_postprocess_text,
 )
@@ -46,7 +47,11 @@ from sglang.multimodal_gen.runtime.pipelines.minwm_causal_dmd_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising import (
     MinWMCausalDMDDenoisingStage,
     MinWMCausalUniPCDenoisingStage,
+    MinWMCausalVaeDecodingStage,
     MinWMChunkLatentPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae import (
+    CausalVaeDecodingStage,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
 from sglang.multimodal_gen.tools.convert_minwm_checkpoint import (
@@ -265,6 +270,95 @@ def test_minwm_bounded_session_presamples_reference_and_full_horizon(monkeypatch
     assert torch.equal(generator.get_state(), expected_generator.get_state())
 
 
+def test_minwm_t2v_uses_first_regular_and_remainder_chunk_sizes():
+    adapter = MinWMRealtimeAdapter()
+    session = SimpleNamespace(request=SimpleNamespace(first_frame=None, num_frames=725))
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    num_frame_first_block=1,
+                    num_frames_per_block=4,
+                )
+            ),
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_temporal=4)
+            ),
+        )
+    )
+
+    assert adapter.get_chunk_size(session, server_args, SimpleNamespace(index=0)) == 1
+    assert adapter.get_chunk_size(session, server_args, SimpleNamespace(index=1)) == 4
+    assert adapter.get_chunk_size(session, server_args, SimpleNamespace(index=45)) == 4
+    assert adapter.get_chunk_size(session, server_args, SimpleNamespace(index=46)) == 1
+
+    session.request.first_frame = "/tmp/reference.png"
+    assert adapter.get_chunk_size(session, server_args, SimpleNamespace(index=0)) == 4
+
+
+def test_minwm_t2v_presamples_exact_horizon_without_reference_slot(monkeypatch):
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minwm.minwm_causal_denoising as stage_module
+
+    monkeypatch.setattr(
+        stage_module, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                num_frame_first_block=1,
+                num_frames_per_block=4,
+                out_channels=2,
+            )
+        )
+    )
+    stage = MinWMChunkLatentPreparationStage(transformer)
+    session = RealtimeSession()
+    generator = torch.Generator().manual_seed(123)
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_spatial=16)
+            )
+        )
+    )
+
+    expected_generator = torch.Generator().manual_seed(123)
+    expected = torch.randn(
+        (1, 6, 2, 1, 2), generator=expected_generator, dtype=torch.float32
+    )
+
+    def make_batch(block_idx, chunk_size):
+        return SimpleNamespace(
+            latents=None,
+            image_latent=None,
+            realtime_chunk_size=chunk_size,
+            generator=generator,
+            session=session,
+            block_idx=block_idx,
+            condition_inputs={
+                MINWM_TOTAL_CHUNKS_CONDITION: 3,
+                MINWM_TOTAL_LATENT_FRAMES_CONDITION: 6,
+            },
+            raw_latent_shape=None,
+            height=16,
+            width=32,
+            batch_size=1,
+            prompt_embeds=[torch.zeros(1, 1, 1)],
+        )
+
+    first = stage.forward(make_batch(0, 1), server_args)
+    middle = stage.forward(make_batch(1, 4), server_args)
+    final = stage.forward(make_batch(2, 1), server_args)
+    actual = torch.cat([first.latents, middle.latents, final.latents], dim=2)
+    torch.testing.assert_close(
+        actual,
+        expected.permute(0, 2, 1, 3, 4),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.equal(generator.get_state(), expected_generator.get_state())
+
+
 def test_minwm_default_kv_horizon_retains_complete_bounded_session():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
@@ -282,6 +376,7 @@ def test_minwm_default_kv_horizon_retains_complete_bounded_session():
         realtime_causal_sink_size=None,
         realtime_causal_kv_cache_num_frames=None,
         condition_inputs={MINWM_TOTAL_CHUNKS_CONDITION: 8},
+        image_latent=torch.empty(1),
     )
     pipeline_config = SimpleNamespace(
         realtime_causal_sink_size=None,
@@ -324,6 +419,7 @@ def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
         realtime_causal_sink_size=9,
         realtime_causal_kv_cache_num_frames=18,
         condition_inputs={MINWM_TOTAL_CHUNKS_CONDITION: 8},
+        image_latent=torch.empty(1),
     )
     stage._apply_causal_cache_overrides(bounded_request, server_args)
     assert stage.sink_size == 9
@@ -334,11 +430,75 @@ def test_minwm_causal_cache_overrides_do_not_leak_between_requests():
         realtime_causal_sink_size=None,
         realtime_causal_kv_cache_num_frames=None,
         condition_inputs={MINWM_TOTAL_CHUNKS_CONDITION: 8},
+        image_latent=torch.empty(1),
     )
     stage._apply_causal_cache_overrides(default_request, server_args)
     assert stage.sink_size == 0
     assert stage.sliding_window_num_frames == 33
     assert stage._minwm_unbounded_cache is True
+
+
+def test_minwm_t2v_default_kv_horizon_uses_exact_latent_count():
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(
+            arch_config=SimpleNamespace(
+                sink_size=0,
+                sliding_window_num_frames=128,
+                num_frame_first_block=1,
+            )
+        )
+    )
+    stage.sink_size = 0
+    stage.sliding_window_num_frames = 128
+    stage.num_frames_per_block = 4
+    batch = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+        condition_inputs={MINWM_TOTAL_LATENT_FRAMES_CONDITION: 182},
+        image_latent=None,
+    )
+    pipeline_config = SimpleNamespace(
+        realtime_causal_sink_size=None,
+        realtime_causal_kv_cache_num_frames=None,
+    )
+
+    stage._apply_causal_cache_overrides(
+        batch, SimpleNamespace(pipeline_config=pipeline_config)
+    )
+
+    assert stage.sliding_window_num_frames == 182
+    assert stage._minwm_unbounded_cache is True
+
+
+def test_minwm_t2v_decoder_does_not_prepend_a_reference(monkeypatch):
+    seen = []
+
+    def fake_forward(_self, batch, _server_args):
+        seen.append(batch.latents.clone())
+        return batch.latents
+
+    monkeypatch.setattr(CausalVaeDecodingStage, "forward", fake_forward)
+    stage = MinWMCausalVaeDecodingStage.__new__(MinWMCausalVaeDecodingStage)
+    generated = torch.ones(1, 2, 1, 1, 1)
+    t2v_batch = SimpleNamespace(
+        block_idx=0,
+        image_latent=None,
+        latents=generated,
+    )
+    i2v_batch = SimpleNamespace(
+        block_idx=0,
+        image_latent=torch.zeros_like(generated),
+        latents=generated,
+    )
+
+    stage.forward(t2v_batch, SimpleNamespace())
+    stage.forward(i2v_batch, SimpleNamespace())
+
+    assert seen[0].shape[2] == 1
+    assert seen[1].shape[2] == 2
+    assert t2v_batch.latents is generated
+    assert i2v_batch.latents is generated
 
 
 def test_minwm_unbounded_kv_policy_reaches_cache_allocation():
@@ -538,6 +698,7 @@ def test_minwm_converter_records_explicit_cache_policy():
     assert config["sink_size"] == 9
     assert config["sliding_window_num_frames"] == 18
     assert TRANSFORMER_CONFIG["local_attn_size"] == -1
+    assert TRANSFORMER_CONFIG["num_frame_first_block"] == 1
     with pytest.raises(ValueError, match="smaller"):
         build_transformer_config(
             local_attn_size=18,
@@ -923,9 +1084,7 @@ def test_minwm_adaln_uses_bf16_modulation_sum_and_fp32_layer_norm():
         weight=affine_weight,
         bias=affine_bias,
     )
-    torch.testing.assert_close(
-        actual_affine_norm, expected_affine_norm, rtol=0, atol=0
-    )
+    torch.testing.assert_close(actual_affine_norm, expected_affine_norm, rtol=0, atol=0)
     fp32_parameter_norm = torch.nn.functional.layer_norm(
         affine_hidden.float(),
         (affine_hidden.shape[-1],),

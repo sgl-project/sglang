@@ -115,7 +115,8 @@
       const switchMeta = item.prompt_switch
         ? ` · prompt → chunk ${item.prompt_switch.target_chunk} / frame ${item.prompt_switch.pixel_frame_boundary}`
         : ' · static prompt control';
-      card.querySelector('.case-meta').textContent = `action ${item.action_label}${switchMeta} · case ${index + 1}/${caseCount}`;
+      const actionMeta = item.trajectory ?? item.action_label;
+      card.querySelector('.case-meta').textContent = `action ${actionMeta}${switchMeta} · case ${index + 1}/${caseCount}`;
       const timeline = card.querySelector('.timeline');
       if (item.action_schedule?.length) {
         timeline.hidden = false;
@@ -129,6 +130,7 @@
         prompt_switch: item.prompt_switch,
         action_label: item.action_label,
         keys: item.keys,
+        trajectory: item.trajectory,
         action_schedule: item.action_schedule,
         baseline_video: baselinePath,
         sglang_video: candidatePath,

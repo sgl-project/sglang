@@ -50,21 +50,30 @@ def load_cases(path: str | Path) -> dict:
             f"parity manifest must contain exactly {expected_case_count} cases, "
             f"got {len(cases)}"
         )
-    if contract["generated_latent_frames"] != (
-        contract["chunks"] * contract["latent_frames_per_chunk"]
-    ):
-        raise ValueError("latent frame/chunk contract is inconsistent")
+    _validate_chunk_contract(contract)
     case_ids = {case["id"] for case in cases}
     if len(case_ids) != len(cases):
         raise ValueError("parity manifest case ids must be unique")
     for case in cases:
-        bits = action_bits(case["keys"])
+        resolved_contract = resolve_case_contract(case, contract)
+        trajectory = case.get("trajectory")
+        if trajectory is not None:
+            if case.get("action_schedule") is not None:
+                raise ValueError(
+                    f"{case['id']}: trajectory and action_schedule are mutually exclusive"
+                )
+            trajectory_action_labels(
+                trajectory,
+                expected_frames=int(resolved_contract["generated_latent_frames"]),
+            )
+            continue
+        action_bits(case["keys"])
         label = action_label(case["keys"])
         if label != case["action_label"]:
             raise ValueError(
                 f"{case['id']}: action_label={case['action_label']} does not match keys={case['keys']}"
             )
-        _validate_action_schedule(case, contract)
+        _validate_action_schedule(case, resolved_contract)
         if "action_weights" in case:
             weights = action_weights(case)
             active_keys = [key for key, value in zip(KEY_ORDER, weights) if value > 0]
@@ -103,6 +112,36 @@ def load_cases(path: str | Path) -> dict:
                 f"{mismatches}"
             )
     return manifest
+
+
+def _validate_chunk_contract(contract: dict) -> None:
+    chunk_sizes = contract.get("latent_chunk_sizes")
+    if chunk_sizes is None:
+        if contract["generated_latent_frames"] != (
+            contract["chunks"] * contract["latent_frames_per_chunk"]
+        ):
+            raise ValueError("latent frame/chunk contract is inconsistent")
+        return
+    if (
+        not isinstance(chunk_sizes, list)
+        or len(chunk_sizes) != int(contract["chunks"])
+        or any(
+            isinstance(size, bool) or not isinstance(size, int) or size < 1
+            for size in chunk_sizes
+        )
+        or sum(chunk_sizes) != int(contract["generated_latent_frames"])
+    ):
+        raise ValueError("variable latent frame/chunk contract is inconsistent")
+
+
+def resolve_case_contract(case: dict, contract: dict) -> dict:
+    resolved = dict(contract)
+    overrides = case.get("contract", {})
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{case['id']}: contract override must be an object")
+    resolved.update(overrides)
+    _validate_chunk_contract(resolved)
+    return resolved
 
 
 def _validate_prompt_switch(case: dict, contract: dict, switch: dict) -> None:
@@ -178,10 +217,7 @@ def action_bits(keys: list[str]) -> list[int]:
 
 def action_label(keys: list[str]) -> int:
     bits = action_bits(keys)
-    return (
-        TRANS_BITS_TO_LABEL[tuple(bits[:4])] * 9
-        + ROT_BITS_TO_LABEL[tuple(bits[4:])]
-    )
+    return TRANS_BITS_TO_LABEL[tuple(bits[:4])] * 9 + ROT_BITS_TO_LABEL[tuple(bits[4:])]
 
 
 def _validate_action_schedule(case: dict, contract: dict) -> None:
@@ -231,13 +267,17 @@ def _validate_action_schedule(case: dict, contract: dict) -> None:
 
 
 def action_label_sequence(case: dict, contract: dict) -> list[int]:
+    contract = resolve_case_contract(case, contract)
+    if case.get("trajectory") is not None:
+        return trajectory_action_labels(
+            case["trajectory"],
+            expected_frames=int(contract["generated_latent_frames"]),
+        )
     schedule = case.get("action_schedule")
     generated_latents = int(contract["generated_latent_frames"])
     if schedule is None:
         return [int(case["action_label"])] * generated_latents
-    pixels_per_latent = (
-        int(contract["generated_pixel_frames"]) // generated_latents
-    )
+    pixels_per_latent = int(contract["generated_pixel_frames"]) // generated_latents
     labels = []
     for segment in schedule:
         segment_latents = (
@@ -248,6 +288,42 @@ def action_label_sequence(case: dict, contract: dict) -> list[int]:
         raise ValueError(
             f"{case['id']}: action schedule produced {len(labels)} latent labels, "
             f"expected {generated_latents}"
+        )
+    return labels
+
+
+def trajectory_action_labels(trajectory: str, *, expected_frames: int) -> list[int]:
+    """Match minWM ``trajectory_str_to_action_labels`` including the leading idle."""
+    if not isinstance(trajectory, str) or not trajectory.strip():
+        raise ValueError("trajectory must be a non-empty string")
+    labels = [0]
+    for raw_segment in trajectory.split(","):
+        segment = raw_segment.strip()
+        if not segment:
+            continue
+        if "*" in segment:
+            key_expression, count_text = segment.split("*", 1)
+        elif "-" in segment:
+            key_expression, count_text = segment.split("-", 1)
+        else:
+            key_expression, count_text = segment, "1"
+        keys = [
+            key.strip().lower()
+            for key in key_expression.strip().lower().split("+")
+            if key.strip()
+        ]
+        normalized_keys = [
+            {"up": "i", "left": "j", "down": "k", "right": "l"}.get(key, key)
+            for key in keys
+        ]
+        count = int(float(count_text.strip()))
+        if count < 0:
+            raise ValueError(f"negative trajectory count in {segment!r}")
+        labels.extend([action_label(normalized_keys)] * count)
+    if len(labels) != expected_frames:
+        raise ValueError(
+            f"trajectory produced {len(labels)} latent labels, "
+            f"expected {expected_frames}"
         )
     return labels
 
@@ -338,10 +414,7 @@ def build_minwm_message(case: dict, contract: dict, first_frame: Path) -> dict:
     if use_weights and case.get("action_schedule") is not None:
         raise ValueError("scheduled primitive_float actions are not implemented")
     pixel_actions = (
-        [
-            action_weights(case)
-            for _ in range(int(contract["generated_pixel_frames"]))
-        ]
+        [action_weights(case) for _ in range(int(contract["generated_pixel_frames"]))]
         if use_weights
         else pixel_action_bits(case, contract)
     )

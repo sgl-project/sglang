@@ -10,7 +10,13 @@ from pathlib import Path
 
 import numpy as np
 
-from common import load_cases, prompt_switch_boundary, sha256_file, write_json
+from common import (
+    load_cases,
+    prompt_switch_boundary,
+    resolve_case_contract,
+    sha256_file,
+    write_json,
+)
 
 
 def write_player(results: Path, report: dict) -> None:
@@ -154,6 +160,8 @@ def main() -> None:
     }
     records = []
     for case in manifest["cases"]:
+        case_contract = resolve_case_contract(case, manifest["contract"])
+        reference_frames = int(case_contract["reference_pixel_frames"])
         case_dir = results / "cases" / case["id"]
         baseline_path = case_dir / "baseline.npy"
         sglang_path = case_dir / "sglang.npy"
@@ -161,8 +169,18 @@ def main() -> None:
         sglang = np.load(sglang_path, allow_pickle=False)
         metrics = {
             "all_frames": metric_block(baseline, sglang),
-            "reference_frame": metric_block(baseline[:1], sglang[:1]),
-            "generated_frames": metric_block(baseline[1:], sglang[1:]),
+            "reference_frame": (
+                metric_block(
+                    baseline[:reference_frames],
+                    sglang[:reference_frames],
+                )
+                if reference_frames
+                else None
+            ),
+            "generated_frames": metric_block(
+                baseline[reference_frames:],
+                sglang[reference_frames:],
+            ),
             "baseline_frames_sha256": sha256_file(baseline_path),
             "sglang_frames_sha256": sha256_file(sglang_path),
         }
@@ -224,8 +242,10 @@ def main() -> None:
         record = {
             "id": case["id"],
             "prompt": case["prompt"],
-            "action_label": case["action_label"],
-            "keys": case["keys"],
+            "action_label": case.get("action_label"),
+            "keys": case.get("keys"),
+            "trajectory": case.get("trajectory"),
+            "contract": case_contract,
             "action_schedule": case.get("action_schedule"),
             "prompt_switch": prompt_switch,
             "passed": passed,
@@ -303,7 +323,8 @@ def main() -> None:
         ssim = "n/a" if metric["ssim"] is None else f"{metric['ssim']:.8f}"
         prompt_switch = record["prompt_switch"]
         markdown.append(
-            f"| {record['id']} | {record['action_label']} | "
+            f"| {record['id']} | "
+            f"{record['action_label'] if record['action_label'] is not None else record['trajectory']} | "
             f"{'yes' if prompt_switch else 'no'} | "
             f"{prompt_switch['target_chunk'] if prompt_switch else 'n/a'} | "
             f"{metric['bitwise_equal']} | "

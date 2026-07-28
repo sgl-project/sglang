@@ -62,6 +62,7 @@ class MinWMVideoArchConfig(DiTArchConfig):
 
     local_attn_size: int = -1
     sink_size: int = 0
+    num_frame_first_block: int = 1
     num_frames_per_block: int = 4
     sliding_window_num_frames: int = 128
     action_type: str = "primitive_token_residual"
