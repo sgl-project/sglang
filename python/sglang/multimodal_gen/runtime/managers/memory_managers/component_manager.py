@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     is_text_encoder_component_name,
     is_vae_component_name,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
@@ -94,6 +95,8 @@ class ComponentResidencyPipeline(Protocol):
 def should_cpu_offload_component(
     component_name: str, module: nn.Module, server_args: ServerArgs
 ) -> bool:
+    if current_platform.is_mps():
+        return False
     if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
         return False
     if is_dit_component_name(component_name):

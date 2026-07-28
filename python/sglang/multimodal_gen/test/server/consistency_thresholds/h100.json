@@ -74,10 +74,10 @@
             "mean_abs_diff_threshold": 13.5
         },
         "zimage_image_t2i_fp8": {
-            "clip_threshold": 0.96,
-            "ssim_threshold": 0.80,
-            "psnr_threshold": 15.3,
-            "mean_abs_diff_threshold": 15.7
+            "clip_threshold": 0.97,
+            "ssim_threshold": 0.84,
+            "psnr_threshold": 18.0,
+            "mean_abs_diff_threshold": 13.0
         },
         "qwen_image_edit_2509_ti2i": {
             "clip_threshold": 0.91,
