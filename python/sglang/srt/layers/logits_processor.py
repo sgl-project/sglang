@@ -393,7 +393,7 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
-        aux_hidden_states: Optional[torch.Tensor] = None,
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion

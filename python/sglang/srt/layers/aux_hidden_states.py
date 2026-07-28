@@ -48,6 +48,10 @@ class AuxHiddenStatePacker:
         return self._buffer
 
 
+# What a model hands down the capture path: a plain list, or a packer writing in place.
+AuxHiddenStateAccumulator = Union[List[torch.Tensor], AuxHiddenStatePacker]
+
+
 def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
     if isinstance(aux_hidden_states, torch.Tensor):
         return aux_hidden_states
