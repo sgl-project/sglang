@@ -123,11 +123,14 @@ pub(super) fn sglang_frame_value(out: &ChunkEvent, rid: &str) -> serde_json::Val
     let Some(ex) = out.extras.as_deref() else {
         return v;
     };
-    if !ex.out_lp_val.is_empty() {
+    // Python (`add_logprob_to_meta_info`) always sets input+output token
+    // logprobs together, empty lists included. A PD decode node never receives
+    // input logprobs (they belong to prefill), yet its response must still
+    // carry the key — the PD router keys its merge of prefill's
+    // `input_token_logprobs` on its presence.
+    if !ex.out_lp_val.is_empty() || !ex.in_lp_val.is_empty() {
         v["meta_info"]["output_token_logprobs"] =
             logprob_tuples(&ex.out_lp_val, &ex.out_lp_idx, opt_texts(&ex.out_lp_txt));
-    }
-    if !ex.in_lp_val.is_empty() {
         v["meta_info"]["input_token_logprobs"] =
             logprob_tuples(&ex.in_lp_val, &ex.in_lp_idx, opt_texts(&ex.in_lp_txt));
     }

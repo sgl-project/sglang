@@ -40,6 +40,12 @@ impl OneOrManyItem for bool {}
 impl OneOrManyItem for i64 {}
 impl OneOrManyItem for String {}
 impl OneOrManyItem for TokenIds {}
+// Nullable elements for the PD bootstrap fields (`List[Optional[...]]` in
+// Python — the PD router sends `bootstrap_port: [null, …]` when deferring to
+// the scheduler's default port). A bare `null` never reaches `One(None)`: the
+// outer `Option<OneOrMany<…>>` field consumes it first.
+impl OneOrManyItem for Option<i64> {}
+impl OneOrManyItem for Option<String> {}
 
 mod sealed {
     /// Supertrait no downstream module can implement, sealing [`super::OneOrManyItem`].
@@ -49,6 +55,8 @@ mod sealed {
     impl SealedItem for i64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
+    impl SealedItem for Option<i64> {}
+    impl SealedItem for Option<String> {}
 }
 
 /// A msgspec `tag=True` struct: element 0 of its array is the Python class name
