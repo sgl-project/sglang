@@ -12,6 +12,7 @@ import zmq
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
@@ -52,7 +53,7 @@ class ScriptedHttpServer:
         self._dirty: Optional[str] = None
 
     @classmethod
-    def start(cls, **engine_kwargs: Any) -> "ScriptedHttpServer":
+    def start(cls, **engine_kwargs: Any) -> ScriptedHttpServer:
         out_of_band_error_path = _create_oob_error_file()
 
         ctx = zmq.Context()
@@ -89,7 +90,7 @@ class ScriptedHttpServer:
             raise RuntimeError(f"ScriptedHttpServer is dirty: {self._dirty}")
 
         fn_path = f"{script_fn.__module__}:{script_fn.__qualname__}"
-        self._socket.send_pyobj(RunScript(fn_path=fn_path, args=args))
+        sock_send(self._socket, wrap_as_pickle(RunScript(fn_path=fn_path, args=args)))
 
         if not self._socket.poll(int(timeout_s * 1000)):
             if not self._server_process.is_alive():
@@ -98,7 +99,7 @@ class ScriptedHttpServer:
             self._dirty = f"script {fn_path!r} timed out after {timeout_s}s"
             raise TimeoutError(self._dirty)
 
-        reply = self._socket.recv_pyobj()
+        reply = sock_recv(self._socket)
         match reply:
             case ScriptFailed(traceback=tb):
                 raise AssertionError(f"scripted-runtime script failed:\n{tb}")
@@ -116,7 +117,7 @@ class ScriptedHttpServer:
         fatal_error: Optional[OutOfBandError] = None
         try:
             try:
-                self._socket.send_pyobj(Shutdown())
+                sock_send(self._socket, wrap_as_pickle(Shutdown()))
             except zmq.ZMQError:
                 pass
 
@@ -139,7 +140,7 @@ class ScriptedHttpServer:
                 f"{LISTENER_ACCEPT_TIMEOUT_S}s"
             )
 
-        ready = self._socket.recv_pyobj()
+        ready = sock_recv(self._socket)
         if not isinstance(ready, HookReady):
             raise RuntimeError(
                 f"ScriptedHttpServer: expected HookReady handshake, got {ready!r}"
@@ -230,7 +231,7 @@ def _spawn_server_process(
         kv_canary="raise",
         kv_canary_real_data="partial",
         kv_canary_sweep_interval=100,
-        disable_piecewise_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
     )
     launch_kwargs.update(engine_kwargs)
     http_port = launch_kwargs["port"]

@@ -4,10 +4,13 @@ prep, denoising, decode.
 
 Cosmos3 has no separate text encoder — text is tokenized with Qwen2's chat
 template and embedded inside the transformer's UND pathway. The same
-``Cosmos3Pipeline`` serves T2V, I2V, and T2I; mode is dispatched per-request
-from ``batch.data_type`` and the presence of ``batch.preprocessed_image``.
+``Cosmos3Pipeline`` serves T2V, I2V, V2V, and T2I; mode is dispatched
+per-request from ``batch.data_type`` and the presence of
+``batch.preprocessed_image`` / ``batch.preprocessed_video``.
 """
 
+import copy
+import json
 from typing import Any
 
 import numpy as np
@@ -32,6 +35,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
+    ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODES,
+    EMBODIMENT_TO_DOMAIN_ID,
+    build_action_prompt,
+    denormalize_action,
+    get_raw_action_dim,
+    load_action_stats,
+    normalize_action,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -42,6 +56,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.vision import load_video
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -57,12 +72,40 @@ COSMOS3_IMAGE_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate images from a given prompt."
 )
 
+# Per-mode flow-shift defaults, applied only when the request and pipeline
+# config leave flow_shift unset.
+COSMOS3_T2I_FLOW_SHIFT = 3.0
+COSMOS3_I2V_FLOW_SHIFT = 10.0
+COSMOS3_T2V_FLOW_SHIFT = 10.0
+COSMOS3_V2V_FLOW_SHIFT = 10.0
+COSMOS3_ACTION_FLOW_SHIFT = 10.0
+
+
+def _resize_crop_pil(
+    image: PIL.Image.Image, target_w: int, target_h: int
+) -> PIL.Image.Image:
+    """Aspect-preserving resize then center-crop to ``target_w x target_h``."""
+    scale = max(target_w / image.width, target_h / image.height)
+    resize_w = int(np.ceil(scale * image.width))
+    resize_h = int(np.ceil(scale * image.height))
+    image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
+    left = (resize_w - target_w) // 2
+    top = (resize_h - target_h) // 2
+    return image.crop((left, top, left + target_w, top + target_h))
+
+
+def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
+    """PIL RGB → ``[3, H, W]`` float32 tensor in ``[-1, 1]``."""
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
 
 class Cosmos3ImagePreprocessStage(PipelineStage):
-    """Load, aspect-resize, and center-crop the I2V conditioning image.
+    """Load, aspect-resize, and center-crop the conditioning input.
 
-    No-op when the request has no image (T2V / T2I). The output is a
-    ``[1, 3, H, W]`` tensor in ``[-1, 1]`` written to ``batch.preprocessed_image``.
+    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
+    For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
+    No-op for T2V / T2I.
     """
 
     parallelism_type = StageParallelismType.REPLICATED
@@ -74,25 +117,88 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         image_path = batch.image_path
         if isinstance(image_path, list):
             image_path = image_path[0] if image_path else None
-        if not isinstance(image_path, str) or not image_path:
+        video_path = batch.video_path
+        if isinstance(video_path, list):
+            video_path = video_path[0] if video_path else None
+
+        if image_path and video_path:
+            raise ValueError(
+                "Cosmos3 accepts either --image-path (I2V) or --video-path "
+                "(V2V), not both"
+            )
+
+        target_h, target_w = batch.height, batch.width
+
+        if isinstance(image_path, str) and image_path:
+            image = PIL.Image.open(image_path).convert("RGB")
+            image = _resize_crop_pil(image, target_w, target_h)
+            batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
+            self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
             return batch
 
-        image = PIL.Image.open(image_path).convert("RGB")
-        target_h, target_w = batch.height, batch.width
-        scale = max(target_w / image.width, target_h / image.height)
-        resize_w = int(np.ceil(scale * image.width))
-        resize_h = int(np.ceil(scale * image.height))
-        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
-        left = (resize_w - target_w) // 2
-        top = (resize_h - target_h) // 2
-        image = image.crop((left, top, left + target_w, top + target_h))
+        if isinstance(video_path, str) and video_path:
+            frames = load_video(video_path)
+            if not frames:
+                raise ValueError(f"No frames decoded from video: {video_path!r}")
 
-        arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
-        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+            keep = (
+                getattr(batch.sampling_params, "condition_video_keep", "first")
+                or "first"
+            )
+            if keep not in ("first", "last"):
+                raise ValueError(
+                    f"condition_video_keep must be 'first' or 'last', got {keep!r}"
+                )
+            cond_indexes = self._resolve_condition_indexes(batch)
+            # Encode the full output-length video so that the latent positions
+            # we lock match what the decoder will reconstruct at those frame
+            # indices. Encoding only the first ``max_idx*4+1`` frames produces
+            # an out-of-distribution latent for the locked slots and decodes
+            # to noise.
+            num_source_frames = max(cond_indexes) * 4 + 1
+            num_target_frames = batch.num_frames
+            if keep == "last":
+                frames = frames[-num_source_frames:]
+            else:
+                frames = frames[:num_source_frames]
+            if len(frames) < num_source_frames:
+                frames = frames + [frames[-1]] * (num_source_frames - len(frames))
+            if len(frames) < num_target_frames:
+                frames = frames + [frames[-1]] * (num_target_frames - len(frames))
 
-        batch.preprocessed_image = tensor
-        self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
+            processed = [
+                _pil_to_normalized_tensor(
+                    _resize_crop_pil(f.convert("RGB"), target_w, target_h)
+                )
+                for f in frames
+            ]
+            video_tensor = torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+            batch.preprocessed_video = video_tensor
+            self.log_info(
+                f"Preprocessed conditioning video to "
+                f"{video_tensor.shape[2]}x{target_h}x{target_w} "
+                f"(keep={keep}, source frames={num_source_frames}, padded to {num_target_frames})"
+            )
+
         return batch
+
+    @staticmethod
+    def _resolve_condition_indexes(batch: Req) -> list[int]:
+        """Resolve condition_frame_indexes for V2V (default ``[0, 1]``).
+
+        Inverse-dynamics action mode conditions on the whole input video, so
+        every latent frame is locked.
+        """
+        if (
+            getattr(batch.sampling_params, "action_mode", None)
+            == ACTION_MODE_INVERSE_DYNAMICS
+        ):
+            num_latent_frames = (batch.num_frames - 1) // 4 + 1
+            return list(range(num_latent_frames))
+        cond_indexes = getattr(batch.sampling_params, "condition_frame_indexes", None)
+        if not cond_indexes:
+            return [0, 1]
+        return sorted(set(int(i) for i in cond_indexes))
 
 
 class Cosmos3TokenizationStage(PipelineStage):
@@ -207,6 +313,21 @@ class Cosmos3TokenizationStage(PipelineStage):
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
         )
 
+        # Action mode uses a structured JSON caption with neither a system
+        # prompt nor the duration suffix.
+        if getattr(batch.sampling_params, "action_mode", None) is not None:
+            prompt = build_action_prompt(
+                prompt,
+                getattr(batch.sampling_params, "action_view_point", "ego_view"),
+                num_frames,
+                fps,
+                batch.height,
+                batch.width,
+            )
+            use_system_prompt = False
+            use_duration_template = False
+            self.log_info(f"Action prompt: {prompt}")
+
         # Apply duration template if enabled (no temporal concept for T2I).
         if use_duration_template and not is_image_gen and num_frames > 1:
             duration = num_frames / fps
@@ -250,10 +371,13 @@ class Cosmos3TokenizationStage(PipelineStage):
 class Cosmos3LatentPreparationStage(PipelineStage):
     """Initialize the noisy latent for Cosmos3.
 
-    T2V / T2I produce pure Gaussian noise. I2V VAE-encodes the conditioning
-    image, replaces frame 0 of the latent with the encoded image, and stashes
-    a per-frame velocity mask plus the clean frame-0 latent for the denoiser
-    to re-inject after each scheduler step.
+    T2V / T2I produce pure Gaussian noise. I2V / V2V VAE-encode the
+    conditioning input, write the resulting latents at the conditioned
+    frame indexes, and stash a per-frame velocity mask plus the full
+    condition latent so the denoiser can re-blend after each scheduler step.
+    I2V is the special case of conditioning at frame ``[0]`` with the image
+    expanded across the temporal axis; V2V conditions at ``[0, 1]`` (or a
+    user-supplied list) with frames from the input video.
     """
 
     parallelism_type = StageParallelismType.REPLICATED
@@ -316,26 +440,55 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
-        is_i2v = (
-            batch.preprocessed_image is not None and batch.data_type == DataType.VIDEO
-        )
+        is_video_gen = batch.data_type == DataType.VIDEO
+        has_image_cond = batch.preprocessed_image is not None and is_video_gen
+        has_video_cond = batch.preprocessed_video is not None and is_video_gen
 
-        if is_i2v:
+        if has_image_cond or has_video_cond:
             vae_dtype = next(self.vae.parameters()).dtype
-            pixel_video = batch.preprocessed_image.unsqueeze(2).to(
-                device=device, dtype=vae_dtype
-            )
-            with torch.no_grad():
-                cond_latent = self._vae_encode(pixel_video).to(dtype)
 
+            if has_video_cond:
+                pixel_input = batch.preprocessed_video.to(
+                    device=device, dtype=vae_dtype
+                )
+                cond_indexes = Cosmos3ImagePreprocessStage._resolve_condition_indexes(
+                    batch
+                )
+            else:
+                pixel_input = batch.preprocessed_image.unsqueeze(2).to(
+                    device=device, dtype=vae_dtype
+                )
+                cond_indexes = [0]
+
+            with torch.no_grad():
+                cond_latent = self._vae_encode(pixel_input).to(dtype)
+
+            max_idx = max(cond_indexes)
+            if max_idx >= num_latent_frames:
+                raise ValueError(
+                    f"condition_frame_indexes={cond_indexes} exceeds the "
+                    f"latent frame count {num_latent_frames} for "
+                    f"num_frames={batch.num_frames}"
+                )
+
+            condition_latents = torch.zeros_like(noise)
             condition_mask = torch.zeros(
                 1, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
             )
-            condition_mask[:, :, 0, :, :] = 1.0
-            latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
-            batch.image_latent = cond_latent[:, :, 0:1, :, :].clone()
+            for idx in cond_indexes:
+                src = min(idx, cond_latent.shape[2] - 1)
+                condition_latents[:, :, idx, :, :] = cond_latent[:, :, src, :, :]
+                condition_mask[:, :, idx, :, :] = 1.0
+
+            latents = (
+                condition_mask * condition_latents + (1.0 - condition_mask) * noise
+            )
+            batch.extra["condition_latents"] = condition_latents
             batch.extra["velocity_mask"] = 1.0 - condition_mask
-            self.log_info("Prepared I2V latents with frame-0 conditioning")
+            mode = "V2V" if has_video_cond else "I2V"
+            self.log_info(
+                f"Prepared {mode} latents with conditioning at frames {cond_indexes}"
+            )
         else:
             latents = noise
 
@@ -347,7 +500,171 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         batch.extra["vae_scale_factor_spatial"] = vae_scale_factor_spatial
 
         self.log_info(f"Prepared latents with shape {shape}")
+
+        sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
+        if sound_duration > 0.0:
+            if not getattr(self.transformer, "sound_gen", False):
+                raise ValueError(
+                    "sound generation was requested (sound_duration > 0) but the "
+                    "loaded Cosmos3 checkpoint has no sound modality (sound_gen is "
+                    "False)."
+                )
+            sound_latent_fps = self.transformer.sound_latent_fps
+            sound_latent_frames = max(1, round(sound_duration * sound_latent_fps))
+            sound_shape = (1, self.transformer.sound_dim, sound_latent_frames)
+            batch.audio_latents = torch.randn(
+                sound_shape, generator=generator, device=device, dtype=dtype
+            )
+            self.log_info(f"Prepared sound latents with shape {sound_shape}")
+
+        action_mode = getattr(batch.sampling_params, "action_mode", None)
+        if action_mode is not None:
+            if getattr(self.transformer, "action_dim", None) is None:
+                raise ValueError(
+                    "action_mode is set but the loaded Cosmos3 checkpoint has no "
+                    "action modality (action_gen is False)."
+                )
+            self._prepare_action_latents(batch, generator, device, dtype)
         return batch
+
+    @staticmethod
+    def _resolve_domain_id(batch: Req) -> int:
+        """Resolve action embodiment domain ID; required for action generation."""
+        domain_id = getattr(batch.sampling_params, "domain_id", None)
+        if domain_id is not None:
+            domain_id = int(domain_id)
+            if domain_id < 0:
+                raise ValueError(f"domain_id must be non-negative, got {domain_id}")
+            return domain_id
+        domain_name = getattr(batch.sampling_params, "domain_name", None)
+        if domain_name:
+            key = str(domain_name).strip().lower()
+            if key not in EMBODIMENT_TO_DOMAIN_ID:
+                raise ValueError(
+                    f"Unknown action domain name {domain_name!r}. "
+                    f"Valid names: {sorted(EMBODIMENT_TO_DOMAIN_ID)}"
+                )
+            return EMBODIMENT_TO_DOMAIN_ID[key]
+        raise ValueError(
+            "Cosmos3 action generation requires --domain-id or --domain-name."
+        )
+
+    def _prepare_action_latents(
+        self,
+        batch: Req,
+        generator,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Prepare action latents and conditioning, writing them onto ``batch``.
+
+        Action tokens run at frame rate (no temporal compression), so the chunk
+        length is ``num_frames - 1`` with ``start_frame_offset=1`` so each action
+        aligns with the frame it drives.
+
+        Three modes:
+        - ``forward_dynamics``: the user supplies the action; all tokens are
+          clean conditioning (velocity mask 0) and the model predicts video.
+        - ``policy`` / ``inverse_dynamics``: actions are denoised from noise
+          (velocity mask 1); ``raw_action_dim`` is required.
+        """
+        sp = batch.sampling_params
+        mode = str(sp.action_mode).strip().lower()
+        if mode not in ACTION_MODES:
+            raise ValueError(
+                f"Unsupported action_mode={sp.action_mode!r}; "
+                f"expected one of {sorted(ACTION_MODES)}"
+            )
+        action_dim = self.transformer.action_dim
+        num_frames = batch.num_frames
+
+        action_chunk_size = num_frames - 1 if num_frames > 1 else 1
+        action_offset = 1 if action_chunk_size == num_frames - 1 else 0
+
+        domain_id = self._resolve_domain_id(batch)
+        raw_action_dim = getattr(sp, "raw_action_dim", None)
+        if raw_action_dim is None:
+            embodiment = getattr(sp, "domain_name", None)
+            if embodiment:
+                raw_action_dim = get_raw_action_dim(embodiment)
+
+        if mode == ACTION_MODE_FORWARD_DYNAMICS:
+            raw = getattr(sp, "action", None)
+            if raw is None:
+                raise ValueError(
+                    "action_mode='forward_dynamics' requires an 'action' array "
+                    "(list[list[float]] of shape [T, D])."
+                )
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            action = torch.as_tensor(np.asarray(raw), dtype=torch.float32)
+            if action.ndim == 3 and action.shape[0] == 1:
+                action = action.squeeze(0)
+            if action.ndim != 2:
+                raise ValueError(
+                    f"action must have shape [T, D], got {tuple(action.shape)}"
+                )
+            if action.shape[0] < action_chunk_size:
+                pad = action[-1:].repeat(action_chunk_size - action.shape[0], 1)
+                action = torch.cat([action, pad], dim=0)
+            elif action.shape[0] > action_chunk_size:
+                action = action[:action_chunk_size]
+            if raw_action_dim is None:
+                raw_action_dim = int(action.shape[-1])
+            stats_path = getattr(sp, "action_stats_path", None)
+            if stats_path is not None:
+                method = getattr(sp, "action_normalization", "quantile")
+                action = normalize_action(action, method, load_action_stats(stats_path))
+            if action.shape[-1] < action_dim:
+                pad = torch.zeros(action.shape[0], action_dim - action.shape[-1])
+                action = torch.cat([action, pad], dim=-1)
+            clean_action = action.to(device=device, dtype=dtype).unsqueeze(0)
+        else:
+            if raw_action_dim is None:
+                raise ValueError(f"action_mode={mode!r} requires --raw-action-dim.")
+            clean_action = torch.zeros(
+                1, action_chunk_size, action_dim, device=device, dtype=dtype
+            )
+
+        raw_action_dim = int(raw_action_dim)
+        if not 0 < raw_action_dim <= action_dim:
+            raise ValueError(
+                f"raw_action_dim must be in [1, {action_dim}], got {raw_action_dim}"
+            )
+
+        # condition_mask marks clean (given) action tokens. forward_dynamics
+        # conditions on the whole action sequence; the others denoise it fully.
+        condition_mask = torch.zeros(
+            1, action_chunk_size, 1, device=device, dtype=dtype
+        )
+        if mode == ACTION_MODE_FORWARD_DYNAMICS:
+            condition_mask[:] = 1.0
+
+        noise = torch.randn(
+            1,
+            action_chunk_size,
+            action_dim,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        noise[:, :, raw_action_dim:] = 0.0
+        clean_action[:, :, raw_action_dim:] = 0.0
+        action_latents = condition_mask * clean_action + (1.0 - condition_mask) * noise
+
+        batch.action_latents = action_latents
+        batch.extra["action_domain_ids"] = torch.tensor(
+            [domain_id], dtype=torch.long, device=device
+        )
+        batch.extra["action_velocity_mask"] = 1.0 - condition_mask
+        batch.extra["action_condition_latents"] = clean_action
+        batch.extra["raw_action_dim"] = raw_action_dim
+        batch.extra["action_start_frame_offset"] = action_offset
+        self.log_info(
+            f"Prepared action latents with shape {tuple(action_latents.shape)} "
+            f"(mode={mode}, domain_id={domain_id}, raw_action_dim={raw_action_dim}, "
+            f"start_frame_offset={action_offset})"
+        )
 
 
 class Cosmos3TimestepPreparationStage(PipelineStage):
@@ -362,9 +679,21 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def __init__(self, scheduler):
         super().__init__()
         self.scheduler = scheduler
-        self.default_flow_shift = getattr(
-            getattr(scheduler, "config", None), "flow_shift", None
-        )
+
+    def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
+        """Resolve the per-mode default flow_shift for the request.
+
+        Matches cosmos-framework's built-in per-mode sample defaults.
+        """
+        if getattr(batch.sampling_params, "action_mode", None) is not None:
+            return COSMOS3_ACTION_FLOW_SHIFT
+        if batch.data_type == DataType.IMAGE:
+            return COSMOS3_T2I_FLOW_SHIFT
+        if batch.preprocessed_image is not None:
+            return COSMOS3_I2V_FLOW_SHIFT
+        if batch.preprocessed_video is not None:
+            return COSMOS3_V2V_FLOW_SHIFT
+        return COSMOS3_T2V_FLOW_SHIFT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
@@ -374,7 +703,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         if flow_shift is None:
             flow_shift = server_args.pipeline_config.flow_shift
         if flow_shift is None:
-            flow_shift = self.default_flow_shift
+            flow_shift = self._default_flow_shift_for_mode(batch)
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
 
@@ -464,7 +793,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             compile_kwargs = {
                 "mode": "default",
                 "fullgraph": False,
-                "dynamic": True,
+                "dynamic": False,
             }
 
         gen_layers = getattr(transformer, "gen_layers", None)
@@ -502,7 +831,13 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run transformer forward pass.
 
         Args:
@@ -514,7 +849,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             fps: Video frame rate
             cache_key: Key for the UND K/V cache. Use "cond" for conditional
                 and "uncond" for unconditional to enable cache reuse across steps.
-            noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V conditioning mask.
+            noisy_frame_mask: Optional [B, 1, T, 1, 1] I2V / V2V conditioning mask.
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
@@ -529,6 +864,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                 cache_key=cache_key,
                 noisy_frame_mask=noisy_frame_mask,
                 max_text_seq_len=max_text_seq_len,
+                sound_latents=sound_latents,
+                action_latents=action_latents,
+                action_domain_ids=action_domain_ids,
+                action_noisy_mask=action_noisy_mask,
+                action_fps=action_fps,
+                action_start_frame_offset=action_start_frame_offset,
             )
 
     def _manage_device_placement(self, server_args: ServerArgs):
@@ -565,6 +906,14 @@ class Cosmos3DenoisingStage(PipelineStage):
         self._manage_device_placement(server_args)
 
         latents = batch.latents
+        sound_latents = batch.audio_latents
+        action_latents = getattr(batch, "action_latents", None)
+        action_domain_ids = batch.extra.get("action_domain_ids")
+        action_velocity_mask = batch.extra.get("action_velocity_mask")
+        action_condition_latents = batch.extra.get("action_condition_latents")
+        action_raw_dim = batch.extra.get("raw_action_dim")
+        action_start_frame_offset = batch.extra.get("action_start_frame_offset", 1)
+        action_fps = getattr(batch.sampling_params, "action_fps", None)
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
@@ -575,12 +924,28 @@ class Cosmos3DenoisingStage(PipelineStage):
         video_shape = batch.extra["video_shape"]
         fps = batch.extra.get("fps", 24.0)
         velocity_mask = batch.extra.get("velocity_mask")
-        image_latent = batch.image_latent
+        condition_latents = batch.extra.get("condition_latents")
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
 
         do_cfg = guidance_scale > 1.0
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
+        if action_latents is not None and enable_cfg_parallel:
+            raise NotImplementedError(
+                "Cosmos3 action generation does not support CFG parallel yet"
+            )
+
+        # Use separate scheduler instances for action/sound: UniPC keeps a
+        # per-call output history sized to the last sample, so video (5D),
+        # action (3D), and sound (3D) steps must not share state.
+        sound_scheduler = None
+        if sound_latents is not None:
+            sound_scheduler = copy.deepcopy(self.scheduler)
+            sound_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
+        action_scheduler = None
+        if action_latents is not None:
+            action_scheduler = copy.deepcopy(self.scheduler)
+            action_scheduler.set_timesteps(len(timesteps), device=timesteps.device)
         cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
         cfg_world_size = (
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
@@ -616,7 +981,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             enumerate(timesteps),
             total=len(timesteps),
             desc="Denoising",
-            disable=batch.is_warmup,
+            batch=batch,
         )
 
         for i, t in progress_bar:
@@ -644,6 +1009,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                         cond_text_seq_len=batch.extra["cond_text_seq_len"],
                         uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
                     )
                 elif effective_scale == 1.0:
                     noise_pred = self._run_transformer(
@@ -657,6 +1028,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                         noisy_frame_mask=velocity_mask,
                         max_text_seq_len=batch.extra["cond_text_seq_len"],
                         current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
                     )
                 else:
                     noise_pred = self._predict_noise_cfg_batched(
@@ -675,6 +1052,12 @@ class Cosmos3DenoisingStage(PipelineStage):
                             batch.extra["uncond_text_seq_len"],
                         ),
                         current_timestep=i,
+                        sound_latents=sound_latents,
+                        action_latents=action_latents,
+                        action_domain_ids=action_domain_ids,
+                        action_noisy_mask=action_velocity_mask,
+                        action_fps=action_fps,
+                        action_start_frame_offset=action_start_frame_offset,
                     )
             else:
                 noise_pred = self._run_transformer(
@@ -688,11 +1071,30 @@ class Cosmos3DenoisingStage(PipelineStage):
                     noisy_frame_mask=velocity_mask,
                     max_text_seq_len=batch.extra["cond_text_seq_len"],
                     current_timestep=i,
+                    sound_latents=sound_latents,
+                    action_latents=action_latents,
+                    action_domain_ids=action_domain_ids,
+                    action_noisy_mask=action_velocity_mask,
+                    action_fps=action_fps,
+                    action_start_frame_offset=action_start_frame_offset,
                 )
 
-            # I2V: zero-velocity at conditioned frames so the scheduler keeps
-            # them clean; UniPC's predictor-corrector still rescales the
-            # sample, so we re-inject the clean image latent below.
+            # Unpack multi-modality outputs; ordering is (video[, action][, sound]).
+            action_noise_pred = None
+            sound_noise_pred = None
+            if isinstance(noise_pred, tuple):
+                out_idx = 1
+                video_noise_pred = noise_pred[0]
+                if action_latents is not None:
+                    action_noise_pred = noise_pred[out_idx]
+                    out_idx += 1
+                if sound_latents is not None:
+                    sound_noise_pred = noise_pred[out_idx]
+                noise_pred = video_noise_pred
+
+            # I2V / V2V: zero-velocity at conditioned frames so the scheduler
+            # keeps them clean; UniPC's predictor-corrector still rescales the
+            # sample, so we re-blend the clean condition latents below.
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
@@ -703,13 +1105,53 @@ class Cosmos3DenoisingStage(PipelineStage):
                 return_dict=False,
             )[0]
 
-            if image_latent is not None:
-                latents[:, :, 0:1, :, :] = image_latent
+            if action_noise_pred is not None:
+                # Zero the velocity at conditioned (clean) action tokens and at
+                # padding dims so the scheduler only denoises the active slots,
+                # then re-blend the clean condition after the step.
+                if action_velocity_mask is not None:
+                    action_noise_pred = action_noise_pred * action_velocity_mask
+                if (
+                    action_raw_dim is not None
+                    and action_raw_dim < action_noise_pred.shape[-1]
+                ):
+                    action_noise_pred[..., action_raw_dim:] = 0.0
+                action_latents = action_scheduler.step(
+                    action_noise_pred,
+                    t,
+                    action_latents,
+                    return_dict=False,
+                )[0]
+                if (
+                    action_condition_latents is not None
+                    and action_velocity_mask is not None
+                ):
+                    action_latents = (
+                        action_velocity_mask * action_latents
+                        + (1.0 - action_velocity_mask) * action_condition_latents
+                    )
+
+            if sound_noise_pred is not None:
+                sound_latents = sound_scheduler.step(
+                    sound_noise_pred,
+                    t,
+                    sound_latents,
+                    return_dict=False,
+                )[0]
+
+            if condition_latents is not None and velocity_mask is not None:
+                latents = (
+                    velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                )
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
 
         batch.latents = latents
+        if action_latents is not None:
+            batch.action_latents = action_latents
+        if sound_latents is not None:
+            batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
 
@@ -727,7 +1169,13 @@ class Cosmos3DenoisingStage(PipelineStage):
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run CFG by stacking both branches into a batch_size=2 forward.
 
         Halves the kernel-launch count vs running cond and uncond serially.
@@ -743,8 +1191,28 @@ class Cosmos3DenoisingStage(PipelineStage):
             if noisy_frame_mask is not None
             else None
         )
+        sound_batched = (
+            torch.cat([sound_latents, sound_latents], dim=0)
+            if sound_latents is not None
+            else None
+        )
+        action_batched = (
+            torch.cat([action_latents, action_latents], dim=0)
+            if action_latents is not None
+            else None
+        )
+        action_domain_ids_batched = (
+            torch.cat([action_domain_ids, action_domain_ids], dim=0)
+            if action_domain_ids is not None
+            else None
+        )
+        action_noisy_mask_batched = (
+            torch.cat([action_noisy_mask, action_noisy_mask], dim=0)
+            if action_noisy_mask is not None
+            else None
+        )
 
-        noise_pred = self._run_transformer(
+        out = self._run_transformer(
             latents=latents_batched,
             timestep=timestep_batched,
             text_ids=text_ids_batched,
@@ -755,13 +1223,21 @@ class Cosmos3DenoisingStage(PipelineStage):
             noisy_frame_mask=mask_batched,
             max_text_seq_len=max_text_seq_len,
             current_timestep=current_timestep,
+            sound_latents=sound_batched,
+            action_latents=action_batched,
+            action_domain_ids=action_domain_ids_batched,
+            action_noisy_mask=action_noisy_mask_batched,
+            action_fps=action_fps,
+            action_start_frame_offset=action_start_frame_offset,
         )
 
-        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
-        # CFG: uncond + g·(cond − uncond).
-        return noise_pred_uncond + guidance_scale * (
-            noise_pred_cond - noise_pred_uncond
-        )
+        def _cfg_combine(pred: torch.Tensor) -> torch.Tensor:
+            uncond, cond = pred.chunk(2, dim=0)
+            return uncond + guidance_scale * (cond - uncond)
+
+        if isinstance(out, tuple):
+            return tuple(_cfg_combine(p) for p in out)
+        return _cfg_combine(out)
 
     def _predict_noise_cfg_parallel(
         self,
@@ -779,45 +1255,54 @@ class Cosmos3DenoisingStage(PipelineStage):
         cond_text_seq_len: int | None = None,
         uncond_text_seq_len: int | None = None,
         current_timestep: int | None = None,
-    ) -> torch.Tensor:
+        sound_latents: torch.Tensor | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run CFG with one branch per CFG rank, combined by all-reduce.
 
         Rank 0 runs the conditional branch and contributes ``g·cond`` to the
         sum; rank 1 runs the unconditional branch and contributes
         ``(1−g)·uncond``. The all-reduce sum is exactly the standard CFG
         result. Each rank keeps its own UND K/V cache (``"cond"`` /
-        ``"uncond"``).
+        ``"uncond"``). When sound/action modalities are present the forward
+        returns a per-modality tuple; each branch scales every modality by its
+        coefficient and the reduction combines them element-wise.
         """
         if cfg_rank == 0:
-            noise_pred = self._run_transformer(
-                latents=latents,
-                timestep=timestep,
-                text_ids=cond_text_ids,
-                text_mask=cond_text_mask,
-                video_shape=video_shape,
-                fps=fps,
-                cache_key="cond",
-                noisy_frame_mask=noisy_frame_mask,
-                max_text_seq_len=cond_text_seq_len,
-                current_timestep=current_timestep,
-            )
-            partial = guidance_scale * noise_pred
+            text_ids, text_mask, cache_key = cond_text_ids, cond_text_mask, "cond"
+            text_seq_len = cond_text_seq_len
+            coeff = guidance_scale
         else:
-            noise_pred = self._run_transformer(
-                latents=latents,
-                timestep=timestep,
-                text_ids=uncond_text_ids,
-                text_mask=uncond_text_mask,
-                video_shape=video_shape,
-                fps=fps,
-                cache_key="uncond",
-                noisy_frame_mask=noisy_frame_mask,
-                max_text_seq_len=uncond_text_seq_len,
-                current_timestep=current_timestep,
-            )
-            partial = (1.0 - guidance_scale) * noise_pred
+            text_ids, text_mask, cache_key = uncond_text_ids, uncond_text_mask, "uncond"
+            text_seq_len = uncond_text_seq_len
+            coeff = 1.0 - guidance_scale
 
-        return cfg_model_parallel_all_reduce(partial)
+        out = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key=cache_key,
+            noisy_frame_mask=noisy_frame_mask,
+            max_text_seq_len=text_seq_len,
+            current_timestep=current_timestep,
+            sound_latents=sound_latents,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_fps=action_fps,
+            action_start_frame_offset=action_start_frame_offset,
+        )
+
+        if isinstance(out, tuple):
+            return tuple(cfg_model_parallel_all_reduce(coeff * p) for p in out)
+        return cfg_model_parallel_all_reduce(coeff * out)
 
 
 class Cosmos3DecodingStage(PipelineStage):
@@ -830,12 +1315,13 @@ class Cosmos3DecodingStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def __init__(self, vae, guardrails: bool = False):
+    def __init__(self, vae, guardrails: bool = False, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
         self._latents_mean = None
         self._latents_std = None
         self._guardrails = guardrails
+        self.sound_tokenizer = sound_tokenizer
         if guardrails:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
                 _init_guardrails,
@@ -935,7 +1421,50 @@ class Cosmos3DecodingStage(PipelineStage):
         elif not is_image_gen:
             self.log_info(f"Postprocessed video tensor shape: {output.shape}")
 
+        audio = None
+        audio_sample_rate = None
+        if self.sound_tokenizer is not None and batch.audio_latents is not None:
+            if server_args.vae_cpu_offload:
+                self.sound_tokenizer.to(device)
+            with torch.no_grad():
+                decoded_audio = self.sound_tokenizer.decode(
+                    batch.audio_latents.to(device)
+                )
+            audio = decoded_audio.float().cpu()
+            audio_sample_rate = self.sound_tokenizer.sample_rate
+            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
+                self.sound_tokenizer.to("cpu", non_blocking=True)
+            self.log_info(
+                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+            )
+
+        action_pred = None
+        if getattr(batch, "action_latents", None) is not None:
+            raw_action_dim = batch.extra.get("raw_action_dim")
+            action_pred = batch.action_latents.float().cpu()
+            if raw_action_dim is not None:
+                action_pred = action_pred[:, :, :raw_action_dim]
+            stats_path = getattr(batch.sampling_params, "action_stats_path", None)
+            if stats_path is not None:
+                method = getattr(
+                    batch.sampling_params, "action_normalization", "quantile"
+                )
+                action_pred = denormalize_action(
+                    action_pred, method, load_action_stats(stats_path)
+                )
+            self.log_info(f"Action predictions shape: {tuple(action_pred.shape)}")
+
         return OutputBatch(
             output=output,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+            action_pred=action_pred,
+            action_mode=getattr(batch.sampling_params, "action_mode", None),
+            action_domain_id=getattr(batch.sampling_params, "domain_id", None),
+            action_raw_action_dim=(
+                batch.extra.get("raw_action_dim")
+                if getattr(batch, "extra", None)
+                else None
+            ),
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
         )

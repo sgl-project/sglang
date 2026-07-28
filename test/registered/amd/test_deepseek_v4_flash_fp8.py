@@ -34,27 +34,14 @@ DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: AITER indexer + triton attn + ROCm700A).
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-    "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
-    "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
-    "SGLANG_OPT_USE_AITER_INDEXER": "true",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
-    "SGLANG_ROCM_USE_MULTI_STREAM": "false",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
+    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -126,11 +113,15 @@ class TestDeepseekV4Fp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-flash-fp8)\n"
+                f"### test_gsm8k (deepseek-v4-flash-fp8, {FLASHMLA_BACKEND})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.91)
 
+    @unittest.skipIf(
+        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+    )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_flash_fp8_perf.json"
         if os.path.exists(json_output):
@@ -181,7 +172,7 @@ class TestDeepseekV4Fp8(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            "### test_perf_8k_1k (deepseek-v4-flash-fp8)",
+            f"### test_perf_8k_1k (deepseek-v4-flash-fp8, {FLASHMLA_BACKEND})",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",

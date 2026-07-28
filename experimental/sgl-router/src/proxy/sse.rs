@@ -55,10 +55,18 @@ use tokio_stream::wrappers::ReceiverStream;
 /// circuit-breaker outcome — without this hook, a worker that returns
 /// 2xx headers and then drops the stream mid-flight would stay credited
 /// as healthy.
+///
+/// # First-byte hook
+/// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
+/// the first `Ok` chunk is read from the upstream stream — i.e. time to first
+/// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
+/// arrives. `forward_streaming_to` passes a closure that records
+/// `sgl_router_ttft_seconds` for successful streaming responses.
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -78,6 +86,7 @@ where
             // underscore suppresses the "unused variable" lint while
             // keeping intent explicit.
             let _hold = stream_guards;
+            let mut on_first_byte = on_first_byte;
             let mut s = stream;
             while let Some(chunk) = s.next().await {
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
@@ -86,6 +95,15 @@ where
                     std::io::Error::other(msg)
                 });
                 let is_err_chunk = item.is_err();
+                // Fire the time-to-first-token hook on the first successful
+                // chunk from upstream. `take()` makes it fire at most once;
+                // an error-first stream never produced a token, so it's left
+                // unfired (and dropped on task end).
+                if !is_err_chunk {
+                    if let Some(hook) = on_first_byte.take() {
+                        hook();
+                    }
+                }
                 if is_err_chunk {
                     *outcome_setter.lock() = false;
                 }
@@ -142,9 +160,64 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None);
+        let body = bytes_stream_to_body(s, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn on_first_byte_fires_once_on_first_ok_chunk() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"b")),
+        ];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await.unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "first-byte hook must fire exactly once across the whole stream",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_first_byte_not_fired_when_stream_errors_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_c = Arc::clone(&fired);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![Err(std::io::Error::other(
+            "upstream failed before any token",
+        ))];
+        let s = stream::iter(chunks);
+        let body = bytes_stream_to_body(
+            s,
+            None,
+            None,
+            Some(Box::new(move || {
+                fired_c.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        let _ = body.collect().await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "first-byte hook must not fire when no Ok chunk is ever produced",
+        );
     }
 
     #[tokio::test]
@@ -154,7 +227,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None);
+        let body = bytes_stream_to_body(s, None, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -216,7 +289,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None);
+        let body = bytes_stream_to_body(s, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -239,7 +312,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None);
+        let body = bytes_stream_to_body(s, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -298,7 +371,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None);
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();

@@ -17,6 +17,15 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 │              UnifiedRadixCache                │
 │            (unified_radix_cache.py)           │
 │                                               │
+│  controller: executes all pool/host I/O and   │
+│  drains the tree's deferred Cache/Component   │
+│  Actions ("tree decides, cache executes")     │
+└──────────────────────┬────────────────────────┘
+                       ▼
+┌───────────────────────────────────────────────┐
+│               UnifiedTreeCore                 │
+│      (unified_cache/unified_tree_core.py)     │
+│                                               │
 │  root_node ──► UnifiedTreeNode (radix tree)   │
 │  components ► {ComponentType → TreeComponent} │
 │  lru_lists ─► {ComponentType → UnifiedLRUList}│
@@ -61,7 +70,10 @@ node.component_data[ComponentType.MAMBA]  # MambaComponent data
 
 | File | Contents |
 |------|----------|
-| `../unified_radix_cache.py` | `UnifiedRadixCache`, `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_radix_cache.py` | `UnifiedRadixCache` — the controller: pool/host I/O, deferred-action draining |
+| `../unified_cache/unified_tree_core.py` | `UnifiedTreeCore` — the tree, LRUs, and size counters; `UnifiedTreeNode`, `UnifiedLRUList` |
+| `../unified_cache/unified_tree_core_interface.py` | `UnifiedTreeCoreInterface`, `NodeId` — the tree/cache boundary contract |
+| `../unified_cache/cache_action.py` | Deferred `CacheAction`/`ComponentAction` types emitted by the tree |
 | `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
 | `full_component.py` | `FullComponent` — standard full-attention KV cache component |
 | `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
@@ -99,7 +111,7 @@ Find the longest cached prefix for a token sequence.
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter
    - Updates `last_access_time` with decreasing timestamps up the path (parent < child)
    - Concatenates matched device indices via `torch.cat` (concat length ≤ K, subsumed by O(K))
-   - Calls `finalize_match_result()` per component (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
+   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes the static `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
 
 ---
 
@@ -125,9 +137,8 @@ Insert a key-value pair into the tree.
      - If partially within window: **splits node** at boundary, recovers SWA on the window portion (returns `start_idx`)
      - If entirely outside window: returns `prefix_len` (no consumption)
    - Mamba: returns `prefix_len` (no consumption, default behavior)
-4. Before creating a new leaf, checks `should_skip_leaf_creation()` per component — any veto aborts leaf creation and frees remaining value
-5. Creates leaf via `_add_new_node` (clones value tensor, updates Full leaf-set tracking)
-6. Calls `commit_insert_component_data()` per component on the final target node (SWA may trigger a secondary split for window boundary; Mamba sets mamba pool indices and inserts into Mamba LRU)
+4. Creates leaf via `_add_new_node` (clones value tensor, updates Full leaf-set tracking). A leaf survives on its Full value alone, so it is materialized even when an auxiliary component holds only a tombstone for the span (e.g. the whole leaf is outside the SWA window)
+5. Calls `commit_insert_component_data()` per component on the final target node (SWA may trigger a secondary split for window boundary; Mamba sets mamba pool indices and inserts into Mamba LRU)
 
 ---
 
@@ -144,7 +155,7 @@ Free cached tokens to reclaim memory.
 | **Complexity** | **O(E·H + L)** — E = nodes evicted, H = tombstone chain height, L = locked nodes skipped in LRU scan. |
 
 **Algorithm detail:**
-1. Calls `drive_eviction()` for each component:
+1. Drives each component's walk via `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()`:
    - Full: drives eviction from `evictable_device_leaves` using `last_access_time`; only device leaves are evicted atomically
    - SWA: scans SWA LRU from tail; **internal** nodes are tombstoned (evict SWA data, keep node), **leaf** nodes are fully deleted; both trigger cascade
    - Mamba: scans Mamba LRU from tail; **internal** nodes are tombstoned, **leaf** nodes are fully deleted; both trigger cascade
@@ -200,14 +211,14 @@ Unlock a previously locked node path.
 
 ---
 
-### `cache_finished_req(req: Req, is_insert: bool = True)`
+### `cache_finished_req(req: Req, is_insert: bool = True, *, kv_len_to_handle: int)`
 
 Cache a completed request's KV data into the tree.
 
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False) |
+| **Inputs** | `req` — the finished request; `is_insert` — whether to insert (True) or just release locks (False); `kv_len_to_handle` — committed KV length supplied by the caller |
 | **Output** | `None` |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices; frees non-inserted KV indices when `is_insert=False`. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
@@ -255,14 +266,14 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
 | `create_match_validator(match_device_only=False)` | Return a per-match stateful predicate that decides whether a node is a valid match boundary. Full: requires Full device data, or host backup when `match_device_only=False`. SWA: tracks accumulated window length across device/host data. Mamba: requires Mamba device data, or host backup when `match_device_only=False`. | `_match_prefix_helper` | *abstract* |
-| `finalize_match_result()` | Post-process the match result after prefix matching completes. Full/SWA: pass-through. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool, records `branching_seqlen`. | `_match_post_processor` | pass-through |
+| `finalize_match_result_in_tree_core()` | Tree-side post-processing inside the match walk. Full/SWA: host-hit sums. Mamba: records `branching_seqlen` + the host-hit bump. | `_match_post_processor` | pass-through |
+| `finalize_match_result_in_cache()` | Static, cache-level finalize after the walk (receives the cache + NodeId-based result), dispatched class-level by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
 
 ### Insert Phase
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
 | `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_helper` | returns `prefix_len` |
-| `should_skip_leaf_creation()` | Veto leaf creation when the entire new leaf would be a tombstone for this component. SWA: vetoes if `swa_evicted_seqlen ≥ total_prefix_len + key_len`. | `_insert_helper` | `False` |
 | `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_helper` | no-op |
 | `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_helper` | no-op |
 
@@ -278,8 +289,8 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 |------|---------|-----------|----------|
 | `evict_component(target=EvictLayer.DEVICE)` | Free this component's device, host, or both resources on a node being evicted. Internal device eviction tombstones (`value = None`); host eviction clears `host_value`. Returns `(device_freed, host_freed)`. | `_evict_component_and_detach_lru` | *abstract* |
 | `eviction_priority()` | Return cascade eviction priority (higher = evicted later). Leaf: all 0. Internal: Full(2) > SWA(1) > Mamba(0). When evicting, all components with ≤ priority on the same node are cascade-evicted. | `_cascade_evict` | `0` |
-| `drive_eviction()` | Drive device eviction until the target amount is freed. Full: leaf-set heap. SWA/Mamba: component LRUs with internal tombstones and atomic leaf deletion. | `evict` | *abstract* |
-| `drive_host_eviction()` | Drive host eviction for this component. Full uses host leaves; SWA/Mamba use host LRUs. | `evict_host` | no-op |
+| `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()` | Step-wise device eviction walk the Controller drives: build the cursor/heap, return the next evictable leaf (freed values collected for the Controller to drain), clear the walk. Full: leaf-set heap. SWA/Mamba: component LRUs with internal tombstones and atomic leaf deletion. | `UnifiedRadixCache._evict_components` | *abstract* |
+| `drive_host_eviction()` | Drive host eviction for this component, collecting freed values for the Controller to drain. Full uses host leaves; SWA/Mamba use host LRUs. | `evict_host` | no-op |
 
 ### Lock Phase
 

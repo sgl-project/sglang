@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -6,7 +5,7 @@ from typing import Optional
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,6 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=450, suite="stage-b-test-1-gpu-large-amd")
 
 
 def get_server_info(base_url: str) -> dict:
@@ -42,12 +42,6 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 class TestFrozenKVMTP(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
-
-    @classmethod
-    def _server_env(cls) -> dict[str, str]:
-        env = dict(os.environ)
-        env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        return env
 
     @classmethod
     def _common_server_args(cls) -> list[str]:
@@ -110,7 +104,6 @@ class TestFrozenKVMTP(CustomTestCase):
                 "google/gemma-4-E4B-it",
                 self.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
-                env=self._server_env(),
                 other_args=self._server_args(topk),
             )
             requests.get(self.base_url + "/flush_cache", timeout=30)

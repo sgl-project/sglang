@@ -41,13 +41,16 @@ def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):
+    done = [False] * len(handles)
     for _ in range(max_steps):
-        if all(h.finished for h in handles):
+        for i, h in enumerate(handles):
+            done[i] = done[i] or h.finished
+        if all(done):
             return
         yield
     raise AssertionError(
         f"run_until_all_finished: not all reqs finished after {max_steps} "
-        f"steps (finished={[h.finished for h in handles]})"
+        f"steps (finished={done})"
     )
 
 
@@ -64,6 +67,12 @@ def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_ST
 
 
 BALLAST_MAX_NEW_TOKENS: int = 30000
+
+SMALL_KV_POOL_MAX_TOTAL_TOKENS: int = 4096
+
+SMALL_KV_POOL_BALLAST_MAX_NEW_TOKENS: int = 512
+
+SMALL_KV_POOL_BALLAST_PROMPT_LEN: int = 1536
 
 
 def exhaust_row_pool(t, *, leave_rows: int, max_steps: int = DEFAULT_MAX_STEPS):

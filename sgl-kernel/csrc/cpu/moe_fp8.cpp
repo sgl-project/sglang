@@ -126,8 +126,8 @@ void fused_experts_fp_kernel_impl(
   } else if (act_func == CPUActMethod::swiglu) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
-        clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N, alpha, limit);
-        clamp_sigmoid_and_mul_stub(ic1 + m * N + N / 2, ic0 + m * 2 * N + N, N, alpha, limit);
+        clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N / 2, alpha, limit);
+        clamp_sigmoid_and_mul_stub(ic1 + m * N + N / 2, ic0 + m * 2 * N + N, N / 2, alpha, limit);
       }
     });
   }

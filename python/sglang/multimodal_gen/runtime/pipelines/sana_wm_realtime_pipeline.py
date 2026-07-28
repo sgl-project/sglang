@@ -7,10 +7,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
 from sglang.multimodal_gen.runtime.pipelines.sana_wm_pipeline import (
     SanaWMTwoStagePipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    RealtimeInputValidationStage,
-    RealtimeTextEncodingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm import (
     SanaWMTextEncodingStage,
 )
@@ -30,6 +26,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming_refiner import (
     SanaWMStreamingRefinerStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime import (
+    RealtimeInputValidationStage,
+    RealtimeTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model

@@ -25,9 +25,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -207,10 +208,20 @@ class Eagle3MLAModel(nn.Module):
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
         self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
-        self.fc = nn.Linear(
+        self.fc = ColumnParallelLinear(
             target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
+        )
+        # Guarded multimem all-gather for the fc output; buffer covers prefill.
+        self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=True, floor=512
+            ),
+            skip_entry_sync=False,
         )
 
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
@@ -258,12 +269,13 @@ class Eagle3MLAModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:
@@ -277,7 +289,8 @@ class Eagle3MLAModel(nn.Module):
                     [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
                     dim=-1,
                 )
-            hidden_states = self.fc(hidden_states)
+            hidden_states, _ = self.fc(hidden_states)
+            hidden_states = self._fc_gatherer(hidden_states)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]

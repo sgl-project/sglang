@@ -38,6 +38,10 @@ This section provides deployment configurations optimized for different hardware
 
 <DeepSeekMathV2Deployment />
 
+<Warning>
+  DeepSeek-Math-V2 is built on DeepSeek-V3.2 and uses DSA sparse attention. All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on this model.
+</Warning>
+
 ### 3.2 Configuration Tips
 
 **Hardware Requirements:**

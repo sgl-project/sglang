@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -95,6 +96,9 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
+    if scheduler._engine_paused:
+        ctx.continue_generation()
+
     ctx._release_exhausted_pools()
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
@@ -116,8 +120,8 @@ class ScriptedSchedulerHook:
     def __init__(
         self,
         *,
-        scheduler: "Scheduler",
-        tokenizer_recv_proxy: Optional["ScriptedTokenizerRecvProxy"],
+        scheduler: Scheduler,
+        tokenizer_recv_proxy: Optional[ScriptedTokenizerRecvProxy],
     ) -> None:
         self.scheduler = scheduler
         self._is_driver = (
@@ -125,7 +129,7 @@ class ScriptedSchedulerHook:
             and scheduler.ps.tp_rank == 0
             and scheduler.ps.attn_cp_rank == 0
         )
-        self._batch_log: List["ScriptedBatchRecord"] = []
+        self._batch_log: List[ScriptedBatchRecord] = []
 
         if self._is_driver:
             ensure_script_importable(
@@ -149,9 +153,9 @@ class ScriptedSchedulerHook:
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
         try:
             yield from _drive_engine_through_warmup(self._context)
-            socket.send_pyobj(HookReady())
+            sock_send(socket, wrap_as_pickle(HookReady()))
             while True:
-                msg = socket.recv_pyobj()
+                msg = sock_recv(socket)
                 match msg:
                     case Shutdown():
                         return
@@ -164,11 +168,14 @@ class ScriptedSchedulerHook:
                         try:
                             yield from sub_gen
                         except Exception:
-                            socket.send_pyobj(
-                                ScriptFailed(traceback=traceback.format_exc())
+                            sock_send(
+                                socket,
+                                wrap_as_pickle(
+                                    ScriptFailed(traceback=traceback.format_exc())
+                                ),
                             )
                         else:
-                            socket.send_pyobj(ScriptSucceeded())
+                            sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
                     case _:
                         raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:

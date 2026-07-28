@@ -205,6 +205,8 @@ msprobe graph_visualize -tp ./problem_dump/step0 -gp ./bench_dump/step0 -o ./gra
 
 After the comparison or build task finishes, a `compare_{timestamp}.vis.db` file is created under `graph_output`.
 
+The dumped data can be used to visualize and analyze differences using tables or charts generated with visualization tools such as Matplotlib and Excel.
+
 ##### Launch TensorBoard
 
 Start TensorBoard:
@@ -304,7 +306,7 @@ After locating the divergent node (e.g., a specific Conv layer or torch API with
 - `dump_tensor_data`: Save the collected tensor data.
 - `dump.json`: Statistics for the forward data of each API or module, including names, dtype, shape, max, min, mean, L2
   norm (square root of the L2 variance), and CRC-32 when `summary_mode="md5"`.
-  See [dump.json file description](#dumpjson-file-description) for details.
+  See [dump.json file description](#dump-json-file-description) for details.
 - `dump_error_info.log`: Present only when the dump tool encountered an error and records the failure log.
 - `stack.json`: Call stacks for APIs/modules.
 - `construct.json`: Hierarchical structure description. Empty when `level=L1`.

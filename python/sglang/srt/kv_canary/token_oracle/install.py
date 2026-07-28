@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 
 def install_token_oracle_from_env(
-    *, server_args: "ServerArgs", vocab_size: int
+    *, server_args: ServerArgs, vocab_size: int
 ) -> Optional[TokenOracleManager]:
     # Must be called before create_sampler() so the factory is present when the
     # Sampler is first constructed.

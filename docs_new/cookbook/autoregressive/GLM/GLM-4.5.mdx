@@ -44,7 +44,7 @@ import { GLM45Deployment } from "/src/snippets/autoregressive/glm-45-deployment.
 
 ### 3.2 Configuration Tips
 
-- **EAGLE Speculative Decoding:** Supported for GLM-4.5/4.6. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default (`SGLANG_ENABLE_SPEC_V2=True`); set `SGLANG_ENABLE_SPEC_V2=0` to disable.
+- **EAGLE Speculative Decoding:** Supported for GLM-4.5/4.6. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable.
 - **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
 
 ## 4. Model Invocation

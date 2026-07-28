@@ -2,17 +2,18 @@ from typing import Union
 
 import torch
 
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    is_dp_attention_enabled,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import set_weight_attrs
 
 
@@ -25,8 +26,13 @@ class Mixer2RMSNormGated(MultiPlatformOp):
         eps: float = 1e-6,
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.use_attn_tp_group = is_dp_attention_enabled()
+        if self.use_attn_tp_group:
+            self.tp_size = get_parallel().attn_tp_size
+            self.tp_rank = get_parallel().attn_tp_rank
+        else:
+            self.tp_size = get_parallel().tp_size
+            self.tp_rank = get_parallel().tp_rank
         self.full_hidden_size = full_hidden_size
         self.group_size = full_hidden_size // full_n_groups
         self.per_rank_hidden_size = full_hidden_size // self.tp_size
@@ -68,7 +74,10 @@ class Mixer2RMSNormGated(MultiPlatformOp):
             if self.tp_size > 1:
                 # Compute local sum and then reduce to obtain global sum
                 local_sums = x.pow(2).sum(dim=-1, keepdim=True)
-                global_sums = tensor_model_parallel_all_reduce(local_sums)
+                if self.use_attn_tp_group:
+                    global_sums = attn_tp_all_reduce(local_sums)
+                else:
+                    global_sums = tensor_model_parallel_all_reduce(local_sums)
                 # Calculate the variance
                 count = self.tp_size * x.shape[-1]
                 variance = global_sums / count
@@ -80,7 +89,12 @@ class Mixer2RMSNormGated(MultiPlatformOp):
             redundant_tp: bool = self.n_groups % self.tp_size != 0
             if redundant_tp:
                 # To handle the general case, redundantly apply the variance
-                x = tensor_model_parallel_all_gather(x, -1)
+                if self.use_attn_tp_group:
+                    parts = [torch.empty_like(x) for _ in range(self.tp_size)]
+                    get_parallel().attn_tp_group.all_gather(x, output_tensor_list=parts)
+                    x = torch.cat(parts, dim=-1)
+                else:
+                    x = tensor_model_parallel_all_gather(x, -1)
 
             *prefix_dims, hidden_dim = x.shape
             group_count = hidden_dim // self.group_size

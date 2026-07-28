@@ -60,7 +60,9 @@ on:
 # defines must be redeclared here for the called job to see the same context.
 env:
   SGLANG_IS_IN_CI: true
-  SGLANG_ENABLE_ASYNC_ASSERT: true
+  # base-a runs the fwd-occupancy sanity kit; async-assert probes add GPU work
+  # and skew the occupancy measurement, so keep them off in that stage.
+  SGLANG_ENABLE_ASYNC_ASSERT: ${{ startsWith(inputs.self_name, 'base-a') && 'false' || 'true' }}
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}

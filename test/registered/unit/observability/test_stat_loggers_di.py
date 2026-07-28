@@ -1,5 +1,22 @@
-"""Unit tests for class-level DI on the five *MetricsCollector classes via
-ServerArgs.stat_loggers — no server, no model loading."""
+"""Pure-CPU unit tests for ``ServerArgs.stat_loggers`` DI plumbing.
+
+These tests cover the small, in-process pieces of the ``stat_loggers``
+dependency injection feature:
+
+* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
+  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
+  collector, so the existing prometheus_client backend is used unchanged.
+* ``resolve_collector_class()`` returns the registered subclass when a role
+  is present in ``stat_loggers`` and falls back to the default otherwise.
+* Without any subclass override, collectors instantiate the real
+  prometheus_client classes.
+
+The full Engine-level integration test (which boots ``sgl.Engine`` and
+verifies that emissions land on a FakeRayMetric-style recording double in
+the scheduler subprocess) lives in
+``test/registered/observability/test_metrics.py`` alongside the other
+GPU-backed metrics tests.
+"""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -25,18 +42,19 @@ from sglang.srt.observability.metrics_collector import (
 
 
 class _StubArgs:
-    """Minimal ServerArgs stand-in. Avoids triggering heavy ServerArgs import chain."""
+    """Minimal ServerArgs stand-in.
+
+    Avoids triggering the heavy real ServerArgs import chain for unit-level
+    ``resolve_collector_class`` cases.
+    """
 
     def __init__(self, stat_loggers=None):
         self.stat_loggers = stat_loggers
 
 
-# ── _gauge_cls / _counter_cls / _histogram_cls / _summary_cls override surface ──
-
-
 class TestCollectorClassAttrs(unittest.TestCase):
-    """All five collectors expose four DI hook class attrs, all defaulting to None
-    so the existing prometheus_client backend is used unchanged."""
+    """All five collectors expose four DI hook class attrs, all defaulting to
+    None so the existing prometheus_client backend is used unchanged."""
 
     def test_scheduler_collector_attrs_default_none(self):
         self.assertIsNone(SchedulerMetricsCollector._counter_cls)
@@ -60,9 +78,6 @@ class TestCollectorClassAttrs(unittest.TestCase):
         self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
 
 
-# ── resolve_collector_class helper ──
-
-
 class TestResolveCollectorClass(unittest.TestCase):
     def test_returns_default_when_server_args_none(self):
         cls = resolve_collector_class(None, "scheduler", SchedulerMetricsCollector)
@@ -81,7 +96,6 @@ class TestResolveCollectorClass(unittest.TestCase):
         self.assertIs(cls, SchedulerMetricsCollector)
 
     def test_returns_default_when_role_missing(self):
-        # Different role registered. Default still wins for "scheduler".
         class MyTokenizer(TokenizerMetricsCollector):
             pass
 
@@ -113,84 +127,13 @@ class TestResolveCollectorClass(unittest.TestCase):
         self.assertEqual(STAT_LOGGER_ROLE_EXPERT_DISPATCH, "expert_dispatch")
 
 
-# ── DI swap behavior — actually instantiate with a custom backend ──
-
-
-class _RecordingGauge:
-    """Test double that mirrors prometheus_client.Gauge constructor signature.
-    Records every instantiation so the test can assert the override took effect."""
-
-    instances = []
-
-    def __init__(self, *args, **kwargs):
-        type(self).instances.append((args, kwargs))
-
-    def labels(self, **kwargs):
-        return self
-
-    def set(self, value):
-        pass
-
-    def inc(self, amount=1):
-        pass
-
-
-class _RecordingCounter(_RecordingGauge):
-    pass
-
-
-class _RecordingHistogram(_RecordingGauge):
-    def observe(self, value):
-        pass
-
-
-class _RecordingSummary(_RecordingGauge):
-    def observe(self, value):
-        pass
-
-
-class TestDISwap(unittest.TestCase):
-    """Subclasses that set the DI hooks at class level cause the collector to
-    instantiate the test doubles instead of prometheus_client classes."""
-
-    def setUp(self):
-        _RecordingGauge.instances = []
-        _RecordingCounter.instances = []
-        _RecordingHistogram.instances = []
-        _RecordingSummary.instances = []
-
-    def test_radix_cache_di_swap(self):
-        """Smallest collector (4 metrics, Counter + Histogram) — verifies the
-        DI shim flows through both class types."""
-
-        class RaySwapRadixCache(RadixCacheMetricsCollector):
-            _counter_cls = _RecordingCounter
-            _histogram_cls = _RecordingHistogram
-
-        labels = {"cache_type": "test"}
-        RaySwapRadixCache(labels=labels)
-
-        # 4 instruments total in RadixCacheMetricsCollector:
-        # eviction_duration_seconds (H), eviction_num_tokens (C),
-        # load_back_duration_seconds (H), load_back_num_tokens (C).
-        self.assertEqual(len(_RecordingCounter.instances), 2)
-        self.assertEqual(len(_RecordingHistogram.instances), 2)
-
-    def test_expert_dispatch_di_swap(self):
-        """Smallest collector (1 Histogram metric)."""
-
-        class RaySwapExpert(ExpertDispatchCollector):
-            _histogram_cls = _RecordingHistogram
-
-        RaySwapExpert(ep_size=4)
-        self.assertEqual(len(_RecordingHistogram.instances), 1)
+class TestDefaultBackend(unittest.TestCase):
+    """Without any subclass override, collectors instantiate the real
+    prometheus_client classes; the existing behavior is unchanged."""
 
     def test_default_path_uses_prometheus_client(self):
-        """Without any subclass override, the collector instantiates the real
-        prometheus_client classes — the existing behavior is unchanged."""
         labels = {"cache_type": "test_default"}
         collector = RadixCacheMetricsCollector(labels=labels)
-        # The instruments must be real prometheus_client objects, not test doubles.
         self.assertIsInstance(collector.eviction_num_tokens, prometheus_client.Counter)
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram

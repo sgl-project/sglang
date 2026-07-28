@@ -1,9 +1,10 @@
 ---
-title: "Deployment Cookbook"
-description: "Practical defaults for choosing CPU offload, FSDP, CFG parallelism, SP, and TP in SGLang Diffusion."
+title: "Deployment and Performance Modes"
+description: "Choose CPU offload, FSDP, CFG parallelism, SP, TP, and performance-mode presets in SGLang Diffusion."
+tag: "preserve"
 ---
 
-This page gives practical defaults for choosing CPU offload, FSDP, CFG parallelism, SP, and TP.
+This page gives practical defaults for choosing `--performance-mode`, CPU offload, FSDP, CFG parallelism, SP, and TP.
 
 ## Quick Rule
 
@@ -75,7 +76,7 @@ Base the decision on available memory on the selected GPU(s).
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`speed`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset and enables `torch.compile` by default unless explicitly disabled; may OOM.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`memory`</td>
@@ -84,9 +85,13 @@ Base the decision on available memory on the selected GPU(s).
   </tbody>
 </table>
 
-`auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. Text encoder, image encoder, and other component residency still follow the offload policy unless the model marks a high-memory resident path as safe. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
+`auto` checks selected GPU memory before applying FSDP. In multi-GPU runs it uses the least available memory across selected GPUs, and only turns on FSDP automatically when doing so can replace DiT offload. Text encoder, image encoder, and other component residency still follow the offload policy unless the model marks a high-memory resident path as safe. When the model default uses CFG and the user did not set a parallelism policy, `auto` may also enable CFG parallelism. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk, and it will turn on `torch.compile` automatically unless `--enable-torch-compile false` is set explicitly.
 
 The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
+
+When `torch.compile` is enabled, `--offload-during-compile` stays on by default. During compile warmup it temporarily offloads the DiT and evicts resident non-DiT components so `max-autotune` fits on tighter-memory GPUs, then restores the configured serving residency before real traffic.
+
+Breakable CUDA graph is a separate manual opt-in for supported image pipelines. If you enable `--enable-breakable-cuda-graph`, declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
 > [!NOTE]
 > The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.

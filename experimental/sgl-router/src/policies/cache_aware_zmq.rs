@@ -10,17 +10,19 @@
 //! # Selection algorithm
 //!
 //! Given `workers` (already filtered to healthy + matching pool by the
-//! caller) and a `SelectionContext` carrying the JSON request body:
+//! caller) and a `SelectionContext` carrying the JSON request body and the
+//! ingress-precomputed routing tokens:
 //!
 //! 1. **Load-imbalance fast-path.** If `max_load - min_load >
 //!    balance_abs_threshold` AND `max_load > min_load *
 //!    balance_rel_threshold`, skip the cache lookup and pick the
 //!    lowest-load worker. This prevents one hot worker from dominating
 //!    cache-aware selection while every other worker idles.
-//! 2. **Tokenize.** Pull the prompt text out of the JSON body (`messages` or
-//!    `prompt` field), run it through the per-model tokenizer. On any
-//!    failure (no body, no tokenizer, encode error, empty tokens), fall
-//!    through to step 4 (min-load fallback).
+//! 2. **Routing tokens.** Prefer the ingress-precomputed ids
+//!    (`ctx.request_tokens()`); fall back to tokenizing the body here
+//!    (chat-encoder-aware for chat traffic, raw `prompt`/`text` otherwise)
+//!    for callers that didn't pre-tokenize. On any failure (no tokens, no
+//!    tokenizer, encode error, empty), fall through to step 4 (min-load).
 //! 3. **Hash + match.** Compute block hashes via
 //!    [`super::kv_events::compute_block_hashes`], query the shared hash tree
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
@@ -35,13 +37,12 @@
 
 use crate::config::CacheAwareConfig;
 
-use crate::discovery::ModelId;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
-use crate::tokenizer::{adapter, TokenizerRegistry};
+use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
 use std::sync::{Arc, OnceLock};
 
@@ -129,84 +130,6 @@ impl CacheAwareZmqPolicy {
         let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
         abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold
     }
-
-    /// Extract a prompt-text candidate from a JSON request body. Returns
-    /// `None` if the body isn't valid JSON or doesn't contain a routable
-    /// text field; the caller falls back to non-cache-aware routing.
-    ///
-    /// Supported shapes (in priority order):
-    ///   1. `"prompt": "..."` — `/v1/completions`-style.
-    ///   2. `"prompt": ["...", "..."]` — `/v1/completions` array form;
-    ///      concatenated with `"\n"`.
-    ///   3. `"messages": [{"content": "..."}]` — `/v1/chat/completions`
-    ///      with string content; concatenated with `"\n"`.
-    ///   4. `"messages": [{"content": [{"text": "..."}]}]` — chat with
-    ///      multimodal content blocks; text-only blocks concatenated.
-    ///   5. `"text": "..."` — SGLang `/generate` native form.
-    ///
-    /// Anything else yields `None`.
-    fn extract_prompt_text(body: &[u8]) -> Option<String> {
-        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-        if let Some(s) = v.get("prompt").and_then(|p| p.as_str()) {
-            return Some(s.to_string());
-        }
-        if let Some(arr) = v.get("prompt").and_then(|p| p.as_array()) {
-            let parts: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
-            if !parts.is_empty() {
-                return Some(parts.join("\n"));
-            }
-        }
-        if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
-            let mut buf = String::new();
-            for m in msgs {
-                match m.get("content") {
-                    Some(serde_json::Value::String(s)) => {
-                        if !buf.is_empty() {
-                            buf.push('\n');
-                        }
-                        buf.push_str(s);
-                    }
-                    Some(serde_json::Value::Array(parts)) => {
-                        for part in parts {
-                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                                if !buf.is_empty() {
-                                    buf.push('\n');
-                                }
-                                buf.push_str(t);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if !buf.is_empty() {
-                return Some(buf);
-            }
-        }
-        if let Some(s) = v.get("text").and_then(|t| t.as_str()) {
-            return Some(s.to_string());
-        }
-        None
-    }
-
-    /// Tokenize `text` for `model_id`. Returns `None` if no tokenizer is
-    /// loaded (the model_id may be misconfigured) or if encoding fails.
-    /// Errors log at debug — they degrade routing but are not fatal.
-    fn tokenize(&self, model_id: &ModelId, text: &str) -> Option<Vec<u32>> {
-        let tokenizer = self.tokenizers.get(&model_id.0)?;
-        match adapter::encode(&tokenizer, text) {
-            Ok(ids) if !ids.is_empty() => Some(ids),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::debug!(
-                    model = %model_id,
-                    error = %e,
-                    "cache-aware-zmq: tokenize failed; falling back to min-load",
-                );
-                None
-            }
-        }
-    }
 }
 
 impl Policy for CacheAwareZmqPolicy {
@@ -221,19 +144,30 @@ impl Policy for CacheAwareZmqPolicy {
             return Self::pick_min_load(workers);
         }
 
-        // 2. Extract the prompt text.
-        let body = match ctx.request_body() {
-            Some(b) if !b.is_empty() => b,
-            _ => return Self::pick_min_load(workers),
-        };
-        let Some(text) = Self::extract_prompt_text(body) else {
-            return Self::pick_min_load(workers);
+        // 2. Routing tokens. Prefer the ids computed once at ingress; fall
+        //    back to tokenizing the body here so the policy stays usable for
+        //    callers that don't pre-tokenize (e.g. unit tests). In production
+        //    the ingress always pre-tokenizes, so this is a single tokenize.
+        let fallback_ids;
+        let tokens: &[u32] = match ctx.request_tokens() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                let body = match ctx.request_body() {
+                    Some(b) if !b.is_empty() => b,
+                    _ => return Self::pick_min_load(workers),
+                };
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+                    return Self::pick_min_load(workers);
+                };
+                let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
+                    return Self::pick_min_load(workers);
+                };
+                fallback_ids = rt.ids;
+                &fallback_ids
+            }
         };
 
-        // 3. Tokenize + hash + match.
-        let Some(tokens) = self.tokenize(ctx.model(), &text) else {
-            return Self::pick_min_load(workers);
-        };
+        // 3. Hash + match.
         // Source block_size from the worker — the router can only hash
         // prompts at the block size the workers publish at. If no worker
         // has registered yet (oracle empty), cache-aware routing has no
@@ -251,9 +185,9 @@ impl Policy for CacheAwareZmqPolicy {
         // reported flag.
         let is_bigram = self.block_size_oracle.is_bigram();
         let block_hashes = if is_bigram {
-            compute_block_hashes_bigram(&tokens, block_size as usize)
+            compute_block_hashes_bigram(tokens, block_size as usize)
         } else {
-            compute_block_hashes(&tokens, block_size as usize)
+            compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
             return Self::pick_min_load(workers);
@@ -306,6 +240,10 @@ impl Policy for CacheAwareZmqPolicy {
         chosen
     }
 
+    fn needs_request_tokens(&self) -> bool {
+        true
+    }
+
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         let _ = self.metrics.set(metrics);
     }
@@ -318,6 +256,7 @@ mod tests {
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
+    use crate::tokenizer::adapter;
 
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
@@ -713,6 +652,237 @@ mod tests {
         }
     }
 
+    /// A chat-completions request on a model with a chat template must route by
+    /// the **chat-templated** tokens (BOS + role markers + content) — the tokens
+    /// the engine actually cached — not by the raw joined content. Worker w0
+    /// published its blocks under the templated tokens; only a router that
+    /// renders the same template hashes a matching query. Hashing the raw
+    /// content instead would match nothing, leaving live `overlap_blocks_sum`
+    /// at 0 for chat traffic.
+    #[test]
+    fn chat_request_routes_by_templated_tokens() {
+        let registry = tokenizer_registry_with_tiny();
+        let template = serde_json::json!({
+            "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}<|assistant|>",
+            "bos_token": "<s>",
+        });
+        registry.attach_chat_template_for_test("tiny", &template);
+
+        let messages = serde_json::json!([{"role":"user","content":"hello world hello world"}]);
+        // Engine-side blocks are keyed on tokenize(render(messages)).
+        let templated_tokens = registry.encode_chat("tiny", &messages).unwrap();
+        let block_size = 4u32;
+        let templated_hashes = compute_block_hashes(&templated_tokens, block_size as usize);
+        assert!(
+            !templated_hashes.is_empty(),
+            "templated prompt must produce at least one block"
+        );
+
+        let tree = Arc::new(HashTree::new());
+        tree.insert(
+            &KvWorkerId::new("http://w0:30000".into(), 0),
+            None,
+            &templated_hashes,
+        );
+
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(block_size),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": messages,
+        }))
+        .unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "chat request must route by chat-templated tokens to the worker holding that prefix"
+        );
+    }
+
+    /// Templated and raw-content hashings must genuinely differ, confirming
+    /// the chat-template path does real work (a no-op template would make this
+    /// assertion fail, and raw-content hashes would miss the engine's
+    /// templated blocks).
+    #[test]
+    fn chat_templated_hashes_differ_from_raw_content_hashes() {
+        let registry = tokenizer_registry_with_tiny();
+        let template = serde_json::json!({
+            "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}<|assistant|>",
+            "bos_token": "<s>",
+        });
+        registry.attach_chat_template_for_test("tiny", &template);
+        let content = "hello world hello world";
+        let messages = serde_json::json!([{"role":"user","content":content}]);
+
+        let templated = registry.encode_chat("tiny", &messages).unwrap();
+        let raw = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
+        assert_ne!(
+            compute_block_hashes(&templated, 4),
+            compute_block_hashes(&raw, 4),
+            "templated and raw-content block hashes must differ"
+        );
+    }
+
+    /// The DeepSeek-V4 built-in encoder is dispatched for chat requests when a
+    /// model has it (no Jinja template). The query tokens come from the V4
+    /// encoder, so a worker holding that encoded prefix is matched. (The V4
+    /// markers aren't special tokens in the tiny fixture, but the dispatch +
+    /// routing wiring is what's under test; byte-exact V4 token parity is pinned
+    /// by `dsv4`'s string goldens and validated live.)
+    #[test]
+    fn chat_request_routes_via_dsv4_encoder() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_encoder_for_test("tiny", crate::tokenizer::ChatEncoder::DeepSeekV4);
+        assert!(registry.has_chat_encoder("tiny"));
+
+        let messages =
+            serde_json::json!([{"role":"user","content":"hello world hello world hello world"}]);
+        let encoded = registry.encode_chat("tiny", &messages).unwrap();
+        let block_size = 4u32;
+        let hashes = compute_block_hashes(&encoded, block_size as usize);
+        assert!(!hashes.is_empty());
+
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(block_size),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({ "messages": messages })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "dsv4 chat request must route by the V4-encoded prefix"
+        );
+    }
+
+    /// Helper: a tree holding `content`'s RAW-tokenized block hashes on w0, the
+    /// two workers, and a policy — the fixture the raw-fallback routing tests
+    /// share. Returns (policy, workers, model).
+    fn raw_prefix_fixture(
+        registry: Arc<TokenizerRegistry>,
+        content: &str,
+    ) -> (CacheAwareZmqPolicy, Vec<Arc<Worker>>, ModelId) {
+        let raw_tokens = adapter::encode(&registry.get("tiny").unwrap(), content).unwrap();
+        let hashes = compute_block_hashes(&raw_tokens, 4);
+        assert!(
+            !hashes.is_empty(),
+            "raw content must produce at least one block"
+        );
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        );
+        let workers = vec![
+            worker("http://w0:30000", "tiny"),
+            worker("http://w1:30000", "tiny"),
+        ];
+        (policy, workers, ModelId("tiny".into()))
+    }
+
+    /// Graceful degradation: a model that HAS a chat template whose render fails
+    /// (here it always raises) must fall back to hashing the RAW content and
+    /// still route by prefix — not error, not blindly min-load. Exercises the
+    /// `request_tokens_for` fall-through that the leaf `encode_chat`-returns-None
+    /// tests don't reach at the routing level.
+    #[test]
+    fn chat_render_failure_falls_back_to_raw_routing() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ raise_exception('boom') }}",
+                "bos_token": "<s>",
+            }),
+        );
+        let content = "hello world hello world hello world";
+        let (policy, workers, model) = raw_prefix_fixture(registry, content);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": content}],
+        }))
+        .unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "a failed template render must degrade to raw-content routing"
+        );
+    }
+
+    /// A chat request on a model WITHOUT a chat template routes by the raw
+    /// joined `messages[*].content` — the common config where the model ships
+    /// no `chat_template`. Covers the `request_tokens_for` path that skips the
+    /// template block entirely for a `messages` body.
+    #[test]
+    fn chat_on_template_less_model_routes_by_raw_content() {
+        let registry = tokenizer_registry_with_tiny(); // no template attached
+        assert!(!registry.has_chat_encoder("tiny"));
+        let content = "hello world hello world hello world";
+        let (policy, workers, model) = raw_prefix_fixture(registry, content);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": content}],
+        }))
+        .unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000");
+    }
+
+    /// A `/v1/completions` (`prompt`) request on a model that DOES have a chat
+    /// template must still use the raw path — the template applies only to
+    /// `messages` traffic. Guards the `messages`-presence gate in
+    /// `request_tokens_for`.
+    #[test]
+    fn completions_prompt_on_templated_model_uses_raw_path() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
+                "bos_token": "<s>",
+            }),
+        );
+        let content = "hello world hello world hello world";
+        let (policy, workers, model) = raw_prefix_fixture(registry, content);
+        // `prompt` body (no `messages`) -> raw path, so it matches the raw tree.
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": content })).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000");
+    }
+
     /// Two workers both hold the prefix; the lower-load one wins.
     #[test]
     fn tie_break_by_lowest_active_load() {
@@ -910,11 +1080,18 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000");
     }
 
+    /// Byte-slice helper over the shared `extract_prompt_text_from_value` free
+    /// function, so the extraction-shape tests below stay terse.
+    fn extract_prompt_text(body: &[u8]) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+        crate::policies::extract_prompt_text_from_value(&v)
+    }
+
     /// Chat completions shape with `messages[*].content` string.
     #[test]
     fn extract_prompt_chat_string_content() {
         let body = br#"{"model":"x","messages":[{"role":"user","content":"hello"}]}"#;
-        let s = CacheAwareZmqPolicy::extract_prompt_text(body).unwrap();
+        let s = extract_prompt_text(body).unwrap();
         assert_eq!(s, "hello");
     }
 
@@ -922,7 +1099,7 @@ mod tests {
     #[test]
     fn extract_prompt_chat_block_content() {
         let body = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":"x"}]}]}"#;
-        let s = CacheAwareZmqPolicy::extract_prompt_text(body).unwrap();
+        let s = extract_prompt_text(body).unwrap();
         assert_eq!(s, "hi");
     }
 
@@ -930,7 +1107,7 @@ mod tests {
     #[test]
     fn extract_prompt_completions_array() {
         let body = br#"{"prompt":["a","b","c"]}"#;
-        let s = CacheAwareZmqPolicy::extract_prompt_text(body).unwrap();
+        let s = extract_prompt_text(body).unwrap();
         assert_eq!(s, "a\nb\nc");
     }
 
@@ -938,7 +1115,7 @@ mod tests {
     #[test]
     fn extract_prompt_sglang_text_field() {
         let body = br#"{"text":"abc"}"#;
-        let s = CacheAwareZmqPolicy::extract_prompt_text(body).unwrap();
+        let s = extract_prompt_text(body).unwrap();
         assert_eq!(s, "abc");
     }
 
@@ -946,7 +1123,7 @@ mod tests {
     #[test]
     fn extract_prompt_unknown_shape_returns_none() {
         let body = br#"{"frobnicate":42}"#;
-        assert!(CacheAwareZmqPolicy::extract_prompt_text(body).is_none());
+        assert!(extract_prompt_text(body).is_none());
     }
 
     /// Lifecycle: removing a worker from the tree via `clear_worker`
@@ -992,5 +1169,100 @@ mod tests {
         let _g2 = w0.load_guard();
         let chosen2 = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen2.url, "http://w1:30000");
+    }
+
+    /// `request_tokens_for` flags chat-encoder output as engine-equivalent (safe
+    /// to forward to the engine as `input_ids`): the ids match what the engine
+    /// tokenizes from its own chat template.
+    #[test]
+    fn request_tokens_chat_encoder_is_engine_equivalent() {
+        let registry = tokenizer_registry_with_tiny();
+        registry.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
+                "bos_token": "<s>",
+            }),
+        );
+        let messages = serde_json::json!([{"role":"user","content":"hello world"}]);
+        let expected = registry.encode_chat("tiny", &messages).unwrap();
+
+        let model = ModelId("tiny".into());
+        let value = serde_json::json!({ "model": "tiny", "messages": messages });
+        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        assert!(
+            rt.engine_equivalent,
+            "chat-encoder ids must be engine-equivalent"
+        );
+        assert_eq!(rt.ids, expected);
+    }
+
+    /// `request_tokens_for` on the raw-prompt path (no chat encoder) is NOT
+    /// engine-equivalent — the engine would still apply its template, so the
+    /// router's raw ids must not be forwarded as `input_ids`.
+    #[test]
+    fn request_tokens_raw_prompt_not_engine_equivalent() {
+        let registry = tokenizer_registry_with_tiny(); // no template attached
+        assert!(!registry.has_chat_encoder("tiny"));
+        let model = ModelId("tiny".into());
+        let value = serde_json::json!({ "prompt": "hello world" });
+        let rt = request_tokens_for(&registry, &model, &value).expect("tokens");
+        assert!(!rt.engine_equivalent);
+        assert!(!rt.ids.is_empty());
+    }
+
+    /// `request_tokens_for` returns `None` when there is no routable prompt
+    /// field — the handler then forwards nothing and the engine tokenizes as
+    /// usual.
+    #[test]
+    fn request_tokens_none_for_unroutable_body() {
+        let registry = tokenizer_registry_with_tiny();
+        let model = ModelId("tiny".into());
+        let value = serde_json::json!({ "frobnicate": 42 });
+        assert!(request_tokens_for(&registry, &model, &value).is_none());
+    }
+
+    /// `select` consumes the ingress-precomputed tokens and does NOT
+    /// re-tokenize the body: the body here tokenizes to an unrelated prefix
+    /// (which the tree does not hold), but the ctx tokens point at w0's cached
+    /// prefix, so w0 wins. If `select` re-tokenized the body it would miss and
+    /// fall back to min-load (w1).
+    #[test]
+    fn select_prefers_ingress_tokens_over_body() {
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let tree_ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&tree_ids, 4);
+        assert!(!hashes.is_empty());
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // Load w0 so a min-load fallback would pick w1 — distinguishes "used
+        // ctx tokens (w0)" from "re-tokenized the body and missed (w1)".
+        let _g = w0.load_guard();
+        let _g2 = w0.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        // Body tokenizes to an unrelated prefix the tree does NOT hold.
+        let body = serde_json::to_vec(&serde_json::json!({"prompt":"zzz unrelated"})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body)).with_request_tokens(Some(&tree_ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "select must use ctx tokens (w0's prefix), not re-tokenize the body"
+        );
     }
 }

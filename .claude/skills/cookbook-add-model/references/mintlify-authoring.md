@@ -61,9 +61,12 @@ table is a live reference.
 - **Tool-call follow-up on thinking models**: the final assistant turn may put text in
   `reasoning_content` instead of (or with) `content` — print both so the output isn't a
   misleading `None`.
-- **Every runnable block** is immediately followed by `**Output Example:**` + a
-  ` ```text Output ` block with **real** server output (verbatim, not paraphrased).
-  `Pending update...` is acceptable only with the user's explicit acknowledgement.
+- **§3 commands and outputs are collapsible (required)**: every runnable example
+  lives in an `<Accordion title="… (Python)">` and its **real** server output
+  (verbatim, not paraphrased) in an immediately following
+  `<Accordion title="Example Output">` — match the DeepSeek-V4 §3 pattern. No
+  inline `**Output Example:**` headings / bare blocks. `Pending update...` is
+  acceptable only with the user's explicit acknowledgement.
 - **Do not hardcode sampling params** (`temperature`, `top_p`) in sample code — SGLang
   uses `generation_config.json` defaults. Listing "Recommended generation" in §1 is fine.
 - Format raw API objects (`ChatCompletionMessage(...)`) into readable Reasoning /
@@ -83,6 +86,12 @@ table is a live reference.
     model name + intent — e.g. `Deploy <Model> with SGLang — …` — aim for ~150–160 chars, and
     pack secondary keywords (variants + sizes, `Mixture-of-Experts` / architecture, target
     GPUs). Phrase it as a value prop, not a generic "`<Model>` is a … model" intro.
+- **No `mode:` on a model page.** Leave it unset so Mintlify renders the default layout
+  *with* the right-hand "On this page" table of contents — every model page relies on this.
+  `mode: wide` drops that ToC; it's only for the category `intro.mdx` card-grid landing pages
+  (which have no ToC by design). The Deploy/Playground panels don't need the extra width —
+  they self-cap at `maxWidth: 900px` and center, which fits the default column fine. (Symptom
+  of a stray `mode: wide`: the page loses its right-hand ToC while its siblings keep theirs.)
 - Frontmatter MUST be the first thing in the file — no comment or blank line before the
   opening `---`.
 

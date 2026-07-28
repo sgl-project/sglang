@@ -31,7 +31,7 @@ _OTHER_ARGS = [
     '{"enable_multithread_load": true, "num_threads": 64}',
 ]
 if not is_in_amd_ci():
-    _OTHER_ARGS += ["--mem-frac", "0.7"]
+    _OTHER_ARGS += ["--mem-frac", "0.85"]
 
 
 class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):

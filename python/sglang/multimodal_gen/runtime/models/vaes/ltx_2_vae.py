@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional, Tuple, Union
 
 import torch
@@ -11,7 +12,38 @@ from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbedding
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelConv3d,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    split_height_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    should_run_spatial_shard_parallel_decode,
+)
+
+
+@lru_cache(maxsize=128)
+def _is_channels_last_3d_stride(size: tuple[int, ...], stride: tuple[int, ...]) -> bool:
+    if len(size) != 5:
+        return False
+
+    expected_stride = 1
+    for dim in (1, 4, 3, 2, 0):
+        if size[dim] == 0:
+            return True
+        if size[dim] == 1:
+            continue
+        if stride[dim] != expected_stride:
+            return False
+        expected_stride *= size[dim]
+    return True
 
 
 class PerChannelRMSNorm(nn.Module):
@@ -87,6 +119,42 @@ class LTX2VideoCausalConv3d(nn.Module):
             padding_mode=spatial_padding_mode,
         )
 
+    def _weight_is_channels_last_3d(self) -> bool:
+        w = self.conv.weight
+        return hasattr(torch, "channels_last_3d") and _is_channels_last_3d_stride(
+            tuple(w.size()), tuple(w.stride())
+        )
+
+    def _causal_temporal_pad_channels_last(
+        self,
+        x: torch.Tensor,
+        left: int,
+        right: int,
+        left_pad: Optional[torch.Tensor] = None,
+        right_pad: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Build the temporally-padded tensor directly in channels_last_3d so the
+        # cuDNN NDHWC conv path is preserved. The single allocate-and-copy_ does
+        # double duty (replication pad + layout fix) and avoids the expensive
+        # contiguous->channels_last reconversion that repeat()+concatenate()
+        # would otherwise force on the decode hot path. Numerically identical to
+        # the repeat/concatenate path (replicate-edge == repeat-edge frame).
+        b, c, t, h, w = x.shape
+        out = torch.empty(
+            (b, c, t + left + right, h, w),
+            dtype=x.dtype,
+            device=x.device,
+            memory_format=torch.channels_last_3d,
+        )
+        out[:, :, left : left + t].copy_(x)
+        if left:
+            out[:, :, :left].copy_(x[:, :, :1] if left_pad is None else left_pad)
+        if right:
+            out[:, :, left + t :].copy_(
+                x[:, :, -1:] if right_pad is None else right_pad
+            )
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -95,13 +163,13 @@ class LTX2VideoCausalConv3d(nn.Module):
         cache_key: Optional[str] = None,
     ) -> torch.Tensor:
         time_kernel_size = self.kernel_size[0]
+        use_channels_last_pad = (
+            hidden_states.dim() == 5 and self._weight_is_channels_last_3d()
+        )
 
         if causal:
-            if (
-                conv_cache is not None
-                and cache_key is not None
-                and time_kernel_size > 1
-            ):
+            left, right = time_kernel_size - 1, 0
+            if conv_cache is not None and cache_key is not None and left:
                 # Streaming: prepend the previous chunk's last (k-1) frames of the
                 # PADDED conv input (first chunk: replicate frame 0, the "sink"),
                 # then store the last (k-1) frames of THIS padded input for the next
@@ -110,37 +178,81 @@ class LTX2VideoCausalConv3d(nn.Module):
                 # stride 1 keeps the output T invariant.
                 prev = conv_cache.get(cache_key)
                 if prev is None:
-                    pad_left = hidden_states[:, :, :1, :, :].repeat(
-                        (1, 1, time_kernel_size - 1, 1, 1)
-                    )
+                    if use_channels_last_pad:
+                        hidden_states = self._causal_temporal_pad_channels_last(
+                            hidden_states, left, right
+                        )
+                    else:
+                        pad_left = hidden_states[:, :, :1, :, :].repeat(
+                            (1, 1, left, 1, 1)
+                        )
+                        hidden_states = torch.concatenate(
+                            [pad_left, hidden_states], dim=2
+                        )
                 else:
                     pad_left = prev.to(
                         device=hidden_states.device, dtype=hidden_states.dtype
                     )
-                hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+                    if use_channels_last_pad:
+                        hidden_states = self._causal_temporal_pad_channels_last(
+                            hidden_states, left, right, left_pad=pad_left
+                        )
+                    else:
+                        hidden_states = torch.concatenate(
+                            [pad_left, hidden_states], dim=2
+                        )
                 conv_cache[cache_key] = (
-                    hidden_states[:, :, -(time_kernel_size - 1) :, :, :]
-                    .detach()
-                    .clone()
+                    hidden_states[:, :, -left:, :, :].detach().clone()
                 )
             else:
-                pad_left = hidden_states[:, :, :1, :, :].repeat(
-                    (1, 1, time_kernel_size - 1, 1, 1)
-                )
-                hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
+                if use_channels_last_pad:
+                    hidden_states = self._causal_temporal_pad_channels_last(
+                        hidden_states, left, right
+                    )
+                else:
+                    pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, left, 1, 1))
+                    hidden_states = torch.concatenate([pad_left, hidden_states], dim=2)
         else:
-            pad_left = hidden_states[:, :, :1, :, :].repeat(
-                (1, 1, (time_kernel_size - 1) // 2, 1, 1)
-            )
-            pad_right = hidden_states[:, :, -1:, :, :].repeat(
-                (1, 1, (time_kernel_size - 1) // 2, 1, 1)
-            )
-            hidden_states = torch.concatenate(
-                [pad_left, hidden_states, pad_right], dim=2
-            )
+            left = right = (time_kernel_size - 1) // 2
+
+            if use_channels_last_pad:
+                hidden_states = self._causal_temporal_pad_channels_last(
+                    hidden_states, left, right
+                )
+            else:
+                pad_left = hidden_states[:, :, :1, :, :].repeat((1, 1, left, 1, 1))
+                parts = [pad_left, hidden_states]
+                if right:
+                    parts.append(
+                        hidden_states[:, :, -1:, :, :].repeat((1, 1, right, 1, 1))
+                    )
+                hidden_states = torch.concatenate(parts, dim=2)
 
         hidden_states = self.conv(hidden_states)
         return hidden_states
+
+
+def _make_spatial_parallel_conv3d(conv: nn.Conv3d) -> SpatialParallelConv3d:
+    spatial_conv = SpatialParallelConv3d(
+        in_channels=conv.in_channels,
+        out_channels=conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+    )
+    spatial_conv.weight = conv.weight
+    spatial_conv.bias = conv.bias
+    return spatial_conv
+
+
+def _enable_ltx_decoder_spatial_parallel(decoder: nn.Module) -> None:
+    for module in decoder.modules():
+        if isinstance(module, LTX2VideoCausalConv3d) and type(module.conv) is nn.Conv3d:
+            module.conv = _make_spatial_parallel_conv3d(module.conv)
 
 
 # Like LTXVideoResnetBlock3d, but uses new causal Conv3d, normal Conv3d for the conv_shortcut, and the spatial padding
@@ -1535,26 +1647,45 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config, "timestep_conditioning", False
         )
         use_ltx23_video_decoder = (
-            str(getattr(config.arch_config, "video_decoder_variant", "ltx_2"))
-            == "ltx_2_3"
+            str(config.arch_config.video_decoder_variant) == "ltx_2_3"
         )
+        use_ltx23_condition_encoder = (
+            str(config.arch_config.video_encoder_variant) == "ltx_2_3_condition"
+        )
+        self._use_ltx23_condition_encoder = use_ltx23_condition_encoder
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
 
-        self.encoder = LTX2VideoEncoder3d(
-            in_channels,
-            latent_channels,
-            block_out_channels,
-            down_block_types,
-            spatio_temporal_scaling,
-            layers_per_block,
-            downsample_type,
-            patch_size,
-            patch_size_t,
-            resnet_norm_eps,
-            encoder_causal,
-            encoder_spatial_padding_mode,
-        )
+        if use_ltx23_condition_encoder:
+            from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
+                LTX23VideoConditionEncoder,
+            )
+
+            video_encoder_config = dict(
+                config.arch_config.video_encoder_config
+                or config.arch_config.video_decoder_config
+            )
+            if not video_encoder_config:
+                raise ValueError(
+                    "LTX-2.3 condition video encoder requires video_encoder_config "
+                    "or video_decoder_config."
+                )
+            self.encoder = LTX23VideoConditionEncoder(video_encoder_config)
+        else:
+            self.encoder = LTX2VideoEncoder3d(
+                in_channels,
+                latent_channels,
+                block_out_channels,
+                down_block_types,
+                spatio_temporal_scaling,
+                layers_per_block,
+                downsample_type,
+                patch_size,
+                patch_size_t,
+                resnet_norm_eps,
+                encoder_causal,
+                encoder_spatial_padding_mode,
+            )
 
         if use_ltx23_video_decoder:
             video_decoder_config = dict(config.arch_config.video_decoder_config)
@@ -1608,6 +1739,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         latents_std = torch.ones((latent_channels,), requires_grad=False)
         self.register_buffer("latents_mean", latents_mean, persistent=True)
         self.register_buffer("latents_std", latents_std, persistent=True)
+        self._spatial_parallel_decode_enabled = False
+        if can_install_spatial_shard_parallel_decode(self.config):
+            _enable_ltx_decoder_spatial_parallel(self.decoder)
+            self._spatial_parallel_decode_enabled = True
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
         # to perform decoding of a single video latent at a time.
@@ -1638,6 +1773,12 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         self.tile_sample_stride_height = 448
         self.tile_sample_stride_width = 448
         self.tile_sample_stride_num_frames = 8
+
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.config, z)
+        )
 
     def enable_tiling(
         self,
@@ -1684,6 +1825,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         )
 
     def _encode(self, x: torch.Tensor, causal: Optional[bool] = None) -> torch.Tensor:
+        if self._use_ltx23_condition_encoder:
+            return self.encoder(x)
+
         batch_size, num_channels, num_frames, height, width = x.shape
 
         if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
@@ -1713,6 +1857,18 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 The latent representations of the encoded videos. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
+        if self._use_ltx23_condition_encoder:
+            if self.use_slicing and x.shape[0] > 1:
+                encoded_slices = [
+                    self._encode(x_slice, causal=causal) for x_slice in x.split(1)
+                ]
+                h = torch.cat(encoded_slices)
+            else:
+                h = self._encode(x, causal=causal)
+            if not return_dict:
+                return (h,)
+            return DecoderOutput(sample=h)
+
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [
                 self._encode(x_slice, causal=causal) for x_slice in x.split(1)
@@ -1754,7 +1910,24 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         ):
             return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
-        dec = self.decoder(z, temb, causal=causal)
+        if self._should_use_spatial_parallel_decode(z):
+            expected_height = (
+                z.shape[-2] * self.config.arch_config.spatial_compression_ratio
+            )
+            z, expected_height = split_height_for_parallel_decode(
+                z,
+                expected_height=expected_height,
+                world_size=get_decode_parallel_world_size(),
+                rank=get_decode_parallel_rank(),
+            )
+            dec = gather_and_trim_height(
+                self.decoder(z, temb, causal=causal), expected_height
+            )
+        elif self._spatial_parallel_decode_enabled:
+            with disable_spatial_parallel_decode():
+                dec = self.decoder(z, temb, causal=causal)
+        else:
+            dec = self.decoder(z, temb, causal=causal)
 
         if not return_dict:
             return (dec,)

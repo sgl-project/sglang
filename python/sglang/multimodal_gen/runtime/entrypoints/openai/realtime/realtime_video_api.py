@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_output_a
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timing import (
+from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.timer import (
     RealtimeStageTimer,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -181,7 +181,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             adapter.on_chunk_complete(session, result)
             if pending_send_task is not None:
                 await pending_send_task
-            if batch.realtime_output_pacing:
+            if getattr(batch, "realtime_output_pacing", False):
                 await _send_output_and_log(
                     ws,
                     session,
@@ -306,7 +306,7 @@ async def _wait_for_realtime_output_slot(
     batch: "Req",
     result,
 ) -> float:
-    if not batch.realtime_output_pacing:
+    if not getattr(batch, "realtime_output_pacing", False):
         return 0.0
 
     frame_count = _result_num_frames(result)
