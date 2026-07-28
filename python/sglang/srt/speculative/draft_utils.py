@@ -1,5 +1,3 @@
-import logging
-
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -9,8 +7,6 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class DraftBackendFactory:
@@ -374,10 +370,9 @@ class DraftBackendFactory:
         return AscendAttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
-        logger.warning(
-            "flashmla prefill backend is not yet supported for draft extend."
-        )
-        return None
+        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+        return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_dsv4_prefill_backend(self):
         # On NPU the "dsv4" backend resolves to the Ascend V4 subclass; its

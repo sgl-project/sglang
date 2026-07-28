@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
@@ -566,7 +566,7 @@ def bench_lock_unlock(
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
         r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        if r.last_device_node != env.tree.root_node:
+        if r.last_device_node != env.tree.root_node_handle():
             nodes.append(r.last_device_node)
     if not nodes:
         return BenchResult("lock_unlock", 0, 0, 0, [])
@@ -643,7 +643,6 @@ def bench_cache_finished(
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
-        req.kv_committed_freed = False
         if hasattr(lr, "swa_uuid_for_lock"):
             req.swa_uuid_for_lock = lr.swa_uuid_for_lock
         env.rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
@@ -656,7 +655,9 @@ def bench_cache_finished(
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(req, is_insert=True),
+        lambda req: env.tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.kv_committed_len
+        ),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,
