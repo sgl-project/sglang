@@ -1,7 +1,7 @@
 //! TokenizerManager — owns the request lifecycle across two isolated threads:
 //!
 //!   * [`ingress`] — drives the ingress FSM (Received → Validating →
-//!     Normalizing → {Tokenizing | Queued}) and pushes tokenized requests to the
+//!     Normalizing → {Tokenizing | PreSendValidating}) and pushes tokenized requests to the
 //!     scheduler ring.
 //!   * [`egress`] — drains the scheduler-output ring and routes each chunk to
 //!     the owning detokenizer shard.
@@ -14,7 +14,7 @@ mod egress;
 mod ingress;
 
 pub use egress::{ActivityCounter, Egress};
-pub use ingress::Ingress;
+pub use ingress::{Ingress, Limits};
 
 use crate::ids::RidHash;
 use crate::message::{DetokMsg, Request};
@@ -33,21 +33,61 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
 pub enum TmEvent {
     /// A freshly received request from the API server.
     Ingress(Request),
-    /// A request back from the tokenizer pool: `Queued` (ids filled) on success,
+    /// A request back from the tokenizer pool: `PreSendValidating` (ids filled) on success,
     /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),
-    /// Client disconnected: forwarded to the scheduler as an `AbortReq` so
-    /// generation stops instead of running to EOS. Carries the rid *string* —
-    /// the scheduler wire needs it and it can't be recovered from the hashed
-    /// `RidHash` (which `on_abort` re-derives via `RidHash::from_rid`).
-    Abort(String),
 }
 
 /// Producer-side handles, cloned into every stage that needs to emit.
+/// Client-visible rids currently in flight. Shared by the api server (which
+/// admits a rid) and ingress (which releases it once its abort has taken effect).
+pub type LiveRids = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Who asked for an abort — which decides who releases the rid.
+///
+/// The registry entry must have exactly ONE owner. `AbortGuard` is that owner: it
+/// releases a rid directly when the request finished naturally, and delegates to
+/// [`Ingress::on_abort`](crate::tokenizer_manager::ingress::Ingress) for a rid it
+/// aborted, so the release lands after the deregister and the ring push rather
+/// than after the mere enqueue.
+///
+/// The detokenizer also issues aborts (a failed request, a decoder error, a full
+/// sink), and those must NOT release: the handler's guard is still armed and still
+/// owns the entry. Releasing there admitted a retry while the original guard was
+/// live, and the guard's later abort — or its later release — then tore the retry
+/// down or opened a second admission slot for a third request that overwrote its
+/// detok sink.
+#[derive(Clone, Debug)]
+pub enum AbortSource {
+    /// From an `AbortGuard` drop. Owns the release.
+    Guard(String),
+    /// From a detokenizer terminal path. Aborts the scheduler work; releases nothing.
+    Detok(String),
+}
+
+impl AbortSource {
+    pub fn rid(&self) -> &str {
+        match self {
+            Self::Guard(rid) | Self::Detok(rid) => rid,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Senders {
     /// → TokenizerManager ingress loop.
     pub tm: flume::Sender<TmEvent>,
+    /// → the same loop, but UNBOUNDED and abort-only.
+    ///
+    /// Aborts cannot share the bounded inbox. `try_send` there drops them exactly
+    /// when they matter most — under overload — leaving the scheduler generating
+    /// for a dead connection; and the caller then faces a false choice between
+    /// releasing the rid (a live entry can be overwritten by a resubmit) and
+    /// holding it (a permanent leak). An unbounded lane removes the dilemma: an
+    /// abort is a small `String` and is always accepted, so releases can be
+    /// unconditional again. It cannot grow without bound in practice — one entry
+    /// per in-flight request, each already bounded by the inbox that admitted it.
+    pub abort: flume::Sender<AbortSource>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
     pub tok: flume::Sender<Request>,
     /// → Detokenizer shards, indexed by `RidHash::shard(detok.len())`.

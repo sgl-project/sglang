@@ -20,6 +20,7 @@ import msgspec
 
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
+    compute_num_reserved_tokens,
     msgpack_decode_explained,
 )
 from sglang.srt.utils.flatten import (
@@ -61,6 +62,19 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
+        # `TokenizerManager` merges these under each request's own sampling params
+        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
+        # manager wholesale — so honouring the flag is not implemented here yet.
+        # Refuse rather than run: silently dropping it means generating with
+        # sampling the operator did not configure, and `/get_model_info` would go on
+        # advertising values no request ever receives.
+        if server_args.preferred_sampling_params:
+            raise ValueError(
+                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
+                "(the Python TokenizerManager merges it into every request; the rust "
+                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
+                "drop --preferred-sampling-params and send those values per request."
+            )
         http_addr = f"{server_args.host}:{server_args.port}"
         launch_cores, server_cores = cls._partition_cores()
 
@@ -171,19 +185,18 @@ class RustServer:
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
-        Fan the batch out into per-request chunks and push each into the Rust
-        egress ring (-> detokenizer shard -> client stream). Each chunk is a
-        ``(header, data)`` pair, mirroring the ingress ``input_ids`` split so the
+        Push the WHOLE batch into the Rust egress ring as one frame (-> detokenizer
+        shards -> client streams), mirroring the ingress ``input_ids`` split so the
         bulk numeric columns never go through msgpack:
 
-          - ``header``: msgpack ``ChunkHeader`` positional array — scalars
-            (``rid, seq, token_ids, finish_reason, prompt_tokens``) plus the shape
-            metadata (``out_lp_n, in_lp_n`` element counts for the flat logprob
-            columns, and the per-position ``lens`` vectors for the ragged / hidden
-            columns).
+          - ``header``: msgpack ``BatchHeader`` positional array — the per-request
+            scalar columns (``rids, finish_reasons, prompt_tokens, tok_lens``) plus
+            the shape metadata for the optional families (``*_lens`` element counts
+            for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
+            and hidden ones).
           - ``data``: the raw little-endian numeric buffer — every column is a
             4-byte element (``f32`` values, ``i32`` indices), concatenated in the
-            order the Rust ``decode_chunk_frame`` reads them.
+            order the Rust ``for_each_chunk`` reads them.
 
         Logprobs are columnar: output families are per-step deltas, input
         (prefill) families ride once on the first chunk. Ragged families (top-k,
@@ -208,7 +221,8 @@ class RustServer:
 
         # Runs on the scheduler's CUDA-launch thread every decode step, so each
         # Python-level pass over the batch costs inter-token latency: `rids` are
-        # the plain rid strings (parsed to u64 on the Rust side, off the GIL),
+        # the plain rid strings (hashed to a routing key on the Rust side with a
+        # per-process seed, off the GIL — not parsed; a rid is any string),
         # `finished_reasons` already `dict | None`, and `output_ids` entries are
         # always `array("i")` (never None) so `map(len)` and a bare
         # `chain.from_iterable` stay in C.
@@ -218,7 +232,7 @@ class RustServer:
         flat_ids = array("i", chain.from_iterable(output_ids))
 
         # Column order here MUST match BatchHeader (header_cols) and
-        # decode_batch_frame's read order (data_cols); the extras contribution
+        # for_each_chunk's read order (data_cols); the extras contribution
         # is ordered by the `extras` tuple below.
         header_cols = [rids, finish_reasons, prompt_tokens, tok_lens]
         data_cols = [flat_ids.tobytes()]
@@ -226,7 +240,7 @@ class RustServer:
         if has_extra:
             # The `extras` tuple is the SINGLE source of the extras column
             # order — it must match the Rust ``BatchHeader`` fields and
-            # ``decode_batch_frame``'s read order.
+            # ``for_each_chunk``'s read order.
             #
             # TODO(perf): the per-request flatten assumes the logprob/hidden
             # columns are ragged, non-contiguous nested Python lists — which is
@@ -310,6 +324,11 @@ class RustServer:
         # the package — stamped here so the rust endpoint can serve them
         # statically (no scheduler round-trip).
         server_args["version"] = __version__
+        # Not a `server_args` field: `TokenizerManager` derives it, and the rust
+        # ingress needs the same number for its total-token check.
+        server_args["num_reserved_tokens"] = compute_num_reserved_tokens(
+            scheduler.server_args
+        )
         server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")

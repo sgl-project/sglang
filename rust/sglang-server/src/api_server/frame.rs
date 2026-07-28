@@ -58,8 +58,17 @@ fn ragged_logprob_tuples(
         if l == 0 {
             positions.push(serde_json::Value::Null);
         } else {
+            // Bounds-checked like `hidden_states_rows`: a header whose `lens` run
+            // past the value buffer would otherwise panic the api thread on an
+            // out-of-range index.
             let tuples: Vec<serde_json::Value> = (off..off + l)
-                .map(|j| serde_json::json!([lp_value(vals[j]), idxs[j], text_slot(texts, j)]))
+                .filter_map(|j| {
+                    Some(serde_json::json!([
+                        lp_value(*vals.get(j)?),
+                        *idxs.get(j)?,
+                        text_slot(texts, j)
+                    ]))
+                })
                 .collect();
             positions.push(serde_json::Value::Array(tuples));
         }
@@ -75,27 +84,14 @@ fn hidden_states_rows(vals: &[f32], lens: &[u32]) -> serde_json::Value {
     let mut off = 0usize;
     for &l in lens {
         let l = l as usize;
-        rows.push(serde_json::json!(&vals[off..(off + l).min(vals.len())]));
+        // `get`, not a clamped index: clamping only the END leaves `off` past
+        // `vals.len()` after one over-long row, making the next range reversed
+        // (`start > end`) — which panics on the api thread rather than yielding
+        // an empty row. Same reasoning as the egress decoder's `take_f32`.
+        rows.push(serde_json::json!(vals.get(off..off + l).unwrap_or(&[])));
         off += l;
     }
     serde_json::Value::Array(rows)
-}
-
-/// Classify a terminal finish reason: `Some((code, message))` when it's an `abort`
-/// carrying a `status_code` (a scheduler request error, e.g. over-context → 400).
-/// Both unary + streaming paths inspect this instead of treating `Done` as normal.
-pub(super) fn abort_status(finish_reason: &Option<serde_json::Value>) -> Option<(u16, String)> {
-    let fr = finish_reason.as_ref()?;
-    if fr.get("type").and_then(|t| t.as_str()) != Some("abort") {
-        return None;
-    }
-    let code = fr.get("status_code").and_then(|s| s.as_u64())? as u16;
-    let message = fr
-        .get("message")
-        .and_then(|m| m.as_str())
-        .unwrap_or("request aborted")
-        .to_string();
-    Some((code, message))
 }
 
 /// The `{ "error": { message, code } }` object every error path emits (an SSE
@@ -497,38 +493,6 @@ mod tests {
         assert_eq!(opt_texts(&t), Some(t.as_slice()));
     }
 
-    /// The shared classifier both paths use: a validation abort yields its
-    /// `(code, message)` (the streaming path turns this into an SSE error event
-    /// instead of a normal `Done` frame); anything else yields `None`.
-    #[test]
-    fn abort_status_extracts_code_and_message() {
-        let (code, msg) = abort_status(&Some(serde_json::json!({
-            "type": "abort", "message": "over the limit", "status_code": 400
-        })))
-        .expect("validation abort → (code, message)");
-        assert_eq!(code, 400);
-        assert_eq!(msg, "over the limit");
-        // Normal finish, bare abort (no status), and no finish → not an error.
-        assert!(abort_status(&Some(serde_json::json!({"type": "stop"}))).is_none());
-        assert!(abort_status(&Some(serde_json::json!({"type": "abort"}))).is_none());
-        assert!(abort_status(&None).is_none());
-    }
-
-    /// A normal finish, a bare abort (no status), and no finish are not errors
-    /// (the unary path returns them as a 200 result frame).
-    #[test]
-    fn non_error_finishes_stay_ok() {
-        assert!(abort_status(&Some(serde_json::json!({"type": "stop", "matched": 5}))).is_none());
-        assert!(abort_status(&Some(serde_json::json!({"type": "length", "length": 8}))).is_none());
-        assert!(
-            abort_status(&Some(
-                serde_json::json!({"type": "abort", "message": "Aborted"})
-            ))
-            .is_none()
-        );
-        assert!(abort_status(&None).is_none());
-    }
-
     /// The memoized cumulative fast path must emit **byte-identical** JSON to the
     /// `serde_json::Value` builder it replaces — same keys, same alphabetical order
     /// (`Map` is a `BTreeMap`; no `preserve_order`), same escaping. Covers unicode
@@ -567,7 +531,10 @@ mod tests {
                 token_ids: vec![9],
                 completion_tokens: 1,
                 prompt_tokens: 128,
-                finish_reason: Some(serde_json::json!({"type": "stop", "matched": 9})),
+                finish_reason: serde_json::from_value(
+                    serde_json::json!({"type": "stop", "matched": 9}),
+                )
+                .expect("finish reason must parse"),
                 ..Default::default()
             },
         ];

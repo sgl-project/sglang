@@ -16,14 +16,14 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::fsm::Event;
-use crate::message::{Request, RequestKind};
+use crate::message::{Request, RequestKind, TokenIds};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
 pub trait TextTokenizer: Send + Sync {
-    fn encode(&self, text: &str) -> Result<Vec<i32>, Error>;
+    fn encode(&self, text: &str) -> Result<TokenIds, Error>;
 }
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
@@ -101,7 +101,7 @@ impl DynamoTokenizer {
 }
 
 impl TextTokenizer for DynamoTokenizer {
-    fn encode(&self, text: &str) -> Result<Vec<i32>, Error> {
+    fn encode(&self, text: &str) -> Result<TokenIds, Error> {
         if text.is_empty() {
             // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
             // not the misleading 500 a tokenize error would give.
@@ -138,7 +138,7 @@ impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
             // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success.
+            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
             let event = {
                 let RequestKind::Generate(g) = &mut req.kind else {
                     tracing::error!("tokenizer pool received a non-generate request");

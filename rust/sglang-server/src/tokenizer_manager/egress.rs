@@ -70,11 +70,52 @@ impl Runnable for Egress {
                     for b in buckets.iter_mut() {
                         b.clear();
                     }
-                    let ok = for_each_chunk(body, |ev| {
+                    let decoded = for_each_chunk(body, |ev| {
                         buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
                     });
-                    if !ok {
-                        tracing::warn!("egress: bad batch frame");
+                    // Routing only fills the buckets; nothing is delivered until the
+                    // sends below. So dropping them here makes rejection atomic for
+                    // free: a frame whose columns drifted would otherwise deliver the
+                    // requests decoded before the bad one, carrying another request's
+                    // logprobs — the corruption the decoder's bounds checks exist to
+                    // prevent. Better a lost frame than a silently wrong one.
+                    if !decoded.ok {
+                        // Dropping the frame keeps wrong data off the wire, but a
+                        // request whose chunk was in it would otherwise wait forever:
+                        // mid-stream it gets a hole, and if its FINAL chunk was here
+                        // it never sees `Done` and the connection hangs — there is no
+                        // server-side timeout. Fail from the HEADER's rids, not the
+                        // buckets: a frame that fails at request 0 buckets nothing,
+                        // so bucket-driven cleanup would leave every request in it
+                        // hanging.
+                        // Distinguish "failed N requests" from "named nobody": a
+                        // frame whose header would not decode at all yields no rids,
+                        // so nothing downstream fails and every request in it waits
+                        // forever. That is the case worth paging on, and it used to
+                        // log the same line as the recoverable one.
+                        if decoded.rids.is_empty() {
+                            tracing::error!(
+                                "egress: bad batch frame named NO rids; any request in \
+                                 it will hang (header undecodable, or empty rid column)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                rids = decoded.rids.len(),
+                                "egress: bad batch frame; failing its requests"
+                            );
+                        }
+                        for b in buckets.iter_mut() {
+                            b.clear();
+                        }
+                        for id in decoded.rids {
+                            // 500, not 400: the client's request was fine — the
+                            // scheduler's own output frame was not.
+                            let _ = self.senders.detok[id.shard(shards)].send(DetokMsg::Fail {
+                                rid_hash: id,
+                                message: "internal error: malformed scheduler output frame".into(),
+                            });
+                        }
+                        continue;
                     }
                     for (i, b) in buckets.iter_mut().enumerate() {
                         if b.is_empty() {
