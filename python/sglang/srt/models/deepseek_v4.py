@@ -73,7 +73,6 @@ from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
-    dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
@@ -321,6 +320,30 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+
+
+def _tbo_collective_sizes(
+    rank_sizes: List[int], attn_tp_size: int
+) -> Tuple[List[int], List[int]]:
+    if attn_tp_size < 1 or len(rank_sizes) % attn_tp_size != 0:
+        raise ValueError(f"Invalid TBO topology: {len(rank_sizes)=}, {attn_tp_size=}")
+
+    dp_sizes = []
+    tp_sizes = []
+    for start in range(0, len(rank_sizes), attn_tp_size):
+        replicas = rank_sizes[start : start + attn_tp_size]
+        if any(size != replicas[0] for size in replicas):
+            raise ValueError(f"TBO token counts differ within attention TP: {replicas}")
+        if replicas[0] % attn_tp_size != 0:
+            raise ValueError(
+                f"TBO token count {replicas[0]} is not divisible by "
+                f"attention TP size {attn_tp_size}"
+            )
+        dp_sizes.append(replicas[0])
+        tp_sizes.extend([replicas[0] // attn_tp_size] * attn_tp_size)
+    return dp_sizes, tp_sizes
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -2170,7 +2193,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
@@ -2731,17 +2753,14 @@ class DeepseekV4DecoderLayer(nn.Module):
     # op_dispatch/op_combine. op_mhc_* and op_attn are reused (local hidden).
     # ------------------------------------------------------------------
     def op_gather_a(self, state):
-        # Launch the all_gatherv (local hidden -> global buffer) + the input_ids
-        # replicate-gather on the shared comm stream; record an event.
+        # Launch the all_gatherv (local hidden -> global buffer) on the shared
+        # comm stream; record an event.
         fb = state.forward_batch
         local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
-        # Shared-expert-local: compute on LOCAL hidden before the gather; added
-        # back after the combine (same as the non-fused forward). Skipped in the
-        # global MoE via skip_shared_experts.
+        # A TP1 shared expert is replicated, so compute it before the gather and
+        # add it after the reducing combine.
         do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
+            self.mlp.shared_experts is not None and self.mlp._shared_expert_tp1
         )
         state.do_shared_local = do_shared_local
         state.shared_local = (
@@ -2758,14 +2777,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         global_hidden = get_tbo_persistent_buffer(
             ("gh", sub), global_rows, local.shape[1], local.dtype, local.device
         )
+        attn_tp_size = get_parallel().attn_tp_size
+        local_shard = local.tensor_split(attn_tp_size)[
+            get_parallel().attn_tp_rank
+        ].contiguous()
+        tp_sizes = fb._tbo_tp_sizes
+        assert local_shard.shape[0] == tp_sizes[get_tp_group().rank_in_group]
         comm = get_dp_tbo_comm_stream()
         compute = torch.cuda.current_stream()
         with torch.cuda.stream(comm):
             comm.wait_stream(compute)
-            dp_gather_partial(global_hidden, local, fb)
+            get_tp_group().all_gatherv(
+                local_shard, sizes=tp_sizes, output=global_hidden
+            )
             state.gather_event = _tbo_event(("gather", sub))
             state.gather_event.record(comm)
-        state.gather_keepalive = local
+        state.gather_keepalive = local_shard
         state.global_hidden = global_hidden
 
     def op_gather_b(self, state):
@@ -2803,7 +2830,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.combine_event = dp_reduce_scatterv_async(
             local_out,
             global_out,
-            get_dp_global_num_tokens(),
+            state.forward_batch._tbo_tp_sizes,
             event_key=("combine", state.tbo_subbatch_index),
         )
         state.local_out = local_out
@@ -2949,14 +2976,20 @@ class DeepseekV4Model(nn.Module):
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
         TBO). We additionally restrict to prefill (EXTEND), single PP, and
-        non-CP paths supported by the DSV4 op strategy.
+        non-CP paths supported by the DSV4 op strategy. The non-EP strategy
+        uses variable-size DP collectives and therefore requires CP1,
+        multi-rank DP, and SUM_LEN padding.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
         path_ok = not dsa_use_prefill_cp(forward_batch) and (
-            not _is_hip
-            or not get_moe_a2a_backend().is_none()
-            or get_parallel().attn_dp_size > 1
+            not get_moe_a2a_backend().is_none()
+            or (
+                get_parallel().attn_cp_size == 1
+                and get_parallel().attn_dp_size > 1
+                and forward_batch.dp_padding_mode is not None
+                and forward_batch.dp_padding_mode.is_sum_len()
+            )
         )
         return (
             is_tbo_enabled()
@@ -3009,6 +3042,7 @@ class DeepseekV4Model(nn.Module):
         if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
             tp_group = get_tp_group()
             world = tp_group.world_size
+            attn_tp_size = get_parallel().attn_tp_size
             children = forward_batch.tbo_children
             local_lens = torch.tensor(
                 [int(c.tbo_padded_len) for c in children],
@@ -3022,19 +3056,22 @@ class DeepseekV4Model(nn.Module):
             )
             tp_group.all_gather_into_tensor(gathered, local_lens)
             gathered_cpu = gathered.tolist()
-            rank = tp_group.rank_in_group
+            dp_rank = get_parallel().attn_dp_rank
+            attn_tp_rank = get_parallel().attn_tp_rank
             for idx, child in enumerate(children):
-                sizes = [gathered_cpu[r][idx] for r in range(world)]
-                child.global_num_tokens_cpu = sizes
-                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
-                child.global_dp_buffer_len = sum(sizes)
+                rank_sizes = [gathered_cpu[r][idx] for r in range(world)]
+                dp_sizes, tp_sizes = _tbo_collective_sizes(rank_sizes, attn_tp_size)
+                child.global_num_tokens_cpu = dp_sizes
+                child.global_num_tokens_gpu = gathered[::attn_tp_size, idx].contiguous()
+                child.global_dp_buffer_len = sum(dp_sizes)
+                child._tbo_tp_sizes = tp_sizes
                 # Gather the ubatch's input_ids -> global ONCE here (cached on the
                 # child) instead of per-layer in op_gather_a. The hash MoE reads
                 # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
                 # VARYING size (-> RCCL registers a new internal buffer per size ->
                 # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
                 local_ids = child.input_ids
-                rows = sizes[rank]
+                rows = dp_sizes[dp_rank]
                 if local_ids.shape[0] < rows:
                     padded_ids = local_ids.new_zeros((rows,))
                     padded_ids[: local_ids.shape[0]] = local_ids
@@ -3042,10 +3079,15 @@ class DeepseekV4Model(nn.Module):
                     padded_ids = local_ids[:rows]
                 else:
                     padded_ids = local_ids
+                local_ids_shard = padded_ids.tensor_split(attn_tp_size)[
+                    attn_tp_rank
+                ].contiguous()
                 gids = torch.empty(
-                    (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
+                    (sum(dp_sizes),),
+                    dtype=local_ids.dtype,
+                    device=local_ids.device,
                 )
-                tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
+                tp_group.all_gatherv(local_ids_shard, sizes=tp_sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
         outputs_arr = execute_overlapped_operations(
@@ -3308,7 +3350,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
