@@ -130,8 +130,9 @@ The AOT filter will change from `sgl-kernel/**` to
 documentation and legal files.
 
 Because the destination is currently covered by broad main-package and JIT
-kernel globs, those filters will gain explicit AOT exclusions. The intended
-matrix is:
+kernel globs, those filters will use segment-level extglobs that omit `aot`.
+Standalone negative rules are not sufficient under the default `some`
+predicate used by `dorny/paths-filter`. The intended matrix is:
 
 | Changed path | AOT jobs | JIT jobs | General Python jobs |
 | --- | --- | --- | --- |
@@ -140,8 +141,8 @@ matrix is:
 | `kernels/ops/**` | no | yes | as currently defined |
 | shared workflow/build logic | according to its existing component contract | according to its existing component contract | according to its existing component contract |
 
-The filter order and negative-pattern syntax will be checked against the
-semantics supported by `dorny/paths-filter`.
+The extglob syntax will be checked against the picomatch semantics used by
+`dorny/paths-filter`.
 
 ## Migration Mechanics
 

@@ -144,15 +144,24 @@ Use this AOT source pattern everywhere a component filter currently uses
 
 - [ ] **Step 2: Prevent broad main and JIT filters from claiming AOT-only changes**
 
-Append this negative pattern after each broad
-`python/sglang/kernels/**` pattern used for JIT detection:
+Replace the broad main-package source rule with:
 
 ```yaml
-- "!python/sglang/kernels/aot/**"
+- "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+- "python/sglang/kernels/!(*.md)"
+- "python/sglang/kernels/!(aot)/**/!(*.md)"
 ```
 
-Append the same negative pattern after the broad `python/sglang/**` main-package
-pattern. Preserve existing workflow-trigger paths for shared CI files.
+Replace the broad JIT source rule with:
+
+```yaml
+- "python/sglang/kernels/!(*.md)"
+- "python/sglang/kernels/!(aot)/**"
+```
+
+Do not use a standalone negative pattern: `dorny/paths-filter` uses the
+`some` predicate by default, under which a broad positive match still selects
+the component. Preserve existing workflow-trigger paths for shared CI files.
 
 - [ ] **Step 3: Update CUDA wheel build and artifact paths**
 
