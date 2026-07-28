@@ -895,9 +895,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=component_actions,
             )
         if self.enable_hicache and not self.is_write_back:
-            action = self._build_incremental_component_backup_action(
-                state.target_node
-            )
+            action = self._build_incremental_component_backup_action(state.target_node)
             if action is not None:
                 state.pending_actions.append(action)
         state.pending_actions.extend(component_actions)

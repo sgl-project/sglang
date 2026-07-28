@@ -3078,9 +3078,7 @@ class UnifiedRadixCacheSuite:
         self._assert_hicache_mamba_incremental_write_through("write_through")
 
     def test_hicache_mamba_incremental_write_through_selective(self):
-        self._assert_hicache_mamba_incremental_write_through(
-            "write_through_selective"
-        )
+        self._assert_hicache_mamba_incremental_write_through("write_through_selective")
 
     def test_hicache_mamba_incremental_write_back(self):
         if not self.cfg.has_mamba or self.cfg.has_swa:
