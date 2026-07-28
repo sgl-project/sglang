@@ -694,6 +694,10 @@ async fn handle_pod_deletion(
     }
 }
 
+/// Page size for the reconcile's LIST, matching the watcher's own initial
+/// list (`watcher::Config::default().page_size`) and client-go's default.
+const LIST_PAGE_SIZE: u32 = 500;
+
 /// Full LIST + reconcile of the tracked worker set against the API server.
 ///
 /// Adds any healthy, selector-matching pod not yet tracked, and removes any
@@ -703,6 +707,9 @@ async fn handle_pod_deletion(
 /// watch-stream reliability: `.applied_objects()` drops Delete events and
 /// unstable environments drop the long-lived watch, so the watch alone
 /// cannot converge.
+///
+/// The LIST is paged; any page failing aborts the whole pass and leaves the
+/// worker set untouched, so a partial view can never drive removals.
 async fn reconcile_from_list(
     pods: &Api<Pod>,
     config: &ServiceDiscoveryConfig,
@@ -731,16 +738,6 @@ async fn reconcile_from_list(
         }
     };
 
-    // Same client-side filtering as the watch (Config::default() => no server
-    // label filter); we match via should_include below.
-    let list = match pods.list(&ListParams::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            warn!("SD resync LIST failed, keeping current worker set: {}", e);
-            return;
-        }
-    };
-
     // Names currently present in the API for matching pods, and add-missing.
     // A pod with a deletion_timestamp is deliberately NOT counted as present:
     // the watch path deregisters a pod as soon as it starts terminating, and
@@ -752,27 +749,65 @@ async fn reconcile_from_list(
     // handle_pod_deletion is idempotent (removes only if tracked), so the
     // watch and the reconcile processing the same termination never conflict.
     let mut present: HashSet<String> = HashSet::new();
-    for pod in &list.items {
-        if !PodInfo::should_include(pod, config) {
-            continue;
+
+    // Page through the LIST rather than pulling the whole collection in one
+    // response. With no namespace configured this is an Api::all over every
+    // pod in the cluster, once per resync per router replica, so an unbounded
+    // list would hand the API server a multi-megabyte response on a large
+    // cluster; the watch's own initial list already pages at the same size.
+    // Chunked list is still a consistent snapshot: the server pins the
+    // resourceVersion to the continue token.
+    //
+    // Only `present` is accumulated across pages — pods are processed and
+    // dropped page by page, so peak memory is one page rather than the whole
+    // cluster.
+    //
+    // Same client-side filtering as the watch (Config::default() => no server
+    // label filter); we match via should_include below.
+    let mut params = ListParams::default().limit(LIST_PAGE_SIZE);
+    loop {
+        let page = match pods.list(&params).await {
+            Ok(page) => page,
+            Err(e) => {
+                // Bail before the removal pass. Adds already applied are
+                // harmless (those pods really do exist), but `present` is now
+                // partial and removing against it would deregister live
+                // workers. An expired continue token (410) lands here too and
+                // is simply retried by the next resync.
+                warn!("SD resync LIST failed, keeping current worker set: {}", e);
+                return;
+            }
+        };
+
+        let continue_token = page.metadata.continue_.clone();
+
+        for pod in &page.items {
+            if !PodInfo::should_include(pod, config) {
+                continue;
+            }
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            if let Some(name) = pod.metadata.name.clone() {
+                present.insert(name);
+            }
+            if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
+                // handle_pod_event dedups via tracked_pods and gates on
+                // is_healthy(), so re-adds are cheap no-ops.
+                handle_pod_event(
+                    &pod_info,
+                    Arc::clone(&tracked_pods),
+                    Arc::clone(&app_context),
+                    port,
+                    config.pd_mode,
+                )
+                .await;
+            }
         }
-        if pod.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        if let Some(name) = pod.metadata.name.clone() {
-            present.insert(name);
-        }
-        if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
-            // handle_pod_event dedups via tracked_pods and gates on
-            // is_healthy(), so re-adds are cheap no-ops.
-            handle_pod_event(
-                &pod_info,
-                Arc::clone(&tracked_pods),
-                Arc::clone(&app_context),
-                port,
-                config.pd_mode,
-            )
-            .await;
+
+        match continue_token {
+            Some(token) if !token.is_empty() => params = params.continue_token(&token),
+            _ => break,
         }
     }
 
