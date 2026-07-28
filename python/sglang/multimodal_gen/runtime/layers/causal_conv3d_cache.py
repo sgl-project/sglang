@@ -152,6 +152,24 @@ def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
     return x
 
 
+def memory_format_of(x: torch.Tensor) -> torch.memory_format:
+    """The layout ``x`` is already in, so derived tensors can keep it.
+
+    Concatenating a contiguous tensor onto a channels_last_3d one yields a
+    contiguous result, which then has to be converted back before every
+    convolution — and the conversion propagates, since a contiguous input
+    produces a contiguous output.
+    """
+    if (
+        x.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    ):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
 def causal_cache_frames(
     *,
     kernel_size: tuple[int, int, int],
@@ -209,12 +227,9 @@ class CausalConv3d(nn.Conv3d):
         self.stateless_pad_frames = 2 * self.padding[0]
         self.height_padding = self.padding[1]
         self.width_padding = self.padding[2]
-        self._spatial_pad = (
-            self.width_padding,
-            self.width_padding,
-            self.height_padding,
-            self.height_padding,
-        )
+        # Only the time dimension needs explicit padding: it is causal, so the
+        # padding is asymmetric. Height and width are symmetric, which is what
+        # cuDNN's implicit padding does natively.
         self.padding = (0, 0, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -226,21 +241,34 @@ class CausalConv3d(nn.Conv3d):
         return self._conv(self._consume_cache(x, cache), time_pad=0)
 
     def _consume_cache(self, x: torch.Tensor, cache: CausalConvCache) -> torch.Tensor:
+        memory_format = memory_format_of(x)
         prev = cache.get(self.cache_key)
         if prev is None:
             prev = x.new_zeros(
                 (x.shape[0], x.shape[1], self.cache_frames, x.shape[3], x.shape[4])
-            )
+            ).contiguous(memory_format=memory_format)
         x = torch.cat([prev, x], dim=2)
-        # Clone: a slice of `x` would keep the whole activation alive, and under
-        # channels_last_3d it is not even contiguous.
-        cache.set(self.cache_key, x[:, :, -self.cache_frames :, :, :].clone())
+        cache.set(self.cache_key, self._retain_tail(x, memory_format))
         return x
 
+    def _retain_tail(
+        self, x: torch.Tensor, memory_format: torch.memory_format
+    ) -> torch.Tensor:
+        """Copy out the frames the next chunk needs, in the layout it wants.
+
+        ``clone`` rather than ``contiguous``: the latter hands back a view when
+        the slice already has the requested layout, which would keep the whole
+        activation alive for as long as the cache does.
+        """
+        return x[:, :, -self.cache_frames :, :, :].clone(memory_format=memory_format)
+
+    def spatial_padding(self) -> tuple[int, int, int]:
+        """Padding handed to the convolution itself, as ``(time, height, width)``."""
+        return (0, self.height_padding, self.width_padding)
+
     def _conv(self, x: torch.Tensor, *, time_pad: int) -> torch.Tensor:
-        pad = (*self._spatial_pad, time_pad, 0)
-        if any(pad):
-            x = F.pad(x, pad)
+        if time_pad:
+            x = F.pad(x, (0, 0, 0, 0, time_pad, 0))
         if not current_platform.is_amp_supported():
             x = x.to(self.weight.dtype)
         x = match_conv3d_input_format(x, self.weight)
@@ -253,7 +281,7 @@ class CausalConv3d(nn.Conv3d):
             self.weight,
             self.bias,
             self.stride,
-            self.padding,
+            self.spatial_padding(),
             self.dilation,
             self.groups,
         )
@@ -294,7 +322,7 @@ class TimeDownsampleCausalConv3d(CausalConv3d):
         if cache.mode is CausalCacheMode.STREAMING and not cache.contains(
             self.cache_key
         ):
-            cache.set(self.cache_key, x[:, :, -self.cache_frames :, :, :].clone())
+            cache.set(self.cache_key, self._retain_tail(x, memory_format_of(x)))
             return x
         return super().forward(x)
 

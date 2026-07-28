@@ -622,15 +622,19 @@ class SpatialParallelCausalConv3d(CausalConv3d):
         self.rank = get_decode_parallel_rank()
         self.world_size = get_decode_parallel_world_size()
 
+    def spatial_padding(self) -> tuple[int, int, int]:
+        if spatial_parallel_decode_disabled():
+            return (0, self.height_pad_top, self.width_padding)
+        # Height padding is supplied by the halo exchange, so the convolution
+        # must not add any of its own.
+        return (0, 0, self.width_padding)
+
     def _conv(self, x: torch.Tensor, *, time_pad: int) -> torch.Tensor:
         if spatial_parallel_decode_disabled():
             return super()._conv(x, time_pad=time_pad)
 
-        # Height padding is supplied by the halo exchange, so it must not be
-        # padded here as well.
-        pad = (self.width_padding, self.width_padding, 0, 0, time_pad, 0)
-        if any(pad):
-            x = F.pad(x, pad)
+        if time_pad:
+            x = F.pad(x, (0, 0, 0, 0, time_pad, 0))
         if not current_platform.is_amp_supported():
             x = x.to(self.weight.dtype)
         return _spatial_parallel_conv_forward(
