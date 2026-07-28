@@ -7,6 +7,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use super::TokenIds;
+use super::finish_reason::FinishReason;
 use crate::error::Error;
 use crate::ids::RidHash;
 
@@ -120,7 +122,7 @@ pub struct BatchHeader {
     /// (`RidHash::from_rid`), mirroring the control path. The wire has no
     /// rid-shape coupling; any string is a valid rid.
     pub rids: Vec<String>,
-    pub finish_reasons: Vec<Option<serde_json::Value>>,
+    pub finish_reasons: Vec<Option<FinishReason>>,
     pub prompt_tokens: Vec<u32>,
     pub tok_lens: Vec<u32>,
     #[serde(default)]
@@ -161,9 +163,23 @@ fn take_flat(
     Some((take_f32(data, cv, l)?, take_i32(data, ci, l)?))
 }
 
+/// Read `np` per-position lengths from `poslens` at `*pcur`, advancing it. `None`
+/// when the range runs past the column — the header's `reqlens` promised more
+/// positions than `poslens` carries, so this request's lengths are unknowable.
+/// Clamping instead would return a short `lens`, and since `lens` also drives how
+/// far the val/idx cursors advance, every later request in that column would read
+/// from the wrong offset: silently wrong logprobs rather than a rejected frame.
+fn take_poslens(poslens: &[u32], pcur: &mut usize, np: usize) -> Option<Vec<u32>> {
+    let start = *pcur;
+    let end = start.checked_add(np)?;
+    let lens = poslens.get(start..end)?.to_vec();
+    *pcur = end;
+    Some(lens)
+}
+
 /// Read a request's ragged logprob column (`np` positions): its per-position `lens`
 /// from `poslens` (advancing `pcur`), then that many val/idx from `cv`/`ci`. `None`
-/// if the val/idx read runs past the buffer (see [`take_f32`]).
+/// if either read runs past its buffer (see [`take_poslens`], [`take_f32`]).
 fn take_ragged(
     data: &[u8],
     cv: &mut usize,
@@ -172,15 +188,14 @@ fn take_ragged(
     pcur: &mut usize,
     np: usize,
 ) -> Option<(Vec<f32>, Vec<i32>, Vec<u32>)> {
-    let pe = (*pcur + np).min(poslens.len());
-    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
-    *pcur = pe;
+    let lens = take_poslens(poslens, pcur, np)?;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
     Some((take_f32(data, cv, nv)?, take_i32(data, ci, nv)?, lens))
 }
 
 /// Like [`take_ragged`] but for hidden states — a val column + row `poslens`, no
-/// idx column. `None` if the val read runs past the buffer (see [`take_f32`]).
+/// idx column. `None` if either read runs past its buffer (see [`take_poslens`],
+/// [`take_f32`]).
 fn take_hidden(
     data: &[u8],
     cv: &mut usize,
@@ -188,31 +203,100 @@ fn take_hidden(
     pcur: &mut usize,
     nr: usize,
 ) -> Option<(Vec<f32>, Vec<u32>)> {
-    let pe = (*pcur + nr).min(poslens.len());
-    let lens = poslens[(*pcur).min(pe)..pe].to_vec();
-    *pcur = pe;
+    let lens = take_poslens(poslens, pcur, nr)?;
     let nv: usize = lens.iter().map(|&x| x as usize).sum();
     Some((take_f32(data, cv, nv)?, lens))
 }
 
 /// Decode a batch egress frame (tag stripped), calling `route` with each request's
 /// [`ChunkEvent`] as it's decoded — one pass, no intermediate `Vec`, peak memory
-/// one request. `false` on a malformed frame. Column order matches `push_generation`.
-pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
+/// one request. Column order matches `push_generation`.
+///
+/// `ok == false` means the frame was rejected. The caller discards everything it
+/// routed and fails the frame's requests instead of forwarding a partial fan-out
+/// (see `tokenizer_manager::egress`), so a rejected frame delivers nothing —
+/// `rids` exists precisely so those requests can be failed rather than left
+/// waiting for a `Done` that no longer exists.
+pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded {
+    let mut decoded = Decoded::default();
     if body.len() < 4 {
-        return false;
+        return decoded;
     }
     let hlen = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     let Some(header) = body.get(4..4 + hlen) else {
-        return false;
+        return decoded;
     };
     let data = &body[4 + hlen..];
-    let Ok(h) = rmp_serde::from_slice::<BatchHeader>(header) else {
-        return false;
+    let h = match rmp_serde::from_slice::<BatchHeader>(header) {
+        Ok(h) => h,
+        Err(_) => {
+            // A typed decode failure (any column whose Python type widens) yields no
+            // rids, so the caller would fail nobody and every request in the frame
+            // would hang. Re-read just the rid column, which is positional element 0
+            // and independent of every other field's type.
+            // Two-stage via `rmpv`: read the header as a generic value, then take
+            // element 0. A serde tuple cannot do this — `(Vec<String>,)` decodes
+            // ONLY a 1-element array, while real headers carry 4 or 16 columns, so
+            // it returned `Err(LengthMismatch(1))` every time and named nobody.
+            // Arity independence is the whole point: the trigger for this path is
+            // Python appending a column an older Rust build does not know.
+            decoded.rids = rmpv::decode::read_value(&mut &header[..])
+                .ok()
+                .and_then(|v| match v {
+                    rmpv::Value::Array(cols) => cols.into_iter().next(),
+                    _ => None,
+                })
+                .and_then(|c| match c {
+                    rmpv::Value::Array(rids) => Some(
+                        rids.iter()
+                            .filter_map(|r| r.as_str().map(RidHash::from_rid))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return decoded;
+        }
     };
+    // Every rid in the frame, known as soon as the header parses — so a rejection
+    // below can still name the requests that were waiting on it.
+    decoded.rids = h.rids.iter().map(|r| RidHash::from_rid(r)).collect();
 
     let n = h.rids.len();
+    // Every column must agree with `rids`. A SHORT column contributes nothing to
+    // `base`, so the `base != data.len()` check below cannot see it: a short
+    // `tok_lens` delivered a 200 with an empty completion, and a short
+    // `finish_reasons` dropped the terminal marker so the request never completed
+    // and its unary drain pended forever. The producer already asserts this for the
+    // extras columns; the four core ones were unchecked.
+    if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
+        return decoded;
+    }
+    // The per-request extras columns are either absent (no request asked) or one
+    // entry per request — never partial.
+    let per_req_ok = |c: &[u32]| c.is_empty() || c.len() == n;
+    if !per_req_ok(&h.out_lp_lens)
+        || !per_req_ok(&h.in_lp_lens)
+        || !per_req_ok(&h.out_top_reqlens)
+        || !per_req_ok(&h.in_top_reqlens)
+        || !per_req_ok(&h.out_tid_reqlens)
+        || !per_req_ok(&h.in_tid_reqlens)
+        || !per_req_ok(&h.hidden_reqlens)
+    {
+        return decoded;
+    }
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
+    // Each ragged family's per-request counts must consume its position column
+    // EXACTLY. Only the deficit was caught (`take_poslens` runs off the end); a
+    // surplus left positions unread and delivered a truncated row with a 200.
+    if sum(&h.out_top_reqlens) != h.out_top_poslens.len()
+        || sum(&h.in_top_reqlens) != h.in_top_poslens.len()
+        || sum(&h.out_tid_reqlens) != h.out_tid_poslens.len()
+        || sum(&h.in_tid_reqlens) != h.in_tid_poslens.len()
+        || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
+    {
+        return decoded;
+    }
 
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
     // are concatenated in exactly this order, every element 4 bytes.
@@ -246,10 +330,16 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let mut c_id_i = col(n_id);
     let mut c_h_v = col(n_h);
 
-    // `col` summed every column's span into `base`. Reject a malformed frame whole,
-    // *before* routing any request: a partial fan-out would deliver garbage.
-    if base > data.len() {
-        return false;
+    // `col` summed every column's span into `base`, so a truncated frame is caught
+    // here — the one rejection that is genuinely whole-frame, since it precedes the
+    // routing loop. Past this point a failure can only be partial.
+    //
+    // The check is EQUALITY, not `>`: every column length is header-determined, so
+    // a data buffer longer than `base` means the header and the buffer disagree.
+    // Accepting the surplus let a producer-side val/idx mismatch through with a
+    // 200, every later column reading off by the difference.
+    if base != data.len() {
+        return decoded;
     }
 
     // Mirror of Python's `has_extra` guard: checking once per frame lets the
@@ -268,8 +358,11 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
     let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
 
     // Decode one request's slice of every column, advancing the cursors. `None` if a
-    // read overruns `data` (belt-and-suspenders past the upfront check) — the caller
-    // then rejects the frame instead of slicing out of bounds.
+    // read overruns `data` (belt-and-suspenders past the upfront check, which already
+    // covers every column's span — so this is unreachable today). It stops the loop
+    // before slicing out of bounds, but requests decoded earlier in the frame are
+    // already routed; making that abort atomic would mean buffering the whole frame,
+    // which is exactly what the streaming decode avoids.
     let mut decode_one = |i: usize| -> Option<ChunkEvent> {
         let token_ids = take_i32(data, &mut c_ids, lens_i(&h.tok_lens, i))?;
 
@@ -343,7 +436,14 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
                 in_tid_lens,
                 hidden_val,
                 hidden_lens,
-                ..Default::default()
+                // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
+                // below: a new column must fail to compile here until it is decoded.
+                out_lp_txt: Vec::new(),
+                in_lp_txt: Vec::new(),
+                out_top_txt: Vec::new(),
+                in_top_txt: Vec::new(),
+                out_tid_txt: Vec::new(),
+                in_tid_txt: Vec::new(),
             };
             (!ex.is_empty()).then(|| Box::new(ex))
         };
@@ -356,17 +456,33 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> bool {
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
             extras,
-            ..Default::default()
+            // Listed explicitly, NOT `..Default::default()`: a new column added to
+            // `ChunkEvent` and wired into the response must fail to compile here
+            // until it is actually decoded. With the struct-update syntax it
+            // compiled clean and silently shipped zeros.
+            text: String::new(),
+            completion_tokens: 0,
         })
     };
 
     for i in 0..n {
         let Some(ev) = decode_one(i) else {
-            return false;
+            return decoded;
         };
         route(ev);
     }
-    true
+    decoded.ok = true;
+    decoded
+}
+
+/// Outcome of [`for_each_chunk`]: whether the frame was accepted, plus the rids it
+/// named. `rids` is populated as soon as the header parses, so a caller can fail
+/// every request in a rejected frame — including ones whose chunk never decoded,
+/// which would otherwise wait forever for a `Done` that no longer exists.
+#[derive(Debug, Default)]
+pub struct Decoded {
+    pub ok: bool,
+    pub rids: Vec<RidHash>,
 }
 
 /// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
@@ -404,9 +520,9 @@ pub struct ChunkEvent {
     /// `RidHash` digest of the rid — the shard routing key; `Copy`, no clone.
     pub rid_hash: u64,
     /// New token ids for this step. Empty allowed (e.g. metadata-only frames).
-    pub token_ids: Vec<i32>,
-    /// `None` while streaming, the full finish-reason dict on the final chunk.
-    pub finish_reason: Option<serde_json::Value>,
+    pub token_ids: TokenIds,
+    /// `None` while streaming, the [`FinishReason`] on the final chunk.
+    pub finish_reason: Option<FinishReason>,
     /// Prompt token count for this request (constant across its chunks).
     pub prompt_tokens: u32,
     /// Decoded text **delta** for this chunk (empty in skip mode / on partial UTF-8),
@@ -479,6 +595,7 @@ impl ChunkExtras {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::finish_reason::{FinishKind, Matched};
 
     /// Concatenating N data columns produces the exact same frame as one joined
     /// buffer (the `b"".join` the Python side used to do), with the layout
@@ -537,7 +654,7 @@ mod tests {
         let framed = frame_egress_batch_cols(&header, &[&data]);
         assert_eq!(framed[0], EGRESS_TAG_BATCH);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].rid_hash, RidHash::from_rid("1").0);
         assert_eq!(events[0].token_ids, vec![10, 11]);
@@ -545,10 +662,15 @@ mod tests {
         assert!(events[0].finish_reason.is_none());
         assert_eq!(events[1].rid_hash, RidHash::from_rid("2").0);
         assert!(events[1].token_ids.is_empty());
-        // The whole dict survives (type + matched), not just the type.
+        // The whole reason survives msgpack (type + matched), not just the type.
         assert_eq!(
             events[1].finish_reason,
-            Some(serde_json::json!({ "type": "stop", "matched": 5 }))
+            Some(
+                FinishKind::Stop {
+                    matched: Some(Matched::Token(5))
+                }
+                .into()
+            )
         );
         assert_eq!(events[2].rid_hash, RidHash::from_rid("3").0);
         assert_eq!(events[2].token_ids, vec![12]);
@@ -584,9 +706,129 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
-        let ok = for_each_chunk(&framed[1..], |_| routed += 1);
-        assert!(!ok, "malformed frame must be rejected, not decoded");
+        let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!decoded.ok, "malformed frame must be rejected, not decoded");
         assert_eq!(routed, 0, "no request may be routed from a rejected frame");
+        // The rid is still reported, so the caller can fail the request that was
+        // waiting on this frame instead of letting it hang.
+        assert_eq!(decoded.rids, vec![RidHash::from_rid("1")]);
+    }
+
+    /// A header whose `reqlens` claim more positions than `poslens` carries is
+    /// rejected, not truncated. This drift passes the upfront `base > data.len()`
+    /// check — the data columns are exactly as long as `poslens` says — so only the
+    /// per-column bound catches it. Clamping (the old behavior) handed req0 a short
+    /// `lens`, which also under-advanced the val/idx cursors, so req1 read from the
+    /// wrong offset: a frame that decodes "successfully" into wrong logprobs.
+    #[test]
+    fn rejects_poslens_shorter_than_reqlens_claims() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+        let rids = Value::Array(vec![Value::from("1"), Value::from("2")]);
+        let finish = Value::Array(vec![Value::Nil, Value::Nil]);
+
+        // Ragged column: reqs claim 2 + 1 = 3 positions, `out_top_poslens` has 2.
+        let header_arr = Value::Array(vec![
+            rids.clone(),
+            finish.clone(),
+            arr_u(&[0, 0]), // prompt
+            arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // out_lp_lens
+            arr_u(&[0, 0]), // in_lp_lens
+            arr_u(&[2, 1]), // out_top_reqlens — 3 positions claimed
+            arr_u(&[2, 2]), // out_top_poslens — only 2 supplied
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let mut data = Vec::new();
+        data.extend(i(&[10, 20])); // token_ids
+        data.extend(f(&[-0.1, -0.2, -0.3, -0.4])); // out_top_val (sum of poslens = 4)
+        data.extend(i(&[1, 2, 3, 4])); // out_top_idx
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        assert!(
+            !for_each_chunk(&framed[1..], |_| routed += 1).ok,
+            "ragged poslens drift must be rejected, not truncated"
+        );
+
+        // Same drift in the hidden column, which has no idx pair: 2 rows claimed, 1 supplied.
+        let header_arr = Value::Array(vec![
+            rids,
+            finish,
+            arr_u(&[0, 0]), // prompt
+            arr_u(&[1, 1]), // tok_lens
+            arr_u(&[0, 0]), // out_lp_lens
+            arr_u(&[0, 0]), // in_lp_lens
+            arr_u(&[0, 0]), // out_top_reqlens
+            arr_u(&[]),     // out_top_poslens
+            arr_u(&[0, 0]), // in_top_reqlens
+            arr_u(&[]),     // in_top_poslens
+            arr_u(&[0, 0]), // out_tid_reqlens
+            arr_u(&[]),     // out_tid_poslens
+            arr_u(&[0, 0]), // in_tid_reqlens
+            arr_u(&[]),     // in_tid_poslens
+            arr_u(&[2, 0]), // hidden_reqlens — 2 rows claimed
+            arr_u(&[3]),    // hidden_poslens — only 1 supplied
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let mut data = Vec::new();
+        data.extend(i(&[10, 20])); // token_ids
+        data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (sum of poslens = 3)
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut routed = 0usize;
+        assert!(
+            !for_each_chunk(&framed[1..], |_| routed += 1).ok,
+            "hidden poslens drift must be rejected, not truncated"
+        );
+    }
+
+    /// A frame that fails at request 0 buckets nothing, so bucket-driven cleanup
+    /// would leave every request in it hanging. The rids come from the header,
+    /// which is fully parsed before the decode loop.
+    #[test]
+    fn rejected_frame_still_reports_all_its_rids() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("r0"), Value::from("r1")]), // rids
+            Value::Array(vec![Value::Nil, Value::Nil]),
+            Value::Array(vec![Value::from(0u32), Value::from(0u32)]),
+            Value::Array(vec![Value::from(9u32), Value::from(9u32)]), // tok_lens past data
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let framed = frame_egress_batch_cols(&header, &[&[0u8; 4][..]]);
+        let mut routed = 0usize;
+        let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
+        assert!(!decoded.ok);
+        assert_eq!(routed, 0, "fails at request 0 — nothing bucketed");
+        assert_eq!(
+            decoded.rids,
+            vec![RidHash::from_rid("r0"), RidHash::from_rid("r1")],
+            "both requests must be nameable so the caller can fail them"
+        );
+    }
+
+    /// A data buffer LONGER than the header's columns means the two disagree — a
+    /// producer-side val/idx mismatch. Accepting the surplus delivered another
+    /// column's bytes as logprobs with a 200.
+    #[test]
+    fn frame_longer_than_its_columns_is_rejected() {
+        use rmpv::Value;
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1")]),
+            Value::Array(vec![Value::Nil]),
+            Value::Array(vec![Value::from(0u32)]),
+            Value::Array(vec![Value::from(1u32)]), // tok_lens: 1 id = 4 bytes
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+        let data: Vec<u8> = vec![0u8; 8]; // 4 bytes too many
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let decoded = for_each_chunk(&framed[1..], |_| {});
+        assert!(!decoded.ok, "header and data must agree exactly");
     }
 
     /// Ingress/egress rid agreement: the routing key decoded from a uuid-rid
@@ -609,8 +851,20 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 1);
+        // The equality below reuses `from_rid`, so on its own it would hold for
+        // any decoder that hashed *something*. These pin the two failure modes it
+        // is meant to catch: a decoder that parsed the rid as an integer (a uuid
+        // is not numeric, so it would fall back to 0), and one that keyed off the
+        // request's position in the batch rather than its rid.
+        assert_ne!(events[0].rid_hash, 0, "uuid rid must not degrade to 0");
+        assert_ne!(events[0].rid_hash, RidHash::from_rid("0").0);
+        assert_ne!(
+            events[0].rid_hash,
+            RidHash::from_rid("another-rid").0,
+            "distinct rids must not collide on the routing key"
+        );
         assert_eq!(events[0].rid_hash, RidHash::from_rid(rid).0);
     }
 
@@ -656,7 +910,7 @@ mod tests {
 
         let framed = frame_egress_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
-        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)));
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].token_ids, vec![10]);
         let ex0 = events[0]
@@ -674,6 +928,85 @@ mod tests {
         assert!(events[1].extras.is_none());
     }
 
+    /// All SEVEN extras families in one frame, each with a distinct length AND
+    /// distinct values. The existing extras test exercises only `out_lp` /
+    /// `out_top` / `hidden`, so transposing a header pair — `in_top_*` with
+    /// `out_tid_*`, say — leaves every assertion passing while the client receives
+    /// another request's logprobs under the wrong key. Lengths differ per family
+    /// (2/1/2/1/2/1/3 elements) so a swap misaligns the cursors too.
+    #[test]
+    fn decodes_all_extras_families_without_transposition() {
+        use rmpv::Value;
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i = |xs: &[i32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let arr_u = |xs: &[u32]| Value::Array(xs.iter().map(|&x| Value::from(x)).collect());
+
+        let header_arr = Value::Array(vec![
+            Value::Array(vec![Value::from("1")]), // rids
+            Value::Array(vec![Value::Nil]),       // finish
+            arr_u(&[9]),                          // prompt
+            arr_u(&[1]),                          // tok_lens
+            arr_u(&[2]),                          // out_lp_lens      (2 flat)
+            arr_u(&[1]),                          // in_lp_lens       (1 flat)
+            arr_u(&[1]),                          // out_top_reqlens  (1 position…
+            arr_u(&[2]),                          // out_top_poslens  …k=2)
+            arr_u(&[1]),                          // in_top_reqlens   (1 position…
+            arr_u(&[1]),                          // in_top_poslens   …k=1)
+            arr_u(&[1]),                          // out_tid_reqlens  (1 position…
+            arr_u(&[2]),                          // out_tid_poslens  …2 ids)
+            arr_u(&[1]),                          // in_tid_reqlens   (1 position…
+            arr_u(&[1]),                          // in_tid_poslens   …1 id)
+            arr_u(&[1]),                          // hidden_reqlens   (1 row…
+            arr_u(&[3]),                          // hidden_poslens   …dim 3)
+        ]);
+        let mut header = Vec::new();
+        rmpv::encode::write_value(&mut header, &header_arr).unwrap();
+
+        // Concatenated in `for_each_chunk`'s column order.
+        let mut data = Vec::new();
+        data.extend(i(&[100])); // token_ids
+        data.extend(f(&[-1.1, -1.2])); // out_lp_val
+        data.extend(i(&[11, 12])); // out_lp_idx
+        data.extend(f(&[-2.1])); // in_lp_val
+        data.extend(i(&[21])); // in_lp_idx
+        data.extend(f(&[-3.1, -3.2])); // out_top_val
+        data.extend(i(&[31, 32])); // out_top_idx
+        data.extend(f(&[-4.1])); // in_top_val
+        data.extend(i(&[41])); // in_top_idx
+        data.extend(f(&[-5.1, -5.2])); // out_tid_val
+        data.extend(i(&[51, 52])); // out_tid_idx
+        data.extend(f(&[-6.1])); // in_tid_val
+        data.extend(i(&[61])); // in_tid_idx
+        data.extend(f(&[7.1, 7.2, 7.3])); // hidden_val
+
+        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let mut events = Vec::new();
+        assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
+        assert_eq!(events.len(), 1);
+        let ex = events[0].extras.as_deref().expect("extras present");
+
+        assert_eq!(ex.out_lp_val, vec![-1.1, -1.2]);
+        assert_eq!(ex.out_lp_idx, vec![11, 12]);
+        assert_eq!(ex.in_lp_val, vec![-2.1]);
+        assert_eq!(ex.in_lp_idx, vec![21]);
+        assert_eq!(ex.out_top_val, vec![-3.1, -3.2]);
+        assert_eq!(ex.out_top_idx, vec![31, 32]);
+        assert_eq!(ex.out_top_lens, vec![2]);
+        assert_eq!(ex.in_top_val, vec![-4.1]);
+        assert_eq!(ex.in_top_idx, vec![41]);
+        assert_eq!(ex.in_top_lens, vec![1]);
+        assert_eq!(ex.out_tid_val, vec![-5.1, -5.2]);
+        assert_eq!(ex.out_tid_idx, vec![51, 52]);
+        assert_eq!(ex.out_tid_lens, vec![2]);
+        assert_eq!(ex.in_tid_val, vec![-6.1]);
+        assert_eq!(ex.in_tid_idx, vec![61]);
+        assert_eq!(ex.in_tid_lens, vec![1]);
+        assert_eq!(ex.hidden_val, vec![7.1, 7.2, 7.3]);
+        assert_eq!(ex.hidden_lens, vec![3]);
+        // Every byte of the data buffer was consumed by exactly one family.
+        assert_eq!(events[0].token_ids, vec![100]);
+    }
+
     /// The common frame must stay small: logprob/hidden columns are boxed behind
     /// `ChunkExtras`, so the inline decode array is a few KiB — not MiB — even at
     /// batch 4096. A regression that inlines a rare column would blow this up.
@@ -684,5 +1017,35 @@ mod tests {
             sz <= 128,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
+    }
+}
+
+#[cfg(test)]
+mod rid_recovery_tests {
+    use super::*;
+
+    /// A header this build cannot type-decode (Python appended a column) must
+    /// still name its requests, or every one of them hangs. The previous
+    /// `(Vec<String>,)` tuple decoded ONLY a 1-element array, so it failed on every
+    /// real header — arity independence is the entire point of this path.
+    #[test]
+    fn rid_recovery_works_at_every_header_arity() {
+        use rmpv::Value;
+        for extra_cols in [0usize, 3, 15, 16] {
+            let mut cols = vec![Value::Array(vec![Value::from("a"), Value::from("b")])];
+            // Columns of a type this build would reject (strings where u32 is
+            // expected) — the "Python widened a column" case.
+            cols.extend((0..extra_cols).map(|_| Value::from("unexpected")));
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &Value::Array(cols)).unwrap();
+            let framed = frame_egress_batch_cols(&header, &[]);
+            let decoded = for_each_chunk(&framed[1..], |_| {});
+            assert!(!decoded.ok, "arity {extra_cols}: must reject");
+            assert_eq!(
+                decoded.rids,
+                vec![RidHash::from_rid("a"), RidHash::from_rid("b")],
+                "arity {extra_cols}: rids must survive so the caller can fail them"
+            );
+        }
     }
 }

@@ -21,9 +21,9 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RidHash;
 use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, SinkError};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::TmEvent;
+use crate::tokenizer_manager::AbortSource;
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in
@@ -134,9 +134,9 @@ pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
     backend: DetokenizerBackend,
-    /// TokenizerManager inbox, used to abort a request the shard had to drop
-    /// (client backpressure/disconnect) so the scheduler stops generating for it.
-    tm: flume::Sender<TmEvent>,
+    /// Unbounded abort lane, used to abort a request the shard had to drop
+    /// (client backpressure) so the scheduler stops generating for it.
+    abort: flume::Sender<AbortSource>,
 }
 
 impl DetokenizerWorker {
@@ -144,13 +144,13 @@ impl DetokenizerWorker {
         shard: usize,
         rx: flume::Receiver<DetokMsg>,
         backend: DetokenizerBackend,
-        tm: flume::Sender<TmEvent>,
+        abort: flume::Sender<AbortSource>,
     ) -> Self {
         Self {
             shard,
             rx,
             backend,
-            tm,
+            abort,
         }
     }
 }
@@ -189,13 +189,15 @@ impl Runnable for DetokenizerWorker {
                 // One decode step's chunks for this shard, batched by tm-egress.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
-                        handle_chunk(&mut table, ev, &self.backend, &self.tm);
+                        handle_chunk(&mut table, ev, &self.backend, &self.abort);
                     }
                 }
                 DetokMsg::Result { rid_hash, payload } => {
                     handle_result(&mut table, rid_hash, payload)
                 }
-                DetokMsg::Fail { rid_hash, message } => handle_fail(&mut table, rid_hash, message),
+                DetokMsg::Fail { rid_hash, message } => {
+                    handle_fail(&mut table, rid_hash, message, &self.abort)
+                }
                 DetokMsg::Deregister { rid_hash } => {
                     table.remove(&rid_hash);
                 }
@@ -217,11 +219,23 @@ fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload:
 
 /// Terminal per-request failure (bad request header): send an `Error` to the sink
 /// (the api-server turns it into an HTTP 400) and drop the request.
-fn handle_fail(table: &mut HashMap<RidHash, DetokState>, id: RidHash, message: String) {
+/// Terminal per-request failure. `Internal` (500), not `Validation` (400): the
+/// producers of this message are server faults — a malformed scheduler output
+/// frame — not bad client input. Also aborts the request on the scheduler, which
+/// otherwise keeps generating tokens for a connection that will never read them.
+fn handle_fail(
+    table: &mut HashMap<RidHash, DetokState>,
+    id: RidHash,
+    message: String,
+    abort: &flume::Sender<AbortSource>,
+) {
     if let Some(mut st) = table.remove(&id) {
+        // Abort first: `try_send` on the sink can release the handler, which frees
+        // the rid for reuse (same ordering hazard as the disconnect path).
+        let _ = abort.send(AbortSource::Detok(st.rid.clone()));
         let _ = st
             .sink
-            .try_send(EgressItem::Error(Error::Validation(message)));
+            .try_send(EgressItem::Error(Error::Internal(message)));
         st.fsm = RequestState::Completed;
     }
 }
@@ -230,7 +244,7 @@ fn handle_chunk(
     table: &mut HashMap<RidHash, DetokState>,
     mut ev: ChunkEvent,
     backend: &DetokenizerBackend,
-    tm: &flume::Sender<TmEvent>,
+    abort: &flume::Sender<AbortSource>,
 ) {
     let id = RidHash(ev.rid_hash); // raw u64 from the wire — no parse
 
@@ -238,7 +252,7 @@ fn handle_chunk(
         // Late chunk after completion/abort — drop.
         return;
     };
-    let decode_lp_text = st.decode_logprob_text;
+    let decode_logprob_text = st.decode_logprob_text;
     let no_stop_trim = st.no_stop_trim;
 
     // Queued → Streaming on the first chunk (the scheduler picked it).
@@ -251,7 +265,7 @@ fn handle_chunk(
     // reason names the stop it matched — a stop STRING or a stop TOKEN id. By
     // default that stop is removed from the output; `no_stop_trim` keeps it.
     let matched = finished
-        .then(|| ev.finish_reason.as_ref().and_then(|fr| fr.get("matched")))
+        .then(|| ev.finish_reason.as_ref().and_then(|fr| fr.matched()))
         .flatten()
         .cloned();
     // Count generated tokens (incl. a matched stop token) *before* trimming.
@@ -268,7 +282,11 @@ fn handle_chunk(
         Some(decoder) => match decoder.step(&ev.token_ids) {
             Ok(delta) => delta,
             Err(e) => {
+                // Abort too: this is terminal for the request, and without it the
+                // scheduler keeps generating for a connection that is already gone
+                // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
+                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
                 let _ = st.sink.try_send(EgressItem::Error(e));
                 table.remove(&id);
                 return;
@@ -278,7 +296,7 @@ fn handle_chunk(
         None => String::new(),
     };
     // Stop STRING: trim it (and anything after) from the decoded delta's tail.
-    if let Some(serde_json::Value::String(stop)) = &matched {
+    if let Some(Matched::Str(stop)) = &matched {
         trim_stop_str(&mut delta_text, stop, no_stop_trim);
     }
 
@@ -289,7 +307,7 @@ fn handle_chunk(
     // CPU-bound shard) rather than on the api-server I/O threads. Flat text columns
     // stay parallel to the `idx` buffers, so `sglang_frame` just reads them. Only the
     // logprob-carrying frames have an `extras` box; a plain token frame skips this.
-    if decode_lp_text && let Some(ex) = ev.extras.as_deref_mut() {
+    if decode_logprob_text && let Some(ex) = ev.extras.as_deref_mut() {
         ex.out_lp_txt = backend.decode_logprob_texts(&ex.out_lp_idx);
         ex.in_lp_txt = backend.decode_logprob_texts(&ex.in_lp_idx);
         ex.out_top_txt = backend.decode_logprob_texts(&ex.out_top_idx);
@@ -333,23 +351,28 @@ fn handle_chunk(
                 }
             }
             let _ = st.fsm.apply(Event::Disconnect);
-            let rid = st.rid.clone();
+            // Abort ONLY when the sink is full. `Closed` means the handler future is
+            // already gone, so its `AbortGuard` has run: it aborted and released the
+            // rid. A second abort from here is unordered with respect to that
+            // release, so it lands after a resubmit of the same rid has registered
+            // and deregisters the NEW request — the cross-wiring the rid registry
+            // exists to prevent, reached through the one abort producer that
+            // bypasses the guard's ordering.
+            if matches!(e, SinkError::Full) {
+                let _ = abort.send(AbortSource::Detok(st.rid.clone()));
+            }
             table.remove(&id);
-            // Best-effort: stop the scheduler generating for a request no client
-            // can receive. A full/closed tm inbox just drops it (shutdown).
-            let _ = tm.try_send(TmEvent::Abort(rid));
         }
     }
 }
 
 /// Drop a matched stop TOKEN from the final chunk (Python `trim_matched_stop`,
 /// token branch); `no_stop_trim` / non-token match keeps it.
-fn trim_stop_token(
-    token_ids: &mut Vec<i32>,
-    matched: &Option<serde_json::Value>,
-    no_stop_trim: bool,
-) {
-    if !no_stop_trim && matches!(matched, Some(serde_json::Value::Number(_))) {
+fn trim_stop_token(token_ids: &mut TokenIds, matched: &Option<Matched>, no_stop_trim: bool) {
+    // Token id 0 is NOT a match: Python guards with `if not matched`, and 0 is
+    // falsy there, so it trims nothing. Trimming on 0 drops a real generated token
+    // for any model whose stop id happens to be 0.
+    if !no_stop_trim && matches!(matched, Some(Matched::Token(t)) if *t != 0) {
         token_ids.pop();
     }
 }
@@ -394,7 +417,7 @@ mod tests {
             },
         );
 
-        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let (tm_tx, tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: vec![5],
@@ -407,7 +430,7 @@ mod tests {
         // ...and the scheduler was told to abort it.
         assert!(matches!(
             tm_rx.try_recv(),
-            Ok(TmEvent::Abort(rid)) if rid == "1"
+            Ok(AbortSource::Detok(rid)) if rid == "1"
         ));
     }
 
@@ -459,11 +482,15 @@ mod tests {
                 fsm: RequestState::Queued,
             },
         );
-        let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
+        let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
         let ev = ChunkEvent {
             rid_hash: 1,
             token_ids: ids,
-            finish_reason: Some(finish_reason),
+            // Parsed from the wire map, so the trim paths are driven by the same
+            // shape Python emits rather than a hand-built enum.
+            finish_reason: Some(
+                serde_json::from_value(finish_reason).expect("finish reason must parse"),
+            ),
             ..Default::default()
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
@@ -471,6 +498,20 @@ mod tests {
             Ok(EgressItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    /// Token id 0 is not a match: Python's `trim_matched_stop` guards with
+    /// `if not matched`, and 0 is falsy there. Trimming on it drops a real
+    /// generated token for any model whose stop id is 0.
+    #[test]
+    fn matched_token_zero_does_not_trim() {
+        let mut ids = vec![1, 2, 0];
+        trim_stop_token(&mut ids, &Some(Matched::Token(0)), false);
+        assert_eq!(ids, vec![1, 2, 0], "id 0 is not a matched stop");
+        // A real stop id still trims.
+        let mut ids = vec![1, 2, 3];
+        trim_stop_token(&mut ids, &Some(Matched::Token(3)), false);
+        assert_eq!(ids, vec![1, 2]);
     }
 
     /// A matched stop TOKEN is dropped from the surfaced `output_ids` by default

@@ -147,8 +147,15 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         detok_rx.push(rx);
     }
 
+    // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
+    // exactly under the overload that makes them necessary (see `Senders::abort`).
+    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
+    // Shared with the api server: it admits a rid, ingress releases it once the
+    // abort has actually been issued (see `Ingress::on_abort`).
+    let live_rids = tokenizer_manager::LiveRids::default();
     let senders = Senders {
         tm: tm_tx.clone(),
+        abort: abort_tx.clone(),
         tok: tok_tx,
         detok: detok_tx,
     };
@@ -195,7 +202,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                 i,
                 rxs.next().unwrap(),
                 backend.clone(),
-                tm_tx.clone(),
+                abort_tx.clone(),
             )
         });
     }
@@ -260,10 +267,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             let (tm_rx, ingress_tx, mm_tx) = parts.take().unwrap();
             tokenizer_manager::Ingress::new(
                 tm_rx,
+                abort_rx.clone(),
+                live_rids.clone(),
                 senders.clone(),
                 ingress_tx,
-                skip_tokenizer_init,
-                cfg.server_args.model_config.vocab_size,
+                tokenizer_manager::Limits::from_server_args(&cfg.server_args),
                 mm_enabled,
                 mm_tx,
                 mm_sidecar.clone(),
@@ -303,6 +311,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
+                    live_rids.clone(),
                     shutdown_rx,
                 ))
             })

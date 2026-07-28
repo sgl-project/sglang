@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use axum::{
     Json, Router,
     extract::State,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -23,14 +24,14 @@ use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, abort_status, cumulative_frame_string, error_value, sglang_frame_value,
+    OutputAccumulator, cumulative_frame_string, error_value, sglang_frame_value,
     stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::environ::env_bool;
 use crate::ids::RidHash;
-use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind};
+use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -79,26 +80,28 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
-    let sampling_params = rmpv::Value::Map(vec![
-        (rmpv::Value::from("max_new_tokens"), rmpv::Value::from(1)),
-        (rmpv::Value::from("temperature"), rmpv::Value::F64(0.0)),
-    ]);
     let probe = GenerateRequest {
+        // The `HEALTH_CHECK_<uuid>` rid form
+        rid: crate::ids::new_health_check_rid(),
         input_ids: Some(vec![0]),
-        sampling_params: Some(sampling_params),
+        // One greedy token: the cheapest round-trip that still produces a frame.
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        },
         stream: false,
-        // The scheduler skips this when busy so it never occupies a queue slot.
-        is_health_check: true,
         ..Default::default()
     };
-    let (id, rid, _keepalive) = match submit(&state, RequestKind::Generate(probe)).await {
-        // Hold the receiver so the probe's sink stays open until it completes.
-        Ok((id, rid, rx)) => (id, rid, rx),
-        Err(resp) => return resp,
-    };
+    let (id, rid, _keepalive) =
+        match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
+            // Hold the receiver so the probe's sink stays open until it completes.
+            Ok((id, rid, rx)) => (id, rid, rx),
+            Err(resp) => return resp,
+        };
     // Deregister on drop (never disarmed): a busy-skipped probe has no terminal
     // frame, so without this abort it leaks one detok entry per call.
-    let _abort_guard = AbortGuard::new(state.senders.clone(), id, rid);
+    let _abort_guard = AbortGuard::new(state.senders.clone(), state.live_rids.clone(), id, rid);
 
     // Watch the heartbeat advance (timeout frozen at router build, default 20s).
     let deadline = tokio::time::Instant::now() + timeout;
@@ -121,24 +124,64 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// into per-request payloads (a scalar body → one, a list body → a batch) and
 /// dispatches to the single or batch path; a malformed body is a 400 before
 /// anything reaches the scheduler.
-async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>) -> Response {
+///
+/// The body is extracted as a `Result` so a deserialization failure is answered
+/// with **400** (Python's status for a bad request) carrying serde's field-level
+/// message, instead of axum's default 422.
+async fn generate(
+    State(state): State<AppState>,
+    body: Result<Json<GenerateBody>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        // A body that fails to parse has no readable `stream` flag, so this one
+        // can only answer unary — as Python's does (FastAPI rejects before its
+        // handler runs).
+        Err(rejection) => {
+            return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
     let stream = body.stream;
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
-    let (payloads, is_batch) = match body.split() {
+    let (payloads, is_batch) = match body.into_requests() {
         Ok(v) => v,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        // The error carries its own status (a bad batch is `Validation` → 400).
+        Err(e) => {
+            let code = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+            return pre_submit_error(code, &e.to_string(), stream);
+        }
     };
     if !is_batch {
-        // `split` guarantees exactly one payload for a non-batch body.
+        // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads
             .into_iter()
             .next()
-            .expect("split yields >=1 payload");
+            .expect("into_requests yields >=1 payload");
         generate_single(&state, payload, stream).await
     } else {
         generate_batch(&state, payloads, stream).await
     }
+}
+
+/// Answer an error raised *before* anything was submitted, in the shape the client
+/// asked for.
+///
+/// Two parity points with Python's `generate_request`. The body is the same
+/// `{"error": {...}}` object every other path emits — not bare text, which a client
+/// parsing JSON chokes on. And a streaming request gets 200 plus one SSE error
+/// frame and `[DONE]`, not a 400: the client has already committed to reading a
+/// stream, and Python answers it inside `stream_results()`.
+pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
+    let body = error_value(code.as_u16(), message);
+    if !stream {
+        return (code, Json(body)).into_response();
+    }
+    let frames = [body.to_string(), "[DONE]".to_string()];
+    Sse::new(futures::stream::iter(
+        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
+    ))
+    .into_response()
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -146,14 +189,20 @@ async fn generate(State(state): State<AppState>, Json(body): Json<GenerateBody>)
 async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `sglang_frame_value` just reads them — no tokenizer needed here.
-    let (id, rid_str, mut rx) = match submit(state, RequestKind::Generate(req)).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let (id, rid_str, mut rx) =
+        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
     // Abort on client disconnect: the guard fires when dropped before the request
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
-    let mut guard = AbortGuard::new(state.senders.clone(), id, rid_str.clone());
+    let mut guard = AbortGuard::new(
+        state.senders.clone(),
+        state.live_rids.clone(),
+        id,
+        rid_str.clone(),
+    );
     // Cumulative frames (SGLang default) vs per-step deltas.
     let incremental = state.server_args.incremental_streaming_output;
 
@@ -189,10 +238,14 @@ async fn drain_unary(
                 acc.fold(&out);
                 let final_out = acc.into_output();
                 // A validation abort carries its own HTTP status + diagnostic.
-                if let Some((code, message)) = abort_status(&final_out.finish_reason) {
+                if let Some((code, message)) = final_out
+                    .finish_reason
+                    .as_ref()
+                    .and_then(|f| f.abort_status())
+                {
                     let status =
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    return (status, error_value(code, &message), true);
+                    return (status, error_value(code, message), true);
                 }
                 return (
                     StatusCode::OK,
@@ -228,10 +281,25 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
 ) -> Response {
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    // Reject the WHOLE batch before dispatching any of it. `submit` checks one rid
+    // at a time, so a collision at item k left items 0..k already handed to the
+    // scheduler — the client sees a 400 while that prefix keeps generating, and
+    // (until the abort lane landed) could leak their rids too. Python validates
+    // every request before it creates any.
+    {
+        let live = state.live_rids.lock().expect("live_rids poisoned");
+        if let Some(dup) = requests.iter().find(|r| live.contains(&r.rid)) {
+            return pre_submit_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Duplicate request ID detected: {}", dup.rid),
+                stream,
+            );
+        }
+    }
+    let mut guard = AbortGuard::new_empty(state.senders.clone(), state.live_rids.clone());
     let mut receivers = Vec::with_capacity(requests.len());
     for req in requests {
-        match submit(state, RequestKind::Generate(req)).await {
+        match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((id, rid, rx)) => {
                 guard.arm(id, rid.clone());
                 receivers.push((id, rid, rx));
@@ -347,8 +415,8 @@ fn generation_event_stream(
             } else if let Some(out) = terminal {
                 // A validation abort → an error object, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
-                yield match abort_status(&out.finish_reason) {
-                    Some((code, message)) => tag_value(error_value(code, &message), idx(i)),
+                yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
+                    Some((code, message)) => tag_value(error_value(code, message), idx(i)),
                     None => stream_frame_string(out, &accs[i], incremental, &rid_strs[i], idx(i)),
                 };
                 guard.disarm(rids[i]); // terminal → not re-pushed
@@ -372,6 +440,7 @@ mod tests {
     fn senders() -> Senders {
         Senders {
             tm: flume::unbounded().0,
+            abort: flume::unbounded().0,
             tok: flume::unbounded().0,
             detok: vec![],
         }
@@ -390,7 +459,11 @@ mod tests {
             rid_hash: rid,
             text: text.into(),
             completion_tokens: 1,
-            finish_reason: Some(serde_json::json!({ "type": "length" })),
+            // Parsed from the wire map Python emits, not a hand-built enum.
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({"type": "length", "length": 1}))
+                    .expect("finish reason must parse"),
+            ),
             ..Default::default()
         })
     }
@@ -409,8 +482,12 @@ mod tests {
             (RidHash(10), "10".to_string(), rx0),
             (RidHash(11), "11".to_string(), rx1),
         ];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            true,
+        );
         futures::pin_mut!(stream);
 
         // Drive deterministically: exactly one channel has data before each poll.
@@ -449,8 +526,12 @@ mod tests {
             (RidHash(10), "10".to_string(), rx0),
             (RidHash(11), "11".to_string(), rx1),
         ];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            true,
+        );
         futures::pin_mut!(stream);
 
         tx0.send(EgressItem::Error(crate::error::Error::Validation(
@@ -475,8 +556,12 @@ mod tests {
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            true,
+            true,
+        );
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "Hello")).await.unwrap();
@@ -507,8 +592,12 @@ mod tests {
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            false,
+        );
         futures::pin_mut!(stream);
 
         tx.send(done(10, "hi")).await.unwrap();
@@ -527,8 +616,12 @@ mod tests {
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            false,
+            false,
+        );
         futures::pin_mut!(stream);
 
         // Three chunks queued before the stream is ever polled (a client falling behind).
@@ -554,8 +647,12 @@ mod tests {
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
         let receivers = vec![(RidHash(10), "10".to_string(), rx)];
-        let stream =
-            generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
+        let stream = generation_event_stream(
+            receivers,
+            AbortGuard::new_empty(senders(), Default::default()),
+            true,
+            false,
+        );
         futures::pin_mut!(stream);
 
         tx.send(frame(10, "a")).await.unwrap();
@@ -570,5 +667,39 @@ mod tests {
                 "count stays cumulative"
             );
         }
+    }
+    /// Pre-submit errors must look like every other error the server emits — a
+    /// JSON `{"error": …}` object, not bare text — and a streaming request must get
+    /// 200 + an SSE error frame rather than a 400, because Python answers it from
+    /// inside `stream_results()` after the stream has already been committed to.
+    #[tokio::test]
+    async fn pre_submit_errors_match_python_shape() {
+        let unary = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", false);
+        assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(v["error"]["message"], "bad input");
+        assert_eq!(v["error"]["code"], 400);
+
+        let streamed = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", true);
+        assert_eq!(
+            streamed.status(),
+            StatusCode::OK,
+            "the stream itself is 200"
+        );
+        let body = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#""code":400"#),
+            "carries the status in-band: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "terminated: {text}"
+        );
     }
 }
