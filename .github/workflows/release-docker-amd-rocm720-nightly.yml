@@ -10,6 +10,7 @@ on:
         options:
           - 'all'
           - publish
+          - publish-k3
   schedule:
     - cron: '0 12 * * *'
 
@@ -125,6 +126,83 @@ jobs:
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+
+  publish_k3_mi35x:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.job_select == 'publish-k3'))
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    steps:
+      - name: Checkout Kimi K3 branch
+        uses: actions/checkout@v4
+        with:
+          ref: kimi-k3
+          fetch-depth: 0  # Required for git describe to find tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set build metadata
+        run: |
+          set -euo pipefail
+
+          DATE=$(date -u +%Y%m%d)
+          SOURCE_SHA=$(git rev-parse HEAD)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+          IMAGE_TAG="rocm720-mi35x-k3-${DATE}"
+
+          {
+            echo "SOURCE_SHA=${SOURCE_SHA}"
+            echo "PRETEND_VERSION=${PRETEND_VERSION}"
+            echo "IMAGE_TAG=${IMAGE_TAG}"
+          } >> "$GITHUB_ENV"
+
+          echo "Source commit: ${SOURCE_SHA}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Kimi K3 image for MI35x
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -f docker/rocm.Dockerfile \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx950-rocm720 \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            --label org.opencontainers.image.source=https://github.com/sgl-project/sglang/tree/kimi-k3 \
+            --label org.opencontainers.image.revision="${SOURCE_SHA}" \
+            -t "lmsysorg/sglang-rocm:${IMAGE_TAG}" \
+            --no-cache \
+            .
+
+      - name: Smoke test Kimi K3 image
+        run: |
+          docker run --rm "lmsysorg/sglang-rocm:${IMAGE_TAG}" \
+            python3 -c "import importlib; [importlib.import_module(name) for name in ('sglang', 'sglang.srt.models.kimi_k3', 'sglang.kernels.ops.sampling.top_p_renorm_triton')]"
+
+      - name: Push Kimi K3 image
+        run: |
+          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
   # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
   # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
