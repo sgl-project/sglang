@@ -10,6 +10,7 @@ from sglang.test.ascend.test_ascend_utils import (
     QWEN3_5_27B_MODEL_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
 )
+from sglang.test.ascend.e2e.test_npu_performance_utils import QWEN3_CODER_NEXT_W8A8_MODEL_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -340,6 +341,7 @@ class TestApiRelatedToolCallParserQwen(CustomTestCase):
 
 class TestApiRelatedToolCallParserQwen3Coder(TestApiRelatedToolCallParserQwen):
     tool_call_parser = "qwen3_coder"
+    model = QWEN3_CODER_NEXT_W8A8_MODEL_PATH
 
 
 class TestApiRelatedAdminApiKey(CustomTestCase):
