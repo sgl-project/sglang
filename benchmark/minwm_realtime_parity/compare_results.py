@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -95,17 +97,17 @@ def metric_block(reference: np.ndarray, candidate: np.ndarray) -> dict:
     try:
         from skimage.metrics import structural_similarity
 
-        ssim_values = [
-            float(
+        def frame_ssim(frame_pair) -> float:
+            ref_frame, candidate_frame = frame_pair
+            return float(
                 structural_similarity(
-                    ref_frame,
-                    candidate_frame,
-                    channel_axis=2,
-                    data_range=255,
+                    ref_frame, candidate_frame, channel_axis=2, data_range=255
                 )
             )
-            for ref_frame, candidate_frame in zip(reference, candidate)
-        ]
+
+        worker_count = max(1, int(os.environ.get("MINWM_SSIM_WORKERS", "8")))
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            ssim_values = list(pool.map(frame_ssim, zip(reference, candidate)))
         ssim = float(np.mean(ssim_values)) if ssim_values else None
         min_frame_ssim = float(min(ssim_values)) if ssim_values else None
     except ImportError:
@@ -175,8 +177,9 @@ def main() -> None:
         sglang_path = case_dir / "sglang.npy"
         baseline = baseline_by_case[case["id"]]
         sglang = np.load(sglang_path, allow_pickle=False)
+        all_frames = metric_block(baseline, sglang)
         metrics = {
-            "all_frames": metric_block(baseline, sglang),
+            "all_frames": all_frames,
             "reference_frame": (
                 metric_block(
                     baseline[:reference_frames],
@@ -185,9 +188,13 @@ def main() -> None:
                 if reference_frames
                 else None
             ),
-            "generated_frames": metric_block(
-                baseline[reference_frames:],
-                sglang[reference_frames:],
+            "generated_frames": (
+                metric_block(
+                    baseline[reference_frames:],
+                    sglang[reference_frames:],
+                )
+                if reference_frames
+                else dict(all_frames)
             ),
             "baseline_frames_sha256": sha256_file(baseline_path),
             "sglang_frames_sha256": sha256_file(sglang_path),
