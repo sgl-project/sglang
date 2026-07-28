@@ -202,7 +202,7 @@ def test_kimi_moonvit_computes_max_sequence_length_on_host():
     assert output.device.type == "meta"
 
 
-def test_kimi_moonvit_prepares_cuda_rope_inputs_once(monkeypatch):
+def test_kimi_moonvit_reuses_complex_rope_inputs_across_blocks():
     recorded = {}
 
     class CapturingRope:
@@ -222,7 +222,6 @@ def test_kimi_moonvit_prepares_cuda_rope_inputs_once(monkeypatch):
             recorded["rope_freqs_cis"] = rope_freqs_cis
             return hidden_states
 
-    monkeypatch.setattr(kimi_k25, "_is_cuda", True)
     encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
     nn.Module.__init__(encoder)
     encoder.rope_2d = CapturingRope()
@@ -233,40 +232,30 @@ def test_kimi_moonvit_prepares_cuda_rope_inputs_once(monkeypatch):
     hidden_states = torch.ones(7, 4)
     encoder(hidden_states, torch.tensor([[1, 1, 7]], dtype=torch.int32))
 
-    cos_sin_cache, positions = recorded["rope_freqs_cis"]
-    assert cos_sin_cache.shape == (7, 4)
-    assert torch.equal(cos_sin_cache[:, :2] + 1, cos_sin_cache[:, 2:])
-    assert torch.equal(positions, torch.arange(7))
+    rope_freqs_cis = recorded["rope_freqs_cis"]
+    assert rope_freqs_cis.shape == (7, 2)
+    assert rope_freqs_cis.dtype == torch.complex64
+    assert torch.equal(rope_freqs_cis.real + 1, rope_freqs_cis.imag)
 
 
-def test_kimi_moonvit_cuda_rope_uses_fused_inplace_kernel(monkeypatch):
+def test_kimi_moonvit_cuda_rope_uses_shared_fused_kernel(monkeypatch):
     recorded = {}
 
-    def fake_apply_rope_inplace(q, k, cos_sin_cache, positions, **kwargs):
-        recorded.update(
-            cos_sin_cache=cos_sin_cache,
-            positions=positions,
-            kwargs=kwargs,
-        )
-        q.add_(1)
-        k.add_(2)
+    def fake_fused_rope(q, k, freqs_cis):
+        recorded["freqs_cis"] = freqs_cis
+        return q + 1, k + 2
 
-    monkeypatch.setattr(
-        kimi_k25, "apply_rope_inplace", fake_apply_rope_inplace, raising=False
-    )
+    monkeypatch.setattr(kimi_k25, "can_use_fused_qk_complex_rope", lambda *args: True)
+    monkeypatch.setattr(kimi_k25, "apply_fused_qk_complex_rope", fake_fused_rope)
     q = torch.zeros(3, 2, 4)
     k = torch.zeros_like(q)
-    cache = torch.ones(3, 4, dtype=torch.float32)
-    positions = torch.arange(3, dtype=torch.int64)
+    freqs_cis = torch.ones(3, 2, dtype=torch.complex64)
 
-    q_out, k_out = kimi_k25.apply_rope(q, k, (cache, positions))
+    q_out, k_out = kimi_k25.apply_rope(q, k, freqs_cis, use_fused=True)
 
-    assert q_out is q and k_out is k
-    assert torch.equal(q, torch.ones_like(q))
-    assert torch.equal(k, torch.full_like(k, 2))
-    assert recorded["cos_sin_cache"] is cache
-    assert recorded["positions"] is positions
-    assert recorded["kwargs"] == {"is_neox": False, "rope_dim": 4}
+    assert torch.equal(q_out, torch.ones_like(q))
+    assert torch.equal(k_out, torch.full_like(k, 2))
+    assert recorded["freqs_cis"] is freqs_cis
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -278,9 +267,9 @@ def test_kimi_moonvit_fused_rope_matches_portable_path():
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
 
     q_ref, k_ref = kimi_k25.apply_rope(q.clone(), k.clone(), freqs_cis)
-    cache = torch.cat((freqs_cis.real, freqs_cis.imag), dim=-1)
-    positions = torch.arange(256, device="cuda", dtype=torch.long)
-    q_fused, k_fused = kimi_k25.apply_rope(q.clone(), k.clone(), (cache, positions))
+    q_fused, k_fused = kimi_k25.apply_rope(
+        q.clone(), k.clone(), freqs_cis, use_fused=True
+    )
 
     torch.testing.assert_close(q_fused, q_ref, rtol=0.01, atol=0.01)
     torch.testing.assert_close(k_fused, k_ref, rtol=0.01, atol=0.01)

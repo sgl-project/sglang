@@ -1,5 +1,6 @@
 import logging
 from copy import deepcopy
+from functools import partial
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -8,6 +9,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import PytorchGELUTanh
 
+from sglang.kernels.ops.attention.vision_rope import (
+    apply_fused_qk_complex_rope,
+    can_use_fused_qk_complex_rope,
+)
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import (
@@ -51,37 +56,26 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cuda = is_cuda()
 
-if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_inplace
-
 
 def apply_rope(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    freqs_cis: torch.Tensor,
     x_shape=None,
+    *,
+    use_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: Either the complex frequencies used by the portable path, or
-            a ``(cos_sin_cache, positions)`` pair prepared for the CUDA kernel.
+        freqs_cis: Complex frequencies of shape (..., head_dim/2).
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
 
-    if isinstance(freqs_cis, tuple):
-        cos_sin_cache, positions = freqs_cis
-        apply_rope_inplace(
-            xq,
-            xk,
-            cos_sin_cache,
-            positions,
-            is_neox=False,
-            rope_dim=cos_sin_cache.size(-1),
-        )
-        return xq, xk
+    if use_fused and can_use_fused_qk_complex_rope(xq, xk, freqs_cis):
+        return apply_fused_qk_complex_rope(xq, xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -106,6 +100,7 @@ class MoonViTEncoderLayer(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         qkv_hidden_size: int | None = None,
+        use_fused_rope: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -134,7 +129,9 @@ class MoonViTEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
-            customized_position_embedding_applier=apply_rope,
+            customized_position_embedding_applier=partial(
+                apply_rope, use_fused=use_fused_rope
+            ),
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -454,6 +451,7 @@ class MoonViT3dEncoder(nn.Module):
                     **block_cfg,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    use_fused_rope=self.use_fused_rope,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -468,18 +466,6 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
-
-        # RL target execution normalizes position embeddings to the activation
-        # dtype in VisionAttention, so retain the portable complex path there.
-        if self.use_fused_rope:
-            rope_freqs_cis = (
-                torch.cat((rope_freqs_cis.real, rope_freqs_cis.imag), dim=-1),
-                torch.arange(
-                    rope_freqs_cis.size(0),
-                    dtype=torch.long,
-                    device=rope_freqs_cis.device,
-                ),
-            )
 
         sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
         max_seqlen = int(sequence_lengths.max().item())
