@@ -502,6 +502,11 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         self.sparse.dense_backend = dense_backend
 
+    def resolved_backend_name(self, forward_mode) -> Optional[str]:
+        # The sparse side is picked per layer, so the dense backend is the one
+        # model dispatch is asking about.
+        return self.dense.resolved_backend_name(forward_mode)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata(forward_batch)
         self.dense.init_forward_metadata(forward_batch)

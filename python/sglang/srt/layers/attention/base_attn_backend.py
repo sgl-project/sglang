@@ -11,7 +11,7 @@ from sglang.srt.utils.common import is_npu
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -38,9 +38,20 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
-    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
-    prefill_attention_backend_str: Optional[str] = None
-    decode_attention_backend_str: Optional[str] = None
+    # Registry name of this backend, stamped where the name-to-object binding is
+    # made (attention_backend_setup for the target runner, DraftBackendFactory
+    # for the draft one).
+    backend_name: Optional[str] = None
+
+    def resolved_backend_name(self, forward_mode: ForwardMode) -> Optional[str]:
+        """Name of the backend that actually serves this forward.
+
+        Model-level dispatch keys its forward-method choice on this instead of
+        re-deriving a name from server_args, which would read the target's knobs
+        on a draft runner and would duplicate the wrapper's own routing rule.
+        Wrappers that own several backends override this to delegate.
+        """
+        return self.backend_name
 
     supports_ragged_verify_graph: bool = False
 
