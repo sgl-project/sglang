@@ -126,9 +126,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
-    // Shared with the api server: it admits a rid, ingress releases it once the
-    // abort has actually been issued (see `Ingress::on_abort`).
-    let live_rids = tokenizer_manager::LiveRids::default();
     let senders = Senders {
         tm: tm_tx.clone(),
         abort: abort_tx.clone(),
@@ -201,7 +198,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
         // First TM core; egress is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `RidHash` later (see
+        // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
         // `TM_CORES`) is just a larger count + per-shard receivers.
         let cores = plan
             .as_ref()
@@ -235,7 +232,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             tokenizer_manager::Ingress::new(
                 tm_rx,
                 abort_rx.clone(),
-                live_rids.clone(),
                 senders.clone(),
                 ingress_tx,
                 tokenizer_manager::Limits::from_server_args(&cfg.server_args),
@@ -275,7 +271,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     cfg.server_args.clone(),
                     // Egress heartbeat watched by `/health_generate`.
                     api_activity,
-                    live_rids.clone(),
                     shutdown_rx,
                 ))
             })
