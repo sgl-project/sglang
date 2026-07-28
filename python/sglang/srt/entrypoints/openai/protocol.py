@@ -48,6 +48,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -1678,6 +1679,8 @@ class ResponsesResponse(BaseModel):
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    # kept as UsageInfo internally (metrics, final_usage_info); serialized below
+    # in the Responses shape, which is what the api and its clients specify
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
     tool_choice: str = "auto"
@@ -1702,6 +1705,21 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_serializer("usage")
+    def _serialize_usage(self, usage: Optional[UsageInfo]) -> Optional[Dict[str, Any]]:
+        if usage is None:
+            return None
+        details = usage.prompt_tokens_details
+        return {
+            "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": {
+                "cached_tokens": getattr(details, "cached_tokens", 0) or 0
+            },
+            "output_tokens": usage.completion_tokens or 0,
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "total_tokens": usage.total_tokens,
+        }
 
     @classmethod
     def from_request(

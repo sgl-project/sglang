@@ -527,3 +527,67 @@ class HarmonyResponsesTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResponsesUsageSerialization(unittest.TestCase):
+    """usage must go out in the Responses shape, not the chat-completions one."""
+
+    def _response(self, usage):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        return ResponsesResponse(model="x", status="completed", usage=usage)
+
+    def test_serialized_usage_uses_responses_keys(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            PromptTokensDetails,
+            UsageInfo,
+        )
+
+        usage = UsageInfo(
+            prompt_tokens=11,
+            completion_tokens=7,
+            total_tokens=18,
+            reasoning_tokens=2,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=5),
+        )
+        dumped = self._response(usage).model_dump()["usage"]
+        self.assertEqual(dumped["input_tokens"], 11)
+        self.assertEqual(dumped["output_tokens"], 7)
+        self.assertEqual(dumped["total_tokens"], 18)
+        self.assertEqual(dumped["input_tokens_details"]["cached_tokens"], 5)
+        self.assertEqual(dumped["output_tokens_details"]["reasoning_tokens"], 2)
+        self.assertNotIn("prompt_tokens", dumped)
+
+    def test_attribute_access_still_chat_shaped(self):
+        from sglang.srt.entrypoints.openai.protocol import UsageInfo
+
+        response = self._response(UsageInfo(prompt_tokens=3, completion_tokens=4))
+        self.assertEqual(response.usage.prompt_tokens, 3)
+        self.assertEqual(response.usage.completion_tokens, 4)
+
+    def test_none_usage_serializes_to_none(self):
+        self.assertIsNone(self._response(None).model_dump()["usage"])
+
+
+class TestSdkResponseSanitizer(unittest.TestCase):
+    """effort tiers above 'high' must not blow up the sdk event models."""
+
+    def _sanitize(self, effort):
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            _sanitize_response_dict,
+        )
+
+        return _sanitize_response_dict(
+            {"tools": [{"type": "custom"}], "reasoning": {"effort": effort}}
+        )["reasoning"]["effort"]
+
+    def test_extended_tiers_clamp_to_high(self):
+        self.assertEqual(self._sanitize("xhigh"), "high")
+        self.assertEqual(self._sanitize("max"), "high")
+
+    def test_known_tiers_pass_through(self):
+        for tier in ("minimal", "low", "medium", "high"):
+            self.assertEqual(self._sanitize(tier), tier)
+
+    def test_none_tier_drops_to_null(self):
+        self.assertIsNone(self._sanitize("none"))
