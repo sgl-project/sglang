@@ -2845,32 +2845,42 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        # From here on a prefill rank may write into our KV pages, so the pages
-        # must not be released until every peer confirms it has stopped.
-        self._metadata_sent = True
         for bootstrap_info, abort_token in self._abort_targets_snapshot():
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             try:
                 with lock:
-                    sock.send_multipart(
-                        [
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
-                            str(aux_index).encode("ascii") if not is_dummy else b"",
-                            (
-                                pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
-                                else b""
-                            ),
-                            str(self.required_dst_info_num).encode("ascii"),
-                            str(decode_prefix_len or 0).encode("ascii"),
-                            abort_token,
-                        ]
-                    )
+                    # Register exposure before send so an abort racing a
+                    # successful send cannot receive and discard an early ACK.
+                    # ZeroMQ delivers multipart messages atomically, so a send
+                    # that raises exposed no complete metadata and is removed.
+                    self._record_metadata_exposure(abort_token)
+                    try:
+                        sock.send_multipart(
+                            [
+                                str(self.bootstrap_room).encode("ascii"),
+                                self.kv_mgr.local_ip.encode("ascii"),
+                                str(self.kv_mgr.rank_port).encode("ascii"),
+                                self.session_id.encode("ascii"),
+                                kv_indices.tobytes() if not is_dummy else b"",
+                                (
+                                    str(aux_index).encode("ascii")
+                                    if not is_dummy
+                                    else b""
+                                ),
+                                (
+                                    pack_int_lists(state_indices, "i")
+                                    if not is_dummy and state_indices
+                                    else b""
+                                ),
+                                str(self.required_dst_info_num).encode("ascii"),
+                                str(decode_prefix_len or 0).encode("ascii"),
+                                abort_token,
+                            ]
+                        )
+                    except Exception:
+                        self._discard_metadata_exposure(abort_token)
+                        raise
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -2992,10 +3002,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     (bootstrap_info, os.urandom(16).hex().encode("ascii"))
                     for bootstrap_info in self.bootstrap_infos
                 ]
-                self._expected_abort_acks = {
-                    token for _info, token in self._abort_targets
-                }
             return list(self._abort_targets)
+
+    def _record_metadata_exposure(self, token: bytes) -> None:
+        """Require an ACK from a peer that may now write into this room."""
+        with self._abort_lock:
+            self._expected_abort_acks.add(token)
+            self._metadata_sent = True
+
+    def _discard_metadata_exposure(self, token: bytes) -> None:
+        """Undo an exposure whose atomic multipart send did not complete."""
+        with self._abort_lock:
+            self._expected_abort_acks.discard(token)
+            self._received_abort_acks.discard(token)
+            self._metadata_sent = bool(self._expected_abort_acks)
 
     def record_abort_ack(self, token: Optional[bytes]) -> None:
         with self._abort_lock:

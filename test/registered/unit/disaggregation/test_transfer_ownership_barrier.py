@@ -118,7 +118,7 @@ def make_receiver(mgr, room=ROOM, bootstrap_infos=None, metadata_sent=True):
     receiver.conclude_state = None
     receiver.require_staging = False
     receiver.bootstrap_infos = bootstrap_infos
-    receiver._metadata_sent = metadata_sent
+    receiver._metadata_sent = False
     receiver._quiescing = False
     receiver._quiesce_complete = False
     receiver._quiesce_deadline = float("inf")
@@ -132,6 +132,13 @@ def make_receiver(mgr, room=ROOM, bootstrap_infos=None, metadata_sent=True):
     receiver._connect_to_bootstrap_server = Mock(
         side_effect=lambda info: (Mock(), threading.Lock())
     )
+    if metadata_sent:
+        targets = receiver._abort_targets_snapshot()
+        if targets:
+            for _info, token in targets:
+                receiver._record_metadata_exposure(token)
+        else:
+            receiver._metadata_sent = True
     return receiver
 
 
@@ -980,6 +987,42 @@ class TestDecodeOwnership(unittest.TestCase):
             tokens[1],
             "a retry must reuse the nonce so the ACK still matches",
         )
+
+    def test_failed_metadata_send_does_not_expect_unexposed_peers(self):
+        mgr = make_decode_manager()
+        mgr.enable_staging = False
+        receiver = make_receiver(
+            mgr,
+            bootstrap_infos=[
+                {
+                    "rank": rank,
+                    "rank_ip": "127.0.0.1",
+                    "rank_port": rank + 1,
+                    "is_dummy": False,
+                }
+                for rank in range(3)
+            ],
+            metadata_sent=False,
+        )
+        receiver.session_id = "decode"
+        receiver.required_dst_info_num = 3
+        sockets = {rank: Mock() for rank in range(3)}
+        sockets[1].send_multipart.side_effect = zmq.ZMQError()
+        connected = []
+
+        def connect(info):
+            connected.append(info["rank"])
+            return sockets[info["rank"]], threading.Lock()
+
+        receiver._connect_to_bootstrap_server = connect
+        receiver.send_metadata(np.array([123], dtype=np.int32))
+
+        tokens = {info["rank"]: token for info, token in receiver._abort_targets}
+        self.assertEqual(connected, [0, 1])
+        self.assertEqual(receiver._expected_abort_acks, {tokens[0]})
+        self.assertTrue(receiver._metadata_sent)
+        self.assertNotIn(tokens[1], receiver._expected_abort_acks)
+        self.assertNotIn(tokens[2], receiver._expected_abort_acks)
 
     def test_quiescence_is_bounded_when_a_peer_never_acknowledges(self):
         mgr = make_decode_manager(quiesce_timeout=0.05)
