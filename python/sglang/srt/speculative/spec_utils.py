@@ -810,6 +810,69 @@ def commit_mamba_states_after_verify(
     # ring is allocated only then; KDA never allocates the cursors.
     req_pool = model_runner.req_to_token_pool
     mamba_pool = getattr(req_pool, "mamba_pool", None)
+
+    # GDN ReplaySSM fold-every-commit (the mamba extra_buffer / overlap-schedule
+    # protocol): the draft window's raw inputs were written to the per-slot ring
+    # by the fused ring-write during verify; replay the accepted prefix into the
+    # fp32 checkpoint (`temporal`) here on commit -- `temporal` is always the
+    # current committed state. With extra_buffer the same fold snapshots the
+    # interval-crossing state into the track ping-pong slot (mirrors the regular
+    # commit's mamba_steps_to_track), so no device-side force-flush is needed.
+    if mamba_pool is not None and getattr(mamba_pool, "replayssm_spec_fold", False):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+            commit_gdn_replayssm_fold_after_verify,
+        )
+
+        spec_state = req_pool.get_speculative_mamba2_params_all_layers()
+        bs = accept_lens.shape[0]
+        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        accept_indices_offset = torch.arange(
+            0,
+            bs * draft_token_num,
+            step=draft_token_num,
+            dtype=accept_lens.dtype,
+            device=accept_lens.device,
+        )
+        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+        last_correct_step_indices = (
+            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+            - accept_indices_offset
+        )
+        mamba_track_indices = batch.mamba_track_indices
+        mamba_steps_to_track = None
+        if mamba_track_indices is not None:
+            track_interval = get_server_args().mamba_track_interval
+            seq_lens_pre_verify = batch.seq_lens
+            seq_lens_post_verify = batch.seq_lens + accept_lens
+            to_track_mask = (
+                seq_lens_pre_verify // track_interval
+                != seq_lens_post_verify // track_interval
+            )
+            tracking_point = seq_lens_post_verify // track_interval * track_interval
+            to_track_ith = torch.clamp(
+                tracking_point - seq_lens_pre_verify - 1, min=0
+            ).to(torch.int64)
+            candidate_track_steps = (
+                accept_index[req_idx, to_track_ith] - accept_indices_offset
+            )
+            mamba_steps_to_track = torch.where(
+                to_track_mask,
+                candidate_track_steps,
+                torch.full_like(candidate_track_steps, -1),
+            )
+        commit_gdn_replayssm_fold_after_verify(
+            spec_state=spec_state,
+            state_batch_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            last_correct_step_indices=last_correct_step_indices,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=-1,
+        )
+        return
+
     if (
         mamba_pool is not None
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
@@ -862,7 +925,7 @@ def commit_mamba_states_after_verify(
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
-        # --enable-gdn-replayssm-spec), so the per-track scatters are intentionally
+        # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
         return
 

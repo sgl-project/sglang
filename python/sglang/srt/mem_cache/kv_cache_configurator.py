@@ -727,10 +727,14 @@ class KVCacheConfigurator:
             # (rings + cursors + the intermediate_ssm gate) only for GDN-hybrid
             # models, so any other mamba-ish model (Mamba2/Nemotron, lightning,
             # ...) run with the flag set stays byte-identical to flag-off.
-            enable_gdn_replayssm_spec=(
-                self.server_args.enable_gdn_replayssm_spec
+            enable_linear_replayssm_spec=(
+                self.server_args.enable_linear_replayssm_spec
                 and self.hybrid_gdn_config is not None
             ),
+            # Fold-every-commit protocol goes with mamba extra_buffer (the
+            # radix strategy that keeps the overlap scheduler on); without it
+            # the circular-ring + periodic-flush protocol is kept.
+            linear_replayssm_spec_fold=self.server_args.enable_mamba_extra_buffer(),
         )
         return req_to_token_pool
 

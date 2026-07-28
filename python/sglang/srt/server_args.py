@@ -2542,15 +2542,18 @@ class ServerArgs:
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
         NS("exec.mamba"),
     ] = 16
-    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
-    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
-    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
-    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
-    # cursors (cache_base, is_flush); the ring length reuses
+    # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
+    # a per-slot ring + fold instead of per-draft full-state snapshots. GDN only;
+    # linear-chain (topk <= 1) only. Two protocols share the flag: with mamba
+    # extra_buffer (the overlap-schedule radix strategy) the verify writes a raw
+    # (v, pre-norm k, g, beta) ring that the commit folds into the fp32
+    # checkpoint every step (fold-every-commit, KDA-style); otherwise the
+    # circular (d, k, g) ring + periodic flush with per-slot cursors
+    # (cache_base, is_flush) is used. Ring length reuses
     # `linear_replayssm_cache_len`.
-    enable_gdn_replayssm_spec: A[
+    enable_linear_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+        "Enable the ReplaySSM linear-attn spec-verify kernel (Part B of RFC #28511): a per-slot ring replacing the recurrent verify's per-draft full-state snapshots (fold-every-commit under mamba extra_buffer, circular ring + periodic flush otherwise). GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
         NS("exec.mamba"),
     ] = False
 
@@ -3540,7 +3543,7 @@ class ServerArgs:
         handle_speculative_decoding(self)
 
         # Needs the draft-token count derived just above.
-        self._validate_gdn_replayssm_spec_ring()
+        self._validate_linear_replayssm_spec_ring()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -6005,10 +6008,10 @@ class ServerArgs:
         # runtime (KDA routes through kda_backend, which never enters this path; the
         # pool gate also checks `not cache_params.is_kda`). The ring length reuses
         # --linear-replayssm-cache-len (no separate flag).
-        if self.enable_gdn_replayssm_spec:
+        if self.enable_linear_replayssm_spec:
             if self.speculative_eagle_topk not in (None, 1):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "--enable-linear-replayssm-spec requires a linear draft chain "
                     "(--speculative-eagle-topk in {None, 1}); the chunked verify "
                     "kernel uses a strictly-lower causal mask and is invalid for "
                     "EAGLE tree verify. Got "
@@ -6016,23 +6019,39 @@ class ServerArgs:
                 )
             if decode != "triton":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
+                    "--enable-linear-replayssm-spec requires the Triton linear-attn "
                     "decode backend, got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            if self.enable_mamba_extra_buffer():
-                # The spec-verify path does not yet implement the device-side
-                # force-flush needed to keep `temporal` consistent with the ring at
-                # radix mamba-track boundaries, so it is incompatible with
-                # extra_buffer (radix prefix caching).
+            # Protocol selection. extra_buffer (the overlap-schedule-compatible
+            # radix strategy) uses the KDA-style fold-every-commit protocol:
+            # verify writes raw (v, pre-norm k, g, beta) ring entries and the
+            # commit replays the accepted prefix into the fp32 checkpoint, so
+            # `temporal` is always current and the radix mamba-track snapshot
+            # happens inside the same fold (no force-flush needed). Without
+            # extra_buffer the original circular-ring + periodic-flush protocol
+            # is kept. Read through the resolved view: the auto->extra_buffer
+            # strategy resolution is still a declaration at this point (the raw
+            # field would silently read "auto").
+            from sglang.srt.arg_groups.overrides import (
+                mamba_extra_buffer_of,
+                resolved_view,
+            )
+
+            _mamba_view = resolved_view(self)
+            _spec_fold = mamba_extra_buffer_of(_mamba_view)
+            if (
+                _spec_fold
+                and _mamba_view.mamba_radix_cache_strategy == "extra_buffer_lazy"
+            ):
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
-                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
-                    "or --mamba-radix-cache-strategy no_buffer."
+                    "--enable-linear-replayssm-spec fold-every-commit is not "
+                    "validated with --mamba-radix-cache-strategy extra_buffer_lazy "
+                    "yet; use extra_buffer."
                 )
             if self.disaggregation_mode != "null":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec is not supported under PD "
+                    "--enable-linear-replayssm-spec is not supported under PD "
                     "disaggregation yet (follow-up). Got "
                     f"--disaggregation-mode={self.disaggregation_mode!r}."
                 )
@@ -6043,19 +6062,21 @@ class ServerArgs:
                 )
             if self.enable_linear_replayssm:
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec and --enable-linear-replayssm are "
+                    "--enable-linear-replayssm-spec and --enable-linear-replayssm are "
                     "mutually exclusive: they share the ring storage but drive it "
                     "with incompatible cursor protocols (per-decode-forward vs "
                     "per-verify-commit advance)."
                 )
+            # Circular-ring invariants only; fold-every-commit sizes its window
+            # to the draft maximum and never reads --linear-replayssm-cache-len.
             ring_len = self.linear_replayssm_cache_len
-            if ring_len & (ring_len - 1) != 0:
+            if not _spec_fold and ring_len & (ring_len - 1) != 0:
                 raise ValueError(
                     "--linear-replayssm-cache-len must be a power of two for the "
                     f"circular spec-verify ring, got {ring_len}."
                 )
             # ring_len >= 2 * max drafts is checked in
-            # _validate_gdn_replayssm_spec_ring() (draft tokens not derived yet).
+            # _validate_linear_replayssm_spec_ring() (draft tokens not derived yet).
             # Closed-loop exact fold: the flush replays raw ring inputs through
             # the recurrent update into the checkpoint, bit-identical to the
             # recurrent baseline -- which keeps its state in fp32. A 16-bit
@@ -6063,14 +6084,14 @@ class ServerArgs:
             # and become the dominant residual error source, so require fp32.
             if self.mamba_ssm_dtype is None:
                 logger.info(
-                    "--enable-gdn-replayssm-spec: setting --mamba-ssm-dtype "
+                    "--enable-linear-replayssm-spec: setting --mamba-ssm-dtype "
                     "float32 (the closed-loop exact fold requires the fp32 SSM "
                     "checkpoint for recurrent-parity)."
                 )
                 self.mamba_ssm_dtype = "float32"
             elif self.mamba_ssm_dtype != "float32":
                 raise ValueError(
-                    "--enable-gdn-replayssm-spec requires --mamba-ssm-dtype "
+                    "--enable-linear-replayssm-spec requires --mamba-ssm-dtype "
                     f"float32, got {self.mamba_ssm_dtype!r}. The closed-loop "
                     "exact fold keeps the committed state bit-identical to the "
                     "recurrent baseline, which is only meaningful against the "
@@ -6078,7 +6099,7 @@ class ServerArgs:
                     "every flush."
                 )
 
-    def _validate_gdn_replayssm_spec_ring(self):
+    def _validate_linear_replayssm_spec_ring(self):
         """Enforce ring_len >= 2 * max draft tokens for the spec-verify ring.
 
         Early-flush margin: write_pos + spec_len <= ring_len must hold on every
@@ -6086,7 +6107,16 @@ class ServerArgs:
         handle_speculative_decoding() so the (adaptive-aware) max is final;
         MambaPool re-checks at ring allocation as a backstop.
         """
-        if not self.enable_gdn_replayssm_spec:
+        if not self.enable_linear_replayssm_spec:
+            return
+        from sglang.srt.arg_groups.overrides import (
+            mamba_extra_buffer_of,
+            resolved_view,
+        )
+
+        if mamba_extra_buffer_of(resolved_view(self)):
+            # Fold-every-commit: the window is sized to the draft maximum and
+            # overwritten every verify step; no early-flush margin exists.
             return
         max_drafts = self.max_speculative_num_draft_tokens
         if max_drafts is None:
