@@ -192,6 +192,7 @@ jobs:
           pip install msgpack
           pip install watchfiles
           pip install torchao==0.16.0
+          pip install /root/.cache/.cache/npu-pkgs/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
           git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
           cd ./lmms-eval
           nohup pip install . > lmmslog.txt 2>&1 &
@@ -260,9 +261,10 @@ jobs:
           pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
           pip install jsonlines httpx==0.25.0 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4 dotenv
           pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
-          pip install websocket-client websockets
+          pip install websocket-client websockets uvicorn==0.49.0
           git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
           pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc
+          pip install /root/.cache/.cache/npu-pkgs/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
           cd ./lmms-eval
           nohup pip install . > lmmslog.txt 2>&1 &
           sleep 120
@@ -329,7 +331,7 @@ jobs:
           pip install zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
           pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 sacrebleu>=1.5.0 pytablewriter black==24.1.0 isort==5.13.2 peft>=0.2.0 accelerate>=0.29.1
           pip install jsonlines httpx==0.25.0 evaluate>=0.4.0 datasets==2.16.1 numexpr xgrammar==0.1.25 numpy==1.26.4 dotenv
-          pip install /root/.cache/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
+          pip install /root/.cache/.cache/npu-pkgs/torch_memory_saver-0.0.8-cp311-cp311-linux_aarch64.whl
           git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
           cd ./lmms-eval
           nohup pip install . > lmmslog.txt 2>&1 &

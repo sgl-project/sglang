@@ -78,6 +78,111 @@ class TestNPUStreamingSession(NPUStreamingSessionServerBase, StreamingSessionKit
     ]
     kv_inherit_offsets = (0,)
 
+    def test_nth_mid_abort_recovery(self) -> None:
+        """NPU override: Qwen3-8B context ~40K, max_new_tokens reduced to 30000."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            # Turn 1: normal generate to create slot.
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+            resp_1 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_1,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                    "session_params": {"id": session_id, "rid": None},
+                },
+                timeout=30,
+            )
+            self.assertEqual(resp_1.status_code, 200, resp_1.text)
+            data_1 = resp_1.json()
+            turn_1_total = (
+                data_1["meta_info"]["prompt_tokens"]
+                + data_1["meta_info"]["completion_tokens"]
+            )
+
+            # Turn 2: long generate, then abort mid-decode.
+            ids_2 = self.tokenizer.encode(" Continue the story in great detail.")
+
+            import threading
+
+            result = [None]
+
+            def do_generate():
+                r = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_2,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 30000,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=60,
+                )
+                result[0] = r
+
+            t = threading.Thread(target=do_generate)
+            t.start()
+            time.sleep(0.5)
+            abort_resp = requests.post(
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
+                timeout=10,
+            )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
+            t.join(timeout=30)
+
+            self.assertIsNotNone(result[0], "Turn 2 should have returned")
+            data_2 = result[0].json()
+            self.assertEqual(
+                data_2["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 2 should be aborted, not finished normally",
+            )
+
+            # Turn 3: recovery. Rolls back to turn 1.
+            ids_3 = self.tokenizer.encode(" What happens next?")
+            for attempt in range(20):
+                resp_3 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_3,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_3.status_code == 200:
+                    break
+                time.sleep(0.5)
+            self.assertEqual(resp_3.status_code, 200, resp_3.text)
+            data_3 = resp_3.json()
+            # prompt_tokens = turn_1_total + append (BOS stripped).
+            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
+            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            self.assertEqual(
+                data_3["meta_info"]["prompt_tokens"],
+                expected_prompt_3,
+                "prompt_tokens must equal turn_1_total + append (no stale abort context)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
+
     def test_first_mid_abort_recovery(self) -> None:
         """NPU override: Qwen3-8B context ~40K, max_new_tokens reduced to 30000."""
         requests.post(self.base_url + "/flush_cache")
