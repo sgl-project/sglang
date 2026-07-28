@@ -256,6 +256,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         enable_upscaling=request.enable_upscaling,
         upscaling_model_path=request.upscaling_model_path,
         upscaling_scale=request.upscaling_scale,
+        generate_audio=_extra_value(request, "generate_audio"),
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
