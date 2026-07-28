@@ -379,8 +379,14 @@ pub async fn start_service_discovery(
             });
         }
 
-        let mut retry_delay = Duration::from_secs(1);
+        const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+        // A watch session that lasted at least this long counts as healthy, so
+        // the drop that ended it is treated as a fresh incident rather than a
+        // continuation of an earlier one.
+        const HEALTHY_STREAM_THRESHOLD: Duration = Duration::from_secs(60);
+
+        let mut retry_delay = INITIAL_RETRY_DELAY;
 
         loop {
             // Reconcile against a fresh LIST before (re)starting the watch so
@@ -423,7 +429,8 @@ pub async fn start_service_discovery(
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
 
-            match filtered_stream
+            let stream_started = time::Instant::now();
+            let watch_result = filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let app_context_inner = Arc::clone(&app_context_clone);
@@ -455,28 +462,32 @@ pub async fn start_service_discovery(
                         Ok(())
                     }
                 })
-                .await
-            {
-                Ok(_) => {
-                    retry_delay = Duration::from_secs(1);
-                }
-                Err(err) => {
-                    error!("Error in Kubernetes watcher: {}", err);
-                    warn!(
-                        "Retrying in {} seconds with exponential backoff",
-                        retry_delay.as_secs()
-                    );
-                    time::sleep(retry_delay).await;
+                .await;
 
-                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
-                }
+            // `watcher()` is an infinite stream — it recovers internally and
+            // surfaces failures as Err items — so `try_for_each` returns only
+            // by aborting on an error. A clean end is not expected, but it is
+            // handled on the same path so the restart is never a hot loop if
+            // that ever changes.
+            match watch_result {
+                Ok(()) => warn!("Kubernetes watcher stream ended unexpectedly"),
+                Err(err) => error!("Error in Kubernetes watcher: {}", err),
             }
 
-            // No extra sleep here: the Err arm already applies exponential
-            // backoff (retry_delay), and on a clean stream end we want a
-            // prompt restart so the reconcile above re-lists without an
-            // additional stall. The periodic reconcile task guarantees
-            // convergence regardless of watch health.
+            // Reset the backoff after a session that ran long enough to be
+            // considered healthy. Without this, retry_delay only ever grows:
+            // in environments that drop long-lived watches every few minutes,
+            // a handful of unrelated drops ratchets the reconnect interval to
+            // MAX_RETRY_DELAY and pins it there for the lifetime of the
+            // process, leaving the periodic reconcile as the only thing still
+            // observing the cluster.
+            if stream_started.elapsed() >= HEALTHY_STREAM_THRESHOLD {
+                retry_delay = INITIAL_RETRY_DELAY;
+            }
+
+            warn!("Restarting Kubernetes watcher in {:?}", retry_delay);
+            time::sleep(retry_delay).await;
+            retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
         }
     });
 
