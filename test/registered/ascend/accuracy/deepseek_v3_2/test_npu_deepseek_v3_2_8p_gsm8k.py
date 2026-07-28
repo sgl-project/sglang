@@ -32,7 +32,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestNPUDeepSeek_V3_2_8P_AIME2025(TestAscendAccuracyTestCaseBase):
+class TestNPUDeepSeek_V3_2_8P_GSM8K(TestAscendAccuracyTestCaseBase):
 
     model = DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH
     other_args = OTHER_ARGS
