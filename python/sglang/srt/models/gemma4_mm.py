@@ -597,13 +597,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         is_first_rank = self.pp_group.is_first_rank
         is_last_rank = self.pp_group.is_last_rank
 
-        # Only the first PP rank consumes input_ids/input_embeds; later stages
-        # receive activations through pp_proxy_tensors.
-        if is_first_rank and (input_ids is None) ^ (input_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
-
         if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
             positions = positions + 1
         else:

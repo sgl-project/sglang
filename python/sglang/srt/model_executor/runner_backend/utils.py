@@ -104,10 +104,23 @@ def resolve_decode_backend(
 def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
-    """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
+    """Pick a backend instance from cuda_graph_config['prefill']['backend'].
+
+    XPU 'tc_piecewise' still falls through to TcPiecewiseCudaGraphBackend
+    below (it internally dispatches to XPUPiecewiseBackend via
+    install_torch_compiled). XPU 'full' is the only phase-level swap: it
+    needs a torch.xpu.XPUGraph-backed backend instead of FullCudaGraphBackend.
+    """
     model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.TC_PIECEWISE
+
+    if model_runner.device == "xpu" and backend_name == Backend.FULL:
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+            FullXPUGraphBackend,
+        )
+
+        return FullXPUGraphBackend(cuda_graph_runner)
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
