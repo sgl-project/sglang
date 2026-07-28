@@ -353,8 +353,11 @@ impl Ingress {
     }
 
     /// Client disconnected: deregister, then push an `AbortReq(rid)` so the
-    /// scheduler stops generating. Fire-and-forget (a full ring drops the abort;
-    /// the request then finishes at EOS).
+    /// scheduler stops generating, then release the rid.
+    ///
+    /// NOT fire-and-forget: if the push fails the scheduler never learns to stop, so
+    /// the rid stays held rather than being handed to a retry that would collide with
+    /// the still-running request.
     fn on_abort(&self, source: AbortSource) {
         let rid = source.rid().to_string();
         let id = RidHash::from_rid(&rid);
@@ -363,17 +366,29 @@ impl Ingress {
             .detok_for(id)
             .send(DetokMsg::Deregister { rid_hash: id });
 
-        match ControlRequest::AbortReq(AbortReq::new(rid.clone(), false)).encode() {
-            Ok(header) => {
-                if !self.ingress.try_push(IngressMsg {
-                    header,
-                    ids: Bytes::new(),
-                }) {
-                    tracing::warn!(rid = %rid, "abort dropped: ingress ring full");
+        // Did the scheduler actually learn to stop? The ring is BOUNDED and drops
+        // pushes under exactly the load this matters for.
+        let scheduler_told =
+            match ControlRequest::AbortReq(AbortReq::new(rid.clone(), false)).encode() {
+                Ok(header) => {
+                    let pushed = self.ingress.try_push(IngressMsg {
+                        header,
+                        ids: Bytes::new(),
+                    });
+                    if !pushed {
+                        tracing::error!(
+                            rid = %rid,
+                            "abort dropped: ingress ring full; holding the rid so a retry \
+                             cannot collide with the still-generating request"
+                        );
+                    }
+                    pushed
                 }
-            }
-            Err(e) => tracing::warn!(rid = %rid, error = %e, "abort encode failed"),
-        }
+                Err(e) => {
+                    tracing::error!(rid = %rid, error = %e, "abort encode failed; holding the rid");
+                    false
+                }
+            };
 
         // Release the rid only now — AFTER the deregister and the ring push have
         // been issued. `AbortGuard::drop` used to release it right after enqueuing
@@ -384,10 +399,19 @@ impl Ingress {
         // `AbortReq` naming it went to the scheduler. An epoch on the detok
         // messages cannot fix that — `AbortReq` matches by rid STRING.
         //
+        // …only if the scheduler was actually told. A dropped push means it keeps
+        // generating for this rid, so releasing would let a retry pass the duplicate
+        // check and register on the same `RidHash` — and the zombie's chunks would
+        // land on the retry's connection. This is the same argument `AbortGuard::drop`
+        // makes for the lane; the ring needs it more, because unlike the unbounded
+        // lane it really does drop under load. Holding costs the client a 400 on
+        // retry; releasing costs another client's tokens.
+        //
         // …and only for a GUARD abort. A detok-originated one (failed request,
         // decoder error, full sink) leaves the handler's guard armed and still
         // owning the entry, so releasing here would hand the same rid out twice.
-        if matches!(source, AbortSource::Guard(_))
+        if scheduler_told
+            && matches!(source, AbortSource::Guard(_))
             && let Ok(mut live) = self.live_rids.lock()
         {
             live.remove(&rid);
@@ -999,6 +1023,56 @@ mod tests {
         assert!(
             consumer.drain(16).headers.is_empty(),
             "must not reach the scheduler"
+        );
+    }
+
+    /// A dropped ring push must NOT release the rid. The ring is bounded, so under
+    /// load the scheduler never learns to stop generating — handing that rid to a
+    /// retry puts the zombie's chunks on the retry's connection, which is the
+    /// collision the registry exists to prevent. `AbortGuard::drop` already argues
+    /// this for the abort lane; the ring is where it actually happens.
+    ///
+    /// Ring capacity 1: the first abort pushes, the second finds it full.
+    #[test]
+    fn abort_holds_the_rid_when_the_ring_push_is_dropped() {
+        let (tok_tx, _tok_rx) = flume::unbounded();
+        let (detok_tx, _detok_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+        let senders = Senders {
+            tm: flume::unbounded().0,
+            abort: abort_tx,
+            tok: tok_tx,
+            detok: vec![detok_tx],
+        };
+        let (producer, _consumer) = ingress_ring(1);
+        let live: LiveRids = Default::default();
+        live.lock().unwrap().insert("pushed".to_string());
+        live.lock().unwrap().insert("dropped".to_string());
+        let (_tm_tx, tm_rx) = flume::unbounded();
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let ingress = Ingress::new(
+            tm_rx,
+            abort_rx,
+            live.clone(),
+            senders,
+            producer,
+            test_limits(),
+            sd_rx,
+        );
+
+        ingress.on_abort(AbortSource::Guard("pushed".to_string()));
+        ingress.on_abort(AbortSource::Guard("dropped".to_string()));
+
+        let held = live.lock().unwrap();
+        assert!(
+            !held.contains("pushed"),
+            "the abort reached the scheduler, so the rid is reusable"
+        );
+        assert!(
+            held.contains("dropped"),
+            "the ring was full, so the scheduler is still generating — the rid must \
+             stay held rather than collide with a retry"
         );
     }
 
