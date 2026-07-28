@@ -69,6 +69,8 @@ class MambaAttnBackendBase(AttentionBackend):
         track_conv_indices = None
         track_ssm_h_src = None
         track_ssm_h_dst = None
+        track_ssm_snapshot_chunk = None
+        track_ssm_snapshot_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
@@ -197,6 +199,8 @@ class MambaAttnBackendBase(AttentionBackend):
                     (
                         track_ssm_h_src,
                         track_ssm_h_dst,
+                        track_ssm_snapshot_chunk,
+                        track_ssm_snapshot_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
@@ -220,6 +224,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
+            track_ssm_snapshot_chunk=track_ssm_snapshot_chunk,
+            track_ssm_snapshot_dst=track_ssm_snapshot_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             has_mamba_track_mask=has_mamba_track_mask,
@@ -313,9 +319,22 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
+        # Keep a dense per-request representation for KDA's direct FP32
+        # snapshot path. The Triton recurrence kernel indexes these with i_n,
+        # avoiding a scan over the packed global h rows in every CTA.
+        track_ssm_snapshot_chunk = torch.full_like(num_h_states, -1)
+        track_ssm_snapshot_dst = torch.full_like(mamba_cache_indices, -1)
+        snapshot_rows = mamba_track_mask.nonzero(as_tuple=True)[0][not_aligned]
+        track_ssm_snapshot_chunk[snapshot_rows] = (
+            lens_masked[not_aligned] // mamba_cache_chunk_size
+        )
+        track_ssm_snapshot_dst[snapshot_rows] = track_ssm_h_dst
+
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),
             track_ssm_h_dst.to(self.device, non_blocking=True),
+            track_ssm_snapshot_chunk.to(self.device, non_blocking=True),
+            track_ssm_snapshot_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
         )
@@ -750,13 +769,18 @@ class MambaAttnBackendBase(AttentionBackend):
         h: torch.Tensor,
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
+        *,
+        intermediate_snapshot_written: bool = False,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
             h = h.squeeze(0)
 
-            if forward_metadata.track_ssm_h_src.numel() > 0:
+            if (
+                not intermediate_snapshot_written
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            ):
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)

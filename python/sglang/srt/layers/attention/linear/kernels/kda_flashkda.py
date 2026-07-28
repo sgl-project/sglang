@@ -40,6 +40,9 @@ def _triton_fallback(
     dt_bias=None,
     lower_bound=None,
     return_intermediate_states=False,
+    track_ssm_h_src=None,
+    track_ssm_snapshot_chunk=None,
+    track_ssm_snapshot_dst=None,
 ):
     """Fall back to the Triton chunk_kda kernel (handles all preprocessing).
 
@@ -51,6 +54,12 @@ def _triton_fallback(
     """
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
+    has_snapshot = (
+        track_ssm_h_src is not None
+        and track_ssm_h_src.numel() > 0
+        and track_ssm_snapshot_chunk is not None
+        and track_ssm_snapshot_dst is not None
+    )
     return chunk_kda(
         q=q,
         k=k,
@@ -65,6 +74,9 @@ def _triton_fallback(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=return_intermediate_states,
+        snapshot_state=ssm_states if has_snapshot else None,
+        snapshot_chunk_indices=(track_ssm_snapshot_chunk if has_snapshot else None),
+        snapshot_state_indices=(track_ssm_snapshot_dst if has_snapshot else None),
     )
 
 
@@ -137,6 +149,9 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 dt_bias=dt_bias,
                 lower_bound=lower_bound,
                 return_intermediate_states=return_intermediate_states,
+                track_ssm_h_src=kwargs.get("track_ssm_h_src"),
+                track_ssm_snapshot_chunk=kwargs.get("track_ssm_snapshot_chunk"),
+                track_ssm_snapshot_dst=kwargs.get("track_ssm_snapshot_dst"),
             )
 
         return self._flashkda_extend(

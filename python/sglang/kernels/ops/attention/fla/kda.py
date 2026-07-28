@@ -1095,6 +1095,9 @@ def chunk_kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    snapshot_state: Optional[torch.Tensor] = None,
+    snapshot_chunk_indices: Optional[torch.Tensor] = None,
+    snapshot_state_indices: Optional[torch.Tensor] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1159,6 +1162,19 @@ def chunk_kda_fwd(
         fuse_recompute=_small_grid,
     )
 
+    if is_intel and snapshot_state is not None:
+        raise NotImplementedError(
+            "Selected KDA state snapshots are not supported on XPU"
+        )
+    snapshot_kwargs = (
+        {}
+        if is_intel
+        else {
+            "snapshot_state": snapshot_state,
+            "snapshot_chunk_indices": snapshot_chunk_indices,
+            "snapshot_state_indices": snapshot_state_indices,
+        }
+    )
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -1169,6 +1185,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        **snapshot_kwargs,
     )
     del w, u, kg
 
@@ -1188,8 +1205,9 @@ def chunk_kda_fwd(
 
     if output_intermediate_states:
         # h holds the recurrent state at every chunk-size boundary
-        # ([1, NT, H, V, K] packed across cu_seqlens) — the mamba radix
-        # track path snapshots per-chunk states from it during extend.
+        # ([1, NT, H, V, K] packed across cu_seqlens). Callers without direct
+        # snapshot support can still copy a selected boundary from it; KDA's
+        # CUDA radix-cache path writes that boundary from the FP32 accumulator.
         return o, h
     del h
     return o
@@ -1210,6 +1228,9 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    snapshot_state: Optional[torch.Tensor] = None,
+    snapshot_chunk_indices: Optional[torch.Tensor] = None,
+    snapshot_state_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1234,4 +1255,7 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+        snapshot_state=snapshot_state,
+        snapshot_chunk_indices=snapshot_chunk_indices,
+        snapshot_state_indices=snapshot_state_indices,
     )
