@@ -226,42 +226,20 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let Some(header) = body.get(4..4 + hlen) else {
         return decoded;
     };
+    // Every rejection past the header slice names its requests by re-reading the
+    // rid column, rather than the whole frame paying a clone for the error path.
+    macro_rules! reject {
+        () => {{
+            decoded.rids = recover_rids(header);
+            return decoded;
+        }};
+    }
+
     let data = &body[4 + hlen..];
     let mut h = match rmp_serde::from_slice::<BatchHeader>(header) {
         Ok(h) => h,
-        Err(_) => {
-            // A typed decode failure (any column whose Python type widens) yields no
-            // rids, so the caller would fail nobody and every request in the frame
-            // would hang. Re-read just the rid column, which is positional element 0
-            // and independent of every other field's type.
-            // Two-stage via `rmpv`: read the header as a generic value, then take
-            // element 0. A serde tuple cannot do this — `(Vec<String>,)` decodes
-            // ONLY a 1-element array, while real headers carry 4 or 16 columns, so
-            // it returned `Err(LengthMismatch(1))` every time and named nobody.
-            // Arity independence is the whole point: the trigger for this path is
-            // Python appending a column an older Rust build does not know.
-            decoded.rids = rmpv::decode::read_value(&mut &header[..])
-                .ok()
-                .and_then(|v| match v {
-                    rmpv::Value::Array(cols) => cols.into_iter().next(),
-                    _ => None,
-                })
-                .and_then(|c| match c {
-                    rmpv::Value::Array(rids) => Some(
-                        rids.iter()
-                            .filter_map(|r| r.as_str().map(Rid::from))
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            return decoded;
-        }
+        Err(_) => reject!(),
     };
-    // Every rid in the frame, known as soon as the header parses — so a rejection
-    // below can still name the requests that were waiting on it.
-    decoded.rids = h.rids.iter().cloned().map(Rid::from).collect();
-
     let n = h.rids.len();
     // Every column must agree with `rids`. A SHORT column contributes nothing to
     // `base`, so the `base != data.len()` check below cannot see it: a short
@@ -270,7 +248,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // and its unary drain pended forever. The producer already asserts this for the
     // extras columns; the four core ones were unchecked.
     if h.finish_reasons.len() != n || h.prompt_tokens.len() != n || h.tok_lens.len() != n {
-        return decoded;
+        reject!()
     }
     // The per-request extras columns are either absent (no request asked) or one
     // entry per request — never partial.
@@ -283,7 +261,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.in_tid_reqlens)
         || !per_req_ok(&h.hidden_reqlens)
     {
-        return decoded;
+        reject!()
     }
     let sum = |v: &[u32]| v.iter().map(|&x| x as usize).sum::<usize>();
     // Each ragged family's per-request counts must consume its position column
@@ -295,7 +273,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || sum(&h.in_tid_reqlens) != h.in_tid_poslens.len()
         || sum(&h.hidden_reqlens) != h.hidden_poslens.len()
     {
-        return decoded;
+        reject!()
     }
 
     // Per-column byte cursors, advanced per request — no whole-column read. Columns
@@ -339,7 +317,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     // Accepting the surplus let a producer-side val/idx mismatch through with a
     // 200, every later column reading off by the difference.
     if base != data.len() {
-        return decoded;
+        reject!()
     }
 
     // Mirror of Python's `has_extra` guard: checking once per frame lets the
@@ -466,13 +444,43 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     };
 
     for i in 0..n {
-        let Some(ev) = decode_one(i) else {
-            return decoded;
-        };
+        let Some(ev) = decode_one(i) else { reject!() };
         route(ev);
     }
     decoded.ok = true;
     decoded
+}
+
+/// Recover the rid column straight from the header bytes.
+///
+/// Read through `rmpv` rather than a serde tuple: `(Vec<String>,)` decodes ONLY a
+/// 1-element array, while real headers carry 4 or 16 columns, so it returned
+/// `Err(LengthMismatch(1))` every time and named nobody. Arity independence is the
+/// whole point — the trigger for the typed-decode-failure path is Python appending
+/// a column an older Rust build does not know.
+///
+/// Called only when a frame is rejected, which is why the accepted path no longer
+/// clones the column up front. That clone was discarded unread on every good frame
+/// and cost ~27% of the whole decode at batch 4096, plus a third of the crate's
+/// steady-state allocations. It also has to be a re-read rather than a snapshot:
+/// `decode_one` moves each rid out of the header as it goes, so by the time the
+/// routing loop can fail, the decoded header no longer holds the earlier ones.
+fn recover_rids(header: &[u8]) -> Vec<Rid> {
+    rmpv::decode::read_value(&mut &header[..])
+        .ok()
+        .and_then(|v| match v {
+            rmpv::Value::Array(cols) => cols.into_iter().next(),
+            _ => None,
+        })
+        .and_then(|c| match c {
+            rmpv::Value::Array(rids) => Some(
+                rids.iter()
+                    .filter_map(|r| r.as_str().map(Rid::from))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Outcome of [`for_each_chunk`]: whether the frame was accepted, plus the rids it
@@ -600,9 +608,6 @@ mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
 
-    /// Concatenating N data columns produces the exact same frame as one joined
-    /// buffer (the `b"".join` the Python side used to do), with the layout
-    /// `[tag][u32 header len][header][col0 col1 …]`.
     #[test]
     fn batch_cols_match_single_joined_buffer() {
         let header = [1u8, 2, 3];
