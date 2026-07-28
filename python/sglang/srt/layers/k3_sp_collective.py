@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import k3_ar_fusion
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -28,6 +29,13 @@ logger = logging.getLogger(__name__)
 _HIDDEN_SIZE = 7168
 _SUPPORTED_WORLD_SIZES = (4, 8)
 
+# Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
+# must resolve the same (buffer, offset) for these, which a per-forward
+# allocation does not give -- see k3_ar_fusion.symm_buffer.
+_O_PROJ = "sp_o_proj"  # TP-partial o_proj output, read by the pull RS
+_ALL_GATHER = "sp_all_gather"  # full-batch output of the direct AG
+_ATTN_RES_AG = "sp_attn_res_ag"  # ... and of its attention-residual fusion
+
 
 class _State:
     def __init__(self, group: GroupCoordinator, comm: CustomAllReduceV2):
@@ -37,9 +45,7 @@ class _State:
 
 _STATE: Optional[_State] = None
 _INITIALIZED = False
-_O_PROJ_BUFFERS: dict[tuple, torch.Tensor] = {}
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
-_SYMM_MC_PTRS: dict[int, int] = {}
 _O_PROJ_OUTPUT_ROWS: ContextVar[Optional[int]] = ContextVar(
     "k3_sp_o_proj_output_rows", default=None
 )
@@ -118,11 +124,13 @@ def enabled() -> bool:
     return _init_state() is not None
 
 
-def symm_alloc():
-    """Allocate a tensor from torch's multicast-bound symmetric pool."""
-    from sglang.srt.layers.k3_ar_fusion import symm_alloc as _symm_alloc
-
-    return _symm_alloc()
+def _symm_buffer(
+    state: _State, name: str, rows: int, width: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Named persistent symmetric buffer over the group this module reduces on."""
+    return k3_ar_fusion.symm_buffer(
+        name, rows, width, dtype, group_name=state.group.cpu_group.group_name
+    )
 
 
 def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
@@ -153,55 +161,13 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
     return fusion is not None and fusion.strategy == "fused_pull"
 
 
-def _find_mc_ptr(state: _State, tensor: torch.Tensor) -> int:
-    cached = _SYMM_MC_PTRS.get(tensor.data_ptr())
-    if cached is not None:
-        return cached
-
-    import torch.distributed._symmetric_memory as torch_symm_mem
-
-    handle = torch_symm_mem.rendezvous(tensor, state.group.cpu_group.group_name)
-    if handle is None or handle.multicast_ptr == 0:
-        return 0
-    ptr = handle.multicast_ptr + tensor.data_ptr() - handle.buffer_ptrs[state.comm.rank]
-    _SYMM_MC_PTRS[tensor.data_ptr()] = ptr
-    return ptr
-
-
 def get_o_proj_output_buffer(
-    num_tokens: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    hidden_size: int = _HIDDEN_SIZE,
+    num_tokens: int, dtype: torch.dtype, hidden_size: int = _HIDDEN_SIZE
 ) -> torch.Tensor:
-    """Return persistent symmetric storage for a TP-partial o_proj output."""
+    """Persistent symmetric storage for a TP-partial o_proj output."""
     state = _init_state()
-    if state is None:
-        raise RuntimeError("K3 SP collective is not initialized")
-    device = torch.device(device)
-    device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    key = (device.type, device_index, dtype, num_tokens, hidden_size)
-    output = _O_PROJ_BUFFERS.get(key)
-    if output is None:
-        with symm_alloc():
-            output = torch.empty(
-                (num_tokens, hidden_size),
-                dtype=dtype,
-                device=device,
-            )
-        if _find_mc_ptr(state, output) == 0:
-            raise RuntimeError("failed to multicast-bind K3 o_proj output buffer")
-        _O_PROJ_BUFFERS[key] = output
-        logger.info(
-            "Allocated persistent symmetric K3 o_proj buffer "
-            "(tokens=%d, hidden=%d, ptr=%#x)",
-            num_tokens,
-            hidden_size,
-            output.data_ptr(),
-        )
-    return output
+    assert state is not None, "K3 SP collective is not initialized"
+    return _symm_buffer(state, _O_PROJ, num_tokens, hidden_size, dtype)
 
 
 @contextmanager
@@ -245,17 +211,18 @@ def finish_padded_o_proj_output(
     return output
 
 
-def _resolve_symmetric_o_proj_input(
-    state: _State, tensor: torch.Tensor
-) -> tuple[torch.Tensor, int]:
-    """Recover the persistent o_proj buffer if a model wrapper rebound its view."""
-    input_mc_ptr = _find_mc_ptr(state, tensor)
-    if input_mc_ptr != 0:
+def _resolve_symmetric_o_proj_input(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Recover the persistent o_proj buffer if a model wrapper rebound its view.
+
+    The second element is 0 when neither is symmetric, and the caller falls back.
+    """
+    input_mc_ptr = k3_ar_fusion.find_mc_ptr(tensor)
+    if input_mc_ptr is not None:
         return tensor, input_mc_ptr
     output = _O_PROJ_RESULT_BUFFERS.get(tensor.data_ptr())
     if output is None:
         return tensor, 0
-    return output, _find_mc_ptr(state, output)
+    return output, k3_ar_fusion.find_mc_ptr(output) or 0
 
 
 def _eligible(
@@ -316,7 +283,7 @@ def reduce_scatter_res(
             tuning=dispatch.tuning,
         )
     if dispatch.strategy == "pull":
-        tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(state, tensor)
+        tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(tensor)
         if input_mc_ptr == 0:
             logger.warning("K3 pull RS input is not symmetric; using NCCL.")
             return None
@@ -369,7 +336,7 @@ def reduce_scatter_attn_res(
     )
     if dispatch is None or dispatch.strategy != "fused_pull":
         return None
-    tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(state, tensor)
+    tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(tensor)
     if input_mc_ptr == 0:
         logger.warning("K3 fused pull RS input is not symmetric; using separate path.")
         return None
@@ -431,22 +398,14 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
             tuning=dispatch.tuning,
         )
     if dispatch.strategy == "direct":
-        import torch.distributed._symmetric_memory as torch_symm_mem
-
-        with symm_alloc():
-            output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
-        handle = torch_symm_mem.rendezvous(output, state.group.cpu_group.group_name)
-        assert handle is not None and handle.multicast_ptr != 0
-        output_mc_ptr = (
-            handle.multicast_ptr
-            + output.data_ptr()
-            - handle.buffer_ptrs[state.comm.rank]
+        output = _symm_buffer(
+            state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
         )
         return sp_collective.all_gather_direct(
             state.group.world_size,
             tensor,
             output,
-            output_mc_ptr=output_mc_ptr,
+            output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
             tuning=dispatch.tuning,
         )
     raise AssertionError(f"unknown K3 all-gather strategy: {dispatch.strategy}")
@@ -492,15 +451,9 @@ def attn_res_all_gather(
     )
     if dispatch is None or dispatch.strategy != "fused_direct":
         return None
-    output_shape = (global_tokens, prefix.shape[1])
-    with symm_alloc():
-        output = torch.empty(output_shape, dtype=prefix.dtype, device=prefix.device)
-    output_mc_ptr = _find_mc_ptr(state, output)
-    if output_mc_ptr == 0:
-        logger.warning(
-            "K3 fused direct AG output is not symmetric; using separate path."
-        )
-        return None
+    output = _symm_buffer(
+        state, _ATTN_RES_AG, global_tokens, prefix.shape[1], prefix.dtype
+    )
     attn_res.attn_res_fused_direct_ag(
         state.group.world_size,
         prefix,
@@ -510,7 +463,7 @@ def attn_res_all_gather(
         output,
         nvb,
         eps,
-        output_mc_ptr=output_mc_ptr,
+        output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
         max_blocks=dispatch.max_blocks,
         write_prefix=write_prefix,
     )
