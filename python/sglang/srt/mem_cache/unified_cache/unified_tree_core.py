@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
+    BackupComponents,
     BackupKV,
     CacheAction,
     ComponentAction,
@@ -884,14 +885,22 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
         state.result = InsertResult(prefix_len=state.total_prefix_length)
+        component_actions: list[CacheAction | ComponentAction] = []
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,
                 is_new_leaf=state.is_new_leaf,
                 params=state.params,
                 result=state.result,
-                cache_actions=state.pending_actions,
+                cache_actions=component_actions,
             )
+        if self.enable_hicache and not self.is_write_back:
+            action = self._build_incremental_component_backup_action(
+                state.target_node
+            )
+            if action is not None:
+                state.pending_actions.append(action)
+        state.pending_actions.extend(component_actions)
         state.phase = _InsertPhase.TAIL
 
     def _insert_tail_step(self, state: _InsertWalkState) -> None:
@@ -1062,6 +1071,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = EvictDeviceLeafResult()
         node = self.node_by_id(node_id)
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if node.backuped:
+            result.backup_kv = self._build_incremental_component_backup_action(node)
+            if result.backup_kv is not None:
+                return result
         if not node.backuped:
             if is_write_back:
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
@@ -1519,6 +1532,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
 
+    def build_component_backup_spec(
+        self, node_id: NodeId, component_types: tuple[ComponentType, ...]
+    ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
+        node = self.node_by_id(node_id)
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert device_value is not None
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for component_type in component_types:
+            comp = self.components_by_type[component_type]
+            if not comp.needs_incremental_host_backup(node):
+                continue
+            transfers = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_HOST
+            )
+            if transfers:
+                comp_xfers[component_type] = transfers
+        return device_value, comp_xfers
+
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather device value backup spec."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -1622,6 +1653,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # write_through: Ancestors first to preserve backup invariant
             chain.reverse()
         return BackupKV([target.id for target in chain])
+
+    def _build_incremental_component_backup_action(
+        self, node: UnifiedTreeNode
+    ) -> Optional[BackupComponents]:
+        if not node.backuped:
+            return None
+        component_types = tuple(
+            comp.component_type
+            for comp in self.components
+            if comp.component_type != BASE_COMPONENT_TYPE
+            and comp.needs_incremental_host_backup(node)
+        )
+        if not component_types:
+            return None
+        return BackupComponents(node.id, component_types)
 
     def commit_hicache_transfers(
         self,

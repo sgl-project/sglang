@@ -580,6 +580,10 @@ class MambaComponent(TreeComponent):
 
     # ---- HiCache Hooks ----
 
+    def needs_incremental_host_backup(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.value is not None and cd.host_value is None
+
     def prepare_load_back(
         self,
         node_id: NodeId,
