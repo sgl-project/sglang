@@ -2,10 +2,11 @@ import logging
 from typing import Optional, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
@@ -28,34 +29,6 @@ from sglang.srt.speculative.spec_info import SpecInput
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
-def _fused_state_indices_kernel(
-    req_pool_indices_ptr,  # (total_bs,) int64 — static replay buffer
-    mamba_map_ptr,  # (req_pool_size,) int32 — req_index_to_mamba_index_mapping
-    out_ptr,  # (total_bs,) int32 — state_indices_list[bs - 1]
-    valid_bs,
-    total_bs,
-    BS_UPPER: tl.constexpr,
-):
-    """Replay-prep state-indices chain in one launch: mapping gather +
-    padding sentinel (-1) + store into the static buffer. Replaces four
-    dispatched aten ops on the bs=1 MTP host critical path. Identity-v2p
-    pools only (the unified pool's allocator translate is not a flat
-    table gather)."""
-    offs = tl.arange(0, BS_UPPER)
-    in_range = offs < total_bs
-    valid = offs < valid_bs
-    req = tl.load(req_pool_indices_ptr + offs, mask=valid, other=0)
-    idx = tl.load(mamba_map_ptr + req, mask=valid, other=0)
-    out_val = tl.where(valid, idx.to(tl.int32), -1)
-    tl.store(out_ptr + offs, out_val, mask=in_range)
-    # Preserve the reference chain's side effect: padded rows of the static
-    # req_pool_indices buffer are zeroed so captured kernels that gather
-    # with them stay in-bounds.
-    zeros = tl.zeros([BS_UPPER], dtype=req.dtype)
-    tl.store(req_pool_indices_ptr + offs, zeros, mask=in_range & (~valid))
-
-
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -66,7 +39,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
-        # Fused replay-prep state-indices fast path (_fused_state_indices_kernel):
+        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
         # requires the static hybrid pool whose v2p translate is the identity —
         # the unified pool overrides translate_mamba_indices with an allocator
         # lookup that is not a flat table gather.
@@ -575,15 +548,13 @@ class MambaAttnBackendBase(AttentionBackend):
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
             # bit-identical to the reference chain below.
-            _fused_state_indices_kernel[(1,)](
-                req_pool_indices,
-                self.req_to_token_pool.req_index_to_mamba_index_mapping,
-                self.state_indices_list[bs - 1],
-                bs - int(num_padding),
-                bs,
-                BS_UPPER=triton.next_power_of_2(bs),
+            mamba_indices = fused_replay_state_indices(
+                req_pool_indices=req_pool_indices,
+                mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                out_state_indices=self.state_indices_list[bs - 1],
+                valid_bs=bs - int(num_padding),
+                total_bs=bs,
             )
-            mamba_indices = self.state_indices_list[bs - 1][:bs]
         else:
             # Make sure forward metadata is correctly handled for padding reqs
             req_pool_indices[bs - num_padding :] = 0

@@ -1,21 +1,19 @@
-"""Bit-exact reference test for ``_fused_state_indices_kernel``.
+"""fused_replay_state_indices must be bit-identical to the unfused prep.
 
-``MambaAttnBackendBase._replay_metadata`` refreshes ``state_indices_list``
-either through the fused single-launch kernel (CUDA + static hybrid pool with
-identity v2p + replayssm off) or through the reference aten chain:
+The unfused reference is the exact op sequence ``_replay_metadata`` used to
+launch for the static hybrid pool:
 
-    req_pool_indices[bs - num_padding:] = 0        # zero padded rows (side effect!)
+    req_pool_indices[valid_bs:total_bs] = 0        # zero padded rows (side effect)
     mamba_indices = mapping[req_pool_indices]      # get_mamba_indices gather
     # identity v2p translate (static pool)
-    mamba_indices[bs - num_padding:] = -1          # padding sentinel
-    state_indices_list[bs - 1][:bs].copy_(mamba_indices)
+    mamba_indices[valid_bs:] = -1                  # padding sentinel
+    state_indices[:total_bs].copy_(mamba_indices)
 
 The two paths must agree bit-for-bit, INCLUDING the side effect of zeroing the
 padded rows of the static ``req_pool_indices`` replay buffer — captured kernels
 gather with that buffer, so a non-zeroed padded row is a delayed illegal memory
-access, not a visible diff. The test drives both paths on guard-padded buffers
-across a bs x num_padding matrix (non-power-of-two sizes exercise the BS_UPPER
-masking) and checks:
+access, not a visible diff. Both paths run on guard-padded buffers across a
+bs x num_padding matrix (non-power-of-two sizes exercise the BS_UPPER masking):
 
 1. the produced state indices are identical over the whole ``[0, total_bs)``
    range (padding sentinel rows included);
@@ -26,15 +24,14 @@ masking) and checks:
 import unittest
 
 import torch
-import triton
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    _fused_state_indices_kernel,
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 # Guard tail appended to every buffer; must stay untouched by both paths.
 _GUARD = 8
@@ -62,7 +59,7 @@ def _reference_chain(
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA (triton kernel)")
-class TestFusedStateIndicesKernel(CustomTestCase):
+class TestFusedReplayStateIndices(CustomTestCase):
     def _run_case(self, total_bs: int, num_padding: int, seed: int) -> None:
         device = torch.device("cuda")
         gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -92,13 +89,12 @@ class TestFusedStateIndicesKernel(CustomTestCase):
             valid_bs=valid_bs,
             total_bs=total_bs,
         )
-        _fused_state_indices_kernel[(1,)](
-            req_pool_fused,
-            mapping_dev,
-            out_fused,
-            valid_bs,
-            total_bs,
-            BS_UPPER=triton.next_power_of_2(total_bs),
+        returned = fused_replay_state_indices(
+            req_pool_indices=req_pool_fused,
+            mamba_index_mapping=mapping_dev,
+            out_state_indices=out_fused,
+            valid_bs=valid_bs,
+            total_bs=total_bs,
         )
         torch.cuda.synchronize()
 
@@ -109,6 +105,11 @@ class TestFusedStateIndicesKernel(CustomTestCase):
             f"state indices mismatch ({case}):\n"
             f"  ref   {out_ref[:total_bs].tolist()}\n"
             f"  fused {out_fused[:total_bs].tolist()}",
+        )
+        # The returned view is what _replay_metadata forwards downstream.
+        self.assertTrue(
+            torch.equal(returned, out_fused[:total_bs]),
+            f"returned view is not the filled buffer ({case})",
         )
         # 2. req_pool_indices side effect bit-identical (padded rows zeroed)
         self.assertTrue(
@@ -175,13 +176,12 @@ class TestFusedStateIndicesKernel(CustomTestCase):
             valid_bs=valid_bs,
             total_bs=total_bs,
         )
-        _fused_state_indices_kernel[(1,)](
-            req_fused,
-            mapping_dev,
-            out_fused,
-            valid_bs,
-            total_bs,
-            BS_UPPER=triton.next_power_of_2(total_bs),
+        fused_replay_state_indices(
+            req_pool_indices=req_fused,
+            mamba_index_mapping=mapping_dev,
+            out_state_indices=out_fused,
+            valid_bs=valid_bs,
+            total_bs=total_bs,
         )
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(out_ref, out_fused))
