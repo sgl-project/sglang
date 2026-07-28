@@ -1018,36 +1018,24 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        if q.shape[2:] == k.shape[2:] == v.shape[2:]:
-            head_dim = q.shape[-1]
-            qkv_shard = torch.stack((q_shard, k_shard, v_shard), dim=3).flatten(3, 4)
-            qkv_shard = _usp_input_all_to_all(qkv_shard, head_dim=2)
+        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
+        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
-            h_local = qkv_shard.shape[2]
-            h_start = sp_rank * h_local
-            qkv_rep = torch.stack((q_rep, k_rep, v_rep), dim=3).flatten(3, 4)
-            qkv_rep = qkv_rep[:, :, h_start : h_start + h_local, :].contiguous()
-            qkv = torch.cat([qkv_rep, qkv_shard], dim=1)
-            q, k, v = [
-                tensor.contiguous()
-                for tensor in qkv.unflatten(-1, (3, head_dim)).unbind(dim=3)
-            ]
-        else:
-            q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-            k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-            v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        # Q and KV can have different head counts (GQA), so slice each replicated
+        # prefix by its own per-rank head shard to match the all-to-all'd suffix.
+        # For MHA (kv heads == q heads) this is identical to the q shard.
+        h_local = q_shard.shape[2]
+        kv_h_local = k_shard.shape[2]
+        h_start = sp_rank * h_local
+        kv_h_start = sp_rank * kv_h_local
+        q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
+        k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
+        v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
 
-            h_local = q_shard.shape[2]
-            kv_h_local = k_shard.shape[2]
-            h_start = sp_rank * h_local
-            kv_h_start = sp_rank * kv_h_local
-            q_rep = q_rep[:, :, h_start : h_start + h_local, :].contiguous()
-            k_rep = k_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
-            v_rep = v_rep[:, :, kv_h_start : kv_h_start + kv_h_local, :].contiguous()
-
-            q = torch.cat([q_rep, q_shard], dim=1)
-            k = torch.cat([k_rep, k_shard], dim=1)
-            v = torch.cat([v_rep, v_shard], dim=1)
+        q = torch.cat([q_rep, q_shard], dim=1)
+        k = torch.cat([k_rep, k_shard], dim=1)
+        v = torch.cat([v_rep, v_shard], dim=1)
 
         out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 

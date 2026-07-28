@@ -481,19 +481,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             lora_B_sliced = self.slice_lora_b_weights(
                 lora_B.to(device=input_.device, non_blocking=True)
             )
-            if lora_A_sliced.dim() > 2 or lora_B_sliced.dim() > 2:
-                if lora_A_sliced.dim() != 3 or lora_B_sliced.dim() != 3:
-                    raise ValueError(
-                        "Stacked LoRA projections require 3D A and B tensors."
-                    )
-                delta_parallel = torch.einsum(
-                    "...i,nri->...nr", input_lora, lora_A_sliced
-                )
-                delta_parallel = torch.einsum(
-                    "...nr,nor->...no", delta_parallel, lora_B_sliced
-                ).flatten(-2)
-            else:
-                delta_parallel = input_lora @ lora_A_sliced.T @ lora_B_sliced.T
+            delta_parallel = input_lora @ lora_A_sliced.T @ lora_B_sliced.T
             if self.lora_alpha != self.lora_rank:
                 delta_parallel = delta_parallel * (
                     self.lora_alpha / self.lora_rank  # type: ignore
