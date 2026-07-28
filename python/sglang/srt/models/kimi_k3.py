@@ -1520,14 +1520,16 @@ class KimiK3DeltaAttention(nn.Module):
             return
         layer = self.attn
         w = layer.conv_weights
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        local_heads = int(layer.A_log.numel()) if layer.A_log is not None else 0
+        supported_heads = (3, 12)
+        seg = local_heads * self.head_dim
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or local_heads not in supported_heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)

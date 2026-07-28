@@ -800,18 +800,18 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 }
 
 // K3 decode configuration of the many-heads kernel: onorm fused, static
-// H = HV = 12 layout with a (B, HV) grid, onorm params preloaded, next state
+// H = HV in {3, 12} layout with a (B, HV) grid, onorm params preloaded, next state
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
 // kUseTmaLoad/kTmaStages select the 1D-TMA state-staging path in place of the
 // cp.async fallback used for a misaligned recurrent-state slot stride.
-template <bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
+template <int kFixedHeads, bool kUseLowerBound, bool kUsePDL, bool kUseTmaLoad = false, int kTmaStages = kNumChunks>
 constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     /*kApplyOnorm=*/true,
     /*kUseStaticDecodeLayout=*/true,
-    /*kFixedHeads=*/12,
-    /*kFixedValueHeads=*/12,
+    /*kFixedHeads=*/kFixedHeads,
+    /*kFixedValueHeads=*/kFixedHeads,
     /*kUseHeadGrid=*/true,
     /*kAccumulateOnormSumsq=*/false,
     /*kUseActiveQkReduction=*/false,
@@ -827,6 +827,20 @@ constexpr auto kda_fused_decode_k3_kernel = kda_decode_fusion_many_heads_kernel<
     kUseTmaLoad,
     kTmaStages,
     kUsePDL>;
+
+template <int kFixedHeads, bool kUsePDL>
+auto select_kda_fused_decode_k3_kernel(bool use_lower_bound, int tma_stages) {
+  if (tma_stages == 3) {
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 3>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 3>;
+  }
+  if (tma_stages == 4) {
+    return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL, true, 4>
+                           : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL, true, 4>;
+  }
+  return use_lower_bound ? kda_fused_decode_k3_kernel<kFixedHeads, true, kUsePDL>
+                         : kda_fused_decode_k3_kernel<kFixedHeads, false, kUsePDL>;
+}
 
 template <bool kUsePDL>
 struct KdaFusedDecodeKernel {
@@ -852,8 +866,9 @@ struct KdaFusedDecodeKernel {
       bool use_lower_bound) {
     using namespace host;
 
-    constexpr int64_t kH = 12;
-    constexpr int64_t kSeg = kH * 128;  // 1536: q, k and v segment width
+    const int64_t kH = A_log.shape()[0];
+    RuntimeCheck(kH == 3 || kH == 12, "KDA fused decode supports local head counts 3 or 12, got ", kH);
+    const int64_t kSeg = kH * 128;  // q, k and v segment width
 
     auto B_ = SymbolicSize{"batch"};
     auto Slots_ = SymbolicSize{"pool_slots"};
@@ -900,8 +915,6 @@ struct KdaFusedDecodeKernel {
     // pools. Threaded into every ssm-state read/write; int64 avoids the
     // envelope-pitch overflow.
     const int64_t state_slot_stride = state.stride(0);
-    auto kernel =
-        use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL> : kda_fused_decode_k3_kernel<false, kUsePDL>;
     int tma_stages = 0;
     // TMA 1D-bulk needs the per-slot source address (state + slot*stride) 16B
     // aligned for every slot. state.data_ptr() is torch-aligned and each chunk
@@ -918,15 +931,9 @@ struct KdaFusedDecodeKernel {
       // fastest. Mirrors the KDA_decode standalone-kernel dispatch on
       // chunan/kda.
       tma_stages = B * static_cast<int>(kH) >= 1024 ? 3 : 4;
-      if (tma_stages == 3) {
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 3>
-                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 3>;
-      } else {
-        tma_stages = 4;
-        kernel = use_lower_bound ? kda_fused_decode_k3_kernel<true, kUsePDL, true, 4>
-                                 : kda_fused_decode_k3_kernel<false, kUsePDL, true, 4>;
-      }
     }
+    auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
+                          : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages);
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(
