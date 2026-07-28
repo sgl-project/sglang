@@ -156,7 +156,10 @@ def _make_backend(
     return backend
 
 
-def _make_sparse_prefill_case(device: torch.device):
+def _make_sparse_prefill_case(
+    device: torch.device,
+    local_heads: int = 64,
+):
     page_size = 64
     total_slots = 384
     forward_batch, req_to_token = _make_forward_batch_and_mapping(device)
@@ -181,14 +184,14 @@ def _make_sparse_prefill_case(device: torch.device):
         torch.randn(
             forward_batch.extend_num_tokens,
             1,
-            64,
+            local_heads,
             512,
             device=device,
             generator=generator,
         )
         * 0.05
     ).to(torch.bfloat16)
-    attn_sink = torch.zeros(64, dtype=torch.float32, device=device)
+    attn_sink = torch.zeros(local_heads, dtype=torch.float32, device=device)
     core_attn_metadata = SimpleNamespace()
     return backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata
 
@@ -291,7 +294,7 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
 
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device)
+        _make_sparse_prefill_case(device, local_heads=16)
     )
 
     bf16_capture = _Capture()
@@ -320,7 +323,7 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
     assert backend.forward_metadata.sparse_prefill_cache is sparse_cache
     assert bf16_out.shape == q8_out.shape == (
         forward_batch.extend_num_tokens,
-        64,
+        16,
         512,
     )
     assert len(bf16_capture.calls) == 1
@@ -334,6 +337,9 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path():
     assert bf16_kv.dtype == torch.bfloat16
     assert q8_kv.dtype == fp8_dtype
     assert q8_call["q"].dtype == fp8_dtype
+    assert q8_call["q"].shape[1] == 64
+    assert torch.count_nonzero(q8_call["q"][:, 16:]).item() == 0
+    assert q8_call["attn_sink"].shape == (64,)
     assert q8_kv.shape[0] == bf16_kv.shape[0] + 1
     torch.testing.assert_close(
         q8_kv[:-1].to(torch.bfloat16).float(),
@@ -399,7 +405,7 @@ def test_q8kv8_sparse_prefill_logs_path_hit_once(caplog):
 def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
-        _make_sparse_prefill_case(device)
+        _make_sparse_prefill_case(device, local_heads=64)
     )
 
     bf16_out = backend._forward_prefill_sparse(

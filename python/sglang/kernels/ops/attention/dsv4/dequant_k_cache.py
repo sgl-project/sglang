@@ -150,18 +150,65 @@ def gather_dequant_requant_fp8_paged(
     )
     return out
 
-def cast_q_fp8_for_q8kv8_prefill(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def q8kv8_padded_num_heads(num_heads: int) -> int:
+    """Return a Q-head count supported by the SM90 Q8KV8 kernel."""
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    raise ValueError(
+        "DeepSeek-V4 Q8KV8 sparse prefill supports at most 128 local "
+        f"query heads, got {num_heads}"
+    )
+
+def cast_q_fp8_for_q8kv8_prefill(
+    q: torch.Tensor,
+    padded_num_heads: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Cast DeepSeek-V4 sparse-prefill Q to the Q8KV8 kernel format.
 
     The incoming Q is the model-produced BF16/FP16 tensor already shaped as
     ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
-    Q8KV8 sparse prefill consumes FP8 Q plus a scalar dequant scale. Keep the
-    scale at one to match the current V4 packed-KV adapter, which requants the
-    dequantized KV workspace directly into FP8 with no additional global scale.
+
+    The SM90 kernel processes query heads in 64-head blocks. Tensor parallelism
+    commonly leaves fewer than 64 local heads, so the active heads are copied
+    into a zero-padded 64/128-head FP8 tensor.
     """
     assert q.ndim == 3
     assert q.shape[-1] == DIM_NOPE + DIM_ROPE
-    q_fp8 = q.to(fp8_dtype).contiguous()
+
+    num_tokens, num_heads, head_dim = q.shape
+    if padded_num_heads is None:
+        padded_num_heads = q8kv8_padded_num_heads(num_heads)
+
+    if padded_num_heads not in (64, 128) or padded_num_heads < num_heads:
+        raise ValueError(
+            f"invalid padded_num_heads={padded_num_heads} for num_heads={num_heads}"
+        )
+
+    expected_shape = (num_tokens, padded_num_heads, head_dim)
+
+    if out is None:
+        q_fp8 = torch.zeros(
+            expected_shape,
+            dtype=fp8_dtype,
+            device=q.device,
+        )
+    else:
+        if out.shape != expected_shape or out.dtype != fp8_dtype or out.device != q.device:
+            raise ValueError(
+                "Q8KV8 Q output must have shape/dtype/device "
+                f"{expected_shape}/{fp8_dtype}/{q.device}, got "
+                f"{tuple(out.shape)}/{out.dtype}/{out.device}"
+            )
+        q_fp8 = out
+        if padded_num_heads > num_heads:
+            q_fp8[:, num_heads:].zero_()
+
+    q_fp8[:, :num_heads].copy_(q)
     q_scale = torch.ones((), dtype=torch.float32, device=q.device)
     return q_fp8, q_scale
 
