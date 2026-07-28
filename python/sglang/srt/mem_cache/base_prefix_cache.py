@@ -31,7 +31,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         ComponentType,
     )
 
@@ -83,6 +83,7 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    host_insert_dropped: bool = False
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
