@@ -190,9 +190,7 @@ class TestGemm(CustomTestCase):
         has_bias=[False, True],
         prepack=[False, True],
     )
-    def test_fp8_per_tensor_gemm(
-        self, M, scale_as_vector, has_bias, prepack
-    ):
+    def test_fp8_per_tensor_gemm(self, M, scale_as_vector, has_bias, prepack):
         """A scalar weight scale must dequantize the entire FP8 matrix."""
         N = 128
         K = 512
