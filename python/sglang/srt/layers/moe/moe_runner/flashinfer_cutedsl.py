@@ -411,6 +411,15 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
+def _synchronize_cutedsl_autotune_replay(wrapper: Any, device: torch.device) -> None:
+    # TODO: Remove once the minimum FlashInfer version includes
+    # https://github.com/flashinfer-ai/flashinfer/pull/4192.
+    from flashinfer.autotuner import AutoTuner
+
+    if wrapper.use_fused_finalize and AutoTuner.get().is_tuning_mode:
+        torch.cuda.current_stream(device).synchronize()
+
+
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
     dispatch_output: StandardDispatchOutput,
@@ -475,6 +484,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         per_token_scale=per_token_scale,
     )
+    _synchronize_cutedsl_autotune_replay(quant_info.wrapper, hidden_states.device)
 
     return StandardCombineInput(hidden_states=output)
 
@@ -562,6 +572,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         per_token_scale=per_token_scale,
     )
+    _synchronize_cutedsl_autotune_replay(quant_info.wrapper, hidden_states.device)
 
     # Note: output contains routed expert results; shared_expert is handled separately
 

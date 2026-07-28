@@ -114,7 +114,6 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "1",
         "--speculative-num-draft-tokens",
         "4",
-        "--disable-flashinfer-autotune",
     ]
     eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
     spec_accept_length_threshold = 2.5
