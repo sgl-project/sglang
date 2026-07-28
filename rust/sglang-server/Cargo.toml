@@ -42,3 +42,5 @@ rmpv = { version = "1", features = ["with-serde"] }
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
+libloading = "0.8"
+sha2 = "0.10"

@@ -17,6 +17,7 @@ mod error;
 mod fsm;
 mod ids;
 mod message;
+pub mod mooncake;
 mod ring;
 mod runtime;
 mod tokenizer;
