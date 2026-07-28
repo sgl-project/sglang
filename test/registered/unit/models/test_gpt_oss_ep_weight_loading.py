@@ -96,7 +96,7 @@ class TestGptOssEpWeightLoading(CustomTestCase):
         fused_moe_layer,
         "get_server_args",
         return_value=SimpleNamespace(
-            ep_join_mode="none", moe_runner_backend="flashinfer_trtllm"
+            ep_join_mode="none", moe_runner_backend="flashinfer_trtllm_routed"
         ),
     )
     @patch.object(
@@ -115,7 +115,7 @@ class TestGptOssEpWeightLoading(CustomTestCase):
     @patch.object(
         fused_moe_layer,
         "get_moe_runner_backend",
-        return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+        return_value=MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
     )
     def test_flashinfer_constructor_keeps_logical_intermediate_size(self, *_):
         """Kernel allocation padding must not overwrite the logical MoE size."""
