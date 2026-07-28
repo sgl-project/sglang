@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
     TimeUpsampleCausalConv3d,
     assign_causal_cache_keys,
     causal_cache_scope,
+    is_channels_last_3d,
 )
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
@@ -172,6 +173,10 @@ class QwenImageResample(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, _, h, w = x.size()
+        # The round trip through 4D below loses channels_last_3d, and every
+        # downstream conv would convert the whole activation back. Restore it
+        # once here instead.
+        restore_channels_last = is_channels_last_3d(x)
 
         if self.mode == "upsample3d":
             x = self.time_conv(x)
@@ -183,6 +188,8 @@ class QwenImageResample(nn.Module):
 
         if self.mode == "downsample3d":
             x = self.time_conv(x)
+        if restore_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         return x
 
 
@@ -265,6 +272,9 @@ class QwenImageAttentionBlock(nn.Module):
         if self.spatial_parallel:
             x = gather_height_for_global_op(x).contiguous()
         identity = x
+        # The 5D -> 4D -> 5D round trip below drops channels_last_3d; restore it
+        # once rather than in each downstream conv.
+        restore_channels_last = is_channels_last_3d(x)
         batch_size, channels, time, height, width = x.size()
 
         x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
@@ -293,6 +303,8 @@ class QwenImageAttentionBlock(nn.Module):
         x = x.permute(0, 2, 1, 3, 4)
 
         x = x + identity
+        if restore_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         if self.spatial_parallel:
             x = chunk_height_for_parallel_decode(x)
         return x

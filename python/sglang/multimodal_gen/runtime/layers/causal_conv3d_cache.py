@@ -191,6 +191,20 @@ def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
     return x
 
 
+def is_channels_last_3d(x: torch.Tensor) -> bool:
+    """Whether ``x`` is already in channels_last_3d.
+
+    A pure tensor query, so it stays inside the compiled graph: if a tensor is
+    in that layout the platform evidently supports it, and no platform lookup
+    is needed.
+    """
+    return (
+        x.dim() == 5
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    )
+
+
 def memory_format_of(x: torch.Tensor) -> torch.memory_format:
     """The layout ``x`` is already in, so derived tensors can keep it.
 

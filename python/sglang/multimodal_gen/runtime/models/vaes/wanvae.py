@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
     TimeUpsampleCausalConv3d,
     assign_causal_cache_keys,
     causal_cache_scope,
+    is_channels_last_3d,
     should_trim_first_chunk,
 )
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
@@ -212,6 +213,10 @@ class WanUpsample(nn.Upsample):
 
 def attention_block_forward(self, x):
     identity = x
+    # The 5D -> 4D -> 5D round trip below drops channels_last_3d, and every
+    # downstream conv would then convert the whole activation back. Restore it
+    # once here instead.
+    restore_channels_last = is_channels_last_3d(x)
     batch_size, channels, num_frames, height, width = x.size()
     x = x.permute(0, 2, 1, 3, 4).reshape(
         batch_size * num_frames, channels, height, width
@@ -239,7 +244,10 @@ def attention_block_forward(self, x):
     x = x.view(batch_size, num_frames, channels, height, width)
     x = x.permute(0, 2, 1, 3, 4)
 
-    return x + identity
+    out = x + identity
+    if restore_channels_last:
+        out = out.contiguous(memory_format=torch.channels_last_3d)
+    return out
 
 
 def split_for_parallel_encode(
@@ -345,6 +353,9 @@ class WanResample(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, _, h, w = x.size()
+        # See attention_block_forward: the round trip through 4D loses the
+        # layout, so restore it once rather than in each consumer.
+        restore_channels_last = is_channels_last_3d(x)
 
         if self.mode == "upsample3d":
             x = self.time_conv(x)
@@ -356,6 +367,8 @@ class WanResample(nn.Module):
 
         if self.mode == "downsample3d":
             x = self.time_conv(x)
+        if restore_channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         return x
 
 
