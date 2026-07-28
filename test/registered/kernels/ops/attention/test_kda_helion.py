@@ -212,23 +212,102 @@ def _compare_prefill(
     beta: torch.Tensor,
     state: torch.Tensor,
     indices: torch.Tensor,
-    **kwargs,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    triton_state = state.clone()
+    batch, tokens, heads, key_dim = q.shape
+    value_dim = v.size(-1)
+    if scale is None:
+        scale = key_dim**-0.5
+
+    reference_q = q.float()
+    reference_k = k.float()
+    if use_qk_l2norm_in_kernel:
+        reference_q = reference_q / torch.sqrt(
+            (reference_q * reference_q).sum(-1, keepdim=True) + 1e-6
+        )
+        reference_k = reference_k / torch.sqrt(
+            (reference_k * reference_k).sum(-1, keepdim=True) + 1e-6
+        )
+        reference_q = reference_q.to(q.dtype).float()
+        reference_k = reference_k.to(k.dtype).float()
+
+    reference_gate = gate.float()
+    if A_log is not None:
+        if dt_bias is not None:
+            reference_gate = reference_gate + dt_bias.view(1, 1, heads, key_dim)
+        a = torch.exp(A_log.float()).view(1, 1, heads, 1)
+        if lower_bound is not None:
+            reference_gate = lower_bound * torch.sigmoid(a * reference_gate)
+        else:
+            reference_gate = -a * torch.nn.functional.softplus(reference_gate)
+
+    reference_state = state.clone()
+    reference_out = torch.empty_like(v)
+    q_rows = reference_q.view(batch * tokens, heads, key_dim)
+    k_rows = reference_k.view(batch * tokens, heads, key_dim)
+    v_rows = v.view(batch * tokens, heads, value_dim).float()
+    gate_rows = reference_gate.view(batch * tokens, heads, key_dim)
+    beta_rows = beta.view(batch * tokens, heads).float()
+    out_rows = reference_out.view(batch * tokens, heads, value_dim)
+
+    if cu_seqlens is None:
+        sequence_bounds = [
+            (sequence * tokens, (sequence + 1) * tokens) for sequence in range(batch)
+        ]
+        chunks_per_sequence = (tokens + 63) // 64
+        reference_chunks = torch.empty(
+            batch,
+            chunks_per_sequence,
+            heads,
+            value_dim,
+            key_dim,
+            device=q.device,
+            dtype=v.dtype,
+        )
+    else:
+        offsets = cu_seqlens.tolist()
+        sequence_bounds = list(zip(offsets, offsets[1:]))
+        total_chunks = sum((end - begin + 63) // 64 for begin, end in sequence_bounds)
+        reference_chunks = torch.empty(
+            1,
+            total_chunks,
+            heads,
+            value_dim,
+            key_dim,
+            device=q.device,
+            dtype=v.dtype,
+        )
+
+    global_chunk = 0
+    for sequence, (begin, end) in enumerate(sequence_bounds):
+        state_index = indices[sequence].item()
+        current_state = reference_state[state_index].float()
+        for local_chunk, chunk_begin in enumerate(range(begin, end, 64)):
+            chunk_index = local_chunk if cu_seqlens is None else global_chunk
+            chunk_batch = sequence if cu_seqlens is None else 0
+            reference_chunks[chunk_batch, chunk_index] = current_state.to(v.dtype)
+            if cu_seqlens is not None:
+                global_chunk += 1
+            for token in range(chunk_begin, min(chunk_begin + 64, end)):
+                current_state = current_state * torch.exp(gate_rows[token])[:, None, :]
+                residual = v_rows[token] - (
+                    current_state * k_rows[token][:, None, :]
+                ).sum(-1)
+                residual = residual * beta_rows[token][:, None]
+                current_state = current_state + (
+                    residual[:, :, None] * k_rows[token][:, None, :]
+                )
+                output = (current_state * (q_rows[token] * scale)[:, None, :]).sum(-1)
+                out_rows[token] = output.to(v.dtype)
+        reference_state[state_index] = current_state.to(state.dtype)
+
     helion_state = state.clone()
-    triton_v = v.clone()
     helion_v = v.clone()
-    triton_out, triton_chunks = triton_chunk_kda(
-        q,
-        k,
-        triton_v,
-        gate,
-        beta,
-        initial_state=triton_state,
-        initial_state_indices=indices,
-        output_intermediate_states=True,
-        **kwargs,
-    )
     helion_out, helion_chunks = helion_chunk_kda(
         q,
         k,
@@ -238,13 +317,18 @@ def _compare_prefill(
         initial_state=helion_state,
         initial_state_indices=indices,
         output_intermediate_states=True,
-        **kwargs,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
 
     assert helion_out.data_ptr() == helion_v.data_ptr()
-    torch.testing.assert_close(helion_out, triton_out, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(helion_chunks, triton_chunks, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(helion_state, triton_state, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(helion_out, reference_out, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(helion_chunks, reference_chunks, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(helion_state, reference_state, atol=2e-2, rtol=2e-2)
     return helion_out, helion_chunks, helion_state
 
 
@@ -280,39 +364,6 @@ def test_fixed_partial_prefill_and_state_pool_contract() -> None:
     assert torch.equal(helion_state[untouched], state[untouched])
 
 
-def test_packed_varlen_safe_gate_contract() -> None:
-    torch.manual_seed(1011)
-    lengths = [1, 15, 17]
-    tokens, heads, key_dim, value_dim = sum(lengths), 2, 32, 32
-    q = torch.randn(1, tokens, heads, key_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, heads, value_dim, device="cuda", dtype=torch.bfloat16)
-    gate = torch.randn_like(q) * 0.2
-    beta = torch.rand(1, tokens, heads, device="cuda")
-    a_log = torch.full([heads], -2.0, device="cuda")
-    cu_seqlens = torch.tensor(
-        [0, *torch.tensor(lengths).cumsum(0).tolist()],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    indices = torch.tensor([4, 1, 3], device="cuda", dtype=torch.int32)
-    state = torch.randn(6, heads, value_dim, key_dim, device="cuda") * 0.01
-
-    _compare_prefill(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        state,
-        indices,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        A_log=a_log,
-        lower_bound=-0.01,
-    )
-
-
 def test_prefill_uses_stable_subchunk_gates() -> None:
     torch.manual_seed(1117)
     tokens, heads, key_dim, value_dim = 64, 1, 32, 32
@@ -333,7 +384,7 @@ def test_prefill_uses_stable_subchunk_gates() -> None:
     indices = torch.zeros(1, device="cuda", dtype=torch.int32)
     state = torch.zeros(1, heads, value_dim, key_dim, device="cuda")
 
-    _compare_prefill(
+    output, chunks, final_state = _compare_prefill(
         q,
         k,
         v,
@@ -343,6 +394,9 @@ def test_prefill_uses_stable_subchunk_gates() -> None:
         indices,
         cu_seqlens=cu_seqlens,
     )
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(chunks).all()
+    assert torch.isfinite(final_state).all()
 
 
 def test_fp16_preactivated_gate_with_bf16_state_contract() -> None:
@@ -383,8 +437,18 @@ def test_fp16_preactivated_gate_with_bf16_state_contract() -> None:
     assert chunks.dtype == torch.float16
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_packed_varlen_prefill_contract(state_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize(
+    ("state_dtype", "lower_bound"),
+    [
+        (torch.float32, None),
+        (torch.bfloat16, -5.0),
+        (torch.float16, None),
+    ],
+    ids=["fp32", "bf16-lower-bound", "fp16"],
+)
+def test_packed_varlen_prefill_contract(
+    state_dtype: torch.dtype, lower_bound: float | None
+) -> None:
     torch.manual_seed(456)
     lengths = [65, 31]
     tokens, heads, key_dim, value_dim = sum(lengths), 2, 128, 128
@@ -410,41 +474,20 @@ def test_packed_varlen_prefill_contract(state_dtype: torch.dtype) -> None:
         )
         * 0.01
     )
-    triton_state = state.clone()
-    helion_state = state.clone()
-
-    triton_out, triton_chunks = triton_chunk_kda(
+    _compare_prefill(
         q,
         k,
-        v.clone(),
+        v,
         gate,
         beta,
-        initial_state=triton_state,
-        initial_state_indices=indices,
+        state,
+        indices,
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=cu_seqlens,
         A_log=a_log,
         dt_bias=dt_bias,
-        output_intermediate_states=True,
+        lower_bound=lower_bound,
     )
-    helion_out, helion_chunks = helion_chunk_kda(
-        q,
-        k,
-        v.clone(),
-        gate,
-        beta,
-        initial_state=helion_state,
-        initial_state_indices=indices,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
-        A_log=a_log,
-        dt_bias=dt_bias,
-        output_intermediate_states=True,
-    )
-
-    torch.testing.assert_close(helion_out, triton_out, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(helion_chunks, triton_chunks, atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(helion_state, triton_state, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
