@@ -544,7 +544,9 @@ class SchedulerBatchResultProcessor:
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
-        # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        # BaseSpecWorker and BaseTpWorker both provide a no-op default
+        # (PP+spec non-last stages process relayed results through the
+        # plain worker, which has no adaptive controller).
         self.model_worker.on_verify_complete_cpu(
             result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
         )

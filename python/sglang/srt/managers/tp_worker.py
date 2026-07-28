@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -69,6 +70,12 @@ class BaseTpWorker(ABC):
     @abstractmethod
     def model_runner(self) -> ModelRunner:
         pass
+
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
+        process relayed spec results through a plain worker."""
 
     @property
     def war_fastpath_runner(self):
@@ -315,11 +322,28 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers
-        if is_draft_worker and server_args.pp_size > 1:
+        if (
+            server_args.enable_pp_spec_decode
+            and is_draft_worker
+            and server_args.pp_size > 1
+        ):
             # PP+spec: the draft worker exists only on the last PP stage, so a
-            # world-group broadcast would deadlock (first-stage ranks never
-            # join). The seed was already synced during target worker init.
-            self.random_seed = server_args.random_seed
+            # world-group broadcast here would deadlock (first-stage ranks never
+            # join). Sync within the stage's TP group instead.
+            tp_group = self.model_runner.tp_group
+            if envs.SGLANG_GLM52_PP_DEBUG.get():
+                logger.info(
+                    "[GLM52-E3-PP][COLLECTIVE] broadcast_pyobj: "
+                    "group=tp_group, op=broadcast, "
+                    f"participant_ranks={list(tp_group.ranks)}, "
+                    "scope=draft_worker_init, safe=True"
+                )
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                tp_group.ranks[tp_rank],
+                tp_group.cpu_group,
+                src=tp_group.ranks[0],
+            )[0]
         else:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],

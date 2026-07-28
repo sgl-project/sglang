@@ -423,6 +423,10 @@ class Scheduler(
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
+        # PP+spec: print rank topology on all ranks.
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+            self._log_pp_spec_topology()
+
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
@@ -772,6 +776,17 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.server_args.pp_size > 1
+            and self.ps.pp_rank != self.server_args.pp_size - 1
+        ):
+            # PP+spec: the draft model needs final hidden states and the
+            # lm_head, both of which live on the last PP stage only.
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
             server_args=self.server_args,
@@ -843,6 +858,19 @@ class Scheduler(
             self.draft_worker.init_cuda_graphs()
 
     def init_model_worker(self):
+        # Validate PP+spec configuration before expensive model loading.
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+            from sglang.srt.speculative.glm52_eagle3_pp import (
+                validate_glm52_eagle3_tp4_pp2_configuration,
+            )
+            validate_glm52_eagle3_tp4_pp2_configuration(
+                server_args=self.server_args,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=False,
+                pp_rank=self.ps.pp_rank,
+                tp_rank=self.ps.tp_rank,
+            )
+
         # Load model weights.
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
@@ -857,8 +885,47 @@ class Scheduler(
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
 
+    def _log_pp_spec_topology(self):
+        """Print rank topology for PP+spec debugging."""
+        import torch.distributed as dist
+
+        world_rank = dist.get_rank() if dist.is_initialized() else 0
+        local_rank = self.ps.gpu_id
+        cuda_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else -1
+        )
+        pci_bus = (
+            torch.cuda.get_device_properties(cuda_device).name
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        tp_group = get_tp_group()
+        pp_group = get_pp_group()
+
+        logger.info(
+            "[GLM52-EAGLE3-PP] Rank topology:\n"
+            "  world_rank=%d\n"
+            "  local_rank=%d\n"
+            "  cuda_device=%d (%s)\n"
+            "  tp_rank=%d\n"
+            "  pp_rank=%d\n"
+            "  tp_group_ranks=%s\n"
+            "  pp_group_ranks=%s",
+            world_rank,
+            local_rank,
+            cuda_device,
+            pci_bus,
+            tp_group.rank_in_group,
+            pp_group.rank_in_group,
+            list(tp_group.ranks) if hasattr(tp_group, "ranks") else "N/A",
+            list(pp_group.ranks) if hasattr(pp_group, "ranks") else "N/A",
+        )
+
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # PP+spec: non-last stages have no draft worker; they run the
+            # verify-shaped target forward through the plain tp_worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -1126,7 +1193,10 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.draft_worker is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -3330,27 +3400,112 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
-                # Non-overlap: drive the V2 worker synchronously (no
-                # future_map relay / on_publish).
-                resolve_forward_inputs(batch, self.future_map)
-                with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
-                # The isolation restore reverted the worker's in-forward SB edits;
-                # re-apply what must carry to the next iter.
-                batch.spec_info = batch_result.next_draft_input
-                if batch_result.new_seq_lens is not None:
-                    batch.seq_lens = batch_result.new_seq_lens
-                    if batch.seq_lens_cpu is not None:
-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                batch.input_ids = None  # rebuilt next iter from draft_token
-                self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors.
-                batch_result.copy_done = self.device_module.Event()
-                batch_result.copy_to_cpu(
-                    return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                is_verify_round = self.server_args.pp_size > 1 and not (
+                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
                 )
+                if is_verify_round:
+                    # PP+spec decode: every stage rebuilds the same verify
+                    # input from relayed per-req state (draft lives on the
+                    # last stage only).
+                    self._pp_spec_rebuild_verify_input(batch)
+                if not self.pp_group.is_last_rank:
+                    # PP+spec: non-last stages run only their model chunk on
+                    # the verify-shaped batch; sampling, accept and draft all
+                    # live on the last stage.
+                    resolve_forward_inputs(batch, self.future_map)
+                    if is_verify_round:
+                        from sglang.srt.speculative.eagle_utils import (
+                            eagle_prepare_for_verify,
+                        )
+                        from sglang.srt.speculative.spec_utils import (
+                            record_stream_each,
+                            record_stream_for_v2_verify,
+                        )
+
+                        # Match standard EAGLEWorkerV2.verify() tensor
+                        # lifetime contract: record_stream on pre-prepare
+                        # SB/verify_input tensors so the caching allocator
+                        # does not recycle them while async GPU work is
+                        # still in flight on fwd_stream.
+                        fwd_stream = (
+                            self.device_module.current_stream()
+                        )
+                        verify_input = batch.spec_info
+                        record_stream_for_v2_verify(
+                            batch, verify_input, fwd_stream
+                        )
+
+                        with self._forward_isolation(batch, overlap=False):
+                            verify_forward_batch, can_run_cuda_graph = (
+                                eagle_prepare_for_verify(
+                                    batch.spec_info,
+                                    self.req_to_token_pool,
+                                    batch,
+                                    self.tp_worker,
+                                )
+                            )
+                            # Cover post-prepare rebinds (same as standard
+                            # EAGLEWorkerV2.verify).
+                            record_stream_each(
+                                (batch.input_ids, batch.out_cache_loc),
+                                fwd_stream,
+                            )
+                            batch_result = self.tp_worker.forward_batch_generation(
+                                batch=None,
+                                forward_batch=verify_forward_batch,
+                                pp_proxy_tensors=pp_proxy_tensors,
+                                is_verify=True,
+                            )
+                        # Keep verify_forward_batch alive until the async
+                        # PP send completes (mirrors standard verify's
+                        # extra_keep_alive_refs). Released when
+                        # batch_result is consumed by _pp_prep_batch_result
+                        # and the PP send work is committed.
+                        batch_result.extra_keep_alive_refs = [
+                            verify_forward_batch
+                        ]
+                        batch_result.can_run_cuda_graph = can_run_cuda_graph
+                    else:
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, pp_proxy_tensors=pp_proxy_tensors
+                        )
+                    batch.input_ids = None
+                    batch.spec_info = None
+                else:
+                    # Non-overlap: drive the V2 worker synchronously (no
+                    # future_map relay / on_publish). Only the PP+spec worker
+                    # takes pp_proxy_tensors; other spec workers keep their
+                    # signature (and pp_size == 1 has nothing to relay).
+                    kwargs = (
+                        {"pp_proxy_tensors": pp_proxy_tensors}
+                        if self.server_args.pp_size > 1
+                        else {}
+                    )
+                    resolve_forward_inputs(batch, self.future_map)
+                    with self._forward_isolation(batch, overlap=False):
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **kwargs
+                        )
+                    # The isolation restore reverted the worker's in-forward SB edits;
+                    # re-apply what must carry to the next iter.
+                    batch.spec_info = batch_result.next_draft_input
+                    if batch_result.new_seq_lens is not None:
+                        batch.seq_lens = batch_result.new_seq_lens
+                        if batch.seq_lens_cpu is not None:
+                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                    batch.input_ids = None  # rebuilt next iter from draft_token
+                    self.update_cache_from_scheduler(batch, batch_result)
+                    if self.server_args.pp_size == 1:
+                        # Sync D2H so the result processor can read CPU tensors.
+                        # Under PP this local result is only relayed (GPU send);
+                        # processing consumes the round-tripped copy, which
+                        # _pp_prep_batch_result already lands on CPU.
+                        batch_result.copy_done = self.device_module.Event()
+                        batch_result.copy_to_cpu(
+                            return_logprob=batch.return_logprob,
+                            return_hidden_states=batch.return_hidden_states,
+                        )
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -4002,6 +4157,17 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+
+        # PP+spec: clean up chain state for all aborted requests.
+        if hasattr(self, "_pp_spec_chain_by_rid") and self._pp_spec_chain_by_rid:
+            rids_to_remove = [
+                rid
+                for rid in self._pp_spec_chain_by_rid
+                if recv_req.abort_all or rid.startswith(recv_req.rid)
+            ]
+            for rid in rids_to_remove:
+                self._pp_spec_chain_by_rid.pop(rid, None)
+                self._pp_spec_req_state.pop(rid, None)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

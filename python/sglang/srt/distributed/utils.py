@@ -98,6 +98,8 @@ def get_pp_indices(
     """Try to evenly distribute layers across partitions.
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
+
+    For PP=2, ``SGLANG_PP_LAYER_PARTITION`` overrides the boundary.
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
@@ -114,6 +116,18 @@ def get_pp_indices(
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
+    elif pp_size == 2:
+        # P1-1: SGLANG_GLM52_PP_SPLIT removed; only SGLANG_PP_LAYER_PARTITION
+        # is the source of truth for layer partitioning.
+        base_layers = num_hidden_layers // pp_size
+        remainder = num_hidden_layers % pp_size
+        if pp_rank >= pp_size - remainder:
+            partitions_without_extra_layer = pp_size - remainder
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
+            end_layer = start_layer + (base_layers + 1)
+        else:
+            start_layer = pp_rank * base_layers
+            end_layer = start_layer + base_layers
     else:
         base_layers = num_hidden_layers // pp_size
         remainder = num_hidden_layers % pp_size

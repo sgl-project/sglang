@@ -704,6 +704,17 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Experimental: allow pipeline parallelism x speculative decoding
+    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
+    # (topk=1 chains, non-overlap schedule).
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    # Debug: log per-PP-lane aux checksums and per-round verify chain state.
+    SGLANG_GLM52_PP_DEBUG = EnvBool(False)
+    # Limit per-round debug logging to first N rounds (0 = unlimited).
+    SGLANG_GLM52_PP_DEBUG_ROUNDS = EnvInt(3)
+    # Packed PP transport: pack proxy tensors into contiguous buffers
+    # to eliminate per-tensor send/recv overhead. Disabled by default.
+    SGLANG_PP_PACKED_TRANSPORT = EnvBool(False)
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

@@ -106,6 +106,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        eagle3_pp_aux_info: Optional[Tuple[int, int]] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -145,6 +146,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                # EAGLE-3 PP: packed aux hidden states buffer.
+                # Sized by max_num_token to handle target-verify token rows.
+                if eagle3_pp_aux_info is not None:
+                    num_aux_layers, aux_hidden_size = eagle3_pp_aux_info
+                    from sglang.srt.speculative.glm52_eagle3_pp import (
+                        GLM52_EAGLE3_AUX_PP_KEY,
+                    )
+
+                    pp_proxy_tensors[GLM52_EAGLE3_AUX_PP_KEY] = torch.zeros(
+                        (max_num_token, num_aux_layers, aux_hidden_size),
+                        dtype=dtype,
                     )
             else:
                 pp_proxy_tensors = None

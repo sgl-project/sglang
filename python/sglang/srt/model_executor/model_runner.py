@@ -381,6 +381,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # PP+spec: the draft runner exists only on the last PP stage, so its
+        # memory profiling must stay rank-local (world-group reduces would
+        # deadlock against stages without a draft worker).
+        self.pp_spec_draft_local = (
+            server_args.enable_pp_spec_decode
+            and is_draft_worker
+            and server_args.pp_size > 1
+        )
         self.is_generation = model_config.is_generation
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
@@ -826,6 +834,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             return None
         return getattr(hf_config, "index_topk", None)
+
+    def get_eagle3_pp_aux_info(self) -> Optional[Tuple[int, int]]:
+        """Return (num_capture_layers, hidden_size) for EAGLE-3 PP aux buffer.
+
+        Returns None when EAGLE-3 PP is not active (pp_size=1 or no eagle3).
+        """
+        if self.pp_size <= 1:
+            return None
+        if not getattr(self, "eagle_use_aux_hidden_state", False):
+            return None
+        global_capture_layers = getattr(
+            self.model.model, "glm52_eagle3_global_capture_layers", []
+        )
+        if not global_capture_layers:
+            return None
+        hidden_size = getattr(
+            self.model.model, "glm52_eagle3_hidden_size",
+            self.model_config.hidden_size,
+        )
+        return (len(global_capture_layers), hidden_size)
 
     def decode_num_tokens_per_bs(
         self, *, num_draft_tokens: Optional[int] = None
@@ -1301,7 +1329,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()

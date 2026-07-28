@@ -80,6 +80,7 @@ def _allocate_decode_buffers(
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
+    eagle3_pp_aux_info: Optional[Tuple[int, int]] = None,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -125,6 +126,20 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            # EAGLE-3 PP: packed aux hidden states buffer.
+            # Shape: [max_num_token, num_capture_layers, hidden_size]
+            # Sized by max_num_token (not max_bs) to handle target-verify
+            # where num_token_rows = bs * verify_tokens_per_request.
+            if eagle3_pp_aux_info is not None:
+                num_aux_layers, aux_hidden_size = eagle3_pp_aux_info
+                from sglang.srt.speculative.glm52_eagle3_pp import (
+                    GLM52_EAGLE3_AUX_PP_KEY,
+                )
+
+                pp_proxy_tensors[GLM52_EAGLE3_AUX_PP_KEY] = torch.zeros(
+                    (max_num_token, num_aux_layers, aux_hidden_size),
+                    dtype=dtype,
                 )
         else:
             pp_proxy_tensors = None
@@ -320,6 +335,7 @@ class BaseRunner(ABC):
             ne_token_table=mr.token_table if mr.use_ngram_embedding else None,
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
+            eagle3_pp_aux_info=mr.get_eagle3_pp_aux_info(),
         )
 
     def _dummy_run(

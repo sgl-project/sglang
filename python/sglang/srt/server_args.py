@@ -6958,6 +6958,12 @@ class ServerArgs:
                 assert self.moe_a2a_backend == "none", (
                     "PP + speculative decoding does not support EP/A2A"
                 )
+                # The PP relay slices spec results with the configured
+                # num_draft_tokens; adaptive spec changes it at runtime.
+                assert not self.speculative_adaptive, (
+                    "PP + speculative decoding is not compatible with "
+                    "--speculative-adaptive"
+                )
                 logger.warning(
                     "PP + speculative decoding is experimental. "
                     "Current restrictions: topk=1, non-overlap schedule, "

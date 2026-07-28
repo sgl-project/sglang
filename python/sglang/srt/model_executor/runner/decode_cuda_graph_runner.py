@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -327,6 +328,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            eagle3_pp_aux_info=self.model_runner.get_eagle3_pp_aux_info(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -921,6 +923,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # graph's proxy input buffers must be refreshed here -- the
                 # captured graph reads these rows (mirrors fill_from's
                 # side-slot copy).
+                # P0-4: Validate required keys are present before silent
+                # stale-buffer reuse. A CUDA Graph static buffer existing
+                # from an earlier replay must not make a missing current
+                # input appear valid.
+                if self.model_runner.server_args.enable_pp_spec_decode:
+                    from sglang.srt.speculative.glm52_eagle3_pp import (
+                        REQUIRED_PP_PROXY_KEYS,
+                        GLM52_EAGLE3_AUX_PP_KEY,
+                    )
+                    available = set(pp_proxy_tensors.tensors.keys())
+                    for req_key in REQUIRED_PP_PROXY_KEYS:
+                        if req_key not in available:
+                            raise RuntimeError(
+                                f"[GLM52-E3-PP][GRAPH] Missing required PP "
+                                f"proxy key '{req_key}' during CUDA Graph "
+                                f"load_batch. Available: {sorted(available)}. "
+                                f"A static buffer from an earlier replay must "
+                                f"not substitute for a missing current input."
+                            )
                 for k, v in pp_proxy_tensors.tensors.items():
                     buf = self.buffers.pp_proxy_tensors.get(k)
                     if buf is not None:  # skip markers like __msg_type__

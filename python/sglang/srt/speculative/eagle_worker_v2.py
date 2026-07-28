@@ -41,7 +41,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -133,6 +137,177 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+# Embedding weight names across checkpoint layouts (GLM/DeepSeek-V3 style
+# vs DeepSeek-V4 style).
+_EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
+
+
+def _load_checkpoint_tensor(model_path: str, tensor_names: tuple) -> torch.Tensor:
+    """Load one tensor from a local safetensors checkpoint (PP+spec path)."""
+    import glob
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    assert os.path.isdir(model_path), (
+        "PP+spec draft embedding loading requires --model-path to be a local "
+        f"checkpoint directory, got {model_path!r}"
+    )
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        for tensor_name in tensor_names:
+            if tensor_name in weight_map:
+                shard_path = os.path.join(model_path, weight_map[tensor_name])
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    return f.get_tensor(tensor_name)
+    else:
+        for shard_path in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_name in tensor_names:
+                    if tensor_name in f.keys():
+                        return f.get_tensor(tensor_name)
+    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
+
+
+# Model class names that are MTP/NextN, not true EAGLE3.
+_MTP_DRAFT_NAMES = frozenset({
+    "GlmMoeDsaForCausalLMNextN",
+    "DeepseekV3ForCausalLMNextN",
+})
+
+# Config-level identifiers that indicate MTP/NextN, not true EAGLE3.
+_MTP_CONFIG_KEYWORDS = frozenset({
+    "glm4_moe_mtp",
+    "deepseek_mtp",
+    "mtp",
+    "nextn",
+})
+
+# Architectures that are MTP/NextN model wrappers.
+_MTP_ARCH_NAMES = frozenset({
+    "MTPModel",
+    "GlmMoeDsaForCausalLMNextN",
+    "DeepseekV3ForCausalLMNextN",
+})
+
+
+def _validate_eagle3_draft_model(draft_runner, server_args) -> None:
+    """Validate that the resolved draft is a true EAGLE3 model, not MTP/NextN.
+
+    Checks:
+    1. Draft path differs from target path (resolved via realpath where possible).
+    2. Draft class name is not in the MTP/NextN set.
+    3. Draft HF config does not contain MTP/NextN identifiers.
+    4. eagle_aux_hidden_state_layer_ids exists and is valid.
+    5. num_nextn_predict_layers is not used as the draft architecture.
+    """
+    import os
+
+    draft_model = draft_runner.model
+    draft_model_cls_name = type(draft_model).__name__
+
+    # Check for eagle_config in the draft's HF config
+    hf_config = getattr(draft_runner.model_config, "hf_config", None)
+    eagle_config = getattr(hf_config, "eagle_config", None) if hf_config else None
+
+    # Get the raw layer IDs from the draft config
+    raw_layer_ids = None
+    if eagle_config:
+        get_eagle_config = (
+            eagle_config.get
+            if isinstance(eagle_config, dict)
+            else lambda key, default=None: getattr(eagle_config, key, default)
+        )
+        raw_layer_ids = get_eagle_config("eagle_aux_hidden_state_layer_ids", None)
+    if raw_layer_ids is None and hf_config:
+        raw_layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+
+    # Resolve paths for comparison
+    target_path = server_args.model_path or ""
+    draft_path = server_args.speculative_draft_model_path or ""
+
+    target_resolved = os.path.realpath(target_path) if os.path.exists(target_path) else target_path
+    draft_resolved = os.path.realpath(draft_path) if os.path.exists(draft_path) else draft_path
+
+    # Draft model_type and architectures from HF config
+    draft_model_type = getattr(hf_config, "model_type", "unknown") if hf_config else "unknown"
+    draft_architectures = getattr(hf_config, "architectures", []) if hf_config else []
+
+    # num_nextn_predict_layers indicates NextN, not EAGLE3
+    has_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", None) is not None if hf_config else False
+
+    logger.info(
+        "[GLM52-EAGLE3-PP] Draft model configuration:\n"
+        "  draft_model_path=%s\n"
+        "  draft_resolved_path=%s\n"
+        "  target_model_path=%s\n"
+        "  target_resolved_path=%s\n"
+        "  draft_architecture=%s\n"
+        "  draft_model_type=%s\n"
+        "  draft_architectures=%s\n"
+        "  eagle_config=%s\n"
+        "  raw eagle_aux_hidden_state_layer_ids=%s\n"
+        "  has_nextn_layers=%s",
+        draft_path,
+        draft_resolved,
+        target_path,
+        target_resolved,
+        draft_model_cls_name,
+        draft_model_type,
+        draft_architectures,
+        eagle_config,
+        raw_layer_ids,
+        has_nextn_layers,
+    )
+
+    # Check 1: Draft path must differ from target path
+    if target_resolved == draft_resolved:
+        raise ValueError(
+            f"Draft model path resolves to the same path as the target model:\n"
+            f"  target: {target_path} -> {target_resolved}\n"
+            f"  draft:  {draft_path} -> {draft_resolved}\n"
+            f"PP+spec requires a separate trained EAGLE3 draft checkpoint.\n"
+            f"The target GLM-5.2 checkpoint cannot be used as its own draft."
+        )
+
+    # Check 2: Draft class name must not be MTP/NextN
+    if draft_model_cls_name in _MTP_DRAFT_NAMES:
+        raise ValueError(
+            f"Draft model resolved as {draft_model_cls_name}, which is an "
+            "MTP/NextN model. PP+spec requires a separate trained EAGLE3 "
+            "draft checkpoint, not GLM-5.2's built-in MTP layer.\n"
+            f"Set --speculative-draft-model-path to a true EAGLE3 checkpoint."
+        )
+
+    # Check 3: Config-level MTP/NextN identifiers
+    draft_model_type_lower = draft_model_type.lower() if isinstance(draft_model_type, str) else ""
+    for keyword in _MTP_CONFIG_KEYWORDS:
+        if keyword in draft_model_type_lower:
+            raise ValueError(
+                f"Draft model_type='{draft_model_type}' contains MTP/NextN "
+                f"identifier '{keyword}'. PP+spec requires a true EAGLE3 "
+                f"draft checkpoint, not MTP/NextN."
+            )
+
+    for arch_name in draft_architectures:
+        if arch_name in _MTP_ARCH_NAMES:
+            raise ValueError(
+                f"Draft architecture='{arch_name}' is an MTP/NextN model. "
+                f"PP+spec requires a true EAGLE3 draft checkpoint."
+            )
+
+    # Check 4: num_nextn_predict_layers indicates NextN
+    if has_nextn_layers:
+        raise ValueError(
+            f"Draft HF config contains 'num_nextn_predict_layers', which "
+            f"indicates a NextN architecture, not true EAGLE3. "
+            f"PP+spec requires a true EAGLE3 draft checkpoint."
+        )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -196,6 +371,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+
+        # PP+spec: validate that the resolved draft is a true EAGLE3 model,
+        # not GLM-5.2 MTP/NextN.
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and server_args.pp_size > 1:
+            _validate_eagle3_draft_model(self.draft_runner, server_args)
+
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -333,6 +514,69 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and self.server_args.pp_size > 1:
+            # PP+spec: the target's embedding lives on the first PP stage
+            # (PPMissingLayer here on the last stage) and NextN/MTP layers
+            # carry no embedding of their own in the checkpoint, so the
+            # draft's embedding must be loaded from the checkpoint directly
+            # — otherwise it stays randomly initialized and accept_length
+            # collapses to ~1.
+            embed = self.draft_runner.model.model.embed_tokens.weight
+            if self.server_args.load_format != "dummy":
+                loaded_embed = _load_checkpoint_tensor(
+                    model_path=self.draft_runner.model_config.model_path,
+                    tensor_names=_EMBED_TENSOR_NAMES,
+                )
+                embed.weight_loader(embed, loaded_embed)
+
+            # For EAGLE-3: most EAGLE-3 drafts own their own lm_head.
+            # Only share from target if the draft model explicitly requests it.
+            is_eagle3 = self.speculative_algorithm.is_eagle3()
+            share_lm_head = False
+            if is_eagle3:
+                # Check if the EAGLE-3 draft requests target lm_head sharing
+                draft_model = self.draft_runner.model
+                if (
+                    hasattr(draft_model, "load_lm_head_from_target")
+                    and draft_model.load_lm_head_from_target
+                ):
+                    share_lm_head = True
+            else:
+                # MTP/EAGLE: share lm_head from target
+                share_lm_head = True
+
+            if share_lm_head:
+                head = self.target_worker.model_runner.model.lm_head.weight
+                self.draft_runner.model.set_embed_and_head(embed, head)
+            else:
+                # EAGLE-3 draft owns its lm_head — only set embedding
+                self.draft_runner.model.set_embed_and_head(
+                    embed, self.draft_runner.model.lm_head.weight
+                )
+
+            # Log weight diagnostics for PP+spec (bounded sample, not full tensor)
+            embed_sample = embed.reshape(-1)[: min(embed.numel(), 1_000_000)]
+            logger.info(
+                "PP+spec draft embedding: source=checkpoint, "
+                "shape=%s, dtype=%s, sampled_norm=%.4f, sampled_finite=%s",
+                tuple(embed.shape),
+                embed.dtype,
+                embed_sample.float().norm().item(),
+                torch.isfinite(embed_sample).all().item(),
+            )
+            head_weight = self.draft_runner.model.lm_head.weight
+            head_sample = head_weight.reshape(-1)[: min(head_weight.numel(), 1_000_000)]
+            logger.info(
+                "PP+spec draft lm_head: source=%s, "
+                "shape=%s, dtype=%s, sampled_norm=%.4f, sampled_finite=%s",
+                "target" if share_lm_head else "draft",
+                tuple(head_weight.shape),
+                head_weight.dtype,
+                head_sample.float().norm().item(),
+                torch.isfinite(head_sample).all().item(),
+            )
+            return
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 
@@ -1104,6 +1348,47 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
+        # Log runtime identity once for PP+spec (proves EAGLEWorkerV2 + EAGLE3).
+        if envs.SGLANG_ENABLE_PP_SPEC.get() and server_args.pp_size > 1:
+            from sglang.srt.distributed import get_pp_group, get_tp_group
+
+            pp_group = get_pp_group()
+            tp_group = get_tp_group()
+            target_model_cls = type(target_worker.model_runner.model)
+            draft_model_cls = type(self._draft_worker.draft_runner.model)
+            logger.info(
+                "[GLM52-EAGLE3-PP] Runtime identity:\n"
+                "  spec_worker=%s\n"
+                "  target_worker=%s\n"
+                "  target_model=%s\n"
+                "  draft_worker=%s\n"
+                "  draft_model=%s\n"
+                "  spec_algorithm=%s\n"
+                "  is_eagle3=%s\n"
+                "  pp_rank=%d\n"
+                "  tp_rank=%d\n"
+                "  world_rank=%d\n"
+                "  cuda_device=%s",
+                type(self).__name__,
+                type(target_worker).__name__,
+                target_model_cls.__name__,
+                type(self._draft_worker).__name__,
+                draft_model_cls.__name__,
+                self.speculative_algorithm,
+                self.speculative_algorithm.is_eagle3(),
+                pp_group.rank_in_group,
+                tp_group.rank_in_group,
+                tp_group.ranks[tp_group.rank_in_group]
+                if hasattr(tp_group, "ranks") else -1,
+                torch.cuda.current_device()
+                if torch.cuda.is_available() else "cpu",
+            )
+            # Runtime assertions
+            assert isinstance(self, EAGLEWorkerV2)
+            assert self.speculative_algorithm.is_eagle3(), (
+                f"Expected EAGLE3, got {self.speculative_algorithm}"
+            )
+
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
@@ -1195,7 +1480,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
+    ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -1204,7 +1491,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1251,7 +1540,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
+            if batch.spec_info is not None and batch.spec_info.is_verify_input():
+                # PP+spec: the scheduler pre-built this round's verify input
+                # from relayed per-req chains — it must match what earlier
+                # stages already ran, so do not re-draft here.
+                verify_input = batch.spec_info
+            elif self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
@@ -1267,7 +1561,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch)
+            with torch.profiler.record_function("glm52_target_verify"):
+                batch_output = self.verify(batch, pp_proxy_tensors=pp_proxy_tensors)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1286,6 +1581,45 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            if (
+                self.server_args.pp_size > 1
+                and not batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 0
+            ):
+                # PP tail-draft: draft the NEXT round's chain now — earlier
+                # stages must have the tokens before running their half of the
+                # next verify forward, so drafting cannot wait for the next
+                # iteration. Mimic the head-of-iteration state draft() expects;
+                # the scheduler's forward isolation reverts these SB edits, and
+                # the chain rides out on batch_output.
+                batch.spec_info = batch_output.next_draft_input
+                batch.seq_lens = batch_output.new_seq_lens
+                batch.forward_mode = ForwardMode.DECODE
+                batch.input_ids = None
+                # Attention metadata planning reads the CPU copies; one D2H
+                # per round (TODO: async or upper-bound estimate).
+                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                with (
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    with torch.profiler.record_function("glm52_tail_draft"):
+                        next_verify_input = self.draft_worker.draft(batch)
+                # P1-7: Clone the chain tensor at the relay boundary.
+                # next_verify_input.draft_token may reference CUDA Graph static
+                # storage or a reusable draft buffer. A later replay could
+                # overwrite the data before asynchronous PP relay finishes.
+                # The chain tensor is small (bs * num_draft_tokens * int64),
+                # so the clone cost is negligible.
+                batch_output.next_verify_chain = (
+                    next_verify_input.draft_token.contiguous().clone()
+                )
 
             return batch_output
 
@@ -1570,7 +1904,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch):
+    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -1638,6 +1972,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = forward_batch_output.logits_output
 

@@ -61,6 +61,11 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    # PP+spec: forward-time snapshot of the microbatch (ScheduleBatch.copy()).
+    # The live mb object can be merged/filtered in place before its relayed
+    # result arrives, so relayed tensors must be applied against the
+    # composition that actually ran the forward.
+    fwd_batch: Optional[ScheduleBatch] = None
 
 
 class SchedulerPPMixin:
@@ -147,9 +152,15 @@ class SchedulerPPMixin:
                     )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    process_target = self.mbs[next_mb_id]
+                    next_md = self.mb_metadata[next_mb_id]
+                    if next_md is not None and next_md.fwd_batch is not None:
+                        # PP+spec: process against the forward-time snapshot;
+                        # the live mb may have been recomposed since launch.
+                        process_target = next_md.fwd_batch
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            process_target,
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
@@ -570,6 +581,13 @@ class SchedulerPPMixin:
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        # PP+spec: per-rid chain rows seeding the next verify round.
+        self._pp_spec_chain_by_rid: Dict[str, torch.Tensor] = {}
+        self._pp_spec_round_idx: int = 0
+        # P0-2: Explicit per-request spec state, keyed by RID.
+        # Replaces fragile len(req.output_ids) <= 1 detection.
+        # Tracks the lifecycle of each request's speculative chain.
+        self._pp_spec_req_state: Dict[str, dict] = {}
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -994,16 +1012,28 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
-        tensor_dict = {
-            "next_token_ids": result.next_token_ids,
-        }
-
-        if batch.return_logprob:
-            logprob_dict = get_logprob_dict_from_result(result)
+        with torch.profiler.record_function("glm52_pp_result_relay"):
             tensor_dict = {
-                **tensor_dict,
-                **logprob_dict,
+                "next_token_ids": result.next_token_ids,
             }
+
+            if not batch.spec_algorithm.is_none() and result.accept_lens is not None:
+                # PP+spec verify round: earlier stages need the accept results to
+                # mirror seq_lens/KV bookkeeping and the bonus token to root the
+                # next round's verify chain.
+                tensor_dict["spec_accept_lens"] = result.accept_lens
+                tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
+                tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
+                if result.next_verify_chain is not None:
+                    # Tail-drafted chain for the next verify round (root = bonus).
+                    tensor_dict["spec_next_chain"] = result.next_verify_chain
+
+            if batch.return_logprob:
+                logprob_dict = get_logprob_dict_from_result(result)
+                tensor_dict = {
+                    **tensor_dict,
+                    **logprob_dict,
+                }
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1129,13 +1159,75 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        is_spec = not batch.spec_algorithm.is_none()
+        if is_spec and "spec_accept_lens" in pp_outputs.tensors:
+            # PP+spec verify round. Relayed tensors align with the composition
+            # that ran the forward (mb_metadata.fwd_batch snapshot); the live
+            # mb object may have been merged/filtered in place since. Mirror
+            # the seq state per-rid onto the live batch, stash the bonus
+            # tokens that root the next verify chain, and rebuild a result the
+            # spec output processor can consume (CPU tensors).
+            fwd_batch = mb_metadata.fwd_batch if mb_metadata.fwd_batch else batch
+            new_seq_lens = pp_outputs["spec_new_seq_lens"]
+            fwd_rids = [req.rid for req in fwd_batch.reqs]
+            live_rids = [req.rid for req in batch.reqs]
+            if live_rids == fwd_rids:
+                batch.seq_lens = new_seq_lens
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            else:
+                row_by_rid = {rid: i for i, rid in enumerate(fwd_rids)}
+                new_cpu = new_seq_lens.tolist()
+                cur_cpu = batch.seq_lens.tolist()
+                merged = [
+                    new_cpu[row_by_rid[rid]] if rid in row_by_rid else cur_cpu[j]
+                    for j, rid in enumerate(live_rids)
+                ]
+                batch.seq_lens = torch.tensor(
+                    merged, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                )
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = torch.tensor(
+                        merged, dtype=batch.seq_lens_cpu.dtype
+                    )
+                    batch.seq_lens_sum = int(sum(merged))
+            self._pp_spec_store_bonus(
+                fwd_batch,
+                pp_outputs["spec_bonus_tokens"],
+                chain_tokens=(
+                    pp_outputs["spec_next_chain"]
+                    if "spec_next_chain" in pp_outputs.tensors
+                    else None
+                ),
+            )
+            output_result = GenerationBatchResult(
+                logits_output=logits_output,
+                pp_hidden_states_proxy_tensors=None,
+                next_token_ids=pp_outputs["next_token_ids"].cpu(),
+                accept_lens=pp_outputs["spec_accept_lens"].cpu(),
+                new_seq_lens=new_seq_lens,
+                speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            )
+            return output_result
+
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
-        )
+        if is_spec:
+            # Spec prefill round: the sampled first token roots round 1's chain.
+            fwd_batch = mb_metadata.fwd_batch if mb_metadata.fwd_batch else batch
+            self._pp_spec_store_bonus(fwd_batch, batch.input_ids)
+        else:
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            # (Spec FutureMap stores draft-input payloads, not bare bonus
+            # tokens, so the stash is non-spec only.)
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+            )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1150,6 +1242,259 @@ class SchedulerPPMixin:
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
         self.process_batch_result(batch, output_result)
+        # Chains are stored before finish flags are set (at result prep), so
+        # finished requests must be dropped here or the dict grows per request.
+        if self._pp_spec_chain_by_rid:
+            for req in batch.reqs:
+                if req.finished():
+                    self._pp_spec_chain_by_rid.pop(req.rid, None)
+                    self._pp_spec_req_state.pop(req.rid, None)
+                    if envs.SGLANG_GLM52_PP_DEBUG.get():
+                        logger.debug(
+                            "[GLM52-E3-PP][STATE] rid=%s, action=remove, "
+                            "reason=finished, map_size=%d",
+                            req.rid,
+                            len(self._pp_spec_chain_by_rid),
+                        )
+
+    def _pp_spec_store_bonus(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        bonus_tokens: torch.Tensor,
+        chain_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Stash the per-request chain row (root = bonus token) that seeds the
+        next verify round.
+
+        chain_tokens is the last stage's tail-drafted chain (flat bs*dtn);
+        without it (prefill rounds) a root-only row [bonus, 0, ...] is stored.
+        The bonus token is the real sampled token from prefill — NOT a
+        fabricated token. The zero drafts are simply rejected by the verify
+        kernel, costing acceptance but not correctness.
+        Keyed by rid (not batch position): the microbatch composition can
+        change between rounds (finish / retract / merge)."""
+        num_draft_tokens = self.server_args.speculative_num_draft_tokens
+        if chain_tokens is not None:
+            rows = chain_tokens.to(torch.int64).reshape(
+                len(batch.reqs), num_draft_tokens
+            )
+        else:
+            rows = torch.zeros(
+                (len(batch.reqs), num_draft_tokens),
+                dtype=torch.int64,
+                device=bonus_tokens.device,
+            )
+            rows[:, 0] = bonus_tokens.to(torch.int64)
+        for i, req in enumerate(batch.reqs):
+            if req.finished():
+                self._pp_spec_chain_by_rid.pop(req.rid, None)
+                self._pp_spec_req_state.pop(req.rid, None)
+            else:
+                # Store a CPU clone to avoid persistent GPU slice views.
+                self._pp_spec_chain_by_rid[req.rid] = (
+                    rows[i].to(device="cpu", dtype=torch.int64).clone()
+                )
+                # P0-2: Track minimal per-request spec state.
+                state = self._pp_spec_req_state.get(req.rid, {})
+                state["chain_initialized"] = True
+                state["spec_round"] = state.get("spec_round", 0) + 1
+                self._pp_spec_req_state[req.rid] = state
+                if envs.SGLANG_GLM52_PP_DEBUG.get():
+                    logger.debug(
+                        "[GLM52-E3-PP][STATE] rid=%s, action=store, "
+                        "map_size=%d, spec_round=%d",
+                        req.rid,
+                        len(self._pp_spec_chain_by_rid),
+                        state["spec_round"],
+                    )
+
+    def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
+        state, without a draft model.
+
+        Phase 1 (correctness bring-up): degenerate topk=1 chains — the root is
+        the relayed bonus token (always accepted by the verify kernel), padded
+        with zero draft tokens that simply get rejected. Verify is sound for
+        arbitrary proposals, so this costs acceptance rate, not correctness.
+        Phase 2 relays the last stage's tail-drafted real chains instead."""
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+        from sglang.srt.speculative.eagle_utils import (
+            TreeMaskMode,
+            build_tree_kernel_efficient,
+        )
+
+        sa = self.server_args
+        steps = sa.speculative_num_steps
+        num_draft_tokens = sa.speculative_num_draft_tokens
+        bs = batch.batch_size()
+        device = self.device
+        self._pp_spec_round_idx += 1
+
+        if batch.forward_mode.is_idle() or bs == 0:
+            batch.spec_info = EagleVerifyInput.create_idle_input(
+                topk=sa.speculative_eagle_topk,
+                spec_steps=steps,
+                num_verify_tokens=num_draft_tokens,
+                device=device,
+            )
+            return
+
+        # Build chain rows from relayed per-rid state.
+        #
+        # Two legitimate cases for a missing chain:
+        #   1. First-decode seeding: a request just finished prefill and
+        #      the relayed bonus token hasn't arrived yet on non-last PP
+        #      stages. The chain [bonus, 0, 0, ...] is the intended seed
+        #      — the bonus is a real sampled token, the zero drafts are
+        #      simply rejected by the verify kernel.
+        #   2. Prefill-to-decode transition on the last PP stage: the
+        #      bonus was stored locally, so the chain exists.
+        #
+        # An unexpected missing chain in steady state (round > 1 for an
+        # active decode rid) is a state-machine bug. Fail fast in both
+        # debug and production for this fixed deployment.
+        missing_rids = [
+            req.rid for req in batch.reqs
+            if req.rid not in self._pp_spec_chain_by_rid
+        ]
+        if missing_rids:
+            active_rids = [req.rid for req in batch.reqs]
+            known_chain_rids = list(self._pp_spec_chain_by_rid.keys())
+            round_idx = self._pp_spec_round_idx
+
+            # P0-2: Use explicit per-request state instead of fragile
+            # len(req.output_ids) <= 1 detection. A legitimate first-decode
+            # seed is when the request has no chain_initialized flag yet
+            # (just transitioned from prefill to decode).
+            is_first_decode_seed = all(
+                not self._pp_spec_req_state.get(req.rid, {}).get(
+                    "chain_initialized", False
+                )
+                for req in batch.reqs
+                if req.rid in missing_rids
+            )
+
+            if is_first_decode_seed:
+                # Legitimate first-decode seeding: use the request's real
+                # last token as root. NOT a fabricated token.
+                if envs.SGLANG_GLM52_PP_DEBUG.get():
+                    logger.info(
+                        "[GLM52-E3-PP][STATE] First-decode seed: "
+                        "missing_rids=%s, round=%d, using real last tokens",
+                        missing_rids[:5],
+                        round_idx,
+                    )
+                for req in batch.reqs:
+                    if req.rid not in self._pp_spec_chain_by_rid:
+                        last_token = (
+                            req.origin_input_ids[-1]
+                            if not req.output_ids
+                            else req.output_ids[-1]
+                        )
+                        chain = torch.zeros(
+                            num_draft_tokens, dtype=torch.int64, device="cpu"
+                        )
+                        chain[0] = int(last_token)
+                        self._pp_spec_chain_by_rid[req.rid] = chain
+                        # Mark as awaiting first real chain from relay.
+                        self._pp_spec_req_state[req.rid] = {
+                            "chain_initialized": False,
+                            "spec_round": 0,
+                        }
+            else:
+                # Unexpected missing steady-state chain: state-machine bug.
+                # Fail fast with rich diagnostics in both debug and production.
+                raise RuntimeError(
+                    "[GLM52-E3-PP][STATE] Unexpected missing speculative "
+                    f"chain in steady state for rids={missing_rids}, "
+                    f"round={round_idx}, "
+                    f"active_rids={active_rids}, "
+                    f"known_chain_rids={known_chain_rids}. "
+                    "This indicates a state-machine bug in the PP relay "
+                    "or request lifecycle cleanup."
+                )
+
+        chain_rows = torch.stack(
+            [self._pp_spec_chain_by_rid[req.rid] for req in batch.reqs]
+        ).to(device=device, dtype=torch.int64)
+        bonus_tokens = chain_rows[:, 0].contiguous()
+        draft_tokens = chain_rows[:, 1:].contiguous()
+        # topk=1 chain constants (mirrors EagleDraftWorker._rebuild_topk1_chain_buffers)
+        parent_width = steps if steps > 1 else 0
+        parent_list = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        top_scores_index = torch.arange(steps, dtype=torch.long, device=device).repeat(
+            bs, 1
+        )
+
+        attn_backend = self.tp_worker.model_runner.attn_backend
+        tree_mask_buf, position_buf = (
+            attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        seq_lens_sum = batch.seq_lens_sum
+        if seq_lens_sum is None:
+            if tree_mask_buf is None:
+                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
+            else:
+                seq_lens_sum = 0
+
+        (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            flat_draft_tokens,
+        ) = build_tree_kernel_efficient(
+            bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            sa.speculative_eagle_topk,
+            steps,
+            num_draft_tokens,
+            TreeMaskMode.FULL_MASK,
+            tree_mask_buf,
+            position_buf,
+        )
+        batch.spec_info = EagleVerifyInput(
+            draft_token=flat_draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=steps,
+            topk=sa.speculative_eagle_topk,
+            draft_token_num=num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
+
+        # Debug: log per-round verify chain state (gated behind env var
+        # and limited to first N rounds).
+        max_rounds = envs.SGLANG_GLM52_PP_DEBUG_ROUNDS.get()
+        if (
+            envs.SGLANG_GLM52_PP_DEBUG.get()
+            and (max_rounds == 0 or self._pp_spec_round_idx <= max_rounds)
+        ):
+            for i, req in enumerate(batch.reqs):
+                logger.info(
+                    "[GLM52-E3-PP][ROUND] rid=%s, "
+                    "bonus=%d, chain=%s, seq_len=%s, round=%d",
+                    req.rid,
+                    chain_rows[i, 0].item(),
+                    chain_rows[i, 1:].tolist(),
+                    batch.seq_lens[i].item()
+                    if batch.seq_lens is not None
+                    else "?",
+                    self._pp_spec_round_idx,
+                )
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
@@ -1280,6 +1625,11 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    fwd_batch=(
+                        cur_batch.copy()
+                        if not cur_batch.spec_algorithm.is_none()
+                        else None
+                    ),
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

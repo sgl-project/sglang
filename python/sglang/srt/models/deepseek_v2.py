@@ -2571,7 +2571,13 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if (
+            forward_batch.can_run_tbo
+            and not (
+                envs.SGLANG_ENABLE_PP_SPEC.get()
+                and get_server_args().pp_size > 1
+            )
+        ):
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -2582,31 +2588,33 @@ class DeepseekV2Model(nn.Module):
         aux_hidden_states = []
         if self.pp_group.is_first_rank:
             topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=topk_indices,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
-                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
-                        i
-                    ),
+        pp_prof_tag = f"glm52_pp{self.pp_group.rank_in_group}_target_layers"
+        with torch.profiler.record_function(pp_prof_tag):
+            for i in range(normal_start_layer, normal_end_layer):
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
+                with ctx:
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        ),
+                        next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                            i
+                        ),
+                    )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2623,37 +2631,169 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            proxy_tensors = {
-                "hidden_states": hidden_states,
-                "residual": residual,
-            }
-            if (
-                self.use_dsa
-                and dsa_forward_uses_topk
-                and self.end_layer < self.config.num_hidden_layers
-                and dsa_layer_skips_topk(self.config, self.end_layer)
+            with torch.profiler.record_function(
+                f"glm52_pp{self.pp_group.rank_in_group}_send_proxy"
             ):
+                proxy_tensors = {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
                 if (
-                    not forward_batch.forward_mode.is_idle()
-                    and hidden_states.shape[0] != 0
+                    self.use_dsa
+                    and dsa_forward_uses_topk
+                    and self.end_layer < self.config.num_hidden_layers
+                    and dsa_layer_skips_topk(self.config, self.end_layer)
                 ):
-                    assert topk_indices is not None, (
-                        f"PP stage ending at layer {self.end_layer} must forward "
-                        "DSA topk_indices because the next stage starts on a "
-                        "skip-topk layer."
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and hidden_states.shape[0] != 0
+                    ):
+                        assert topk_indices is not None, (
+                            f"PP stage ending at layer {self.end_layer} must forward "
+                            "DSA topk_indices because the next stage starts on a "
+                            "skip-topk layer."
+                        )
+                    if topk_indices is None:
+                        topk_indices = hidden_states.new_empty(
+                            (0, get_dsa_index_topk(self.config)), dtype=torch.int32
+                        )
+                    proxy_tensors["topk_indices"] = topk_indices
+
+                # PP+spec: pack locally captured EAGLE-3 aux hidden states
+                # into the proxy tensor for the next PP stage.
+                global_capture_layers = getattr(
+                    self, "glm52_eagle3_global_capture_layers", None
+                )
+                if (
+                    global_capture_layers
+                    and aux_hidden_states
+                    and envs.SGLANG_ENABLE_PP_SPEC.get()
+                ):
+                    from sglang.srt.speculative.glm52_eagle3_pp import (
+                        GLM52_EAGLE3_AUX_PP_KEY,
+                        pack_aux_into_buffer,
                     )
-                if topk_indices is None:
-                    topk_indices = hidden_states.new_empty(
-                        (0, get_dsa_index_topk(self.config)), dtype=torch.int32
+
+                    local_capture_layers = getattr(
+                        self, "glm52_eagle3_local_capture_layers", []
                     )
-                proxy_tensors["topk_indices"] = topk_indices
-            return PPProxyTensors(proxy_tensors)
+                    layer_to_slot = getattr(self, "glm52_eagle3_layer_to_slot", {})
+                    num_capture = len(global_capture_layers)
+                    aux_hidden_size = getattr(
+                        self, "glm52_eagle3_hidden_size", self.config.hidden_size
+                    )
+                    num_tokens = hidden_states.shape[0]
+
+                    # Use the static buffer from pp_proxy_tensors (CUDA Graph
+                    # compatible) instead of allocating a new tensor every
+                    # forward. The static buffer is owned by DecodeInputBuffers
+                    # / BaseRunner and sized to max_num_token.
+                    #
+                    # Architecture trace (P0-5):
+                    #   On PP0 during TARGET_VERIFY:
+                    #     - pp_proxy_tensors is the INCOMING PP data from the
+                    #       scheduler (constructed from DecodeInputBuffers).
+                    #     - DecodeInputBuffers.pp_proxy_tensors[GLM52_EAGLE3_AUX_PP_KEY]
+                    #       is a static CUDA Graph-owned buffer allocated in
+                    #       _allocate_decode_buffers / DecodeInputBuffers.create.
+                    #     - On capture: capture_prepare builds pp_proxy_tensors
+                    #       from buffers.pp_proxy_tensors (same static storage).
+                    #     - On replay: load_batch calls fill_from which copies
+                    #       the incoming proxy into the same static buffer.
+                    #     - The model forward gets a view (static_buf[:num_tokens])
+                    #       and writes into it in-place (pack_aux_into_buffer).
+                    #     - The PP output (proxy_tensors[GLM52_EAGLE3_AUX_PP_KEY])
+                    #       references the same static storage.
+                    #   On PP1:
+                    #     - pp_proxy_tensors carries the received packed aux
+                    #       from PP0 (via PP P2P communication).
+                    #     - The model merges local aux into the received buffer.
+                    #
+                    # Eager path: pp_proxy_tensors may be None (no CUDA Graph
+                    # buffer available), so allocate dynamically. This is
+                    # acceptable for eager mode.
+                    used_static = False
+                    if (
+                        pp_proxy_tensors is not None
+                        and GLM52_EAGLE3_AUX_PP_KEY in pp_proxy_tensors.tensors
+                    ):
+                        static_buf = pp_proxy_tensors.tensors[GLM52_EAGLE3_AUX_PP_KEY]
+                        packed_aux = static_buf[:num_tokens]
+                        used_static = True
+                    else:
+                        # Eager path or prefill: allocate normally.
+                        packed_aux = torch.zeros(
+                            (num_tokens, num_capture, aux_hidden_size),
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+
+                    # Zero only the active rows and pack local aux into slots.
+                    packed_aux.zero_()
+                    pack_aux_into_buffer(
+                        packed_aux, aux_hidden_states,
+                        local_capture_layers, layer_to_slot,
+                    )
+                    proxy_tensors[GLM52_EAGLE3_AUX_PP_KEY] = packed_aux
+
+                    # P0-5: Unconditional enforcement — CUDA Graph capture
+                    # must use the runner-owned static buffer.  This failure
+                    # does NOT depend on SGLANG_GLM52_PP_DEBUG, logger level,
+                    # assert statements, or Python optimization mode.
+                    if torch.cuda.is_current_stream_capturing() and not used_static:
+                        raise RuntimeError(
+                            "[GLM52-E3-PP][GRAPH] CUDA Graph capture "
+                            "on PP%d fell back to dynamic aux allocation. "
+                            "The static buffer is missing from "
+                            "pp_proxy_tensors. This indicates a buffer "
+                            "registration bug." %
+                            self.pp_group.rank_in_group,
+                        )
+
+                    # Debug: log aux info (gated, metadata-only during capture).
+                    if envs.SGLANG_GLM52_PP_DEBUG.get():
+                        if torch.cuda.is_current_stream_capturing():
+                            # During CUDA Graph capture/replay: log metadata only.
+                            # Reading tensor values (.item()) causes GPU sync,
+                            # which is forbidden inside graph capture.
+                            logger.info(
+                                "[GLM52-EAGLE3-PP][GRAPH] PP%d send: "
+                                "shape=%s, dtype=%s, data_ptr=%d, "
+                                "active_rows=%d, bytes=%d, "
+                                "used_static=%s",
+                                self.pp_group.rank_in_group,
+                                tuple(packed_aux.shape),
+                                packed_aux.dtype,
+                                packed_aux.data_ptr(),
+                                num_tokens,
+                                packed_aux.numel() * packed_aux.element_size(),
+                                used_static,
+                            )
+                        else:
+                            # Eager mode: safe to read values.
+                            flat = packed_aux.reshape(-1)
+                            sample = flat[: min(flat.numel(), 1024)]
+                            logger.info(
+                                "[GLM52-EAGLE3-PP][AUX] PP%d send: "
+                                "shape=%s, data_ptr=%d, "
+                                "sample_sum=%.4f, sample_abs_mean=%.6f",
+                                self.pp_group.rank_in_group,
+                                tuple(packed_aux.shape),
+                                packed_aux.data_ptr(),
+                                sample.float().sum().item(),
+                                sample.float().abs().mean().item()
+                                if sample.numel() > 0
+                                else 0.0,
+                            )
+
+                return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                with torch.profiler.record_function("glm52_target_final_norm"):
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.pp_group.is_last_rank and (
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
@@ -2666,6 +2806,103 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        # PP+spec: on the last stage, merge received aux hidden states
+        # from earlier PP stages with locally captured ones.
+        global_capture_layers = getattr(
+            self, "glm52_eagle3_global_capture_layers", None
+        )
+        if (
+            global_capture_layers
+            and envs.SGLANG_ENABLE_PP_SPEC.get()
+            and pp_proxy_tensors is not None
+        ):
+            with torch.profiler.record_function("glm52_pp1_aux_merge"):
+                from sglang.srt.speculative.glm52_eagle3_pp import (
+                    GLM52_EAGLE3_AUX_PP_KEY,
+                    pack_aux_into_buffer,
+                    unpack_aux_from_buffer,
+                    validate_pp_proxy_keys,
+                )
+
+                local_capture_layers = getattr(
+                    self, "glm52_eagle3_local_capture_layers", []
+                )
+                layer_to_slot = getattr(self, "glm52_eagle3_layer_to_slot", {})
+                slot_ownership = getattr(self, "glm52_eagle3_slot_ownership", {})
+
+                # P0-3: Validate required PP proxy keys are present.
+                # Missing required aux is fatal — do not silently use
+                # only local aux hidden states.
+                remote_capture_layers_exist = any(
+                    owner < self.pp_group.rank_in_group
+                    for owner in slot_ownership.values()
+                ) if slot_ownership else False
+                validate_pp_proxy_keys(
+                    available_keys=list(pp_proxy_tensors.tensors.keys()),
+                    pp_rank=self.pp_group.rank_in_group,
+                    tp_rank=get_parallel().tp_rank,
+                    forward_mode=str(forward_batch.forward_mode),
+                    active_token_rows=hidden_states.shape[0],
+                    remote_capture_layers_exist=remote_capture_layers_exist,
+                    slot_ownership=slot_ownership,
+                )
+
+                received_packed = pp_proxy_tensors.tensors.get(GLM52_EAGLE3_AUX_PP_KEY)
+                if received_packed is not None:
+                    # Debug: log received aux info (metadata-only during capture).
+                    if envs.SGLANG_GLM52_PP_DEBUG.get():
+                        if torch.cuda.is_current_stream_capturing():
+                            logger.info(
+                                "[GLM52-EAGLE3-PP][AUX][GRAPH] PP%d recv: "
+                                "shape=%s, dtype=%s, data_ptr=%d, "
+                                "bytes=%d",
+                                self.pp_group.rank_in_group,
+                                tuple(received_packed.shape),
+                                received_packed.dtype,
+                                received_packed.data_ptr(),
+                                received_packed.numel()
+                                * received_packed.element_size(),
+                            )
+                        else:
+                            flat = received_packed.reshape(-1)
+                            sample = flat[: min(flat.numel(), 1024)]
+                            logger.info(
+                                "[GLM52-EAGLE3-PP][AUX] PP%d recv: "
+                                "shape=%s, data_ptr=%d, "
+                                "sample_sum=%.4f, sample_abs_mean=%.6f",
+                                self.pp_group.rank_in_group,
+                                tuple(received_packed.shape),
+                                received_packed.data_ptr(),
+                                sample.float().sum().item(),
+                                sample.float().abs().mean().item()
+                                if sample.numel() > 0
+                                else 0.0,
+                            )
+                    # Merge: copy locally captured aux into the received packed buffer
+                    if aux_hidden_states:
+                        pack_aux_into_buffer(
+                            received_packed, aux_hidden_states,
+                            local_capture_layers, layer_to_slot,
+                        )
+                    # Unpack into ordered list for the logits processor
+                    aux_hidden_states = unpack_aux_from_buffer(
+                        received_packed,
+                        global_capture_layers,
+                        layer_to_slot,
+                        slot_ownership,
+                        local_capture_layers,
+                        self.pp_group.rank_in_group,
+                        self.pp_group.world_size,
+                        available_proxy_keys=list(pp_proxy_tensors.tensors.keys()),
+                    )
+                elif aux_hidden_states:
+                    # No received packed aux (e.g., all capture layers on last stage)
+                    # — use locally captured aux directly.
+                    pass
+                else:
+                    aux_hidden_states = []
+
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -2866,13 +3103,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and not isinstance(hidden_states, PPProxyTensors):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+            with torch.profiler.record_function("glm52_lm_head_logits"):
+                return self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+                )
         else:
             return hidden_states
 
@@ -2907,21 +3145,87 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+            raw_layer_ids = [2, num_layers // 2, num_layers - 3]
         else:
-            self.capture_aux_hidden_states = True
             # TODO (Qiaolin-Yu): check if other draft models need similar layer id
             # adjustment
             if layer_ids and layer_ids[0] == 1:
-                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+                raw_layer_ids = [val + 1 for val in layer_ids]
             else:
-                self.model.layers_to_capture = list(layer_ids)
+                raw_layer_ids = list(layer_ids)
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = list(raw_layer_ids)
+
+        # PP+spec: store global capture info for aux hidden state packing.
+        if (
+            envs.SGLANG_ENABLE_PP_SPEC.get()
+            and get_server_args().pp_size > 1
+        ):
+            from sglang.srt.speculative.glm52_eagle3_pp import (
+                build_layer_to_slot_map,
+                build_slot_ownership_map,
+                get_local_capture_layers,
+                log_pp_aux_capture_info,
+                validate_capture_layers,
+            )
+
+            server_args = get_server_args()
+            num_hidden = self.config.num_hidden_layers
+            hidden_size = self.config.hidden_size
+            pp_size = server_args.pp_size
+            pp_rank = self.pp_group.rank_in_group
+            start_layer = self.model.start_layer
+            end_layer = self.model.end_layer
+
+            # Validate capture layers and build ownership
+            slot_ownership = validate_capture_layers(
+                raw_layer_ids, num_hidden, pp_size, start_layer, end_layer,
+                hidden_size,
+            )
+
+            # Store global metadata on the model for forward-time packing
+            self.model.glm52_eagle3_global_capture_layers = raw_layer_ids
+            self.model.glm52_eagle3_hidden_size = hidden_size
+            self.model.glm52_eagle3_layer_to_slot = build_layer_to_slot_map(
+                raw_layer_ids
+            )
+            self.model.glm52_eagle3_slot_ownership = slot_ownership
+            self.model.glm52_eagle3_local_capture_layers = get_local_capture_layers(
+                raw_layer_ids, start_layer, end_layer
+            )
+
+            log_pp_aux_capture_info(
+                raw_layer_ids, start_layer, end_layer, hidden_size,
+                pp_rank, pp_size, slot_ownership,
+            )
+
+            # Detailed per-layer capture semantics (proves +1 transformation)
+            layer_to_slot = build_layer_to_slot_map(raw_layer_ids)
+            from sglang.srt.speculative.glm52_eagle3_pp import get_pp_split_layer
+            split_layer = get_pp_split_layer(num_hidden, pp_size)
+            logger.info(
+                "[GLM52-EAGLE3-PP] Capture layer semantics:\n"
+                "  num_hidden_layers=%d, pp_split_layer=%d (PP0=[0,%d), PP1=[%d,%d))\n"
+                "  +1 transformation: %s\n"
+                "  raw_layer_ids (after +1) = %s\n"
+                "  Per-layer ownership:",
+                num_hidden, split_layer, split_layer, split_layer, num_hidden,
+                "applied" if layer_ids and layer_ids[0] == 1 else "not applied (layer_ids[0] != 1 or layer_ids is None)",
+                raw_layer_ids,
+            )
+            for lid in raw_layer_ids:
+                owner = slot_ownership.get(lid, "?")
+                slot = layer_to_slot.get(lid, "?")
+                # The captured feature for layer i is hidden_states + residual
+                # BEFORE layer i runs, i.e., the output of layer i-1.
+                semantic = f"output of layer {lid - 1} (input to layer {lid})"
+                logger.info(
+                    "    layer %d -> slot %d, owner=PP%d, semantic=%s",
+                    lid, slot, owner, semantic,
+                )
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:

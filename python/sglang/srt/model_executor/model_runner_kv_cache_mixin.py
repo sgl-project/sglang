@@ -15,7 +15,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -115,7 +115,8 @@ class ModelRunnerKVCacheMixin:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=(get_world_group().world_size > 1) and not _pp_spec_draft,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
 
@@ -389,7 +390,8 @@ class ModelRunnerKVCacheMixin:
         free_gb = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=(get_world_group().world_size > 1)
+            and not self.pp_spec_draft_local,
             cpu_group=get_world_group().cpu_group,
         )
         headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
@@ -1339,8 +1341,12 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, user_limit)
 
-        # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
+        # Sync across PP ranks (each may have different layer counts).
+        # PP+spec draft workers exist only on the last PP stage — a world-group
+        # all_reduce would deadlock against stages without a draft worker.
+        # Use the TP group instead (all TP ranks on the same PP stage enter
+        # the draft init path together).
+        if self.pp_size > 1 and not self.pp_spec_draft_local:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -1348,6 +1354,17 @@ class ModelRunnerKVCacheMixin:
                 group=get_world_group().cpu_group,
             )
             token_capacity = tensor.item()
+        elif self.pp_size > 1 and self.pp_spec_draft_local:
+            # Draft worker: sync within the TP group only (same PP stage).
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tensor = torch.tensor(token_capacity, dtype=torch.int64)
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=tp_group.cpu_group,
+                )
+                token_capacity = tensor.item()
 
         return token_capacity
 
