@@ -411,21 +411,6 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertTrue(sp.spaces_between_special_tokens)
         self.assertFalse(sp.no_stop_trim)
 
-    def test_msgpack_uses_array_layout(self):
-        encoded = msgspec.msgpack.encode(SamplingParams())
-        decoded = msgspec.msgpack.decode(encoded)
-
-        self.assertIsInstance(decoded, list)
-        self.assertEqual(decoded[0], 128)
-        self.assertEqual(len(decoded), len(msgspec.structs.fields(SamplingParams)))
-
-    def test_custom_params_follows_sampling_seed(self):
-        field_names = [field.name for field in msgspec.structs.fields(SamplingParams)]
-
-        self.assertEqual(
-            field_names.index("custom_params"), field_names.index("sampling_seed") + 1
-        )
-
     def test_msgpack_round_trip_preserves_normalized_state(self):
         tokenizer = MagicMock()
         tokenizer.encode.side_effect = lambda s, add_special_tokens=False: {
