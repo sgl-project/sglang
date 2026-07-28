@@ -308,6 +308,8 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             cu_topk_indices_offset = torch.repeat_interleave(
                 cu_seqlens_q_topk[:-1],
                 cu_seqlens_q,
+                # Avoid reading sum(cu_seqlens_q) back to the host.
+                output_size=logits.shape[0],
             )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q

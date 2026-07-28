@@ -340,6 +340,8 @@ def _build_flashinfer_paged_args(
         else None
     )
 
+    # Both dynamic mappings contain one entry per logit row. Supplying the known
+    # size avoids synchronizing CUDA to infer the sum of the repeat counts.
     if (
         row_to_batch is not None
         and cu_seqlens_q_topk is not None
@@ -348,7 +350,9 @@ def _build_flashinfer_paged_args(
         q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
             dtype=torch.int32, device=device
         )
-        row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
+        row_to_batch = torch.repeat_interleave(
+            row_to_batch, q_lens, output_size=num_rows
+        )
 
     if row_to_batch is None and cu_seqlens_q_topk is not None:
         # Decode-like case (one query row per batch) does not need an explicit mapping.
@@ -361,6 +365,7 @@ def _build_flashinfer_paged_args(
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
                 q_lens,
+                output_size=num_rows,
             )
 
     if row_starts is not None and row_to_batch is None:
