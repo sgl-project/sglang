@@ -9,9 +9,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
-import requests
 import torch
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
@@ -22,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     envs,
     is_cpu,
     is_npu,
@@ -566,11 +566,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except (
-            ValueError,
-            UnidentifiedImageError,
-            requests.exceptions.RequestException,
-        ) as e:
+        except CLIENT_MEDIA_EXCEPTIONS as e:
             # Bad input (e.g. invalid base64, a media URL that cannot be
             # fetched, or media bytes that cannot be parsed) is a client
             # error -> 400, not 500.
