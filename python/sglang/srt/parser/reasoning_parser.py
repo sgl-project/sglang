@@ -450,7 +450,22 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             tool_start_token=TOOLS_OPEN,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
-            reasoning_default="thinking",
+            # K3 is an always-thinking model: the think channel is
+            # structural in every assistant turn and cannot be switched
+            # off from the request. "always" makes
+            # ``_get_reasoning_from_request`` return True unconditionally.
+            #
+            # This used to be "thinking", which sent the read side looking
+            # for a ``chat_template_kwargs["thinking"]`` toggle that K3
+            # never defines (its knob is ``thinking_effort``). When that
+            # lookup failed, ``force_reasoning`` came out False and
+            # ``detect_and_parse`` took its "not in reasoning" branch, so
+            # any turn where the model hand-writes its own open marker
+            # (e.g. a malformed ``<|open|>think<|sep|`` built from plain
+            # BPE text instead of the atomic special token) fell through
+            # to normal_text and leaked the entire think channel to the
+            # client.
+            reasoning_default="always",
         )
         self._reasoning_done = False
         self._tools_passthrough = False

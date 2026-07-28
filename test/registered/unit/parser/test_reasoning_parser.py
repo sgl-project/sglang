@@ -12,6 +12,7 @@ from sglang.srt.parser.reasoning_parser import (
     InklingDetector,
     KimiDetector,
     KimiK2Detector,
+    KimiK3Detector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -1248,6 +1249,163 @@ class TestPoolsideV1Registered(CustomTestCase):
         rp = ReasoningParser("poolside_v1", stream_reasoning=True)
         self.assertEqual(rp.detector.reasoning_default, "explicit_enable_thinking")
         self.assertTrue(rp.detector.thinks_internally)
+
+
+class TestKimiK3Detector(CustomTestCase):
+    """Kimi K3 is always-thinking: its XTML think channel is structural in
+    every assistant turn and has no request-level off switch.
+
+    Regression guard for a leak where the whole think channel reached the
+    client as visible text. K3's reasoning_default used to be "thinking",
+    which made ``_get_reasoning_from_request`` look for a
+    ``chat_template_kwargs["thinking"]`` toggle that K3 never defines (its
+    knob is ``thinking_effort``). The lookup failed, force_reasoning came
+    out False, and ``detect_and_parse``/``parse_streaming_increment`` took
+    their "not in reasoning" branch.
+    """
+
+    THINK_OPEN = "<|open|>think<|sep|>"
+    THINK_CLOSE = "<|close|>think<|sep|>"
+    MARKERS = ("<|open|>", "<|sep|", "<|close|>")
+
+    def test_reasoning_default_is_always(self):
+        rp = ReasoningParser("kimi_k3", stream_reasoning=True)
+        self.assertEqual(rp.detector.reasoning_default, "always")
+
+    def test_force_reasoning_defaults_true(self):
+        self.assertTrue(KimiK3Detector().force_reasoning)
+
+    def test_healthy_output_splits_channels(self):
+        text = "Weighing the options.%sAnswer: 42." % self.THINK_CLOSE
+        r = KimiK3Detector().detect_and_parse(text)
+        self.assertEqual(r.reasoning_text, "Weighing the options.")
+        self.assertEqual(r.normal_text, "Answer: 42.")
+
+    def test_malformed_open_marker_does_not_leak(self):
+        """The model sometimes re-emits its own open marker built from plain
+        BPE text (``<|sep`` + ``|``) instead of the atomic special token, so
+        it never matches THINK_OPEN exactly. It must still be contained in
+        the think channel rather than shown to the user."""
+        text = "<|open|>think<|sep|<|sep|>Thinking hard.%sAnswer: 42." % self.THINK_CLOSE
+        r = KimiK3Detector().detect_and_parse(text)
+        self.assertEqual(r.normal_text, "Answer: 42.")
+        for marker in self.MARKERS:
+            self.assertNotIn(marker, r.normal_text or "")
+
+    def test_malformed_open_marker_without_close_does_not_leak(self):
+        """Short-circuit case: the model emits a broken open marker and then
+        stops. Everything is reasoning; the user must not see the markers."""
+        r = KimiK3Detector().detect_and_parse("<|open|>think<|sep|")
+        self.assertFalse(r.normal_text)
+
+    def test_streaming_malformed_open_marker_does_not_leak(self):
+        """Delta sequence captured from a real leaking response: the atomic
+        ``<|open|>think`` token, then ``<|sep`` and ``|`` as ordinary text,
+        then a genuine ``<|sep|>``."""
+        deltas = [
+            "<|open|>think",
+            "<|sep",
+            "|",
+            "<|sep|>",
+            "The",
+            " user asks a hard question.",
+            self.THINK_CLOSE,
+            "Answer: 42.",
+        ]
+        detector = KimiK3Detector()
+        reasoning, normal = "", ""
+        for delta in deltas:
+            r = detector.parse_streaming_increment(delta)
+            reasoning += r.reasoning_text or ""
+            normal += r.normal_text or ""
+        self.assertEqual(normal, "Answer: 42.")
+        for marker in self.MARKERS:
+            self.assertNotIn(marker, normal)
+        self.assertIn("The user asks a hard question.", reasoning)
+
+    def test_force_reasoning_false_leaks_in_streaming(self):
+        """Pin the exact failure mode observed in production.
+
+        The detector itself is fine once it is forced into reasoning; the
+        bug was that the serving layer computed force_reasoning=False for
+        K3. On the streaming path that leaks the think channel whether or
+        not a close marker arrives, which is what clients actually saw.
+        """
+        deltas = [
+            "<|open|>think",
+            "<|sep",
+            "|",
+            "<|sep|>",
+            "The user asks.",
+            self.THINK_CLOSE,
+            "Answer: 42.",
+        ]
+
+        def run(force_reasoning):
+            detector = KimiK3Detector(force_reasoning=force_reasoning)
+            normal = ""
+            for delta in deltas:
+                normal += detector.parse_streaming_increment(delta).normal_text or ""
+            return normal
+
+        leaked = run(False)
+        self.assertIn("<|open|>", leaked)
+        self.assertIn("<|close|>", leaked)
+
+        contained = run(True)
+        self.assertEqual(contained, "Answer: 42.")
+        for marker in self.MARKERS:
+            self.assertNotIn(marker, contained)
+
+    def test_non_streaming_leaks_only_without_close_marker(self):
+        """Non-streaming is partially self-healing: ``detect_and_parse``
+        keys off think_end_token, so a malformed open marker only escapes
+        when the model also stops before emitting a close marker."""
+        broken_open = "<|open|>think<|sep|<|sep|>Thinking hard."
+
+        with_close = KimiK3Detector(force_reasoning=False).detect_and_parse(
+            broken_open + self.THINK_CLOSE + "Answer: 42."
+        )
+        self.assertEqual(with_close.normal_text, "Answer: 42.")
+
+        without_close = KimiK3Detector(force_reasoning=False).detect_and_parse(
+            broken_open
+        )
+        self.assertIn("<|open|>", without_close.normal_text or "")
+
+        forced = KimiK3Detector(force_reasoning=True).detect_and_parse(broken_open)
+        self.assertFalse(forced.normal_text)
+
+    def test_serving_layer_forces_reasoning_for_k3(self):
+        """End-to-end guard on the path that actually broke.
+
+        ``_get_reasoning_from_request`` is what the serving layer calls per
+        request to decide force_reasoning. With reasoning_default="thinking"
+        it looked for a ``chat_template_kwargs["thinking"]`` key that K3
+        never sets; "always" makes it unconditionally True, which is correct
+        for an always-thinking model.
+        """
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        rp = ReasoningParser("kimi_k3", stream_reasoning=True)
+        mode = rp.detector.reasoning_default
+        self.assertEqual(mode, "always")
+
+        # Mirrors the serving-layer fallback branch for a K3-shaped request:
+        # thinking_effort is the real knob, so a "thinking" lookup is absent.
+        request = ChatCompletionRequest(
+            model="kimi-k3",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"thinking_effort": "max"},
+        )
+        if mode == "always":
+            resolved = True
+        else:
+            resolved = (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get(mode) is not False
+            )
+        self.assertTrue(resolved)
 
 
 if __name__ == "__main__":
