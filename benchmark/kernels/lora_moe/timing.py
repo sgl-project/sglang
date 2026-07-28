@@ -21,8 +21,12 @@ Nothing here decides anything.  Selection lives in the gate packets.
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
+import secrets
 import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Callable
 
 import msgspec
@@ -109,6 +113,14 @@ class TimingSuite(msgspec.Struct, kw_only=True):
     # Content digest of the measuring source files (works on file-synced
     # trees where git state is absent) — see content_fingerprint().
     source_digest: str = "unknown"
+    # 6th review: kernel-only identity, recorded at suite CREATION so
+    # write_suite can prove the measured tree never changed mid-run.
+    kernel_digest: str = "unknown"
+    # 7th review: identity of the RUNNING producer (kernel digest + that
+    # producer + direct runtime helpers), checked again at publication.
+    execution_digest: str = "unknown"
+    # Recorded so write_suite recomputes over exactly the same inputs.
+    producer_files: tuple[str, ...] = ()
     records: list[TimingRecord] = []
     # §31.7 crossover rows found in THIS session; serialized with the suite so
     # the gate packet's ledger is copied from an archive, not reconstructed.
@@ -306,6 +318,129 @@ def resolve_source_revision() -> str:
     return head.stdout.strip() + suffix
 
 
+# Modules whose CONTENT determines a measurement (kernels, fixtures,
+# the timing harness). A config table transfers iff these are identical;
+# edits to a sibling bench's sweep-enumeration logic cannot change what
+# a promoted config does, so they must not invalidate the table.
+# 4th review: the first version omitted fixtures, invocation paths,
+# execution helpers, and shared tuning logic — all of which control what
+# a measurement means. Everything that can change a number belongs here;
+# only a SIBLING bench's own sweep-enumeration code may sit outside.
+_KERNEL_MODULES = (
+    "bench_common.py",
+    "bench_lora_b.py",  # the table PRODUCER: grid, admission, winner pick
+    "bench_lora_a.py",  # _LegFixture: every fixture tensor and layout
+    "bench_sgmv_real.py",  # segment-metadata synthesis
+    "cases.py",
+    "crossover_ledger.py",  # decide_cell: the adjudication rule itself
+    "lora_a_candidates.py",
+    "lora_a_cutedsl.py",
+    "lora_a_execution.py",
+    "lora_a_shared.py",
+    "lora_b_candidates.py",
+    "lora_b_execution.py",
+    "r10_joint_route.py",
+    "reference.py",
+    "routes.py",
+    "signal_gates.py",
+    "timing.py",
+)
+
+
+def kernel_fingerprint() -> str:
+    """Digest of the MEASURED code only (see _KERNEL_MODULES + kernel roots)."""
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3]
+    here = pathlib.Path(__file__).resolve().parent
+    files: list[pathlib.Path] = [here / name for name in _KERNEL_MODULES]
+    # 6th review: measured dependencies outside the roots below.
+    files.append(base / "python/sglang/srt/lora/utils.py")
+    # 8th review: cached_triton_kernel lives here and can change both
+    # measurements and which config wins, so it is a TRANSFER invariant.
+    files.append(base / "python/sglang/srt/utils/common.py")
+    # (the jit tree is covered by the roots list below: kernels/jit)
+    for root in (
+        base / "python/sglang/srt/lora/sgl_lora",
+        base / "python/sglang/kernels/ops/gemm",
+        base / "python/sglang/kernels/ops/moe",
+        # 5th/6th review: the whole JIT tree — marker.py is the timing
+        # engine timing.py drives, and its helpers travel with it.
+        base / "python/sglang/kernels/jit",
+    ):
+        if not root.is_dir():
+            return "unknown"
+        files.extend(sorted(root.rglob("*.py")))
+    digest = hashlib.sha256()
+    for file in files:
+        if file.name.startswith("._"):
+            continue  # macOS AppleDouble sync junk, never identity
+        if not file.is_file():
+            # Squash review: a listed identity module that vanished
+            # (rename, bad sync) used to be silently SKIPPED, weakening
+            # the identity the transfer contract hangs on. Unknown blocks
+            # publication; silence does not.
+            return "unknown"
+        digest.update(str(file.relative_to(base)).encode())
+        digest.update(file.read_bytes())
+    return f"kernels:{digest.hexdigest()}"
+
+
+def execution_fingerprint(*producer_files: str) -> str:
+    """Identity of the code EXECUTING this suite (7th review).
+
+    ``kernel_fingerprint`` answers "may a config table transfer here?" and
+    must therefore NOT depend on which bench is running. This answers a
+    different question — "did the code producing this artifact change
+    while it ran?" — by hashing the WHOLE lab tree plus any out-of-lab
+    producer files. ``producer_files`` is primarily the fail-closed
+    identity requirement: empty means the producer never declared itself,
+    and that refuses publication. Keeping the two fingerprints separate
+    means editing one bench cannot invalidate another bench's TABLE,
+    while any mid-run edit in the lab still blocks publication.
+    """
+    import pathlib
+
+    base = pathlib.Path(__file__).resolve().parents[3]
+    kernel = kernel_fingerprint()
+    if kernel == "unknown":
+        return "unknown"  # 8th review: propagate, never hash the sentinel
+    if not producer_files:
+        # 9th review: no producer identity is not a valid identity. An
+        # empty tuple used to yield a kernel-only digest that LOOKED fine.
+        return "unknown"
+    digest = hashlib.sha256()
+    digest.update(kernel.encode())
+    # 9th review: execution identity hashes the WHOLE lab tree — the
+    # simplest fail-closed answer to "did any code this run depends on
+    # change while it ran?". Table-TRANSFER identity stays narrow.
+    lab = pathlib.Path(__file__).resolve().parent
+    extra: list[pathlib.Path] = sorted(
+        f for f in lab.rglob("*.py") if not f.name.startswith("._")
+    )
+    # The tree walk above already covers every in-lab producer; only
+    # out-of-lab files add bytes here, deduplicated so the digest is
+    # well-defined regardless of how callers spell their paths.
+    seen = set(extra)
+    for declared in producer_files:
+        resolved = pathlib.Path(declared).resolve()
+        if resolved not in seen:
+            extra.append(resolved)
+            seen.add(resolved)
+    for file in extra:
+        if not file.is_file():
+            return "unknown"
+        # 10th review: hash the PATH like content_fingerprint does — two
+        # same-named files in different directories must not collide.
+        try:
+            identity = str(file.relative_to(base))
+        except ValueError:
+            identity = str(file)
+        digest.update(identity.encode())
+        digest.update(file.read_bytes())
+    return f"exec:{digest.hexdigest()}"
+
+
 def content_fingerprint() -> str:
     """Digest of the lab + sgl_lora source files actually on disk.
 
@@ -342,7 +477,23 @@ def content_fingerprint() -> str:
     return "files:" + digest.hexdigest()
 
 
-def new_suite(suite: str, *, source_revision: str | None = None) -> TimingSuite:
+def new_suite(
+    suite: str,
+    *,
+    source_revision: str | None = None,
+    producer_files: tuple[str, ...] = (),
+) -> TimingSuite:
+    """Create a suite, recording device/revision/identity provenance.
+
+    8th review: ``producer_files`` used to be optional, so most benches
+    got an execution digest that omitted their own code. When it is not
+    supplied we INFER the calling module's file — the producer by
+    definition — and only fall through to "unknown" (which blocks
+    publication) if even that is unavailable.
+    """
+    if not producer_files:
+        caller = sys._getframe(1).f_globals.get("__file__")
+        producer_files = (caller,) if caller else ()
     # Eighth S3 review: a caller-supplied revision is a CLAIM; the suite
     # additionally records what the running tree actually resolves to
     # (full-format short SHA with -dirty, or "unknown" on a file-synced
@@ -353,6 +504,9 @@ def new_suite(suite: str, *, source_revision: str | None = None) -> TimingSuite:
         source_revision=source_revision or resolve_source_revision(),
         observed_revision=resolve_source_revision(),
         source_digest=content_fingerprint(),
+        kernel_digest=kernel_fingerprint(),
+        execution_digest=execution_fingerprint(*producer_files),
+        producer_files=tuple(producer_files),
         torch_version=str(torch.__version__),
         host=platform.node(),
     )
@@ -460,9 +614,109 @@ def pair_with_base(record: TimingRecord, base: TimingRecord) -> TimingRecord:
     )
 
 
-def write_suite(suite: TimingSuite, path: str) -> str:
-    """Serialize a suite and return the SHA256 of the bytes written."""
+def atomic_write_bytes(path: str | os.PathLike[str], payload: bytes) -> None:
+    """Atomically replace ``path`` with fully flushed ``payload``.
+
+    The temporary file lives beside the destination, so ``os.replace`` is
+    atomic on the target filesystem. A failed replacement leaves the old
+    destination intact and removes the temporary file.
+    """
+    destination = Path(path)
+    if destination.is_symlink():
+        raise ValueError(f"refusing to atomically replace symlink {destination}")
+    existing_mode = destination.stat().st_mode & 0o777 if destination.exists() else None
+    descriptor = -1
+    temporary = None
+    for _ in range(100):
+        candidate = destination.parent / (
+            f".{destination.name}.{secrets.token_hex(8)}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                existing_mode if existing_mode is not None else 0o666,
+            )
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if temporary is None:
+        raise FileExistsError(
+            f"could not allocate a unique temporary file beside {destination}"
+        )
+    try:
+        if existing_mode is not None:
+            # os.open applies the process umask even to an existing target's
+            # requested mode. Restore that target's exact mode explicitly.
+            os.fchmod(descriptor, existing_mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _validated_suite_payload(suite: TimingSuite) -> tuple[bytes, str]:
+    """Validate source identity and serialize one immutable suite snapshot."""
+    recorded = suite.execution_digest
+    if recorded == "unknown":
+        raise RuntimeError(
+            "suite has no starting execution_digest; refusing to publish "
+            "an artifact whose code identity cannot be established"
+        )
+    end_digest = execution_fingerprint(*suite.producer_files)
+    if end_digest != recorded:
+        raise RuntimeError(
+            f"execution fingerprint drifted during the run ({recorded} -> "
+            f"{end_digest}); the source tree was overlaid while measuring "
+            "— refusing to publish an artifact with an ambiguous identity"
+        )
     payload = msgspec.json.format(msgspec.json.encode(suite), indent=2)
-    with open(path, "wb") as handle:
-        handle.write(payload)
-    return hashlib.sha256(payload).hexdigest()
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def write_suite(suite: TimingSuite, path: str) -> str:
+    """Atomically serialize a suite and return its byte-level SHA256.
+
+    6th review: the start/end fingerprint drift guard protected only table
+    publication. EVERY suite artifact gets it here — if the source tree
+    was overlaid while measuring, the recorded identity is a lie and the
+    artifact must not be published.
+    """
+    payload, digest = _validated_suite_payload(suite)
+    atomic_write_bytes(path, payload)
+    return digest
+
+
+def write_content_addressed_suite(
+    suite: TimingSuite,
+    output_path: str,
+    *,
+    label: str,
+) -> tuple[str, str]:
+    """Publish an immutable suite beside ``output_path``, keyed by SHA256."""
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+    if not label or any(character not in allowed for character in label):
+        raise ValueError(f"invalid content-addressed suite label {label!r}")
+    payload, digest = _validated_suite_payload(suite)
+    anchor = Path(output_path)
+    suffix = anchor.suffix or ".json"
+    stem = anchor.stem if anchor.suffix else anchor.name
+    destination = anchor.with_name(f"{stem}.{label}.sha256-{digest}{suffix}")
+    if destination.is_symlink():
+        raise ValueError(f"refusing content-addressed suite symlink {destination}")
+    if destination.exists():
+        if destination.read_bytes() != payload:
+            raise RuntimeError(
+                f"content-addressed artifact {destination} does not match "
+                f"its sha256 filename"
+            )
+    else:
+        atomic_write_bytes(destination, payload)
+    return str(destination), digest

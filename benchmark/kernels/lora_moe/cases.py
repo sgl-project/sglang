@@ -158,6 +158,45 @@ MODEL_PRESETS: dict[str, ModelGeometry] = {
             expert_form="nongated_one_slice",
             activation="relu2",
         ),
+        # Ragged-width perf probe (gate-4 review question): a gated slice
+        # width divisible by NEITHER 64 nor 32, so every BLOCK_N tiling
+        # carries a partial tile per slice — the shape class where a
+        # two-launch schedule could plausibly beat the flat one. Qwen-like
+        # otherwise; never a correctness-matrix pick.
+        ModelGeometry(
+            name="ragged_gated_720",
+            hidden_size=2048,
+            moe_hidden_size=2048,
+            intermediate_size_global=720,
+            num_experts_global=256,
+            top_k=8,
+            expert_form="gated_two_slice",
+            activation="silu_glu",
+        ),
+        ModelGeometry(
+            # Small ragged gate width AND ragged hidden (2032/64 = 31.75),
+            # so the DOWN site's slice width is ragged too.
+            name="ragged_gated_176",
+            hidden_size=2032,
+            moe_hidden_size=2032,
+            intermediate_size_global=176,
+            num_experts_global=256,
+            top_k=8,
+            expert_form="gated_two_slice",
+            activation="silu_glu",
+        ),
+        ModelGeometry(
+            # Large ragged gate width (1104/64 = 17.25) + ragged hidden
+            # (1808/64 = 28.25).
+            name="ragged_gated_1104",
+            hidden_size=1808,
+            moe_hidden_size=1808,
+            intermediate_size_global=1104,
+            num_experts_global=256,
+            top_k=8,
+            expert_form="gated_two_slice",
+            activation="silu_glu",
+        ),
         # Provider-benchmark geometries: the shapes the section 53/55 provider
         # study measured, kept as named presets so the timing suite's cases
         # are content-addressed like everything else. The correctness matrix

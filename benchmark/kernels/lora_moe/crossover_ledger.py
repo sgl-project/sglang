@@ -33,6 +33,12 @@ class CellDecision(msgspec.Struct, frozen=True, kw_only=True):
     geo_a_over_b: float
     unanimous: bool
     min_margin: float
+    # 12th review (gate-4): "charged" = both arms timed at the SAME
+    # boundary; "ceiling" = the arms carry DIFFERENT boundaries (one side
+    # excludes work the other includes), so the decision bounds the
+    # possibility rather than adjudicating a policy; "undeclared" = a
+    # legacy caller that did not state its boundaries.
+    scope: str = "undeclared"
 
     def margin(self) -> float:
         """Winner's geometric-mean advantage (>= 1); 1.0 when tied."""
@@ -48,11 +54,20 @@ def decide_cell(
     arm_b: str,
     samples_b: list[float],
     min_margin: float = MIN_MARGIN,
+    boundary_a: str | None = None,
+    boundary_b: str | None = None,
 ) -> CellDecision:
     """Decide one cell from paired timing samples (seconds, same order).
 
     Samples must be PAIRED — the i-th entries of both lists come from the
     same (seed, repeat) so clock drift cancels in the ratio.
+
+    12th review: comparing arms timed at DIFFERENT boundaries (grouped
+    route-inclusive vs sgmv prepared-input) is a CEILING statement, not a
+    policy verdict — the prepared side is credited work the charged side
+    pays for. Callers declare each arm's boundary; a mismatch is recorded
+    and printed as scope=ceiling so adjudication cannot mistake it for a
+    same-boundary win.
     """
     if len(samples_a) != len(samples_b) or not samples_a:
         raise ValueError("paired non-empty sample lists required")
@@ -69,7 +84,14 @@ def decide_cell(
         winner = arm_b
     elif all(r < 1 for r in ratios) and 1 / geo >= min_margin:
         winner = arm_a
+    if boundary_a is None or boundary_b is None:
+        scope = "undeclared"
+    elif boundary_a == boundary_b:
+        scope = "charged"
+    else:
+        scope = "ceiling"
     return CellDecision(
+        scope=scope,
         arm_a=arm_a,
         arm_b=arm_b,
         winner=winner,
