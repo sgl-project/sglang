@@ -33,9 +33,14 @@ use pyo3::types::PyBytes;
 use crate::runtime::{Runtime, RuntimeConfig};
 
 /// One drained MM result (see [`Server::take_mm`]):
-/// `(features_f32, grids, hashes, offsets, mrope_i64, mrope_delta)`.
+/// `(features_f32 | None, shm_names | None, grids, hashes, offsets,
+/// mrope_i64, mrope_delta)`. Exactly one of the first two is `Some`:
+/// inline features for single-rank serving (zero-copy into numpy), or one
+/// POSIX shm segment name per item when the scheduler broadcasts across TP
+/// ranks (the Python side wraps each name in a `ShmPointerMMData` stub).
 type MmHandoff<'py> = (
-    Bound<'py, numpy::PyArray1<f32>>,
+    Option<Bound<'py, numpy::PyArray1<f32>>>,
+    Option<Vec<String>>,
     Vec<(u32, u32, u32)>,
     Vec<u64>,
     Vec<(u32, u32)>,
@@ -249,11 +254,21 @@ impl Server {
         use numpy::IntoPyArray;
 
         let res = self.rt.mm_sidecar.lock().unwrap().remove(rid)?;
-        let features = res.features.into_pyarray(py);
+        let (features, shm_names) = match res.features {
+            mm::FeatureStore::Inline(v) => (Some(v.into_pyarray(py)), None),
+            // Ownership of the segments (and the duty to unlink) moves to
+            // Python here: `materialize()` unlinks after the post-broadcast
+            // clone on every rank.
+            mm::FeatureStore::Shm(segments) => (
+                None,
+                Some(segments.into_iter().map(|s| s.into_name()).collect()),
+            ),
+        };
         let mrope = res.mrope.into_pyarray(py);
         let grids = res.grids.iter().map(|g| (g[0], g[1], g[2])).collect();
         Some((
             features,
+            shm_names,
             grids,
             res.hashes,
             res.offsets,

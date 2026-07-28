@@ -3690,6 +3690,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum 0.8.9",
+ "bytemuck",
  "bytes",
  "core_affinity",
  "dynamo-parsers",
@@ -3700,6 +3701,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "itertools",
+ "libc",
  "numpy",
  "pyo3",
  "regex-syntax",

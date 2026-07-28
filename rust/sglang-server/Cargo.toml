@@ -43,8 +43,14 @@ dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 flume = "0.12.0"
+# Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
+bytemuck = "1"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
+# POSIX shm for the MM feature fan-out (`mm::ShmSegment`): the worker writes
+# feature buffers into named segments so the TP broadcast carries a pointer,
+# not the tensor. Linux-only crate usage; no default features needed.
+libc = "0.2"
 # Same major as the workspace pyo3: the zero-copy MM drain
 # (`take_mm`) moves Rust vectors into numpy arrays.
 numpy = "0.29.0"
