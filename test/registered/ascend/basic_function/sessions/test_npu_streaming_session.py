@@ -78,7 +78,7 @@ class TestNPUStreamingSession(NPUStreamingSessionServerBase, StreamingSessionKit
     ]
     kv_inherit_offsets = (0,)
 
-  def test_nth_mid_abort_recovery(self) -> None:
+    def test_nth_mid_abort_recovery(self) -> None:
         """NPU override: Qwen3-8B context ~40K, max_new_tokens reduced to 30000."""
         requests.post(self.base_url + "/flush_cache")
 
