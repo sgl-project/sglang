@@ -1,0 +1,332 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minwm-dmd22-step1600-t2v-full14-20260728-01
+  namespace: default
+  labels:
+    app.kubernetes.io/name: minwm-dmd22-step1600-t2v-full14
+    seedleap.ai/task: minwm-realtime-parity
+    seedleap.ai/owner: chenshengdong
+  annotations:
+    seedleap.ai/sglang-git-ref: ac723dfc4c0a8eafd46af7dd14ebfd95abd16166
+    seedleap.ai/minwm-git-ref: c1c8d447a8f195aab4092061bc6461bdecaab841
+    seedleap.ai/checkpoint-version-id: 9u_oXdzep3r4ckmlcp5xCw7JPsq61Lp5
+    seedleap.ai/staged-checkpoint-version-id: OcOfChtm_TsPPEQXNnEYg4Y1NUbT.p7E
+    seedleap.ai/capacity-type: spot
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 10800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minwm-dmd22-step1600-t2v-full14
+        seedleap.ai/task: minwm-realtime-parity
+        seedleap.ai/owner: chenshengdong
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seLinuxOptions:
+          type: spc_t
+      nodeSelector:
+        seedleap.ai/capacity-pool: minwm-test-usw2d-karpenter
+        node.kubernetes.io/instance-type: p6-b200.48xlarge
+      tolerations:
+        - key: seedleap.ai/capacity-pool
+          operator: Equal
+          value: minwm-test-usw2d-karpenter
+          effect: NoSchedule
+      containers:
+        - name: baseline
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              clone_at() {
+                local repository="$1" destination="$2" revision="$3"
+                git clone --no-checkout \
+                  "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/${repository}.git" \
+                  "${destination}"
+                git -C "${destination}" checkout --detach "${revision}"
+                [[ "$(git -C "${destination}" rev-parse HEAD)" == "${revision}" ]]
+              }
+              clone_at minWM /workspace/minWM c1c8d447a8f195aab4092061bc6461bdecaab841
+              clone_at sglang /workspace/sglang ac723dfc4c0a8eafd46af7dd14ebfd95abd16166
+
+              python3 - <<'PY'
+              from pathlib import Path
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if block in text:
+                  path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --force-reinstall --no-deps \
+                --index-url https://flashinfer.ai/whl/cu130 \
+                'flashinfer-jit-cache==0.6.12+cu130'
+
+              RUN_ROOT=/work/minwm-realtime/dmd22-step1600-t2v-full14-attempt01
+              RESULTS="${RUN_ROOT}/results"
+              CHECKPOINT=/work/minwm-realtime/dmd22-step1600-t2v-smoke-attempt03/checkpoint/model.pt
+              PRETRAINED=/work/minwm-realtime/0724-window18-sink9-5s-b200-attempt01/pretrained
+              CASES=/workspace/sglang/benchmark/minwm_realtime_parity/cases_step1600_t2v_30s_832x480.json
+              CONFIG=/workspace/minWM/Wan21/configs/eval/wan22_5b_varlen_dmd.yaml
+              mkdir -p "${RESULTS}"
+              cp /s3/world-model/evals/minwm/wan22-5B-stage3-dmd-22-0724-5eba381389f/step-1600-30s/provenance/wan22_5b_varlen_dmd.yaml "${CONFIG}"
+              echo "0e9bf2b8c9ea20b7c484182c88ba5edb676b6cb9f15948f2c17dcf6f2d940efc  ${CONFIG}" \
+                | sha256sum --check -
+              echo "be7c369b341ba88798de38cdbf8a734c3347a9a3fd15f30d116fef38a5b224b8  ${CHECKPOINT}" \
+                | sha256sum --check -
+
+              export PRETRAINED_DIR="${PRETRAINED}"
+              export MINWM_PARITY_DETERMINISTIC=1
+              export MINWM_DETERMINISTIC_ATTENTION=true
+              export SGLANG_ENABLE_DETERMINISTIC_INFERENCE=1
+              export CUBLAS_WORKSPACE_CONFIG=:4096:8
+              export PYTHONHASHSEED=0
+              python3 /workspace/sglang/benchmark/minwm_realtime_parity/materialize_step1600_t2v_batches.py \
+                --prompts /s3/world-model/evals/minwm/wan22-5B-stage3-dmd-22-0724-5eba381389f/step-1600-30s/inputs/prompts.txt \
+                --trajectories /s3/world-model/evals/minwm/wan22-5B-stage3-dmd-22-0724-5eba381389f/step-1600-30s/inputs/trajectories.txt \
+                --output-dir "${RESULTS}/input-batches"
+              python3 /workspace/sglang/benchmark/minwm_realtime_parity/run_minwm_t2v_baseline.py \
+                --cases "${CASES}" \
+                --minwm-root /workspace/minWM \
+                --checkpoint "${CHECKPOINT}" \
+                --pretrained-dir "${PRETRAINED}" \
+                --config "${CONFIG}" \
+                --results "${RESULTS}" \
+                | tee "${RESULTS}/baseline.log"
+              touch "${RESULTS}/.baseline_done"
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+
+        - name: sglang
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach ac723dfc4c0a8eafd46af7dd14ebfd95abd16166
+              [[ "$(git -C /workspace/sglang rev-parse HEAD)" == \
+                "ac723dfc4c0a8eafd46af7dd14ebfd95abd16166" ]]
+
+              python3 - <<'PY'
+              from pathlib import Path
+              path = Path("/workspace/sglang/python/pyproject.toml")
+              text = path.read_text()
+              block = '''[[tool.setuptools-rust.ext-modules]]
+              target = "sglang.srt.grpc._core"
+              path = "../rust/sglang-grpc/Cargo.toml"
+              binding = "PyO3"
+              '''
+              if block in text:
+                  path.write_text(text.replace(block, ""))
+              PY
+              python3 -m pip install -e "/workspace/sglang/python[diffusion]" \
+                --root-user-action=ignore
+              python3 -m pip uninstall -y peft
+              python3 -m pip install --force-reinstall --no-deps \
+                --index-url https://flashinfer.ai/whl/cu130 \
+                'flashinfer-jit-cache==0.6.12+cu130'
+              python3 -m pytest -q \
+                /workspace/sglang/python/sglang/multimodal_gen/test/unit/realtime/test_minwm_realtime.py \
+                -k 'starts_fractional_actions'
+
+              RUN_ROOT=/work/minwm-realtime/dmd22-step1600-t2v-full14-attempt01
+              RESULTS="${RUN_ROOT}/results"
+              MODEL_DIR=/work/minwm-realtime/dmd22-step1600-t2v-smoke-attempt03/sglang-model
+              CASES=/workspace/sglang/benchmark/minwm_realtime_parity/cases_step1600_t2v_30s_832x480.json
+              mkdir -p "${RESULTS}"
+              test -f "${MODEL_DIR}/minwm_conversion_manifest.json"
+              cp "${MODEL_DIR}/minwm_conversion_manifest.json" "${RESULTS}/"
+
+              export PRETRAINED_DIR=/work/minwm-realtime/0724-window18-sink9-5s-b200-attempt01/pretrained
+              export MINWM_PARITY_DETERMINISTIC=1
+              export MINWM_DETERMINISTIC_ATTENTION=true
+              export SGLANG_ENABLE_DETERMINISTIC_INFERENCE=1
+              export SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=false
+              export CUBLAS_WORKSPACE_CONFIG=:4096:8
+              export PYTHONHASHSEED=0
+              MINWM_ATTENTION_IMPL=packed \
+              MINWM_PACKED_ATTENTION_DETERMINISTIC=true \
+              MINWM_NATIVE_COMPONENTS=text_encoder,vae \
+              sglang serve \
+                --model-path "${MODEL_DIR}" \
+                --pipeline-class-name MinWMCausalDMDPipeline \
+                --attention-backend fa \
+                --performance-mode speed \
+                --num-gpus 1 \
+                --sp-degree 1 \
+                --enable-cfg-parallel false \
+                --enable-torch-compile false \
+                --warmup-mode off \
+                --host 127.0.0.1 \
+                --port 30000 \
+                > "${RESULTS}/sglang-server.log" 2>&1 &
+              SERVER_PID=$!
+              cleanup() {
+                kill "${SERVER_PID}" 2>/dev/null || true
+                wait "${SERVER_PID}" 2>/dev/null || true
+              }
+              trap cleanup EXIT INT TERM
+              for _ in $(seq 1 300); do
+                if curl --fail --silent http://127.0.0.1:30000/health >/dev/null; then
+                  break
+                fi
+                if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+                  tail -300 "${RESULTS}/sglang-server.log"
+                  exit 1
+                fi
+                sleep 2
+              done
+              curl --fail --silent http://127.0.0.1:30000/health >/dev/null
+              python3 /workspace/sglang/benchmark/minwm_realtime_parity/run_sglang_api.py \
+                --cases "${CASES}" \
+                --results "${RESULTS}" \
+                --ws-url ws://127.0.0.1:30000/v1/realtime_video/generate \
+                | tee "${RESULTS}/sglang-client.log"
+              cleanup
+              trap - EXIT INT TERM
+              touch "${RESULTS}/.sglang_done"
+          resources:
+            requests:
+              cpu: "32"
+              memory: 200Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "64"
+              memory: 400Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+
+        - name: compare
+          image: 829115578968.dkr.ecr.us-east-2.amazonaws.com/leap-world/minwm-training@sha256:bedc07ea3ba55059a8c1c569c3b177c4d00d41f37d4fa9105375531534ef5f2a
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: token
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MINWM_SSIM_WORKERS
+              value: "16"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -euo pipefail
+              git clone --no-checkout \
+                "https://x-access-token:${GITHUB_TOKEN}@github.com/seedleap/sglang.git" \
+                /workspace/sglang
+              git -C /workspace/sglang checkout --detach ac723dfc4c0a8eafd46af7dd14ebfd95abd16166
+              RUN_ROOT=/work/minwm-realtime/dmd22-step1600-t2v-full14-attempt01
+              RESULTS="${RUN_ROOT}/results"
+              CASES=/workspace/sglang/benchmark/minwm_realtime_parity/cases_step1600_t2v_30s_832x480.json
+              for _ in $(seq 1 1440); do
+                if [[ -f "${RESULTS}/.baseline_done" && -f "${RESULTS}/.sglang_done" ]]; then
+                  break
+                fi
+                sleep 5
+              done
+              test -f "${RESULTS}/.baseline_done"
+              test -f "${RESULTS}/.sglang_done"
+              python3 - "${CASES}" "${RESULTS}" <<'PY'
+              import json, shutil, sys
+              from pathlib import Path
+
+              manifest = json.loads(Path(sys.argv[1]).read_text())
+              results = Path(sys.argv[2])
+              archived = Path(
+                  "/s3/world-model/evals/minwm/"
+                  "wan22-5B-stage3-dmd-22-0724-5eba381389f/"
+                  "step-1600-30s/outputs"
+              )
+              for case in manifest["cases"]:
+                  target = results / "cases" / case["id"] / "archived_baseline.mp4"
+                  shutil.copyfile(archived / case["archived_baseline"], target)
+              PY
+              python3 /workspace/sglang/benchmark/minwm_realtime_parity/compare_results.py \
+                --cases "${CASES}" \
+                --results "${RESULTS}" \
+                --profile bf16_backend_candidate \
+                | tee "${RESULTS}/numerical-compare.log"
+              touch "${RESULTS}/.compare_done"
+          resources:
+            requests:
+              cpu: "16"
+              memory: 64Gi
+            limits:
+              cpu: "32"
+              memory: 128Gi
+          volumeMounts:
+            - name: s3
+              mountPath: /s3
+              readOnly: true
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: s3
+          persistentVolumeClaim:
+            claimName: s3-minwm-step1600
+            readOnly: true
+        - name: work
+          persistentVolumeClaim:
+            claimName: minwm-dmd-0724-p6-work
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi

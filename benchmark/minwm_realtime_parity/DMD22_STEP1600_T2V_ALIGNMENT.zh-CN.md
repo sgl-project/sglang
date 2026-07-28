@@ -219,13 +219,28 @@ Wan2.2 causal VAE 的 residual cache 不能把单独解码 1 latent 后留下的
 
 ## 测试状态
 
-- MinWM realtime unit tests：`71 passed, 1 deselected`
+- MinWM realtime unit tests：`71 passed, 1 deselected`（T2V/I2V action 冷启动修复后，
+  定向回归 `2 passed, 72 deselected`）
 - harness tests：`6 passed`
 - Ruff 和 `git diff --check`：通过
 - deselected 的测试是当前容器中 diffusers UniPC timestep rounding 漂移；本任务使用
   固定 few-step DMD schedule `[1000, 750, 500, 250]`，不经过 UniPC。
-- B200 单 case 端到端：执行中
-- 14-case raw-frame parity：等待单 case 收敛后执行
+- B200 单 case `02_explorer_w30j60l60a31`：
+  - 182 个 BF16 latent bitwise 一致，`max_abs=0`；
+  - 725 个 uint8 RGB frame 尚非 bitwise；
+  - pixel `max_abs=1`、RMSE `0.0068532548`、SSIM `0.9999997259`；
+  - 只有 `0.0046967%` 的 uint8 channel values 发生变化，且变化幅度均为 1。
+- 14-case raw-frame parity：使用两张 B200 并行执行 native baseline 和 SGLang API，
+  Job 为 `minwm-dmd22-step1600-t2v-full14-20260728-01`。
+
+单 case 证明 DiT、DMD scheduler、action 和 KV cache 已经 bitwise 对齐；剩余 pixel
+差异来自两条 decode 路径的执行边界：
+
+- baseline 把 182 latent 一次性交给 causal VAE；
+- realtime 为了低延迟按 `1/4/.../1` latent 流式解码，并在第二块重播种 cache。
+
+两者输出仅有 uint8 round-to-nearest 边界上的 ±1 差异。本次把它归类为“latent
+bitwise、pixel numerical parity”，而不是宣称 pixel bitwise。
 
 ## 结果阅读原则
 
