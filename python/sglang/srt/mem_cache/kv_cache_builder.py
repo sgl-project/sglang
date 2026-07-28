@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
@@ -127,6 +128,19 @@ def maybe_register_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def is_supported_dsv4_decode_radix_mtp(
+    *, spec_algorithm: SpeculativeAlgorithm, server_args: ServerArgs
+) -> bool:
+    return (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and not spec_algorithm.is_frozen_kv_mtp()
+        and server_args.speculative_eagle_topk == 1
+        and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+    )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -182,18 +196,58 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode-side radix cache: SWA is supported only via the unified radix tree
+    # (its component pools handle the prefix-match-and-lock path); the default
+    # SWARadixCache and the Mamba/SSM pools are not supported.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models requires the unified radix "
+                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
+            if enable_hierarchical_cache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models currently supports only "
+                    "device-resident cache and is incompatible with "
+                    "--enable-hierarchical-cache."
+                )
+            # Compressed-KV SWA variants need model-specific sidecar guarantees.
+            # DSV4 has a conservative experimental L1-only path below.
+            if getattr(model_config, "is_deepseek_v4_arch", False):
+                if not envs.SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE.get():
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache with "
+                        "DeepSeek-V4 (DSA compressed KV) is experimental. Set "
+                        "SGLANG_EXPERIMENTAL_DSV4_DECODE_RADIX_CACHE=1 to enable "
+                        "the conservative L1-only path."
+                    )
+                if enable_hierarchical_cache:
+                    raise ValueError(
+                        "DeepSeek-V4 decode-side radix cache currently supports "
+                        "only device-resident L1 cache. Disable hierarchical "
+                        "cache / HiCache storage for this experimental path."
+                    )
+                if not spec_algorithm.is_none():
+                    if not is_supported_dsv4_decode_radix_mtp(
+                        spec_algorithm=spec_algorithm, server_args=server_args
+                    ):
+                        raise ValueError(
+                            "DeepSeek-V4 decode-side radix cache currently supports "
+                            "only the experimental EAGLE topk=1 online c128 MTP "
+                            "path. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
+                            "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
+                        )
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
