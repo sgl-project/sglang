@@ -6,6 +6,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe import MoeRunnerBackend
+from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.models.gpt_oss import _narrow_fused_moe_ep_weight
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -14,6 +17,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGptOssEpWeightLoading(CustomTestCase):
+    def _make_fused_moe_shell(self) -> FusedMoE:
+        """Build the minimum loader surface without allocating expert weights."""
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer.__dict__["use_padded_loading"] = True
+        layer.quant_config = None
+        layer.use_presharded_weights = False
+        return layer
+
     @patch("sglang.srt.models.gpt_oss.get_parallel")
     def test_global_expert_weights_are_sliced_for_ep_rank(self, get_parallel):
         """Global checkpoint experts must be narrowed to the current EP rank."""
@@ -54,6 +66,69 @@ class TestGptOssEpWeightLoading(CustomTestCase):
             ValueError, "Expected 128 global or 32 local experts, got 64"
         ):
             _narrow_fused_moe_ep_weight(weight, num_experts=128)
+
+    def test_w2_bias_loading_uses_its_last_dimension(self):
+        """Fused down-projection biases must ignore the weight shard dimension."""
+        layer = self._make_fused_moe_shell()
+        expert_data = torch.empty(2, 4)
+        loaded_weight = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+        layer._load_w2(
+            expert_data=expert_data,
+            shard_dim=2,
+            shard_id="w2",
+            loaded_weight=loaded_weight,
+            tp_rank=0,
+            is_bias=True,
+        )
+
+        torch.testing.assert_close(expert_data, loaded_weight)
+
+    @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_moe_runner")
+    @patch.object(fused_moe_layer.UnquantizedFusedMoEMethod, "create_weights")
+    @patch.object(fused_moe_layer, "create_moe_dispatcher")
+    @patch.object(
+        fused_moe_layer,
+        "get_moe_a2a_backend",
+        return_value=SimpleNamespace(is_ascend_fuseep=lambda: False),
+    )
+    @patch.object(
+        fused_moe_layer,
+        "get_server_args",
+        return_value=SimpleNamespace(
+            ep_join_mode="none", moe_runner_backend="flashinfer_trtllm"
+        ),
+    )
+    @patch.object(
+        fused_moe_layer,
+        "get_parallel",
+        return_value=SimpleNamespace(
+            moe_ep_size=1, moe_ep_rank=0, moe_tp_size=1, moe_tp_rank=0
+        ),
+    )
+    @patch.object(
+        fused_moe_layer, "has_per_rank_fused_shared_slots", return_value=False
+    )
+    @patch.object(
+        fused_moe_layer, "create_kt_config_from_server_args", return_value=None
+    )
+    @patch.object(
+        fused_moe_layer,
+        "get_moe_runner_backend",
+        return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+    )
+    def test_flashinfer_constructor_keeps_logical_intermediate_size(self, *_):
+        """Kernel allocation padding must not overwrite the logical MoE size."""
+        layer = FusedMoE(
+            num_experts=1,
+            hidden_size=1,
+            intermediate_size=2880,
+            layer_id=0,
+            params_dtype=torch.float32,
+        )
+
+        self.assertEqual(layer.intermediate_size_per_partition_unpadded, 2880)
+        self.assertEqual(layer.intermediate_size_per_partition, 2944)
 
 
 if __name__ == "__main__":
