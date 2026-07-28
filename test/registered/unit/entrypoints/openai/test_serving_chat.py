@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     TOOL_ERROR_PREFIX,
     OpenAIServingChat,
     fold_tool_error_into_content,
+    normalize_assistant_tool_call_arguments,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -2571,6 +2572,55 @@ class InklingReasoningEffortTest(unittest.TestCase):
             thinking_mode=None,
         )
         self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
+
+    def test_tool_error_marker_reaches_inkling_renderer(self):
+        """Inkling returns through _encode_messages and never reaches the Jinja
+        branch, so a fold placed there would leave its tool turns unmarked."""
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(text.encode())
+
+        serving = object.__new__(OpenAIServingChat)
+        serving.chat_encoding_spec = "inkling"
+        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "boom",
+                    "is_error": True,
+                },
+            ],
+            reasoning_effort=0.5,
+        )
+
+        messages = [message.model_dump() for message in request.messages]
+        for message in messages:
+            normalize_assistant_tool_call_arguments(message)
+            fold_tool_error_into_content(message)
+
+        prompt_ids = serving._encode_messages(messages, request, thinking_mode=None)
+
+        rendered = bytes(b for b in prompt_ids if b < 256).decode(errors="ignore")
+        self.assertIn(TOOL_ERROR_PREFIX.strip(), rendered)
 
     def test_continue_final_message_resumes_open_model_text_block(self):
         """Bug regression: continue_final_message was silently ignored on the
