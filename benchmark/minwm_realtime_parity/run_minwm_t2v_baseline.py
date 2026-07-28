@@ -111,6 +111,52 @@ def main() -> None:
         torch.device("cuda"),
         low_memory=False,
     )
+    parity_root = os.environ.get("MINWM_PARITY_DUMP_DIR")
+    parity_dir = Path(parity_root) / "baseline" if parity_root else None
+    if parity_dir is not None:
+        parity_dir.mkdir(parents=True, exist_ok=True)
+        original_model_flow = pipeline._model_flow
+        forward_index = 0
+
+        def model_flow_with_dump(
+            latents,
+            conditional_dict,
+            timestep,
+            action,
+            cache,
+            self_cache_update,
+            condition_switch=None,
+        ):
+            nonlocal forward_index
+            output = original_model_flow(
+                latents,
+                conditional_dict,
+                timestep,
+                action,
+                cache,
+                self_cache_update,
+                condition_switch,
+            )
+            if forward_index < 6:
+                torch.save(
+                    {
+                        "latent_model_input": latents.detach().cpu(),
+                        "prompt_embeds": conditional_dict["flat_prompt_embeds"]
+                        .detach()
+                        .cpu(),
+                        "prompt_lens": conditional_dict["prompt_lens"],
+                        "timestep": timestep.detach().cpu(),
+                        "action": (None if action is None else action.detach().cpu()),
+                        "self_cache_update": self_cache_update,
+                        "condition_switch": condition_switch,
+                        "output": output.detach().cpu(),
+                    },
+                    parity_dir / f"forward_{forward_index:03d}.pt",
+                )
+            forward_index += 1
+            return output
+
+        pipeline._model_flow = model_flow_with_dump
     results = Path(args.results).resolve()
     run_records = []
     for case in cases:
@@ -149,6 +195,9 @@ def main() -> None:
             device="cuda",
             dtype=torch.long,
         ).unsqueeze(0)
+        if parity_dir is not None:
+            torch.save(noise.detach().cpu(), parity_dir / "initial_noise_bfchw.pt")
+            torch.save(action.detach().cpu(), parity_dir / "action_labels.pt")
 
         torch.cuda.synchronize()
         started = time.perf_counter()
