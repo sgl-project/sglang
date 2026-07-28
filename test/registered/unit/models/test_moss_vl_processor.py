@@ -79,3 +79,7 @@ def test_moss_vl_accepts_matching_vision_metadata_and_tokens():
     assert vision_positions.shape == (3, 1, 16)
     assert updated_positions.shape == position_ids.shape
     assert rope_deltas.shape == (1,)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
