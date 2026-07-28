@@ -1,8 +1,9 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Iterator, Optional, Union
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 
@@ -70,7 +71,29 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
 
 
 def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
-    return dtype != torch.float32 and not disable_autocast
+    return (
+        dtype != torch.float32
+        and not disable_autocast
+        and current_platform.is_amp_supported()
+    )
+
+
+def autocast_context(
+    dtype: torch.dtype,
+    disable_autocast: bool,
+    *,
+    enabled: Optional[bool] = None,
+):
+    autocast_is_enabled = (
+        autocast_enabled(dtype, disable_autocast) if enabled is None else enabled
+    )
+    if not autocast_is_enabled and current_platform.is_mps():
+        return nullcontext()
+    return torch.autocast(
+        device_type=current_platform.device_type,
+        dtype=dtype,
+        enabled=autocast_is_enabled,
+    )
 
 
 def get_module_dtype(module, default: torch.dtype = torch.float32) -> torch.dtype:
