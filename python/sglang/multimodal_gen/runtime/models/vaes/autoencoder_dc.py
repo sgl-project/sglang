@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 
 import torch
+from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
@@ -141,11 +142,20 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
     def decode(self, z: torch.Tensor, **kwargs):
         self._ensure_inner_model()
         if z.device.type == "mps":
+            orig_device = z.device
             torch.mps.synchronize()
             self._inner_model = self._inner_model.to("cpu", dtype=torch.float32)
             torch.mps.empty_cache()
             z = z.to(device="cpu", dtype=torch.float32)
-            return self._inner_model.decode(z, **kwargs)
+            decoded = self._inner_model.decode(z, **kwargs)
+            if isinstance(decoded, DecoderOutput):
+                return DecoderOutput(sample=decoded.sample.to(device=orig_device))
+            if isinstance(decoded, tuple):
+                sample = decoded[0].to(device=orig_device)
+                return (sample, *decoded[1:])
+            if isinstance(decoded, torch.Tensor):
+                return decoded.to(device=orig_device)
+            return decoded
 
         z = z.to(dtype=self.dtype)
         if not self._spatial_parallel_decode_enabled:

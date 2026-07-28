@@ -164,7 +164,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 x.to(torch.float32),
                 layer.weight.to(torch.float32),
                 None if bias is None else bias.to(torch.float32),
-            )
+            ).to(x.dtype)
 
         output = (
             F.linear(x, layer.weight, bias)

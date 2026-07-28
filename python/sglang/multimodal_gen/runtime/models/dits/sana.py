@@ -26,7 +26,7 @@ def _mps_safe_linear(linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
         x.to(torch.float32),
         linear.weight.to(torch.float32),
         None if linear.bias is None else linear.bias.to(torch.float32),
-    )
+    ).to(x.dtype)
 
 
 def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
@@ -41,7 +41,7 @@ def _mps_safe_conv2d(conv: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
         conv.padding,
         conv.dilation,
         conv.groups,
-    )
+    ).to(x.dtype)
 
 
 def _mps_match_dtype(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
