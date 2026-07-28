@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
 import torch
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import ORJSONResponse
+from fastapi import APIRouter, HTTPException, Response
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -33,21 +33,33 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
+def _extract_single_sample_tensor(
+    obj: Any, sample_idx: int, batch_size: int, *, current_key: str | None = None
+) -> Any:
     if isinstance(obj, torch.Tensor):
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
             return obj[sample_idx].contiguous()
         return obj
     if isinstance(obj, dict):
         return {
-            k: _extract_single_sample_tensor(v, sample_idx, batch_size)
+            k: _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=k)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj]
+        if current_key == "img_shapes" and len(obj) == batch_size:
+            return [obj[sample_idx]]
+        return [
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
+        ]
     if isinstance(obj, tuple):
         return tuple(
-            _extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
         )
     return obj
 
@@ -206,7 +218,9 @@ def _build_response(
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx].contiguous()
+        out_i = result.output[sample_idx]
+        if isinstance(out_i, torch.Tensor):
+            out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
@@ -284,7 +298,16 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
 
 
-@router.post("/generate", response_model=list[RolloutResponse])
+@router.post(
+    "/generate",
+    response_class=Response,
+    responses={
+        200: {
+            "model": list[RolloutResponse],
+            "content": {"application/msgpack": {}},
+        }
+    },
+)
 async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     server_args = get_global_server_args()
@@ -312,4 +335,8 @@ async def rollout_generate(request: RolloutRequest):
     rollout_responses = _build_response(
         request_id, request.prompt, request.seed, request.rollout, output_batch
     )
-    return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])
+    payload = [r.model_dump() for r in rollout_responses]
+    return Response(
+        content=msgspec.msgpack.encode(payload),
+        media_type="application/msgpack",
+    )

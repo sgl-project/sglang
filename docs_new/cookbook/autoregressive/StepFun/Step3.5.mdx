@@ -22,14 +22,14 @@ Step-3.5-Flash is currently available in SGLang via Docker image install.
 ### Docker (NVIDIA)
 ```bash Command
 # Pull the docker image
-docker pull lmsysorg/sglang:dev-pr-18084
+docker pull lmsysorg/sglang:latest
 
 # Launch the container
 docker run -it --gpus all \
   --shm-size=32g \
   --ipc=host \
   --network=host \
-  lmsysorg/sglang:dev-pr-18084 bash
+  lmsysorg/sglang:latest bash
 ```
 
 ### Docker (AMD ROCm)

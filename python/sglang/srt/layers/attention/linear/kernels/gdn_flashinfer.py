@@ -17,6 +17,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             _flashinfer_gdn_available = (
-                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+                is_cuda() and torch.cuda.get_device_capability()[0] >= 9
             )
             if _flashinfer_gdn_available:
                 logger.info("FlashInfer GDN kernels loaded successfully")
@@ -69,6 +70,12 @@ def _get_flashinfer_gdn_kernels():
         _flashinfer_gated_delta_rule_decode,
         _flashinfer_gated_delta_rule_mtp_bf16,
     )
+
+
+def is_flashinfer_gdn_prefill_available() -> bool:
+    """Return whether the kernel loader can construct the prefill path."""
+    available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
+    return bool(available and prefill_fn is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +233,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]

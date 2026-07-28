@@ -29,6 +29,8 @@ SGLang offers multiple installation methods. You can choose the most suitable in
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
+For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
+
 ## 3. Model Deployment
 
 This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
@@ -54,6 +56,7 @@ This section provides a progressive guide from quick deployment to performance o
 - **Multi-Modal:** Add `--enable-multimodal` to enable image input support.
 - **Hybrid KV Cache:** Set `--swa-full-tokens-ratio` to control the ratio of SWA (local attention) KV tokens to full-attention KV tokens (default: 0.8, range: 0–1).
 - **EAGLE Speculative Decoding:** Supported for Llama 4 Scout and Maverick via EAGLE3. Enable with the interactive command generator above.
+- **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
 

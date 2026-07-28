@@ -20,10 +20,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import torch
 
-from sglang.srt.model_executor.runner.shape_key import ShapeKey
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class BaseCudaGraphBackend(ABC):
@@ -35,7 +34,7 @@ class BaseCudaGraphBackend(ABC):
       - capture_session(stream) — context wrapping the runner's outer
         capture loop; backends bind stream / pool and open per-backend
         capture flags here.
-      - capture_one(shape_key, forward_fn, dummies, post_warmup_hook)
+      - capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
         — record the replayable artifact for shape_key; one call per
         shape inside capture_session.
       - can_run(forward_batch, shape_key) — can this backend replay
@@ -50,6 +49,8 @@ class BaseCudaGraphBackend(ABC):
     Notes:
       - The outer capture loop is runner-specific; it lives on the
         runner, not here.
+      - capture_inputs optionally carries capture-time input owners that a
+        backend must retain when its graph records their tensor addresses.
     """
 
     @abstractmethod
@@ -60,7 +61,7 @@ class BaseCudaGraphBackend(ABC):
         self,
         shape_key: ShapeKey,
         forward_fn,
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None: ...
 

@@ -4,7 +4,7 @@ from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=1, suite="base-b-test-cpu")
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestExpandPreset:

@@ -86,10 +86,23 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
-        )
+        if self.page_size != 1:
+            raise NotImplementedError(
+                "HiSparse generic allocation is only supported for page_size=1. "
+                "Use alloc_extend for paged allocation."
+            )
+
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+
+        hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            return None
+
+        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        return logical_indices
 
     def alloc_logical_only(
         self,
@@ -172,8 +185,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
-        assert self.page_size > 1
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
@@ -391,6 +402,26 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             extend_num_tokens,
         )
 
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend_swa_tail(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=extend_num_tokens,
+            swa_tail_len=swa_tail_len,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.hisparse_page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
@@ -555,11 +586,3 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )

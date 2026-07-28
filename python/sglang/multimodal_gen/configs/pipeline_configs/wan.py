@@ -21,6 +21,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -97,6 +100,26 @@ class WanT2V480PConfig(PipelineConfig):
             auto_dit_layerwise_offload=True,
         )
 
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "image_embeds",
+            "image_latent",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
+
+    def get_pos_prompt_embeds(self, batch):
+        return batch.prompt_embeds[0]
+
+    def get_neg_prompt_embeds(self, batch):
+        return batch.negative_prompt_embeds[0]
+
 
 @dataclass
 class TurboWanT2V480PConfig(WanT2V480PConfig):
@@ -106,6 +129,22 @@ class TurboWanT2V480PConfig(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [988, 932, 852, 608]
     )
+
+
+@dataclass
+class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
+    """Configuration for TurboWan T2V 1.3B DMD pipeline."""
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass
@@ -182,6 +221,17 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 757, 522]
     )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass

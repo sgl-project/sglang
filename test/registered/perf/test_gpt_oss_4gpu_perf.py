@@ -18,7 +18,7 @@ class TestNightlyGptOss4GpuPerformance(unittest.TestCase):
                 [
                     "--tp",
                     "4",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "200",
                     "--mem-fraction-static",
                     "0.93",
