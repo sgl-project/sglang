@@ -141,9 +141,37 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             ("{%- set enable_thinking = enable_thinking | d(true) -%}", True),
             # No whitespace around the pipe.
             ("{% set enable_thinking = enable_thinking|default(false) %}", False),
+            # An explicit boolean=false second argument is equivalent to the
+            # one-argument form.
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(true, false) -%}",
+                True,
+            ),
+            # Boolean mode with a false default still maps False -> False and
+            # True -> True, so it is a working default-off toggle.
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(false, true) -%}",
+                False,
+            ),
+            (
+                "{%- set enable_thinking = enable_thinking"
+                " | default(false, boolean=true) -%}",
+                False,
+            ),
+            # The filter also counts outside a set-assignment (gemma-4 style).
+            ("{%- if enable_thinking | default(false) -%}x{%- endif -%}", False),
             # A commented-out assignment must not shadow the live one.
             (
                 "{# {%- set enable_thinking = enable_thinking | default(false) -%} #}\n"
+                "{%- set enable_thinking = enable_thinking | default(true) -%}",
+                True,
+            ),
+            # Neither must a raw block or a string literal.
+            (
+                "{% raw %}{% set enable_thinking = enable_thinking"
+                " | default(false) %}{% endraw %}\n"
                 "{%- set enable_thinking = enable_thinking | default(true) -%}",
                 True,
             ),
@@ -158,10 +186,11 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                     ),
                 )
 
-    def test_enable_thinking_boolean_mode_default_not_a_toggle(self):
-        # default(x, true) / default(x, boolean=true) replace any falsy value,
-        # so an explicit enable_thinking=false still renders as the default;
-        # the assignment is not a working toggle and must stay undetected.
+    def test_enable_thinking_collapsing_default_not_a_toggle(self):
+        # default(true, true) / default(true, boolean=true) replace any falsy
+        # value with True, so an explicit enable_thinking=false still renders
+        # thinking on; the assignment is not a working toggle and must stay
+        # undetected.
         for template in (
             "{%- set enable_thinking = enable_thinking | default(true, true) -%}",
             "{%- set enable_thinking = enable_thinking"
