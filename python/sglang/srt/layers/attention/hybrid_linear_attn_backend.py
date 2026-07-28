@@ -4,6 +4,9 @@ from typing import Optional, Union
 import torch
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_if_needed,
@@ -36,6 +39,16 @@ class MambaAttnBackendBase(AttentionBackend):
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
+        # Fused replay-prep state-indices fast path (fused_replay_state_indices):
+        # requires the static hybrid pool whose v2p translate is the identity —
+        # the unified pool overrides translate_mamba_indices with an allocator
+        # lookup that is not a flat table gather.
+        self._fused_state_indices_ok = (
+            str(self.device).startswith("cuda")
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and type(self.req_to_token_pool).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
@@ -241,6 +254,30 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._forward_metadata(forward_batch)
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup: slot indices / static query_start_loc are
+        # draft-independent, but tree verify (topk > 1) copies the
+        # draft-produced tree links into the captured buffers on the plan
+        # stream, racing the draft — re-copy after the stream join. Eager
+        # verify reads the spec_info tensors directly; parent links are
+        # derived from these buffers at execution time.
+        if self.topk <= 1 or cuda_graph_bs is None:
+            return
+        if (
+            not isinstance(spec_info, EagleVerifyInput)
+            or spec_info.retrieve_next_token is None  # dummy / capture runs
+        ):
+            return
+        bs_without_pad = spec_info.retrieve_next_token.shape[0]
+        self.retrieve_next_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_token
+        )
+        self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+            spec_info.retrieve_next_sibling
+        )
 
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
@@ -507,14 +544,26 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Translate using the LIVE v2p table BEFORE the padding sentinel below;
-        # captured Mamba kernels read state_indices_list as PHYSICAL ids.
-        mamba_indices = self._translate_mamba_indices(mamba_indices)
-        mamba_indices[bs - num_padding :] = -1
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
+            # Single-launch fast path: mapping gather + padding sentinel + store
+            # into the static buffer, plus zeroing padded req_pool_indices rows —
+            # bit-identical to the reference chain below.
+            mamba_indices = fused_replay_state_indices(
+                req_pool_indices=req_pool_indices,
+                mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                out_state_indices=self.state_indices_list[bs - 1],
+                valid_bs=bs - int(num_padding),
+                total_bs=bs,
+            )
+        else:
+            # Make sure forward metadata is correctly handled for padding reqs
+            req_pool_indices[bs - num_padding :] = 0
+            mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+            # Translate using the LIVE v2p table BEFORE the padding sentinel below;
+            # captured Mamba kernels read state_indices_list as PHYSICAL ids.
+            mamba_indices = self._translate_mamba_indices(mamba_indices)
+            mamba_indices[bs - num_padding :] = -1
+            self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         track_buf = None
@@ -865,6 +914,24 @@ class HybridLinearAttnBackend(AttentionBackend):
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        # Verify tree-mask / position buffers live on the full-attn child (the
+        # linear side consumes no mask). Handing them out lets the draft stage
+        # write straight into the captured verify buffers instead of allocating
+        # a fresh mask every step.
+        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Plan-stream fixup after draft completes: forward to both children.
+        # Sub-backends that cannot run under the plan stream keep the fail-loud
+        # NotImplementedError base behavior.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
