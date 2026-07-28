@@ -307,7 +307,7 @@ template <
     int kTmaStages = kNumChunks,
     bool kUsePDL = false>
 // Shapes below use K3's per-TP-rank sizing (linear_attn_config: num_heads=96 over
-// TP=8 -> H=HV=12 local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128 = 1536;
+// TP={8,16,32} -> H=HV={12,6,3} local heads; head_dim=128 -> kDimK=kDimV=128; kSeg = H*128;
 // short_conv_kernel_size=4 -> kKernelWidth=4, kConvStateWidth=3). B is the live
 // (post-padding, under kUseStaticDecodeLayout) decode batch size; slots is the
 // recurrent-state / conv-cache pool capacity, addressed by ssm_state_indices, not B.
@@ -338,8 +338,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
                                 // state_slot_stride
     __nv_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
     int B,                            // live decode batch size (token count for this launch)
-    int H,                            // local key/query heads on this TP rank (12 for K3)
-    int HV,                           // local value heads on this TP rank (12 for K3, H==HV since KDA is MHA not GQA)
+    int H,                            // local key/query heads on this TP rank
+    int HV,                           // local value heads on this TP rank (H==HV since KDA is MHA not GQA)
     float lower_bound,                // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
     float scale,                      // query scale applied after L2-normalization
     float onorm_eps,                  // onorm RMSNorm epsilon
@@ -800,7 +800,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 }
 
 // K3 decode configuration of the many-heads kernel: onorm fused, static
-// H = HV in {3, 12} layout with a (B, HV) grid, onorm params preloaded, next state
+// H = HV in {3, 6, 12} layout with a (B, HV) grid, onorm params preloaded, next state
 // chunk prefetched, active onorm reduction, conv cache updated in place,
 // beta sigmoid in-kernel. Both forget-gate variants are compiled (softplus
 // and lower-bounded sigmoid) and selected at launch from the model config.
@@ -867,7 +867,7 @@ struct KdaFusedDecodeKernel {
     using namespace host;
 
     const int64_t kH = A_log.shape()[0];
-    RuntimeCheck(kH == 3 || kH == 12, "KDA fused decode supports local head counts 3 or 12, got ", kH);
+    RuntimeCheck(kH == 3 || kH == 6 || kH == 12, "KDA fused decode supports local head counts 3, 6, or 12, got ", kH);
     const int64_t kSeg = kH * 128;  // q, k and v segment width
 
     auto B_ = SymbolicSize{"batch"};
@@ -933,7 +933,8 @@ struct KdaFusedDecodeKernel {
       tma_stages = B * static_cast<int>(kH) >= 1024 ? 3 : 4;
     }
     auto kernel = kH == 3 ? select_kda_fused_decode_k3_kernel<3, kUsePDL>(use_lower_bound, tma_stages)
-                          : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages);
+                          : (kH == 6 ? select_kda_fused_decode_k3_kernel<6, kUsePDL>(use_lower_bound, tma_stages)
+                                      : select_kda_fused_decode_k3_kernel<12, kUsePDL>(use_lower_bound, tma_stages));
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(

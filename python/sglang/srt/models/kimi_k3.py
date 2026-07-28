@@ -1521,7 +1521,7 @@ class KimiK3DeltaAttention(nn.Module):
         layer = self.attn
         w = layer.conv_weights
         local_heads = int(layer.A_log.numel()) if layer.A_log is not None else 0
-        supported_heads = (3, 12)
+        supported_heads = (3, 6, 12)
         seg = local_heads * self.head_dim
         if (
             w is None
