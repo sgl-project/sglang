@@ -456,6 +456,10 @@ class SpectrumMixin:
         # fires exactly once per step, preventing the double-reset that would
         # desync the two branches.
         if ctx.current_step == 0 and not ctx.is_cfg_negative:
+            if ctx.debug:
+                logger.info(
+                    "[Spectrum] Debug mode enables shadow-error validation; runtime perf is not representative of non-debug runs."
+                )
             self.reset_spectrum_state(ctx.spectrum_params)
 
         self.spectrum_is_cfg_negative = ctx.is_cfg_negative
