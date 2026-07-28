@@ -524,7 +524,7 @@ class XPUAttentionBackend(AttentionBackend):
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {"num_splits": self.num_splits}
+        kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -559,6 +559,10 @@ class XPUAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+            # The MLA branch passes num_splits explicitly per call site, since the
+            # chunked-prefix varlen kernels there keep their own default.
+            kwargs["num_splits"] = self.num_splits
+
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -660,7 +664,6 @@ class XPUAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
-                        num_splits=self.num_splits,
                     )
                 else:
                     # MHA for extend part of sequence without attending prefix kv cache
@@ -675,7 +678,6 @@ class XPUAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
-                        num_splits=self.num_splits,
                     )
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
@@ -834,7 +836,7 @@ class XPUAttentionBackend(AttentionBackend):
         causal = not layer.is_cross_attention
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
-        kwargs = {"num_splits": self.num_splits}
+        kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -852,6 +854,10 @@ class XPUAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+
+            # Only the MHA kernels below take num_splits; the MLA path uses
+            # flash_mla_decode, which has no such argument.
+            kwargs["num_splits"] = self.num_splits
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(
