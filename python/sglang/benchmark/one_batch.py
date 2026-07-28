@@ -478,20 +478,92 @@ class TreeCacheNamespace(SimpleNamespace):
         pass
 
 
-@torch.no_grad
-def extend(reqs, model_runner):
-    # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
-    dummy_tree_cache = TreeCacheNamespace(
+def _make_dummy_tree_cache(model_runner):
+    # No prefix caching in the offline bench path — only allocation + free.
+    return TreeCacheNamespace(
         page_size=model_runner.server_args.page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
 
+
+def _assign_chunked_extend_ranges(reqs, chunk_budget: int, page_size: int) -> int:
+    """Fill ``req.extend_range`` for one chunked-prefill iteration.
+
+    Splits ``chunk_budget`` evenly across unfinished reqs so every forward keeps
+    the full batch (needed so the final ``ScheduleBatch`` is decode-ready for
+    all requests). Page-aligns partial takes. Returns tokens scheduled this iter.
+    """
+    unfinished = []
+    for req in reqs:
+        done = len(req.prefix_indices)
+        need = len(req.full_untruncated_fill_ids) - done
+        if need <= 0:
+            req.set_extend_range(done, done)
+        else:
+            unfinished.append((req, done, need))
+
+    if not unfinished:
+        return 0
+
+    # Even split keeps all unfinished reqs in every forward (and thus in the
+    # final batch used for decode). Prefer at least one page per req when the
+    # budget allows; otherwise fall back to filling reqs sequentially.
+    per_req = chunk_budget // len(unfinished)
+    if page_size > 1:
+        per_req = (per_req // page_size) * page_size
+
+    total = 0
+    if per_req <= 0:
+        # Budget too small for an even split — fill sequentially like PrefillAdder.
+        rem = chunk_budget
+        for req, done, need in unfinished:
+            if rem <= 0:
+                req.set_extend_range(done, done)
+                continue
+            take = min(need, rem)
+            if take < need and page_size > 1:
+                take = (take // page_size) * page_size
+                if take <= 0:
+                    req.set_extend_range(done, done)
+                    continue
+            req.set_extend_range(done, done + take)
+            rem -= take
+            total += take
+        return total
+
+    for req, done, need in unfinished:
+        take = min(need, per_req)
+        if take < need and page_size > 1:
+            take = (take // page_size) * page_size
+            if take <= 0:
+                req.set_extend_range(done, done)
+                continue
+        req.set_extend_range(done, done + take)
+        total += take
+    return total
+
+
+def _advance_prefix_after_chunk(reqs, model_runner) -> None:
+    """Promote this chunk's KV into ``prefix_indices`` for the next chunk.
+
+    Same contract as ``ChunkCache.cache_unfinished_req`` (no radix insert).
+    """
+    req_to_token = model_runner.req_to_token_pool.req_to_token
+    for req in reqs:
+        if req.extend_range.length <= 0 or req.req_pool_idx is None:
+            continue
+        kv_indices = req_to_token[req.req_pool_idx, : req.extend_range.end]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+
+@torch.no_grad
+def _extend_once(reqs, model_runner, tree_cache):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
-        tree_cache=dummy_tree_cache,
+        tree_cache=tree_cache,
         model_config=model_runner.model_config,
         enable_overlap=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -515,6 +587,70 @@ def extend(reqs, model_runner):
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits, batch
+
+
+@torch.no_grad
+def extend(reqs, model_runner):
+    """Run extend / prefill for ``reqs``.
+
+    Eager static buffers are sized to ``chunked_prefill_size`` (not the full KV
+    pool). When the batch would exceed that budget, split into multiple chunked
+    forwards so each step fits the fixed buffer — same contract as the
+    scheduler (issue #30773).
+    """
+    tree_cache = _make_dummy_tree_cache(model_runner)
+    chunk_size = model_runner.server_args.chunked_prefill_size
+    page_size = model_runner.server_args.page_size or 1
+
+    # Chunking disabled: one unchunked forward (buffer sized to max_total).
+    if chunk_size is None or chunk_size <= 0:
+        return _extend_once(reqs, model_runner, tree_cache)
+
+    # Page-align the budget like PrefillAdder.
+    chunk_budget = (chunk_size // page_size) * page_size
+    if chunk_budget <= 0:
+        raise ValueError(
+            f"chunked_prefill_size={chunk_size} is smaller than page_size={page_size}"
+        )
+
+    next_token_ids = None
+    next_token_logits = None
+    batch = None
+
+    while True:
+        scheduled = _assign_chunked_extend_ranges(reqs, chunk_budget, page_size)
+        if scheduled <= 0:
+            unfinished = [
+                r
+                for r in reqs
+                if len(r.prefix_indices) < len(r.full_untruncated_fill_ids)
+            ]
+            if not unfinished:
+                break
+            raise RuntimeError(
+                f"one_batch chunked prefill made no progress "
+                f"(chunked_prefill_size={chunk_size}, page_size={page_size}, "
+                f"remaining tokens="
+                f"{[len(r.full_untruncated_fill_ids) - len(r.prefix_indices) for r in unfinished]}). "
+                f"Raise --chunked-prefill-size or set it to -1 for a single unchunked extend."
+            )
+
+        active = [r for r in reqs if r.extend_range.length > 0]
+        is_last = all(
+            r.extend_range.end >= len(r.full_untruncated_fill_ids) for r in reqs
+        )
+
+        next_token_ids, next_token_logits, batch = _extend_once(
+            active, model_runner, tree_cache
+        )
+        if is_last:
+            return next_token_ids, next_token_logits, batch
+
+        _advance_prefix_after_chunk(active, model_runner)
+
+    if batch is None:
+        raise RuntimeError("one_batch extend called with empty requests")
+    return next_token_ids, next_token_logits, batch
 
 
 @torch.no_grad
