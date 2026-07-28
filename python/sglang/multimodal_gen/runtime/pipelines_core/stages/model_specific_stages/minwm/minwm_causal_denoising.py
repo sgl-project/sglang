@@ -406,16 +406,24 @@ class MinWMCausalDMDDenoisingStage(CausalDMDDenoisingStage):
         condition_inputs = batch.condition_inputs or {}
         weight_windows = condition_inputs.get(MINWM_ACTION_WEIGHTS_CONDITION)
         if batch.block_idx == 0:
+            # Native V3 starts T2V with a cold action cache: the first action
+            # convolution sees only the current first block. I2V has one
+            # committed reference frame, represented by one noop history slot.
+            initial_history_frames = int(
+                getattr(batch, "image_latent", None) is not None
+            )
             if weight_windows is None:
                 history = torch.zeros(
-                    (1, 1), dtype=torch.long, device=batch.latents.device
+                    (1, initial_history_frames),
+                    dtype=torch.long,
+                    device=batch.latents.device,
                 )
             else:
                 temporal_factor = int(
                     server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
                 )
                 history = torch.zeros(
-                    (1, 1, temporal_factor, 8),
+                    (1, initial_history_frames, temporal_factor, 8),
                     dtype=torch.float32,
                     device=batch.latents.device,
                 )

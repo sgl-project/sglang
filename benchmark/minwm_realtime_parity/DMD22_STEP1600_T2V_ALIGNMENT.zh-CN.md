@@ -190,6 +190,33 @@ baseline 配置解析后是：
 T2V 第一块直接解码生成 latent，不拼接 reference latent。realtime decoder 维持
 Wan causal VAE cache，使逐 chunk 解码的时间因果状态连续。
 
+Wan2.2 causal VAE 的 residual cache 不能把单独解码 1 latent 后留下的内部状态直接
+接到常规 4-latent block；这样第二块会出现 temporal shape `2 != 4`。SGLang 因此：
+
+1. 第一块先单独解码并发送首帧；
+2. 第二块到来时重置 decoder cache，用“首 latent + 当前 4 latent”重新播种；
+3. 丢弃重复解出的首帧，只发送新增的 16 帧；
+4. 后续 4-latent block 继续使用已经播种好的 cache。
+
+重播种只修复流式边界条件，不改变 baseline 的完整 latent 序列。
+
+### action history 冷启动
+
+原生 V3 的 T2V 第一块以 `action_hist=None` 开始，所以 action causal conv 只接收
+当前第一块的 1 个 idle action。原有 SGLang I2V 路径会先放入 1 个 reference/no-op
+历史帧；若把这个行为沿用到 T2V，第一块会错误地看到两个 idle frame，causal conv
+左边界随即发生变化，之后所有 latent 都无法对齐。
+
+当前实现明确区分：
+
+- T2V：block 0 action history 长度是 0；
+- I2V：block 0 action history 长度是 1，对应已经提交的 reference latent；
+- 第一块完成后，两条路径都只保留模型配置要求的最近
+  `action_history_frames=4` 个 action。
+
+这项差异比“首帧动作都是 idle”更隐蔽：动作值相同并不代表卷积输入长度和边界状态
+相同。
+
 ## 测试状态
 
 - MinWM realtime unit tests：`71 passed, 1 deselected`

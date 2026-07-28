@@ -635,7 +635,7 @@ def test_minwm_unipc_stage_steps_in_native_bfchw_layout():
     assert metadata is None
 
 
-def test_minwm_fractional_action_windows_reach_denoiser_unchanged():
+def test_minwm_t2v_starts_fractional_actions_without_reference_history():
     stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
     stage.transformer = SimpleNamespace(
         config=SimpleNamespace(arch_config=SimpleNamespace(action_history_frames=4))
@@ -645,6 +645,35 @@ def test_minwm_fractional_action_windows_reach_denoiser_unchanged():
         session=RealtimeSession(),
         block_idx=0,
         latents=torch.zeros(1, 2, 4, 1, 1),
+        condition_inputs={MINWM_ACTION_WEIGHTS_CONDITION: [window] * 4},
+    )
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(scale_factor_temporal=4)
+            )
+        )
+    )
+    action = stage._prepare_causal_dmd_pos_cond_kwargs(
+        batch, server_args, torch.bfloat16
+    )["action"]
+    assert action.shape == (1, 4, 4, 8)
+    torch.testing.assert_close(
+        action[:, :, :, 0], torch.full((1, 4, 4), 0.8), rtol=0, atol=0
+    )
+
+
+def test_minwm_i2v_starts_fractional_actions_after_reference_history():
+    stage = MinWMCausalDMDDenoisingStage.__new__(MinWMCausalDMDDenoisingStage)
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(arch_config=SimpleNamespace(action_history_frames=4))
+    )
+    window = [[0.8, 0, 0, 0, 0, 0, 0, 0]] * 4
+    batch = SimpleNamespace(
+        session=RealtimeSession(),
+        block_idx=0,
+        latents=torch.zeros(1, 2, 4, 1, 1),
+        image_latent=torch.zeros(1, 2, 1, 1, 1),
         condition_inputs={MINWM_ACTION_WEIGHTS_CONDITION: [window] * 4},
     )
     server_args = SimpleNamespace(
