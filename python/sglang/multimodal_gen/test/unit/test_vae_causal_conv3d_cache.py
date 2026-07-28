@@ -320,6 +320,57 @@ class TestCausalConv3dCache(unittest.TestCase):
                 msg=f"T={num_frames} must map to ceil(T/2)",
             )
 
+    def test_time_batch_flatten_is_a_layout_preserving_view(self):
+        """Merging a size-1 dimension must not degrade the strides.
+
+        ``permute().reshape()`` yields a view whose merged batch dimension has
+        stride ``c`` rather than ``h * w * c`` when ``b * t == 1``.
+        ``is_contiguous`` accepts that but ATen's ``suggest_memory_format`` does
+        not, so interpolate/conv/pad/cat downstream all fall back to NCHW.
+        """
+        from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
+            flatten_time_into_batch,
+            unflatten_batch_into_time,
+        )
+
+        for b, t in ((1, 1), (1, 2), (2, 1), (2, 3)):
+            c, h, w = 8, 4, 6
+            x = torch.randn(
+                (b, c, t, h, w), dtype=torch.float64, generator=self.generator
+            ).contiguous(memory_format=torch.channels_last_3d)
+
+            flat = flatten_time_into_batch(x)
+            legacy = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+            self.assertEqual(flat.data_ptr(), x.data_ptr(), msg=f"b={b} t={t}")
+            torch.testing.assert_close(flat, legacy, rtol=0, atol=0)
+            self.assertEqual(
+                flat.stride(), (c * h * w, 1, c * w, c), msg=f"b={b} t={t}"
+            )
+
+            back = unflatten_batch_into_time(flat, b)
+            torch.testing.assert_close(back, x, rtol=0, atol=0)
+            self.assertTrue(
+                back.is_contiguous(memory_format=torch.channels_last_3d),
+                msg=f"round trip lost the layout at b={b} t={t}",
+            )
+
+    def test_time_batch_flatten_matches_legacy_for_contiguous(self):
+        """With channels_last off, both helpers must be the old expressions."""
+        from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
+            flatten_time_into_batch,
+            unflatten_batch_into_time,
+        )
+
+        b, c, t, h, w = 1, 8, 1, 4, 6
+        x = torch.randn((b, c, t, h, w), dtype=torch.float64, generator=self.generator)
+        flat = flatten_time_into_batch(x)
+        legacy = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        torch.testing.assert_close(flat, legacy, rtol=0, atol=0)
+        self.assertEqual(flat.stride(), legacy.stride())
+        torch.testing.assert_close(
+            unflatten_batch_into_time(flat, b), x, rtol=0, atol=0
+        )
+
     def test_interleave_time_matches_legacy_reshape(self):
         x = torch.randn((2, 8, 3, 4, 5), dtype=torch.float64, generator=self.generator)
         b, c2, t, h, w = x.shape

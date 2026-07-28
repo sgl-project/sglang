@@ -192,17 +192,54 @@ def match_conv3d_input_format(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
 
 
 def is_channels_last_3d(x: torch.Tensor) -> bool:
-    """Whether ``x`` is already in channels_last_3d.
+    """Whether ``x``'s bytes are already ordered NDHWC.
 
     A pure tensor query, so it stays inside the compiled graph: if a tensor is
     in that layout the platform evidently supports it, and no platform lookup
     is needed.
+
+    Note this is weaker than what ATen's ``suggest_memory_format`` accepts. A
+    tensor whose bytes are NDHWC but whose strides are degenerate — which is
+    what merging a size-1 dimension produces — passes here and fails there. See
+    :func:`flatten_time_into_batch`.
     """
     return (
         x.dim() == 5
         and x.is_contiguous(memory_format=torch.channels_last_3d)
         and not x.is_contiguous()
     )
+
+
+def flatten_time_into_batch(x: torch.Tensor) -> torch.Tensor:
+    """``(b, c, t, h, w) -> (b * t, c, h, w)``, as a view that keeps the layout.
+
+    ``permute(0, 2, 1, 3, 4).reshape(...)`` is already a free view of a
+    channels_last_3d tensor, but when ``b * t == 1`` the merged batch dimension
+    comes out with stride ``c`` instead of ``h * w * c``. ``is_contiguous``
+    accepts that; ``suggest_memory_format`` does not — and interpolate, conv,
+    pad and cat all pick their output layout from the latter. So everything
+    downstream silently falls back to NCHW and the next causal convolution
+    converts the whole activation back.
+
+    Flattening along the NDHWC axis order yields the same view with canonical
+    strides.
+    """
+    b, c, t, h, w = x.shape
+    if is_channels_last_3d(x):
+        return x.permute(0, 2, 3, 4, 1).reshape(b * t, h, w, c).permute(0, 3, 1, 2)
+    return x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+
+
+def unflatten_batch_into_time(x: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Inverse of :func:`flatten_time_into_batch`; same stride fix, here for ``t == 1``."""
+    bt, c, h, w = x.shape
+    if x.is_contiguous(memory_format=torch.channels_last) and not x.is_contiguous():
+        return (
+            x.permute(0, 2, 3, 1)
+            .reshape(batch_size, bt // batch_size, h, w, c)
+            .permute(0, 4, 1, 2, 3)
+        )
+    return x.view(batch_size, bt // batch_size, c, h, w).permute(0, 2, 1, 3, 4)
 
 
 def memory_format_of(x: torch.Tensor) -> torch.memory_format:

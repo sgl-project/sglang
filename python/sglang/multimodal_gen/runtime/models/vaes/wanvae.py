@@ -43,8 +43,10 @@ from sglang.multimodal_gen.runtime.layers.causal_conv3d_cache import (
     TimeUpsampleCausalConv3d,
     assign_causal_cache_keys,
     causal_cache_scope,
+    flatten_time_into_batch,
     is_channels_last_3d,
     should_trim_first_chunk,
+    unflatten_batch_into_time,
 )
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelCausalConv3d,
@@ -218,9 +220,7 @@ def attention_block_forward(self, x):
     # once here instead.
     restore_channels_last = is_channels_last_3d(x)
     batch_size, channels, num_frames, height, width = x.size()
-    x = x.permute(0, 2, 1, 3, 4).reshape(
-        batch_size * num_frames, channels, height, width
-    )
+    x = flatten_time_into_batch(x)
     x = self.norm(x)
 
     # compute query, key, value
@@ -233,16 +233,15 @@ def attention_block_forward(self, x):
 
     x = (
         x.squeeze(1)
-        .permute(0, 2, 1)
-        .reshape(batch_size * num_frames, channels, height, width)
+        .reshape(batch_size * num_frames, height, width, channels)
+        .permute(0, 3, 1, 2)
     )
 
     # output projection
     x = self.proj(x)
 
     # Reshape back: [(b*t), c, h, w] -> [b, c, t, h, w]
-    x = x.view(batch_size, num_frames, channels, height, width)
-    x = x.permute(0, 2, 1, 3, 4)
+    x = unflatten_batch_into_time(x, batch_size)
 
     out = x + identity
     if restore_channels_last:
@@ -352,7 +351,7 @@ class WanResample(nn.Module):
             self.resample = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, _, h, w = x.size()
+        b = x.size(0)
         # See attention_block_forward: the round trip through 4D loses the
         # layout, so restore it once rather than in each consumer.
         restore_channels_last = is_channels_last_3d(x)
@@ -360,10 +359,9 @@ class WanResample(nn.Module):
         if self.mode == "upsample3d":
             x = self.time_conv(x)
 
-        t = x.shape[2]
-        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = flatten_time_into_batch(x)
         x = self.resample(x)
-        x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+        x = unflatten_batch_into_time(x, b)
 
         if self.mode == "downsample3d":
             x = self.time_conv(x)
