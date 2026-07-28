@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
@@ -53,7 +53,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
+    from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
@@ -175,6 +175,18 @@ def mla_quantize_and_rope_for_fp8(
     )
 
     return q_out, k_nope_out, k_rope_out
+
+
+def mla_quantize_without_rope_for_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize MLA components to FP8 without applying rotary embeddings."""
+    attn_dtype = torch.float8_e4m3fn
+    q = concat_mla_absorb_q_general(q_nope, q_rope).to(attn_dtype)
+    return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):

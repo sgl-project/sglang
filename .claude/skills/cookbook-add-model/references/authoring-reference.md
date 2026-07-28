@@ -4,7 +4,7 @@ Loaded on demand by the `cookbook-add-model` skill. This is the field-by-field
 contract for when the clone needs more than a rename. The two engine files are
 the canonical specs — read their headers first:
 
-- [`_deployment.jsx`](../../../../docs_new/src/snippets/_deployment.jsx) — the 5-dim matrix widget; lists every config field.
+- [`_deployment.jsx`](../../../../docs_new/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
 - [`_playground.jsx`](../../../../docs_new/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
@@ -34,7 +34,7 @@ the full contract):
 | `quantizations` | `{id, label}[]` | 3rd-dim option list. |
 | `strategies` | `{id, label}[]` | 4th-dim option list. Canonical ids: `low-latency` / `balanced` / `high-throughput` (never model-specific ids like `mtp`). **The count follows the page's operating points**: one recipe → a single `balanced`; two → `low-latency` + `high-throughput`; three → the full trio (the ideal). Tiers apply per (hw × variant × quant) combination — a single-recipe combination parks under its semantically honest tier (clear slant → that tier, e.g. DSv4's RTX 6000 → `low-latency`; no slant → `balanced`, e.g. Qwen3.5's Xeon); the page's list is the union and the engine greys unused chips per selection. Never invent a recipe just to fill chips. When two recipes differ by MTP / speculative decoding, the assignment is deterministic: spec ON → `low-latency`, spec OFF → `high-throughput` (at saturation the draft+verify overhead outweighs the speedup — same reason DSv4's high-throughput recipes disable MTP). The recurring markers in the other direction: dp-attention ON (MLA-attention models) and EP / DP+EP ON (MoE models) → `high-throughput`. |
 | `nodesOptions` | `{id, label}[]` | 5th-dim option list. The `id` MUST be `single` or `multi-N` — the engine parses N from the id for `--nnodes`. |
-| `cells` | `{match, verified?, env, flags}[]` | One per supported (hw × variant × quant × strategy × nodes) combination. See §2.2. |
+| `cells` | `{match, verified?, nnodes?, env, flags}[]` | One per supported (hw × match-dim) combination. See §2.2. `nnodes` supplies the node count when the config declares no `nodes` dim (default 1). |
 | `modelNames` | `{[key]: string}` | HF slug lookup. Keys are either `hw\|variant\|quant` (most specific) or `variant\|quant` (fallback). |
 | `placeholders` | `{[key]: {target, label, default?}}` | `{{KEY}}` interpolation map for command + curl. `target` is `'command'` or `'curl'`. Editable through the Env modal. |
 | `curl` | string | cURL template. Uses `{{MODEL_NAME}}` + placeholder keys. |
@@ -46,13 +46,48 @@ the full contract):
 | `multiNodeHints` | `{[hwId]: string[]}` | Lines prepended as `# ...` comments to multi-node commands (env-var hints). Per-hw, and only for hw whose **cluster fabric needs manual NIC config** (e.g. `gb200` NVL72/MNNVL → NVSHMEM/Gloo hints). NOT every multi-N hw needs an entry — standard-IB DeepEP (h200) auto-detects the HCA, and Marlin multi-node (h100) uses no DeepEP/NVSHMEM at all. |
 | `dockerImages` | `{[key]: string}` | Image for `docker run` framing, keyed by `hw\|quant` (most specific) then `hw`. Use a `hw\|quant` key only when one quant on a shared GPU needs a different image (e.g. an NVFP4 dev build on b300/gb300 while FP8/BF16 stay on the release image); otherwise key by plain `hw`. **Ask the user which sglang build the recipes ran on; don't guess a supporting release.** Falls back to `lmsysorg/sglang:dev` if missing — also the sensible default when unsure. |
 | `playgroundFeatures` | `{[axisId]: {...}}` | Opts into the Playground widget. See §2.3. |
-| `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. Optional; the button only appears when this AND `benchmarks` are present. |
+| `benchmarkCommands` | `{speed: string, accuracy: {[accKey]: string \| {[variant]: string}}, numPromptsByConc?: {[c]: number}}` | Powers the benchmark card's **"⚡ Reproduce"** modal. `speed` is ONE `bench_serving` template; the engine fills `{{DATASET}}`/`{{ISL}}`/`{{OSL}}` from each cell's `speed[].workload`, the chip-picked `{{MAX_CONCURRENCY}}`, and `{{NUM_PROMPTS}}` (resolved `workload.num_prompts ?? numPromptsByConc[c] ?? max(c*2, 200)`). `accuracy` maps an accuracy field (e.g. `gsm8k_pct`) to a per-eval template — a string, OR a `{flash, pro, …}` object keyed by variant when the command differs per variant (e.g. GPQA/AIME `--max-tokens`). The modal renders a chip per eval (one command area, like Speed). Both also use `{{MODEL_NAME}}` + `{{CURL_HOST}}`/`{{CURL_PORT}}` like `curl`. `speed` should carry `--flush-cache` (bench_serving's `random` prompts are deterministic — warm reruns hit the radix cache and inflate throughput; measure cache-cold). Optional; the button only appears when this AND `benchmarks` are present. |
 | `defaultAccuracy` | `{[variant]: {[accKey]: number}}` | Model-level accuracy applied to **every** cell of a variant (e.g. GPQA Diamond / AIME25 — hardware-independent). Merged UNDER each cell's measured `accuracy` (a per-cell value wins), so you set a variant's score once instead of copying it onto every benchmark entry. Keys must match `accuracyLabels` (below) + `benchmarkCommands.accuracy`. |
 | `accuracyLabels` | `[key, label, unit][]` | The eval set rendered in the benchmark card and the "⚡ Reproduce" modal — **the engine ships no default**, every config declares its own (e.g. DSv4: GPQA/AIME25/GSM8K; Qwen3.5: GSM8K/MMMU). Required whenever the benchmarks carry accuracy data; without it the accuracy rows silently don't render. Every key used in `benchmarks[].accuracy`, `defaultAccuracy`, and `benchmarkCommands.accuracy` must appear here. |
-| `latencyPercentile` | `"Mean" \| "P50"` | Optional, **temporary**; the percentile the benchmark TTFT/TPOT values are. **Default `"P50"`** — the card renders `TTFT (<pct>)` / `TPOT (<pct>)`. Set `"Mean"` only for legacy data recorded as Mean (being re-measured to P50). `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU** = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. |
+| `latencyPercentile` | `"Mean" \| "P50"` | Optional, **temporary**; the percentile the benchmark TTFT/TPOT values are. **Default `"P50"`** — the card renders `TTFT (<pct>)` / `TPOT (<pct>)`. Set `"Mean"` only for legacy data recorded as Mean (being re-measured to P50). A benchmarks entry may carry its own `latencyPercentile` to override the page value per cell (entry → config → `"P50"`). `tokens_per_sec_per_gpu` is stored as **total (in+out)/GPU** = `output tok/s/GPU × (isl+osl)/osl`, shown by the card as-is. |
 | `github` | `{owner?, repo?, issueTemplate?, cookbookModel?}` | Overrides for the "Submit verified cell" CTA in the playground. Defaults: `sgl-project/sglang` + `3-playground-verified-cell.yml` + `"deepseek-ai/deepseek-v4"`. Set `cookbookModel` to the model's HF id (`<hf-org>/<model-slug>`); it prefills the issue template's free-form `model` input when the issue opens. **Don't prune this block** — without it the engine falls back to `deepseek-ai/deepseek-v4` and submissions from your page get mislabeled. |
 
-## 2.2 Author the 5-dim matrix (`cells[]`)
+## 2.1b Custom dimensions (`matchDims` / `overlayDims`)
+
+The legacy shape above is a fixed five dimensions. A model whose axes don't fit
+(no variant axis, a deployment-shape axis, an orthogonal feature toggle) declares
+its own instead. Declaring `matchDims` replaces `variants`/`quantizations`/
+`strategies`/`nodesOptions` wholesale; omitting it keeps the legacy behaviour, so
+existing pages need no change.
+
+| Field | Shape | Notes |
+|---|---|---|
+| `matchDims` | `{id, title, options}[]` | Rows that key the cell lookup. `hw` is always the implicit first dim, so cells match on (hw × these ids). Order is priority: lower rows adapt to higher ones. |
+| `overlayDims` | `{id, title, default?, showWhen?, options}[]` | Rows that do NOT key the lookup — the picked option layers onto whichever cell matched. Use this for a knob that is orthogonal to the grid (speculative decoding, hierarchical cache): as a match dim it would multiply the cell count, as an overlay it costs nothing. |
+
+Option shape, both kinds:
+
+| Key | Meaning |
+|---|---|
+| `id`, `label` | as usual |
+| `showWhen(sel)` | option is hidden unless the predicate accepts the current selection — this is how one row shows a different option set per mode |
+| `disabled`, `disableReason` | `true` or a predicate over the selection; greys the option out and supplies the tooltip. Use it for a combination the server rejects, so the reader learns why instead of hitting a startup error |
+
+Overlay options additionally take `flags`, `env` and `hints` — each a literal array
+or a function of the whole selection (so an "auto" value can resolve against another
+row). `hints` render as `# ...` comment lines above the command, for setup the
+launch line cannot express on its own.
+
+`_playground.jsx` sees the overlay dims in its `base`, so a playground axis can gate
+on them with its own `showWhen(base)` — an axis whose feature the Deploy panel never
+switched on is not rendered at all. Changing the Deploy selection resets every
+playground axis back to inherit-from-base.
+
+> The overlay resolution rule is written in BOTH engines (snippets can't import each
+> other); each copy is marked `MIRROR`. Change both or neither, or the Deploy command
+> and the playground base silently disagree.
+
+## 2.2 Author the matrix (`cells[]`)
 
 Each cell describes one verified (or auto-estimated) launch recipe.
 
