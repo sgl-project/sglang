@@ -127,6 +127,11 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
         split_qkv_rmsnorm_rope_pos_cache_half_npu,
     )
+    # Per-layer qk-norm + partial RoPE + q|k|v split fallback (used by the
+    # non-fused branch of forward_prepare_npu for dense per_layer layers).
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import (
+        split_qkv_tp_rmsnorm_rope,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1037,15 +1042,6 @@ class MiniMaxM3Attention(nn.Module):
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
-    def _can_use_npu_split_qkv_tp_rmsnorm_rope(self) -> bool:
-        return (
-            _is_npu
-            and not self.is_sparse_attention_layer
-            and self.use_qk_norm
-            and self.qk_norm_type == "per_layer"
-            and not self.attention_output_gate
-        )
-
     def _can_use_npu_fused_qkv_norm_rope(self) -> bool:
         # Reuse sgl_kernel_npu's per-head GemmaRMSNorm + partial NeoX RoPE + QKV
         # split fusion (split_qkv_rmsnorm_rope_pos_cache_half_npu) for M3's
@@ -1079,8 +1075,12 @@ class MiniMaxM3Attention(nn.Module):
         # q|k|v split matches idx_qkv only when the index V head is enabled (it is
         # laid out [idx_q | idx_k | idx_v]); when the V head is disabled the input
         # has no v slot and we fall back to _split_index_qkv + _index_qk_norm_rope.
-        # M3 never disables the index V (sparse_disable_index_value is absent ->
-        # disable_value_layer_ids empty), so every sparse layer fuses here.
+        # M3 DISABLES the index V on every sparse layer: sparse_disable_index_value
+        # = [0,0,0, 1x57], aligned with sparse_attention_freq, so
+        # disable_value_layer_ids = layers 3..59 -> disable_index_value=True here.
+        # This gate therefore returns False for all M3 sparse layers and they fall
+        # back to _split_index_qkv + _index_qk_norm_rope (no V slot). The fused
+        # path only fires for configs that keep the index V head (split [q|k|v]).
         return (
             self.is_sparse_attention_layer
             and not self.disable_index_value

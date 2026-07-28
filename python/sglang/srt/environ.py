@@ -415,6 +415,17 @@ class Envs:
     # Default OFF (triton is the validated baseline); set =1 to A/B the FIA path.
     SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
 
+    # MiniMax M3 NPU native Ascend block-sparse attention (aclnn
+    # npu_sparse_attention_score) for the DECODE/VERIFY main attention, replacing
+    # the Triton split-K kernel. DECODE is cuda-graph replay-safe; VERIFY needs a
+    # defensive clamp (see topk_sparse_decode._native_decode_main) and is WIP.
+    # Both default OFF (Triton is the validated baseline).
+    SGLANG_MINIMAX_NPU_NATIVE_DECODE = EnvBool(False)
+    SGLANG_MINIMAX_NPU_NATIVE_VERIFY = EnvBool(False)
+    # Path to the vllm_ascend_C.so build of the aclnn op wrapper; required when
+    # either NATIVE_DECODE or NATIVE_VERIFY is on.
+    SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB = EnvStr("")
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

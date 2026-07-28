@@ -44,6 +44,19 @@ from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score
 # triton topk loses to CANN torch.topk's O(K); see the gate in
 # flash_prefill_bnsd_indexer / flash_prefill_bnsd_with_topk_idx.
 
+# Tunable launch configs for the score kernels. Defaults are the validated
+# (4, 2); bench/tuning scripts override these module globals before the first
+# launch to sweep configs (NOT triton.autotune, so each shape compiles to one
+# deterministic artifact -- cuda-graph safe). Mirrors topk_sparse_decode.py.
+_SCORE_NW = 4
+_SCORE_NS = 2
+# Swept nw∈{2,4,8}×ns∈{1,2,3} on a 4-req prefill indexer scenario (KV up to 8K):
+# nw=8 is consistently fastest (~12.95ms vs ~13.48ms for nw=4, ~3.6%), ns-neutral.
+# More warps parallelises the [BSQ*gqa=64, D] index-Q tile; ns has little effect on
+# this dense-KV-loop (memory-bound) kernel. num_warps does not affect numerics.
+_SCORE_ATTN_NW = 8
+_SCORE_ATTN_NS = 2
+
 
 @triton.jit
 def _prefill_bnsd_score_kernel(
@@ -365,7 +378,11 @@ def _prefill_bnsd_score_attn_kernel(
     )
 
     sm_scale_log2e = sm_scale * 1.4426950409
-    m_i = tl.full((BLOCK_SIZE_Q * BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    # Finite floor (not -inf): an all-masked block has sub_max=-inf -> m_new=m_i,
+    # exp2(qk-m_new)=exp2(-inf)=0 (p=0), exp2(m_i-m_new)=1 (acc_o/l_i no-op), so
+    # no -inf-​-inf=NaN and no per-iter ``contributes`` where-guard is needed (saves
+    # 3 vector ops/iter; same technique as the blockq main-attention kernel).
+    m_i = tl.full((BLOCK_SIZE_Q * BLOCK_SIZE_H,), -1.0e30, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_SIZE_Q * BLOCK_SIZE_H,), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_Q * BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
 
@@ -407,10 +424,9 @@ def _prefill_bnsd_score_attn_kernel(
 
         # online softmax -> idx_o accumulation
         m_new = tl.maximum(m_i, sub_max)
-        # guard exp2(-inf - -inf)=nan on fully-masked rows: only update where
-        # the block contributes (sub_max > -inf).
-        contributes = sub_max > float("-inf")
-        p = tl.where(contributes[:, None], tl.exp2(qk - m_new[:, None]), 0.0)
+        # Finite-floor m_i: p=exp2(qk-m_new) is 0 on masked cols (-inf) and on
+        # all-masked blocks (m_new=m_i -> no-op), so no contributes guard needed.
+        p = tl.exp2(qk - m_new[:, None])
         l_new = tl.sum(p, axis=1)
         acc_o = acc_o * tl.exp2(m_i - m_new)[:, None]
         v_offsets = (
@@ -424,7 +440,7 @@ def _prefill_bnsd_score_attn_kernel(
             mask=pos_mask[:, None] & (off_d[None, :] < head_dim),
             other=0.0,
         )
-        acc_o = tl.where(contributes[:, None], acc_o + tl.dot(p.to(v.dtype), v), acc_o)
+        acc_o = acc_o + tl.dot(p.to(v.dtype), v)
         l_i = l_i * tl.exp2(m_i - m_new) + l_new
         m_i = m_new
 
@@ -638,6 +654,8 @@ def flash_prefill_bnsd_score(
         triton.next_power_of_2(page_size * blocks_per_step),
         score_type,
         blocks_per_step,
+        num_warps=_SCORE_NW,
+        num_stages=_SCORE_NS,
     )
     return score
 
@@ -722,6 +740,8 @@ def flash_prefill_bnsd_score_attn(
             triton.next_power_of_2(head_dim),
             triton.next_power_of_2(page_size),
             score_type,
+            num_warps=_SCORE_ATTN_NW,
+            num_stages=_SCORE_ATTN_NS,
         )
     return score, idx_o
 

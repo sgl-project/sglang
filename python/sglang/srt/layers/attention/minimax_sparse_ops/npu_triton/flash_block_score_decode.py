@@ -2106,6 +2106,12 @@ def flash_decode_bnsd_with_topk_idx(
             all_seqblock_q=batch_size,
             num_kv_heads=num_kv_heads,
         )
+        # Clamp runtime_score_short_chunks so it never exceeds num_score_chunks
+        # (eager mode / short KV can have num_score_chunks < the hardcoded 16).
+        if runtime_score_short_chunks:
+            runtime_score_short_chunks = min(
+                runtime_score_short_chunks, num_score_chunks
+            )
         use_runtime_adaptive_score_chunks = bool(
             runtime_score_short_max_blocks or runtime_score_short_chunks
         )

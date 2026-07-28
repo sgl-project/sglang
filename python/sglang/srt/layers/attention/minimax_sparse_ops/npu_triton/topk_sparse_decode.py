@@ -6,9 +6,150 @@ import torch
 import triton
 import triton.language as tl
 
-# Default launch config for the sparse-decode kernel (overridable per call).
-_SPARSE_DECODE_NW = 4
-_SPARSE_DECODE_NS = 2
+from sglang.srt.environ import envs
+
+# --- Native Ascend block-sparse attention (npu_sparse_attention_score) for decode ---
+# Experimental gate: route decode-main attention through the vllm-ascend native cube
+# kernel (built per cc_docs/triton_opt/minimax_m3_npu_vllm_attention_borrow_20260728.md
+# §2.4) instead of the Triton split-K kernel. On Ascend910_9362 (ascend910_93) microbench
+# (bf16, B=48, KV=16384, topk=17) the native cube kernel is ~3.3x FASTER than the
+# Triton decode main (0.35ms vs 1.14ms) -- the Triton path is scalar-bound/MAC-idle on
+# the small decode workload while the native cube kernel has far better MAC utilisation.
+# Correctness: allclose(atol=2e-2, rtol=2e-2) vs the Triton path. Enable by setting both
+# SGLANG_MINIMAX_NPU_NATIVE_DECODE=1 and SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB=<path to
+# vllm_ascend_C.so>; ASCEND_CUSTOM_OPP_PATH + LD_LIBRARY_PATH must also point at the
+# installed _cann_ops_custom vendor + torch_npu/lib (see the doc).
+_NATIVE_SPARSE_LOADED = False
+
+
+def _native_sparse_decode_enabled() -> bool:
+    return envs.SGLANG_MINIMAX_NPU_NATIVE_DECODE.get() and bool(
+        envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get()
+    )
+
+
+def _native_verify_enabled() -> bool:
+    """Native Ascend op on the EAGLE3 TARGET_VERIFY cuda-graph path.
+
+    Independent of NATIVE_DECODE so verify can go native while decode stays
+    Triton (set NATIVE_VERIFY=1 + NATIVE_SPARSE_LIB). The op is cuda-graph
+    replay-safe (standard EXEC_NPU_CMD workspace via the caching allocator); the
+    verify OOB that previously crashed replay (score-phase topk >= num_blocks) is
+    handled by the per-query sanitize in _native_decode_main (skip OOB slots).
+    """
+    return bool(envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get()) and envs.SGLANG_MINIMAX_NPU_NATIVE_VERIFY.get()
+
+
+def _ensure_native_sparse_loaded():
+    global _NATIVE_SPARSE_LOADED
+    if _NATIVE_SPARSE_LOADED:
+        return
+    torch.ops.load_library(envs.SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB.get())
+    _NATIVE_SPARSE_LOADED = True
+
+
+@triton.jit
+def _native_sanitize_topk_kernel(
+    sel_ptr,            # [num_kv_heads, batch, SLOTS] int32 (in-place OUT)
+    select_num_idx_ptr,  # [num_kv_heads, batch] int32 (OUT)
+    seq_lens_ptr,        # [batch] int32
+    stride_sel_h, stride_sel_b, stride_sel_s,
+    stride_sn_h, stride_sn_b,
+    block_size: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    """One-launch sanitize for the native op's select_idx/select_num_idx.
+
+    Per (kv_head, batch) program:
+      1. sanitize: sel >= cdiv(seq_len, block_size) -> -1 (skip OOB; the verify
+         cuda-graph score phase can emit sel >= max_blocks. Skipping matches the
+         Triton main kernel's pos<seq_len mask).
+      2. select_num_idx = count(sel >= 0).
+    No fold/cap: the native op's kernel array (validPhysicalIds) is now [32] (was
+    [16], which OOB'd at attend=17 -- fixed in the recompiled .o), so the op
+    safely handles up to 32 attended blocks.
+    """
+    pid_h = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + pid_b)
+    nblocks = tl.cdiv(seq_len, block_size)
+    off = tl.arange(0, SLOTS)
+    base = pid_h * stride_sel_h + pid_b * stride_sel_b
+    sel = tl.load(sel_ptr + base + off * stride_sel_s)            # [SLOTS]
+    sel = tl.where(sel >= nblocks, -1, sel)                       # sanitize OOB
+    count = tl.sum((sel >= 0).to(tl.int32), axis=0)               # scalar
+    tl.store(sel_ptr + base + off * stride_sel_s, sel)
+    tl.store(select_num_idx_ptr + pid_h * stride_sn_h + pid_b * stride_sn_b, count)
+
+
+def _native_decode_main(
+    q, k, v, topk_idx, seq_lens, block_size, sm_scale,
+    block_table, req_to_token, req_pool_indices, max_num_blocks,
+    num_kv_heads, head_dim,
+):
+    _ensure_native_sparse_loaded()
+    device = q.device
+    batch_size = q.shape[0]
+    if block_table is not None:
+        bt = block_table.to(torch.int32)
+    else:
+        # Gather only the B x maxBlocks block-start slots (NOT the full B x max_ctx),
+        # then // block_size -> physical page id per (request, logical block). The full
+        # gather would dominate the native op's ~0.14ms cost.
+        bidx = torch.arange(max_num_blocks, device=device, dtype=torch.int32)
+        slots = req_to_token[
+            req_pool_indices[:, None].to(torch.int64),
+            (bidx * block_size)[None, :].to(torch.int64),
+        ]
+        bt = (slots // block_size).to(torch.int32)
+    num_kv_heads = topk_idx.shape[0]
+    batch_size = q.shape[0]
+    num_pages = k.shape[0]
+    # Sanitize (skip OOB select_idx beyond per-query KV) in ONE triton kernel,
+    # replacing ~7 torch ops (where/sum/cat/clamp) whose launch overhead ate the
+    # native op's win. sel is cloned (in-place kernel write); select_num_idx is
+    # computed in-kernel. Pure device ops (no host sync -> cuda-graph safe).
+    # No fold/cap: the native op's kernel array is now [32] (OOB bug fixed in the
+    # recompiled .o), so it safely handles up to 32 attended blocks.
+    sel = topk_idx.to(torch.int32).clone()
+    select_num_idx = torch.empty(
+        (num_kv_heads, batch_size), dtype=torch.int32, device=q.device
+    )
+    _native_sanitize_topk_kernel[(num_kv_heads, batch_size)](
+        sel, select_num_idx, seq_lens.to(torch.int32),
+        sel.stride(0), sel.stride(1), sel.stride(2),
+        select_num_idx.stride(0), select_num_idx.stride(1),
+        block_size=block_size, SLOTS=sel.shape[-1], num_warps=1, num_stages=1,
+    )
+    # bt is already valid for attended slots (sel < per-query nblocks after sanitize
+    # -> bt from the req_to_token gather is a valid page id in [0, num_pages));
+    # unattended tail slots are not dereferenced by the native op (it attends only
+    # [0, select_num_idx)). No clamp needed (the old safety net cost ~140us +
+    # ~97MB graph pool per forward).
+    # actual_seq_lengths_kv carries the per-request KV length. In the cuda-graph
+    # path `seq_lens` is the layer-invariant int32 STATIC buffer
+    # (_decode_seq_lens_i32_cg / _verify_meta_cg) that sglang refreshes OUTSIDE
+    # graph replay each forward, so the captured kernel reads the live value on
+    # replay -- it is graph-safe by construction (int32 .to() is a no-op alias).
+    #
+    # Do NOT MAX-pad this. The op's host tiling is shape-derived
+    # (totalTaskNum = totalQTokens * kvHeads in sparse_attention_score_tiling.cpp
+    # CalculateTaskSplit) and never reads this value, so padding gains nothing.
+    # Worse, a constant MAX value makes the device kernel's KV-boundary check walk
+    # past the real block_table on replay and OOB -> CCU instruction address check
+    # error (507011). The workspace itself comes through the standard EXEC_NPU_CMD
+    # NPU caching allocator (graph memory pool), which is what makes replay safe.
+    actual_kv = seq_lens.to(torch.int32)
+    out = torch.ops._C_ascend.npu_sparse_attention_score(
+        q, k, v, sel, bt,
+        select_num_idx=select_num_idx,
+        actual_seq_lengths=torch.ones(batch_size, dtype=torch.int32, device=device),
+        actual_seq_lengths_kv=actual_kv,
+        num_key_value_heads=num_kv_heads,
+        scale_value=sm_scale if sm_scale is not None else head_dim ** -0.5,
+        block_size=block_size, top_k=topk_idx.shape[-1], inner_precise=0,
+    )
+    return out
 
 # =============================================================================
 # Utilities
@@ -684,6 +825,12 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     sanitize_page_ids: bool = False,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    # Native Ascend aclnn op gate. True -> route to npu_sparse_attention_score;
+    # False -> fall through to the Triton split-K path below. Caller decides per
+    # path (decode passes _native_sparse_decode_enabled(), verify passes
+    # _native_verify_enabled()), so the two cuda-graph paths are independently
+    # switchable.
+    use_native: bool = False,
 ) -> torch.Tensor:
     """Sparse decode attention using BNSD KV cache and precomputed topk blocks.
 
@@ -717,6 +864,28 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     assert k_cache_bnsd.dtype == q.dtype
     assert v_cache_bnsd.dtype == q.dtype
     assert k_cache_bnsd.shape == v_cache_bnsd.shape
+    # Native Ascend block-sparse decode main (~3.3x faster than the Triton
+    # split-K path on Ascend910_9362). Placed BEFORE the direct-page-lookup
+    # asserts so the backend's hoisted block_table (passed alongside req_to_token)
+    # does not trip `assert block_table is None`.
+    #
+    # cuda-graph replay-safe: the aclnn op runs through the STANDARD EXEC_NPU_CMD
+    # (workspace from the NPU caching allocator -> graph memory pool, so its
+    # address is pinned across replay), and actual_seq_lengths_kv is sglang's
+    # static int32 seq_lens buffer refreshed out-of-graph each forward. The op's
+    # host tiling is shape-derived (totalTaskNum = totalQTokens*kvHeads) and thus
+    # identical at capture and replay. Engages when use_native=True (caller-gated
+    # per path); False falls through to the Triton split-K path.
+    if use_native:
+        _nkvh = k_cache_bnsd.shape[2]
+        if topk_idx.shape[0] == _nkvh and (
+            block_table is not None or req_to_token is not None
+        ):
+            return _native_decode_main(
+                q, k_cache_bnsd, v_cache_bnsd, topk_idx, seq_lens, block_size, sm_scale,
+                block_table, req_to_token, req_pool_indices, max_num_blocks,
+                _nkvh, q.shape[2],
+            )
 
     use_direct_page_lookup = req_to_token is not None
     assert (req_pool_indices is not None) == use_direct_page_lookup
