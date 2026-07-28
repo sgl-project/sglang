@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    compute_head_slice_params,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -780,10 +781,6 @@ class NixlKVManager(CommonKVManager):
             # Reuse the canonical head-slice mapping (integer division under
             # replication, not modulo) so this direct-slice path stays in sync
             # with the staging path.
-            from sglang.srt.disaggregation.common.staging_buffer import (
-                compute_head_slice_params,
-            )
-
             src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
                 prefill_tp_size,
                 decode_tp_size,
