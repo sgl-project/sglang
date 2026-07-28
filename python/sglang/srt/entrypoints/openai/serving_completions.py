@@ -159,6 +159,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
+            "disable_speculative_decoding": request.disable_speculative_decoding,
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,

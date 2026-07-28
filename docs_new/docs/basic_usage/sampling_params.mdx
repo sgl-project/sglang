@@ -314,6 +314,11 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Don't trim stop words or EOS token from the generated text.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>disable_speculative_decoding</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool = False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Experimental (RFC #30263): request-level opt-out of speculative decoding. The parameter is accepted and carried per request, but worker-side enforcement is still being designed in RFC #30263 and is not active yet. Always a no-op when the server runs no speculative decoding.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>custom_params</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[List[Optional[Dict[str, Any]]]] = None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Used when employing `CustomLogitProcessor`. For usage, see below.</td>
