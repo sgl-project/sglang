@@ -24,7 +24,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -269,15 +272,109 @@ class RadixAttention(nn.Module):
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         else:
-            return get_attn_backend().forward(
-                q,
-                k,
-                v,
+            context = get_forward_context()
+            attn_backend = context.attn_backend
+            runtime_sparse_coordinator = context.runtime_sparse_coordinator
+            if _should_use_runtime_sparse_attention(
                 self,
                 forward_batch,
+                k,
                 save_kv_cache,
-                **kwargs,
+                runtime_sparse_coordinator,
+            ):
+                return sparse_attention_forward(
+                    q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                )
+            return _dense_attention_forward(
+                attn_backend, q, k, v, self, forward_batch, save_kv_cache, **kwargs
             )
+
+
+def _should_use_runtime_sparse_attention(
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    key: Optional[torch.Tensor],
+    save_kv_cache: bool,
+    runtime_sparse_coordinator,
+) -> bool:
+    if runtime_sparse_coordinator is None:
+        return False
+    if (
+        not save_kv_cache
+        or key is None
+        or layer.is_cross_attention
+        or layer.attn_type != AttentionType.DECODER
+        or get_tc_piecewise_forward_context() is not None
+        or forward_batch.req_pool_indices is None
+        or forward_batch.seq_lens is None
+    ):
+        return False
+    return forward_batch.forward_mode.is_decode() or (
+        forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        and not forward_batch.forward_mode.is_mixed()
+        and not forward_batch.forward_mode.is_split_prefill()
+    )
+
+
+def _dense_attention_forward(
+    attn_backend,
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    **kwargs,
+) -> torch.Tensor:
+    return attn_backend.forward(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+
+
+def sparse_attention_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    save_kv_cache: bool,
+    **kwargs,
+) -> torch.Tensor:
+    context = get_forward_context()
+    attn_backend = context.attn_backend
+    coordinator = context.runtime_sparse_coordinator
+
+    if forward_batch.forward_mode.is_decode():
+        sparse_attention_begin(q, k, v, layer, forward_batch, **kwargs)
+
+    output = _dense_attention_forward(
+        attn_backend, q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+    )
+    coordinator.attention_end(output, layer, forward_batch)
+    return output
+
+
+def sparse_attention_begin(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layer: RadixAttention,
+    forward_batch: ForwardBatch,
+    **kwargs,
+) -> None:
+    context = get_forward_context()
+    attn_backend = context.attn_backend
+    coordinator = context.runtime_sparse_coordinator
+    current_metadata = getattr(attn_backend, "forward_metadata", None)
+    new_metadata = coordinator.attention_begin(
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        current_metadata,
+        **kwargs,
+    )
+    if new_metadata is not None:
+        attn_backend.forward_metadata = new_metadata
 
 
 def _unified_attention_with_output_impl(
