@@ -2135,6 +2135,7 @@ def _fwd_kernel_expand_to_masked_slab(
     recv_x_stride0,
     recv_x_scale_ptr,
     recv_x_scale_stride0,
+    recv_x_scale_stride1,
     slab_ptr,
     slab_stride0,
     slab_scale_ptr,
@@ -2181,7 +2182,10 @@ def _fwd_kernel_expand_to_masked_slab(
         tl.store(slab_ptr + dst * slab_stride0 + off, v, mask=mask)
         if IS_FP8:
             vs = tl.load(
-                recv_x_scale_ptr + src * recv_x_scale_stride0 + off_s, mask=mask_s
+                recv_x_scale_ptr
+                + src * recv_x_scale_stride0
+                + off_s * recv_x_scale_stride1,
+                mask=mask_s,
             )
             # mn-major write: physical layout [E, SCALE_HIDDEN, MAX_M], element
             # (e, s, j). Viewed as [E, MAX_M, SCALE_HIDDEN] this is the mn-major
@@ -2233,12 +2237,14 @@ def expand_to_masked_slab(
         )
         scale_arg = recv_x_scale
         scale_s0 = recv_x_scale.stride(0)
+        scale_s1 = recv_x_scale.stride(1)
         slab_scale_s0 = 0  # unused: scale write uses mn-major addressing
     else:
         sh = 1
         slab_scale = None
         scale_arg = recv_x
         scale_s0 = 0
+        scale_s1 = 0
         slab_scale_s0 = 0
     num_workers = min(max_m, _EPV2_REPACK_WORKERS_PER_EXPERT)
     _fwd_kernel_expand_to_masked_slab[(num_local_experts, num_workers)](
@@ -2247,6 +2253,7 @@ def expand_to_masked_slab(
         recv_x.stride(0),
         scale_arg,
         scale_s0,
+        scale_s1,
         slab,
         slab.stride(0),
         slab_scale if is_fp8 else scale_arg,

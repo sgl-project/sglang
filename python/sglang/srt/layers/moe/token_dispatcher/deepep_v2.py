@@ -352,17 +352,21 @@ class _DeepEPv2Impl:
         if self._uses_fp8_dispatch_output():
             _ensure_fp8_quant_available()
             if use_masked:
-                # _run_masked_gemm consumes plain per-token-group fp32 scales and
-                # does its own e8m0/tma-major alignment, so dispatch a plain
-                # row-major scale (no col-major, no tma, no e8m0 pre-pack).
+                # Follow the hardware scale format (DEEPGEMM_SCALE_UE8M0 via
+                # capability.fp8_scale_ue8m0). Hopper (False): plain row-major
+                # fp32 scale, and _run_masked_gemm does its own e8m0/tma-major
+                # alignment. Blackwell (True): pre-quantize the activation
+                # against a col-major UE8M0 scale so it already matches the
+                # layout the masked GEMM consumes.
+                _ue8m0 = self.capability.fp8_scale_ue8m0
                 dispatch_x = sglang_per_token_group_quant_fp8(
                     hidden_states,
                     _SCALE_BLOCK_SIZE,
-                    column_major_scales=False,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
+                    column_major_scales=_ue8m0,
+                    scale_tma_aligned=_ue8m0,
+                    scale_ue8m0=_ue8m0,
                 )
-                use_tma_aligned_col_major_sf = False
+                use_tma_aligned_col_major_sf = _ue8m0
             else:
                 dispatch_x = _quantize_for_deepep_v2_dispatch(
                     hidden_states, self.capability
