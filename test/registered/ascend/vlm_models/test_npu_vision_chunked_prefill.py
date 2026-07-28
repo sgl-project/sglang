@@ -2,10 +2,7 @@ from sglang.test.ascend.test_ascend_utils import (
     LLAVA_ONEVISION_QWEN2_7B_OV_WEIGHTS_PATH,
     VIDEO_JOBS_PATH,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_npu_ci
 
-register_npu_ci(est_time=156, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:
 python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_chunked_prefill
@@ -25,6 +22,7 @@ import requests
 from PIL import Image
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -32,6 +30,8 @@ from sglang.test.test_utils import (
     calculate_rouge_l,
     popen_launch_server,
 )
+
+register_npu_ci(est_time=400, suite="full-4-npu-a3", nightly=True)
 
 # Configure logging to help diagnose CI timeouts
 logging.basicConfig(

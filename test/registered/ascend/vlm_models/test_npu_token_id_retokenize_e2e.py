@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_npu_ci(est_time=400, suite="full-4-npu-a3", nightly=True)
 
 
 def _data_uri():

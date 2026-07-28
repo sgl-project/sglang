@@ -29,7 +29,7 @@ from sglang.test.ascend.vlm_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
+register_npu_ci(est_time=3200, suite="full-2-npu-a3", nightly=True)
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
