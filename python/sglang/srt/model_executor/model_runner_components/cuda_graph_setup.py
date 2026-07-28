@@ -180,6 +180,17 @@ def capture_prefill_graph(
         )
         return eager_runner
 
+    if (
+        model_runner.server_args.enable_lora
+        and not model_runner.lora_manager.supports_prefill_cuda_graph
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because the current LoRA "
+            "configuration does not support it (unsupported LoRA backend, "
+            "MoE LoRA, or DP attention)."
+        )
+        return eager_runner
+
     # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
     # expose it as ``language_model`` rather than ``model``.
     try:
@@ -222,6 +233,7 @@ def capture_prefill_graph(
         model_runner.moe_layers,
         model_runner.moe_fusions,
         model_runner.dsa_indexers,
+        model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
     if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:

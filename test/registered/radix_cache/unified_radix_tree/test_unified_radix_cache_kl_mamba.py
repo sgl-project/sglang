@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -59,6 +60,8 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
+                "--mamba-max-states-per-path",
+                "3",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
@@ -125,6 +128,11 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
 
 
@@ -186,6 +194,11 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
         if os.path.isdir(cls.hicache_dir):
             shutil.rmtree(cls.hicache_dir, ignore_errors=True)
