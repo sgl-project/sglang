@@ -60,6 +60,7 @@ class ChebyshevForecaster(nn.Module):
         self._shape: Optional[torch.Size] = feature_shape
         self._coef: Optional[torch.Tensor] = None
         self.device_ref = device
+        self._tau_scale = 2.0 / float(self.num_steps) if self.num_steps != 0 else 0.0
 
     @property
     def P(self) -> int:
@@ -67,13 +68,9 @@ class ChebyshevForecaster(nn.Module):
 
     def _taus(self, t: torch.Tensor) -> torch.Tensor:
         """Normalize timesteps to [-1, 1] range for Chebyshev basis."""
-        t_min = torch.zeros(1, device=t.device, dtype=t.dtype)
-        t_max = torch.full((1,), float(self.num_steps), device=t.device, dtype=t.dtype)
-        mid = 0.5 * (t_min + t_max)
-        rng = t_max - t_min
-        if torch.isclose(rng, torch.zeros_like(rng)):
+        if self.num_steps == 0:
             return torch.zeros_like(t)
-        return (t - mid) * 2.0 / rng
+        return t * self._tau_scale - 1.0
 
     def _build_design(self, taus: torch.Tensor) -> torch.Tensor:
         """Build Chebyshev basis design matrix [T_0(tau), T_1(tau), ..., T_M(tau)]."""
