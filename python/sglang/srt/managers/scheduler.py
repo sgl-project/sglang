@@ -79,7 +79,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.managers.disagg_service import start_rust_disagg_service
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1811,13 +1811,14 @@ class Scheduler(
 
     def maybe_init_disagg_bootstrap_server(self) -> None:
         """Host the prefill KV bootstrap server on this scheduler in rust-server
-        mode: there is no ``TokenizerManager`` process to own it. No-op
-        otherwise, and ``start_disagg_service`` itself no-ops on non-prefill
-        roles."""
+        mode: there is no ``TokenizerManager`` process to own it. Served by the
+        rust extension on its own native thread — an in-process aiohttp server
+        here would contend for the scheduler's GIL. No-op otherwise, and
+        ``start_rust_disagg_service`` itself no-ops on non-prefill roles."""
 
         # Kept only to hold a reference — the server dies if it is collected.
         self.disagg_bootstrap_server = (
-            start_disagg_service(self.server_args)
+            start_rust_disagg_service(self.server_args)
             if self._hosts_rust_server()
             else None
         )
