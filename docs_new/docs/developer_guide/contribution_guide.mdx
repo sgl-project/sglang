@@ -161,6 +161,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
+  - Do not use `tensor.is_cuda` (or any other raw PyTorch device-namespace property/name) to mean "this is running on NVIDIA CUDA." PyTorch's ROCm build exposes HIP tensors under the `cuda` device type for API compatibility, so `tensor.is_cuda` is also True on AMD/ROCm. Use `sglang.srt.utils.is_cuda()` (checks `torch.version.cuda is not None`) or `is_hip()` (checks `torch.version.hip is not None`) instead — see [#30926](https://github.com/sgl-project/sglang/pull/30926) for a real bug this distinction would have caught: CUDA IPC handle creation (`storage._share_cuda_()`) being attempted on ROCm tensors because the gate only checked `tensor.is_cuda`.
 
 ## How to update sgl-kernel
 Since sglang and the `sglang-kernel` (prior `sgl-kernel`) distribution are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
