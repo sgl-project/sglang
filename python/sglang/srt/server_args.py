@@ -3409,8 +3409,6 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._validate_mamba_max_states_per_path()
-
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3587,14 +3585,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
-
-    def _validate_mamba_max_states_per_path(self):
-        value = self.mamba_max_states_per_path
-        if value == 0 or value < -1:
-            raise ValueError(
-                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
-                f"integer, got {value}."
-            )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -5811,6 +5801,12 @@ class ServerArgs:
     def _handle_mamba_backend(self):
         if self.mamba_cache_philox_rounds < 0:
             raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.mamba_max_states_per_path == 0 or self.mamba_max_states_per_path < -1:
+            raise ValueError(
+                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
+                f"integer, got {self.mamba_max_states_per_path}."
+            )
 
         if self.enable_mamba_cache_stochastic_rounding:
             if self.mamba_ssm_dtype != "float16":
