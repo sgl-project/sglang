@@ -66,6 +66,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -1149,7 +1150,9 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        run_transformer_blocks = self.begin_spectrum_step()
+        forward_batch = get_forward_context().forward_batch
+        spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
+        run_transformer_blocks = self.begin_spectrum_step() if spectrum_enabled else True
         if run_transformer_blocks:
             for block in self.transformer_blocks:
                 encoder_hidden_states, hidden_states = block(
@@ -1169,9 +1172,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
-            self.spectrum_record_features(hidden_states)
+            if spectrum_enabled:
+                self.spectrum_record_features(hidden_states)
         else:
-            hidden_states = self.spectrum_predict_features(hidden_states)
+            if spectrum_enabled:
+                hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
 

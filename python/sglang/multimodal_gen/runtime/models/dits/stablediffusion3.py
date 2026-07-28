@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -128,7 +129,9 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             interval_control = 0
 
-        run_transformer_blocks = self.begin_spectrum_step()
+        forward_batch = get_forward_context().forward_batch
+        spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
+        run_transformer_blocks = self.begin_spectrum_step() if spectrum_enabled else True
         if run_transformer_blocks:
             for index_block, block in enumerate(self.transformer_blocks):
                 if index_block not in skip_layer_set:
@@ -150,9 +153,11 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                             int(index_block / interval_control)
                         ]
                     )
-            self.spectrum_record_features(hidden_states)
+            if spectrum_enabled:
+                self.spectrum_record_features(hidden_states)
         else:
-            hidden_states = self.spectrum_predict_features(hidden_states)
+            if spectrum_enabled:
+                hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
