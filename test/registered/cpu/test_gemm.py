@@ -184,6 +184,44 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
+    @parametrize(
+        M=[1, 11],
+        scale_as_vector=[False, True],
+        has_bias=[False, True],
+        prepack=[False, True],
+    )
+    def test_fp8_per_tensor_gemm(
+        self, M, scale_as_vector, has_bias, prepack
+    ):
+        """A scalar weight scale must dequantize the entire FP8 matrix."""
+        N = 128
+        K = 512
+        data = torch.randn(M, K, dtype=torch.bfloat16) / 10
+        weight = torch.randn(N, K).to(torch.float8_e4m3fn)
+        scale = torch.tensor(0.01, dtype=torch.float32)
+        scales = scale.reshape(1) if scale_as_vector else scale
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        ref = torch.matmul(data.float(), weight.float().T) * scale
+        if bias is not None:
+            ref = ref + bias
+        ref = ref.bfloat16()
+
+        kernel_weight = (
+            torch.ops.sgl_kernel.convert_weight_packed(weight) if prepack else weight
+        )
+        out = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            data,
+            kernel_weight,
+            scales,
+            bias,
+            data.dtype,
+            prepack,
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
         prepack = True
