@@ -422,7 +422,12 @@ def _build_ref_page_mask(kv_u8, src_pbs, idx):
     rmask_key = f"flash_mla_sm120_refmask:{kv_u8.device}"
     rmask = buffers.get(rmask_key)
     if rmask is None or rmask.shape[0] < N_src:
-        rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
+        # The first allocation can happen under inference mode (autotune),
+        # but the mask is zeroed each call including during CUDA graph
+        # capture outside inference mode, where an inference tensor cannot
+        # be mutated, so force a normal tensor.
+        with torch.inference_mode(False):
+            rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
         buffers[rmask_key] = rmask
     rmask = rmask[:N_src]
     rmask.zero_()
@@ -457,12 +462,17 @@ def _split_kv_pages_to_64(
     key = f"flash_mla_sm120_split:{dev}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
-        buf = torch.empty(
-            num_dst_pages,
-            _BYTES_PER_DST_PAGE_PADDED,
-            dtype=torch.uint8,
-            device=dev,
-        )
+        # The first allocation can happen under inference mode (autotune),
+        # but the buffer is written again later during CUDA graph capture
+        # outside inference mode, where an inference tensor cannot be
+        # mutated, so force a normal tensor.
+        with torch.inference_mode(False):
+            buf = torch.empty(
+                num_dst_pages,
+                _BYTES_PER_DST_PAGE_PADDED,
+                dtype=torch.uint8,
+                device=dev,
+            )
         buffers[key] = buf
     out = buf[:num_dst_pages]
 
