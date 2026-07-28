@@ -684,11 +684,11 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[bs:, :].fill_(0)
 
             # Update SWA mask: True = masked out (don't attend), False = attend
-            seq_lens_int = seq_lens_cpu[:bs].int()
+            seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
-            start_exp = starts.unsqueeze(1).to(self.device)
-            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            start_exp = starts.unsqueeze(1)
+            seq_exp = seq_lens_int.unsqueeze(1)
             mask = (indices.unsqueeze(0) < start_exp) | (
                 indices.unsqueeze(0) >= seq_exp
             )
@@ -849,7 +849,10 @@ class AscendAttnBackend(AttentionBackend):
         q_nope_next = q_nope_next.contiguous()
         q_rope_prev = q_rope_prev.contiguous()
         q_rope_next = q_rope_next.contiguous()
-        topk_indices_prev, topk_indices_next = topk_indices
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        topk_indices_prev, topk_indices_next = torch.split(
+            topk_indices, split_len, dim=0
+        )
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
