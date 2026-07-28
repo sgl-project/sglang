@@ -61,6 +61,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     initial_state,
     initial_state_indices,
     stride_init_state,
+    snapshot_state,
+    snapshot_chunk_indices,
+    snapshot_state_indices,
+    stride_snapshot_state,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -75,6 +79,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    SAVE_SNAPSHOT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -125,6 +130,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
         ht = ht + i_h * V * K
+    if SAVE_SNAPSHOT:
+        snapshot_chunk = tl.load(snapshot_chunk_indices + i_n).to(tl.int32)
+        snapshot_index = tl.load(snapshot_state_indices + i_n).to(tl.int64)
+        snapshot_index_safe = tl.maximum(snapshot_index, 0)
+        snapshot_base = (
+            snapshot_state + snapshot_index_safe * stride_snapshot_state + i_h * V * K
+        )
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -167,6 +179,45 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+
+        # `h` intentionally stays in the Q/K dtype because the output kernel
+        # consumes every chunk row. Prefix caching only needs one selected
+        # boundary per sequence, so preserve that row directly from the FP32
+        # recurrence accumulator instead of round-tripping through BF16 `h`.
+        if SAVE_SNAPSHOT:
+            o_v = i_v * BV + tl.arange(0, BV)
+            o_k1 = tl.arange(0, 64)
+            snapshot_mask = (i_t == snapshot_chunk) & (snapshot_index >= 0)
+            p_snapshot1 = snapshot_base + o_v[:, None] * K + o_k1[None, :]
+            tl.store(
+                p_snapshot1,
+                b_h1,
+                mask=snapshot_mask & (o_v[:, None] < V) & (o_k1[None, :] < K),
+            )
+            if K > 64:
+                o_k2 = 64 + o_k1
+                p_snapshot2 = snapshot_base + o_v[:, None] * K + o_k2[None, :]
+                tl.store(
+                    p_snapshot2,
+                    b_h2,
+                    mask=snapshot_mask & (o_v[:, None] < V) & (o_k2[None, :] < K),
+                )
+            if K > 128:
+                o_k3 = 128 + o_k1
+                p_snapshot3 = snapshot_base + o_v[:, None] * K + o_k3[None, :]
+                tl.store(
+                    p_snapshot3,
+                    b_h3,
+                    mask=snapshot_mask & (o_v[:, None] < V) & (o_k3[None, :] < K),
+                )
+            if K > 192:
+                o_k4 = 192 + o_k1
+                p_snapshot4 = snapshot_base + o_v[:, None] * K + o_k4[None, :]
+                tl.store(
+                    p_snapshot4,
+                    b_h4,
+                    mask=snapshot_mask & (o_v[:, None] < V) & (o_k4[None, :] < K),
+                )
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -322,6 +373,9 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
+    snapshot_state: Optional[torch.Tensor] = None,
+    snapshot_chunk_indices: Optional[torch.Tensor] = None,
+    snapshot_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (
         use_exp2 and g is not None
@@ -342,6 +396,31 @@ def chunk_gated_delta_rule_fwd_h(
             prepare_chunk_offsets(cu_seqlens, BT),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+    snapshot_args = (
+        snapshot_state,
+        snapshot_chunk_indices,
+        snapshot_state_indices,
+    )
+    if any(arg is not None for arg in snapshot_args) and not all(
+        arg is not None for arg in snapshot_args
+    ):
+        raise ValueError(
+            "snapshot_state, snapshot_chunk_indices, and snapshot_state_indices "
+            "must be provided together"
+        )
+    save_snapshot = snapshot_state is not None
+    if save_snapshot:
+        if snapshot_chunk_indices.numel() != N or snapshot_state_indices.numel() != N:
+            raise ValueError(
+                "KDA snapshot metadata must contain one entry per sequence: "
+                f"got chunks={snapshot_chunk_indices.numel()}, "
+                f"states={snapshot_state_indices.numel()}, sequences={N}"
+            )
+        if tuple(snapshot_state.shape[1:]) != (H, V, K):
+            raise ValueError(
+                "KDA snapshot state must have [slot, H, V, K] layout: "
+                f"got {tuple(snapshot_state.shape)}, expected [slot, {H}, {V}, {K}]"
+            )
 
     h = k.new_empty(B, NT, H, V, K)
 
@@ -363,6 +442,10 @@ def chunk_gated_delta_rule_fwd_h(
         # Envelope-strided state pools (page-major / unified memory) have a
         # per-slot pitch != H*V*K; contiguous pools pass exactly H*V*K.
         stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
+        snapshot_state=snapshot_state,
+        snapshot_chunk_indices=snapshot_chunk_indices,
+        snapshot_state_indices=snapshot_state_indices,
+        stride_snapshot_state=(snapshot_state.stride(0) if save_snapshot else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -376,6 +459,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
+        SAVE_SNAPSHOT=save_snapshot,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,

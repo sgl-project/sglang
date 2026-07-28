@@ -227,6 +227,16 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        snapshot_chunk_indices = kwargs.get("track_ssm_snapshot_chunk")
+        snapshot_state_indices = kwargs.get("track_ssm_snapshot_dst")
+        track_h_src = kwargs.get("track_ssm_h_src")
+        has_snapshot = (
+            snapshot_chunk_indices is not None
+            and snapshot_state_indices is not None
+            and track_h_src is not None
+            and track_h_src.numel() > 0
+        )
+        snapshot_state = ssm_states if has_snapshot else None
         return chunk_kda(
             q=q,
             k=k,
@@ -241,4 +251,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=return_intermediate_states,
+            snapshot_state=snapshot_state,
+            snapshot_chunk_indices=(
+                snapshot_chunk_indices if snapshot_state is not None else None
+            ),
+            snapshot_state_indices=(
+                snapshot_state_indices if snapshot_state is not None else None
+            ),
         )

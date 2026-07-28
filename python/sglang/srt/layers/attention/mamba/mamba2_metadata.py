@@ -53,6 +53,11 @@ class ForwardMetadata:
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_h_src: Optional[torch.Tensor] = None
     track_ssm_h_dst: Optional[torch.Tensor] = None
+    # Per-request local chunk index and destination slot for kernels that can
+    # write the selected boundary state directly from their FP32 accumulator.
+    # Untracked/aligned rows carry -1 and keep using the existing paths below.
+    track_ssm_snapshot_chunk: Optional[torch.Tensor] = None
+    track_ssm_snapshot_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
 
@@ -191,6 +196,8 @@ class Mamba2Metadata(ForwardMetadata):
             track_conv_indices=forward_metadata.track_conv_indices,
             track_ssm_h_src=forward_metadata.track_ssm_h_src,
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
+            track_ssm_snapshot_chunk=forward_metadata.track_ssm_snapshot_chunk,
+            track_ssm_snapshot_dst=forward_metadata.track_ssm_snapshot_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
@@ -282,6 +289,8 @@ class Mamba2Metadata(ForwardMetadata):
             track_conv_indices=forward_metadata.track_conv_indices,
             track_ssm_h_src=forward_metadata.track_ssm_h_src,
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
+            track_ssm_snapshot_chunk=forward_metadata.track_ssm_snapshot_chunk,
+            track_ssm_snapshot_dst=forward_metadata.track_ssm_snapshot_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,

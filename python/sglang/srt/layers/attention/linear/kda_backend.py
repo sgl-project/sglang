@@ -641,6 +641,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
+        direct_snapshot = (
+            track_ssm
+            and is_cuda()
+            and self.forward_metadata.track_ssm_h_src.numel() > 0
+        )
         core_attn_out = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -664,6 +669,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track_ssm_h_src=(
                 self.forward_metadata.track_ssm_h_src if track_ssm else None
             ),
+            track_ssm_snapshot_chunk=(
+                self.forward_metadata.track_ssm_snapshot_chunk
+                if direct_snapshot
+                else None
+            ),
+            track_ssm_snapshot_dst=(
+                self.forward_metadata.track_ssm_snapshot_dst
+                if direct_snapshot
+                else None
+            ),
         )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
@@ -671,7 +686,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # ping-pong track slots (see _init_track_ssm_indices).
             core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, self.forward_metadata
+                forward_batch,
+                h,
+                ssm_states,
+                self.forward_metadata,
+                intermediate_snapshot_written=direct_snapshot,
             )
 
         return core_attn_out

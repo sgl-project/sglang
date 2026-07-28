@@ -384,6 +384,112 @@ class TestKDAChunkExponentDomain(CustomTestCase):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAChunkCheckpointSnapshot(unittest.TestCase):
+    """The selected radix boundary must bypass BF16 intermediate `h`."""
+
+    @torch.inference_mode()
+    def test_selected_boundary_is_written_from_fp32_accumulator(self):
+        torch.manual_seed(42)
+        device = "cuda"
+        dtype = torch.bfloat16
+        lengths = [257, 129, 65]
+        boundaries = [256, 128]
+        num_heads, head_dim = 2, 128
+        total_tokens = sum(lengths)
+        shape = (1, total_tokens, num_heads, head_dim)
+
+        q = torch.nn.functional.normalize(
+            torch.randn(shape, dtype=torch.float32, device=device), dim=-1
+        ).to(dtype)
+        k = torch.nn.functional.normalize(
+            torch.randn(shape, dtype=torch.float32, device=device), dim=-1
+        ).to(dtype)
+        v = torch.randn(shape, dtype=dtype, device=device) * 0.1
+        g = -(torch.rand(shape, dtype=dtype, device=device) * 0.1 + 0.01)
+        beta = torch.rand(
+            1, total_tokens, num_heads, dtype=dtype, device=device
+        ).sigmoid()
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        active_slots = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+        snapshot_slots = torch.tensor([3, 4, -1], dtype=torch.int64, device=device)
+        snapshot_chunks = torch.tensor([4, 2, -1], dtype=torch.int64, device=device)
+        initial_pool = (
+            torch.randn(
+                5,
+                num_heads,
+                head_dim,
+                head_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.05
+        )
+
+        baseline_pool = initial_pool.clone()
+        baseline_output, baseline_h = chunk_kda(
+            q=q.clone(),
+            k=k.clone(),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            initial_state=baseline_pool,
+            initial_state_indices=active_slots,
+            cu_seqlens=cu_seqlens,
+            output_intermediate_states=True,
+        )
+
+        snapshot_pool = initial_pool.clone()
+        snapshot_output, snapshot_h = chunk_kda(
+            q=q.clone(),
+            k=k.clone(),
+            v=v.clone(),
+            g=g.clone(),
+            beta=beta.clone(),
+            initial_state=snapshot_pool,
+            initial_state_indices=active_slots,
+            cu_seqlens=cu_seqlens,
+            output_intermediate_states=True,
+            snapshot_state=snapshot_pool,
+            snapshot_chunk_indices=snapshot_chunks,
+            snapshot_state_indices=snapshot_slots,
+        )
+
+        self.assertTrue(torch.equal(snapshot_output, baseline_output))
+        self.assertTrue(torch.equal(snapshot_h, baseline_h))
+        self.assertTrue(
+            torch.equal(snapshot_pool[active_slots], baseline_pool[active_slots])
+        )
+
+        token_start = 0
+        for sequence_index, boundary in enumerate(boundaries):
+            reference_state = initial_pool[sequence_index : sequence_index + 1].clone()
+            token_end = token_start + boundary
+            chunk_kda(
+                q=q[:, token_start:token_end].clone(),
+                k=k[:, token_start:token_end].clone(),
+                v=v[:, token_start:token_end].clone(),
+                g=g[:, token_start:token_end].clone(),
+                beta=beta[:, token_start:token_end].clone(),
+                initial_state=reference_state,
+                initial_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+                cu_seqlens=torch.tensor(
+                    [0, boundary], dtype=torch.int32, device=device
+                ),
+            )
+            self.assertTrue(
+                torch.equal(
+                    snapshot_pool[snapshot_slots[sequence_index]], reference_state[0]
+                )
+            )
+            token_start += lengths[sequence_index]
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAPackedDecode(unittest.TestCase):
     """Verify ``fused_recurrent_kda_packed_decode`` matches the existing decode
     path (split + unflatten + ``fused_sigmoid_gating_delta_rule_update``)."""
