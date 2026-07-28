@@ -78,7 +78,7 @@ FAILED_SESSION_RECOVERIES = Counter(
 
 TRANSFER_QUIESCE_TIMEOUTS = Counter(
     "sglang:kv_transfer_quiesce_timeouts_total",
-    "Requests released while KV transfer work may still have been in flight.",
+    "Requests whose KV transfer quiescence deadline expired.",
 )
 
 # How often a decode rank re-sends an unacknowledged abort notification.
@@ -794,8 +794,8 @@ class MooncakeKVManager(CommonKVManager):
         and fails the worker once too many requests are stuck, because a restart
         releases every page safely while a silent overwrite does not.
         """
-        TRANSFER_QUIESCE_TIMEOUTS.inc()
         if self.transfer_barrier != TransferBarrierLevel.STRICT:
+            TRANSFER_QUIESCE_TIMEOUTS.inc()
             logger.error(
                 "Releasing KV pages for bootstrap_room=%s without proof that "
                 "transfer work stopped: %s. An in-flight write may still land in "
@@ -807,16 +807,19 @@ class MooncakeKVManager(CommonKVManager):
             return True
 
         with self._unquiesced_lock:
+            first_timeout = room not in self._unquiesced_rooms
             self._unquiesced_rooms.add(room)
             stuck = len(self._unquiesced_rooms)
-        logger.error(
-            "Withholding KV pages for bootstrap_room=%s: %s (%d/%d requests "
-            "stuck). STRICT will not reuse a page it cannot prove is idle.",
-            room,
-            reason,
-            stuck,
-            self.max_unquiesced,
-        )
+        if first_timeout:
+            TRANSFER_QUIESCE_TIMEOUTS.inc()
+            logger.error(
+                "Withholding KV pages for bootstrap_room=%s: %s (%d/%d requests "
+                "stuck). STRICT will not reuse a page it cannot prove is idle.",
+                room,
+                reason,
+                stuck,
+                self.max_unquiesced,
+            )
         if stuck >= self.max_unquiesced:
             # Unrecoverable: the only way to reclaim these pages safely is to
             # stop using this address space entirely. The scheduler's top-level
@@ -2950,10 +2953,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
         with self._abort_lock:
             if self._peer_lacks_barrier:
                 # A peer that acknowledges without echoing a nonce does so before
-                # its transfers drain, so its ACK is not proof. WARN accepts that
-                # and keeps a rolling upgrade working; STRICT cannot, by
-                # definition, so such a peer never satisfies the barrier.
-                return self.kv_mgr.transfer_barrier != TransferBarrierLevel.STRICT
+                # its transfers drain, so its ACK is not proof. WARN may credit
+                # that compatibility exception to one peer, but it must still
+                # receive every other peer's token. Tokenless ACKs carry no source
+                # identity and may be retries, so crediting more than one would
+                # let duplicates impersonate token-aware peers. STRICT cannot
+                # accept any proof-less peer.
+                return (
+                    self.kv_mgr.transfer_barrier != TransferBarrierLevel.STRICT
+                    and len(self._received_abort_acks) + 1
+                    >= len(self._expected_abort_acks)
+                )
             return self._expected_abort_acks <= self._received_abort_acks
 
     def _abort_targets_snapshot(self) -> List[Tuple[dict, bytes]]:
@@ -2979,16 +2989,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
             if not token:
                 # A prefill that predates the ownership barrier acknowledges the
                 # notification without echoing a nonce, and does so before its
-                # transfers have drained. It cannot promise quiescence, so stop
-                # waiting rather than stalling until the deadline.
+                # transfers have drained. It cannot promise quiescence. WARN can
+                # credit one such compatibility exception while still waiting
+                # for every token-aware peer; STRICT waits for proof or escalates.
                 self._peer_lacks_barrier = True
                 logger.warning_once(
                     "Prefill peer acknowledged an abort without a transfer-quiescence "
                     "token, so it acknowledges before its transfers drain and cannot "
-                    "prove quiescence. Upgrade the prefill instances; until then this "
-                    "request's pages are released on the "
-                    "SGLANG_DISAGGREGATION_TRANSFER_BARRIER policy rather than on "
-                    "proof, and STRICT will refuse to release them at all."
+                    "prove quiescence. Upgrade the prefill instances; WARN will still "
+                    "wait for every token-aware peer before crediting one legacy peer, "
+                    "and STRICT will refuse to release without proof."
                 )
                 return
             if token in self._expected_abort_acks:

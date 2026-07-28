@@ -1006,6 +1006,23 @@ class TestDecodeOwnership(unittest.TestCase):
         receiver.record_abort_ack(None)
         self.assertTrue(receiver.advance_failure_quiescence())
 
+    def test_legacy_ack_does_not_satisfy_a_token_aware_peer(self):
+        mgr = make_decode_manager()
+        receiver = make_receiver(
+            mgr, bootstrap_infos=[{"rank": "legacy"}, {"rank": "current"}]
+        )
+        self.assertFalse(receiver.advance_failure_quiescence())
+        tokens = {info["rank"]: token for info, token in receiver._abort_targets}
+
+        receiver.record_abort_ack(None)
+        self.assertFalse(
+            receiver.advance_failure_quiescence(),
+            "one legacy ACK must not satisfy another rank's outstanding token",
+        )
+
+        receiver.record_abort_ack(tokens["current"])
+        self.assertTrue(receiver.advance_failure_quiescence())
+
     def test_stale_ack_for_another_request_is_ignored(self):
         mgr = make_decode_manager()
         receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}])
@@ -1097,12 +1114,17 @@ class TestBarrierLevels(unittest.TestCase):
     def test_strict_never_releases_without_proof(self):
         mgr, sender = self._stuck_sender(TransferBarrierLevel.STRICT)
         self._arm_and_expire(sender)
-        with patch("sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"):
-            for _ in range(5):
-                self.assertFalse(
-                    sender.advance_failure_quiescence(),
-                    "STRICT must not hand back a page it cannot prove is idle",
-                )
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
+        ) as metric:
+            with patch("sglang.srt.disaggregation.mooncake.conn.logger.error") as error:
+                for _ in range(5):
+                    self.assertFalse(
+                        sender.advance_failure_quiescence(),
+                        "STRICT must not hand back a page it cannot prove is idle",
+                    )
+        metric.inc.assert_called_once_with()
+        error.assert_called_once()
         self.assertIn(
             ROOM, mgr._unquiesced_rooms, "the stuck room must be tracked for escalation"
         )
