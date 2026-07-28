@@ -6042,10 +6042,15 @@ class ServerArgs:
                         f"verify={verify!r}. Use SGLANG_RAGGED_VERIFY_MODE=static."
                     )
             if self.disaggregation_mode == "prefill":
-                raise ValueError(
-                    "--enable-linear-replayssm-spec is not supported on a PD "
-                    "prefill server: the ring is spec-verify-only scratch and "
-                    "the prefill server never runs spec verify."
+                if _algo != "DSPARK":
+                    raise ValueError(
+                        "--enable-linear-replayssm-spec is not supported on a PD "
+                        "prefill server: the ring is spec-verify-only scratch and "
+                        "the prefill server never runs spec verify."
+                    )
+                logger.warning(
+                    "--enable-linear-replayssm-spec is ignored on a DSPARK PD "
+                    "prefill server; spec verify runs on the decode server."
                 )
             if self.linear_replayssm_cache_len < 1:
                 raise ValueError(
@@ -8522,8 +8527,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
+            pp_dspark_pd = (
+                (self.speculative_algorithm or "").upper() == "DSPARK"
+                and self.disaggregation_mode in ("prefill", "decode")
+            )
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
+                self.disable_overlap_schedule
+                and (self.speculative_algorithm is None or pp_dspark_pd)
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (

@@ -927,6 +927,33 @@ def resolve_dcp_dst_entry_indices(
     ]
 
 
+def get_transfer_kv_layer_ids(kv_pool, num_entries: int) -> List[int]:
+    """Return global layer ids aligned with ``kv_pool.get_contiguous_buf_infos``.
+
+    Pools with a custom sparse/MLA layout expose ``get_kv_layer_ids`` directly.
+    Plain MHA-like draft pools usually expose only ``start_layer``/``end_layer``;
+    infer either one entry per layer or K/V tensor-major entries.
+    """
+    if kv_pool is None or num_entries <= 0:
+        return []
+
+    if hasattr(kv_pool, "get_kv_layer_ids"):
+        layer_ids = list(kv_pool.get_kv_layer_ids())
+        if len(layer_ids) == num_entries:
+            return layer_ids
+
+    start_layer = int(getattr(kv_pool, "start_layer", 0) or 0)
+    end_layer = getattr(kv_pool, "end_layer", None)
+    if end_layer is not None:
+        layer_ids = list(range(start_layer, int(end_layer)))
+        if len(layer_ids) == num_entries:
+            return layer_ids
+        if len(layer_ids) * 2 == num_entries:
+            return layer_ids * 2
+
+    return []
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,

@@ -1,6 +1,5 @@
 import logging
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -107,7 +106,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                ps=ps,
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -154,7 +153,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         target_model = self.target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        needs_lm_head = not (
+            self._is_pd_prefill
+            and self.ps.pp_size > 1
+            and self.ps.pp_rank + 1 < self.ps.pp_size
+            and not self._draft_is_moe
+        )
+        if needs_lm_head and (lm_head is None or not hasattr(lm_head, "weight")):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
@@ -409,16 +414,31 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
         logits_output = batch_output.logits_output
+        pp_proxy_tensors = batch_output.pp_hidden_states_proxy_tensors
+        target_hidden = (
+            logits_output.hidden_states
+            if logits_output is not None
+            else (
+                pp_proxy_tensors.tensors.get("dspark_aux_hidden_states")
+                if pp_proxy_tensors is not None
+                else None
+            )
+        )
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
-        if logits_output.hidden_states is None:
+        if target_hidden is None and self.ps.pp_size > 1:
+            target_hidden = torch.empty(
+                (0, 0), dtype=torch.float16, device=self.device
+            )
+        if target_hidden is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
+        has_local_target_hidden = target_hidden.numel() > 0
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -439,18 +459,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
-        )
+        if has_local_target_hidden:
+            self._kv_injector.inject_target_hidden(
+                target_hidden=target_hidden,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
+        if logits_output is not None:
+            logits_output.hidden_states = None
 
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
-        )
+        if next_token_ids is not None:
+            batch_output.next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
