@@ -88,9 +88,10 @@ class LingBotVideoGroupedExperts(nn.Module):
     ) -> None:
         super().__init__()
         self.num_experts = num_experts
-        self.w1 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.w13_weight = nn.Parameter(
+            torch.empty(num_experts, 2 * intermediate_size, hidden_size)
+        )
         self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
-        self.w3 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
 
 
 class LingBotVideoSparseMoeBlock(nn.Module):
@@ -148,8 +149,7 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             topk_ids=top_indices.to(torch.int32),
             router_logits=torch.empty(0, device=tokens.device),
         )
-        # inplace=False (router pre-scales weights); gate_up_interleaved=False
-        # (w13 = cat(gate, up), contiguous not interleaved).
+        # Router pre-scales the topk scores; fused_experts must not apply routed_scaling_factor.
         runner_config = MoeRunnerConfig(
             num_experts=self.num_experts,
             num_local_experts=self.num_experts,
@@ -163,12 +163,10 @@ class LingBotVideoSparseMoeBlock(nn.Module):
             routed_scaling_factor=None,
             gate_up_interleaved=False,
         )
-        w13 = torch.cat((self.experts.w1, self.experts.w3), dim=1).contiguous()
-        w2 = self.experts.w2.contiguous()
         return fused_experts(
             tokens.contiguous().bfloat16(),
-            w13.bfloat16(),
-            w2.bfloat16(),
+            self.experts.w13_weight.bfloat16(),
+            self.experts.w2.bfloat16(),
             topk_output,
             runner_config,
         ).type_as(tokens)

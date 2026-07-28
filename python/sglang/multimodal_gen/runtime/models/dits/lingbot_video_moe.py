@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +89,41 @@ def make_joint_position_ids(
         [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
     )
     return torch.cat([grid, text_pos], dim=0)  # (Nx + L, 3)
+
+
+def _joint_position_ids(
+    text_lens: torch.Tensor,
+    grid_t: int,
+    grid_h: int,
+    grid_w: int,
+    text_len_padded: int,
+    device: torch.device,
+) -> torch.Tensor:
+    # Joint video;text positions for rotary_emb; on-device, padding masked in attention.
+    B = text_lens.shape[0]
+    n_video = grid_t * grid_h * grid_w
+    seq_len = n_video + text_len_padded
+    text_lens_i = text_lens.to(torch.int32)
+    tt = torch.arange(grid_t, device=device, dtype=torch.int32)
+    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
+    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
+    video_t = (text_lens_i + 1)[:, None] + tt[None, :]
+    t_g = video_t[:, :, None, None].expand(B, grid_t, grid_h, grid_w)
+    h_g = hh[None, None, :, None].expand(B, grid_t, grid_h, grid_w)
+    w_g = ww[None, None, None, :].expand(B, grid_t, grid_h, grid_w)
+    video_pos = torch.stack([t_g, h_g, w_g], dim=-1).reshape(B, n_video, 3)
+    text_t = (
+        torch.arange(text_len_padded, device=device, dtype=torch.int32)[None, :] + 1
+    )
+    real = (
+        torch.arange(text_len_padded, device=device, dtype=torch.int32)[None, :]
+        < text_lens_i[:, None]
+    )
+    text_t = torch.where(real, text_t, torch.zeros_like(text_t))
+    text_pos = torch.stack(
+        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
+    )
+    return torch.cat([video_pos, text_pos], dim=1).reshape(B * seq_len, 3)
 
 
 class LingBotVideoTextEmbedder(nn.Module):
@@ -181,34 +216,14 @@ class LingBotVideoAttention(nn.Module):
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         B, S, H, D = q.shape
-        if B > 1:
-            # cos/sin are laid out per token over the flattened batch, so RoPE
-            # runs flattened; attention runs per sample, else samples attend
-            # across batch boundaries (the reference packs with varlen).
-            q = _apply_rotary_emb(
-                q.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
-            ).reshape(B, S, H, D)
-            k = _apply_rotary_emb(
-                k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
-            ).reshape(B, S, H, D)
-            sample_outs = []
-            for i in range(B):
-                sample_mask = (
-                    attention_mask[i : i + 1] if attention_mask is not None else None
-                )
-                sample_outs.append(
-                    self.attn(
-                        q[i : i + 1],
-                        k[i : i + 1],
-                        v[i : i + 1],
-                        attn_mask=sample_mask,
-                    )
-                )
-            out = torch.cat(sample_outs, dim=0)
-        else:
-            q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-            k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-            out = self.attn(q, k, v, attn_mask=attention_mask)
+        # RoPE over the flattened batch; one batched call, the key mask isolates samples.
+        q = _apply_rotary_emb(
+            q.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+        ).reshape(B, S, H, D)
+        k = _apply_rotary_emb(
+            k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
+        ).reshape(B, S, H, D)
+        out = self.attn(q, k, v, attn_mask=attention_mask)
         out = out.flatten(2)
         out, _ = self.to_out(out)
         return out
@@ -357,6 +372,26 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         return self
 
+    def preprocess_loaded_state_dict(
+        self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        # Pack experts.w1+w3 into experts.w13_weight, gate then up on dim 1; w2 passes through.
+        seen: dict[str, list[torch.Tensor | None]] = {}
+        for name, tensor in weight_iterator:
+            suffix = next(
+                (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
+                None,
+            )
+            if suffix is None:
+                yield name, tensor
+                continue
+            prefix = name[: -len(suffix)]
+            pair = seen.setdefault(prefix, [None, None])
+            pair[0 if suffix.endswith(".w1") else 1] = tensor
+            if pair[0] is not None and pair[1] is not None:
+                yield f"{prefix}.ffn.experts.w13_weight", torch.cat(pair, dim=1)
+                del seen[prefix]
+
     def __init__(
         self,
         config: LingBotVideoMoEConfig,
@@ -466,7 +501,6 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             text_lens = encoder_attention_mask.sum(dim=-1).long()
         else:
             text_lens = torch.full((B,), L, dtype=torch.long, device=device)
-        text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
 
         patch_tokens = hidden_states.reshape(B, C, gt, pF, gh, pH, gw, pW)
         patch_tokens = patch_tokens.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(
@@ -480,19 +514,13 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        rotary_parts = [
-            self.rotary_emb.forward_uncached(
-                make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)
-            )
-            for i in range(B)
-        ]
-        cos = torch.cat([c for c, _ in rotary_parts], dim=0)  # (B*S, head_dim//2)
-        sin = torch.cat([s for _, s in rotary_parts], dim=0)
+        positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
+        cos, sin = self.rotary_emb.forward_uncached(positions)
         freqs_cis = (cos.float(), sin.float())
 
         attention_mask = None
-        has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
-        if has_padding:
+        # B==1 text is trimmed to true length upstream, so no mask; B>1 may pad, build a key mask.
+        if B > 1 and encoder_attention_mask is not None:
             key_mask = torch.cat(
                 [
                     torch.ones(B, n_video, dtype=torch.bool, device=device),
@@ -500,7 +528,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 ],
                 dim=1,
             )
-            attention_mask = key_mask[:, None, None, :]  # (B,1,1,S) mask broadcast
+            attention_mask = key_mask[:, None, None, :]
 
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)

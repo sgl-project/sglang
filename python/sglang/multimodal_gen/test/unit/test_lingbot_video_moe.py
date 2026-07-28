@@ -17,12 +17,18 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
-from sglang.multimodal_gen.runtime.layers.moe import LingBotVideoRouter
+from sglang.multimodal_gen.runtime.layers.moe import (
+    LingBotVideoGroupedExperts,
+    LingBotVideoRouter,
+)
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_video_moe as dits_lingbot_video_moe,
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
+    LingBotVideoTransformer3DModel,
+    _joint_position_ids,
+    make_joint_position_ids,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -259,3 +265,75 @@ def test_decode_scale_and_shift_invert_vae_normalization():
 def test_latents_stay_fp32_under_bf16_precision():
     config = LingBotVideoMoEPipelineConfig()
     assert config.get_latent_dtype(torch.bfloat16) == torch.float32
+
+
+def test_grouped_experts_store_packed_w13_weight():
+    experts = LingBotVideoGroupedExperts(
+        num_experts=2, hidden_size=4, intermediate_size=3
+    )
+    names = {n for n, _ in experts.named_parameters()}
+    assert "w13_weight" in names and "w2" in names
+    assert "w1" not in names and "w3" not in names
+    assert tuple(experts.w13_weight.shape) == (2, 6, 4)  # [E, 2I, H]
+
+
+def test_preprocess_packs_w1_w3_into_w13_weight():
+    pack = LingBotVideoTransformer3DModel.preprocess_loaded_state_dict
+    E, I, H = 2, 3, 4
+    w1 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H)
+    w2 = torch.arange(E * H * I, dtype=torch.float32).reshape(E, H, I)
+    w3 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H) + 100.0
+    # block 0: w1 before w3; block 1: w3 before w1 (order-independence).
+    src = [
+        ("blocks.0.ffn.experts.w1", w1),
+        ("blocks.0.ffn.experts.w2", w2),
+        ("blocks.0.ffn.experts.w3", w3),
+        ("blocks.0.ffn.router.weight", torch.zeros(E, H)),
+        ("blocks.1.ffn.experts.w3", w3.clone()),
+        ("blocks.1.ffn.experts.w2", w2.clone()),
+        ("blocks.1.ffn.experts.w1", w1.clone()),
+    ]
+    out = dict(pack(None, iter(src)))
+    assert set(out.keys()) == {
+        "blocks.0.ffn.experts.w13_weight",
+        "blocks.0.ffn.experts.w2",
+        "blocks.0.ffn.router.weight",
+        "blocks.1.ffn.experts.w13_weight",
+        "blocks.1.ffn.experts.w2",
+    }
+    packed = torch.cat((w1, w3), dim=1)  # gate then up, dim-1
+    torch.testing.assert_close(out["blocks.0.ffn.experts.w13_weight"], packed)
+    torch.testing.assert_close(out["blocks.1.ffn.experts.w13_weight"], packed)
+    torch.testing.assert_close(out["blocks.0.ffn.experts.w2"], w2)
+
+
+def test_joint_position_ids_match_reference_and_cover_padding():
+    dev = torch.device("cpu")
+    gt, gh, gw = 2, 3, 4
+    n_video = gt * gh * gw
+
+    # B==1, no padding: byte-identical to the per-sample reference.
+    vec = _joint_position_ids(torch.tensor([5]), gt, gh, gw, 5, dev)
+    torch.testing.assert_close(vec, make_joint_position_ids(5, gt, gh, gw, dev))
+
+    # B==1 with padding: real tokens match the text_len=4 reference; the extra
+    # padding row is (0,0,0). vec has n_video+L rows (matches q for B*S).
+    vec_p = _joint_position_ids(torch.tensor([4]), gt, gh, gw, 5, dev)
+    torch.testing.assert_close(
+        vec_p[: n_video + 4], make_joint_position_ids(4, gt, gh, gw, dev)
+    )
+    torch.testing.assert_close(
+        vec_p[n_video + 4 :], torch.zeros((1, 3), dtype=torch.int32)
+    )
+
+    # B>1 with padding: covers B*S rows; each sample's real tokens match its ref.
+    text_lens = [5, 3, 6]
+    B, L = len(text_lens), 6
+    vec_b = _joint_position_ids(torch.tensor(text_lens), gt, gh, gw, L, dev)
+    assert vec_b.shape[0] == B * (n_video + L)
+    for i, t in enumerate(text_lens):
+        start = i * (n_video + L)
+        real = n_video + t
+        torch.testing.assert_close(
+            vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
+        )
