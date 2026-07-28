@@ -356,6 +356,68 @@ class TestCausalConv3dCache(unittest.TestCase):
         self.assertLess(tail.untyped_storage().nbytes(), x.numel() * x.element_size())
 
 
+class TestConvImplIsTheOnlyBackendSeam(unittest.TestCase):
+    """Backends swap out `_conv_impl`; that must not bypass the cache.
+
+    ROCm's `optimize_vae` replaces the convolution with a temporally unfolded
+    batched Conv2D. It used to replace `forward` wholesale, which after this
+    refactor would have skipped the cache update entirely and silently produced
+    wrong output rather than merely slower output.
+    """
+
+    def setUp(self):
+        self.generator = torch.Generator().manual_seed(99)
+
+    def test_patching_conv_impl_still_updates_the_cache(self):
+        conv = CausalConv3d(4, 4, 3, padding=1).double().eval()
+        conv.cache_key = "conv"
+        calls = []
+        real_conv_impl = conv._conv_impl
+
+        def spy(x):
+            calls.append(x.shape[2])
+            return real_conv_impl(x)
+
+        conv._conv_impl = spy
+        chunks = _make_chunks((1, 4, 1, 5, 7), 3, generator=self.generator)
+        _run_managed(conv, chunks)
+
+        # Every chunk must reach the backend with its cached frames prepended.
+        self.assertEqual(calls, [1 + conv.cache_frames] * len(chunks))
+
+    def test_spatial_padding_is_reported_for_the_backend(self):
+        """A backend padding by hand needs to know what the conv would have used."""
+        self.assertEqual(CausalConv3d(4, 4, 3, padding=1).spatial_padding(), (0, 1, 1))
+        self.assertEqual(CausalConv3d(4, 4, 1).spatial_padding(), (0, 0, 0))
+        self.assertEqual(
+            TimeUpsampleCausalConv3d(
+                4, 8, (3, 1, 1), padding=(1, 0, 0)
+            ).spatial_padding(),
+            (0, 0, 0),
+        )
+
+    def test_rocm_conv2d_decomposition_matches_conv3d(self):
+        """The ROCm unfold path must agree with the conv it replaces.
+
+        Checked here rather than only on a ROCm runner: the decomposition is
+        plain torch, so its arithmetic is verifiable anywhere.
+        """
+        from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
+
+        conv = CausalConv3d(4, 6, 3, padding=1).double().eval()
+        weight_2d = (
+            conv.weight.data.permute(0, 2, 1, 3, 4)
+            .reshape(conv.out_channels, 3 * conv.in_channels, 3, 3)
+            .contiguous()
+        )
+        x = torch.randn((1, 4, 5, 6, 7), dtype=torch.float64, generator=self.generator)
+        expected = F.conv3d(x, conv.weight, conv.bias, conv.stride, (0, 1, 1))
+        produced = RocmPlatform._conv3d_as_batched_conv2d(
+            x, weight_2d, conv.bias, conv.stride, 3, spatial_padding=(1, 1)
+        )
+        torch.testing.assert_close(produced, expected)
+
+
 class TestWanVaeCacheLifecycle(unittest.TestCase):
     """End-to-end properties of the cache across a whole tiny Wan VAE."""
 
