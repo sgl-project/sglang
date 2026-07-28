@@ -156,6 +156,7 @@ class NativeMmHost:
         try:
             spec = {
                 "family": "qwen_vl",
+                "feature_shm": self._use_feature_shm(),
                 "image_token_id": hf_config.image_token_id,
                 "patch_size": ip.patch_size,
                 "merge_size": ip.merge_size,
@@ -180,6 +181,31 @@ class NativeMmHost:
         logger.info("rust server: native MM pipeline enabled (family=qwen_vl)")
         return json.dumps(spec)
 
+    def _use_feature_shm(self) -> bool:
+        """Park native feature buffers in POSIX shm instead of the sidecar.
+
+        On when — and only when — the drained request is broadcast across TP
+        ranks AND the receiver's ``unwrap_shm_features`` will materialize the
+        stubs (its gates: non-default tensor transport, no
+        ``skip_tokenizer_init``). With inline tensors the whole feature buffer
+        (~20 MB/image) rides ``broadcast_pyobj`` serially on the scheduler
+        loop; ranks 1..n then start the TP-sharded ViT ~30 ms after rank 0 and
+        every rank stalls at the first collective for exactly that skew. With
+        shm the broadcast carries a ~100-byte stub and all ranks map +
+        materialize in parallel behind the receiver's barrier — the same
+        transport the Python TokenizerManager uses. Single-rank serving keeps
+        the zero-copy inline path (shm would only add a copy per image).
+        """
+        from sglang.srt.managers.tokenizer_manager import (
+            determine_tensor_transport_mode,
+        )
+
+        return (
+            self.server_args.tp_size > 1
+            and determine_tensor_transport_mode(self.server_args) != "default"
+            and not self.server_args.skip_tokenizer_init
+        )
+
     def build_native_mm(self, entry: tuple):
         """Drain-time adapter: wrap the Rust-produced buffers into the
         scheduler's ``MultimodalProcessorOutput``. Only tensor wrapping happens
@@ -193,6 +219,7 @@ class NativeMmHost:
         stalls every running request's inter-token latency."""
         import torch
 
+        from sglang.srt.managers.mm_utils import ShmPointerMMData
         from sglang.srt.managers.schedule_batch import (
             Modality,
             MultimodalDataItem,
@@ -200,16 +227,38 @@ class NativeMmHost:
         )
 
         native = self._native
-        features_arr, grids, hashes, offsets, mrope_arr, mrope_delta = entry
-        features = torch.from_numpy(features_arr.reshape(-1, native["feature_dim"]))
+        features_arr, shm_names, grids, hashes, offsets, mrope_arr, mrope_delta = entry
+        if shm_names is None:
+            features = torch.from_numpy(
+                features_arr.reshape(-1, native["feature_dim"])
+            )
         items = []
         row = 0
-        for (t, h, w), item_hash, offset in zip(grids, hashes, offsets):
+        for index, ((t, h, w), item_hash, offset) in enumerate(
+            zip(grids, hashes, offsets)
+        ):
             n = t * h * w
+            if shm_names is None:
+                feature = features[row : row + n]
+            else:
+                # The worker parked this item's buffer in a named POSIX
+                # segment (see `_use_feature_shm`). Build the stub in its
+                # post-`__setstate__` form: rank 0 never pickle-roundtrips its
+                # own copy, and `materialize()` needs the mapped view.
+                # Ownership of the unlink moved here with `take_mm`.
+                feature = ShmPointerMMData.__new__(ShmPointerMMData)
+                feature.__setstate__(
+                    {
+                        "shm_name": shm_names[index],
+                        "shape": (n, native["feature_dim"]),
+                        "dtype": torch.float32,
+                        "precomputed_hash": item_hash,
+                    }
+                )
             items.append(
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
-                    feature=features[row : row + n],
+                    feature=feature,
                     hash=item_hash,
                     offsets=[tuple(offset)],
                     model_specific_data={

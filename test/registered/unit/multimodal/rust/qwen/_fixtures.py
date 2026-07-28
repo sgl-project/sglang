@@ -65,6 +65,10 @@ def make_processor(config):
         mm_feature_transport="cpu",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,
+        # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
+        # inline zero-copy transport, like the 1-GPU e2e).
+        tp_size=1,
+        dist_init_addr=None,
         mm_process_config={},
         mm_io_worker_num=1,
         mm_processor_worker_num=1,

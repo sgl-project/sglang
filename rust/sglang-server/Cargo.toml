@@ -33,7 +33,13 @@ axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
 dynamo-tokenizers = "1.5.3"
 flume = "0.12.0"
+# Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
+bytemuck = "1"
 itertools = "0.14"
+# POSIX shm for the MM feature fan-out (`mm::ShmSegment`): the worker writes
+# feature buffers into named segments so the TP broadcast carries a pointer,
+# not the tensor. Linux-only crate usage; no default features needed.
+libc = "0.2"
 # Same major as the workspace pyo3: the zero-copy MM drain
 # (`take_mm`) moves Rust vectors into numpy arrays.
 numpy = "0.29.0"

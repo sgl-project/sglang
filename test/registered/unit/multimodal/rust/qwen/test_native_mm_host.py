@@ -70,7 +70,9 @@ class TestQwenNativeMmHost(CustomTestCase):
         ids, features, grids, hashes, offsets, mrope, delta = raw
 
         rust_output = host.build_native_mm(
-            (features, grids, hashes, offsets, mrope, delta)
+            # Inline entry shape (single-rank; `shm_names=None`). The shm
+            # shape's wrapping contract is pinned by test_build_native_mm.
+            (features, None, grids, hashes, offsets, mrope, delta)
         )
         request = SimpleNamespace(video_data=None, audio_data=None, rid="parity")
         python_output = asyncio.run(
