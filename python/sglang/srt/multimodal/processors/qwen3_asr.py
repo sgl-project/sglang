@@ -1,3 +1,4 @@
+import logging
 import re
 from typing import Union
 
@@ -5,18 +6,18 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from sglang.srt.multimodal import audio_encoder_windowing
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 
+logger = logging.getLogger(__name__)
+
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 DEFAULT_ASR_PROMPT = (
-    f"<|im_start|>user\n"
-    f"{AUDIO_PLACEHOLDER}"
-    f"<|im_end|>\n"
-    f"<|im_start|>assistant\n"
+    f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
@@ -50,6 +51,41 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             return DEFAULT_ASR_PROMPT
         return input_text
 
+    def resolve_audio_encoder_window_config(self, model_sample_rate):
+        audio_config = self.hf_config.thinker_config.audio_config
+        # The encoder chunks mel features in 2 * n_window-frame blocks, so a
+        # reusable attention window must contain an integral number of them.
+        return audio_encoder_windowing.resolve_audio_encoder_window_config(
+            window_frames=int(audio_config.n_window_infer),
+            alignment_frames=2 * int(audio_config.n_window),
+            processor=self._processor,
+            model_sample_rate=model_sample_rate,
+        )
+
+    def _process_audio_encoder_windows(self, base_output, window_config):
+        raw_items = base_output.audios
+        if len(base_output.organize_results()) != 1 or len(raw_items) != 1:
+            raise ValueError("audio windowing requires exactly one audio item")
+
+        input_ids = self._tokenizer(
+            base_output.input_text,
+            return_tensors="pt",
+            padding=False,
+        ).input_ids.flatten()
+        mm_items, input_ids = audio_encoder_windowing.build_audio_encoder_windows(
+            samples=raw_items[0],
+            input_ids=input_ids,
+            placeholder_token_id=self.audio_token_id,
+            config=window_config,
+            processor=self._processor,
+        )
+        # Window items arrive with offsets and features set; only transport
+        # preparation remains.
+        if self.use_cuda_ipc:
+            for item in mm_items:
+                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+        return mm_items, input_ids
+
     def compute_mrope_positions(self, input_ids, mm_items):
         if isinstance(input_ids, list):
             seq_len = len(input_ids)
@@ -79,9 +115,24 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
-            base_output, self.mm_tokens
-        )
+        window_config = kwargs.get("audio_encoder_window_config")
+        if window_config is not None:
+            try:
+                mm_items, input_ids = self._process_audio_encoder_windows(
+                    base_output, window_config
+                )
+            except ValueError:
+                logger.warning(
+                    "Audio encoder windowing failed; using monolithic processing",
+                    exc_info=True,
+                )
+                mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                    base_output, self.mm_tokens
+                )
+        else:
+            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens
+            )
 
         mrope_positions, mrope_position_delta = self.compute_mrope_positions(
             input_ids, mm_items

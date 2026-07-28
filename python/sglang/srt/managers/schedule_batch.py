@@ -310,6 +310,7 @@ class MultimodalDataItem:
     """
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
+    A processor may also split one input into several items when they encode independently.
 
     Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
 
@@ -328,6 +329,8 @@ class MultimodalDataItem:
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
+    # One-use items skip the embedding cache so they cannot evict reusable entries.
+    use_embedding_cache: bool = True
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -369,9 +372,10 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
 
-        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+        # A preset hash must survive SGLANG_MM_SKIP_COMPUTE_HASH unchanged.
+        if self.hash is None and envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
             import uuid
 
             self.hash = uuid.uuid4().int
@@ -382,7 +386,9 @@ class MultimodalDataItem:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+            self.hash = hash_mm_item(
+                hash_feature(hashed_feature), self.modality, self.offsets
+            )
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
 

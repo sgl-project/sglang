@@ -16,6 +16,8 @@ relies on.
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -84,6 +86,25 @@ class TestMmHashesContract(CustomTestCase):
 
         self.assertEqual(item.hash, 0xBBBB)
         self.assertEqual(item.pad_value, _compute_pad_value(0xBBBB))
+
+    def test_automatic_hash_includes_token_geometry(self):
+        feature = torch.ones(2, 3)
+        short = MultimodalDataItem(
+            modality=Modality.AUDIO, feature=feature, offsets=[(2, 4)]
+        )
+        long = MultimodalDataItem(
+            modality=Modality.AUDIO, feature=feature, offsets=[(2, 5)]
+        )
+        relocated = MultimodalDataItem(
+            modality=Modality.AUDIO, feature=feature, offsets=[(20, 22)]
+        )
+
+        short.set_pad_value()
+        long.set_pad_value()
+        relocated.set_pad_value()
+
+        self.assertNotEqual(short.hash, long.hash)
+        self.assertEqual(short.hash, relocated.hash)
 
 
 if __name__ == "__main__":

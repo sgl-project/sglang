@@ -200,6 +200,8 @@ def _acknowledge_deferred_cuda_ipc_cache_hits(
     the equivalent single acknowledgement.  This preserves the fixed-pool
     lifecycle without reintroducing an unnecessary GPU-to-GPU copy.
     """
+    if not any(item.has_cuda_ipc_proxy() for item in items):
+        return
     parallel = get_parallel()
     if parallel.attn_tp_rank != 0:
         return
@@ -310,7 +312,11 @@ def _batch_encode_per_image_misses(
         for _idx, item, start, end in overlapping:
             if item.hash in hash_to_embedding:
                 continue
-            cached = embedding_cache.get_single(item.hash)
+            cached = (
+                embedding_cache.get_single(item.hash)
+                if item.use_embedding_cache
+                else None
+            )
             if cached is not None:
                 hash_to_embedding[item.hash] = cached.embedding
             elif item.hash not in unique_misses:
@@ -345,7 +351,8 @@ def _batch_encode_per_image_misses(
             )
             split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
         for h, emb in zip(ordered_hashes, split_embeddings):
-            embedding_cache.set(h, EmbeddingResult(embedding=emb))
+            if unique_misses[h][0].use_embedding_cache:
+                embedding_cache.set(h, EmbeddingResult(embedding=emb))
             # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
             hash_to_embedding[h] = emb
 
@@ -383,7 +390,9 @@ def _get_chunked_embedding_by_item(
     cached_embeddings = {}
     miss_items = []
     for idx, item, start, end in overlapping:
-        cached = embedding_cache.get_single(item.hash)
+        cached = (
+            embedding_cache.get_single(item.hash) if item.use_embedding_cache else None
+        )
         if cached is not None:
             cached_embeddings[idx] = cached.embedding
             _acknowledge_deferred_cuda_ipc_cache_hits([item])
@@ -417,7 +426,8 @@ def _get_chunked_embedding_by_item(
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
             cached_embeddings[idx] = emb
-            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+            if item.use_embedding_cache:
+                embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
 
     chunk_slices = []
     for idx, _, start, end in overlapping:

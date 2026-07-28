@@ -371,6 +371,11 @@ class BaseMultimodalProcessor(ABC):
         """
         return None, None
 
+    def resolve_audio_encoder_window_config(self, model_sample_rate: int):
+        # Model-specific processors that support encoder-aligned audio
+        # windowing override this with their own geometry.
+        raise ValueError("model does not support audio encoder windowing")
+
     @property
     def spatial_merge_size(self):
         return self.hf_config.vision_config.spatial_merge_size
