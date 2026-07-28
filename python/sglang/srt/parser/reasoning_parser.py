@@ -460,8 +460,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
         if tools_idx != -1:
-            return _strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
-        return _strip_response_wrappers(text)
+            return self._strip_markers(_strip_response_wrappers(text[:tools_idx])) + text[tools_idx:]
+        return self._strip_markers(_strip_response_wrappers(text))
 
     # a think close is <|close|>think followed by <|sep|> (consumed), another marker,
     # an end token, or — non-streaming only — the end of the text
@@ -571,6 +571,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
         return StreamingParseResult(normal_text=self._drain_content())
 
+    # think markers included: when the template does not pre-open a think section
+    # the model may still emit a stray close, which lands in the content channel
+    _CONTENT_STRIP = (THINK_CLOSE, THINK_OPEN, RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE)
+
+    def _strip_markers(self, text: str) -> str:
+        for marker in self._CONTENT_STRIP:
+            text = text.replace(marker, "")
+        return text
+
     def _drain_content(self) -> str:
         buf = self._buffer
         if not buf:
@@ -581,21 +590,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
         tools_idx = buf.find(TOOLS_OPEN)
         if tools_idx != -1:
-            head = buf[:tools_idx]
-            for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
-                head = head.replace(marker, "")
+            head = self._strip_markers(buf[:tools_idx])
             self._tools_passthrough = True
             self._buffer = ""
             return head + buf[tools_idx:]
 
-        holdback = _partial_suffix_len(
-            buf, [RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE, TOOLS_OPEN]
-        )
+        holdback = _partial_suffix_len(buf, list(self._CONTENT_STRIP) + [TOOLS_OPEN])
         emit = buf[: len(buf) - holdback] if holdback else buf
         self._buffer = buf[len(emit) :]
-        for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
-            emit = emit.replace(marker, "")
-        return emit
+        return self._strip_markers(emit)
 
 
 class Glm45Detector(BaseReasoningFormatDetector):

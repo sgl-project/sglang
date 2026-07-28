@@ -362,6 +362,28 @@ class TestKimiK3ReasoningDetector(unittest.TestCase):
         self.assertEqual(reasoning, "thinking...")
         self.assertNotIn("<|close|>", reasoning + content)
 
+    def test_streaming_stray_close_when_not_forced(self):
+        # template did not pre-open think but the model emits a close anyway;
+        # seen as a leading <|close|>think<|sep|> in claude code output
+        detector = KimiK3ReasoningDetector(force_reasoning=False)
+        chunks = ["<|close|>thi", "nk<|sep|>The file", " contains hello"]
+        reasoning, content = self._stream(detector, chunks)
+        self.assertEqual(content, "The file contains hello")
+        self.assertNotIn("<|", reasoning + content)
+
+    def test_non_stream_stray_close_when_not_forced(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=False)
+        result = detector.detect_and_parse("<|close|>think<|sep|>The answer is 4.")
+        self.assertEqual(result.normal_text, "The answer is 4.")
+        self.assertNotIn("<|", result.reasoning_text or "")
+
+    def test_streaming_stray_open_mid_content(self):
+        detector = KimiK3ReasoningDetector(force_reasoning=False)
+        reasoning, content = self._stream(
+            detector, ["plain text ", "<|open|>think<|sep|>more text"]
+        )
+        self.assertEqual(content, "plain text more text")
+
     def test_streaming_elided_think_close_char_by_char(self):
         detector = KimiK3ReasoningDetector(force_reasoning=True)
         full = (
