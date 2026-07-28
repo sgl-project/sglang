@@ -41,17 +41,12 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.utils.common import is_cuda, is_npu, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
 register_npu_ci(est_time=747, suite="full-2-npu-a3", nightly=True)
 
 IMAGE_MAN_IRONING_URL = IMAGE_MAN_IRONING_PATH
 IMAGE_SGL_LOGO_URL = IMAGE_SGL_LOGO_PATH
-
-_is_cuda = is_cuda()
-_is_xpu = is_xpu()
-_is_npu = is_npu()
 
 
 class VLMInputTestBase:
@@ -66,14 +61,7 @@ class VLMInputTestBase:
         assert cls.chat_template is not None, "Set chat_template in subclass"
 
         cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
-        if _is_cuda:
-            cls.device = torch.device("cuda")
-        elif _is_xpu:
-            cls.device = torch.device("xpu")
-        elif _is_npu:
-            cls.device = torch.device("npu")
-        else:
-            cls.device = torch.device("cpu")
+        cls.device = torch.device("npu")
 
         cls.main_image = []
         for image_url in cls.image_urls:
@@ -194,7 +182,7 @@ class VLMInputTestBase:
             precomputed_embeddings = self.__class__.visual(processor_output)
 
         output = await self.engine.async_generate(
-            input_ids=processor_output["input_ids"][0].detach().unsqueeze(0).tolist(),
+            input_ids=processor_output["input_ids"][0].tolist(),
             image_data=[
                 self._precomputed_image_data(processor_output, precomputed_embeddings)
             ],
@@ -206,7 +194,7 @@ class VLMInputTestBase:
         req = self.get_completion_request()
         processor_output, prompt = self.get_processor_output(req=req)
         output = await self.engine.async_generate(
-            input_ids=processor_output["input_ids"][0].detach().unsqueeze(0).tolist(),
+            input_ids=processor_output["input_ids"][0].tolist(),
             image_data=[self._processor_output_image_data(processor_output)],
             sampling_params=dict(temperature=0.0, max_new_tokens=512),
         )
