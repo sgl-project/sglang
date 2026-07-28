@@ -5,7 +5,7 @@
 import datetime
 import logging
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -40,7 +40,10 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 
-from sglang.srt.entrypoints.openai.protocol import ResponseInputOutputItem
+from sglang.srt.entrypoints.openai.protocol import (
+    ReasoningEffortTier,
+    ResponseInputOutputItem,
+)
 from sglang.srt.utils import random_uuid
 
 logger = logging.getLogger(__name__)
@@ -49,9 +52,12 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
-    # harmony has no minimal; map it to low. "none" isn't here, so .get() below
-    # lets it fall through to the harmony default.
+    # harmony only has low/medium/high, so the outer tiers clamp inward. "none"
+    # is absent on purpose: .get() below lets it fall through to the harmony
+    # default rather than forcing a tier.
     "minimal": ReasoningEffort.LOW,
+    "xhigh": ReasoningEffort.HIGH,
+    "max": ReasoningEffort.HIGH,
 }
 
 _harmony_encoding = None
@@ -66,9 +72,7 @@ def get_encoding():
 
 def get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[
-        Literal["none", "minimal", "high", "medium", "low"]
-    ] = None,
+    reasoning_effort: Optional[ReasoningEffortTier] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,

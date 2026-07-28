@@ -44,7 +44,11 @@ from openai.types.responses import (
     ResponseTextConfig,
 )
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_format_text_json_schema_config import (
+    ResponseFormatTextJSONSchemaConfig,
+)
 from openai.types.responses.tool import Tool
+from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -1538,12 +1542,14 @@ class ResponsesRequest(BaseModel):
         deepseek/kimi, "enable_thinking" for qwen3/glm)."""
         if not isinstance(values, dict):
             return values
+        # mode="before", so reasoning is still the raw payload: a dict from JSON,
+        # or an already-built param object when constructed in Python.
         r = values.get("reasoning")
         effort = None
         if isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-        elif r is not None:
-            effort = getattr(r, "effort", None)
+        elif isinstance(r, ResponseReasoningParam):
+            effort = r.effort
 
         if effort == "none":
             existing = values.get("chat_template_kwargs")
@@ -1617,13 +1623,12 @@ class ResponsesRequest(BaseModel):
         ``json_object`` -> permissive object schema; ``json_schema`` -> the
         caller's schema; ``text`` (the default) and anything unrecognized -> None.
         """
-        response_format = getattr(text, "format", None)
-        fmt_type = getattr(response_format, "type", None)
-        if fmt_type == "json_object":
+        response_format = text.format if text is not None else None
+        if isinstance(response_format, ResponseFormatJSONObject):
             return '{"type": "object"}'
-        if fmt_type != "json_schema":
+        if not isinstance(response_format, ResponseFormatTextJSONSchemaConfig):
             return None
-        schema = getattr(response_format, "schema_", None)
+        schema = response_format.schema_
         return convert_json_schema_to_str(schema) if schema is not None else None
 
     def is_include_output_logprobs(self) -> bool:

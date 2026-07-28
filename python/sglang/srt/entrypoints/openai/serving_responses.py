@@ -639,9 +639,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             num_generated_tokens = context.num_output_tokens
             num_cached_tokens = context.num_cached_tokens
             num_reasoning_tokens = context.num_reasoning_tokens
-            status = self._status_from_finish_reason(
-                getattr(context, "finish_reason", None)
-            )
+            status = self._status_from_finish_reason(context.finish_reason)
         else:
             assert isinstance(context, SimpleContext)
             final_res = context.last_output
