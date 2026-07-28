@@ -656,7 +656,7 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     # Opt-in MiniMax-M3 prefill path using the dedicated normal-mode FuseEP operator.
-    SGLANG_ENABLE_M3_FUSEEP_PREFILL = EnvBool(False)
+    SGLANG_ENABLE_M3_FUSEEP_PREFILL = EnvBool(True)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
