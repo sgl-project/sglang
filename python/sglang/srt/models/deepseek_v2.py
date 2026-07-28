@@ -956,7 +956,6 @@ class DeepseekV2MoE(nn.Module):
         prequant_event = None
         if (
             envs.SGLANG_MOE_ALT_STREAM_PREQUANT.get()
-            and use_flashinfer_trtllm_bypass
             and hidden_states.shape[0] > 0
             and hidden_states.dtype == torch.bfloat16
         ):
