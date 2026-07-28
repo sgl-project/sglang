@@ -39,19 +39,13 @@ def make_runner(
         enable_dynamic_chunking=False,
         chunked_prefill_size=8192,
     )
+    # The policy routes its load-time default through the audited mutation entry
+    # (server_args.override); mirror that on the stub so the write lands.
     args.override = MagicMock(
         side_effect=lambda _source, **fields: vars(args).update(fields)
     )
     for name, value in arg_overrides.items():
         setattr(args, name, value)
-
-    # The policy routes its load-time default through the audited mutation entry
-    # (server_args.override); mirror that on the stub so the write lands.
-    def _override(source, **fields):
-        for _field, _value in fields.items():
-            setattr(args, _field, _value)
-
-    args.override = _override
 
     return SimpleNamespace(
         server_args=args,
@@ -100,7 +94,7 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         runner = make_runner()
         self.assertEqual(self.apply_policy(runner), "flashinfer")
         runner.server_args.override.assert_called_once_with(
-            "gdn_backend.auto_select_flashinfer_prefill",
+            "gdn_backend.sm100_flashinfer_default",
             linear_attn_prefill_backend="flashinfer",
         )
 
