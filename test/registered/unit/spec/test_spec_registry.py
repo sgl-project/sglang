@@ -231,6 +231,7 @@ class TestServerArgsHook(_RegistryIsolated):
             decrypted_draft_config_file=None,
             trust_remote_code=False,
             speculative_draft_window_size=None,
+            speculative_draft_sink_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
         )
