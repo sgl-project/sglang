@@ -28,18 +28,7 @@ struct AppState {
     server_args: Arc<ServerArgs>,
     /// Egress heartbeat (bumped per drained ring frame).
     egress_activity: ActivityCounter,
-    /// Client-visible rids currently in flight. Detok `Register` is an
-    /// insert-overwrite keyed on the rid's hash, so two concurrent requests
-    /// sharing a rid would evict each other's sink and cross-wire their output;
-    /// this rejects the second one instead, as Python does ("Duplicate request ID
-    /// detected"). Entries are removed by [`guard::AbortGuard`] on drop.
-    live_rids: LiveRids,
 }
-
-/// The in-flight rid set (see [`AppState::live_rids`]). A `std::sync::Mutex` is
-/// right here: it is held only across one hash-set operation, never across an
-/// await.
-use crate::tokenizer_manager::LiveRids;
 
 pub async fn serve(
     listener: std::net::TcpListener,
@@ -50,7 +39,6 @@ pub async fn serve(
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
     // releases.
-    live_rids: LiveRids,
     shutdown: flume::Receiver<()>,
 ) {
     let state = AppState {
@@ -58,7 +46,6 @@ pub async fn serve(
         egress_buf,
         server_args: server_args.clone(),
         egress_activity,
-        live_rids,
     };
     // Each endpoint module registers its own routes and merges here.
     let app = Router::new()

@@ -208,12 +208,22 @@ impl GenerateBody {
         // rid: absent → mint one uuid per item here, so every request carries its
         // final rid from this point on; a single string fans out as `{rid}_{i}`
         // for a batch (Python `_normalize_batch`); a list is per-item.
+        //
+        // Every CLIENT-supplied rid goes through `Rid::from_client`, which appends a
+        // uniquifier so two concurrent requests sharing an rid cannot collide on the
+        // detok table. `client_facing` strips it back off for `meta_info.id`, so the
+        // client sees exactly what it sent. Minted rids (`Rid::default`) are already
+        // unique and are left bare.
         let rids: Vec<Rid> = match rid {
             None => (0..n).map(|_| Rid::default()).collect(),
-            Some(OneOrMany::One(r)) if !is_batch => vec![r.into()],
+            Some(OneOrMany::One(r)) if !is_batch => vec![Rid::from_client(&r)],
             Some(OneOrMany::One(r)) => {
                 check_broadcast_budget(r.len(), n, "rid")?;
-                (0..n).map(|i| format!("{r}_{i}").into()).collect()
+                // Uniquify AFTER the `_{i}` split, so the split index stays part of
+                // the rid the client gets back.
+                (0..n)
+                    .map(|i| Rid::from_client(&format!("{r}_{i}")))
+                    .collect()
             }
             Some(OneOrMany::Many(v)) => {
                 if !is_batch || v.len() != n {
@@ -222,8 +232,12 @@ impl GenerateBody {
                         v.len()
                     )));
                 }
-                // Python `_validate_rid_uniqueness`: two items sharing an rid would
-                // share a `RidHash` slot, so the first is orphaned before it starts.
+                // Python `_validate_rid_uniqueness`. `from_client` below would make
+                // even these unique, so this is parity rather than safety: Python
+                // 400s a request that names one id twice, and echoing the same
+                // `meta_info.id` on two entries of one batch response is useless to
+                // the client regardless. Checked on the RAW strings, before the
+                // uniquifier hides the duplication.
                 {
                     let mut seen = HashSet::with_capacity(v.len());
                     let duplicates: Vec<&String> = v.iter().filter(|r| !seen.insert(*r)).collect();
@@ -233,7 +247,7 @@ impl GenerateBody {
                         )));
                     }
                 }
-                v.into_iter().map(Into::into).collect()
+                v.iter().map(|r| Rid::from_client(r)).collect()
             }
         };
 
@@ -320,10 +334,14 @@ pub struct GenerateRequest {
     ///
     /// Duplicates *within* one request are rejected by `into_requests` (Python
     /// `_validate_rid_uniqueness`). A collision with a *concurrent* request's rid
-    /// is rejected too, by the in-flight registry `api_server::submit` consults —
-    /// as Python's `TokenizerManager` does ("Duplicate request ID detected"). It
-    /// used to overwrite the earlier request's `RidHash` slot, and this comment
-    /// used to call that parity with Python; both were wrong.
+    /// cannot arise: [`Rid::from_client`] appends a uniquifier to every
+    /// client-supplied rid, so this value is unique for the process's lifetime and
+    /// only [`client_facing`](Rid::client_facing) is ever shown back.
+    ///
+    /// This diverges from Python, which 400s the second request ("Duplicate request
+    /// ID detected"). Serving both is the friendlier answer and strictly safer —
+    /// what the rejection protected against was one request evicting the other's
+    /// detok sink, which is now unrepresentable.
     pub rid: Rid,
     pub text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
@@ -544,18 +562,22 @@ mod tests {
     /// single string passes through for a single request, fans out as
     /// `{rid}_{i}` for a batch, and a list must match the batch length. An
     /// absent rid is minted here, one uuid per item.
+    ///
+    /// Asserted on `client_facing()`, which is what `meta_info.id` echoes: the
+    /// internal rid additionally carries the `from_client` uniquifier, and that
+    /// suffix must never be visible in the parity-defined shape.
     #[test]
     fn split_rid_matches_python_normalize() {
         let (ps, _) = requests(r#"{"text": "a", "rid": "r"}"#).unwrap();
-        assert_eq!(ps[0].rid, Rid::from("r"));
+        assert_eq!(ps[0].rid.client_facing(), "r");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "base"}"#).unwrap();
-        assert_eq!(ps[0].rid, Rid::from("base_0"));
-        assert_eq!(ps[1].rid, Rid::from("base_1"));
+        assert_eq!(ps[0].rid.client_facing(), "base_0");
+        assert_eq!(ps[1].rid.client_facing(), "base_1");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).unwrap();
-        assert_eq!(ps[0].rid, Rid::from("x"));
-        assert_eq!(ps[1].rid, Rid::from("y"));
+        assert_eq!(ps[0].rid.client_facing(), "x");
+        assert_eq!(ps[1].rid.client_facing(), "y");
 
         let (ps, _) = requests(r#"{"text": ["a", "b"]}"#).unwrap();
         // Absent → `into_requests` mints one uuid per item, all distinct.
@@ -720,8 +742,10 @@ mod tests {
         assert!(requests(r#"{"input_ids": [[1], [2]]}"#).is_ok());
     }
 
-    /// Two items in one request cannot share an rid: they would map to the same
-    /// `RidHash` slot. Mirrors Python `_validate_rid_uniqueness`.
+    /// Two items in one request cannot share an rid. Mirrors Python
+    /// `_validate_rid_uniqueness` — and it must be checked on the RAW strings,
+    /// because `Rid::from_client` would otherwise make the duplicates distinct and
+    /// the client would get two response entries carrying the same `meta_info.id`.
     #[test]
     fn duplicate_rids_within_one_request_are_rejected() {
         let err = requests(r#"{"text": ["a", "b"], "rid": ["x", "x"]}"#).unwrap_err();
@@ -729,7 +753,24 @@ mod tests {
 
         assert!(requests(r#"{"text": ["a", "b"], "rid": ["x", "y"]}"#).is_ok());
         let (ps, _) = requests(r#"{"text": ["a", "b"], "rid": "x"}"#).unwrap();
-        assert_eq!(ps[0].rid, Rid::from("x_0"));
-        assert_eq!(ps[1].rid, Rid::from("x_1"));
+        assert_eq!(ps[0].rid.client_facing(), "x_0");
+        assert_eq!(ps[1].rid.client_facing(), "x_1");
+    }
+
+    /// The collision this whole scheme exists to prevent: two CONCURRENT requests
+    /// naming the same rid. They must end up with different internal `Rid`s — the
+    /// detok table is keyed on it, and `Register` is an insert-overwrite, so equal
+    /// rids would evict the first client's sink and deliver its remaining chunks to
+    /// the second's connection. Both still see their own rid echoed back.
+    #[test]
+    fn concurrent_requests_sharing_an_rid_get_distinct_internal_rids() {
+        let (a, _) = requests(r#"{"text": "a", "rid": "same"}"#).unwrap();
+        let (b, _) = requests(r#"{"text": "b", "rid": "same"}"#).unwrap();
+        assert_ne!(
+            a[0].rid, b[0].rid,
+            "a shared client rid must not become a shared internal rid"
+        );
+        assert_eq!(a[0].rid.client_facing(), "same");
+        assert_eq!(b[0].rid.client_facing(), "same");
     }
 }

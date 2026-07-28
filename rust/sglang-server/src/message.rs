@@ -54,10 +54,12 @@ pub struct IngressMsg {
 }
 
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
-/// the shard's local `rid -> sink` map. The rid STRING is the identity: `RidHash`
+/// the shard's local `rid -> sink` map. The rid STRING is the identity: `Rid::hash`
 /// picks the shard (collisions there merely co-locate, which is harmless), but two
 /// distinct rids that hash alike must not be the same map entry — that evicted one
-/// client's sink and delivered their tokens to the other's connection.
+/// client's sink and delivered their tokens to the other's connection. Equal rids
+/// cannot reach here from different requests: `Rid::from_client` uniquifies every
+/// client-supplied one.
 pub enum DetokMsg {
     Register {
         /// Client-visible rid string — kept in `DetokState` so the shard can
