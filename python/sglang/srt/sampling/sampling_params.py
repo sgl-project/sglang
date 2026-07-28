@@ -72,7 +72,7 @@ def raise_if_tokenizer_required(
         )
 
 
-class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
+class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
@@ -106,10 +106,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
-    custom_params: Optional[Dict[str, CustomParamValue]] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
+    custom_params: Optional[Dict[str, CustomParamValue]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -269,7 +269,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
         )
 
-        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        # Clear API input aliases after normalizing them into internal fields.
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
