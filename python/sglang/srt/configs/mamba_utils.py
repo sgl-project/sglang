@@ -137,6 +137,10 @@ class Mamba2StateShape:
     conv: list[tuple[int, int]]
     temporal: tuple[int, int, int]
 
+    # Conv tuples read (dim, K-1) — the window axis is last, which the
+    # deduplicated conv-intermediate layout requires.
+    disable_conv_window_dedup: bool = False
+
     intermediate_size: int
     conv_dim: int
     ssm_state_size: int
@@ -148,6 +152,12 @@ class Mamba2StateShape:
     # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
     # buffer (k_cache) to size/stride exactly like the kernel expects.
     num_k_heads_per_tp: int = 1
+    # Full (unsharded) conv sub-block dims, e.g. GDN's [key_dim, key_dim,
+    # value_dim] for conv_state == cat([query, key, value]). Each sub-block is
+    # head-sharded INDEPENDENTLY across attn-TP, so PD transfer across different
+    # attn_tp_size must slice per sub-block. None when the single contiguous
+    # slice already matches the layout (e.g. standard Mamba2 conv order differs).
+    conv_shard_groups: Optional[List[int]] = None
 
     @staticmethod
     def create(
@@ -159,6 +169,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        conv_shard_groups: Optional[List[int]] = None,
     ) -> "Mamba2StateShape":
         # The q/k projections are sharded by `num_k_heads // tp` heads (the
         # ORIGINAL n_groups, before the conv head-shard extension below), so the
@@ -196,6 +207,7 @@ class Mamba2StateShape:
             state_size=state_size,
             conv_kernel=conv_kernel,
             num_k_heads_per_tp=num_k_heads_per_tp,
+            conv_shard_groups=conv_shard_groups,
         )
 
 
@@ -209,12 +221,21 @@ class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]
 
+    # Conv tuples read (K-1, dim) — the overlapping dedup view would alias
+    # along the dim axis, so the dedup conv-intermediate layout must stay off.
+    disable_conv_window_dedup: bool = True
+    # Per-slot conv tensors are [K-1, sharded_channels], unlike the usual
+    # [sharded_channels, K-1] layout.
+    conv_slice_axis: int = 1
+
     num_heads: int
     head_dim: int
     num_k_heads: int
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    # Full q/k/v dimensions. Each block is TP-sharded independently.
+    conv_shard_groups: Optional[List[int]] = None
     # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
     # kernels infer from ``mixed_qkv``). Mirrors Mamba2StateShape; consumed by
     # the ReplaySSM ring (k_cache) to size/stride exactly like the kernel.
@@ -262,6 +283,7 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            conv_shard_groups=[proj_size, proj_k_size, proj_k_size],
             num_k_heads_per_tp=num_k_heads_per_tp,
         )
 

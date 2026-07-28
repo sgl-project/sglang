@@ -7,7 +7,8 @@ export const Llama33Deployment = () => {
       items: [
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
-        { id: 'mi355x', label: 'MI355X', default: false }
+        { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
@@ -27,6 +28,17 @@ export const Llama33Deployment = () => {
       ]
     }
   };
+
+  const getDisplayOptions = (values) => ({
+    ...options,
+    quantization: {
+      ...options.quantization,
+      items: options.quantization.items.map(item => ({
+        ...item,
+        disabled: values.hardware === 'xeon' && item.id === 'fp8'
+      }))
+    }
+  });
 
   // Initialize state
   const getInitialState = () => {
@@ -57,7 +69,13 @@ export const Llama33Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.quantization = 'bf16';
+      }
+      return next;
+    });
   };
 
   // Generate command
@@ -65,14 +83,20 @@ export const Llama33Deployment = () => {
     const { hardware, quantization, toolcall } = values;
 
     // Select model based on quantization
-    const modelPath = quantization === 'fp8'
+    const modelPath = quantization === 'fp8' && hardware !== 'xeon'
       ? 'amd/Llama-3.3-70B-Instruct-FP8-KV'
       : 'meta-llama/Llama-3.3-70B-Instruct';
 
     // Build command
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model-path ${modelPath} \\\n`;
-    cmd += `  --tp 1`;
+    if (hardware === 'xeon') {
+      cmd += `  --device cpu \\\n`;
+      cmd += `  --disable-overlap-schedule \\\n`;
+      cmd += `  --tp 6`;
+    } else {
+      cmd += `  --tp 1`;
+    }
 
     // Add tool calling parser
     if (toolcall === 'enabled') {
@@ -98,7 +122,7 @@ export const Llama33Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
@@ -117,9 +141,10 @@ export const Llama33Deployment = () => {
             ) : (
               option.items.map(item => {
                 const isChecked = values[option.name] === item.id;
+                const isDisabled = Boolean(item.disabled);
                 return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
-                    <input type="radio" name={option.name} value={item.id} checked={isChecked} onChange={() => handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
+                    <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
                     {item.label}
                     {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
