@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
+
 #########################
 # Constants & Enums
 #########################
@@ -956,7 +961,17 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        # Pool ships each sub-pool as its own page-indexed component (fixed order
+        # so prefill and decode register identically); skips get_state_buf_infos.
+        for (
+            st,
+            comp_ptrs,
+            comp_lens,
+            comp_item_lens,
+        ) in token_to_kv_pool.get_pd_state_components():
+            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
+    elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "
