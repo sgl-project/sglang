@@ -1932,4 +1932,275 @@ mod tests {
         let stale = stale_tracked_pods(&tracked, &HashSet::new());
         assert_eq!(stale, vec![stored]);
     }
+
+    // ---- reconcile_from_list ----
+    //
+    // These drive the real `reconcile_from_list` against a fake API server
+    // built from a `tower::service_fn`, which `kube::Client::new` accepts
+    // directly — no cluster and no extra dependencies.
+    //
+    // Two traps worth knowing if you extend these: a `k8s_openapi::List<Pod>`
+    // serialized with serde_json does not round-trip into kube's `ObjectList`
+    // (the items come back empty), so the body is assembled as explicit
+    // PodList JSON; and the config selector must actually match the pod
+    // labels, or `should_include` filters everything out and the test
+    // silently asserts nothing.
+
+    fn reconcile_test_config() -> ServiceDiscoveryConfig {
+        // Matches the labels set by `create_regular_k8s_pod`.
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "regular-worker".to_string());
+        ServiceDiscoveryConfig {
+            enabled: true,
+            selector,
+            ..Default::default()
+        }
+    }
+
+    fn pod_list_json(pods: &[Pod], continue_token: Option<&str>) -> String {
+        let mut metadata = serde_json::json!({ "resourceVersion": "1" });
+        if let Some(token) = continue_token {
+            metadata["continue"] = serde_json::Value::String(token.to_string());
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": metadata,
+            "items": pods
+                .iter()
+                .map(|pod| serde_json::to_value(pod).unwrap())
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    fn json_response(
+        status: u16,
+        body: String,
+    ) -> http::Response<http_body_util::Full<bytes::Bytes>> {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .unwrap()
+    }
+
+    /// Fake `Api<Pod>` that replays `responses` in order and records the
+    /// request URIs it was asked for.
+    fn fake_pod_api(responses: Vec<(u16, String)>) -> (Api<Pod>, Arc<Mutex<Vec<String>>>) {
+        let pending = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_service = Arc::clone(&seen);
+
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            let pending = Arc::clone(&pending);
+            let seen = Arc::clone(&seen_for_service);
+            async move {
+                seen.lock().unwrap().push(req.uri().to_string());
+                let (status, body) = pending
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("fake API server got more requests than it had responses");
+                Ok::<_, std::convert::Infallible>(json_response(status, body))
+            }
+        });
+
+        (Api::all(Client::new(service, "default")), seen)
+    }
+
+    fn tracked_names(tracked: &Arc<Mutex<HashSet<PodInfo>>>) -> HashSet<String> {
+        tracked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod_info| pod_info.name.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_adds_listed_pods_and_removes_absent_ones() {
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+
+        let live = create_regular_k8s_pod("pod-live", "10.0.0.2");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let names = tracked_names(&tracked);
+        assert!(
+            names.contains("pod-live"),
+            "a listed healthy pod should be tracked"
+        );
+        assert!(
+            !names.contains("pod-gone"),
+            "a tracked pod absent from the LIST should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_treats_terminating_pod_as_absent() {
+        // The pod is still in the API but has begun terminating. It must be
+        // deregistered now rather than when it finally disappears, so it stops
+        // receiving new traffic while its drain hook runs.
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked.lock().unwrap().insert(tracked_pod_info(
+            "pod-draining",
+            "10.0.0.3",
+            "Running",
+            true,
+        ));
+
+        let mut draining = create_regular_k8s_pod("pod-draining", "10.0.0.3");
+        draining.metadata.deletion_timestamp = Some(Time(chrono::Utc::now()));
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[draining], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            !tracked_names(&tracked).contains("pod-draining"),
+            "a terminating pod should be treated as absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_keeps_worker_set_when_list_fails() {
+        // The most consequential branch: a failed LIST must never be read as
+        // "no pods exist" and drain every worker.
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+
+        let forbidden = serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": "pods is forbidden",
+            "reason": "Forbidden",
+            "code": 403,
+        })
+        .to_string();
+        let (api, _) = fake_pod_api(vec![(403, forbidden)]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            tracked_names(&tracked).contains("pod-a"),
+            "a failed LIST must leave the worker set untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_remove_pod_registered_during_the_list() {
+        // The watch registers a pod while the LIST is in flight. It cannot
+        // appear in that response through no fault of its own, and the watch
+        // will not re-emit an Apply for it, so removing it here would strand
+        // the worker until the next resync.
+        let tracked: Arc<Mutex<HashSet<PodInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_for_service = Arc::clone(&tracked);
+
+        let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+            let tracked = Arc::clone(&tracked_for_service);
+            async move {
+                tracked
+                    .lock()
+                    .unwrap()
+                    .insert(tracked_pod_info("late-pod", "10.0.0.9", "Running", true));
+                Ok::<_, std::convert::Infallible>(json_response(200, pod_list_json(&[], None)))
+            }
+        });
+        let api: Api<Pod> = Api::all(Client::new(service, "default"));
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert!(
+            tracked_names(&tracked).contains("late-pod"),
+            "a pod registered while the LIST was in flight must survive the reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_follows_continue_token_across_pages() {
+        let tracked = Arc::new(Mutex::new(HashSet::new()));
+        tracked
+            .lock()
+            .unwrap()
+            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+
+        let first = create_regular_k8s_pod("pod-page1", "10.0.0.2");
+        let second = create_regular_k8s_pod("pod-page2", "10.0.0.3");
+        let (api, seen) = fake_pod_api(vec![
+            (200, pod_list_json(&[first], Some("next-page-token"))),
+            (200, pod_list_json(&[second], None)),
+        ]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let names = tracked_names(&tracked);
+        assert!(names.contains("pod-page1"), "first page should be applied");
+        assert!(names.contains("pod-page2"), "second page should be applied");
+        assert!(
+            !names.contains("pod-gone"),
+            "removal should consider every page, not just the last"
+        );
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "expected exactly two pages");
+        assert!(
+            requests[0].contains(&format!("limit={}", LIST_PAGE_SIZE)),
+            "first page should be bounded, got {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("continue=next-page-token"),
+            "second page should carry the continue token, got {}",
+            requests[1]
+        );
+    }
 }
