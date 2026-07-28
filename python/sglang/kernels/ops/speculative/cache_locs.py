@@ -67,7 +67,11 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    window_size: tl.constexpr = 0,
+    sink_size: tl.constexpr = 0,
 ):
+    # window_size > 0 restricts the draft (not the target) to sink_size prefix
+    # tokens + the most-recent window_size; window_size == 0 is the identity.
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
@@ -84,18 +88,32 @@ def generate_draft_decode_kv_indices(
     load_offset = tl.arange(0, bs_upper)
     seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
     seq_len = tl.load(paged_kernel_lens + bid)
+    # The cap must hit both the cumulative offsets and the copy length, or the
+    # per-request layout desyncs from kv_indptr. Extend tokens are never capped.
+    if window_size > 0:
+        cap = window_size + sink_size
+        seq_lens = tl.minimum(seq_lens, cap)
+        seq_len_w = tl.minimum(seq_len, cap)
+        s_eff = tl.minimum(sink_size, seq_len)
+        recent_start = seq_len - (seq_len_w - s_eff)
+    else:
+        seq_len_w = seq_len
+        s_eff = 0
+        recent_start = 0
     cum_seq_len = tl.sum(seq_lens)
 
     # Update kv_indices
-    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
+    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len_w + iters)
     kv_ptr = kv_indices + kv_offset
     token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
 
     kv_offset = tl.arange(0, BLOCK_SIZE)
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    num_loop = tl.cdiv(seq_len_w, BLOCK_SIZE)
     for _ in range(num_loop):
-        mask = kv_offset < seq_len
-        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
+        mask = kv_offset < seq_len_w
+        # First s_eff outputs read the sink, the rest the recent window.
+        src = tl.where(kv_offset < s_eff, kv_offset, recent_start + kv_offset - s_eff)
+        data = tl.load(token_pool_ptr + src, mask=mask)
         tl.store(kv_ptr + kv_offset, data, mask=mask)
         kv_offset += BLOCK_SIZE
 
@@ -120,7 +138,9 @@ def generate_draft_decode_kv_indices(
             mask=extend_offset < iters,
         )
 
-    tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
+    tl.store(
+        kv_ptr + seq_len_w + extend_offset, extend_data, mask=extend_offset < iters
+    )
 
     # Update kv_indptr
     bs_offset = tl.arange(0, num_tokens_upper)
@@ -129,6 +149,9 @@ def generate_draft_decode_kv_indices(
     if zid == 0:
         zid = num_seqs * topk
     positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+    # Match the gather above: each prior slot contributes min(len, sink+W).
+    if window_size > 0:
+        positions = tl.minimum(positions, window_size + sink_size)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 

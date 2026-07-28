@@ -102,8 +102,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         kwargs=kwargs,
     )
 
-    # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
+    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
+    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
+    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
+    # recent window).
     if server_args.speculative_draft_window_size is not None:
         window_size = int(server_args.speculative_draft_window_size)
         if window_size <= 0:
@@ -111,12 +114,25 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
+                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
                 server_args.speculative_algorithm,
             )
+
+    if server_args.speculative_draft_sink_size is not None:
+        sink_size = int(server_args.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if server_args.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        server_args.speculative_draft_sink_size = sink_size
 
     algo = None
     if server_args.speculative_algorithm is not None:
