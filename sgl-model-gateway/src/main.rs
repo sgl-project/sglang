@@ -255,7 +255,10 @@ struct CliArgs {
     /// Interval (seconds) of the periodic full-LIST reconcile that repairs the
     /// discovered worker set independently of watch health. Keep it below the
     /// pod termination-drain budget so draining pods stop receiving traffic
-    /// early enough for in-flight requests to complete.
+    /// early enough for in-flight requests to complete. Removing a model's
+    /// last healthy worker can be held a few seconds longer while a
+    /// replacement activates, so leave headroom rather than sizing this to the
+    /// drain budget exactly.
     #[arg(
         long,
         default_value_t = 30,

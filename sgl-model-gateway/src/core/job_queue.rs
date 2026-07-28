@@ -247,6 +247,24 @@ impl JobQueue {
     ///
     /// Used by the removal path to detect an in-flight add/remove handoff
     /// (e.g. a rolling update replacing one worker with another).
+    ///
+    /// This is deliberately global rather than per-model, because the model
+    /// is not knowable here: `JobStatus` records only job type, URL, status
+    /// and timestamp, and k8s service discovery submits AddWorker with
+    /// `model_id: None` (the model is discovered once the add pipeline
+    /// reaches the engine). The queue also cannot inspect the queued `Job`
+    /// itself — it has been moved into the channel or a spawned task, leaving
+    /// `status_map` as the only observable state.
+    ///
+    /// The cost of the approximation is bounded: an unrelated model's add
+    /// makes this return true, which can delay one removal by up to
+    /// `HANDOFF_WAIT_MAX`. Nothing is lost, only deferred, and the TTL
+    /// cleanup of `status_map` caps how long a single add can keep returning
+    /// true.
+    ///
+    /// The `"AddWorker"` literal must match `Job::job_type()`, and the status
+    /// literals must match the `JobStatus` constructors. Both are plain
+    /// strings, so a rename on either side would disable this check silently.
     pub fn has_add_worker_in_flight(&self) -> bool {
         self.status_map.iter().any(|entry| {
             entry.job_type == "AddWorker"
@@ -311,8 +329,15 @@ impl JobQueue {
     ///   scale-to-zero), or
     /// - the deadline expires (an in-flight add that cannot activate must not
     ///   block removals indefinitely).
+    ///
+    /// The wait is held while this job owns a job-queue concurrency permit,
+    /// and it delays deregistering the departing worker — which keeps sending
+    /// it new traffic for the duration. Both argue for a deadline only as
+    /// large as the handoff it protects: an observed activation takes about a
+    /// second, and the wait also stacks on top of the discovery resync
+    /// interval against a pod's termination-drain budget.
     async fn wait_for_handoff_before_removal(url: &str, context: &Arc<AppContext>) {
-        const HANDOFF_WAIT_MAX: Duration = Duration::from_secs(15);
+        const HANDOFF_WAIT_MAX: Duration = Duration::from_secs(5);
         const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
         let dp_aware = context.router_config.dp_aware;
