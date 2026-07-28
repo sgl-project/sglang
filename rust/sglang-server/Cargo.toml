@@ -28,14 +28,20 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 uuid = { workspace = true }
+zeroize = "1"
 
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together
 dynamo-tokenizers = "1.5.3"
 flume = "0.12.0"
+getrandom = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
+libc = "0.2"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Pinned EXACTLY: this crate's accepted grammar defines the
