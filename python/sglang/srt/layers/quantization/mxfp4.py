@@ -1087,7 +1087,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
-        # ---- Per-expert SwiGLU scalars (read from runner config, fallback to GPT-OSS defaults)
+        # ---- Per-expert gated activation scalars ---------------------------
+        # SwiGLU uses alpha/beta/limit. Kimi-K3 SiTU reuses alpha as
+        # situ_beta and limit as situ_linear_beta.
         _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
         _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
         layer.swiglu_alpha = Parameter(

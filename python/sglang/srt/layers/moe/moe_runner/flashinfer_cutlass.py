@@ -83,7 +83,10 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     w13_bias: Optional[torch.Tensor] = None  # bf16 [E, 2*N]
     w2_bias: Optional[torch.Tensor] = None  # bf16 [E, K]
 
-    # Optional per-expert SwiGLU overrides, fp32 [E].
+    # Optional per-expert activation overrides, fp32 [E].
+    # For ActivationType.Swiglu these are alpha/beta/limit. For
+    # ActivationType.Situ, swiglu_alpha carries situ_beta and swiglu_limit
+    # carries situ_linear_beta.
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
@@ -364,6 +367,20 @@ def fused_experts_none_to_flashinfer_mxfp4(
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 
+    activation_type = ActivationType.Swiglu
+    if runner_config.activation == "situ":
+        if not hasattr(ActivationType, "Situ"):
+            raise RuntimeError(
+                "Kimi-K3 SiTU on SM90 flashinfer_mxfp4 requires a FlashInfer "
+                "build with ActivationType.Situ support."
+            )
+        activation_type = ActivationType.Situ
+    elif runner_config.activation != "silu":
+        raise RuntimeError(
+            "flashinfer_mxfp4 CUTLASS MXFP4 supports only silu/swiglu or "
+            f"situ activations, got {runner_config.activation!r}."
+        )
+
     flashinfer_cutlass_fused_moe(
         input=x,
         token_selected_experts=topk_ids.to(torch.int32),
@@ -384,7 +401,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=ActivationType.Swiglu,
+        activation_type=activation_type,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
     )
