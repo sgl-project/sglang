@@ -390,6 +390,27 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -1063,6 +1084,10 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(
+                    topk_indices, q_nope.shape[0]
+                )
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
             attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
