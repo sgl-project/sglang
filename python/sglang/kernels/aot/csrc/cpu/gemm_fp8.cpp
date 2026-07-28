@@ -1205,7 +1205,8 @@ at::Tensor fp8_per_tensor_scaled_mm_cpu(
   TORCH_CHECK(st == out_dtype, "fp8_per_tensor_scaled_mm_cpu: expect A has same dtype with out_dtype.");
   TORCH_CHECK(mat2.scalar_type() == at::kFloat8_e4m3fn, "fp8_per_tensor_scaled_mm_cpu: expect mat2 to be fp8_e4m3.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to be float32.");
-  TORCH_CHECK(scales2.numel() == 1, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to have one element for per-tensor scaling.");
+  TORCH_CHECK(
+      scales2.numel() == 1, "fp8_per_tensor_scaled_mm_cpu: expect scales2 to have one element for per-tensor scaling.");
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
   auto buffer = alloc_thread_buffer(mat1.options(), K);
