@@ -426,6 +426,9 @@ class ServerArgs(DisaggServerArgsMixin):
     srt_encoder_connect_timeout: int = 3.05
     srt_encoder_timeout: int = 100
 
+    # SGLang server for PE model inference
+    pe_server_url: str | None = None
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -799,6 +802,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
@@ -1128,8 +1133,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self.vae_cpu_offload
             ):
                 logger.warning(
-                    "Disabling component CPU offload on MPS because CPU-to-MPS "
-                    "module relocation can produce invalid diffusion outputs."
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
                 )
             self.dit_cpu_offload = False
             self.text_encoder_cpu_offload = False
@@ -1936,6 +1941,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.srt_encoder_timeout,
             help="Timeout (in seconds) for HTTP requests to the SGLang encoder server. "
             "Increase value if connection between diffusion server and AR model server is slow.",
+        )
+
+        # SGLang server for PE model inference
+        parser.add_argument(
+            "--pe-server-url",
+            type=str,
+            default=ServerArgs.pe_server_url,
+            help="URL of SGLang server for PE model",
         )
 
         return parser
