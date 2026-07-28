@@ -39,6 +39,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
+    TboAuxCaptureSink,
     model_forward_maybe_tbo,
 )
 from sglang.srt.configs.model_config import (
@@ -2334,9 +2335,22 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
+        aux_capture_sink: Optional[TboAuxCaptureSink] = None,
     ):
+        # Passing None for captured_last_layer_outputs makes this identical to
+        # plain prepare_attn, so non-capturing layers take the same path.
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
-            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=(
+                    aux_capture_sink.captures
+                    if aux_capture_sink is not None
+                    and self.layer_id in aux_capture_sink.layer_ids
+                    else None
+                ),
+            )
         )
         if get_moe_a2a_backend().is_mori():
             state.num_tokens = hidden_states.shape[0]
@@ -2346,6 +2360,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 positions=positions,
                 zero_allocator=zero_allocator,
                 tbo_subbatch_index=tbo_subbatch_index,
+                aux_capture_sink=aux_capture_sink,
             )
         )
 
@@ -2372,6 +2387,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
+            aux_capture_sink=state.aux_capture_sink,
         )
 
         state.clear(
@@ -2380,6 +2396,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 "forward_batch",
                 "zero_allocator",
                 "tbo_subbatch_index",
+                "aux_capture_sink",
             }
         )
         return output
@@ -2664,6 +2681,10 @@ class DeepseekV2Model(nn.Module):
                     normal_end_layer - 1
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
+                # The loop above covers [start, normal_end_layer) and this covers
+                # [normal_end_layer, end), so appending here keeps layer order.
+                captured_last_layer_outputs=aux_hidden_states,
+                layers_to_capture=self.layers_to_capture,
             )
 
         if not self.pp_group.is_last_rank:

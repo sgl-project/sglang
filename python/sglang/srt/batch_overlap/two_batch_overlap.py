@@ -4,8 +4,9 @@ import copy
 import dataclasses
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Container, Dict, List, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.batch_overlap.operations import (
@@ -865,6 +866,18 @@ def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
 # -------------------------------- Execution ---------------------------------------
 
 
+class TboAuxCaptureSink(msgspec.Struct):
+    """Per-sub-batch collector for Eagle3/DFlash captures taken inside the TBO region.
+
+    ``layer_ids`` is the model's ``layers_to_capture``; each sub-batch fills its own
+    ``captures`` with sub-batch-wide tensors, which the caller merges back by token
+    range once both sub-batches finish.
+    """
+
+    layer_ids: Container[int]
+    captures: List[torch.Tensor] = []
+
+
 def model_forward_maybe_tbo(
     layers,
     enable_tbo: bool,
@@ -874,7 +887,12 @@ def model_forward_maybe_tbo(
     input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
+    captured_last_layer_outputs=None,
+    layers_to_capture: Optional[Container[int]] = None,
 ):
+    """``captured_last_layer_outputs`` is the same accumulator the non-TBO layer loop
+    appends to, so captures from both regions land in one layer-ordered sequence."""
+    capture_wanted = captured_last_layer_outputs is not None and layers_to_capture
     inputs = dict(
         positions=positions,
         hidden_states=hidden_states,
@@ -887,14 +905,56 @@ def model_forward_maybe_tbo(
         layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
-        return _model_forward_tbo(
+        sinks = (
+            [TboAuxCaptureSink(layer_ids=layers_to_capture) for _ in range(2)]
+            if capture_wanted
+            else None
+        )
+        outputs = _model_forward_tbo(
             inputs=inputs,
             operations_strategy=operations_strategy,
             input_data_scatter_mode=input_data_scatter_mode,
             layer_input_scatter_mode=layer_input_scatter_mode,
+            aux_capture_sinks=sinks,
         )
+        if sinks is not None:
+            for merged in _merge_tbo_aux_captures(
+                sinks, forward_batch, original_len=hidden_states.shape[0]
+            ):
+                captured_last_layer_outputs.append(merged)
+        return outputs
     else:
+        if capture_wanted:
+            inputs["aux_capture_sink"] = TboAuxCaptureSink(
+                layer_ids=layers_to_capture, captures=captured_last_layer_outputs
+            )
         return _model_forward_non_tbo(inputs, operations_strategy)
+
+
+def _merge_tbo_aux_captures(
+    sinks: Sequence[TboAuxCaptureSink],
+    forward_batch: ForwardBatch,
+    original_len: int,
+) -> List[torch.Tensor]:
+    """Scatter each sub-batch's captures back into full-batch tensors, layer by layer."""
+    captures_a, captures_b = (sink.captures for sink in sinks)
+    assert len(captures_a) == len(captures_b), (
+        f"sub-batches captured different layer counts: "
+        f"{len(captures_a)} vs {len(captures_b)}"
+    )
+    s0, t0 = forward_batch.tbo_children[0].tbo_parent_token_range
+    s1, t1 = forward_batch.tbo_children[1].tbo_parent_token_range
+    merged = []
+    for value_a, value_b in zip(captures_a, captures_b):
+        res = torch.zeros(
+            (original_len, *value_a.shape[1:]),
+            dtype=value_a.dtype,
+            device=value_a.device,
+        )
+        res[slice(s0, t0)] = value_a[: t0 - s0]
+        res[slice(s1, t1)] = value_b[: t1 - s1]
+        merged.append(res)
+    return merged
 
 
 def _model_forward_tbo(
@@ -902,11 +962,13 @@ def _model_forward_tbo(
     operations_strategy: OperationsStrategy,
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    aux_capture_sinks: Optional[Sequence[TboAuxCaptureSink]] = None,
 ):
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
+        aux_capture_sinks=aux_capture_sinks,
     )
     original_hidden_states_len = inputs["hidden_states"].shape[0]
     del inputs
@@ -942,6 +1004,7 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    aux_capture_sinks: Optional[Sequence[TboAuxCaptureSink]] = None,
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
@@ -962,6 +1025,7 @@ def _model_forward_tbo_split_inputs(
         positions=positions,
         forward_batch=forward_batch,
         zero_allocator=zero_allocator,
+        aux_capture_sinks=aux_capture_sinks,
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
@@ -990,6 +1054,7 @@ def _model_forward_tbo_split_inputs_raw(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
+    aux_capture_sinks: Optional[Sequence[TboAuxCaptureSink]] = None,
 ) -> List[Dict]:
     return [
         dict(
@@ -999,6 +1064,11 @@ def _model_forward_tbo_split_inputs_raw(
                 positions=positions,
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
+                aux_capture_sink=(
+                    None
+                    if aux_capture_sinks is None
+                    else aux_capture_sinks[tbo_subbatch_index]
+                ),
             ),
             **(
                 dict(zero_allocator=zero_allocator)
@@ -1018,6 +1088,7 @@ def _model_forward_filter_inputs(
     positions: torch.Tensor,
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
+    aux_capture_sink: Optional[TboAuxCaptureSink] = None,
 ) -> Dict:
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
@@ -1043,6 +1114,9 @@ def _model_forward_filter_inputs(
         positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
+        # Omitted when unused: models that never capture have no such op parameter,
+        # and the ops chain forwards this dict as kwargs.
+        **({} if aux_capture_sink is None else dict(aux_capture_sink=aux_capture_sink)),
     )
 
 
