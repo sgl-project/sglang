@@ -186,6 +186,16 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
                     ),
                 )
 
+    def test_pathological_template_does_not_raise(self):
+        # A template jinja cannot parse (RecursionError from deep nesting) must
+        # degrade to no detection, not crash template loading.
+        template = (
+            "{% if a %}" * 5000 + "x" + "{% endif %}" * 5000 + "\n"
+            "{%- set enable_thinking = enable_thinking | default(true) -%}"
+        )
+        _, config = detect_reasoning_pattern(template)
+        self.assertIsNone(config)
+
     def test_enable_thinking_collapsing_default_not_a_toggle(self):
         # default(true, true) / default(true, boolean=true) replace any falsy
         # value with True, so an explicit enable_thinking=false still renders

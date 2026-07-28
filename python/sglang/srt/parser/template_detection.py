@@ -107,6 +107,11 @@ def _has_toggle_default_assignment(
         tree = env.parse(ctx.template)
     except jinja2.TemplateError:
         return False
+    except Exception:
+        # e.g. RecursionError on a pathologically nested template; detection
+        # must never take down server startup (mirrors
+        # detect_inline_system_support).
+        return False
     for node in tree.find_all(jinja2.nodes.Filter):
         if node.name not in ("default", "d") or node.dyn_args or node.dyn_kwargs:
             continue
