@@ -382,6 +382,14 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -586,6 +594,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
+
+    try:
+        batch.req_to_token_pool.alloc_aux_to_lengths(
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
+        )
+    except Exception:
+        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        raise
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
