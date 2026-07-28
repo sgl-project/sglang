@@ -1,6 +1,5 @@
 import logging
 from copy import deepcopy
-from functools import partial
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -10,8 +9,9 @@ from torch import nn
 from transformers.activations import PytorchGELUTanh
 
 from sglang.kernels.ops.attention.vision_rope import (
-    apply_fused_qk_complex_rope,
-    can_use_fused_qk_complex_rope,
+    PreparedInplaceComplexRoPE,
+    apply_fused_qk_complex_rope_inplace,
+    prepare_fused_qk_complex_rope_inplace,
 )
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -60,22 +60,21 @@ _is_cuda = is_cuda()
 def apply_rope(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: torch.Tensor | PreparedInplaceComplexRoPE,
     x_shape=None,
-    *,
-    use_fused: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: Complex frequencies of shape (..., head_dim/2).
+        freqs_cis: Complex frequencies for the portable path, or inputs
+            prepared once for the contiguous in-place CUDA kernel.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
 
-    if use_fused and can_use_fused_qk_complex_rope(xq, xk, freqs_cis):
-        return apply_fused_qk_complex_rope(xq, xk, freqs_cis)
+    if isinstance(freqs_cis, tuple):
+        return apply_fused_qk_complex_rope_inplace(xq, xk, freqs_cis)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -100,7 +99,6 @@ class MoonViTEncoderLayer(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         qkv_hidden_size: int | None = None,
-        use_fused_rope: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -129,9 +127,7 @@ class MoonViTEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
-            customized_position_embedding_applier=partial(
-                apply_rope, use_fused=use_fused_rope
-            ),
+            customized_position_embedding_applier=apply_rope,
             use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
@@ -451,7 +447,6 @@ class MoonViT3dEncoder(nn.Module):
                     **block_cfg,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
-                    use_fused_rope=self.use_fused_rope,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -466,6 +461,8 @@ class MoonViT3dEncoder(nn.Module):
         rope_freqs_cis = self.rope_2d.get_freqs_cis(
             grid_thws=grid_thws, device=hidden_states.device
         )
+        if self.use_fused_rope:
+            rope_freqs_cis = prepare_fused_qk_complex_rope_inplace(rope_freqs_cis)
 
         sequence_lengths = grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]
         max_seqlen = int(sequence_lengths.max().item())

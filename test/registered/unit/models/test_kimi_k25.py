@@ -242,13 +242,7 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
         (2, torch.randn(3, 28, 20)),
     ]
     expected = [
-        F.interpolate(
-            image.unsqueeze(0),
-            size=(16, 12),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
+        _resize_bicubic_if_needed(image.unsqueeze(0), 16, 12)
         for _, image in indexed_images
     ]
     real_interpolate = F.interpolate

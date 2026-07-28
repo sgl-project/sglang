@@ -202,7 +202,7 @@ def test_kimi_moonvit_computes_max_sequence_length_on_host():
     assert output.device.type == "meta"
 
 
-def test_kimi_moonvit_reuses_complex_rope_inputs_across_blocks():
+def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
     recorded = {}
 
     class CapturingRope:
@@ -232,30 +232,33 @@ def test_kimi_moonvit_reuses_complex_rope_inputs_across_blocks():
     hidden_states = torch.ones(7, 4)
     encoder(hidden_states, torch.tensor([[1, 1, 7]], dtype=torch.int32))
 
-    rope_freqs_cis = recorded["rope_freqs_cis"]
-    assert rope_freqs_cis.shape == (7, 2)
-    assert rope_freqs_cis.dtype == torch.complex64
-    assert torch.equal(rope_freqs_cis.real + 1, rope_freqs_cis.imag)
+    cos_sin_cache, positions = recorded["rope_freqs_cis"]
+    assert cos_sin_cache.shape == (7, 4)
+    assert torch.equal(cos_sin_cache[:, :2] + 1, cos_sin_cache[:, 2:])
+    assert torch.equal(positions, torch.arange(7))
 
 
 def test_kimi_moonvit_cuda_rope_uses_shared_fused_kernel(monkeypatch):
     recorded = {}
 
-    def fake_fused_rope(q, k, freqs_cis):
-        recorded["freqs_cis"] = freqs_cis
+    def fake_fused_rope(q, k, prepared_rope):
+        recorded["prepared_rope"] = prepared_rope
         return q + 1, k + 2
 
-    monkeypatch.setattr(kimi_k25, "can_use_fused_qk_complex_rope", lambda *args: True)
-    monkeypatch.setattr(kimi_k25, "apply_fused_qk_complex_rope", fake_fused_rope)
+    monkeypatch.setattr(
+        kimi_k25, "apply_fused_qk_complex_rope_inplace", fake_fused_rope
+    )
     q = torch.zeros(3, 2, 4)
     k = torch.zeros_like(q)
-    freqs_cis = torch.ones(3, 2, dtype=torch.complex64)
+    cache = torch.ones(3, 4, dtype=torch.float32)
+    positions = torch.arange(3, dtype=torch.int64)
 
-    q_out, k_out = kimi_k25.apply_rope(q, k, freqs_cis, use_fused=True)
+    q_out, k_out = kimi_k25.apply_rope(q, k, (cache, positions))
 
     assert torch.equal(q_out, torch.ones_like(q))
     assert torch.equal(k_out, torch.full_like(k, 2))
-    assert recorded["freqs_cis"] is freqs_cis
+    assert recorded["prepared_rope"][0] is cache
+    assert recorded["prepared_rope"][1] is positions
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -267,9 +270,8 @@ def test_kimi_moonvit_fused_rope_matches_portable_path():
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
 
     q_ref, k_ref = kimi_k25.apply_rope(q.clone(), k.clone(), freqs_cis)
-    q_fused, k_fused = kimi_k25.apply_rope(
-        q.clone(), k.clone(), freqs_cis, use_fused=True
-    )
+    prepared_rope = kimi_k25.prepare_fused_qk_complex_rope_inplace(freqs_cis)
+    q_fused, k_fused = kimi_k25.apply_rope(q.clone(), k.clone(), prepared_rope)
 
     torch.testing.assert_close(q_fused, q_ref, rtol=0.01, atol=0.01)
     torch.testing.assert_close(k_fused, k_ref, rtol=0.01, atol=0.01)
