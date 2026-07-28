@@ -4,6 +4,70 @@ This directory contains scripts to automate version bumping for SGLang releases.
 
 ## Scripts
 
+### `upload_zip_to_whl.sh`
+
+Uploads a local ZIP file to a new
+[`sgl-project/whl`](https://github.com/sgl-project/whl) GitHub Release and
+prints its direct download URL. The ZIP bytes remain in the Release rather than
+the Git tree. The script adds the direct link to the flat
+[`others/index.html`](https://docs.sglang.io/whl/others/) catalog on the
+`gh-pages` branch and adds an `others/` entry to the root index. Existing
+package-specific PEP 503 indexes are unchanged.
+
+Prerequisites:
+
+- Install [GitHub CLI](https://cli.github.com/).
+- Authenticate once with `gh auth login`.
+- Use a GitHub account with write access to `sgl-project/whl`.
+- Install Git and Python 3.
+- Keep each ZIP file smaller than 2 GiB.
+
+**Usage:**
+
+```bash
+scripts/release/upload_zip_to_whl.sh <zip-path> <version> [release-tag] [release-title]
+```
+
+For example:
+
+```bash
+scripts/release/upload_zip_to_whl.sh ~/Downloads/model-cache.zip v1.2.0
+```
+
+This creates the tag and release `zip-v1.2.0`, preserves the filename
+`model-cache.zip`, and prints output similar to:
+
+```text
+Release: https://github.com/sgl-project/whl/releases/tag/zip-v1.2.0
+Asset:   https://github.com/sgl-project/whl/releases/download/zip-v1.2.0/model-cache.zip
+SHA256:  <checksum>
+Index:   https://docs.sglang.io/whl/others/
+wget https://github.com/sgl-project/whl/releases/download/zip-v1.2.0/model-cache.zip
+```
+
+The optional third and fourth arguments override the default `zip-<version>` tag
+and `ZIP <version>: <filename>` title:
+
+```bash
+scripts/release/upload_zip_to_whl.sh archive.zip 20260726 \
+  special-build-20260726 "Special build 20260726"
+```
+
+The version and tag may contain ASCII letters, digits, `.`, `_`, and `-`. Every
+upload must use a new tag. The script never overwrites or deletes a Release,
+asset, tag, or index entry. ZIP filenames may contain spaces but not backslashes
+or control characters.
+
+The root and `others` index changes are pushed in one commit. If another process
+updates `gh-pages` concurrently, the script reclones the latest branch and
+retries up to three times.
+
+If Release creation succeeds but index publication fails, rerun the exact same
+command. The script resumes only when the existing Release's filename, byte
+size, GitHub asset digest, and SHA256 marker match the local file; any mismatch
+is treated as a version conflict. After three failed index pushes, use the
+`Release` URL printed by the script to inspect the uploaded asset.
+
 ### `bump_sglang_version.py`
 Updates SGLang version across all relevant files following the pattern from [PR #10468](https://github.com/sgl-project/sglang/pull/10468).
 
