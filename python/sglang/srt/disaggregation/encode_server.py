@@ -47,17 +47,6 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    add_prometheus_middleware,
-    configure_logger,
-    load_audio,
-    load_image,
-    load_video,
-    random_uuid,
-    set_prometheus_multiproc_dir,
-)
-from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -319,6 +308,7 @@ class MMEncoder:
         self._element_size = torch.tensor(
             [], dtype=self._embedding_dtype
         ).element_size()
+        self._embedding_dims = self._infer_embedding_dims()
 
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.embedding_cache_controller import (
@@ -329,7 +319,7 @@ class MMEncoder:
             embedding_store = EmbeddingStoreFactory.create_backend(
                 self.server_args.mm_global_cache_backend,
             )
-            hidden_dims = self._infer_embedding_dims()
+            hidden_dims = self._embedding_dims
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
@@ -341,10 +331,6 @@ class MMEncoder:
             )
         else:
             self.mm_global_cache = None
-
-        # Pre-compute embedding metadata (needed by all ranks for mooncake)
-        if self.server_args.encoder_transfer_backend == "mooncake":
-            self._embedding_dims = self._infer_embedding_dims()
 
         if self.rank == 0:
             logger.info(
@@ -452,296 +438,8 @@ class MMEncoder:
                     dims[Modality.AUDIO] = int(val)
                     break
 
-        logger.info(f"Global cache embedding dims: {dims}")
+        logger.info(f"Encoder embedding dims: {dims}")
         return dims
-
-    def _resolve_audio_sr(self) -> int:
-        # Must match MiMoProcessor.from_hf_config — on drift, mimo tags the
-        # ndarray with its own audio_sampling_rate and skips resample, so the
-        # waveform is interpreted at the wrong rate and warped.
-        def _read(obj, attr):
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                return obj.get(attr)
-            return getattr(obj, attr, None)
-
-        audio_cfg = self.vision_config.get("audio", {})
-        sr = audio_cfg.get("audio_sampling_rate")
-        if sr:
-            return int(sr)
-
-        hf_cfg = self.model_config.hf_config
-        thinker_cfg = _read(hf_cfg, "thinker_config")
-        pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
-        sr = _read(pc, "audio_sampling_rate")
-        if sr:
-            return int(sr)
-        ac = _read(thinker_cfg, "audio_config") or _read(hf_cfg, "audio_config")
-        for attr in ("sampling_rate", "sample_rate"):
-            sr = _read(ac, attr)
-            if sr:
-                return int(sr)
-
-        sr = audio_cfg.get("sampling_rate")
-        if sr:
-            return int(sr)
-        logger.warning(
-            "No audio sampling rate found in mm_config or hf_config; "
-            "falling back to 16000 Hz. If the model expects a different SR "
-            "(e.g. MiMo-V2 defaults to 24000), audio will be warped."
-        )
-        return 16000
-
-    def _build_vision_config(self, mm_process_config):
-        """
-        Validate vision config, used for image/video/audio.
-        If not provided, keep default values.
-        """
-        self.vision_config = (
-            mm_process_config.get("vision_config", {})
-            if mm_process_config is not None
-            else {}
-        )
-        for modality_str in ["image", "video", "audio"]:
-            if not self.vision_config.get(modality_str, None):
-                self.vision_config[modality_str] = {}
-            if self.use_image_processor_gpu:
-                self.vision_config[modality_str]["device"] = self.device
-
-            if modality_str == "video":
-                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
-                for k, v in video_defaults.items():
-                    self.vision_config["video"].setdefault(k, v)
-
-            if modality_str == "audio":
-                if "return_attention_mask" not in self.vision_config["audio"]:
-                    self.vision_config["audio"]["return_attention_mask"] = True
-                if "padding" not in self.vision_config["audio"]:
-                    if self.model_type == "qwen2_audio":
-                        # For Qwen2Audio, use padding="max_length"
-                        # (same as https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_audio/processing_qwen2_audio.py#L93)
-                        self.vision_config["audio"]["padding"] = "max_length"
-                    else:
-                        self.vision_config["audio"]["padding"] = True
-                if "truncation" not in self.vision_config["audio"]:
-                    # keep same logic as base_processor.py
-                    if (
-                        hasattr(self, "audio_processor")
-                        and self.audio_processor is not None
-                    ):
-                        if self.audio_processor.__class__.__name__ in {
-                            "Gemma3nProcessor",
-                            "GlmAsrProcessor",
-                            "Qwen2AudioProcessor",
-                            "Qwen3OmniMoeProcessor",
-                        }:
-                            self.vision_config["audio"]["truncation"] = False
-
-    def _load_mm_processor(self, server_args: ServerArgs):
-        """
-        Load image/video/audio processor separately,
-        avoid issues with AutoProcessor not recognizing certain models
-        """
-        from transformers import AutoImageProcessor, AutoVideoProcessor
-
-        try:
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load image processor: {e}")
-            self.image_processor = None
-
-        try:
-            self.video_processor = AutoVideoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load video processor: {e}")
-            self.video_processor = None
-
-        try:
-            # Note: AutoProcessor is used for audio processor
-            _audio_proc = AutoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-            )
-            if not hasattr(_audio_proc, "feature_extractor"):
-                logger.warning(
-                    "Loaded AutoProcessor has no feature_extractor attribute, "
-                    "audio processing will be unavailable."
-                )
-                self.audio_processor = None
-            else:
-                self.audio_processor = _audio_proc
-        except Exception as e:
-            logger.warning(f"Failed to load audio processor: {e}")
-            self.audio_processor = None
-
-    def _load_single_item(
-        self,
-        data,
-        modality: Modality,
-        frame_count_limit=None,
-        discard_alpha_channel=True,
-    ):
-        """
-        Load a single multimodal data.
-        If data is precomputed, returns directly.
-        Static method that can be pickled for multiprocessing"""
-        if isinstance(data, dict):
-            return data
-        try:
-            if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    # Needed only when `img` is a PIL image
-                    img = img.convert("RGB")
-                return img
-            elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
-            elif modality == Modality.AUDIO:
-                return load_audio(data, self.model_audio_sr)
-
-        except CLIENT_MEDIA_EXCEPTIONS as e:
-            # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
-            raise BadRequestError(f"Error while loading data {data}: {e}") from e
-        except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
-
-    def submit_data_loading_tasks(self, items, modalities):
-        futures = []
-        task_info = []
-
-        for data, modality in zip(items, modalities):
-            if modality is not None:
-                futures.append(
-                    self.io_executor.submit(
-                        self._load_single_item,
-                        data,
-                        modality,
-                    )
-                )
-                task_info.append((modality, data))
-        return futures, task_info
-
-    def _get_feat_extract_output_lengths(self, feature_lens):
-        """
-        Computes the output length of the convolutional layers and the output length of the audio encoder
-        """
-        # qwen2_audio/qwen2.5_omni
-        if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
-            input_length = (feature_lens - 1) // 2 + 1
-            return (input_length - 2) // 2 + 1
-        # qwen3_asr / qwen3_omni_moe (same audio encoder architecture)
-        elif self.model_type in ["qwen3_asr", "qwen3_omni_moe"]:
-            input_lengths_leave = feature_lens % 100
-            feat_lengths = (input_lengths_leave - 1) // 2 + 1
-            output_lengths = (
-                ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
-            )
-            return output_lengths
-        elif self.model_type == "mimo_v2":
-            # MiMo-V2's preprocess_audio returns audio_token_len (already
-            # post-encoder/avg-pooler/group-size). Stored in audio_feature_lens_raw,
-            # so no further reduction here.
-            return feature_lens
-        else:
-            # fallback to original HF audio sample logic for other models
-            logger.warning(
-                f"Fallback to original HF audio sample logic for {self.model_type}"
-            )
-            input_length = (feature_lens - 1) // 2 + 1
-            return (input_length - 2) // 2 + 1
-
-    async def _flatten_and_load_videos(self, mm_items):
-        if not isinstance(mm_items, (list, tuple)):
-            mm_items = [mm_items]
-
-        futures, _ = self.submit_data_loading_tasks(
-            mm_items, [Modality.VIDEO] * len(mm_items)
-        )
-        async_futures = [asyncio.wrap_future(f) for f in futures]
-        video_items = await asyncio.gather(*async_futures)
-
-        video_processor_kwargs = {}
-        if "qwen" in self.model_type:
-            # for qwen-series model, do sample frames before preprocess
-            video_processed = [
-                await preprocess_video(
-                    video, video_config=self.vision_config.get("video", {})
-                )
-                for video in video_items
-            ]
-            videos, video_metadata = map(list, zip(*video_processed))
-            video_processor_kwargs["do_sample_frames"] = False
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            return videos, video_processor_kwargs
-        else:
-            raise NotImplementedError(
-                f"Video processing is not supported for {self.model_type} model."
-            )
-
-    async def _flatten_and_load_data_by_modality(self, mm_items, modality):
-        """
-        Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
-
-        Returns:
-            Same structure as load_mm_items would return, support for image/audio
-        """
-        # Handle single mm_item (not a list)
-        if not isinstance(mm_items, (list, tuple)):
-            futures, _ = self.submit_data_loading_tasks([mm_items], [modality])
-            return await asyncio.wrap_future(futures[0])
-
-        # Handle nested list (list of lists)
-        if len(mm_items) > 0 and isinstance(mm_items[0], (list, tuple)):
-            # Flatten nested structure
-            flat_data = []
-            flat_indices = []  # Track which group each item belongs to
-            for group_idx, item_group in enumerate(mm_items):
-                for item in item_group:
-                    flat_data.append(item)
-                    flat_indices.append(group_idx)
-
-            # Submit all tasks concurrently
-            futures, _ = self.submit_data_loading_tasks(
-                flat_data, [modality] * len(flat_data)
-            )
-
-            # Wait for all tasks to complete asynchronously
-            async_futures = [asyncio.wrap_future(f) for f in futures]
-            results = await asyncio.gather(*async_futures)
-
-            # Restore nested structure
-            nested_results = [[] for _ in range(len(mm_items))]
-            for idx, result in zip(flat_indices, results):
-                nested_results[idx].append(result)
-
-            return nested_results
-
-        # Handle simple list
-        else:
-            futures, _ = self.submit_data_loading_tasks(
-                mm_items, [modality] * len(mm_items)
-            )
-            # Wait for all tasks to complete asynchronously
-            async_futures = [asyncio.wrap_future(f) for f in futures]
-            return await asyncio.gather(*async_futures)
 
     def get_num_patches(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
@@ -773,10 +471,40 @@ class MMEncoder:
             )
         return int(values[-2]), int(values[-1])
 
+    def _kimi_tokens_from_patch_grid(
+        self, grid: Union[torch.Tensor, List[int]]
+    ) -> int:
+        """Calculate Kimi image tokens from either 2D or 3D patch metadata."""
+        h, w = self._kimi_hw_from_patch_grid(grid)
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
+    def get_num_tokens(
+        self, grid: Union[torch.Tensor, List[int]], modality: Modality
+    ) -> int:
+        """Compatibility helper for callers that still provide patch grids."""
+        if modality == Modality.AUDIO:
+            input_length = self.get_num_patches(grid, modality)
+            return self.preprocessor._get_feat_extract_output_lengths(input_length)
+        if (
+            self.model_type in ("kimi_k25", "kimi_vl")
+            and modality == Modality.IMAGE
+        ):
+            return self._kimi_tokens_from_patch_grid(grid)
+        merge_size = getattr(self.preprocessor.image_processor, "merge_size", 2)
+        return self.get_num_patches(grid, modality) // (merge_size**2)
+
     def slice_embedding(
-        self, mm_embedding: torch.Tensor, token_counts: Iterable[int]
+        self,
+        mm_embedding: torch.Tensor,
+        token_counts: Iterable[int],
+        modality: Optional[Modality] = None,
     ) -> List[torch.Tensor]:
-        """Slice a concatenated embedding tensor using preprocessor metadata."""
+        """Slice embeddings using token counts or legacy patch-grid metadata."""
+        if modality is not None:
+            token_counts = (
+                self.get_num_tokens(grid, modality) for grid in token_counts
+            )
         slices, offset = [], 0
         for count in token_counts:
             slices.append(mm_embedding[offset : offset + count])
@@ -1544,77 +1272,38 @@ class MMEncoder:
                 backend=self.server_args.encoder_transfer_backend,
             )
 
-    async def _encode_zmq(
+    def _setup_per_request_encode(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
+        use_mooncake: bool,
     ):
-        """Compute synchronously and stage a CPU embedding for ZMQ transfer."""
-        mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=False)
+        """Setup metadata and event management for async encode.
+        Returns ((nbytes, total_tokens, embedding_dim), event).
+        """
+        total_tokens = sum(ctx.token_counts)
+        embedding_dim = self._embedding_dims[ctx.modality]
+        nbytes = total_tokens * embedding_dim * self._element_size
 
-        if self.profiler is not None:
-            self.profiler.step()
-
-        if self.rank == 0:
-            if mm_embedding is None:
-                raise InternalError(
-                    f"Rank 0 produced no embedding for request {ctx.req_id}"
-                )
+        event = None
+        if self.rank == 0 and use_mooncake:
             mm_data = EmbeddingData(
                 ctx.req_id,
                 num_parts,
                 part_idx,
                 ctx.grid_thw,
                 ctx.modality,
-                mm_embedding,
+                embedding=None,
+                embedding_shape=[total_tokens, embedding_dim],
                 **ctx.aux_data,
             )
             self.embedding_to_send[ctx.req_id] = mm_data
-        if mm_embedding is None:
-            return (0, 0, 0, None, None)
-        return (
-            mm_embedding.nbytes,
-            mm_embedding.shape[0],
-            mm_embedding.shape[1],
-            None,
-            None,
-        )
-
-    def _setup_mooncake_async_encode(
-        self,
-        req_id: str,
-        num_parts: int,
-        part_idx: int,
-        grid_thw,
-        token_counts: List[int],
-        modality: Modality,
-        aux_data: dict,
-    ):
-        """Setup metadata and event management for mooncake async encode.
-        Returns (nbytes, total_tokens, embedding_dim, event)."""
-        total_tokens = sum(token_counts)
-        embedding_dim = self._embedding_dims[modality]
-        nbytes = total_tokens * embedding_dim * self._element_size
-
-        event = None
-        if self.rank == 0:
-            mm_data = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                grid_thw,
-                modality,
-                embedding=None,
-                embedding_shape=[total_tokens, embedding_dim],
-                **aux_data,
-            )
-            self.embedding_to_send[req_id] = mm_data
             event = asyncio.Event()
-            self._forward_ready_events[req_id] = event
-            self._forward_results[req_id] = {}
+            self._forward_ready_events[ctx.req_id] = event
+            self._forward_results[ctx.req_id] = {}
 
-        return nbytes, total_tokens, embedding_dim, event
+        return (nbytes, total_tokens, embedding_dim), event
 
     def _handle_mooncake_encode_error(
         self, req_id, num_parts, part_idx, modality, error_msg, error_code
@@ -1636,7 +1325,7 @@ class MMEncoder:
             self.embedding_to_send[req_id] = mm_data
         return 0, 0, 0, error_msg, error_code
 
-    def _launch_mooncake_background_task(self, coro):
+    def _launch_encode_background_task(self, coro):
         """Launch an async background task and track it."""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
@@ -1733,21 +1422,19 @@ class MMEncoder:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    def _encode_mooncake(
+    def _start_per_request_encode(
         self,
         ctx: EncodeContext,
         num_parts: int,
         part_idx: int,
+        use_mooncake: bool,
     ):
-        """Return Mooncake metadata before computing the embedding asynchronously."""
-        nbytes, total_tokens, embedding_dim, event = self._setup_mooncake_async_encode(
-            ctx.req_id,
+        """Launch one common forward; callers decide whether to await it."""
+        metadata, event = self._setup_per_request_encode(
+            ctx,
             num_parts,
             part_idx,
-            ctx.grid_thw,
-            ctx.token_counts,
-            ctx.modality,
-            ctx.aux_data,
+            use_mooncake,
         )
 
         # All ranks launch in dispatch order. The model feature method must
@@ -1755,48 +1442,71 @@ class MMEncoder:
         # not available in a ThreadPoolExecutor worker.
         async def _run_forward():
             try:
-                emb = await self._compute_embedding(ctx, keep_on_gpu=True)
+                emb = await self._compute_embedding(ctx, keep_on_gpu=use_mooncake)
                 # The transfer engine operates outside the CUDA stream, so GPU
                 # writes must complete before a transfer can start.
-                if emb is not None and emb.is_cuda:
+                if use_mooncake and emb is not None and emb.is_cuda:
                     torch.cuda.current_stream(emb.device).synchronize()
                 if self.rank == 0:
                     if emb is None:
                         raise InternalError(
                             f"Rank 0 produced no embedding for request {ctx.req_id}"
                         )
-                    # Direct embeddings share this registration across /send
-                    # calls. Global-cache embeddings register inside _send.
-                    if not ctx.use_global_cache:
-                        try:
-                            self.engine.register(emb.data_ptr(), emb.nbytes)
-                            self._forward_results[ctx.req_id]["mr_ptr"] = emb.data_ptr()
-                        except Exception as reg_err:
-                            logger.warning(
-                                f"Shared-MR register failed for {ctx.req_id}, "
-                                f"falling back to per-/send register: {reg_err}"
-                            )
-                            self._forward_results[ctx.req_id]["mr_ptr"] = None
-                    self._forward_results[ctx.req_id]["embedding"] = emb
+                    actual_metadata = (
+                        emb.nbytes,
+                        emb.shape[0],
+                        emb.shape[1],
+                    )
+                    if actual_metadata != metadata:
+                        raise InternalError(
+                            f"Embedding metadata mismatch for {ctx.req_id}: "
+                            f"expected={metadata}, actual={actual_metadata}"
+                        )
+                    if use_mooncake:
+                        # Direct embeddings share this registration across /send
+                        # calls. Global-cache embeddings register inside _send.
+                        if not ctx.use_global_cache:
+                            try:
+                                self.engine.register(emb.data_ptr(), emb.nbytes)
+                                self._forward_results[ctx.req_id][
+                                    "mr_ptr"
+                                ] = emb.data_ptr()
+                            except Exception as reg_err:
+                                logger.warning(
+                                    f"Shared-MR register failed for {ctx.req_id}, "
+                                    f"falling back to per-/send register: {reg_err}"
+                                )
+                                self._forward_results[ctx.req_id]["mr_ptr"] = None
+                        self._forward_results[ctx.req_id]["embedding"] = emb
+                    else:
+                        self.embedding_to_send[ctx.req_id] = EmbeddingData(
+                            ctx.req_id,
+                            num_parts,
+                            part_idx,
+                            ctx.grid_thw,
+                            ctx.modality,
+                            emb,
+                            **ctx.aux_data,
+                        )
             except Exception as e:
-                logger.error(f"Encoder forward failed for {ctx.req_id}: {e}")
+                if not use_mooncake:
+                    raise
+
+                error_msg = str(e)
+                logger.error(
+                    f"Encoder forward failed for {ctx.req_id}: {error_msg}",
+                    exc_info=True,
+                )
                 if self.rank == 0:
-                    self._forward_results[ctx.req_id]["error"] = str(e)
+                    self._forward_results[ctx.req_id]["error"] = error_msg
             finally:
-                if self.rank == 0:
+                if self.rank == 0 and event is not None:
                     event.set()
                 if self.profiler is not None:
                     self.profiler.step()
 
-        self._launch_mooncake_background_task(_run_forward())
-
-        if self.rank == 0:
-            logger.info(
-                f"Returning metadata immediately for {ctx.req_id}, "
-                f"encoder forward running async"
-            )
-
-        return (nbytes, total_tokens, embedding_dim, None, None)
+        task = self._launch_encode_background_task(_run_forward())
+        return metadata, task
 
     async def encode(
         self, mm_items, modality: Modality, req_id, num_parts, part_idx, hashes=None
@@ -1822,17 +1532,21 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            if use_mooncake:
-                return self._encode_mooncake(
-                    ctx,
-                    num_parts,
-                    part_idx,
-                )
-            return await self._encode_zmq(
+            metadata, encode_task = self._start_per_request_encode(
                 ctx,
                 num_parts,
                 part_idx,
+                use_mooncake,
             )
+            if use_mooncake:
+                if self.rank == 0:
+                    logger.info(
+                        f"Returning metadata immediately for {ctx.req_id}, "
+                        f"encoder forward running async"
+                    )
+                return (*metadata, None, None)
+            await encode_task
+            return (*metadata, None, None)
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
