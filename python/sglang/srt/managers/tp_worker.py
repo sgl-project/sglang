@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -613,7 +614,10 @@ class TpModelWorker(BaseTpWorker):
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and forward_batch.sampling_info.grammars is not None
+                and (
+                    forward_batch.sampling_info.grammars is not None
+                    or envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                )
             ):
 
                 def sample_batch_func():
