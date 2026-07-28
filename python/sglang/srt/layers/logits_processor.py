@@ -25,6 +25,10 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStates,
+    pack_aux_hidden_states,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_tp_all_gather,
@@ -58,12 +62,6 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-# Aux hidden states arrive as either a list of K [tokens, hidden] tensors (concatenated
-# here -> transient ~2x HBM) or a pre-packed [tokens, K * hidden] tensor written in place
-# by AuxHiddenStatePacker (no cat). The code below branches on which; both paths stay
-# live since models that haven't opted into packing still pass a list.
-AuxHiddenStates = Union[torch.Tensor, List[torch.Tensor]]
 _is_cpu = is_cpu()
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
@@ -669,9 +667,7 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    hidden_states_to_store = self._pack_aux_hidden_states(
-                        aux_hidden_states
-                    )
+                    hidden_states_to_store = pack_aux_hidden_states(aux_hidden_states)
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm
@@ -680,7 +676,7 @@ class LogitsProcessor(nn.Module):
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
                     assert aux_pruned_states is not None
-                    aux_pruned_states = self._pack_aux_hidden_states(aux_pruned_states)
+                    aux_pruned_states = pack_aux_hidden_states(aux_pruned_states)
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
@@ -707,15 +703,6 @@ class LogitsProcessor(nn.Module):
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         return hidden_states_to_store
-
-    @staticmethod
-    def _pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
-        # The point where the two representations converge to one packed tensor.
-        if isinstance(aux_hidden_states, torch.Tensor):
-            # Already packed in place by the producer -- no copy.
-            return aux_hidden_states
-        # Legacy list path: concatenate K tensors, transiently ~2x aux HBM (see AuxHiddenStates).
-        return torch.cat(aux_hidden_states, dim=-1)
 
     def _get_logits(
         self,
