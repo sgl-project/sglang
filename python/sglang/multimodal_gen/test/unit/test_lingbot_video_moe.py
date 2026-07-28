@@ -108,8 +108,10 @@ def test_router_bias_shifts_selection_but_not_gate_weights():
     assert abs(picked[3] - float(raw[1])) < 1e-5
 
 
-def _sdpa(q, k, v, attn_mask=None):
+def _sdpa(q, k, v, attn_mask=None, attn_mask_meta=None):
     q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    if attn_mask is not None and attn_mask.dim() == 2:
+        attn_mask = attn_mask[:, None, None, :]
     out = torch.nn.functional.scaled_dot_product_attention(
         q_, k_, v_, attn_mask=attn_mask
     )
@@ -138,9 +140,9 @@ def test_attention_isolates_samples_across_batch(monkeypatch):
     freqs = torch.zeros(batch * seq_len, head_dim // 2)
 
     valid = [seq_len, seq_len - 2, seq_len - 5]
-    mask = torch.zeros(batch, 1, 1, seq_len, dtype=torch.bool)
+    mask = torch.zeros(batch, seq_len, dtype=torch.bool)
     for i, length in enumerate(valid):
-        mask[i, ..., :length] = True
+        mask[i, :length] = True
 
     batched = attn.forward(x, (freqs, freqs), mask)
 
@@ -157,6 +159,32 @@ def test_attention_isolates_samples_across_batch(monkeypatch):
     flat = attn.forward(x.reshape(1, batch * seq_len, hidden), (freqs, freqs), None)
     flat = flat.reshape(batch, seq_len, hidden)
     assert (flat[0, : valid[0]] - batched[0, : valid[0]]).abs().max() > 1e-3
+
+
+def test_attention_forwards_2d_mask_and_varlen_metadata(monkeypatch):
+    monkeypatch.setattr(
+        dits_lingbot_video_moe, "_apply_rotary_emb", lambda t, *a, **k: t
+    )
+    num_heads, head_dim, batch, seq_len = 4, 8, 2, 6
+    attn = _real_attention(num_heads, head_dim)
+    hidden = num_heads * head_dim
+    captured = {}
+
+    def capture_attention(q, k, v, attn_mask=None, attn_mask_meta=None):
+        captured["mask"] = attn_mask
+        captured["meta"] = attn_mask_meta
+        return _sdpa(q, k, v, attn_mask=attn_mask)
+
+    attn.attn = capture_attention
+    x = torch.randn(batch, seq_len, hidden)
+    freqs = torch.zeros(batch * seq_len, head_dim // 2)
+    mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=torch.bool)
+    metadata = {"max_seqlen": seq_len}
+
+    attn.forward(x, (freqs, freqs), mask, metadata)
+
+    assert captured["mask"] is mask
+    assert captured["meta"] is metadata
 
 
 def test_attention_single_sample_matches_direct_attention(monkeypatch):

@@ -14,7 +14,10 @@ from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    USPAttention,
+    build_varlen_mask_meta,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -206,6 +209,7 @@ class LingBotVideoAttention(nn.Module):
         x: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
         cos, sin = freqs_cis
         q, _ = self.to_q(x)
@@ -223,7 +227,13 @@ class LingBotVideoAttention(nn.Module):
         k = _apply_rotary_emb(
             k.reshape(1, B * S, H, D), cos, sin, is_neox_style=False
         ).reshape(B, S, H, D)
-        out = self.attn(q, k, v, attn_mask=attention_mask)
+        out = self.attn(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            attn_mask_meta=attn_mask_meta,
+        )
         out = out.flatten(2)
         out, _ = self.to_out(out)
         return out
@@ -296,6 +306,7 @@ class LingBotVideoBlock(nn.Module):
         temb6: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
         expected_tokens = x.shape[0] * x.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
@@ -317,7 +328,8 @@ class LingBotVideoBlock(nn.Module):
         attn_out = self.attn(
             attn_in,
             freqs_cis,
-            attention_mask,
+            attention_mask=attention_mask,
+            attn_mask_meta=attn_mask_meta,
         )
         x = x + (gate_msa * self.norm_post_attn(attn_out)).to(x.dtype)
 
@@ -518,17 +530,17 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         cos, sin = self.rotary_emb.forward_uncached(positions)
         freqs_cis = (cos.float(), sin.float())
 
-        attention_mask = None
+        attention_mask = attn_mask_meta = None
         # B==1 text is trimmed to true length upstream, so no mask; B>1 may pad, build a key mask.
         if B > 1 and encoder_attention_mask is not None:
-            key_mask = torch.cat(
+            attention_mask = torch.cat(
                 [
                     torch.ones(B, n_video, dtype=torch.bool, device=device),
                     encoder_attention_mask.bool(),
                 ],
                 dim=1,
             )
-            attention_mask = key_mask[:, None, None, :]
+            attn_mask_meta = build_varlen_mask_meta(attention_mask)
 
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)
@@ -544,6 +556,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 temb6,
                 freqs_cis,
                 attention_mask,
+                attn_mask_meta,
             )
 
         final_mod = self.norm_out_modulation(
