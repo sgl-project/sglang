@@ -68,12 +68,15 @@ class IndexKeyCache:
         for index_k in self.buffer:
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
-    def get_buffer(self, layer_id: int) -> torch.Tensor:
+    def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
         return self.buffer[layer_id - self.pool.start_layer]
+
+    def get_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.get_local_buffer(layer_id)
 
     def get_k_continuous(self, layer_id: int, seq_len: int, page_indices: torch.Tensor):
         buf = self.get_buffer(layer_id)

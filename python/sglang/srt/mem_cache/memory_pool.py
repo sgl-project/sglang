@@ -4297,7 +4297,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_key_cache.move(tgt_loc, src_loc)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.index_key_cache.get_buffer(layer_id)
+        return self.index_key_cache.get_local_buffer(layer_id)
 
     def get_index_k_continuous(
         self,

@@ -104,8 +104,12 @@ def _run(rank: int, world: int, port: int):
     # Indexer buffer owner-broadcast: owner writes a layer-distinct value, then
     # every rank must read it back for every layer.
     for layer_id in range(LAYER_NUM):
+        store_buf = pool.get_index_k_with_scale_buffer(layer_id)
+        assert (
+            store_buf.data_ptr() == pool.index_k_with_scale_buffer[layer_id].data_ptr()
+        )
         if pool._is_layer_owned(layer_id):
-            pool.index_k_with_scale_buffer[layer_id].fill_(layer_id + 10)
+            store_buf.fill_(layer_id + 10)
     torch.cuda.synchronize()
     torch.distributed.barrier()
     for layer_id in range(LAYER_NUM):
