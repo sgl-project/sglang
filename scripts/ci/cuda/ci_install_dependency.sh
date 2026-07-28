@@ -417,34 +417,6 @@ download_flashinfer_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-force_reinstall_cutlass_dsl_libs_cu13() {
-    # nvidia-cutlass-dsl[cu13] has additive PyPI extras: installing it pulls in
-    # both -libs-base and -libs-cu13. The two wheels ship intentionally-different
-    # content for the same paths (cutlass/_mlir/dialects/_gpu_ops_gen.py and
-    # cutlass/_mlir/_mlir_libs/_cutlass_ir.cpython-*.so) -- each Python wrapper
-    # is paired with a matching pybind11 .so. If install order leaves the .py
-    # from one wheel and the .so from the other, GPUModuleOp.__init__ raises
-    # TypeError: incompatible function arguments at kernel-compile time.
-    #
-    # Force-reinstall -libs-cu13 LAST so both files come from the same wheel
-    # (BOTH-cu13 state), eliminating the mismatch. The version is parsed from
-    # pyproject.toml so this stays in sync with whatever nvidia-cutlass-dsl
-    # version the project pins.
-    if [ "$CU_MAJOR" != "13" ]; then
-        return
-    fi
-
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
-    if [ -z "$CUTLASS_DSL_VERSION" ]; then
-        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
-        return
-    fi
-
-    $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 stabilize_flashinfer_jit_paths() {
     # In venv mode, FlashInfer JIT writes build.ninja with hardcoded -isystem
     # paths. Per-job venvs get unique paths, but the JIT cache is shared on the
@@ -497,8 +469,14 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.11.post1"
+    MOONCAKE_VERSION="0.3.12.post1"
     NIXL_VERSION="1.3.0"
+    # sgl-eval is git-only and cannot be declared in python/pyproject.toml (see
+    # the note there). The nightly GSM8K eval shells out to the sgl-eval CLI and
+    # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
+    # re-baseline MODEL_SCORE_THRESHOLDS in
+    # test/registered/eval/test_text_models_gsm8k_eval.py first.
+    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -533,6 +511,8 @@ install_extra_deps() {
         $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
+
+    $PIP_CMD install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@${SGL_EVAL_REF}" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -624,7 +604,6 @@ main() {
     install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
-    force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
