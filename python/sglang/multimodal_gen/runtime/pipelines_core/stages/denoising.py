@@ -1587,7 +1587,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with (
-            precision_autocast_context(ctx.target_dtype, server_args.disable_autocast),
+            precision_autocast_context(
+                ctx.target_dtype,
+                server_args.disable_autocast,
+                enabled=ctx.autocast_enabled,
+            ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
             with self.progress_bar(

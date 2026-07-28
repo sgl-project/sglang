@@ -78,13 +78,21 @@ def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:
     )
 
 
-def autocast_context(dtype: torch.dtype, disable_autocast: bool):
-    if not autocast_enabled(dtype, disable_autocast):
+def autocast_context(
+    dtype: torch.dtype,
+    disable_autocast: bool,
+    *,
+    enabled: Optional[bool] = None,
+):
+    autocast_is_enabled = (
+        autocast_enabled(dtype, disable_autocast) if enabled is None else enabled
+    )
+    if not autocast_is_enabled and current_platform.is_mps():
         return nullcontext()
     return torch.autocast(
         device_type=current_platform.device_type,
         dtype=dtype,
-        enabled=True,
+        enabled=autocast_is_enabled,
     )
 
 
