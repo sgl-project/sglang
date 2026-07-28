@@ -9,7 +9,7 @@ import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
@@ -346,6 +346,28 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             error_context=f"request {req.request_id}",
         )
+
+    def execute_forward_incremental(
+        self, batch: list[Req]
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped results after each request finishes its terminal stage."""
+        assert self.pipeline is not None
+        self._validate_group_forward_reqs(batch)
+        results = iter(self.pipeline.forward_batch_iter(batch, self.server_args))
+
+        for req in batch:
+            output_batch = self._execute_forward_common(
+                req,
+                forward_fn=lambda results=results: next(results),
+                log_reqs=[req],
+                return_req=False,
+                save_output_paths=lambda output_batch, req=req: self._save_output_paths(
+                    req, output_batch
+                ),
+                error_context=f"grouped request {req.request_id}",
+            )
+            assert isinstance(output_batch, OutputBatch)
+            yield output_batch
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch | Req:
         """Execute expanded multi-output requests as one grouped forward."""

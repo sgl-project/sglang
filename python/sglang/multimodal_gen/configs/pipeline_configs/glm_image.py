@@ -54,6 +54,12 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def supports_native_grouped_requests(self):
         return True
 
+    def supports_incremental_grouped_outputs(self):
+        return True
+
+    def incremental_grouped_stage_count(self):
+        return 1
+
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
