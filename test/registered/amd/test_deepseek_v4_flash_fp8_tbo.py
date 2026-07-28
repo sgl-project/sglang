@@ -6,6 +6,7 @@ two-batch-overlap path on MI35x ROCm 7.2.
 TBO here is the DP-attention TP-MoE variant (moe_a2a_backend='none'): it overlaps
 one micro-batch's DP all_gatherv (pre-MoE gather) + reduce_scatterv (post-MoE
 combine) with the other micro-batch's attention + expert compute (prefill only).
+The TP8/DP2 topology exercises attention TP4.
 Enabled purely via `--enable-dp-attention` + `--enable-two-batch-overlap` (no opt-in
 env). This test guards that TBO does not regress GSM8K accuracy and that the DP TBO
 server launches + runs to completion (exercises op_gather/op_moe/op_combine and the
@@ -21,6 +22,8 @@ Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
 import os
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -72,7 +75,7 @@ COMMON_ENV_VARS = {
     "SGLANG_DP_USE_GATHERV": "1",
     "SGLANG_DP_USE_REDUCE_SCATTER": "1",
     "SGLANG_SHARED_EXPERT_TP1": "1",
-    "SGLANG_DP_SHARED_EXPERT_LOCAL": "1",
+    "SGLANG_TBO_DEBUG": "1",
     # ROCm HSA-resource stability for TBO at high concurrency.
     "GPU_MAX_HW_QUEUES": "5",
     # FP8 variant
@@ -96,7 +99,7 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
             # selected because moe_a2a_backend stays 'none'; no opt-in env needed.
             "--dp",
-            "8",
+            "2",
             "--enable-dp-attention",
             "--enable-prefill-delayer",
             "--enable-two-batch-overlap",
@@ -115,9 +118,9 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
             "0.90",
             "--swa-full-tokens-ratio",
             "0.15",
-            # global chunk; DP-attention divides by dp_size=8 -> 8192/rank.
+            # Global chunk; DP-attention divides by dp_size=2 -> 8192/rank.
             "--chunked-prefill-size",
-            "65536",
+            "16384",
             "--disable-shared-experts-fusion",
             "--tool-call-parser",
             "deepseekv4",
@@ -136,6 +139,21 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def test_single_request_tbo(self):
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": "What is 7 + 5?"}],
+                "temperature": 0,
+                "max_tokens": 32,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        text = response.json()["choices"][0]["message"]["content"]
+        self.assertIn("12", text, f"Expected 12, got {text!r}")
 
     def test_gsm8k_tbo(self):
         args = SimpleNamespace(
