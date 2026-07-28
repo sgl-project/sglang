@@ -33,9 +33,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.session_unified_radix_cache import (
-    SessionUnifiedRadixCacheMixin,
-)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -43,6 +40,9 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
+)
+from sglang.srt.mem_cache.unified_cache.cache_mixin.session_unified_radix_cache import (
+    SessionUnifiedRadixCacheMixin,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
