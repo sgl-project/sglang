@@ -36,10 +36,7 @@ pub enum OneOrMany<T: OneOrManyItem> {
 /// round-trip.
 pub trait OneOrManyItem: sealed::SealedItem {}
 
-impl OneOrManyItem for bool {}
-impl OneOrManyItem for i64 {}
-impl OneOrManyItem for String {}
-impl OneOrManyItem for TokenIds {}
+impl<T: sealed::SealedItem> OneOrManyItem for T {}
 
 mod sealed {
     /// Supertrait no downstream module can implement, sealing [`super::OneOrManyItem`].
