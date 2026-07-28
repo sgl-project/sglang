@@ -290,6 +290,53 @@ class TestShippedTopologies(CustomTestCase):
         )
 
 
+_LTX2_SINGLE_STAGE_WITH_SPLIT_VAE = [
+    "InputValidationStage",
+    "TextEncodingStage",
+    "LTX2TextConnectorStage",
+    "LTX2SigmaPreparationStage",
+    "TimestepPreparationStage",
+    "LTX2AVLatentPreparationStage",
+    "LTX2ImageEncodingStage",
+    "LTX2AVDenoisingStage",
+    "LTX2VideoDecodingStage",
+    "LTX2AudioDecodingStage",
+]
+
+_LTX2_TWO_STAGE_EXTRA_STAGES = [
+    "LTX2HalveResolutionStage",
+    "LTX2LoRASwitchStage",
+    "LTX2UpsampleStage",
+    "ltx2_lora_switch_stage2",
+    "ltx2_image_encoding_stage2",
+    "LTX2RefinementStage",
+]
+
+
+class TestLtx2DualVaeTopologyCoverage(CustomTestCase):
+    """Guardrail: dual-VAE YAML must match the single-stage LTX2 pipeline only."""
+
+    topology_dir = Path(__file__).resolve().parents[2] / "configs" / "disagg_topologies"
+    topology = topology_dir / "ltx2_dual_vae.yaml"
+
+    def test_covers_single_stage_ltx2_pipeline(self):
+        plan = ExecutionPlan.compile(DagSpec.load(str(self.topology)))
+        self.assertEqual(
+            plan.validate_stage_coverage(_LTX2_SINGLE_STAGE_WITH_SPLIT_VAE),
+            [],
+        )
+
+    def test_rejects_two_stage_pipeline_stages(self):
+        plan = ExecutionPlan.compile(DagSpec.load(str(self.topology)))
+        errors = plan.validate_stage_coverage(
+            _LTX2_SINGLE_STAGE_WITH_SPLIT_VAE + _LTX2_TWO_STAGE_EXTRA_STAGES
+        )
+        self.assertTrue(errors)
+        joined = "\n".join(errors)
+        self.assertIn("not claimed by any node", joined)
+        self.assertIn("LTX2RefinementStage", joined)
+
+
 class TestDagRequestScheduler(CustomTestCase):
     def _run_linear(self) -> tuple[DagRequestScheduler, list]:
         plan = ExecutionPlan.compile(DagSpec.parse(_linear_spec()))

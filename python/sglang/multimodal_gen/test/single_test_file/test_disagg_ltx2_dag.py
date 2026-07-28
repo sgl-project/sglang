@@ -3,9 +3,13 @@
 Exercises fan-out from the denoiser to independently scaled video and audio
 decoders, terminal output merging, and conditional pruning of the audio branch.
 
+Uses a 2-GPU colocated layout (encoder + both VAE nodes on GPU 0, denoiser on
+GPU 1) so it fits the multimodal ``2-gpu`` CI suite alongside Z-Image disagg.
+
 Run directly:
 
-    pytest -v python/sglang/multimodal_gen/test/single_test_file/test_disagg_ltx2_dag.py
+    CUDA_VISIBLE_DEVICES=0,1 MC_FORCE_TCP=1 \\
+        pytest -v python/sglang/multimodal_gen/test/single_test_file/test_disagg_ltx2_dag.py
     pytest -v ... -k DualVae
 """
 
@@ -25,8 +29,6 @@ from sglang.multimodal_gen.test.single_test_file.test_disagg_server import (
     DisaggCluster,
     _DisaggTestBase,
 )
-from sglang.test.test_utils import CustomTestCase
-
 _LTX23_MODEL = "Lightricks/LTX-2.3"
 _TOPOLOGY_DIR = Path(__file__).resolve().parents[2] / "configs" / "disagg_topologies"
 
@@ -144,14 +146,14 @@ def _warmup_ltx2_video(cluster: DisaggCluster) -> None:
 class TestDisaggLtx2DualVaeDag(_DisaggTestBase):
     """LTX-2.3 with video/audio VAEs on separate DAG terminal nodes."""
 
-    cluster_name = "ltx2_dual_vae"
+    cluster_name = "ltx2_dual_vae_2gpu"
     model = _LTX23_MODEL
-    required_gpus = 4
+    required_gpus = 2
     gpu_layout = {
         "encoder": [0],
         "denoiser": [1],
-        "vae_video": [2],
-        "vae_audio": [3],
+        "vae_video": [0],
+        "vae_audio": [0],
     }
     dag_topology = _TOPOLOGY_DIR / "ltx2_dual_vae.yaml"
     disagg_role_map = _LTX2_DAG_ROLE_MAP
@@ -164,6 +166,11 @@ class TestDisaggLtx2DualVaeDag(_DisaggTestBase):
         "vae_audio": list(_LTX2_TRANSFER_ARGS),
         "server": ["--disagg-timeout", "900"],
     }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        os.environ.setdefault("MC_FORCE_TCP", "1")
+        super().setUpClass()
 
     def test_generates_muxed_av_mp4(self) -> None:
         """Fan-out + dual terminals produce one mp4 with video and audio streams."""
@@ -231,63 +238,6 @@ class TestDisaggLtx2DualVaeDag(_DisaggTestBase):
             decode_runs_before,
             "vae_audio must be skipped, not run, when generate_audio is false",
         )
-
-
-# Stage names registered by LTX2Pipeline when the DAG claims the split decoders.
-_LTX2_SINGLE_STAGE_WITH_SPLIT_VAE = [
-    "InputValidationStage",
-    "TextEncodingStage",
-    "LTX2TextConnectorStage",
-    "LTX2SigmaPreparationStage",
-    "TimestepPreparationStage",
-    "LTX2AVLatentPreparationStage",
-    "LTX2ImageEncodingStage",
-    "LTX2AVDenoisingStage",
-    "LTX2VideoDecodingStage",
-    "LTX2AudioDecodingStage",
-]
-
-_LTX2_TWO_STAGE_EXTRA_STAGES = [
-    "LTX2HalveResolutionStage",
-    "LTX2LoRASwitchStage",
-    "LTX2UpsampleStage",
-    "ltx2_lora_switch_stage2",
-    "ltx2_image_encoding_stage2",
-    "LTX2RefinementStage",
-]
-
-
-class TestLtx2DualVaeTopologyCoverage(CustomTestCase):
-    """Guardrail: dual-VAE YAML must match the single-stage LTX2 pipeline only."""
-
-    topology = _TOPOLOGY_DIR / "ltx2_dual_vae.yaml"
-
-    def test_covers_single_stage_ltx2_pipeline(self) -> None:
-        from sglang.multimodal_gen.runtime.disaggregation.dag import (
-            DagSpec,
-            ExecutionPlan,
-        )
-
-        plan = ExecutionPlan.compile(DagSpec.load(str(self.topology)))
-        self.assertEqual(
-            plan.validate_stage_coverage(_LTX2_SINGLE_STAGE_WITH_SPLIT_VAE),
-            [],
-        )
-
-    def test_rejects_two_stage_pipeline_stages(self) -> None:
-        from sglang.multimodal_gen.runtime.disaggregation.dag import (
-            DagSpec,
-            ExecutionPlan,
-        )
-
-        plan = ExecutionPlan.compile(DagSpec.load(str(self.topology)))
-        errors = plan.validate_stage_coverage(
-            _LTX2_SINGLE_STAGE_WITH_SPLIT_VAE + _LTX2_TWO_STAGE_EXTRA_STAGES
-        )
-        self.assertTrue(errors)
-        joined = "\n".join(errors)
-        self.assertIn("not claimed by any node", joined)
-        self.assertIn("LTX2RefinementStage", joined)
 
 
 if __name__ == "__main__":
