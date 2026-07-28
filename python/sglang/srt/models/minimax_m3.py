@@ -28,7 +28,10 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
 )
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import (
+    get_pp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -76,7 +79,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -284,7 +287,7 @@ class MiniMaxM3MoE(nn.Module):
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
             0
-            if get_exec().moe.disable_shared_experts_fusion
+            if get_server_args().disable_shared_experts_fusion
             else config.n_shared_experts
         )
 
@@ -308,7 +311,7 @@ class MiniMaxM3MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
             + self.num_fused_shared_experts
-            + get_exec().moe.ep_num_redundant_experts,
+            + get_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -1440,7 +1443,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
 
             self.logits_processor = LogitsProcessor(config)
@@ -1453,7 +1456,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def determine_num_fused_shared_experts(self):
-        if get_exec().moe.disable_shared_experts_fusion:
+        if get_server_args().disable_shared_experts_fusion:
             return
 
         disable_reason = None
