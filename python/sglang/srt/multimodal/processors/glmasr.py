@@ -29,14 +29,42 @@ class GlmAsrProcessor(BaseMultimodalProcessor):
             audio_token_id=self.audio_token_id,
         ).build(_processor)
 
+    def _build_transcription_prompt(self, input_text) -> str:
+        """Fall back to a default ASR prompt for audio-only requests.
+
+        The ``/v1/audio/transcriptions`` endpoint sends empty text (and hence
+        empty ``input_ids``), which carries no audio placeholder. Build the
+        standard GLM-ASR chat prompt with one audio span so the encoder
+        features have a slot to fill.
+        """
+        if isinstance(input_text, list):
+            input_text = (
+                self._processor.tokenizer.decode(input_text) if input_text else ""
+            )
+        if input_text and input_text.strip():
+            return input_text
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": ""},
+                    {"type": "text", "text": "Transcribe the audio."},
+                ],
+            }
+        ]
+        return self._processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False
+        )
+
     async def process_mm_data_async(
         self,
         audio_data,
         input_text,
         **kwargs,
     ):
+        prompt = self._build_transcription_prompt(input_text)
         base_output = await self.load_mm_data(
-            prompt=input_text,
+            prompt=prompt,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
