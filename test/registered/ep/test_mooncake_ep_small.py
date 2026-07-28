@@ -15,7 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=82, stage="base-c", runner_config="deepep-4-gpu-h100")
+register_cuda_ci(
+    est_time=82,
+    stage="base-c",
+    runner_config="deepep-4-gpu-h100",
+    disabled="Temporarily disabled until the next Mooncake release includes the PyTorch 2.13 collective forwarding fix.",
+)
 
 ib_devices = get_rdma_devices_args()
 
