@@ -10,17 +10,21 @@ Tests cover:
 - from_server_args() defaults max_running_requests to 1 when None
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 import sys
 import types
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock, mock_open, patch
-
 
 # ---------------------------------------------------------------------------
 # Minimal stubs so the module can be imported without the full SGLang stack
 # ---------------------------------------------------------------------------
+
 
 def _make_stub_modules():
     """Create lightweight stubs for all heavy dependencies pulled in by
@@ -77,11 +81,20 @@ _make_stub_modules()
 import importlib.util as _ilu
 import os as _os
 
-_config_path = _os.path.abspath(_os.path.join(
-    _os.path.dirname(__file__),
-    "..", "..", "..", "..",
-    "python", "sglang", "srt", "dllm", "config.py",
-))
+_config_path = _os.path.abspath(
+    _os.path.join(
+        _os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "..",
+        "python",
+        "sglang",
+        "srt",
+        "dllm",
+        "config.py",
+    )
+)
 _spec = _ilu.spec_from_file_location("sglang.srt.dllm.config", _config_path)
 _mod = _ilu.module_from_spec(_spec)
 sys.modules["sglang.srt.dllm.config"] = _mod
@@ -90,10 +103,10 @@ _spec.loader.exec_module(_mod)
 DllmConfig = _mod.DllmConfig
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_server_args(**kwargs) -> ServerArgs:
     args = ServerArgs(model_path="dummy")
@@ -111,6 +124,7 @@ def _make_mock_model_config(arch: str):
 # ---------------------------------------------------------------------------
 # Test Cases
 # ---------------------------------------------------------------------------
+
 
 class TestDllmConfigInit(unittest.TestCase):
     """Tests for direct __init__ / constructor."""
@@ -133,7 +147,11 @@ class TestDllmConfigInit(unittest.TestCase):
 
     def test_default_fdfo_is_false(self):
         cfg = DllmConfig(
-            algorithm="x", algorithm_config={}, block_size=1, mask_id=0, max_running_requests=1
+            algorithm="x",
+            algorithm_config={},
+            block_size=1,
+            mask_id=0,
+            max_running_requests=1,
         )
         self.assertFalse(cfg.first_done_first_out_mode)
 
@@ -156,8 +174,12 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_llada2_architecture_defaults(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("LLaDA2MoeModelLM")
-        args = _make_server_args(dllm_algorithm="low_confidence", max_running_requests=2)
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "LLaDA2MoeModelLM"
+        )
+        args = _make_server_args(
+            dllm_algorithm="low_confidence", max_running_requests=2
+        )
 
         cfg = DllmConfig.from_server_args(args)
 
@@ -169,7 +191,9 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_sdar_architecture_defaults(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("SDARForCausalLM")
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "SDARForCausalLM"
+        )
         args = _make_server_args(dllm_algorithm="joint_threshold")
 
         cfg = DllmConfig.from_server_args(args)
@@ -179,7 +203,9 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_sdar_moe_architecture_defaults(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("SDARMoeForCausalLM")
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "SDARMoeForCausalLM"
+        )
         args = _make_server_args(dllm_algorithm="joint_threshold")
 
         cfg = DllmConfig.from_server_args(args)
@@ -207,7 +233,9 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_max_running_requests_defaults_to_1_when_none(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("LLaDA2MoeModelLM")
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "LLaDA2MoeModelLM"
+        )
         args = _make_server_args(dllm_algorithm="x", max_running_requests=None)
 
         cfg = DllmConfig.from_server_args(args)
@@ -220,7 +248,9 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_yaml_config_overrides_block_size(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("SDARForCausalLM")
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "SDARForCausalLM"
+        )
         args = _make_server_args(
             dllm_algorithm="x",
             dllm_algorithm_config="config.yaml",
@@ -239,7 +269,9 @@ class TestDllmConfigFromServerArgs(unittest.TestCase):
 
     @patch("sglang.srt.dllm.config.ModelConfig")
     def test_yaml_config_without_block_size_keeps_model_default(self, mock_cls):
-        mock_cls.from_server_args.return_value = _make_mock_model_config("SDARForCausalLM")
+        mock_cls.from_server_args.return_value = _make_mock_model_config(
+            "SDARForCausalLM"
+        )
         args = _make_server_args(dllm_algorithm="x", dllm_algorithm_config="cfg.yaml")
 
         yaml_content = "some_key: 42\n"
