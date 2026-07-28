@@ -1,4 +1,4 @@
-"""Unit tests for prefill CUDA graph runner helpers."""
+"""Unit tests for prefill CUDA graph wrapper helpers."""
 
 import unittest
 from types import SimpleNamespace
