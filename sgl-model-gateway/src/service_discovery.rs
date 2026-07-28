@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -344,15 +347,15 @@ pub async fn start_service_discovery(
         // startup.
         //
         // Both this timer and the watch-restart path below drive reconciles,
-        // so they share a lock (taken inside `reconcile_from_list`) to keep
-        // the passes from interleaving.
-        let reconcile_lock = Arc::new(tokio::sync::Mutex::new(()));
+        // so they share state (a lock taken inside `reconcile_from_list` to
+        // keep the passes from interleaving, plus the failure counter).
+        let reconcile_state = Arc::new(ReconcileState::default());
         {
             let pods_resync = pods.clone();
             let config_resync = Arc::clone(&config_arc);
             let tracked_resync = Arc::clone(&tracked_pods);
             let app_context_resync = Arc::clone(&app_context);
-            let lock_resync = Arc::clone(&reconcile_lock);
+            let state_resync = Arc::clone(&reconcile_state);
             // Clamp to >= 1s: time::interval panics on a zero period.
             let resync_period = config_arc.resync_interval.max(Duration::from_secs(1));
             tokio::spawn(async move {
@@ -372,7 +375,7 @@ pub async fn start_service_discovery(
                         Arc::clone(&tracked_resync),
                         Arc::clone(&app_context_resync),
                         config_resync.port,
-                        &lock_resync,
+                        &state_resync,
                     )
                     .await;
                 }
@@ -398,7 +401,7 @@ pub async fn start_service_discovery(
                 Arc::clone(&tracked_pods),
                 Arc::clone(&app_context),
                 port,
-                &reconcile_lock,
+                &reconcile_state,
             )
             .await;
 
@@ -698,6 +701,21 @@ async fn handle_pod_deletion(
 /// list (`watcher::Config::default().page_size`) and client-go's default.
 const LIST_PAGE_SIZE: u32 = 500;
 
+/// Consecutive failed resyncs after which the log is escalated to `error!`.
+/// A single failed LIST is unremarkable; a run of them means the worker set
+/// is frozen and may be routing to pods that no longer exist.
+const RESYNC_FAILURES_BEFORE_ESCALATION: u32 = 3;
+
+/// State shared by the two reconcile drivers (the periodic timer and the
+/// watch-restart path).
+#[derive(Default)]
+struct ReconcileState {
+    /// Held for the duration of a pass so the two drivers never interleave.
+    lock: tokio::sync::Mutex<()>,
+    /// Consecutive failed passes, used only to escalate the log level.
+    consecutive_failures: AtomicU32,
+}
+
 /// Full LIST + reconcile of the tracked worker set against the API server.
 ///
 /// Adds any healthy, selector-matching pod not yet tracked, and removes any
@@ -716,12 +734,13 @@ async fn reconcile_from_list(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
-    reconcile_lock: &tokio::sync::Mutex<()>,
+    state: &ReconcileState,
 ) {
     // One reconcile at a time. The periodic timer and the watch-restart path
     // both call this, and letting two passes interleave lets the one holding
     // the older LIST snapshot delete a pod the newer one has just added.
-    let _guard = reconcile_lock.lock().await;
+    let _guard = state.lock.lock().await;
+    let started = time::Instant::now();
 
     // Snapshot the tracked set BEFORE issuing the LIST; only pods that were
     // already tracked at that instant are eligible for removal below. The
@@ -774,7 +793,25 @@ async fn reconcile_from_list(
                 // partial and removing against it would deregister live
                 // workers. An expired continue token (410) lands here too and
                 // is simply retried by the next resync.
-                warn!("SD resync LIST failed, keeping current worker set: {}", e);
+                Metrics::record_discovery_sync(
+                    metrics_labels::DISCOVERY_KUBERNETES,
+                    metrics_labels::RESULT_ERROR,
+                );
+                let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= RESYNC_FAILURES_BEFORE_ESCALATION {
+                    // The gauge cannot show this: it just stops moving, so a
+                    // frozen worker set looks identical to a quiet cluster.
+                    error!(
+                        "SD resync LIST has failed {} times in a row; the worker set is \
+                         frozen and may still route to pods that no longer exist: {}",
+                        failures, e
+                    );
+                } else {
+                    warn!(
+                        "SD resync LIST failed ({} in a row), keeping current worker set: {}",
+                        failures, e
+                    );
+                }
                 return;
             }
         };
@@ -810,6 +847,18 @@ async fn reconcile_from_list(
             _ => break,
         }
     }
+
+    // Every page landed, so `present` is a complete view and the removal pass
+    // below is safe to run.
+    state.consecutive_failures.store(0, Ordering::Relaxed);
+    Metrics::record_discovery_sync(
+        metrics_labels::DISCOVERY_KUBERNETES,
+        metrics_labels::RESULT_SUCCESS,
+    );
+    Metrics::record_discovery_sync_duration(
+        metrics_labels::DISCOVERY_KUBERNETES,
+        started.elapsed(),
+    );
 
     // Remove-absent: any pod tracked before the LIST whose name is no longer
     // in the API. Iterate the STORED PodInfo values so handle_pod_deletion's
