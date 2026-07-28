@@ -2619,10 +2619,7 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
-        # Pack captured aux hidden states directly into one [tokens, K * hidden]
-        # buffer instead of a list of K tensors, so the LogitsProcessor receives an
-        # already-packed tensor and skips its full-size torch.cat. AuxHiddenStatePacker
-        # is append-compatible, so the shared capture path below is unchanged.
+        # Append-compatible, so the shared capture path below is unchanged.
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
         if self.pp_group.is_first_rank:
             topk_indices = None

@@ -1,27 +1,24 @@
-"""
-Aux hidden states captured for Eagle3/DFlash draft models.
-"""
+"""Aux hidden states captured for Eagle3/DFlash draft models."""
 
 from typing import List, Optional, Union
 
 import torch
 
-# Aux hidden states arrive as either a list of K [tokens, hidden] tensors (concatenated
-# here -> transient ~2x HBM) or a pre-packed [tokens, K * hidden] tensor written in place
-# by AuxHiddenStatePacker (no cat). LogitsProcessor branches on which; both paths stay
-# live since models that haven't opted into packing still pass a list.
+# Two representations coexist: models migrated to AuxHiddenStatePacker pass one
+# packed [tokens, K * hidden] tensor, the rest still pass a list of K tensors.
 AuxHiddenStates = Union[torch.Tensor, List[torch.Tensor]]
 
 
 class AuxHiddenStatePacker:
-    """Append-compatible accumulator that packs aux hidden states in place.
+    """Drop-in for the ``[]`` a model collects Eagle3/DFlash captures into.
 
-    Drop-in for the ``[]`` a model collects Eagle3/DFlash captures into: each
-    ``.append()`` writes straight into one preallocated ``[tokens, K * hidden]``
-    buffer and ``.finalize()`` returns it. Avoids the legacy list path's transient
-    ~2x HBM (K separate tensors plus their ``torch.cat`` in ``LogitsProcessor``).
+    Each ``.append()`` writes into one preallocated ``[tokens, K * hidden]``
+    buffer, avoiding the list path's transient ~2x HBM at ``torch.cat``.
     Assumes all captures share leading shape and feature size.
     """
+
+    # ``append`` copies, so producers need not clone a tensor they later mutate.
+    copies_on_append = True
 
     def __init__(self, num_captures: int) -> None:
         self._num_captures = int(num_captures)
@@ -43,20 +40,15 @@ class AuxHiddenStatePacker:
     def __len__(self) -> int:
         return self._idx
 
-    def finalize(self) -> Optional[torch.Tensor]:
-        """Return the packed buffer, narrowed if fewer layers were captured than
-        ``num_captures``. Returns ``None`` when nothing was captured."""
-        if self._buffer is None:
-            return None
-        if self._idx != self._num_captures:
-            return self._buffer[..., : self._idx * self._feature_size]
+    def finalize(self) -> torch.Tensor:
+        """Return the packed buffer; callers guard the empty case on ``len()``."""
+        assert (
+            self._buffer is not None and self._idx == self._num_captures
+        ), f"captured {self._idx} of {self._num_captures} aux hidden states"
         return self._buffer
 
 
 def pack_aux_hidden_states(aux_hidden_states: AuxHiddenStates) -> torch.Tensor:
-    # The point where the two representations converge to one packed tensor.
     if isinstance(aux_hidden_states, torch.Tensor):
-        # Already packed in place by the producer -- no copy.
         return aux_hidden_states
-    # Legacy list path: concatenate K tensors, transiently ~2x aux HBM (see AuxHiddenStates).
     return torch.cat(aux_hidden_states, dim=-1)

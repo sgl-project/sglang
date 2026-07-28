@@ -525,6 +525,8 @@ class LayerCommunicator:
             )
             if (
                 gathered_last_layer_output is residual
+                # An accumulator that copies on append already holds a snapshot.
+                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
                 and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
