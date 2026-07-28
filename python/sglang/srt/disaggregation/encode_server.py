@@ -69,6 +69,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
     load_audio,
@@ -624,6 +625,9 @@ class MMEncoder:
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
+            raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 

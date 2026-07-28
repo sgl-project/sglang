@@ -49,6 +49,17 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     ReplaceWriteThroughOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.components import (
+    _NUM_COMPONENT_TYPES,
+    BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
+    ComponentData,
+    ComponentType,
+    EvictLayer,
+    LRURefreshPhase,
+    TreeComponent,
+    get_and_increase_time_counter,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -60,17 +71,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     NodeId,
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
-)
-from sglang.srt.mem_cache.unified_cache_components import (
-    _NUM_COMPONENT_TYPES,
-    BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
-    ComponentData,
-    ComponentType,
-    EvictLayer,
-    LRURefreshPhase,
-    TreeComponent,
-    get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
