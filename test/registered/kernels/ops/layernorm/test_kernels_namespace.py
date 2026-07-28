@@ -46,6 +46,7 @@ EXPECTED = {
     "moe.moe_align_block_size": {"aot", "jit"},
     "quantization.nvfp4_gemm_swiglu_nvfp4_quant": {"cute_dsl"},
     "kvcache.reshape_and_cache_flash": {"triton"},
+    "diffusion.apply_group_norm_silu": {"triton"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
