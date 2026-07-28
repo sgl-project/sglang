@@ -5,7 +5,7 @@
 // (benchmark/H200/script/v1/launch-k3.sh, benchmark/B300/script/v1/launch-k3.sh)
 // and the B200 2×8 / GB200 4×4 / H100 4×8 / MI35x 1×8 reference launches.
 // Kimi-K3 is a hybrid MoE VLM: 93 layers = 69 KDA (linear) + 24 MLA, 896 routed
-// experts + 1 shared. Served today from the DarkSharpness/sglang-kimi fork.
+// experts + 1 shared. Served today from the public sgl-project/sglang kimi-k3 branch.
 
 export const config = {
   modelName: "Kimi-K3",
@@ -216,8 +216,8 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang:dev-rocm720-mi35x",
-    mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
+    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
@@ -647,11 +647,16 @@ export const config = {
     ],
   },
 
+  // Verification marks: every cell carries "Final Verification In Progress" —
+  // the recipe runs, but its serving round on the final weights and current
+  // code is still open. Flip a cell to `verified: true` (and drop its
+  // `verificationStatus`) once that round lands.
   cells: [
     {
       match: { hw: "b300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -670,6 +675,7 @@ export const config = {
       match: { hw: "b300", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -688,6 +694,7 @@ export const config = {
       match: { hw: "b300", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       redirect: true,
       warn: "High-Throughput is the large-scale lane: pick a Cluster Size and a Large-Scale Preset in the [Playground](#playground) to compose the DP x EP command on top of this hardware's Balanced recipe.",
       env: [],
@@ -709,6 +716,7 @@ export const config = {
       match: { hw: "b200", pdMode: "unified", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -729,6 +737,7 @@ export const config = {
       match: { hw: "b200", pdMode: "unified", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -750,6 +759,7 @@ export const config = {
       match: { hw: "b200", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       redirect: true,
       warn: "High-Throughput is the large-scale lane: pick a Cluster Size and a Large-Scale Preset in the [Playground](#playground) to compose the DP x EP command on top of this hardware's Balanced recipe.",
       env: [],
@@ -774,6 +784,7 @@ export const config = {
       match: { hw: "b200", pdMode: "unified", strategy: "long-context" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -798,6 +809,7 @@ export const config = {
       match: { hw: "mi350x", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
@@ -823,6 +835,7 @@ export const config = {
       match: { hw: "mi355x", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
@@ -849,6 +862,7 @@ export const config = {
       match: { hw: "h100", pdMode: "unified", strategy: "low-latency" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -880,6 +894,7 @@ export const config = {
       match: { hw: "h100", pdMode: "unified", strategy: "balanced" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -911,6 +926,7 @@ export const config = {
       match: { hw: "h100", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -941,6 +957,7 @@ export const config = {
       match: { hw: "h200", pdMode: "unified", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -966,6 +983,7 @@ export const config = {
       match: { hw: "h200", pdMode: "unified", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -991,6 +1009,7 @@ export const config = {
       match: { hw: "h200", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -1016,6 +1035,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1037,6 +1057,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "unified", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1056,6 +1077,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       redirect: true,
       warn: "High-Throughput is the large-scale lane: pick a Cluster Size and a Large-Scale Preset in the [Playground](#playground) to compose the DP x EP command on top of this hardware's Balanced recipe.",
       env: [
@@ -1078,6 +1100,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "unified", strategy: "low-latency" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1098,6 +1121,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "unified", strategy: "balanced" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1118,6 +1142,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "unified", strategy: "high-throughput" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       redirect: true,
       warn: "High-Throughput is the large-scale lane: pick a Cluster Size and a Large-Scale Preset in the [Playground](#playground) to compose the DP x EP command on top of this hardware's Balanced recipe.",
       env: [
@@ -1147,6 +1172,7 @@ export const config = {
       match: { hw: "b300", pdMode: "prefill", strategy: "default" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1174,6 +1200,7 @@ export const config = {
       match: { hw: "b300", pdMode: "prefill", strategy: "long-context" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1199,6 +1226,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "prefill", strategy: "default" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1223,6 +1251,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "prefill", strategy: "long-context" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1260,6 +1289,7 @@ export const config = {
       match: { hw: "b300", pdMode: "decode", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1281,6 +1311,7 @@ export const config = {
       match: { hw: "b300", pdMode: "decode", strategy: "low-latency" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1302,6 +1333,7 @@ export const config = {
       match: { hw: "b300", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1323,6 +1355,7 @@ export const config = {
       match: { hw: "b200", pdMode: "decode", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1345,6 +1378,7 @@ export const config = {
       match: { hw: "b200", pdMode: "decode", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1368,6 +1402,7 @@ export const config = {
       match: { hw: "b200", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1391,6 +1426,7 @@ export const config = {
       match: { hw: "mi350x", pdMode: "decode", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
@@ -1417,6 +1453,7 @@ export const config = {
       match: { hw: "mi355x", pdMode: "decode", strategy: "balanced" },
       nnodes: 1,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
@@ -1443,6 +1480,7 @@ export const config = {
       match: { hw: "h100", pdMode: "decode", strategy: "low-latency" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -1474,6 +1512,7 @@ export const config = {
       match: { hw: "h100", pdMode: "decode", strategy: "balanced" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -1505,6 +1544,7 @@ export const config = {
       match: { hw: "h100", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
@@ -1536,6 +1576,7 @@ export const config = {
       match: { hw: "h200", pdMode: "decode", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -1562,6 +1603,7 @@ export const config = {
       match: { hw: "h200", pdMode: "decode", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -1588,6 +1630,7 @@ export const config = {
       match: { hw: "h200", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -1614,6 +1657,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "decode", strategy: "low-latency" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1636,6 +1680,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "decode", strategy: "balanced" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1658,6 +1703,7 @@ export const config = {
       match: { hw: "gb300", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 2,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1680,6 +1726,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "decode", strategy: "low-latency" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1702,6 +1749,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "decode", strategy: "balanced" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],
@@ -1724,6 +1772,7 @@ export const config = {
       match: { hw: "gb200", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 4,
       verified: false,
+      verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
       ],

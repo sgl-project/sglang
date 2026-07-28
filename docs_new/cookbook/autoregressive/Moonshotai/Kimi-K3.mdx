@@ -30,7 +30,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Tabs>
 
-If you do not want to use a Docker image, reproduce the dependency installation steps from the [CUDA 13 Dockerfile](https://github.com/DarkSharpness/sglang-kimi/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu13.Dockerfile) or [CUDA 12 Dockerfile](https://github.com/DarkSharpness/sglang-kimi/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu12.Dockerfile).
+If you do not want to use a Docker image, reproduce the dependency installation steps from the [CUDA 13 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu13.Dockerfile) or [CUDA 12 Dockerfile](https://github.com/sgl-project/sglang/blob/kimi-k3/docker/kimi_k3/kimi_k3_cu12.Dockerfile).
 
 </Accordion>
 
@@ -96,14 +96,14 @@ K3 **always runs with thinking enabled**, with reasoning depth controlled by `re
 
 <Note>
 Kimi-K3 is Moonshot AI's first open-source model in the trillion-plus class; **full model weights
-are scheduled to release by July 27, 2026**. The recipes on this page were validated on the
-[`DarkSharpness/sglang-kimi`](https://github.com/DarkSharpness/sglang-kimi) fork — the HuggingFace
+are scheduled to release by July 27, 2026**. The recipes on this page were validated on the public
+[`sgl-project/sglang` `kimi-k3` branch](https://github.com/sgl-project/sglang/tree/kimi-k3) — the HuggingFace
 repository (`moonshotai/Kimi-K3`) and a public `lmsysorg/sglang` image with K3 support will be
 available at launch.
 
-Every cell on this page is currently marked **Not Verified**: the recipes run, but none has a
-serving round on the final weights and current code behind it. Re-measure throughput and accuracy
-before you rely on any of them.
+Every cell in the Deploy panel above is currently marked **Final Verification In Progress**: the
+recipe runs, but its serving round on the final weights and current code is still open. Re-measure
+throughput and accuracy before you rely on any of them.
 </Note>
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `presence_penalty=0`, `frequency_penalty=0` (fixed by the model; informational — do not hardcode in sample code).
@@ -246,6 +246,8 @@ K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1
 
 - On the DCP recipes (Blackwell Balanced / High-Throughput), the host tiers are not fully DCP-aware yet: **L3 always, and L1+L2 with Spec Decode on, drop the DCP flags and run plain TP** (the command hints call it out — per-request KV capacity shrinks accordingly). L1+L2 NOSPEC keeps DCP.
 - Low-Latency and the Hopper recipes take all tiers unchanged.
+
+<a id="pd-disaggregation" />
 
 ### 3.4 PD Disaggregation
 
