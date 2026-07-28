@@ -150,7 +150,7 @@ def fused_q_norm_rope(
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     if _is_xpu:
-        sgl_kernel.fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
+        _fused_q_norm_rope(q_input, q_output, freqs_real, positions, eps)
         return
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
@@ -279,7 +279,7 @@ def fused_k_norm_rope_flashmla(
 ) -> None:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     if _is_xpu:
-        sgl_kernel.fused_k_norm_rope_flashmla(
+        _fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
         return
