@@ -225,8 +225,7 @@ impl Server {
 }
 
 /// PD prefill KV bootstrap registry (see `crate::bootstrap`) on its own
-/// listener + thread — no GIL, unlike the aiohttp `CommonKVBootstrapServer`
-/// it replaces in rust-server mode. Deliberately separate from [`Server`]:
+/// listener + thread — no GIL. Deliberately separate from [`Server`]:
 /// the scheduler starts it during `init_disaggregation`, BEFORE the main
 /// runtime boots, because the KV managers PUT-register synchronously right
 /// after with only a few bounded retries.
