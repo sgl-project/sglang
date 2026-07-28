@@ -4,7 +4,7 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
@@ -23,8 +23,8 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
-        WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        worker::local::find_workers_by_url, McpServerConfigRequest, TokenizerConfigRequest,
+        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
     },
     protocols::worker_spec::{JobStatus, WorkerConfigRequest, WorkerUpdateRequest},
 };
@@ -315,17 +315,27 @@ impl JobQueue {
         const HANDOFF_WAIT_MAX: Duration = Duration::from_secs(15);
         const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+        let dp_aware = context.router_config.dp_aware;
         let start = std::time::Instant::now();
         loop {
-            let Some(worker) = context.worker_registry.get_by_url(url) else {
+            // Resolve the target exactly the way the removal workflow does. In
+            // dp-aware mode a single pod URL is registered as one worker per
+            // rank ("<url>@<dp_rank>"), so an exact-URL registry lookup never
+            // matches and this guard would silently do nothing while the
+            // removal itself still succeeds via prefix matching.
+            let removing = find_workers_by_url(&context.worker_registry, url, dp_aware);
+            let Some(target) = removing.first() else {
                 return;
             };
-            let model_id = worker.model_id().to_string();
+            let model_id = target.model_id().to_string();
+            // Every rank of the pod being removed is leaving, so none of them
+            // counts as a worker the model retains.
+            let removing_urls: HashSet<&str> = removing.iter().map(|w| w.url()).collect();
             let model_retains_healthy_worker = context
                 .worker_registry
                 .get_by_model(&model_id)
                 .iter()
-                .any(|w| w.url() != url && w.is_healthy());
+                .any(|w| !removing_urls.contains(w.url()) && w.is_healthy());
             if model_retains_healthy_worker {
                 return;
             }
