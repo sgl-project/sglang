@@ -351,6 +351,20 @@ def _add3(
 _EP_FRONT_LOGGED = False
 
 
+def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
+    """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
+    optional quant-method capability; only the unquantized method has it."""
+    return getattr(o_proj.quant_method, "apply_into", None) is not None
+
+
+def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    """Symmetric storage for o_proj's TP-partial output; the fused attention
+    all-reduce reduces it in place."""
+    return k3_ar_fusion.symm_buffer(
+        k3_ar_fusion.ATTN_O_PROJ, x.shape[0], o_proj.weight.shape[0], x.dtype
+    )
+
+
 class KimiK3MoE(nn.Module):
     def __init__(
         self,
@@ -1036,8 +1050,14 @@ class KimiK3MoE(nn.Module):
             routed_input = routed_input.contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
-            with k3_ar_fusion.symm_alloc():
-                buf = hidden_states.new_empty(latent_numel + num_tokens * hidden_size)
+            # the shared-expert AR is pull-only, so its input must be a
+            # symm_buffer slice for every rank to resolve the same offset
+            buf = k3_ar_fusion.symm_buffer(
+                k3_ar_fusion.MOE_LATENT_SHARED,
+                num_tokens,
+                self.moe_hidden_size + hidden_size,
+                hidden_states.dtype,
+            ).view(-1)
         else:
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1449,14 +1469,20 @@ class KimiK3DeltaAttention(nn.Module):
             # group (sums across DP groups) and asymmetric vs idle DP ranks
             # (deadlocks the per-layer DP gather). Off under all_reduce_fusion:
             # the fused AR does the reduce itself (reduce_results=False) and the
-            # forward wraps o_proj in k3 symm_alloc — leaving this True would
-            # nest use_symmetric_memory(attn_tp) inside symm_alloc and misroute
-            # the GEMM output away from the k3 pool (rendezvous miss). At the
-            # fusion config attn_tp==tp so the fused full-TP reduce is the same
-            # group anyway.
+            # forward hands o_proj a slice of a persistent symmetric region —
+            # leaving this True would wrap the GEMM in
+            # use_symmetric_memory(attn_tp), which allocates its own output and
+            # so defeats the caller-owned buffer. At the fusion config
+            # attn_tp==tp so the fused full-TP reduce is the same group anyway.
             use_dp_attention_reduce=not self.all_reduce_fusion,
             prefix=f"{prefix}.o_proj",
         )
+        if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
+            # the fused AR reduces o_proj's output in place out of a symmetric
+            # buffer, which needs the GEMM to write into caller-owned storage
+            self.all_reduce_fusion = False
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
         k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
@@ -1661,8 +1687,8 @@ class KimiK3DeltaAttention(nn.Module):
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         if self.all_reduce_fusion:
-            with k3_ar_fusion.symm_alloc():
-                partial, _ = self.o_proj(core_attn_out)
+            out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
+            partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
         return self.o_proj(core_attn_out)[0]
 
@@ -1705,26 +1731,38 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
+        if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
+            # the fused AR reduces o_proj's output in place out of a symmetric
+            # buffer, which needs the GEMM to write into caller-owned storage
+            self.all_reduce_fusion = False
+            self.o_proj.reduce_results = True
+            self.o_proj.use_dp_attention_reduce = True
         k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
-            # the fused all-reduce does the reduce itself and needs the o_proj
-            # output in the k3 symm pool, so install the symm-pool wrap and do
-            # NOT set use_dp_attention_reduce (its inner attn_tp symm_ctx would
-            # nest inside symm_alloc and misroute the GEMM output away from the
-            # k3 pool → rendezvous miss). At the fusion config (attn_tp==tp) the
-            # fused full-TP reduce is the same group as the attn_tp reduce.
+            # the fused all-reduce does the reduce itself and reduces the o_proj
+            # output in place, so hand the GEMM a slice of the persistent
+            # symmetric buffer (k3_ar_fusion.symm_buffer) and do NOT set
+            # use_dp_attention_reduce — its inner attn_tp symm_ctx allocates its
+            # own output and would defeat the caller-owned buffer. At the fusion
+            # config (attn_tp==tp) the fused full-TP reduce is the same group as
+            # the attn_tp reduce.
             # The wrap is installed before the output-gate wrap below so the
-            # gate multiply stays outside the pool and only the o_proj GEMM
-            # output lands in it. NOTE: the captured name must differ from the
+            # gate multiply stays outside it and only the o_proj GEMM writes the
+            # region slice. NOTE: the captured name must differ from the
             # gate block's `_orig_o_proj_forward` — closures capture the
             # __init__ local by reference, and reusing the name would rebind it
             # to this wrapper (infinite recursion + nested pool enter).
             _symm_inner_o_proj_forward = self.o_proj.forward
+            _symm_o_proj = self.o_proj
 
             def _symm_o_proj_forward(x, *args, **kwargs):
-                with k3_ar_fusion.symm_alloc():
-                    return _symm_inner_o_proj_forward(x, *args, **kwargs)
+                return _symm_inner_o_proj_forward(
+                    x,
+                    *args,
+                    output_tensor=_k3_symm_o_proj_out(_symm_o_proj, x),
+                    **kwargs,
+                )
 
             self.o_proj.forward = _symm_o_proj_forward
         else:
@@ -1928,6 +1966,10 @@ class KimiK3DecoderLayer(nn.Module):
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
+
+        # the attention drops the fusion when its o_proj cannot write into
+        # caller-owned storage; the layer's own AR call-site must agree
+        self.all_reduce_fusion = self.self_attn.all_reduce_fusion
 
         # MLP / MoE
         if self._is_moe_layer:

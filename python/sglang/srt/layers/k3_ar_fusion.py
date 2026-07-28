@@ -4,21 +4,13 @@ Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
 available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
 1 = attempt anywhere and warn when unavailable).
 
-Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels,
-mirroring the NCCL-window design (pool + registered segments + find-window
-dispatch), but backed by torch symmetric memory:
-
-* :func:`symm_alloc` — allocation context that routes tensor allocations into
-  the torch symm-mem pool (with the pause-the-graph-pool dance under CUDA
-  graph capture, same as ``pynccl_allocator.SymmetricMemoryContext``).
-* :func:`all_reduce` — in-place ``x = allreduce(x) [+ residual]``:
-  small messages take the 1shot multicast-push (any tensor; reuses the
-  group's CustomAllReduceV2 workspace), large ones take the in-place NVLS
-  2shot on ``x``'s multicast address (rendezvous cached per segment).
+Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels. Small
+messages take the 1shot multicast-push through the group's CustomAllReduceV2
+workspace; large ones take the in-place NVLS 2shot, which needs its input to be a
+:func:`symm_buffer` slice and otherwise falls back to the regular all-reduce.
 
 Call-site contract when the fusion is active: ``enabled()`` was
 checked once (which initializes the state), ``x`` is bf16 and contiguous,
-tensors above the push threshold are allocated under :func:`symm_alloc`,
 and the residual is identical on every rank (a fully reduced tensor such
 as the attn-res prefix sum) or ``None``.
 """
@@ -27,10 +19,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+import sglang.srt.runtime_context as ctx
+from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -49,44 +43,32 @@ _PUSH_MAX_BYTES = 512 * 1024
 # csrc/kimi_k3/comm/ar_fusion.cuh — the mod hardcodes this row width.
 NORM_DIM = 3584
 
-
-class _State:
-    def __init__(self, comm: CustomAllReduceV2, world_size: int, group_name: str):
-        self.comm = comm  # CustomAllReduceV2 (storage plane owner)
-        self.world_size = world_size
-        self.group_name = group_name
+# :func:`symm_buffer` names: o_proj's [rows, hidden_size] output, and the MoE
+# [latent | shared] pair flattened to rows x (moe_hidden_size + hidden_size).
+ATTN_O_PROJ = "attn_o_proj"
+MOE_LATENT_SHARED = "moe_latent_shared"
 
 
-_STATE: Optional[_State] = None
-_INITIALIZED = False
+class _State(NamedTuple):
+    comm: CustomAllReduceV2
+    world_size: int
+    group_name: str
 
 
-def _init_state() -> Optional[_State]:
-    global _STATE, _INITIALIZED
-    if _INITIALIZED:
-        return _STATE
-    _INITIALIZED = True
+@cache_once
+def _get_state() -> Optional[_State]:
     explicit = envs.SGLANG_K3_AR_FUSION.is_set()
     if explicit:
         if not envs.SGLANG_K3_AR_FUSION.get():
             return None
     else:
-        # Auto: attempt only inside the validated envelope — SM100/SM103
-        # (the arches the fused kernels were measured on) and no
-        # --enable-symm-mem (its pynccl allocator context misroutes the
-        # o_proj/MoE outputs away from the k3 symm pool -> the pull path's
-        # symm-pool contract fails, see _find_mc_ptr). DCP composes: the
-        # TP-group reduces the fusion covers (KDA o_proj, latent|shared MoE)
-        # are DCP-transparent, validated on DCP8 fp8/fi_a2a GB300 (GSM8K
-        # in-band; bs=1 +19%, bs=64 +9%). The CustomAllReduceV2 multicast
-        # probe below is the remaining capability gate.
-        # SGLANG_K3_AR_FUSION=1 still force-attempts anywhere.
-        from sglang.srt.runtime_context import get_server_args
+        # Auto-probe: only SM100/SM103, and not under --enable-symm-mem or EP
+        # a2a (their allocator contexts misroute the buffers the pull needs).
         from sglang.srt.utils.common import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None
-        server_args = get_server_args()
+        server_args = ctx.get_server_args()
         if server_args.enable_symm_mem or server_args.moe_a2a_backend != "none":
             logger.info(
                 "K3 all-reduce fusion auto-probe: skipping "
@@ -127,24 +109,18 @@ def _init_state() -> Optional[_State]:
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
     mod.register_comm(comm.obj, pull_sem_mc_ptr=comm.pull_sem_mc_ptr)
-    _STATE = _State(comm, comm.world_size, group.cpu_group.group_name)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
-    return _STATE
+    return _State(comm, comm.world_size, group.cpu_group.group_name)
 
 
 def enabled() -> bool:
-    return _init_state() is not None
+    return _get_state() is not None
 
 
 @contextmanager
 def symm_alloc():
-    """Route tensor allocations into the torch symm-mem pool.
-
-    Only entered when the fusion is enabled (call-site contract). Under CUDA
-    graph capture the graph's own pool is paused first (allocating to two
-    pools at once is rejected), mirroring
-    pynccl_allocator.SymmetricMemoryContext.
-    """
+    """Route tensor allocations into the torch symm-mem pool. Under capture the
+    graph's own pool is paused first (two pools at once is rejected)."""
     import torch.distributed._symmetric_memory as torch_symm_mem
     from torch._C import (
         _cuda_beginAllocateCurrentThreadToPool,
@@ -172,114 +148,112 @@ def symm_alloc():
             _cuda_beginAllocateCurrentThreadToPool(device_index, graph_pool_id)
 
 
-_GRAPHS_ACTIVE: Optional[bool] = None
+class _Buffer(NamedTuple):
+    region: torch.Tensor  # flat [max_rows * width]
+    base: int  # local VA of region[0]
+    mc_base: int  # multicast VA of region[0]
+    max_rows: int
+    width: int
 
 
-def _eager_call_with_graphs_active() -> bool:
-    """True for a fused-AR call issued OUTSIDE capture on a server that uses
-    CUDA graphs.
-
-    The fused comm family assumes allocation and dispatch stay TP-uniform
-    (see _find_mc_ptr). With captured graphs in the process, eager forwards
-    (prefill / small extends) lose that uniformity -- the graph pool shifts
-    the symm allocator's reuse phase per rank, so ranks resolve different
-    (segment, offset) pairs for the same logical call and the NVLS reduce
-    sums misaligned multicast windows (garbage output, worst on extends
-    <= attn_res_block_size). Route those calls to the regular all-reduce;
-    captured graphs keep the fused path (capture is lockstep and replays
-    are pointer-stable).
-    """
-    global _GRAPHS_ACTIVE
-    if _GRAPHS_ACTIVE is None:
-        try:
-            from sglang.srt.runtime_context import get_server_args
-
-            _GRAPHS_ACTIVE = not get_server_args().disable_cuda_graph
-        except Exception:
-            _GRAPHS_ACTIVE = True  # conservative: prefer the safe path
-    return _GRAPHS_ACTIVE and not torch.cuda.is_current_stream_capturing()
+# Reverse pointer -> multicast lookup for get_mc_ptr().
+_BUFS: List[_Buffer] = []
 
 
-def _fallback_all_reduce(
-    x: torch.Tensor, residual: Optional[torch.Tensor]
-) -> torch.Tensor:
-    from sglang.srt.distributed import tensor_model_parallel_all_reduce
-
-    out = tensor_model_parallel_all_reduce(x)
-    if residual is not None:
-        # writing the sum into x absorbs the copy-back when the all-reduce
-        # is out-of-place, and degenerates to an in-place add when it is not
-        torch.add(out, residual, out=x)
-    elif out is not x:
-        x.copy_(out)
-    return x
+@cache_once
+def _max_buffer_rows() -> int:
+    """Rows to reserve per buffer: the largest batch the server args allow."""
+    server_args = ctx.get_server_args()
+    chunked = server_args.chunked_prefill_size
+    if chunked is not None and chunked > 0:
+        return int(chunked)
+    return int(server_args.max_prefill_tokens or 0)
 
 
-def _fallback_all_reduce_norm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, num_tokens: int
-) -> torch.Tensor:
-    from flashinfer.norm import rmsnorm
+def _create_buffer(name: str, width: int, dtype: torch.dtype) -> _Buffer:
+    """One symmetric buffer, rendezvoused once. ``empty_strided_p2p`` skips the
+    caching allocator, so this is right for a persistent buffer only."""
+    from torch._C._distributed_c10d import _SymmetricMemory
 
-    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+    from sglang.srt.distributed.parallel_state import get_tp_group
 
-    # Same epilogue as the fused kernels (fp32 accumulate, fp32 weight
-    # multiply, one bf16 store -- see ar_fusion.cuh). Norming straight into
-    # x absorbs the copy-back when the all-reduce is out-of-place, and is a
-    # safe in-place update when it is not (each thread only stores back the
-    # elements it loaded). Only the un-normed tail -- the shared rows of the
-    # flat latent|shared buffer -- is left to copy.
-    out = tensor_model_parallel_all_reduce(x)
-    rmsnorm(out[:num_tokens], weight, eps, out=x[:num_tokens])
-    if out is not x and out.shape[0] > num_tokens:
-        x[num_tokens:].copy_(out[num_tokens:])
-    return x
-
-
-def _find_mc_ptr(state: _State, x: torch.Tensor) -> int:
-    """Multicast VA of ``x`` (contract: allocated under :func:`symm_alloc`).
-
-    Rendezvous per call: torch caches the handle per allocation (~2us on a
-    hit), tracks segment lifetime itself, and the first touch of a fresh
-    segment is a lockstep collective (allocation and dispatch are
-    TP-uniform), so no extra Python-side registry is needed or safe.
-    """
-    import torch.distributed._symmetric_memory as torch_symm_mem
-
-    hdl = torch_symm_mem.rendezvous(x, state.group_name)
-    assert hdl is not None and hdl.multicast_ptr != 0, (
-        "all_reduce input above the push threshold is not a "
-        "symm-pool tensor (allocate it under k3_ar_fusion.symm_alloc())"
+    max_rows = _max_buffer_rows()
+    # outside inference mode on purpose: created inside it the buffer would be an
+    # inference tensor, and the in-place write from a no_grad path (CUDA graph
+    # capture) is then rejected
+    with torch.inference_mode(False):
+        region = _SymmetricMemory.empty_strided_p2p(
+            (max_rows * width,),
+            [1],
+            dtype,
+            torch.device("cuda", torch.cuda.current_device()),
+            get_tp_group().cpu_group.group_name,
+        ).view(max_rows, width)
+    handle = _SymmetricMemory.rendezvous(region)
+    assert handle is not None and handle.multicast_ptr != 0
+    buf = _Buffer(
+        region=region,
+        base=int(region.data_ptr()),
+        mc_base=int(handle.multicast_ptr),
+        max_rows=max_rows,
+        width=width,
     )
-    offset = x.data_ptr() - hdl.buffer_ptrs[state.comm.rank]
-    return hdl.multicast_ptr + offset
+    _BUFS.append(buf)
+    logger.info(
+        "K3 symm buffer %r: %d rows x %d, %.1f MB (rendezvoused once on first "
+        "use; no per-forward symmetric allocation)",
+        name,
+        max_rows,
+        width,
+        region.numel() * region.element_size() / (1024 * 1024),
+    )
+    return buf
+
+
+def symm_buffer(name: str, rows: int, width: int, dtype: torch.dtype):
+    """``[rows, width]`` view of a named persistent symmetric buffer.
+
+    The pull reduces in place on the input's multicast alias, so every rank must
+    resolve the same ``(buffer, offset)``; a per-forward symm-pool allocation does
+    not, because torch's caching allocator breaks ties on the absolute address and
+    ``rendezvous`` validates sizes only.
+    """
+    buf: _Buffer = ctx.get_buffer(
+        f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype)
+    )
+    assert 0 < rows <= buf.max_rows and width == buf.width and dtype == buf.region.dtype
+    return buf.region[:rows]
+
+
+def get_mc_ptr(x: torch.Tensor) -> int:
+    """Multicast VA of ``x``, which must be a :func:`symm_buffer` slice."""
+    ptr = int(x.data_ptr())
+    end = ptr + x.numel() * x.element_size()
+    for buf in _BUFS:
+        if buf.base <= ptr and end <= buf.base + buf.region.nbytes:
+            return buf.mc_base + (ptr - buf.base)
+    raise AssertionError("K3 fused pull input is not a symm_buffer slice")
 
 
 def all_reduce(
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """In-place ``x = allreduce(x) [+ residual]``; returns ``x``.
-
-    Call-site contract (see module docstring): the state is initialized,
-    ``x`` is bf16 and contiguous, and large inputs live in the symm pool.
-    """
+    """In-place ``x = allreduce(x) [+ residual]``; returns ``x``."""
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x if residual is None else x + residual
-    if _eager_call_with_graphs_active():
-        return _fallback_all_reduce(x, residual)
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
         return mod.all_reduce_push_res(
             state.world_size, x, residual, ws_mc_base=state.comm.mc_base_ptr
         )
-    else:
-        return mod.all_reduce_pull_res(
-            state.world_size, x, residual, input_mc_ptr=_find_mc_ptr(state, x)
-        )
+    return mod.all_reduce_pull_res(
+        state.world_size, x, residual, input_mc_ptr=get_mc_ptr(x)
+    )
 
 
 def all_reduce_low_sm(
@@ -289,28 +263,22 @@ def all_reduce_low_sm(
     num_blocks: Optional[int] = None,
     unroll: Optional[int] = None,
 ) -> torch.Tensor:
-    """In-place ``x = allreduce(x) [+ residual]`` pinned to the low-SM NVLS
-    pull, with the launch geometry exposed; returns ``x``.
+    """In-place ``x = allreduce(x) [+ residual]``, pinned to the low-SM NVLS pull.
 
-    For side-stream use (the shared-expert all-reduce): unlike
-    :func:`all_reduce` it never dispatches to the push kernel — push fans
-    out over many blocks and would steal SMs from the main-stream GEMMs it
-    is meant to overlap. ``x`` must live in the symm pool at ANY size.
-    ``num_blocks`` / ``unroll`` default to the tuned tables when None.
+    For side-stream use: push would fan out over many blocks and steal SMs from
+    the GEMMs it overlaps. ``num_blocks`` / ``unroll`` default to the tuned tables.
     """
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x if residual is None else x + residual
-    if _eager_call_with_graphs_active():
-        return _fallback_all_reduce(x, residual)
     return mod.all_reduce_pull_res(
         state.world_size,
         x,
         residual,
-        input_mc_ptr=_find_mc_ptr(state, x),
+        input_mc_ptr=get_mc_ptr(x),
         num_blocks=num_blocks,
         unroll=unroll,
     )
@@ -324,21 +292,13 @@ def all_reduce_norm(
     num_tokens: int,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x)`` with a fused RMSNorm over the first
-    ``num_tokens`` rows; returns ``x``.
-
-    ``x`` is a 2D ``[rows, NORM_DIM]`` bf16 tensor (a latent-only
-    ``[N, NORM_DIM]`` tensor with ``num_tokens = N``, or the flat K3
-    latent|shared buffer viewed as ``[3N, NORM_DIM]`` with ``num_tokens =
-    N``). Same dispatch and call-site contract as :func:`all_reduce`.
-    """
+    ``num_tokens`` rows of the 2D ``[rows, NORM_DIM]`` input."""
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x
-    if _eager_call_with_graphs_active():
-        return _fallback_all_reduce_norm(x, weight, eps, num_tokens)
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
         return mod.all_reduce_push_norm(
@@ -349,40 +309,32 @@ def all_reduce_norm(
             num_norm_rows=num_tokens,
             ws_mc_base=state.comm.mc_base_ptr,
         )
-    else:
-        return mod.all_reduce_pull_norm(
-            state.world_size,
-            x,
-            weight,
-            eps,
-            num_norm_rows=num_tokens,
-            input_mc_ptr=_find_mc_ptr(state, x),
-        )
+    return mod.all_reduce_pull_norm(
+        state.world_size,
+        x,
+        weight,
+        eps,
+        num_norm_rows=num_tokens,
+        input_mc_ptr=get_mc_ptr(x),
+    )
 
 
 def finalize_push_fits(num_tokens: int) -> bool:
-    """Whether a [num_tokens, NORM_DIM] latent fits the 1shot push window
-    (the finalize-fused AR is push-only; larger sizes keep the in-op
-    finalize + :func:`all_reduce_norm` NVLS path)."""
-    state = _STATE
+    """Whether a [num_tokens, NORM_DIM] latent fits the push window; the
+    finalize-fused AR is push-only."""
+    state = _get_state()
     assert state is not None
-    if _eager_call_with_graphs_active():
-        return False
     nbytes = num_tokens * NORM_DIM * 2
     return nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size)
 
 
 def gemm_ag_up_fits(num_tokens: int) -> bool:
-    """Whether the column-parallel up_proj + multicast all-gather tail
-    (:func:`gemm_ag_up_proj`) covers this decode batch: TP8, the batch is
-    within the kernel's win range, one [num_tokens, 896] staging slice fits
-    a push slot, and the phase-counter array covers both launch grids."""
+    """Whether :func:`gemm_ag_up_proj` covers this decode batch: TP8, within the
+    kernel's win range, and the staging slice fits a push slot."""
     from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
-    if _eager_call_with_graphs_active():
-        return False
     comm = state.comm
     return (
         0 < num_tokens <= mod.MAX_TOKENS
@@ -398,16 +350,12 @@ def gemm_ag_up_proj(
     b: torch.Tensor,
     c: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """``up_proj(x) + b (+ c)`` via the column-parallel GEMV + multicast
-    all-gather + fused add3 (one more push-workspace user). ``x`` is the
-    normed [T, 3584] latent, ``weight`` the FULL replicated [7168, 3584]
-    up_proj weight (the kernel slices out this rank's row block itself),
-    ``b`` / ``c`` the [T, 7168] addends. Caller checked
-    :func:`gemm_ag_up_fits`; same call-site contract as
-    :func:`all_reduce`."""
+    """``up_proj(x) + b (+ c)`` via column-parallel GEMV + multicast all-gather +
+    fused add3. ``weight`` is the FULL replicated up_proj (the kernel slices this
+    rank's rows). Caller checked :func:`gemm_ag_up_fits`."""
     from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
     return mod.gemm_ag_up_proj(
         state.world_size,
@@ -428,13 +376,11 @@ def finalize_all_reduce_push_norm(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm on every
-    row; ``out`` ([T, NORM_DIM] bf16) is output-only. Caller checked
-    :func:`finalize_push_fits`; same call-site contract as
-    :func:`all_reduce`."""
+    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
+    output-only. Caller checked :func:`finalize_push_fits`."""
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
-    state = _STATE
+    state = _get_state()
     assert state is not None
     return mod.finalize_all_reduce_push_norm(
         state.world_size,
